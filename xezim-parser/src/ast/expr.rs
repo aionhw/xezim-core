@@ -124,6 +124,12 @@ pub struct HierarchicalIdentifier {
     /// Cached signal ID for fast lookup during simulation (set on first access).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub cached_signal_id: Cell<Option<usize>>,
+    /// Cached resolved hierarchical name (set on first call to
+    /// `resolve_hier_name`). Bypasses all path-joining, prefix-stripping and
+    /// suffix-scanning on repeat calls — the dominant cost for tight
+    /// memory-init loops and `arr[i]` accesses in hot paths.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub cached_resolved_name: std::cell::OnceCell<String>,
 }
 
 impl std::fmt::Debug for HierarchicalIdentifier {

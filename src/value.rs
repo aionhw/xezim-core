@@ -1299,9 +1299,33 @@ impl Value {
 impl Value {
     /// Copy the storage from another value (used in NBA apply)
     pub fn copy_from(&mut self, other: &Value) {
-        self.storage = other.storage.clone();
+        // Fast path: Inline→Inline is just a word-level overwrite (no alloc).
+        // Wide→Wide with the same length reuses `self`'s existing Vec buffer
+        // via `extend_from_slice` after `clear()`, avoiding the per-iter
+        // allocation that `storage.clone()` would do. Mixed variants fall
+        // back to the generic clone.
+        //
+        // Copies `width`, `is_signed`, and `is_real` as well — this is the
+        // drop-in equivalent of `*self = other.clone()` minus the heap
+        // allocation for Wide values. Before: callers that wanted full-value
+        // replace had to write `*self = other.clone()`; they can now use
+        // `copy_from` and get the no-alloc benefit for free.
+        match (&mut self.storage, &other.storage) {
+            (ValueStorage::Inline { val_bits: sv, xz_bits: sx },
+             ValueStorage::Inline { val_bits: ov, xz_bits: ox }) => {
+                *sv = *ov; *sx = *ox;
+            }
+            (ValueStorage::Wide(sv), ValueStorage::Wide(ov)) => {
+                sv.clear();
+                sv.extend_from_slice(ov);
+            }
+            _ => {
+                self.storage = other.storage.clone();
+            }
+        }
         self.width = other.width;
-        // Preserve is_signed from self
+        self.is_signed = other.is_signed;
+        self.is_real = other.is_real;
     }
 }
 

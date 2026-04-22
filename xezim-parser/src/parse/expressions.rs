@@ -508,6 +508,7 @@ impl Parser {
                     path: vec![HierPathSegment { name: id, selects: Vec::new() }],
                     span: self.span_from(start),
                     cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -531,6 +532,7 @@ impl Parser {
                     path: vec![HierPathSegment { name: id, selects: Vec::new() }],
                     span: self.span_from(start),
                     cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
                 };
                 let expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 // Check for type cast: identifier'(expr)  e.g. my_type'(value)
@@ -596,6 +598,7 @@ impl Parser {
                     path: vec![HierPathSegment { name: name_id, selects: Vec::new() }],
                     span: self.span_from(start),
                     cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -787,6 +790,7 @@ impl Parser {
             path,
             span: self.span_from(start),
             cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
         }
     }
     /// Handles indices [expr] as well.
@@ -798,6 +802,7 @@ impl Parser {
             path: vec![HierPathSegment { name: id, selects: Vec::new() }],
             span: self.span_from(start),
             cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
         };
         let mut res = Expression::new(ExprKind::Ident(hier), self.span_from(start));
         

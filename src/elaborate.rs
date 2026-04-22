@@ -3890,6 +3890,7 @@ fn make_ident_expr(name: &str) -> Expression {
         path: vec![HierPathSegment { name: Identifier { name: name.to_string(), span: Span::dummy() }, selects: Vec::new() }],
         span: Span::dummy(),
         cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
     }), Span::dummy())
 }
 
