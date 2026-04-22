@@ -224,7 +224,7 @@ impl Parser {
             }
             _ if self.is_data_type_keyword() =>
                 Some(ModuleItem::DataDeclaration(self.parse_data_declaration())),
-            TokenKind::KwVar | TokenKind::KwConst =>
+            TokenKind::KwVar | TokenKind::KwConst | TokenKind::KwStatic | TokenKind::KwAutomatic =>
                 Some(ModuleItem::DataDeclaration(self.parse_data_declaration())),
             TokenKind::KwParameter =>
                 Some(ModuleItem::ParameterDeclaration(self.parse_parameter_decl_stmt())),
@@ -248,6 +248,14 @@ impl Parser {
                 Some(ModuleItem::FinalConstruct(FinalConstruct { stmt: st, span: self.span_from(start) })) }
             TokenKind::KwAssign => {
                 self.bump();
+                if self.eat(TokenKind::Hash).is_some() {
+                    if self.eat(TokenKind::LParen).is_some() {
+                        let _ = self.parse_expression();
+                        self.expect(TokenKind::RParen);
+                    } else {
+                        let _ = self.parse_expression();
+                    }
+                }
                 let mut asgns = Vec::new();
                 loop { let l = self.parse_expression(); self.expect(TokenKind::Assign); let r = self.parse_expression();
                     asgns.push((l, r)); if self.eat(TokenKind::Comma).is_none() { break; } }
@@ -469,8 +477,46 @@ impl Parser {
                 // Parse condition
                 let cond = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
-                // Parse increment
-                let incr = self.parse_expression();
+                // Parse increment: allow both expression steps (`i++`) and
+                // assignment-style steps (`i = i + 1`), which are common in
+                // generate-for loops in real RTL.
+                let incr = {
+                    let expr = self.parse_lvalue_or_expr();
+                    if self.at(TokenKind::Assign) || self.at_any(&[
+                        TokenKind::PlusAssign, TokenKind::MinusAssign,
+                        TokenKind::StarAssign, TokenKind::SlashAssign,
+                        TokenKind::PercentAssign, TokenKind::AndAssign,
+                        TokenKind::OrAssign, TokenKind::XorAssign,
+                        TokenKind::ShiftLeftAssign, TokenKind::ShiftRightAssign,
+                        TokenKind::ArithShiftLeftAssign, TokenKind::ArithShiftRightAssign,
+                    ]) {
+                        let op_kind = self.current().kind.clone();
+                        self.bump();
+                        let rhs = self.parse_expression();
+                        let span = self.span_from(s);
+                        let rvalue = match op_kind {
+                            TokenKind::PlusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Add, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::MinusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Sub, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::StarAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mul, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::SlashAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Div, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::PercentAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mod, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::AndAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::OrAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::XorAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::ShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::ShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::ArithShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            TokenKind::ArithShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                            _ => Expression::new(ExprKind::AssignExpr { lvalue: Box::new(expr.clone()), rvalue: Box::new(rhs) }, span),
+                        };
+                        match op_kind {
+                            TokenKind::Assign => rvalue,
+                            _ => Expression::new(ExprKind::AssignExpr { lvalue: Box::new(expr), rvalue: Box::new(rvalue) }, span),
+                        }
+                    } else {
+                        expr
+                    }
+                };
                 self.expect(TokenKind::RParen);
                 let items = self.parse_generate_branch_items();
                 Some(ModuleItem::GenerateFor(GenerateFor { var: var_name, init_val, cond, incr, items, span: self.span_from(s) }))

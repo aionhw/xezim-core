@@ -3,6 +3,7 @@
 
 use ahash::AHashMap as HashMap;
 use ahash::AHashSet as HashSet;
+use std::collections::BTreeMap;
 use crate::ast::{Identifier, Span};
 use crate::ast::decl::*;
 use crate::ast::module::*;
@@ -10,6 +11,13 @@ use crate::ast::types::*;
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
 use super::value::Value;
+
+fn elab_trace_enabled() -> bool {
+    std::env::var("XEZIM_TRACE_ELAB").map(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    }).unwrap_or(false)
+}
 
 /// A resolved signal in the simulation model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2074,6 +2082,14 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
 }
 
 fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &HashSet<String>) -> Result<(), String> {
+    fn root_ident_name(expr: &Expression) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Ident(hier) if hier.path.len() == 1 => Some(hier.path[0].name.name.as_str()),
+            ExprKind::MemberAccess { expr, .. } => root_ident_name(expr),
+            _ => None,
+        }
+    }
+
     match &expr.kind {
         ExprKind::Ident(hier) => {
             // Only check plain identifiers for now (hierarchical might be valid across modules)
@@ -2164,11 +2180,12 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
             }
         }
         ExprKind::MemberAccess { expr, .. } => {
-            // Skip validation when LHS is a bare ident matching a known package name
-            // (e.g. `pkg::name`); those are scope refs, not value lookups.
-            if let ExprKind::Ident(hier) = &expr.kind {
-                if hier.path.len() == 1 && elab.packages.contains(&hier.path[0].name.name) {
-                    // skip
+            // Skip validation for package scopes (`pkg::name`) and for
+            // hierarchical references rooted at the current top module name
+            // (e.g. `tb.x_soc...` inside the testbench).
+            if let Some(root) = root_ident_name(expr) {
+                if root == elab.name || elab.packages.contains(root) {
+                    // scope / hierarchy reference, not a value lookup
                 } else {
                     validate_expr_idents(expr, elab, locals)?;
                 }
@@ -3047,13 +3064,20 @@ pub fn inline_instantiations(
     }
 
     let module_name = elab.name.clone();
+    if elab_trace_enabled() {
+        eprintln!("[xezim][elab] start top={}", module_name);
+    }
     let top_def = match definitions.get(&module_name) {
         Some(m) => *m,
         None => return Err(format!("Top module '{}' not found in module map", module_name)),
     };
     // Recursively inline starting from the top module's items
     let top_params = elab.parameters.clone();
-    inline_module_items(elab, top_def, "", definitions, &mut HashMap::new(), &top_params)?;
+    let mut cache = HashMap::new();
+    inline_module_items(elab, top_def, "", definitions, &mut HashMap::new(), &top_params, &mut cache)?;
+    if elab_trace_enabled() {
+        eprintln!("[xezim][elab] finished inline top={}", module_name);
+    }
 
     // Identify interface instances at top level
     let mut top_interface_names = HashSet::new();
@@ -3139,6 +3163,164 @@ fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -
     }
 }
 
+#[derive(Debug, Clone)]
+struct PreparedModuleItems {
+    effective_items: Vec<ModuleItem>,
+    local_typedefs: std::collections::HashSet<String>,
+    interface_ports: std::collections::HashSet<String>,
+    port_directions: HashMap<String, PortDirection>,
+    local_names: std::collections::HashSet<String>,
+}
+
+type InlinePrepCache = HashMap<String, PreparedModuleItems>;
+
+fn format_param_key(params: &HashMap<String, Value>) -> String {
+    let mut ordered = BTreeMap::new();
+    for (name, value) in params {
+        ordered.insert(name.as_str(), value);
+    }
+    let mut key = String::new();
+    for (name, value) in ordered {
+        use std::fmt::Write as _;
+        let _ = write!(
+            key,
+            "{}:{}:{}:{}:{:?}|",
+            name,
+            value.width,
+            value.is_signed as u8,
+            value.is_real as u8,
+            value.raw_bits()
+        );
+    }
+    key
+}
+
+fn prepare_module_items(
+    source_def: Definition,
+    definitions: &HashMap<String, Definition>,
+    local_params: &HashMap<String, Value>,
+    typedef_widths: &HashMap<String, u32>,
+    cache: &mut InlinePrepCache,
+) -> PreparedModuleItems {
+    let cache_key = format!("{}|{}", source_def.name(), format_param_key(local_params));
+    if let Some(prepared) = cache.get(&cache_key) {
+        return prepared.clone();
+    }
+
+    let mut local_typedefs = std::collections::HashSet::new();
+    for item in source_def.items() {
+        if let ModuleItem::TypedefDeclaration(td) = item {
+            local_typedefs.insert(td.name.name.clone());
+        }
+    }
+
+    let mut interface_ports = std::collections::HashSet::new();
+    if let PortList::Ansi(ports) = source_def.ports() {
+        for port in ports {
+            if let Some(dt) = &port.data_type {
+                if is_interface_type(dt, definitions) {
+                    interface_ports.insert(port.name.name.clone());
+                }
+            }
+        }
+    }
+
+    let effective_items = collect_effective_items(source_def.items(), local_params);
+
+    let mut port_directions = HashMap::new();
+    match source_def.ports() {
+        PortList::Ansi(ports) => {
+            for port in ports {
+                if let Some(dir) = port.direction {
+                    port_directions.insert(port.name.name.clone(), dir);
+                }
+            }
+        }
+        PortList::NonAnsi(_) => {
+            for item in &effective_items {
+                if let ModuleItem::PortDeclaration(pd) = item {
+                    for decl in &pd.declarators {
+                        port_directions.insert(decl.name.name.clone(), pd.direction);
+                    }
+                }
+            }
+        }
+        PortList::Empty => {}
+    }
+
+    let mut local_names = std::collections::HashSet::new();
+    for p_decl in source_def.params() {
+        if let ParameterKind::Data { assignments, .. } = &p_decl.kind {
+            for assign in assignments {
+                local_names.insert(assign.name.name.clone());
+            }
+        }
+    }
+    match source_def.ports() {
+        PortList::Ansi(ports) => {
+            for port in ports {
+                local_names.insert(port.name.name.clone());
+            }
+        }
+        PortList::NonAnsi(names) => {
+            for name in names {
+                local_names.insert(name.name.clone());
+            }
+        }
+        PortList::Empty => {}
+    }
+    for item in &effective_items {
+        match item {
+            ModuleItem::NetDeclaration(nd) => {
+                for decl in &nd.declarators {
+                    local_names.insert(decl.name.name.clone());
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for decl in &dd.declarators {
+                    local_names.insert(decl.name.name.clone());
+                }
+            }
+            ModuleItem::PortDeclaration(pd) => {
+                for decl in &pd.declarators {
+                    local_names.insert(decl.name.name.clone());
+                }
+            }
+            ModuleItem::FunctionDeclaration(fd) => {
+                local_names.insert(fd.name.name.name.clone());
+            }
+            ModuleItem::TaskDeclaration(td) => {
+                local_names.insert(td.name.name.name.clone());
+            }
+            ModuleItem::ModuleInstantiation(inst) => {
+                if typedef_widths.contains_key(&inst.module_name.name) || local_typedefs.contains(&inst.module_name.name) {
+                    for hi in &inst.instances {
+                        local_names.insert(hi.name.name.clone());
+                    }
+                }
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for assign in assignments {
+                        local_names.insert(assign.name.name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let prepared = PreparedModuleItems {
+        effective_items,
+        local_typedefs,
+        interface_ports,
+        port_directions,
+        local_names,
+    };
+    cache.insert(cache_key, prepared.clone());
+    prepared
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -3146,39 +3328,25 @@ fn inline_module_items(
     definitions: &HashMap<String, Definition>,
     interface_map: &mut HashMap<String, String>,
     local_params: &HashMap<String, Value>,
+    cache: &mut InlinePrepCache,
 ) -> Result<(), String> {
-    // First pass: collect typedef names from this module so we can distinguish them from instantiations
-    let mut local_typedefs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for item in source_def.items() {
-        if let ModuleItem::TypedefDeclaration(td) = item {
-            local_typedefs.insert(td.name.name.clone());
-        }
-    }
-
-    // Identify interface ports in the current module/interface
-    let mut interface_ports: std::collections::HashSet<String> = std::collections::HashSet::new();
-    match source_def.ports() {
-        PortList::Ansi(ports) => {
-            for port in ports {
-                if let Some(dt) = &port.data_type {
-                    if is_interface_type(dt, definitions) {
-                        interface_ports.insert(port.name.name.clone());
-                    }
-                }
-            }
-        }
-        _ => {} // Non-ANSI might need deeper check but skipping for now
-    }
-
-    let effective_source_items = collect_effective_items(source_def.items(), local_params);
-    for item in &effective_source_items {
+    let prepared_source = prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
+    for item in &prepared_source.effective_items {
         if let ModuleItem::ModuleInstantiation(inst) = item {
             let sub_mod_name = &inst.module_name.name;
+            if elab_trace_enabled() {
+                eprintln!(
+                    "[xezim][elab] visiting prefix='{}' module='{}' instances={}",
+                    prefix,
+                    sub_mod_name,
+                    inst.instances.len()
+                );
+            }
             let sub_mod = match definitions.get(sub_mod_name) {
                 Some(m) => *m,
                 None => {
                     // Check if it's a typedef-based variable declaration (happens if parser was unsure)
-                    if elab.typedefs.contains_key(sub_mod_name) || local_typedefs.contains(sub_mod_name) {
+                    if elab.typedefs.contains_key(sub_mod_name) || prepared_source.local_typedefs.contains(sub_mod_name) {
                         let width = elab.typedefs.get(sub_mod_name).copied().unwrap_or(32);
                         let is_real = sub_mod_name == "real";
                         for hi in &inst.instances {
@@ -3198,35 +3366,18 @@ fn inline_module_items(
             for hi in &inst.instances {
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
-                let mut scoped_eval_params = elab.parameters.clone();
-                if !prefix.is_empty() {
-                    for (k, v) in &elab.parameters {
-                        if let Some(local_name) = k.strip_prefix(prefix) {
-                            if !local_name.contains('.') {
-                                scoped_eval_params.insert(local_name.to_string(), v.clone());
-                            }
-                        }
-                    }
+                if elab_trace_enabled() {
+                    eprintln!(
+                        "[xezim][elab] inline instance path='{}' target='{}'",
+                        inst_prefix,
+                        sub_mod_name
+                    );
                 }
+                let scoped_eval_params = local_params.clone();
 
                 // Build port map and interface map
                 let mut port_map = HashMap::new();
                 let mut sub_interface_map = HashMap::new();
-
-                // Identify interface ports in the sub-module
-                let mut sub_interface_ports: std::collections::HashSet<String> = std::collections::HashSet::new();
-                match sub_mod.ports() {
-                    PortList::Ansi(ports) => {
-                        for port in ports {
-                            if let Some(dt) = &port.data_type {
-                                if is_interface_type(dt, definitions) {
-                                    sub_interface_ports.insert(port.name.name.clone());
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
 
                 // Local names of the CURRENT (parent) module — bare names of
                 // signals declared in this scope. Used when rewriting port
@@ -3235,17 +3386,7 @@ fn inline_module_items(
                 // connection like `.mrd(mrd)` inside wrapper would be stored
                 // in port_map as a bare `mrd`, and later substitutions into
                 // the sub-module would insert a bare (unresolvable) name.
-                let parent_local_names: std::collections::HashSet<String> = elab.signals.keys()
-                    .filter_map(|s| {
-                        if prefix.is_empty() {
-                            if !s.contains('.') { Some(s.clone()) } else { None }
-                        } else {
-                            s.strip_prefix(prefix).and_then(|rest| {
-                                if !rest.is_empty() && !rest.contains('.') { Some(rest.to_string()) } else { None }
-                            })
-                        }
-                    })
-                    .collect();
+                let parent_local_names = prepared_source.local_names.clone();
 
                 if !hi.connections.is_empty() {
                     match &hi.connections[0] { // Simplification: check if first is wildcard
@@ -3256,7 +3397,10 @@ fn inline_module_items(
                                     for port in ports {
                                         let name = &port.name.name;
                                         let parent_name = format!("{}{}", prefix, name);
-                                        if sub_interface_ports.contains(name) {
+                                        let is_if_port = port.data_type.as_ref()
+                                            .map(|dt| is_interface_type(dt, definitions))
+                                            .unwrap_or(false);
+                                        if is_if_port {
                                             sub_interface_map.insert(name.clone(), parent_name.clone());
                                         } else {
                                             port_map.insert(name.clone(), make_ident_expr(&parent_name));
@@ -3272,7 +3416,7 @@ fn inline_module_items(
                                     PortConnection::Named { name, expr } => {
                                         if let Some(e) = expr {
                                             let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &parent_local_names, interface_map);
-                                            if sub_interface_ports.contains(&name.name) {
+                                            if prepared_source.interface_ports.contains(&name.name) {
                                                 if let ExprKind::Ident(hier) = &rewritten_e.kind {
                                                     let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
                                                     sub_interface_map.insert(name.name.clone(), if_full_path);
@@ -3287,7 +3431,7 @@ fn inline_module_items(
                                             let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &parent_local_names, interface_map);
                                             if let Some(port) = sub_mod.ports().get(i) {
                                                 let port_name = port.name();
-                                                if sub_interface_ports.contains(port_name) {
+                                                if prepared_source.interface_ports.contains(port_name) {
                                                     if let ExprKind::Ident(hier) = &rewritten_e.kind {
                                                         let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
                                                         sub_interface_map.insert(port_name.to_string(), if_full_path);
@@ -3405,6 +3549,8 @@ fn inline_module_items(
                 // 2. Parameters from module items
                 add_params_from_items(sub_mod.items(), &mut sub_local_params);
 
+                let prepared_sub = prepare_module_items(sub_mod, definitions, &sub_local_params, &elab.typedefs, cache);
+
                 // Inline all resolved parameters into global map with prefix
                 for (name, val) in &sub_local_params {
                     let full_name = format!("{}{}", inst_prefix, name);
@@ -3427,7 +3573,7 @@ fn inline_module_items(
                 // so port type widths like `[W-1:0]` resolve against the sub's
                 // overridden parameter values.
                 let port_type_params = {
-                    let mut m = elab.parameters.clone();
+                    let mut m = local_params.clone();
                     for (k, v) in &sub_local_params {
                         m.insert(k.clone(), v.clone());
                     }
@@ -3436,7 +3582,7 @@ fn inline_module_items(
                 match sub_mod.ports() {
                     PortList::Ansi(ports) => {
                         for port in ports {
-                            if sub_interface_ports.contains(&port.name.name) { continue; }
+                            if prepared_sub.interface_ports.contains(&port.name.name) { continue; }
                             let width = port.data_type.as_ref()
                                 .map(|dt| resolve_type_width(dt, Some(&port_type_params), Some(&elab.typedefs)))
                                 .unwrap_or(1);
@@ -3453,8 +3599,7 @@ fn inline_module_items(
                         }
                     }
                     PortList::NonAnsi(_names) => {
-                        let effective_items = collect_effective_items(sub_mod.items(), &sub_local_params);
-                        for sub_item in &effective_items {
+                        for sub_item in &prepared_sub.effective_items {
                             if let ModuleItem::PortDeclaration(pd) = sub_item {
                                 if is_interface_type(&pd.data_type, definitions) { continue; }
                                 let width = resolve_type_width(&pd.data_type, Some(&sub_local_params), Some(&elab.typedefs));
@@ -3475,17 +3620,16 @@ fn inline_module_items(
                 }
 
                 // Declare internal nets/vars (including from generate blocks)
-                let effective_decl_items = collect_effective_items(sub_mod.items(), &sub_local_params);
                 // Merge elab.parameters with sub_local_params so unprefixed
                 // param references in type widths/dimensions resolve correctly
                 let sub_merged_params = {
-                    let mut m = elab.parameters.clone();
+                    let mut m = local_params.clone();
                     for (k, v) in &sub_local_params {
                         m.insert(k.clone(), v.clone());
                     }
                     m
                 };
-                for sub_item in &effective_decl_items {
+                for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
                         if let DataType::Enum(et) = &td.data_type {
                             let base_width = et.base_type.as_ref()
@@ -3512,7 +3656,7 @@ fn inline_module_items(
                         }
                     }
                 }
-                for sub_item in &effective_decl_items {
+                for sub_item in &prepared_sub.effective_items {
                     match sub_item {
                         ModuleItem::NetDeclaration(nd) => {
                             let width = resolve_type_width(&nd.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
@@ -3570,37 +3714,11 @@ fn inline_module_items(
                     }
                 }
 
-                // Port connection assigns
-                let port_directions: HashMap<String, PortDirection> = {
-                    let mut dirs = HashMap::new();
-                    match sub_mod.ports() {
-                        PortList::Ansi(ports) => {
-                            for port in ports {
-                                if let Some(dir) = port.direction {
-                                    dirs.insert(port.name.name.clone(), dir);
-                                }
-                            }
-                        }
-                        PortList::NonAnsi(_) => {
-                            let effective_items = collect_effective_items(sub_mod.items(), &sub_merged_params);
-                            for sub_item in &effective_items {
-                                if let ModuleItem::PortDeclaration(pd) = sub_item {
-                                    for decl in &pd.declarators {
-                                        dirs.insert(decl.name.name.clone(), pd.direction);
-                                    }
-                                }
-                            }
-                        }
-                        PortList::Empty => {}
-                    }
-                    dirs
-                };
-
                 for (port_name, parent_expr) in &port_map {
-                    if sub_interface_ports.contains(port_name) { continue; }
+                    if prepared_sub.interface_ports.contains(port_name) { continue; }
                     let sub_sig_name = format!("{}{}", inst_prefix, port_name);
                     let sub_expr = make_ident_expr(&sub_sig_name);
-                    match port_directions.get(port_name) {
+                    match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs: parent_expr.clone(),
@@ -3619,44 +3737,6 @@ fn inline_module_items(
                     }
                 }
 
-                // Collect sub-module local signal names
-                let mut local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-                // Include module parameter port list names (e.g. picorv32 #(parameter PROGADDR_RESET = ...))
-                for p_decl in sub_mod.params() {
-                    if let ParameterKind::Data { assignments, .. } = &p_decl.kind {
-                        for assign in assignments { local_names.insert(assign.name.name.clone()); }
-                    }
-                }
-                match sub_mod.ports() {
-                    PortList::Ansi(ports) => {
-                        for port in ports { local_names.insert(port.name.name.clone()); }
-                    }
-                    PortList::NonAnsi(names) => {
-                        for name in names { local_names.insert(name.name.clone()); }
-                    }
-                    PortList::Empty => {}
-                }
-                for sub_item in &effective_decl_items {
-                    match sub_item {
-                        ModuleItem::NetDeclaration(nd) => { for d in &nd.declarators { local_names.insert(d.name.name.clone()); } }
-                        ModuleItem::DataDeclaration(dd) => { for d in &dd.declarators { local_names.insert(d.name.name.clone()); } }
-                        ModuleItem::PortDeclaration(pd) => { for d in &pd.declarators { local_names.insert(d.name.name.clone()); } }
-                        ModuleItem::FunctionDeclaration(fd) => { local_names.insert(fd.name.name.name.clone()); }
-                        ModuleItem::TaskDeclaration(td) => { local_names.insert(td.name.name.name.clone()); }
-                        ModuleItem::ModuleInstantiation(inst) => {
-                            if elab.typedefs.contains_key(&inst.module_name.name) || local_typedefs.contains(&inst.module_name.name) {
-                                for hi in &inst.instances { local_names.insert(hi.name.name.clone()); }
-                            }
-                        }
-                        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
-                            if let ParameterKind::Data { assignments, .. } = &pd.kind {
-                                for assign in assignments { local_names.insert(assign.name.name.clone()); }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
                 // Build a rewrite_port_map that excludes output ports.
                 // Output ports should use the local prefixed name (inst_prefix + port_name)
                 // rather than the parent expression, because:
@@ -3665,24 +3745,23 @@ fn inline_module_items(
                 //     (a continuous assign parent = local handles the connection)
                 let rewrite_port_map: HashMap<String, Expression> = port_map.iter()
                     .filter(|(name, _)| {
-                        !matches!(port_directions.get(name.as_str()), Some(PortDirection::Output))
+                        !matches!(prepared_sub.port_directions.get(name.as_str()), Some(PortDirection::Output))
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
 
                 // Inline the sub-module's continuous assigns
-                let effective_items = collect_effective_items(sub_mod.items(), &sub_merged_params);
-                for sub_item in &effective_items {
+                for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
                         new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
                         for p in &mut new_fd.ports {
                             if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map));
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
                             }
                         }
                         new_fd.items = fd.items.iter()
-                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map))
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map))
                             .collect();
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
@@ -3691,18 +3770,18 @@ fn inline_module_items(
                         new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
                         for p in &mut new_td.ports {
                             if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map));
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
                             }
                         }
                         new_td.items = td.items.iter()
-                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map))
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map))
                             .collect();
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ContinuousAssign(ca) = sub_item {
                         for (lhs, rhs) in &ca.assignments {
-                            let new_lhs = rewrite_expr(lhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
-                            let new_rhs = rewrite_expr(rhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
+                            let new_lhs = rewrite_expr(lhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
+                            let new_rhs = rewrite_expr(rhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: new_lhs, rhs: new_rhs,
                             });
@@ -3711,8 +3790,8 @@ fn inline_module_items(
                     if let ModuleItem::GateInstantiation(gi) = sub_item {
                         let assigns = gate_inst_to_assign_pairs(gi);
                         for (lhs, rhs) in assigns {
-                            let new_lhs = rewrite_expr(&lhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
-                            let new_rhs = rewrite_expr(&rhs, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
+                            let new_lhs = rewrite_expr(&lhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
+                            let new_rhs = rewrite_expr(&rhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: new_lhs, rhs: new_rhs,
                             });
@@ -3723,7 +3802,7 @@ fn inline_module_items(
                             if let Some(init_expr) = &decl.init {
                                 let lhs_name = format!("{}{}", inst_prefix, decl.name.name);
                                 let new_lhs = make_ident_expr(&lhs_name);
-                                let new_rhs = rewrite_expr(init_expr, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map);
+                                let new_rhs = rewrite_expr(init_expr, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     lhs: new_lhs, rhs: new_rhs,
                                 });
@@ -3736,7 +3815,7 @@ fn inline_module_items(
                                 &make_ident_expr(&p.dst.name),
                                 &inst_prefix,
                                 &rewrite_port_map,
-                                &local_names,
+                                &prepared_sub.local_names,
                                 &sub_interface_map,
                             );
                             if let ExprKind::Ident(hier) = &dst_expr.kind {
@@ -3749,18 +3828,18 @@ fn inline_module_items(
                     if let ModuleItem::AlwaysConstruct(ac) = sub_item {
                         elab.always_blocks.push(super::elaborate::AlwaysBlock {
                             kind: ac.kind,
-                            stmt: rewrite_stmt(&ac.stmt, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map),
+                            stmt: rewrite_stmt(&ac.stmt, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map),
                         });
                     }
                     if let ModuleItem::InitialConstruct(ic) = sub_item {
                         elab.initial_blocks.push(super::elaborate::InitialBlock {
-                            stmt: rewrite_stmt(&ic.stmt, &inst_prefix, &rewrite_port_map, &local_names, &sub_interface_map),
+                            stmt: rewrite_stmt(&ic.stmt, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map),
                         });
                     }
                 }
 
                 // Recurse into sub-module instantiations
-                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params)?;
+                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache)?;
             }
         }
     }

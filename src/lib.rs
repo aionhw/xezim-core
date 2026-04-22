@@ -118,13 +118,15 @@ pub fn parse_and_elaborate_multi(
         all_descriptions.extend(source_ast.descriptions);
     }
 
-    parse_and_elaborate(&all_descriptions, top_module_name, include_dirs)
+    let lib_defines = pp.snapshot_defines();
+    parse_and_elaborate(&all_descriptions, top_module_name, include_dirs, &lib_defines)
 }
 
 fn parse_and_elaborate(
     all_descriptions: &[ast::Description],
     top_module_name: Option<&str>,
     include_dirs: &[String],
+    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
 ) -> Result<(ahash::AHashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
     let mut definitions: ahash::AHashMap<String, SourceDefinition> = ahash::AHashMap::new();
     let mut top_module = None;
@@ -202,7 +204,7 @@ fn parse_and_elaborate(
             }
         }
     }
-    if !include_dirs.is_empty() { resolve_library_modules(&mut definitions, include_dirs)?; }
+    if !include_dirs.is_empty() { resolve_library_modules(&mut definitions, include_dirs, lib_defines)?; }
 
     if let Some(name) = top_module_name {
         if definitions.contains_key(name) { top_module = Some(name.to_string()); }
@@ -271,7 +273,75 @@ fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::
     }
 }
 
-fn resolve_library_modules(_definitions: &mut ahash::AHashMap<String, SourceDefinition>, _include_dirs: &[String]) -> Result<(), String> {
+fn resolve_library_modules(
+    definitions: &mut ahash::AHashMap<String, SourceDefinition>,
+    include_dirs: &[String],
+    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+) -> Result<(), String> {
+    fn collect_sv_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| format!("read_dir '{}': {}", dir.display(), e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read_dir '{}': {}", dir.display(), e))?;
+            let path = entry.path();
+            if path.is_dir() {
+                collect_sv_files(&path, out)?;
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            if matches!(ext, "v" | "sv" | "V") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    for dir in include_dirs {
+        let path = std::path::Path::new(dir);
+        if path.is_dir() {
+            collect_sv_files(path, &mut files)?;
+        }
+    }
+
+    for path in files {
+        let source = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut pp = preprocessor::Preprocessor::new();
+        for dir in include_dirs {
+            pp.add_include_dir(std::path::PathBuf::from(dir));
+        }
+        for (name, def) in lib_defines {
+            pp.define(name.clone(), def.clone());
+        }
+        let preprocessed = pp.preprocess_file(&source, Some(&path));
+        let result = sv_parser::parse(&preprocessed);
+        for desc in result.source.descriptions {
+            match desc {
+                ast::Description::Module(m) => {
+                    definitions.entry(m.name.name.clone()).or_insert(SourceDefinition::Module(m));
+                }
+                ast::Description::Interface(i) => {
+                    definitions.entry(i.name.name.clone()).or_insert(SourceDefinition::Interface(i));
+                }
+                ast::Description::Program(p) => {
+                    definitions.entry(p.name.name.clone()).or_insert(SourceDefinition::Program(p));
+                }
+                ast::Description::Class(c) => {
+                    definitions.entry(c.name.name.clone()).or_insert(SourceDefinition::Class(c));
+                }
+                ast::Description::Package(p) => {
+                    definitions.entry(p.name.name.clone()).or_insert(SourceDefinition::Package(p));
+                }
+                ast::Description::TypedefDecl(t) => {
+                    definitions.entry(t.name.name.clone()).or_insert(SourceDefinition::Typedef(t));
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(())
 }
 

@@ -86,6 +86,10 @@ impl Preprocessor {
         self.defines.insert(name, value);
     }
 
+    pub fn snapshot_defines(&self) -> HashMap<String, MacroDef> {
+        self.defines.clone()
+    }
+
     pub fn is_defined(&self, name: &str) -> bool {
         self.defines.contains_key(name)
     }

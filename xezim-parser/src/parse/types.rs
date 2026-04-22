@@ -179,10 +179,11 @@ impl Parser {
                 self.bump();
                 self.expect(TokenKind::RBracket);
                 dims.push(UnpackedDimension::Associative { data_type: None, span: self.span_from(start) });
-            } else if self.is_type_start() {
-                // Peek ahead: if it's "type ]" it's definitely associative
-                // If it's "expr : expr ]" or "expr ]" it might be an expression
-                // But most type keywords are NOT valid starts of expressions unless they are casts (which have ')
+            } else if self.is_associative_index_type_start() {
+                // Associative arrays use a data type between brackets. An
+                // identifier alone is ambiguous here because unpacked ranges
+                // like [FLOP_NUM-1:0] are also common. Restrict the type path
+                // to cases that really look like a type reference.
                 let dt = self.parse_data_type();
                 self.expect(TokenKind::RBracket);
                 dims.push(UnpackedDimension::Associative { data_type: Some(Box::new(dt)), span: self.span_from(start) });
@@ -204,6 +205,19 @@ impl Parser {
             }
         }
         dims
+    }
+
+    fn is_associative_index_type_start(&self) -> bool {
+        if self.is_data_type_keyword() {
+            return true;
+        }
+        if !self.at(TokenKind::Identifier) {
+            return false;
+        }
+        matches!(
+            self.peek_kind(),
+            TokenKind::RBracket | TokenKind::DoubleColon | TokenKind::Hash
+        )
     }
 fn parse_enum_type(&mut self) -> DataType {
     let start = self.current().span.start;
