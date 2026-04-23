@@ -100,6 +100,7 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn from_u64(val: u64, width: u32) -> Self {
         if width <= 64 {
             let mask = Self::mask(width);
@@ -250,6 +251,7 @@ impl Value {
     }
 
     /// Convert to u64, treating X/Z as 0.
+    #[inline]
     pub fn to_u64(&self) -> Option<u64> {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => Some(*val_bits & !*xz_bits),
@@ -404,6 +406,7 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn add(&self, other: &Value) -> Value {
         if self.is_real || other.is_real {
             return Value::from_f64(self.to_f64() + other.to_f64());
@@ -420,6 +423,7 @@ impl Value {
         v
     }
 
+    #[inline]
     pub fn sub(&self, other: &Value) -> Value {
         if self.is_real || other.is_real {
             return Value::from_f64(self.to_f64() - other.to_f64());
@@ -502,6 +506,7 @@ impl Value {
 
     // === Bitwise ===
 
+    #[inline]
     pub fn bitwise_and(&self, other: &Value) -> Value {
         let w = self.width.max(other.width);
         match (&self.storage, &other.storage) {
@@ -525,6 +530,7 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn bitwise_or(&self, other: &Value) -> Value {
         let w = self.width.max(other.width);
         match (&self.storage, &other.storage) {
@@ -546,6 +552,7 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn bitwise_xor(&self, other: &Value) -> Value {
         let w = self.width.max(other.width);
         match (&self.storage, &other.storage) {
@@ -567,6 +574,7 @@ impl Value {
         r.bitwise_not()
     }
 
+    #[inline]
     pub fn bitwise_not(&self) -> Value {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
@@ -641,6 +649,7 @@ impl Value {
 
     // === Shifts ===
 
+    #[inline]
     pub fn shift_left(&self, amount: &Value) -> Value {
         let amt = amount.to_u64().unwrap_or(0) as u32;
         if amount.has_xz() { return Value::new(self.width); }
@@ -669,6 +678,7 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn shift_right(&self, amount: &Value) -> Value {
         let amt = amount.to_u64().unwrap_or(0) as u32;
         if amount.has_xz() { return Value::new(self.width); }
@@ -739,6 +749,7 @@ impl Value {
 
     // === Comparison ===
 
+    #[inline]
     pub fn is_equal(&self, other: &Value) -> Value {
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() == other.to_f64()) as u64, 1);
@@ -773,6 +784,7 @@ impl Value {
         Value::from_u64(eq as u64, 1)
     }
 
+    #[inline]
     pub fn is_not_equal(&self, other: &Value) -> Value {
         let eq = self.is_equal(other);
         match eq.get_bit(0) {
@@ -796,6 +808,7 @@ impl Value {
         if eq.to_u64() == Some(1) { Value::from_u64(0, 1) } else { Value::from_u64(1, 1) }
     }
 
+    #[inline]
     pub fn less_than(&self, other: &Value) -> Value {
         if self.has_xz() || other.has_xz() { return Value::new(1); }
         if self.is_real || other.is_real {
@@ -812,6 +825,7 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn less_equal(&self, other: &Value) -> Value {
         if self.has_xz() || other.has_xz() { return Value::new(1); }
         if self.is_real || other.is_real {
@@ -824,7 +838,9 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn greater_than(&self, other: &Value) -> Value { other.less_than(self) }
+    #[inline]
     pub fn greater_equal(&self, other: &Value) -> Value { other.less_equal(self) }
 
     // === Logic ===
@@ -1297,7 +1313,12 @@ impl Value {
 }
 
 impl Value {
-    /// Copy the storage from another value (used in NBA apply)
+    /// Copy the storage from another value (used in NBA apply).
+    /// Marked `#[inline]` so the `match` on (self.storage, other.storage)
+    /// collapses at the call site when both sides are monomorphic —
+    /// crucial for the `snapshot_edge_signals` loop that runs this
+    /// 5B times per c910 simulation.
+    #[inline]
     pub fn copy_from(&mut self, other: &Value) {
         // Fast path: Inline→Inline is just a word-level overwrite (no alloc).
         // Wide→Wide with the same length reuses `self`'s existing Vec buffer
