@@ -78,6 +78,14 @@ impl StdoutSink {
     pub fn writeln_str(&mut self, s: &str) {
         self.write_bytes(s.as_bytes());
         self.write_bytes(b"\n");
+        // Line-buffered: flush after each complete line so $display output
+        // is visible as the sim produces it. Without this, a long-running
+        // sim (e.g. c910 hello_world) can churn for 30+ minutes with no
+        // visible output because BufWriter's 16 KB capacity never fills
+        // before a SIGTERM from `timeout`. `$write`-without-newline still
+        // batches in the buffer (picorv32's per-char UART pattern isn't
+        // regressed — `\n` from the surrounding message triggers flush).
+        self.flush();
     }
 
     fn write_bytes(&mut self, data: &[u8]) {
