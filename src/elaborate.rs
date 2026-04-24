@@ -1023,22 +1023,14 @@ pub fn elaborate_module_with_defs(
                         } else { None };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
-                            let is_real = is_type_real(&dd.data_type);
-                            for i in lo1..=hi1 {
-                                for j in lo2..=hi2 {
-                                    let elem_name = format!("{}[{}][{}]", decl.name.name, i, j);
-                                    let sig = Signal { is_const: dd.const_kw,
-                                        name: elem_name.clone(),
-                                        width,
-                                        is_signed,
-                                        is_real,
-                                        direction: None,
-                                        value: default_value_for_type(&dd.data_type, width),
-                                        type_name: get_type_name(&dd.data_type),
-                                    };
-                                    elab.signals.insert(elem_name, sig);
-                                }
-                            }
+                            // Per-element Signal entries are synthesized lazily
+                            // by Simulator::new from the arrays_2d metadata —
+                            // avoids the per-element HashMap entries at
+                            // elaborate time (major memory win on designs
+                            // with large memories). The width/signed/real
+                            // attributes are uniform across elements so we
+                            // don't need a per-element Signal struct.
+                            let _ = (is_signed, width);
                             continue;
                         }
                     }
@@ -1062,28 +1054,10 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
-                        let is_real = is_type_real(&dd.data_type);
-                        fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
-                            if dims.is_empty() { out.push(prefix); return; }
-                            let (lo, hi) = dims[0];
-                            for i in lo..=hi {
-                                enumerate(&dims[1..], format!("{}[{}]", prefix, i), out);
-                            }
-                        }
-                        let mut names = Vec::new();
-                        enumerate(&shape, decl.name.name.clone(), &mut names);
-                        for elem_name in names {
-                            let sig = Signal { is_const: dd.const_kw,
-                                name: elem_name.clone(),
-                                width,
-                                is_signed,
-                                is_real,
-                                direction: None,
-                                value: default_value_for_type(&dd.data_type, width),
-                                type_name: get_type_name(&dd.data_type),
-                            };
-                            elab.signals.insert(elem_name, sig);
-                        }
+                        // Per-element Signals synthesized by Simulator::new
+                        // from arrays_nd — skip the per-element HashMap
+                        // inserts here.
+                        let _ = is_signed;
                         continue;
                     }
                     // Check for unpacked array dimensions (e.g., memory [0:255])
@@ -1097,21 +1071,11 @@ pub fn elaborate_module_with_defs(
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                             if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
                         }
-                        let is_real = is_type_real(&dd.data_type);
-                        // Create individual element signals: name[lo], name[lo+1], ..., name[hi]
-                        for idx in lo..=hi {
-                            let elem_name = format!("{}[{}]", decl.name.name, idx);
-                            let sig = Signal { is_const: dd.const_kw,
-                                name: elem_name.clone(),
-                                width,
-                                is_signed,
-                                is_real,
-                                direction: None,
-                                value: default_value_for_type(&dd.data_type, width),
-                                type_name: get_type_name(&dd.data_type),
-                            };
-                            elab.signals.insert(elem_name, sig);
-                        }
+                        // Per-element Signals are synthesized by Simulator::new
+                        // from the `arrays` metadata; no per-element HashMap
+                        // inserts here. This alone is the largest memory win
+                        // on designs with testbench memory arrays.
+                        let _ = (is_signed, width);
                         if let Some(init_expr) = &decl.init {
                             let init_items: Vec<&Expression> = match &init_expr.kind {
                                 ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
@@ -2378,15 +2342,10 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                             if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
                         }
-                        for idx in lo..=hi {
-                            let elem_name = format!("{}[{}]", decl.name.name, idx);
-                            let sig = Signal { is_const: dd.const_kw,
-                                name: elem_name.clone(), width, is_signed, is_real, direction: None,
-                                value: default_value_for_type(&dd.data_type, width),
-                                type_name: get_type_name(&dd.data_type)
-                            };
-                            elab.signals.insert(elem_name, sig);
-                        }
+                        // Per-element Signals synthesized by Simulator::new
+                        // from the `arrays` metadata — skip per-element
+                        // HashMap inserts.
+                        let _ = (is_signed, width, is_real);
                         if let Some(init_expr) = &decl.init {
                             let init_items: Vec<&Expression> = match &init_expr.kind {
                                 ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
@@ -3386,7 +3345,7 @@ fn inline_module_items(
                 // connection like `.mrd(mrd)` inside wrapper would be stored
                 // in port_map as a bare `mrd`, and later substitutions into
                 // the sub-module would insert a bare (unresolvable) name.
-                let parent_local_names = prepared_source.local_names.clone();
+                let parent_local_names = &prepared_source.local_names;
 
                 if !hi.connections.is_empty() {
                     match &hi.connections[0] { // Simplification: check if first is wildcard
@@ -3415,7 +3374,7 @@ fn inline_module_items(
                                 match conn {
                                     PortConnection::Named { name, expr } => {
                                         if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &parent_local_names, interface_map);
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), parent_local_names, interface_map);
                                             if prepared_source.interface_ports.contains(&name.name) {
                                                 if let ExprKind::Ident(hier) = &rewritten_e.kind {
                                                     let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
@@ -3428,7 +3387,7 @@ fn inline_module_items(
                                     }
                                     PortConnection::Ordered(expr) => {
                                         if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), &parent_local_names, interface_map);
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), parent_local_names, interface_map);
                                             if let Some(port) = sub_mod.ports().get(i) {
                                                 let port_name = port.name();
                                                 if prepared_source.interface_ports.contains(port_name) {
@@ -3451,6 +3410,29 @@ fn inline_module_items(
 
                 // Resolve parameters for the sub-module
                 let mut sub_params = HashMap::new();
+                let dbg_param = std::env::var("XEZIM_DBG_PARAM").is_ok()
+                    && (sub_mod_name == "ram" || sub_mod_name == "f_spsram_large");
+                // Build the effective declared-parameter list for the
+                // sub-module: header `#(…)` parameters first, then
+                // ParameterDeclaration items in source order (Localparam
+                // declarations are NOT overridable per IEEE 1800 §6.20.4).
+                // Positional `inst.params` resolution must index into THIS
+                // combined list — without it, modules that declare parameters
+                // only inside the body (e.g. openc910's ram.v) get their
+                // positional overrides silently dropped, leaving the sim
+                // running with default sizes (4-element memories instead of
+                // 2 M).
+                let mut sub_param_decls: Vec<&ParameterDeclaration> = sub_mod.params().iter().collect();
+                for it in sub_mod.items() {
+                    if let ModuleItem::ParameterDeclaration(pd) = it {
+                        sub_param_decls.push(pd);
+                    }
+                }
+                if dbg_param {
+                    eprintln!("[DBG_PARAM] inlining {} into prefix='{}', inst.params={:?}, inst_name={}, sub_param_decls={}",
+                        sub_mod_name, inst_prefix,
+                        inst.params.as_ref().map(|p| p.len()), hi.name.name, sub_param_decls.len());
+                }
                 if let Some(param_conns) = &inst.params {
                     for (i, conn) in param_conns.iter().enumerate() {
                         match conn {
@@ -3476,10 +3458,22 @@ fn inline_module_items(
                                 }
                             }
                             ParamConnection::Ordered(value) => {
+                                if dbg_param {
+                                    eprintln!("[DBG_PARAM]   ordered[{}] value={:?}, sub_param_decls.get(i)={:?}",
+                                        i, value.is_some(),
+                                        sub_param_decls.get(i).map(|p| match &p.kind {
+                                            ParameterKind::Data { assignments, .. } => assignments.first().map(|a| a.name.name.clone()),
+                                            _ => None,
+                                        }));
+                                }
                                 if let Some(ParamValue::Expr(v)) = value {
-                                    if let Some(p_decl) = sub_mod.params().get(i) {
+                                    if let Some(p_decl) = sub_param_decls.get(i) {
                                         if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
                                             let mut val = eval_const_expr_val(v, &scoped_eval_params);
+                                            if dbg_param {
+                                                eprintln!("[DBG_PARAM]     eval -> {} = {}",
+                                                    assignments[0].name.name, val.to_u64().unwrap_or(0));
+                                            }
                                             if is_type_real(data_type) {
                                                 val = Value::from_f64(val.to_f64());
                                             } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
@@ -3688,16 +3682,18 @@ fn inline_module_items(
                                 let base_name = decl.name.name.clone();
                                 let sig_name = format!("{}{}", inst_prefix, base_name);
                                 let array_range = extract_array_range(&decl.dimensions, &sub_merged_params);
+                                if std::env::var("XEZIM_DBG_ARR").is_ok() && sig_name.contains("ram0.mem") {
+                                    let mut p: Vec<_> = sub_merged_params.iter().collect();
+                                    p.sort_by_key(|(k, _)| k.as_str());
+                                    eprintln!("[DBG_ARR] {} width={} array_range={:?} prefix='{}' sub_merged_params(len={}): {:?}",
+                                        sig_name, width, array_range, inst_prefix, sub_merged_params.len(),
+                                        p.iter().map(|(k, v)| format!("{}={}", k, v.to_u64().unwrap_or(0))).collect::<Vec<_>>());
+                                }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
-                                    for idx in lo..=hi {
-                                        let elem_name = format!("{}[{}]", sig_name, idx);
-                                        elab.signals.insert(elem_name.clone(), Signal { is_const: dd.const_kw,
-                                            name: elem_name, width, is_signed,
-                                            direction: None, value: Value::new(width),
-                                            is_real: is_type_real(&dd.data_type), type_name: get_type_name(&dd.data_type),
-                                        });
-                                    }
+                                    // Per-element Signals synthesized by
+                                    // Simulator::new from arrays metadata.
+                                    let _ = is_signed;
                                 } else {
                                     let init_val = if let Some(init_expr) = &decl.init {
                                         eval_const_expr_val(init_expr, &sub_merged_params).resize(width)
