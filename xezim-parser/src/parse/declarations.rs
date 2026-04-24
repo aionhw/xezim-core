@@ -44,6 +44,8 @@ impl Parser {
         // "parameter [7:0] X = ..." has implicit type with range
         let data_type = if self.is_data_type_keyword() {
             self.parse_data_type()
+        } else if self.looks_like_parameter_type_reference() {
+            self.parse_data_type()
         } else if self.at(TokenKind::LBracket) {
             // Implicit type with packed dimensions
             let dimensions = self.parse_packed_dimensions();
@@ -74,6 +76,14 @@ impl Parser {
             }
         }
         ParameterDeclaration { local, kind: ParameterKind::Data { data_type, assignments }, span: self.span_from(start) }
+    }
+
+    fn looks_like_parameter_type_reference(&self) -> bool {
+        matches!(self.current_kind(), TokenKind::Identifier | TokenKind::EscapedIdentifier) &&
+            matches!(
+                self.peek_kind(),
+                TokenKind::Identifier | TokenKind::EscapedIdentifier | TokenKind::DoubleColon | TokenKind::Hash
+            )
     }
 
     pub(super) fn parse_parameter_decl_stmt(&mut self) -> ParameterDeclaration {
@@ -314,7 +324,7 @@ impl Parser {
 
     pub(super) fn parse_param_args(&mut self) -> Vec<ParamValue> {
         let mut args = Vec::new();
-        let has_hash = self.eat(TokenKind::Hash).is_some();
+        let _has_hash = self.eat(TokenKind::Hash).is_some();
         if self.eat(TokenKind::LParen).is_none() { return args; }
         if self.at(TokenKind::RParen) { self.bump(); return args; }
         loop {

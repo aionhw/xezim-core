@@ -456,7 +456,19 @@ impl Parser {
             TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral => {
                 let tok = self.bump();
                 let num = parse_number_literal(&tok.text);
-                Expression::new(ExprKind::Number(num), self.span_from(start))
+                let expr = Expression::new(ExprKind::Number(num), self.span_from(start));
+                if self.current().kind == TokenKind::IntegerLiteral
+                    && self.current().text == "'"
+                    && self.peek_kind() == TokenKind::LParen
+                {
+                    self.bump();
+                    self.expect(TokenKind::LParen);
+                    let inner = self.parse_expression();
+                    self.expect(TokenKind::RParen);
+                    Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
+                } else {
+                    expr
+                }
             }
             TokenKind::UnbasedUnsizedLiteral => {
                 let tok = self.bump();
@@ -605,7 +617,7 @@ impl Parser {
 
             // Data type keywords used as expressions (e.g. $bits(int))
             k if self.is_data_type_keyword() || k == TokenKind::KwVoid => {
-                let dt = self.parse_data_type();
+                let _dt = self.parse_data_type();
                 // Treat as empty expression for now, but we've consumed the type
                 Expression::new(ExprKind::Empty, self.span_from(start))
             }

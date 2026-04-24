@@ -1,3 +1,4 @@
+use crate::ast::{decl::ModuleItem, Description};
 use crate::parse;
 
 #[test]
@@ -58,6 +59,61 @@ fn test_interfaces_modports() {
 
         module req_slave(req_gnt_if.slave bus);
           always @(*) bus.gnt = bus.req;
+        endmodule
+    ";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_module_header_imports() {
+    let source = "
+        package p;
+        endpackage
+
+        module m import p::*; (input logic a);
+          initial a = 1'b0;
+        endmodule
+    ";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+
+    let module = result
+        .source
+        .descriptions
+        .iter()
+        .find_map(|desc| match desc {
+            Description::Module(module) if module.name.name == "m" => Some(module),
+            _ => None,
+        })
+        .expect("module m not found");
+
+    match module.items.first() {
+        Some(ModuleItem::ImportDeclaration(import)) => {
+            assert_eq!(import.items.len(), 1);
+            assert_eq!(import.items[0].package.name, "p");
+            assert!(import.items[0].item.is_none());
+        }
+        other => panic!("expected header import as first module item, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_numeric_size_cast_expression() {
+    let source = "module m; logic [31:0] x; initial x = 32'(1); endmodule";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_scoped_constant_unpacked_dimension() {
+    let source = "
+        package ibex_pkg;
+          localparam int IC_NUM_WAYS = 4;
+        endpackage
+
+        module m;
+          logic [7:0] a [ibex_pkg::IC_NUM_WAYS-1:0];
         endmodule
     ";
     let result = parse(source);

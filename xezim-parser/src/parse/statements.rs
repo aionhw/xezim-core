@@ -3,7 +3,7 @@
 use super::Parser;
 use crate::ast::stmt::*;
 use crate::ast::expr::{ExprKind, BinaryOp, Expression, NumberLiteral, NumberBase};
-use crate::ast::types::{DataType, TypeName, Lifetime};
+use crate::ast::types::{DataType, Lifetime};
 use crate::lexer::token::TokenKind;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -443,7 +443,9 @@ impl Parser {
         // Init
         let mut init = Vec::new();
         if !self.at(TokenKind::Semicolon) {
-            if self.is_data_type_keyword() || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Identifier) {
+            if self.is_data_type_keyword() ||
+                (self.at(TokenKind::Identifier) &&
+                    matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)) {
                 let dt = self.parse_data_type();
                 let name = self.parse_identifier();
                 self.expect(TokenKind::Assign);
@@ -464,14 +466,38 @@ impl Parser {
         let mut step = Vec::new();
         if !self.at(TokenKind::RParen) {
             loop {
-                // Step can be assignment (i = i + 1) or expression (i++)
-                let expr = self.parse_expression();
-                if self.eat(TokenKind::Assign).is_some() {
+                // Step can be assignment (i = i + 1 / i += 2) or expression (i++).
+                let expr = self.parse_lvalue_or_expr();
+                if self.at(TokenKind::Assign) || self.at_any(&[
+                    TokenKind::PlusAssign, TokenKind::MinusAssign,
+                    TokenKind::StarAssign, TokenKind::SlashAssign,
+                    TokenKind::PercentAssign, TokenKind::AndAssign,
+                    TokenKind::OrAssign, TokenKind::XorAssign,
+                    TokenKind::ShiftLeftAssign, TokenKind::ShiftRightAssign,
+                    TokenKind::ArithShiftLeftAssign, TokenKind::ArithShiftRightAssign,
+                ]) {
+                    let op_kind = self.current().kind;
+                    self.bump();
                     let rhs = self.parse_expression();
-                    // Wrap as AssignOp expression (lhs = rhs)
+                    let span = self.span_from(start);
+                    let rvalue = match op_kind {
+                        TokenKind::PlusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Add, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::MinusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Sub, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::StarAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mul, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::SlashAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Div, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::PercentAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mod, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::AndAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::OrAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::XorAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::ShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::ShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::ArithShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::ArithShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        _ => rhs,
+                    };
                     step.push(Expression::new(
-                        ExprKind::Binary { op: BinaryOp::Assign, left: Box::new(expr), right: Box::new(rhs) },
-                        crate::ast::Span { start: 0, end: 0 },
+                        ExprKind::AssignExpr { lvalue: Box::new(expr), rvalue: Box::new(rvalue) },
+                        span,
                     ));
                 } else {
                     step.push(expr);
