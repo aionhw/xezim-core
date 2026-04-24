@@ -24,6 +24,13 @@ pub struct Preprocessor {
 
 const MAX_INCLUDE_DEPTH: usize = 32;
 
+#[derive(Clone, Copy)]
+struct IfdefState {
+    parent_active: bool,
+    branch_taken: bool,
+    active: bool,
+}
+
 impl Preprocessor {
     pub fn new() -> Self {
         let mut defines = HashMap::new();
@@ -110,16 +117,14 @@ impl Preprocessor {
         }
         let stripped = self.strip_comments(source);
         let resolved = self.resolve_directives(&stripped, source_path);
-        let expanded = self.expand_macros(&resolved);
-        Self::strip_attributes(&expanded)
+        Self::strip_attributes(&resolved)
     }
 
     /// Simple preprocessing pass (no file context — `include lines are skipped).
     pub fn preprocess(&mut self, source: &str) -> String {
         let stripped = self.strip_comments(source);
         let resolved = self.resolve_directives(&stripped, None);
-        let expanded = self.expand_macros(&resolved);
-        Self::strip_attributes(&expanded)
+        Self::strip_attributes(&resolved)
     }
 
     fn strip_comments(&self, source: &str) -> String {
@@ -202,7 +207,7 @@ impl Preprocessor {
     fn resolve_directives(&mut self, source: &str, source_path: Option<&Path>) -> String {
         let mut output = String::with_capacity(source.len());
         let mut lines = source.lines().peekable();
-        let mut ifdef_stack: Vec<bool> = Vec::new(); // true = active
+        let mut ifdef_stack: Vec<IfdefState> = Vec::new();
 
         // Directory of the current source file (for relative `include resolution)
         let source_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -225,7 +230,7 @@ impl Preprocessor {
                 let mut current = line.to_string();
                 
                 loop {
-                    let mut text = current.as_str();
+                    let text = current.as_str();
                     // Handle trailing comment if any? No, trim_end handles it if it's after \.
                     // But if comment has \, it's tricky. Let's assume clean source after strip_comments.
                     if let Some(pos) = text.trim_end().rfind('\\') {
@@ -242,7 +247,7 @@ impl Preprocessor {
                     break;
                 }
                 
-                if ifdef_stack.iter().all(|&b| b) {
+                if ifdef_stack.iter().all(|s| s.active) {
                     self.parse_define(&clean_line);
                 }
                 // Don't output `define lines, but preserve line numbers
@@ -253,7 +258,7 @@ impl Preprocessor {
             }
 
             if trimmed.starts_with("`undef") {
-                if ifdef_stack.iter().all(|&b| b) {
+                if ifdef_stack.iter().all(|s| s.active) {
                     let name = trimmed[6..].trim().to_string();
                     self.defines.remove(&name);
                 }
@@ -265,7 +270,9 @@ impl Preprocessor {
                 let name = trimmed[6..].trim();
                 // Strip trailing // comments from ifdef macro name
                 let name = name.split_whitespace().next().unwrap_or(name);
-                ifdef_stack.push(self.is_defined(name));
+                let parent_active = ifdef_stack.iter().all(|s| s.active);
+                let active = parent_active && self.is_defined(name);
+                ifdef_stack.push(IfdefState { parent_active, branch_taken: active, active });
                 output.push('\n');
                 continue;
             }
@@ -273,14 +280,36 @@ impl Preprocessor {
             if trimmed.starts_with("`ifndef") {
                 let name = trimmed[7..].trim();
                 let name = name.split_whitespace().next().unwrap_or(name);
-                ifdef_stack.push(!self.is_defined(name));
+                let parent_active = ifdef_stack.iter().all(|s| s.active);
+                let active = parent_active && !self.is_defined(name);
+                ifdef_stack.push(IfdefState { parent_active, branch_taken: active, active });
+                output.push('\n');
+                continue;
+            }
+
+            if trimmed.starts_with("`elsif") {
+                let name = trimmed[6..].trim();
+                let name = name.split_whitespace().next().unwrap_or(name);
+                if let Some(last) = ifdef_stack.last_mut() {
+                    if !last.parent_active || last.branch_taken {
+                        last.active = false;
+                    } else {
+                        let active = self.is_defined(name);
+                        last.active = active;
+                        if active {
+                            last.branch_taken = true;
+                        }
+                    }
+                }
                 output.push('\n');
                 continue;
             }
 
             if trimmed.starts_with("`else") {
                 if let Some(last) = ifdef_stack.last_mut() {
-                    *last = !*last;
+                    let active = last.parent_active && !last.branch_taken;
+                    last.active = active;
+                    last.branch_taken = true;
                 }
                 output.push('\n');
                 continue;
@@ -293,7 +322,7 @@ impl Preprocessor {
             }
 
             // Skip inactive blocks
-            if !ifdef_stack.iter().all(|&b| b) {
+            if !ifdef_stack.iter().all(|s| s.active) {
                 output.push('\n');
                 continue;
             }
@@ -343,8 +372,32 @@ impl Preprocessor {
                 continue;
             }
 
-            output.push_str(line);
-            output.push('\n');
+            let mut logical_line = line.to_string();
+            let mut consumed_lines = 1;
+            while logical_line.contains('`') && Self::has_unclosed_paren(&logical_line) {
+                if let Some(next) = lines.next() {
+                    logical_line.push('\n');
+                    logical_line.push_str(next);
+                    consumed_lines += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let expanded = self.expand_macros(&logical_line);
+            let expanded = if Self::contains_preprocessor_directive(&expanded) {
+                self.resolve_directives(&expanded, source_path)
+            } else {
+                expanded
+            };
+            if expanded.trim().is_empty() {
+                for _ in 0..consumed_lines {
+                    output.push('\n');
+                }
+            } else {
+                output.push_str(&expanded);
+                output.push('\n');
+            }
         }
 
         output
@@ -638,5 +691,40 @@ impl Preprocessor {
             i += ch.len_utf8();
         }
         result
+    }
+
+    fn has_unclosed_paren(line: &str) -> bool {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' if i == 0 || bytes[i - 1] != b'\\' => {
+                    in_string = !in_string;
+                }
+                b'(' if !in_string => depth += 1,
+                b')' if !in_string => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        depth > 0
+    }
+
+    fn contains_preprocessor_directive(text: &str) -> bool {
+        text.lines().any(|line| {
+            matches!(
+                line.trim_start(),
+                trimmed if trimmed.starts_with("`ifdef")
+                    || trimmed.starts_with("`ifndef")
+                    || trimmed.starts_with("`elsif")
+                    || trimmed.starts_with("`else")
+                    || trimmed.starts_with("`endif")
+                    || trimmed.starts_with("`include")
+                    || trimmed.starts_with("`undef")
+                    || trimmed.starts_with("`define")
+            )
+        })
     }
 }

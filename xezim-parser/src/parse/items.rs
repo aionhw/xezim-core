@@ -1,11 +1,10 @@
 //! Module-level item parsing (IEEE 1800-2017 §A.1)
 
 use super::Parser;
-use crate::ast::{Identifier, Span};
+use crate::ast::Identifier;
 use crate::ast::decl::*;
 use crate::ast::expr::*;
 use crate::ast::module::*;
-use crate::ast::stmt::*;
 use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
@@ -15,11 +14,18 @@ impl Parser {
         let kind = if self.eat(TokenKind::KwMacromodule).is_some() { ModuleKind::Macromodule } else { self.expect(TokenKind::KwModule); ModuleKind::Module };
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
+        let header_imports = self.parse_module_header_imports();
         let params = self.parse_parameter_port_list();
         let ports = self.parse_port_list();
         self.expect(TokenKind::Semicolon);
 
-        let items = self.parse_module_items();
+        let mut items = self.parse_module_items();
+        if !header_imports.is_empty() {
+            let mut prefixed = Vec::with_capacity(header_imports.len() + items.len());
+            prefixed.extend(header_imports);
+            prefixed.extend(items);
+            items = prefixed;
+        }
 
         self.expect(TokenKind::KwEndmodule);
         let endlabel = self.parse_end_label();
@@ -36,11 +42,18 @@ impl Parser {
         self.expect(TokenKind::KwInterface);
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
+        let header_imports = self.parse_module_header_imports();
         let params = self.parse_parameter_port_list();
         let ports = self.parse_port_list();
         self.expect(TokenKind::Semicolon);
 
-        let items = self.parse_module_items();
+        let mut items = self.parse_module_items();
+        if !header_imports.is_empty() {
+            let mut prefixed = Vec::with_capacity(header_imports.len() + items.len());
+            prefixed.extend(header_imports);
+            prefixed.extend(items);
+            items = prefixed;
+        }
 
         self.expect(TokenKind::KwEndinterface);
         let endlabel = self.parse_end_label();
@@ -57,11 +70,18 @@ impl Parser {
         self.expect(TokenKind::KwProgram);
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
+        let header_imports = self.parse_module_header_imports();
         let params = self.parse_parameter_port_list();
         let ports = self.parse_port_list();
         self.expect(TokenKind::Semicolon);
 
-        let items = self.parse_module_items();
+        let mut items = self.parse_module_items();
+        if !header_imports.is_empty() {
+            let mut prefixed = Vec::with_capacity(header_imports.len() + items.len());
+            prefixed.extend(header_imports);
+            prefixed.extend(items);
+            items = prefixed;
+        }
 
         self.expect(TokenKind::KwEndprogram);
         let endlabel = self.parse_end_label();
@@ -71,6 +91,14 @@ impl Parser {
             lifetime, name, params, ports, items, endlabel,
             span: self.span_from(start),
         }
+    }
+
+    fn parse_module_header_imports(&mut self) -> Vec<ModuleItem> {
+        let mut imports = Vec::new();
+        while self.at(TokenKind::KwImport) && self.peek_kind() != TokenKind::StringLiteral {
+            imports.push(ModuleItem::ImportDeclaration(self.parse_import_declaration()));
+        }
+        imports
     }
 
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
@@ -101,7 +129,7 @@ impl Parser {
         if self.at(TokenKind::RParen) { self.bump(); return PortList::Empty; }
         if self.is_port_direction() || self.is_data_type_keyword() || self.at(TokenKind::KwVar)
             || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Dot)
-            || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Identifier)
+            || (self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash))
         {
             let mut ports = Vec::new();
             let mut last_direction: Option<PortDirection> = None;
@@ -155,12 +183,16 @@ impl Parser {
             self.expect(TokenKind::Dot);
             let mp_name = self.parse_identifier();
             Some(DataType::Interface { name: if_name, modport: Some(mp_name), span: self.span_from(start) })
-        } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Identifier {
-            let name = self.parse_identifier();
-            Some(DataType::Interface { name, modport: None, span: self.span_from(start) })
+        } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash) {
+            Some(self.parse_data_type())
         } else { None };
+        let mut dimensions = if data_type.is_some() {
+            self.parse_unpacked_dimensions()
+        } else {
+            Vec::new()
+        };
         let name = self.parse_identifier();
-        let dimensions = self.parse_unpacked_dimensions();
+        dimensions.extend(self.parse_unpacked_dimensions());
         let default = if self.eat(TokenKind::Assign).is_some() { Some(self.parse_expression()) } else { None };
         AnsiPort { attrs: Vec::new(), direction, net_type, var_kw, data_type, name, dimensions, default, span: self.span_from(start) }
     }
@@ -201,6 +233,9 @@ impl Parser {
                 let dir = self.parse_optional_direction().unwrap_or(PortDirection::Input);
                 let nt = self.parse_optional_net_type();
                 let dt = if self.is_data_type_keyword() { self.parse_data_type() }
+                    else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash) {
+                        self.parse_data_type()
+                    }
                     else if self.at(TokenKind::LBracket) {
                         let dimensions = self.parse_packed_dimensions();
                         DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
@@ -460,7 +495,7 @@ impl Parser {
             TokenKind::KwFor => {
                 let s = self.current().span.start; self.bump(); self.expect(TokenKind::LParen);
                 // Parse init: genvar i = 0 or i = 0
-                let has_genvar = self.eat(TokenKind::KwGenvar).is_some();
+                let _has_genvar = self.eat(TokenKind::KwGenvar).is_some();
                 let var_name = if self.at(TokenKind::Identifier) {
                     let n = self.current().text.clone(); self.bump(); n
                 } else { String::new() };
@@ -659,6 +694,26 @@ impl Parser {
     fn parse_identifier_starting_item(&mut self) -> ModuleItem {
         let start = self.current().span.start;
         let first_name = self.parse_identifier();
+        if self.at(TokenKind::DoubleColon) {
+            self.bump();
+            let second_name = self.parse_identifier();
+            let dt = DataType::TypeReference {
+                name: TypeName { scope: Some(first_name), name: second_name, span: self.span_from(start) },
+                dimensions: Vec::new(),
+                type_args: Vec::new(),
+                span: self.span_from(start),
+            };
+            let decls = self.parse_var_declarator_list();
+            self.expect(TokenKind::Semicolon);
+            return ModuleItem::DataDeclaration(DataDeclaration {
+                const_kw: false,
+                var_kw: false,
+                lifetime: None,
+                data_type: dt,
+                declarators: decls,
+                span: self.span_from(start),
+            });
+        }
         if self.eat(TokenKind::Colon).is_some() { return self.parse_module_item().unwrap_or(ModuleItem::Null); }
         let params = if self.at(TokenKind::Hash) {
             self.bump();

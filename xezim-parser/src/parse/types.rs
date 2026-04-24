@@ -180,13 +180,33 @@ impl Parser {
                 self.expect(TokenKind::RBracket);
                 dims.push(UnpackedDimension::Associative { data_type: None, span: self.span_from(start) });
             } else if self.is_associative_index_type_start() {
-                // Associative arrays use a data type between brackets. An
-                // identifier alone is ambiguous here because unpacked ranges
-                // like [FLOP_NUM-1:0] are also common. Restrict the type path
-                // to cases that really look like a type reference.
+                // Associative arrays use a data type between brackets, but
+                // scoped constants like [pkg::WIDTH-1:0] look similar at the
+                // beginning. Only keep the associative parse if it closes the
+                // bracket immediately; otherwise rewind and treat it as a
+                // regular expression/range dimension.
+                let save_pos = self.pos;
                 let dt = self.parse_data_type();
-                self.expect(TokenKind::RBracket);
-                dims.push(UnpackedDimension::Associative { data_type: Some(Box::new(dt)), span: self.span_from(start) });
+                if self.at(TokenKind::RBracket) {
+                    self.expect(TokenKind::RBracket);
+                    dims.push(UnpackedDimension::Associative { data_type: Some(Box::new(dt)), span: self.span_from(start) });
+                } else {
+                    self.pos = save_pos;
+                    let expr = self.parse_expression();
+                    if self.eat(TokenKind::Colon).is_some() {
+                        let right = self.parse_expression();
+                        self.expect(TokenKind::RBracket);
+                        dims.push(UnpackedDimension::Range {
+                            left: Box::new(expr), right: Box::new(right),
+                            span: self.span_from(start),
+                        });
+                    } else {
+                        self.expect(TokenKind::RBracket);
+                        dims.push(UnpackedDimension::Expression {
+                            expr: Box::new(expr), span: self.span_from(start),
+                        });
+                    }
+                }
             } else {
                 let expr = self.parse_expression();
                 if self.eat(TokenKind::Colon).is_some() {
