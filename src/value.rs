@@ -170,6 +170,17 @@ impl Value {
         }
     }
 
+    /// Overwrite inline storage in place.
+    #[inline]
+    pub fn set_inline_bits(&mut self, val_bits: u64, xz_bits: u64) -> bool {
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits: v, xz_bits: x } => {
+                *v = val_bits; *x = xz_bits; true
+            }
+            _ => false,
+        }
+    }
+
     pub fn raw_bits(&self) -> (u64, u64) {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits, *xz_bits),

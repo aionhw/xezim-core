@@ -212,9 +212,25 @@ fn parse_and_elaborate(
     } else {
         let mut instantiated: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in definitions.values() { collect_instantiated_modules(m.items(), &mut instantiated); }
-        let candidates: Vec<String> = definitions.keys().filter(|n| !instantiated.contains(n.as_str())).cloned().collect();
-        if candidates.len() == 1 { top_module = Some(candidates[0].clone()); }
-        else if candidates.len() > 1 {
+        let mut candidates: Vec<String> = definitions.keys().filter(|n| !instantiated.contains(n.as_str())).cloned().collect();
+        // Sort to make top-module selection deterministic when more than one
+        // module is uninstantiated. Without this, ahash's random seed picks
+        // arbitrarily between, e.g., openc910's `tb` and `top` testbenches —
+        // each iteration runs a different testbench's initial blocks, so the
+        // sim either fires up clk/rst correctly or silently picks the
+        // verilator variant whose forever-counter logic xezim doesn't model.
+        candidates.sort();
+        // If the source-order parse already picked a top that's a valid
+        // candidate (uninstantiated by anything else), prefer it over the
+        // candidate-based heuristic. Otherwise fall through to the heuristic
+        // and rely on `candidates.sort()` for determinism.
+        let parse_pick_valid = top_module.as_ref()
+            .map_or(false, |n| candidates.iter().any(|c| c == n));
+        if parse_pick_valid {
+            // Keep top_module as-is — deterministic via source order.
+        } else if candidates.len() == 1 {
+            top_module = Some(candidates[0].clone());
+        } else if candidates.len() > 1 {
             for c in &candidates {
                 if definitions.get(c).unwrap().items().iter().any(|item| matches!(item, ast::decl::ModuleItem::InitialConstruct(_))) {
                     top_module = Some(c.clone()); break;
