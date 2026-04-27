@@ -229,6 +229,11 @@ impl Value {
 
     /// Get bit at position i.
     #[inline]
+    /// Hot-path; called per gate input from `exec_fused_gate` on
+    /// gate-level netlists (>1 billion calls on picorv32 test_synth).
+    /// Marked `#[inline(always)]` so the Inline arm collapses to two
+    /// shifts and a small match in the caller's frame.
+    #[inline(always)]
     pub fn get_bit(&self, i: usize) -> LogicBit {
         if i as u32 >= self.width { return LogicBit::Zero; }
         match &self.storage {
@@ -246,8 +251,9 @@ impl Value {
         }
     }
 
-    /// Set bit at position i.
-    #[inline]
+    /// Set bit at position i. Hot-path mirror of `get_bit`; same
+    /// rationale for `#[inline(always)]`.
+    #[inline(always)]
     pub fn set_bit(&mut self, i: usize, bit: LogicBit) {
         if i as u32 >= self.width { return; }
         match &mut self.storage {
@@ -267,7 +273,6 @@ impl Value {
     }
 
     /// Convert to u64, treating X/Z as 0.
-    #[inline]
     #[inline(always)]
     pub fn to_u64(&self) -> Option<u64> {
         match &self.storage {
