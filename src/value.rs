@@ -181,6 +181,11 @@ impl Value {
         }
     }
 
+    /// Hot-path; called by `check_edge_id` per edge signal per settle
+    /// iteration (millions of times on c910-scale runs). Marked
+    /// `#[inline(always)]` so the Inline arm collapses to a direct
+    /// (u64,u64) load with no enum match in the caller's frame.
+    #[inline(always)]
     pub fn raw_bits(&self) -> (u64, u64) {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits, *xz_bits),
@@ -263,6 +268,7 @@ impl Value {
 
     /// Convert to u64, treating X/Z as 0.
     #[inline]
+    #[inline(always)]
     pub fn to_u64(&self) -> Option<u64> {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => Some(*val_bits & !*xz_bits),
