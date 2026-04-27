@@ -327,6 +327,18 @@ impl Parser {
                 continue;
             }
 
+            // Sized / type cast postfix: <expr>'(value)
+            // Covers (expr)'(value), pkg::type'(value), id'(value), array_select'(value), etc.
+            // Treated as pass-through (cast is a width/type hint at parse time).
+            if self.current().text == "'" && self.peek_kind() == TokenKind::LParen {
+                self.bump(); // skip '
+                self.bump(); // skip (
+                let inner = self.parse_expression();
+                self.expect(TokenKind::RParen);
+                lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
+                continue;
+            }
+
             break;
         }
 

@@ -183,7 +183,7 @@ impl Parser {
             self.expect(TokenKind::Dot);
             let mp_name = self.parse_identifier();
             Some(DataType::Interface { name: if_name, modport: Some(mp_name), span: self.span_from(start) })
-        } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash) {
+        } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket) {
             Some(self.parse_data_type())
         } else { None };
         let mut dimensions = if data_type.is_some() {
@@ -229,11 +229,27 @@ impl Parser {
         }
 
         match self.current_kind() {
+            // Elaboration-time system tasks at module-item level: $error, $warning,
+            // $info, $fatal — typically inside a `STATIC_ASSERT` macro expansion
+            // (`generate if (!(cond)) $error msg; endgenerate`). Parse and discard.
+            TokenKind::SystemIdentifier => {
+                self.bump();
+                if self.at(TokenKind::LParen) {
+                    let _ = self.parse_call_args();
+                } else {
+                    // No-paren form: $error msg;  where msg is an expression.
+                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                        self.bump();
+                    }
+                }
+                self.expect(TokenKind::Semicolon);
+                Some(ModuleItem::Null)
+            }
             TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef => {
                 let dir = self.parse_optional_direction().unwrap_or(PortDirection::Input);
                 let nt = self.parse_optional_net_type();
                 let dt = if self.is_data_type_keyword() { self.parse_data_type() }
-                    else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash) {
+                    else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket) {
                         self.parse_data_type()
                     }
                     else if self.at(TokenKind::LBracket) {
@@ -465,6 +481,7 @@ impl Parser {
                 }
             }
             TokenKind::KwIf => { let s = self.current().span.start; Some(self.parse_generate_if(s)) }
+            TokenKind::KwCase => { let s = self.current().span.start; Some(self.parse_generate_case(s)) }
             TokenKind::KwChecker => {
                 let start = self.current().span.start; self.bump();
                 let name = self.parse_identifier();
@@ -682,6 +699,32 @@ impl Parser {
         ModuleItem::GenerateIf(GenerateIf { branches, span: self.span_from(start) })
     }
 
+    fn parse_generate_case(&mut self, start: usize) -> ModuleItem {
+        // case (selector)
+        self.bump(); // consume `case`
+        self.expect(TokenKind::LParen);
+        let selector = self.parse_expression();
+        self.expect(TokenKind::RParen);
+        let mut arms: Vec<GenerateCaseArm> = Vec::new();
+        while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
+            // Either `default[:] generate-block` or `expr {, expr}: generate-block`.
+            let mut values: Vec<crate::ast::expr::Expression> = Vec::new();
+            if self.eat(TokenKind::KwDefault).is_some() {
+                let _ = self.eat(TokenKind::Colon);
+            } else {
+                loop {
+                    values.push(self.parse_expression());
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::Colon);
+            }
+            let items = self.parse_generate_branch_items();
+            arms.push(GenerateCaseArm { values, items });
+        }
+        self.expect(TokenKind::KwEndcase);
+        ModuleItem::GenerateCase(GenerateCase { selector, arms, span: self.span_from(start) })
+    }
+
     fn parse_generate_branch_items(&mut self) -> Vec<ModuleItem> {
         if self.eat(TokenKind::KwBegin).is_some() {
             let _ = self.parse_end_label();
@@ -697,9 +740,10 @@ impl Parser {
         if self.at(TokenKind::DoubleColon) {
             self.bump();
             let second_name = self.parse_identifier();
+            let dimensions = self.parse_packed_dimensions();
             let dt = DataType::TypeReference {
                 name: TypeName { scope: Some(first_name), name: second_name, span: self.span_from(start) },
-                dimensions: Vec::new(),
+                dimensions,
                 type_args: Vec::new(),
                 span: self.span_from(start),
             };
@@ -732,6 +776,31 @@ impl Parser {
             } else { None }
         } else { None };
 
+        // Packed dimensions on a user-typedef base: `MyType [hi:lo] var_name;`
+        // After the optional #(params), if we see `[`, treat the construct as a
+        // data declaration of `MyType` with packed dimensions, not a module
+        // instantiation.
+        if self.at(TokenKind::LBracket) {
+            let dimensions = self.parse_packed_dimensions();
+            let type_args: Vec<crate::ast::expr::Expression> = match &params {
+                Some(ps) => ps.iter().filter_map(|pc| match pc {
+                    ParamConnection::Ordered(Some(ParamValue::Expr(e))) => Some(e.clone()),
+                    ParamConnection::Named { value: Some(ParamValue::Expr(e)), .. } => Some(e.clone()),
+                    _ => None,
+                }).collect(),
+                None => Vec::new(),
+            };
+            let dt = DataType::TypeReference {
+                name: TypeName { scope: None, name: first_name, span: self.span_from(start) },
+                dimensions, type_args, span: self.span_from(start),
+            };
+            let decls = self.parse_var_declarator_list();
+            self.expect(TokenKind::Semicolon);
+            return ModuleItem::DataDeclaration(DataDeclaration {
+                const_kw: false, var_kw: false, lifetime: None,
+                data_type: dt, declarators: decls, span: self.span_from(start),
+            });
+        }
         if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
             let initial_pos = self.pos;
             let mut is_data_decl = false;
@@ -741,9 +810,9 @@ impl Parser {
                 let inst_start = self.current().span.start;
                 let _iname = self.parse_identifier();
                 let _dims = self.parse_unpacked_dimensions();
-                if self.at(TokenKind::Assign) || self.at(TokenKind::Semicolon) || self.at(TokenKind::Comma) { 
-                    is_data_decl = true; 
-                    break; 
+                if self.at(TokenKind::Assign) || self.at(TokenKind::Semicolon) || self.at(TokenKind::Comma) {
+                    is_data_decl = true;
+                    break;
                 }
                 self.pos = inst_save_pos; // rewind just this instance
                 let iname = self.parse_identifier();

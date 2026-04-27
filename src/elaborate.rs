@@ -4,6 +4,7 @@
 use ahash::AHashMap as HashMap;
 use ahash::AHashSet as HashSet;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use crate::ast::{Identifier, Span};
 use crate::ast::decl::*;
 use crate::ast::module::*;
@@ -925,7 +926,22 @@ pub fn elaborate_module_with_defs(
                 let is_signed = is_type_signed(&nd.data_type);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
-                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                    if elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
+                    // A `wire X;` (or other NetDeclaration) following an
+                    // `input X;` / `output X;` port declaration is the
+                    // legal SystemVerilog idiom that explicitly attaches a
+                    // net-type to an already-declared port. Keep the
+                    // existing port entry (direction, width, type_name)
+                    // and just record the leaf in `nets`. Only treat it
+                    // as an error if the existing entry is not a port
+                    // (i.e. a true duplicate user declaration).
+                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                        if existing.direction.is_some() {
+                            elab.nets.insert(decl.name.name.clone());
+                            continue;
+                        }
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
                     let w = width_with_unpacked_dims(&decl.dimensions, width);
@@ -1411,6 +1427,9 @@ pub fn elaborate_module_with_defs(
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
+                if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
+                    eprintln!("[xezim][elab] elaborate_items: pushing initial (top-level path)");
+                }
                 elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
             }
             ModuleItem::GenerateRegion(gr) => {
@@ -1419,6 +1438,9 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::GenerateIf(gi) => {
                 elaborate_generate_if(&gi.branches, &mut elab, all_defs)?;
+            }
+            ModuleItem::GenerateCase(gc) => {
+                elaborate_generate_case(gc, &mut elab, all_defs)?;
             }
             ModuleItem::GenerateFor(gf) => {
                 elaborate_generate_for(gf, &mut elab, all_defs)?;
@@ -2428,6 +2450,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
+                if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
+                    eprintln!("[xezim][elab] @2453 pushing initial (other path)");
+                }
                 elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
             }
             ModuleItem::ModuleInstantiation(inst) => {
@@ -2450,6 +2475,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
             ModuleItem::GenerateIf(gi) => {
                 elaborate_generate_if(&gi.branches, elab, all_defs)?;
+            }
+            ModuleItem::GenerateCase(gc) => {
+                elaborate_generate_case(gc, elab, all_defs)?;
             }
             ModuleItem::GenerateFor(gf) => {
                 elaborate_generate_for(gf, elab, all_defs)?;
@@ -2590,14 +2618,58 @@ fn elaborate_generate_if(branches: &[(Option<Expression>, Vec<ModuleItem>)], ela
     Ok(())
 }
 
+fn elaborate_generate_case(gc: &GenerateCase, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
+    if !is_const_expr(&gc.selector, &elab.parameters) {
+        return Err("Generate case selector must be a constant expression".to_string());
+    }
+    let sel = eval_const_expr(&gc.selector, &elab.parameters);
+    // First pass: try to match a non-default arm.
+    for arm in &gc.arms {
+        if arm.values.is_empty() { continue; } // skip default in this pass
+        for v in &arm.values {
+            if !is_const_expr(v, &elab.parameters) {
+                return Err("Generate case value must be a constant expression".to_string());
+            }
+            if eval_const_expr(v, &elab.parameters) == sel {
+                return elaborate_items(&arm.items, elab, all_defs);
+            }
+        }
+    }
+    // No non-default match — fall through to default arm if present.
+    for arm in &gc.arms {
+        if arm.values.is_empty() {
+            return elaborate_items(&arm.items, elab, all_defs);
+        }
+    }
+    Ok(())
+}
+
 fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
     let var = &gf.var;
     let mut i = gf.init_val;
+    let trace = elab_trace_enabled();
+    let mut iter_count = 0u32;
     for _ in 0..10000 {
         elab.parameters.insert(var.clone(), Value::from_u64(i as u64, 32));
         let cond_val = eval_const_expr(&gf.cond, &elab.parameters);
         if cond_val == 0 { break; }
-        elaborate_items(&gf.items, elab, all_defs)?;
+        // Rename per-iteration declarations so each iteration owns a fresh
+        // copy. Without this, two iterations both declare e.g. `valid_q` and
+        // the elaborator's flat signal table flags a duplicate.
+        let subst = substitute_genvar_in_items(&gf.items, var, i);
+        let suffix = format!("__gf_{}_{}_", var, i);
+        let renamed = rename_decls_in_iter(&subst, &suffix);
+        elaborate_items(&renamed, elab, all_defs)?;
+        if trace && (iter_count % 8) == 0 {
+            let rss = std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1).and_then(|n| n.parse::<u64>().ok()))
+                .map(|p| p * 4096 / (1024 * 1024))
+                .unwrap_or(0);
+            eprintln!("[xezim][gf] var={} iter={} rss={}MB assigns={} signals={}",
+                var, iter_count, rss, elab.continuous_assigns.len(), elab.signals.len());
+        }
+        iter_count += 1;
         // Evaluate increment: handle i++, i=i+1, etc.
         match &gf.incr.kind {
             ExprKind::Unary { op: UnaryOp::PostIncr, .. } | ExprKind::Unary { op: UnaryOp::PreIncr, .. } => { i += 1; }
@@ -2970,6 +3042,16 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             for _ in 0..n { r = inner.clone().concat_with(&r); }
             r
         }
+        // SystemVerilog `for (j = 0; j < N; j = j+1)` parses the increment
+        // as an `AssignExpr { lvalue: j, rvalue: j+1 }`. As a const-eval
+        // result, the value of `j = j+1` is the rvalue's value (the
+        // assigned-after value). Without this case the increment falls to
+        // `Value::zero(32)` and the generate-for loop never terminates
+        // until the 10000-iter safety cap fires — observed on E902
+        // `cr_clic_sel` where the inner `for (j=0; j<DATA_WIDTH; j=j+1)`
+        // ran ~313× over budget and consumed ~1.4 GB elaborating phantom
+        // assigns.
+        ExprKind::AssignExpr { rvalue, .. } => eval_const_expr_val(rvalue, params),
         _ => Value::zero(32),
     };
     // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
@@ -3073,6 +3155,335 @@ pub fn inline_instantiations(
     Ok(())
 }
 
+/// Construct an unsized integer-literal `Expression` for a genvar value.
+/// Used by `substitute_genvar_in_items` to inject a constant in place of
+/// the genvar identifier so downstream constant-evaluation, edge-block
+/// resolution, and bit-select compilation see the resolved index.
+fn genvar_const_expr(value: i64) -> Expression {
+    let signed = value < 0;
+    Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: Some(32),
+            signed,
+            base: NumberBase::Decimal,
+            value: value.to_string(),
+            cached_val: std::cell::Cell::new(Some((value as u64, 0u64, 32u32))),
+        }),
+        Span::dummy(),
+    )
+}
+
+/// Replace bare references to `var` (a genvar) with the given constant
+/// `value` throughout the module items. Walks into nested generate-for /
+/// generate-if / generate-region so the substitution covers the whole
+/// generate subtree before unrolling kicks in.
+fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Vec<ModuleItem> {
+    let mut port_map: HashMap<String, Expression> = HashMap::default();
+    port_map.insert(var.to_string(), genvar_const_expr(value));
+    let local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let interface_map: HashMap<String, String> = HashMap::default();
+    items.iter().map(|item| substitute_in_module_item(item, &port_map, &local_names, &interface_map)).collect()
+}
+
+/// Collect the names of signals/parameters/instances declared at the top level
+/// of a generate-for body. These need per-iteration renaming so that 20 copies
+/// of `logic valid_q;` don't collapse into a single flat signal.
+fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
+    for item in items {
+        match item {
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators { names.push(d.name.name.clone()); }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators { names.push(d.name.name.clone()); }
+            }
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators { names.push(d.name.name.clone()); }
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for a in assignments { names.push(a.name.name.clone()); }
+                }
+            }
+            ModuleItem::ModuleInstantiation(mi) => {
+                for hi in &mi.instances { names.push(hi.name.name.clone()); }
+            }
+            // Nested generate constructs declare their own scope; we recurse
+            // and rename names declared in the unconditional bodies, since a
+            // nested generate-if may declare a name that the parent's other
+            // siblings reference.
+            ModuleItem::GenerateRegion(gr) => collect_decl_names_in_items(&gr.items, names),
+            ModuleItem::GenerateIf(gi) => {
+                for (_cond, branch) in &gi.branches {
+                    collect_decl_names_in_items(branch, names);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    collect_decl_names_in_items(&arm.items, names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Rename declarations inside a generate-for iteration so that each iteration
+/// owns a distinct copy of every locally declared name. References in
+/// always/initial/contassign/instance ports get rewritten via a port_map.
+fn rename_decls_in_iter(items: &[ModuleItem], suffix: &str) -> Vec<ModuleItem> {
+    let mut names = Vec::new();
+    collect_decl_names_in_items(items, &mut names);
+    if names.is_empty() { return items.to_vec(); }
+    // Build rewrite map: original_name -> Ident(renamed)
+    let mut port_map: HashMap<String, Expression> = HashMap::default();
+    let rename_set: std::collections::HashSet<String> = names.iter().cloned().collect();
+    for n in &names {
+        let renamed = format!("{}{}", n, suffix);
+        let id = Identifier { name: renamed.clone(), span: Span { start: 0, end: 0 } };
+        let hier = HierarchicalIdentifier {
+            root: None,
+            path: vec![HierPathSegment { name: id, selects: Vec::new() }],
+            span: Span { start: 0, end: 0 },
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        port_map.insert(n.clone(), Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }));
+    }
+    let local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let interface_map: HashMap<String, String> = HashMap::default();
+    items.iter().map(|item| rename_item_decls(item, suffix, &rename_set, &port_map, &local_names, &interface_map)).collect()
+}
+
+fn rename_item_decls(
+    item: &ModuleItem,
+    suffix: &str,
+    rename_set: &std::collections::HashSet<String>,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> ModuleItem {
+    match item {
+        ModuleItem::DataDeclaration(dd) => {
+            let mut new_dd = dd.clone();
+            for d in &mut new_dd.declarators {
+                if rename_set.contains(&d.name.name) {
+                    d.name.name = format!("{}{}", d.name.name, suffix);
+                }
+                if let Some(init) = &d.init {
+                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
+                }
+            }
+            ModuleItem::DataDeclaration(new_dd)
+        }
+        ModuleItem::NetDeclaration(nd) => {
+            let mut new_nd = nd.clone();
+            for d in &mut new_nd.declarators {
+                if rename_set.contains(&d.name.name) {
+                    d.name.name = format!("{}{}", d.name.name, suffix);
+                }
+                if let Some(init) = &d.init {
+                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
+                }
+            }
+            ModuleItem::NetDeclaration(new_nd)
+        }
+        ModuleItem::PortDeclaration(pd) => {
+            let mut new_pd = pd.clone();
+            for d in &mut new_pd.declarators {
+                if rename_set.contains(&d.name.name) {
+                    d.name.name = format!("{}{}", d.name.name, suffix);
+                }
+            }
+            ModuleItem::PortDeclaration(new_pd)
+        }
+        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+            let mut new_pd = pd.clone();
+            if let ParameterKind::Data { assignments, .. } = &mut new_pd.kind {
+                for a in assignments {
+                    if rename_set.contains(&a.name.name) {
+                        a.name.name = format!("{}{}", a.name.name, suffix);
+                    }
+                    if let Some(init) = &a.init {
+                        a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
+                    }
+                }
+            }
+            // Preserve original variant
+            match item {
+                ModuleItem::ParameterDeclaration(_) => ModuleItem::ParameterDeclaration(new_pd),
+                _ => ModuleItem::LocalparamDeclaration(new_pd),
+            }
+        }
+        ModuleItem::ModuleInstantiation(mi) => {
+            let mut new_mi = mi.clone();
+            for hi in &mut new_mi.instances {
+                if rename_set.contains(&hi.name.name) {
+                    hi.name.name = format!("{}{}", hi.name.name, suffix);
+                }
+                for conn in &mut hi.connections {
+                    match conn {
+                        PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) => {
+                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ModuleItem::ModuleInstantiation(new_mi)
+        }
+        ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(AlwaysConstruct {
+            kind: ac.kind,
+            stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
+            span: ac.span,
+        }),
+        ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
+            stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
+            span: ic.span,
+        }),
+        ModuleItem::ContinuousAssign(ca) => {
+            let mut new_ca = ca.clone();
+            new_ca.assignments = ca.assignments.iter().map(|(l, r)| (
+                rewrite_expr(l, "", port_map, local_names, interface_map),
+                rewrite_expr(r, "", port_map, local_names, interface_map),
+            )).collect();
+            ModuleItem::ContinuousAssign(new_ca)
+        }
+        ModuleItem::GenerateRegion(gr) => {
+            let mut new_gr = gr.clone();
+            new_gr.items = gr.items.iter().map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map)).collect();
+            ModuleItem::GenerateRegion(new_gr)
+        }
+        ModuleItem::GenerateIf(gi) => {
+            let mut new_gi = gi.clone();
+            new_gi.branches = gi.branches.iter().map(|(cond, branch_items)| {
+                let new_cond = cond.as_ref().map(|c| rewrite_expr(c, "", port_map, local_names, interface_map));
+                let new_items: Vec<ModuleItem> = branch_items.iter()
+                    .map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map))
+                    .collect();
+                (new_cond, new_items)
+            }).collect();
+            ModuleItem::GenerateIf(new_gi)
+        }
+        ModuleItem::GenerateCase(gc) => {
+            let new_arms: Vec<GenerateCaseArm> = gc.arms.iter().map(|arm| {
+                GenerateCaseArm {
+                    values: arm.values.iter().map(|v| rewrite_expr(v, "", port_map, local_names, interface_map)).collect(),
+                    items: arm.items.iter().map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map)).collect(),
+                }
+            }).collect();
+            ModuleItem::GenerateCase(GenerateCase {
+                selector: rewrite_expr(&gc.selector, "", port_map, local_names, interface_map),
+                arms: new_arms,
+                span: gc.span,
+            })
+        }
+        ModuleItem::GenerateFor(gf) => {
+            // Inner generate-for: rewrite expression refs but leave its body
+            // alone (its own iteration loop will handle further renaming).
+            let mut new_gf = gf.clone();
+            new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
+            new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
+            new_gf.items = gf.items.iter().map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map)).collect();
+            ModuleItem::GenerateFor(new_gf)
+        }
+        other => other.clone(),
+    }
+}
+
+fn substitute_in_module_item(
+    item: &ModuleItem,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> ModuleItem {
+    match item {
+        ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(AlwaysConstruct {
+            kind: ac.kind,
+            stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
+            span: ac.span,
+        }),
+        ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
+            stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
+            span: ic.span,
+        }),
+        ModuleItem::ContinuousAssign(ca) => {
+            let mut new_ca = ca.clone();
+            new_ca.assignments = ca.assignments.iter().map(|(l, r)| (
+                rewrite_expr(l, "", port_map, local_names, interface_map),
+                rewrite_expr(r, "", port_map, local_names, interface_map),
+            )).collect();
+            ModuleItem::ContinuousAssign(new_ca)
+        }
+        ModuleItem::ModuleInstantiation(inst) => {
+            let mut new_inst = inst.clone();
+            for hi in &mut new_inst.instances {
+                for conn in &mut hi.connections {
+                    match conn {
+                        PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) => {
+                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(params) = &mut new_inst.params {
+                for pc in params.iter_mut() {
+                    match pc {
+                        ParamConnection::Named { value: Some(ParamValue::Expr(e)), .. }
+                        | ParamConnection::Ordered(Some(ParamValue::Expr(e))) => {
+                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ModuleItem::ModuleInstantiation(new_inst)
+        }
+        ModuleItem::GenerateRegion(gr) => {
+            let mut new_gr = gr.clone();
+            new_gr.items = gr.items.iter().map(|i| substitute_in_module_item(i, port_map, local_names, interface_map)).collect();
+            ModuleItem::GenerateRegion(new_gr)
+        }
+        ModuleItem::GenerateIf(gi) => {
+            let mut new_gi = gi.clone();
+            new_gi.branches = gi.branches.iter().map(|(cond, branch_items)| {
+                let new_cond = cond.as_ref().map(|c| rewrite_expr(c, "", port_map, local_names, interface_map));
+                let new_items: Vec<ModuleItem> = branch_items.iter()
+                    .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
+                    .collect();
+                (new_cond, new_items)
+            }).collect();
+            ModuleItem::GenerateIf(new_gi)
+        }
+        ModuleItem::GenerateCase(gc) => {
+            let new_arms: Vec<GenerateCaseArm> = gc.arms.iter().map(|arm| {
+                GenerateCaseArm {
+                    values: arm.values.iter().map(|v| rewrite_expr(v, "", port_map, local_names, interface_map)).collect(),
+                    items: arm.items.iter().map(|i| substitute_in_module_item(i, port_map, local_names, interface_map)).collect(),
+                }
+            }).collect();
+            ModuleItem::GenerateCase(GenerateCase {
+                selector: rewrite_expr(&gc.selector, "", port_map, local_names, interface_map),
+                arms: new_arms,
+                span: gc.span,
+            })
+        }
+        ModuleItem::GenerateFor(gf) => {
+            let mut new_gf = gf.clone();
+            new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
+            new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
+            new_gf.items = gf.items.iter().map(|i| substitute_in_module_item(i, port_map, local_names, interface_map)).collect();
+            ModuleItem::GenerateFor(new_gf)
+        }
+        // Most other module-level declarations don't carry expressions that
+        // reference a genvar in practice; pass through unchanged.
+        other => other.clone(),
+    }
+}
+
 /// Recursively inline all instantiations found in `source_mod`, using `prefix` for signal naming.
 /// Flatten module items by resolving generate-if/else and generate regions.
 /// Returns all effective items after evaluating generate conditions.
@@ -3101,6 +3512,65 @@ fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>
                     }
                 }
                 let _ = matched;
+            }
+            ModuleItem::GenerateCase(gc) => {
+                let sel = eval_const_expr(&gc.selector, params);
+                let mut matched = false;
+                // First pass: try non-default arms.
+                for arm in &gc.arms {
+                    if arm.values.is_empty() { continue; }
+                    if arm.values.iter().any(|v| eval_const_expr(v, params) == sel) {
+                        result.extend(collect_effective_items(&arm.items, params));
+                        matched = true;
+                        break;
+                    }
+                }
+                // Default arm fallback.
+                if !matched {
+                    for arm in &gc.arms {
+                        if arm.values.is_empty() {
+                            result.extend(collect_effective_items(&arm.items, params));
+                            break;
+                        }
+                    }
+                }
+            }
+            ModuleItem::GenerateFor(gf) => {
+                // Without this expansion, items inside `for genvar` (always
+                // blocks, instances, cont assigns) are dropped when the
+                // host module is inlined into its parent. ct_fifo's
+                // DFIFO_VLD_GEN reset block was being lost this way, leaving
+                // fifo_entry_vld stuck at X and the AXI request path
+                // permanently stalled — see openc910 hello_world bringup.
+                let mut local_params = params.clone();
+                let mut i = gf.init_val;
+                let limit = 10000;
+                let mut iters = 0;
+                while iters < limit {
+                    local_params.insert(gf.var.clone(), Value::from_u64(i as u64, 32));
+                    let cond_val = eval_const_expr(&gf.cond, &local_params);
+                    if cond_val == 0 { break; }
+                    let subst = substitute_genvar_in_items(&gf.items, &gf.var, i);
+                    // Rename signals declared inside the for-body so each
+                    // iteration gets its own unique copy. Without this, two
+                    // iterations both declare `valid_q` and the elaborator
+                    // sees a flat duplicate.
+                    let suffix = format!("__gf_{}_{}_", gf.var, i);
+                    let subst = rename_decls_in_iter(&subst, &suffix);
+                    result.extend(collect_effective_items(&subst, &local_params));
+                    match &gf.incr.kind {
+                        ExprKind::Unary { op: UnaryOp::PostIncr, .. }
+                        | ExprKind::Unary { op: UnaryOp::PreIncr, .. } => i += 1,
+                        ExprKind::Unary { op: UnaryOp::PostDecr, .. }
+                        | ExprKind::Unary { op: UnaryOp::PreDecr, .. } => i -= 1,
+                        _ => {
+                            let new_val = eval_const_expr(&gf.incr, &local_params) as i64;
+                            if new_val == i { i += 1; } else { i = new_val; }
+                        }
+                    }
+                    iters += 1;
+                }
+                local_params.remove(&gf.var);
             }
             other => result.push(other.clone()),
         }
@@ -3131,7 +3601,7 @@ struct PreparedModuleItems {
     local_names: std::collections::HashSet<String>,
 }
 
-type InlinePrepCache = HashMap<String, PreparedModuleItems>;
+type InlinePrepCache = HashMap<String, Rc<PreparedModuleItems>>;
 
 fn format_param_key(params: &HashMap<String, Value>) -> String {
     let mut ordered = BTreeMap::new();
@@ -3160,10 +3630,10 @@ fn prepare_module_items(
     local_params: &HashMap<String, Value>,
     typedef_widths: &HashMap<String, u32>,
     cache: &mut InlinePrepCache,
-) -> PreparedModuleItems {
+) -> Rc<PreparedModuleItems> {
     let cache_key = format!("{}|{}", source_def.name(), format_param_key(local_params));
     if let Some(prepared) = cache.get(&cache_key) {
-        return prepared.clone();
+        return Rc::clone(prepared);
     }
 
     let mut local_typedefs = std::collections::HashSet::new();
@@ -3269,14 +3739,14 @@ fn prepare_module_items(
         }
     }
 
-    let prepared = PreparedModuleItems {
+    let prepared = Rc::new(PreparedModuleItems {
         effective_items,
         local_typedefs,
         interface_ports,
         port_directions,
         local_names,
-    };
-    cache.insert(cache_key, prepared.clone());
+    });
+    cache.insert(cache_key, Rc::clone(&prepared));
     prepared
 }
 
@@ -3828,6 +4298,9 @@ fn inline_module_items(
                         });
                     }
                     if let ModuleItem::InitialConstruct(ic) = sub_item {
+                        if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
+                            eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);
+                        }
                         elab.initial_blocks.push(super::elaborate::InitialBlock {
                             stmt: rewrite_stmt(&ic.stmt, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map),
                         });

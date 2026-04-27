@@ -103,7 +103,8 @@ impl Parser {
                     let _dimensions = self.parse_packed_dimensions();
                     DataType::Interface { name: name.name, modport, span: self.span_from(start) }
                 } else {
-                    DataType::TypeReference { name, dimensions: Vec::new(), type_args, span: self.span_from(start) }
+                    let dimensions = self.parse_packed_dimensions();
+                    DataType::TypeReference { name, dimensions, type_args, span: self.span_from(start) }
                 }
             }
             _ => DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }

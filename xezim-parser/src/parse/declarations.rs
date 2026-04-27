@@ -82,7 +82,7 @@ impl Parser {
         matches!(self.current_kind(), TokenKind::Identifier | TokenKind::EscapedIdentifier) &&
             matches!(
                 self.peek_kind(),
-                TokenKind::Identifier | TokenKind::EscapedIdentifier | TokenKind::DoubleColon | TokenKind::Hash
+                TokenKind::Identifier | TokenKind::EscapedIdentifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket
             )
     }
 

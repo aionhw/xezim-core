@@ -667,7 +667,14 @@ impl Preprocessor {
             if bytes[i] == b'\"' && (i == 0 || bytes[i - 1] != b'\\') {
                 in_string = !in_string;
             }
-            if !in_string && i + 1 < bytes.len() && bytes[i] == b'(' && bytes[i + 1] == b'*' {
+            if !in_string && i + 1 < bytes.len() && bytes[i] == b'(' && bytes[i + 1] == b'*'
+                // `@(*)` is the implicit-sensitivity-list construct, not an
+                // attribute. Skip if the byte after `(*` is `)`. Likewise
+                // skip `(**` (e.g. an exponent inside parens) where the
+                // payload starts with another `*`.
+                && bytes.get(i + 2).copied() != Some(b')')
+                && bytes.get(i + 2).copied() != Some(b'*')
+            {
                 // Find matching *)
                 let mut j = i + 2;
                 let mut found = false;

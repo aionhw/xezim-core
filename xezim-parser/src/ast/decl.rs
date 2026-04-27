@@ -25,6 +25,11 @@ pub enum ModuleItem {
     /// Generate-if: condition + then-items, and a chain of (condition, items) for else-if/else
     GenerateIf(GenerateIf),
     GenerateFor(GenerateFor),
+    /// Generate-case: case (constant_expr) values: items ... endcase
+    /// Each arm matches one or more case values; an arm with empty `values`
+    /// is the `default` arm. Used to pick between alternative module
+    /// instantiations based on a parameter / genvar.
+    GenerateCase(GenerateCase),
     GenvarDeclaration(GenvarDeclaration),
     FunctionDeclaration(FunctionDeclaration),
     TaskDeclaration(TaskDeclaration),
@@ -412,6 +417,26 @@ pub struct GenerateRegion {
 pub struct GenerateIf {
     /// Chain of (condition, items). Last entry may have None condition for `else`.
     pub branches: Vec<(Option<super::expr::Expression>, Vec<ModuleItem>)>,
+    pub span: Span,
+}
+
+/// A single arm of a generate-case construct.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GenerateCaseArm {
+    /// Constant expressions matched against the selector. Empty for the
+    /// `default` arm.
+    pub values: Vec<super::expr::Expression>,
+    /// Generate items elaborated when this arm is selected.
+    pub items: Vec<ModuleItem>,
+}
+
+/// A generate-case construct: case (selector) <arm>* endcase
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GenerateCase {
+    pub selector: super::expr::Expression,
+    pub arms: Vec<GenerateCaseArm>,
     pub span: Span,
 }
 
