@@ -830,6 +830,33 @@ impl Value {
         if eq.to_u64() == Some(1) { Value::from_u64(0, 1) } else { Value::from_u64(1, 1) }
     }
 
+    /// casez wildcard equality (IEEE 1800 §12.5.1): Z bits (also written
+    /// `?` in literals — both lex to LogicBit::Z) on either side are
+    /// treated as don't-care positions and always match.
+    pub fn casez_eq(&self, other: &Value) -> Value {
+        let w = self.width.max(other.width) as usize;
+        for i in 0..w {
+            let a = self.get_bit(i);
+            let b = other.get_bit(i);
+            if a == LogicBit::Z || b == LogicBit::Z { continue; }
+            if a != b { return Value::from_u64(0, 1); }
+        }
+        Value::from_u64(1, 1)
+    }
+
+    /// casex wildcard equality: X and Z bits on either side are
+    /// treated as don't-care.
+    pub fn casex_eq(&self, other: &Value) -> Value {
+        let w = self.width.max(other.width) as usize;
+        for i in 0..w {
+            let a = self.get_bit(i);
+            let b = other.get_bit(i);
+            if matches!(a, LogicBit::X | LogicBit::Z) || matches!(b, LogicBit::X | LogicBit::Z) { continue; }
+            if a != b { return Value::from_u64(0, 1); }
+        }
+        Value::from_u64(1, 1)
+    }
+
     #[inline]
     pub fn less_than(&self, other: &Value) -> Value {
         if self.has_xz() || other.has_xz() { return Value::new(1); }
@@ -1217,7 +1244,7 @@ impl Value {
     /// Parse from a string with given radix (2, 8, 10, 16)
     pub fn from_str_radix(s: &str, radix: u32, width: u32) -> Self {
         let s = s.trim().replace("_", "");
-        if s.contains('x') || s.contains('X') || s.contains('z') || s.contains('Z') {
+        if s.contains('x') || s.contains('X') || s.contains('z') || s.contains('Z') || s.contains('?') {
             // Parse with unknown bits
             let mut val = Self::zero(width);
             let bits_per_digit = match radix {
