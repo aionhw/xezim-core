@@ -253,10 +253,38 @@ impl Parser {
                 Statement::new(StatementKind::Null, self.span_from(start)) // Skip for now
             }
             // User-defined type variable declaration: TypeName var [= expr];
-            // Detected by: Identifier followed by Identifier, Hash (if followed by identifier), 
+            // Detected by: Identifier followed by Identifier, Hash (if followed by identifier),
             // or DoubleColon (if followed by identifier).
             // Expressions starting with Identifier: class_scope::member, pkg::member, obj.member
-            TokenKind::Identifier if !self.peek_is_class_scope() && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon) =>
+            // Also: `typedef_t [packed-dims] var;` — distinguish from `arr[idx] = ...`
+            // by requiring an Identifier after the balanced [..] block.
+            TokenKind::Identifier if !self.peek_is_class_scope() && (
+                matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon)
+                || (self.peek_kind() == TokenKind::LBracket && {
+                    // Look-ahead: balance brackets and check what follows.
+                    let mut depth: i32 = 0;
+                    let mut k: usize = 0;
+                    let mut next_after = TokenKind::Eof;
+                    loop {
+                        let kind = self.peek_kind_n(k + 1);
+                        match kind {
+                            TokenKind::LBracket => depth += 1,
+                            TokenKind::RBracket => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    next_after = self.peek_kind_n(k + 2);
+                                    break;
+                                }
+                            }
+                            TokenKind::Eof => break,
+                            _ => {}
+                        }
+                        k += 1;
+                        if k > 64 { break; }
+                    }
+                    matches!(next_after, TokenKind::Identifier)
+                })
+            ) =>
             {
                 let data_type = self.parse_data_type();
                 let mut declarators = Vec::new();

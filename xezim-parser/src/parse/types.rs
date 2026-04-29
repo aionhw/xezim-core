@@ -263,11 +263,28 @@ fn parse_enum_type(&mut self) -> DataType {
             if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
             let mstart = self.current().span.start;
             let name = self.parse_identifier();
+            // IEEE 1800-2017 §6.19 enum_name_declaration:
+            //   identifier [ '[' integral_number [ ':' integral_number ] ']' ] [ '=' constant_expression ]
+            // E.g. `ReqPeriResetIdx[0:1]` declares `ReqPeriResetIdx0` and
+            // `ReqPeriResetIdx1`. We capture the range; downstream
+            // elaboration can split it.
+            let range = if self.eat(TokenKind::LBracket).is_some() {
+                let lo = self.parse_expression();
+                let hi = if self.eat(TokenKind::Colon).is_some() {
+                    self.parse_expression()
+                } else {
+                    lo.clone()
+                };
+                self.expect(TokenKind::RBracket);
+                Some((lo, hi))
+            } else {
+                None
+            };
             let init = if self.eat(TokenKind::Assign).is_some() {
                 Some(self.parse_expression())
             } else { None };
             members.push(crate::ast::types::EnumMember {
-                name, range: None, init, span: self.span_from(mstart),
+                name, range, init, span: self.span_from(mstart),
             });
             if self.eat(TokenKind::Comma).is_none() { break; }
         }

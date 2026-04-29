@@ -220,9 +220,17 @@ impl Parser {
                             (self.at(TokenKind::Identifier) && (
                                 self.peek_kind() == TokenKind::Identifier ||
                                 (self.peek_kind() == TokenKind::DoubleColon && self.peek_kind_n(2) != TokenKind::KwNew) ||
-                                self.peek_kind() == TokenKind::Hash
+                                self.peek_kind() == TokenKind::Hash ||
+                                // `function automatic typedef_t [7:0] name(...)` — packed
+                                // dimension on a typedef-named return type.
+                                self.peek_kind() == TokenKind::LBracket
                             )) {
             self.parse_data_type()
+        } else if self.at(TokenKind::LBracket) {
+            // `function automatic [PtrW-1:0] name(...)` — implicit type
+            // (just packed dimensions, no leading type name).
+            let dims = self.parse_packed_dimensions();
+            DataType::Implicit { signing: None, dimensions: dims, span: self.span_from(start) }
         } else {
             DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
         };
@@ -368,14 +376,38 @@ impl Parser {
             } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon) {
                 self.parse_data_type()
             } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket {
-                // Could be user-defined type with packed dims, or plain identifier with unpacked dims.
-                // It's safer to parse as data_type if it looks like a type, but sv_parser might need more lookahead.
-                // We'll parse it as a type, and if we fail to find a port name after, it's an error.
-                // For now, let's assume it's a data type if there's another identifier later, but without unlimited lookahead,
-                // we'll just try to parse it as a type if it has packed dims.
-                // Actually, let's stick to the previous simple logic for LBracket, but fix the others:
-                let type_name = self.parse_identifier();
-                DataType::TypeReference { name: TypeName { scope: None, name: type_name, span: self.span_from(start) }, dimensions: Vec::new(), type_args: Vec::new(), span: self.span_from(start) }
+                // `typedef_t [7:0] port_name` — user-defined type with packed
+                // dimensions. Look ahead past the [..] balanced brackets: if
+                // the next token after the close-bracket is an identifier
+                // (the port name), this is a typedef-with-packed-dims; parse
+                // it as a full data type. Otherwise it's the legacy
+                // implicit-name-with-unpacked-dims fallback.
+                let mut depth: i32 = 0;
+                let mut k: usize = 0;
+                let mut next_after = TokenKind::Eof;
+                loop {
+                    let kind = self.peek_kind_n(k + 1);
+                    match kind {
+                        TokenKind::LBracket => depth += 1,
+                        TokenKind::RBracket => {
+                            depth -= 1;
+                            if depth == 0 {
+                                next_after = self.peek_kind_n(k + 2);
+                                break;
+                            }
+                        }
+                        TokenKind::Eof => break,
+                        _ => {}
+                    }
+                    k += 1;
+                    if k > 64 { break; }
+                }
+                if matches!(next_after, TokenKind::Identifier) {
+                    self.parse_data_type()
+                } else {
+                    let type_name = self.parse_identifier();
+                    DataType::TypeReference { name: TypeName { scope: None, name: type_name, span: self.span_from(start) }, dimensions: Vec::new(), type_args: Vec::new(), span: self.span_from(start) }
+                }
             } else if self.at(TokenKind::LBracket) {
                 let dims = self.parse_packed_dimensions();
                 DataType::Implicit { signing: None, dimensions: dims, span: self.span_from(start) }
@@ -413,10 +445,13 @@ impl Parser {
                     Some(PackageItem::DPIExport(self.parse_dpi_export()))
                 } else {
                     // Non-DPI export declarations are not modeled; consume statement.
+                    // Return PackageItem::Null (not None) so the package-decl loop
+                    // doesn't fall through to its `else { self.bump(); }` recovery
+                    // and accidentally swallow the next token (e.g. `endpackage`).
                     self.bump();
                     while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
                     self.expect(TokenKind::Semicolon);
-                    None
+                    Some(PackageItem::Null)
                 }
             }
             TokenKind::KwClass => Some(PackageItem::Class(self.parse_class_declaration())),

@@ -664,4 +664,10 @@ pub enum PackageItem {
     Checker(CheckerDeclaration),
     Let(LetDeclaration),
     Nettype(NettypeDeclaration),
+    /// Placeholder for package items that the parser consumed but does not
+    /// model (e.g. non-DPI `export pkg::*;` re-exports). Lets
+    /// `parse_package_declaration`'s item loop consume them without falling
+    /// through to its `else { self.bump(); }` recovery, which would otherwise
+    /// eat the `endpackage` keyword and corrupt parsing.
+    Null,
 }
