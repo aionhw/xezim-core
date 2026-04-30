@@ -54,6 +54,125 @@ pub struct InitialBlock {
     pub stmt: Statement,
 }
 
+// ----------------------------------------------------------------------------
+// Deferred-rewrite (lazy-prefix) infrastructure — fix #7.
+//
+// `inline_module_items` historically eagerly rewrote each instance's procedural
+// body (always/initial/cont-assign) at elaborate time, producing a per-instance
+// owned AST in elab.always_blocks/initial_blocks/continuous_assigns. For
+// designs that wrap many instances of large auto-generated modules
+// (e.g. OpenTitan rv_core_ibex_cfg_reg_top with 26× prim_subreg) this peak
+// memory is multi-GB.
+//
+// The lazy-prefix path stores the rewrite *context* alongside an Rc-shared
+// reference to the (unrewritten) source AST. The rewrite produces an owned
+// AST only at consumption time, so peak memory is bounded by:
+//   sum(pending contexts)  +  one materialized block in flight
+// instead of:
+//   sum(materialized blocks)
+//
+// Sharing strategy: source ASTs are shared via Rc<Statement> / Rc<Expression>.
+// `local_names` is shared via Rc<HashSet<String>> across siblings of the same
+// submodule (a single Rc lives in PreparedModuleItems and is cloned cheaply
+// per instance). port_map and interface_map are per-instance owned.
+//
+// A streaming consumer (the simulator's bytecode compiler) is expected to
+// drain `pending_*` one block at a time via the `drain_pending_*` helpers,
+// compile-and-drop, so the materialized AST never co-exists in bulk.
+//
+// For non-streaming callers, `ElaboratedModule::materialize_pending()`
+// performs a non-streaming drain into `always_blocks`/`initial_blocks`/
+// `continuous_assigns` — preserving prior semantics at the cost of peak.
+// ----------------------------------------------------------------------------
+
+/// Per-instance context needed to materialize a deferred procedural body.
+/// Held lightweight: cloning is cheap because shared structures sit behind Rc.
+#[derive(Debug, Clone)]
+pub struct RewriteCtx {
+    pub prefix: String,
+    /// Port name → connecting expression in the parent scope. Per-instance
+    /// (different connections per instantiation), so owned per ctx.
+    pub port_map: HashMap<String, Expression>,
+    /// Names declared locally inside the submodule. Shared across siblings of
+    /// the same submodule via the prepared-items cache. Uses
+    /// `std::collections::HashSet` to match `rewrite_expr`/`rewrite_stmt`
+    /// signatures (which deliberately don't take ahash for hash determinism
+    /// across the rewrite boundary).
+    pub local_names: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Interface-port substitutions (interface name → parent path). Per-branch
+    /// in the recursion tree; cloning the small map is cheap.
+    pub interface_map: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAlways {
+    pub kind: AlwaysKind,
+    /// Source Statement, shared with the prepared-items cache so 26 sibling
+    /// instances of the same submodule all point at the same Rc<Statement>.
+    pub source: std::rc::Rc<Statement>,
+    pub ctx: RewriteCtx,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingInitial {
+    pub source: std::rc::Rc<Statement>,
+    pub ctx: RewriteCtx,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingContAssign {
+    pub lhs_source: std::rc::Rc<Expression>,
+    pub rhs_source: std::rc::Rc<Expression>,
+    pub ctx: RewriteCtx,
+}
+
+impl PendingAlways {
+    /// Run the rewrite once and produce the owned AlwaysBlock. Drops self.
+    pub fn materialize(self) -> AlwaysBlock {
+        let stmt = rewrite_stmt(
+            &self.source,
+            &self.ctx.prefix,
+            &self.ctx.port_map,
+            &self.ctx.local_names,
+            &self.ctx.interface_map,
+        );
+        AlwaysBlock { kind: self.kind, stmt }
+    }
+}
+
+impl PendingInitial {
+    pub fn materialize(self) -> InitialBlock {
+        let stmt = rewrite_stmt(
+            &self.source,
+            &self.ctx.prefix,
+            &self.ctx.port_map,
+            &self.ctx.local_names,
+            &self.ctx.interface_map,
+        );
+        InitialBlock { stmt }
+    }
+}
+
+impl PendingContAssign {
+    pub fn materialize(self) -> ContinuousAssignment {
+        let lhs = rewrite_expr(
+            &self.lhs_source,
+            &self.ctx.prefix,
+            &self.ctx.port_map,
+            &self.ctx.local_names,
+            &self.ctx.interface_map,
+        );
+        let rhs = rewrite_expr(
+            &self.rhs_source,
+            &self.ctx.prefix,
+            &self.ctx.port_map,
+            &self.ctx.local_names,
+            &self.ctx.interface_map,
+        );
+        ContinuousAssignment { lhs, rhs }
+    }
+}
+
 /// Elaborated class definition.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ElaboratedClass {
@@ -264,6 +383,18 @@ pub struct ElaboratedModule {
     /// Out-of-class constraint definitions: `(class_name, constraint_name)`.
     #[serde(default)]
     pub out_of_class_constraints: HashSet<(String, String)>,
+    /// Deferred-rewrite buffers (fix #7). Populated by `inline_module_items`
+    /// instead of eagerly producing rewritten ASTs in `always_blocks` /
+    /// `initial_blocks` / `continuous_assigns`. Drained by callers via
+    /// `materialize_pending` (eager) or `drain_pending_*_for_each` (streaming).
+    /// Skipped from serialization: the bincode artifact format only stores
+    /// post-materialization state.
+    #[serde(skip)]
+    pub pending_always: Vec<PendingAlways>,
+    #[serde(skip)]
+    pub pending_initial: Vec<PendingInitial>,
+    #[serde(skip)]
+    pub pending_cont_assign: Vec<PendingContAssign>,
 }
 
 impl ElaboratedModule {
@@ -303,7 +434,51 @@ impl ElaboratedModule {
             deferred_param_exprs: Vec::new(),
             nets: HashSet::new(),
             out_of_class_constraints: HashSet::new(),
+            pending_always: Vec::new(),
+            pending_initial: Vec::new(),
+            pending_cont_assign: Vec::new(),
         }
+    }
+
+    /// Eager (non-streaming) drain of pending procedural blocks. Materializes
+    /// every Pending* into the corresponding always_blocks/initial_blocks/
+    /// continuous_assigns vec. Keeps semantics identical to pre-#7 elaborate
+    /// at the cost of high peak memory — use streaming drains in performance-
+    /// sensitive paths (see drain_pending_*_for_each).
+    pub fn materialize_pending(&mut self) {
+        let pending_always = std::mem::take(&mut self.pending_always);
+        for p in pending_always {
+            self.always_blocks.push(p.materialize());
+        }
+        let pending_initial = std::mem::take(&mut self.pending_initial);
+        for p in pending_initial {
+            self.initial_blocks.push(p.materialize());
+        }
+        let pending_ca = std::mem::take(&mut self.pending_cont_assign);
+        for p in pending_ca {
+            self.continuous_assigns.push(p.materialize());
+        }
+    }
+
+    /// Streaming drain for pending always-blocks. Each block is materialized
+    /// just before the callback runs, then dropped. Peak memory is one
+    /// materialized AlwaysBlock at a time. Intended consumer: bytecode
+    /// compiler — `f` should compile and discard the AST.
+    pub fn drain_pending_always_for_each<F: FnMut(AlwaysBlock)>(&mut self, mut f: F) {
+        let pending = std::mem::take(&mut self.pending_always);
+        for p in pending { f(p.materialize()); }
+    }
+
+    /// Streaming drain for pending initial-blocks.
+    pub fn drain_pending_initial_for_each<F: FnMut(InitialBlock)>(&mut self, mut f: F) {
+        let pending = std::mem::take(&mut self.pending_initial);
+        for p in pending { f(p.materialize()); }
+    }
+
+    /// Streaming drain for pending continuous-assigns.
+    pub fn drain_pending_cont_assign_for_each<F: FnMut(ContinuousAssignment)>(&mut self, mut f: F) {
+        let pending = std::mem::take(&mut self.pending_cont_assign);
+        for p in pending { f(p.materialize()); }
     }
 }
 
@@ -3133,6 +3308,16 @@ pub fn inline_instantiations(
     }
 
     // Final rewrite of all blocks to convert MemberAccess to HierarchicalIdentifier and handle local signals
+    // #7 default consume: drain any deferred per-instance blocks into their
+    // materialized counterparts so the top-level rewrite pass below covers
+    // them. Streaming consumers (the bytecode compiler) should opt-in via
+    // `XEZIM_LAZY_PREFIX_STREAM=1` and then call `drain_pending_*_for_each`
+    // themselves, after running an equivalent top-level pass on each
+    // materialized block one at a time.
+    if std::env::var("XEZIM_LAZY_PREFIX_STREAM").ok().as_deref() != Some("1") {
+        elab.materialize_pending();
+    }
+
     let local_names = elab.signals.keys().cloned().collect::<std::collections::HashSet<_>>();
     let port_map = HashMap::new();
     let mut interface_map = HashMap::new();
@@ -3598,7 +3783,10 @@ struct PreparedModuleItems {
     local_typedefs: std::collections::HashSet<String>,
     interface_ports: std::collections::HashSet<String>,
     port_directions: HashMap<String, PortDirection>,
-    local_names: std::collections::HashSet<String>,
+    /// Local-name set used by rewrite_expr/rewrite_stmt. Stored behind Rc so
+    /// the per-instance RewriteCtx can `Rc::clone` it cheaply (siblings of
+    /// the same submodule with the same parameters share one Rc).
+    local_names: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
 type InlinePrepCache = HashMap<String, Rc<PreparedModuleItems>>;
@@ -3744,7 +3932,7 @@ fn prepare_module_items(
         local_typedefs,
         interface_ports,
         port_directions,
-        local_names,
+        local_names: std::rc::Rc::new(local_names),
     });
     cache.insert(cache_key, Rc::clone(&prepared));
     prepared
@@ -3816,7 +4004,7 @@ fn inline_module_items(
                 // connection like `.mrd(mrd)` inside wrapper would be stored
                 // in port_map as a bare `mrd`, and later substitutions into
                 // the sub-module would insert a bare (unresolvable) name.
-                let parent_local_names = &prepared_source.local_names;
+                let parent_local_names = &*prepared_source.local_names;
 
                 if !hi.connections.is_empty() {
                     match &hi.connections[0] { // Simplification: check if first is wildcard
@@ -4218,11 +4406,11 @@ fn inline_module_items(
                         new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
                         for p in &mut new_fd.ports {
                             if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &*prepared_sub.local_names, &sub_interface_map));
                             }
                         }
                         new_fd.items = fd.items.iter()
-                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map))
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &*prepared_sub.local_names, &sub_interface_map))
                             .collect();
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
@@ -4231,41 +4419,70 @@ fn inline_module_items(
                         new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
                         for p in &mut new_td.ports {
                             if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &*prepared_sub.local_names, &sub_interface_map));
                             }
                         }
                         new_td.items = td.items.iter()
-                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map))
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &*prepared_sub.local_names, &sub_interface_map))
                             .collect();
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ContinuousAssign(ca) = sub_item {
+                        // Deferred path (#7): push as PendingContAssign instead of
+                        // eagerly materializing. The rewrite runs at consumption.
                         for (lhs, rhs) in &ca.assignments {
-                            let new_lhs = rewrite_expr(lhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
-                            let new_rhs = rewrite_expr(rhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
-                            elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: new_lhs, rhs: new_rhs,
+                            elab.pending_cont_assign.push(PendingContAssign {
+                                lhs_source: std::rc::Rc::new(lhs.clone()),
+                                rhs_source: std::rc::Rc::new(rhs.clone()),
+                                ctx: RewriteCtx {
+                                    prefix: inst_prefix.clone(),
+                                    port_map: rewrite_port_map.clone(),
+                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                    interface_map: sub_interface_map.clone(),
+                                },
                             });
                         }
                     }
                     if let ModuleItem::GateInstantiation(gi) = sub_item {
+                        // Gate instantiations expand to a small fixed set of
+                        // assigns (and/or/xor/buf/not, etc.). Inline-expand
+                        // and defer the rewrite of each via pending_cont_assign.
                         let assigns = gate_inst_to_assign_pairs(gi);
                         for (lhs, rhs) in assigns {
-                            let new_lhs = rewrite_expr(&lhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
-                            let new_rhs = rewrite_expr(&rhs, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
-                            elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: new_lhs, rhs: new_rhs,
+                            elab.pending_cont_assign.push(PendingContAssign {
+                                lhs_source: std::rc::Rc::new(lhs),
+                                rhs_source: std::rc::Rc::new(rhs),
+                                ctx: RewriteCtx {
+                                    prefix: inst_prefix.clone(),
+                                    port_map: rewrite_port_map.clone(),
+                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                    interface_map: sub_interface_map.clone(),
+                                },
                             });
                         }
                     }
                     if let ModuleItem::NetDeclaration(nd) = sub_item {
                         for decl in &nd.declarators {
                             if let Some(init_expr) = &decl.init {
+                                // The lhs (the declared net name with the
+                                // sub-instance prefix) is an Ident that
+                                // rewrite_expr would only prefix-substitute,
+                                // and we can build it directly here. The rhs
+                                // (the init expression from the source) goes
+                                // through the deferred-rewrite path.
                                 let lhs_name = format!("{}{}", inst_prefix, decl.name.name);
                                 let new_lhs = make_ident_expr(&lhs_name);
-                                let new_rhs = rewrite_expr(init_expr, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map);
-                                elab.continuous_assigns.push(ContinuousAssignment {
-                                    lhs: new_lhs, rhs: new_rhs,
+                                elab.pending_cont_assign.push(PendingContAssign {
+                                    // Pre-built lhs: wrap in Rc; ctx's prefix
+                                    // is empty so rewrite is a no-op for it.
+                                    lhs_source: std::rc::Rc::new(new_lhs),
+                                    rhs_source: std::rc::Rc::new(init_expr.clone()),
+                                    ctx: RewriteCtx {
+                                        prefix: inst_prefix.clone(),
+                                        port_map: rewrite_port_map.clone(),
+                                        local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                        interface_map: sub_interface_map.clone(),
+                                    },
                                 });
                             }
                         }
@@ -4276,7 +4493,7 @@ fn inline_module_items(
                                 &make_ident_expr(&p.dst.name),
                                 &inst_prefix,
                                 &rewrite_port_map,
-                                &prepared_sub.local_names,
+                                &*prepared_sub.local_names,
                                 &sub_interface_map,
                             );
                             if let ExprKind::Ident(hier) = &dst_expr.kind {
@@ -4287,17 +4504,35 @@ fn inline_module_items(
                         }
                     }
                     if let ModuleItem::AlwaysConstruct(ac) = sub_item {
-                        elab.always_blocks.push(super::elaborate::AlwaysBlock {
+                        // Deferred path (#7): defer the per-instance AST
+                        // rewrite until consumption. Source body is wrapped
+                        // in Rc; in a future refactor PreparedModuleItems
+                        // can pre-build the Rc<Statement> once per
+                        // (module, params) so siblings of the same
+                        // submodule share storage and we skip the .clone().
+                        elab.pending_always.push(PendingAlways {
                             kind: ac.kind,
-                            stmt: rewrite_stmt(&ac.stmt, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map),
+                            source: std::rc::Rc::new(ac.stmt.clone()),
+                            ctx: RewriteCtx {
+                                prefix: inst_prefix.clone(),
+                                port_map: rewrite_port_map.clone(),
+                                local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                interface_map: sub_interface_map.clone(),
+                            },
                         });
                     }
                     if let ModuleItem::InitialConstruct(ic) = sub_item {
                         if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                             eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);
                         }
-                        elab.initial_blocks.push(super::elaborate::InitialBlock {
-                            stmt: rewrite_stmt(&ic.stmt, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map),
+                        elab.pending_initial.push(PendingInitial {
+                            source: std::rc::Rc::new(ic.stmt.clone()),
+                            ctx: RewriteCtx {
+                                prefix: inst_prefix.clone(),
+                                port_map: rewrite_port_map.clone(),
+                                local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                interface_map: sub_interface_map.clone(),
+                            },
                         });
                     }
                 }

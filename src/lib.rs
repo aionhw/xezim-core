@@ -283,6 +283,22 @@ fn parse_and_elaborate(
     )?;
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
+    if std::env::var("XEZIM_ELAB_STATS").is_ok() {
+        eprintln!("[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",
+            elab.always_blocks.len(),
+            elab.initial_blocks.len(),
+            elab.continuous_assigns.len(),
+            elab.pending_always.len(),
+            elab.pending_initial.len(),
+            elab.pending_cont_assign.len(),
+            elab.signals.len(),
+            elab.parameters.len(),
+            elab.arrays.len(),
+            elab.arrays_2d.len(),
+            elab.arrays_nd.len(),
+            elab.packed_struct_fields.len(),
+        );
+    }
     Ok((definitions, elab))
 }
 
