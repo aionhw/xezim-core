@@ -1434,11 +1434,11 @@ impl Value {
 
 impl Value {
     /// Copy the storage from another value (used in NBA apply).
-    /// Marked `#[inline]` so the `match` on (self.storage, other.storage)
-    /// collapses at the call site when both sides are monomorphic —
-    /// crucial for the `snapshot_edge_signals` loop that runs this
-    /// 5B times per c910 simulation.
-    #[inline]
+    /// `#[inline(always)]` so the `match` on (self.storage, other.storage)
+    /// collapses at the call site (LoadSignal hot path in the bytecode VM)
+    /// — copy_from accounted for 16% of c910 hello CPU and showed a cache-
+    /// stall pattern at the function-entry signal_table[s] load.
+    #[inline(always)]
     pub fn copy_from(&mut self, other: &Value) {
         // Fast path: Inline→Inline is just a word-level overwrite (no alloc).
         // Wide→Wide with the same length reuses `self`'s existing Vec buffer
