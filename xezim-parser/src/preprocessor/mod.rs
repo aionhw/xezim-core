@@ -514,8 +514,14 @@ impl Preprocessor {
 
     fn expand_macros(&self, source: &str) -> String {
         let mut result = self.expand_macros_once(source);
-        // Recursively expand up to 16 times to handle nested macros
-        for _ in 0..16 {
+        // Recursively expand up to 128 times to handle deeply nested macros.
+        // C906's aq_idu_cfig.h chains 25+ DIS_VEC_* defines (DIS_VEC_WIDTH →
+        // DIS_VEC_FUNC → DIS_VEC_EU → … → DIS_VEC_SRC1_DATA), each requiring
+        // one expansion iteration. The earlier 16-step cap silently truncated
+        // expansion mid-chain, leaving residual `IDENT directives that the
+        // tokenizer then reported as parse errors. We stop early on
+        // fixed-point so the cap only matters for pathological cases.
+        for _ in 0..128 {
             if !result.contains('`') { break; }
             let next = self.expand_macros_once(&result);
             if next == result { break; }
