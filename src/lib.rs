@@ -298,6 +298,30 @@ fn parse_and_elaborate(
             elab.arrays_nd.len(),
             elab.packed_struct_fields.len(),
         );
+        // Bytewise breakdown via bincode serialize. Approximation only —
+        // bincode is more compact than in-memory layout (no Vec capacity
+        // slack, no padding, no String header) but the per-section relative
+        // sizes correctly identify hot spots. On c910 hello this revealed
+        // continuous_assigns at 394 MB, always_blocks at 193 MB, signals at
+        // 173 MB — the three to target for memory work.
+        let try_size = |label: &str, bytes: Result<Vec<u8>, _>| match bytes {
+            Ok(b) => eprintln!("[elab-bytes-bincode] {}: {:>10} bytes", label, b.len()),
+            Err(_) => eprintln!("[elab-bytes-bincode] {}: <serialize failed>", label),
+        };
+        try_size("always_blocks    ", bincode::serialize(&elab.always_blocks));
+        try_size("initial_blocks   ", bincode::serialize(&elab.initial_blocks));
+        try_size("continuous_assigns", bincode::serialize(&elab.continuous_assigns));
+        try_size("signals          ", bincode::serialize(&elab.signals));
+        try_size("parameters       ", bincode::serialize(&elab.parameters));
+        try_size("arrays           ", bincode::serialize(&elab.arrays));
+        try_size("arrays_2d        ", bincode::serialize(&elab.arrays_2d));
+        try_size("arrays_nd        ", bincode::serialize(&elab.arrays_nd));
+        try_size("functions        ", bincode::serialize(&elab.functions));
+        try_size("tasks            ", bincode::serialize(&elab.tasks));
+        try_size("typedefs         ", bincode::serialize(&elab.typedefs));
+        try_size("typedef_types    ", bincode::serialize(&elab.typedef_types));
+        try_size("classes          ", bincode::serialize(&elab.classes));
+        try_size("specify_delays   ", bincode::serialize(&elab.specify_delays));
     }
     Ok((definitions, elab))
 }
