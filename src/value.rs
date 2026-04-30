@@ -1335,6 +1335,7 @@ impl Value {
     }
 
     /// Select a range of bits [left:right]
+    #[inline]
     pub fn range_select(&self, left: usize, right: usize) -> Value {
         let width = if left >= right { left - right + 1 } else { right - left + 1 };
         let lo = left.min(right);
