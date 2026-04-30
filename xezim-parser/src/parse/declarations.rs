@@ -323,7 +323,13 @@ impl Parser {
     }
 
     pub(super) fn parse_param_value(&mut self) -> ParamValue {
-        if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
+        // `.NAME(int'(...))` etc. — a type-keyword followed by `'` (apostrophe
+        // tokenized as IntegerLiteral with text "'") is a casting expression,
+        // not a type-parameter override. Defer to parse_expression in that case.
+        let is_type_cast = (self.is_data_type_keyword() || self.at(TokenKind::KwVoid))
+            && self.peek_kind() == TokenKind::IntegerLiteral
+            && self.tokens.get(self.pos + 1).map(|t| t.text.as_str()).unwrap_or("") == "'";
+        if (self.is_data_type_keyword() || self.at(TokenKind::KwVoid)) && !is_type_cast {
             ParamValue::Type(self.parse_data_type())
         } else {
             ParamValue::Expr(self.parse_expression())

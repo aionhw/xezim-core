@@ -3802,7 +3802,8 @@ fn inline_module_items(
                         sub_mod_name
                     );
                 }
-                let scoped_eval_params = local_params.clone();
+                // Was: `let scoped_eval_params = local_params.clone();` — wasted clone, only read.
+                let scoped_eval_params: &HashMap<String, Value> = local_params;
 
                 // Build port map and interface map
                 let mut port_map = HashMap::new();
@@ -3908,7 +3909,7 @@ fn inline_module_items(
                         match conn {
                             ParamConnection::Named { name, value } => {
                                 if let Some(ParamValue::Expr(v)) = value {
-                                    let mut val = eval_const_expr_val(v, &scoped_eval_params);
+                                    let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     // Check if target parameter is real or implicit real
                                     for p_decl in sub_mod.params() {
                                         if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
@@ -3939,7 +3940,7 @@ fn inline_module_items(
                                 if let Some(ParamValue::Expr(v)) = value {
                                     if let Some(p_decl) = sub_param_decls.get(i) {
                                         if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
-                                            let mut val = eval_const_expr_val(v, &scoped_eval_params);
+                                            let mut val = eval_const_expr_val(v, scoped_eval_params);
                                             if dbg_param {
                                                 eprintln!("[DBG_PARAM]     eval -> {} = {}",
                                                     assignments[0].name.name, val.to_u64().unwrap_or(0));
@@ -3960,8 +3961,9 @@ fn inline_module_items(
                     }
                 }
 
-                // Internal parameter map for resolving default parameters that depend on each other
-                let mut sub_local_params = sub_params.clone();
+                // Internal parameter map for resolving default parameters that depend on each other.
+                // Moved (was clone): sub_params is not used after this line.
+                let mut sub_local_params = sub_params;
                 
                 // Helper to add parameters from a list of items
                 let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>| {
@@ -4031,12 +4033,14 @@ fn inline_module_items(
                     });
                 }
 
-                // Declare sub-module port signals
-                // Build a param map that includes both elab.parameters (global,
-                // full-name keys) and sub_local_params (unprefixed short names)
-                // so port type widths like `[W-1:0]` resolve against the sub's
-                // overridden parameter values.
-                let port_type_params = {
+                // Build the merged param map ONCE — used for both port-signal
+                // declaration and the later sub-item processing. Skip the
+                // parent clone when local_params is empty (top-level case).
+                let sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
+                    sub_local_params.clone()
+                } else if sub_local_params.is_empty() {
+                    local_params.clone()
+                } else {
                     let mut m = local_params.clone();
                     for (k, v) in &sub_local_params {
                         m.insert(k.clone(), v.clone());
@@ -4048,7 +4052,7 @@ fn inline_module_items(
                         for port in ports {
                             if prepared_sub.interface_ports.contains(&port.name.name) { continue; }
                             let width = port.data_type.as_ref()
-                                .map(|dt| resolve_type_width(dt, Some(&port_type_params), Some(&elab.typedefs)))
+                                .map(|dt| resolve_type_width(dt, Some(&sub_merged_params), Some(&elab.typedefs)))
                                 .unwrap_or(1);
                             let sig_name = format!("{}{}", inst_prefix, port.name.name);
                             let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
@@ -4083,16 +4087,7 @@ fn inline_module_items(
                     PortList::Empty => {}
                 }
 
-                // Declare internal nets/vars (including from generate blocks)
-                // Merge elab.parameters with sub_local_params so unprefixed
-                // param references in type widths/dimensions resolve correctly
-                let sub_merged_params = {
-                    let mut m = local_params.clone();
-                    for (k, v) in &sub_local_params {
-                        m.insert(k.clone(), v.clone());
-                    }
-                    m
-                };
+                // sub_merged_params already built above for port declarations.
                 for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
                         if let DataType::Enum(et) = &td.data_type {

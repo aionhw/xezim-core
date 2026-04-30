@@ -229,6 +229,13 @@ impl Parser {
         }
 
         match self.current_kind() {
+            // `timeunit 1ns / 10ps;` / `timeprecision …;` inside a module —
+            // already parsed at top-level via Description::TimeunitsDecl;
+            // accept and discard inside modules too (LRM allows both).
+            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
+                let _ = self.parse_timeunits_declaration();
+                Some(ModuleItem::Null)
+            }
             // Elaboration-time system tasks at module-item level: $error, $warning,
             // $info, $fatal — typically inside a `STATIC_ASSERT` macro expansion
             // (`generate if (!(cond)) $error msg; endgenerate`). Parse and discard.
@@ -664,6 +671,35 @@ impl Parser {
             _ => GateType::And,
         };
         self.bump();
+        // Optional drive_strength `(strong0, strong1)` etc.
+        if self.at(TokenKind::LParen) && self.peek_kind() == TokenKind::Identifier {
+            // Heuristic: if it looks like (strength, strength), skip it.
+            // We don't track strengths, just consume.
+            let mut k = 1;
+            while !matches!(self.peek_kind_n(k + 1), TokenKind::RParen | TokenKind::Eof) {
+                k += 1;
+                if k > 8 { break; }
+            }
+            // Only swallow if balanced and contains a comma — otherwise this
+            // `(` likely belongs to the first instance's terminal list.
+            // Skip — too risky without proper strength keyword detection.
+        }
+        // Optional `#(delay)` or `#delay` spec between the gate keyword and
+        // the first instance: `buf #(D) name (...)`.
+        if self.eat(TokenKind::Hash).is_some() {
+            if self.eat(TokenKind::LParen).is_some() {
+                let mut depth = 1;
+                while depth > 0 && !self.at(TokenKind::Eof) {
+                    match self.current_kind() {
+                        TokenKind::LParen => { depth += 1; self.bump(); }
+                        TokenKind::RParen => { depth -= 1; self.bump(); }
+                        _ => { self.bump(); }
+                    }
+                }
+            } else {
+                let _ = self.parse_expression();
+            }
+        }
         let mut instances = Vec::new();
         loop {
             let istart = self.current().span.start;

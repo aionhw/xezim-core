@@ -36,14 +36,16 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
     Ok(Some(elab))
 }
 
+use std::rc::Rc;
+
 #[derive(Debug, Clone)]
 pub enum SourceDefinition {
-    Module(ast::module::ModuleDeclaration),
-    Interface(ast::module::InterfaceDeclaration),
-    Program(ast::module::ProgramDeclaration),
-    Class(ast::decl::ClassDeclaration),
-    Package(ast::module::PackageDeclaration),
-    Typedef(ast::decl::TypedefDeclaration),
+    Module(Rc<ast::module::ModuleDeclaration>),
+    Interface(Rc<ast::module::InterfaceDeclaration>),
+    Program(Rc<ast::module::ProgramDeclaration>),
+    Class(Rc<ast::decl::ClassDeclaration>),
+    Package(Rc<ast::module::PackageDeclaration>),
+    Typedef(Rc<ast::decl::TypedefDeclaration>),
 }
 
 impl SourceDefinition {
@@ -119,11 +121,11 @@ pub fn parse_and_elaborate_multi(
     }
 
     let lib_defines = pp.snapshot_defines();
-    parse_and_elaborate(&all_descriptions, top_module_name, include_dirs, &lib_defines)
+    parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines)
 }
 
 fn parse_and_elaborate(
-    all_descriptions: &[ast::Description],
+    all_descriptions: Vec<ast::Description>,
     top_module_name: Option<&str>,
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
@@ -138,53 +140,60 @@ fn parse_and_elaborate(
     for desc in all_descriptions {
         match desc {
             ast::Description::Module(m) => {
-                definitions.insert(m.name.name.clone(), SourceDefinition::Module(m.clone()));
-                top_module = Some(m.name.name.clone());
+                let name = m.name.name.clone();
+                top_module = Some(name.clone());
+                definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
             }
             ast::Description::Interface(i) => {
-                definitions.insert(i.name.name.clone(), SourceDefinition::Interface(i.clone()));
+                let name = i.name.name.clone();
+                definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
             ast::Description::Program(p) => {
-                definitions.insert(p.name.name.clone(), SourceDefinition::Program(p.clone()));
-                top_module = Some(p.name.name.clone());
+                let name = p.name.name.clone();
+                top_module = Some(name.clone());
+                definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
             ast::Description::Class(c) => {
-                definitions.insert(c.name.name.clone(), SourceDefinition::Class(c.clone()));
+                let name = c.name.name.clone();
+                definitions.insert(name, SourceDefinition::Class(Rc::new(c)));
             }
             ast::Description::Package(p) => {
-                definitions.insert(p.name.name.clone(), SourceDefinition::Package(p.clone()));
+                let name = p.name.name.clone();
+                definitions.insert(name, SourceDefinition::Package(Rc::new(p)));
             }
             ast::Description::TypedefDecl(t) => {
-                definitions.insert(t.name.name.clone(), SourceDefinition::Typedef(t.clone()));
+                let name = t.name.name.clone();
+                definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
             }
             ast::Description::ImportDecl(id) => {
-                top_level_imports.push(id.clone());
+                top_level_imports.push(id);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
                 let m = ast::module::ModuleDeclaration {
                     attrs: Vec::new(),
                     kind: ast::module::ModuleKind::Module,
                     lifetime: None,
-                    name: c.name.clone(),
+                    name: c.name,
                     params: Vec::new(),
-                    ports: c.ports.clone(),
-                    items: c.items.clone(),
-                    endlabel: c.endlabel.clone(),
+                    ports: c.ports,
+                    items: c.items,
+                    endlabel: c.endlabel,
                     span: c.span,
                 };
-                definitions.insert(m.name.name.clone(), SourceDefinition::Module(m));
+                let name = m.name.name.clone();
+                definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Let(l)) => {
-                top_level_lets.push(l.clone());
+                top_level_lets.push(l);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Function(f)) => {
-                top_level_functions.push(f.clone());
+                top_level_functions.push(f);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Task(t)) => {
-                top_level_tasks.push(t.clone());
+                top_level_tasks.push(t);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
-                top_level_nettypes.push(n.clone());
+                top_level_nettypes.push(n);
             }
             _ => {}
         }
@@ -192,6 +201,7 @@ fn parse_and_elaborate(
     if !top_level_functions.is_empty() || !top_level_tasks.is_empty() || !top_level_nettypes.is_empty() {
         for def in definitions.values_mut() {
             if let SourceDefinition::Module(m) = def {
+                let m = Rc::make_mut(m);
                 for f in top_level_functions.iter().rev() {
                     m.items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f.clone()));
                 }
@@ -246,22 +256,22 @@ fn parse_and_elaborate(
     let def_refs: ahash::AHashMap<String, elaborate::Definition> =
         definitions.iter().filter_map(|(k, v)| {
             let def = match v {
-                SourceDefinition::Module(m) => elaborate::Definition::Module(m),
-                SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
-                SourceDefinition::Program(p) => elaborate::Definition::Program(p),
-                SourceDefinition::Class(c) => elaborate::Definition::Class(c),
-                SourceDefinition::Package(p) => elaborate::Definition::Package(p),
-                SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(t),
+                SourceDefinition::Module(m) => elaborate::Definition::Module(&**m),
+                SourceDefinition::Interface(i) => elaborate::Definition::Interface(&**i),
+                SourceDefinition::Program(p) => elaborate::Definition::Program(&**p),
+                SourceDefinition::Class(c) => elaborate::Definition::Class(&**c),
+                SourceDefinition::Package(p) => elaborate::Definition::Package(&**p),
+                SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(&**t),
             };
             Some((k.clone(), def))
         }).collect();
 
     let elab_def = match top_def {
-        SourceDefinition::Module(m) => elaborate::Definition::Module(m),
-        SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
-        SourceDefinition::Program(p) => elaborate::Definition::Program(p),
-        SourceDefinition::Class(c) => elaborate::Definition::Class(c),
-        SourceDefinition::Package(p) => elaborate::Definition::Package(p),
+        SourceDefinition::Module(m) => elaborate::Definition::Module(&**m),
+        SourceDefinition::Interface(i) => elaborate::Definition::Interface(&**i),
+        SourceDefinition::Program(p) => elaborate::Definition::Program(&**p),
+        SourceDefinition::Class(c) => elaborate::Definition::Class(&**c),
+        SourceDefinition::Package(p) => elaborate::Definition::Package(&**p),
         _ => return Err(format!("Top-level element '{}' is not a module or program", top_name)),
     };
     let mut elab = elaborate::elaborate_module_with_defs(
@@ -337,22 +347,28 @@ fn resolve_library_modules(
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(m) => {
-                    definitions.entry(m.name.name.clone()).or_insert(SourceDefinition::Module(m));
+                    let name = m.name.name.clone();
+                    definitions.entry(name).or_insert_with(|| SourceDefinition::Module(Rc::new(m)));
                 }
                 ast::Description::Interface(i) => {
-                    definitions.entry(i.name.name.clone()).or_insert(SourceDefinition::Interface(i));
+                    let name = i.name.name.clone();
+                    definitions.entry(name).or_insert_with(|| SourceDefinition::Interface(Rc::new(i)));
                 }
                 ast::Description::Program(p) => {
-                    definitions.entry(p.name.name.clone()).or_insert(SourceDefinition::Program(p));
+                    let name = p.name.name.clone();
+                    definitions.entry(name).or_insert_with(|| SourceDefinition::Program(Rc::new(p)));
                 }
                 ast::Description::Class(c) => {
-                    definitions.entry(c.name.name.clone()).or_insert(SourceDefinition::Class(c));
+                    let name = c.name.name.clone();
+                    definitions.entry(name).or_insert_with(|| SourceDefinition::Class(Rc::new(c)));
                 }
                 ast::Description::Package(p) => {
-                    definitions.entry(p.name.name.clone()).or_insert(SourceDefinition::Package(p));
+                    let name = p.name.name.clone();
+                    definitions.entry(name).or_insert_with(|| SourceDefinition::Package(Rc::new(p)));
                 }
                 ast::Description::TypedefDecl(t) => {
-                    definitions.entry(t.name.name.clone()).or_insert(SourceDefinition::Typedef(t));
+                    let name = t.name.name.clone();
+                    definitions.entry(name).or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
                 }
                 _ => {}
             }
