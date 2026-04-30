@@ -123,6 +123,25 @@ impl Parser {
         }
     }
 
+    /// Skip an optional inline `(* attr_spec *)` attribute. Used at points
+    /// where the LRM grammar permits attribute_instance prefixes that the
+    /// preprocessor's standalone-line stripper missed. Tolerates nested
+    /// parens inside the attribute body.
+    pub(super) fn skip_optional_attribute(&mut self) {
+        if self.at(TokenKind::LParen) && self.peek_kind() == TokenKind::Star {
+            self.bump(); // (
+            self.bump(); // *
+            // consume up to and including the closing *)
+            while !self.at(TokenKind::Eof) {
+                if self.at(TokenKind::Star) && self.peek_kind() == TokenKind::RParen {
+                    self.bump(); self.bump();
+                    break;
+                }
+                self.bump();
+            }
+        }
+    }
+
     pub(super) fn parse_optional_signing(&mut self) -> Option<Signing> {
         match self.current_kind() {
             TokenKind::KwSigned => { self.bump(); Some(Signing::Signed) }

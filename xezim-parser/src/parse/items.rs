@@ -290,6 +290,10 @@ impl Parser {
                     TokenKind::KwAlways_latch => AlwaysKind::AlwaysLatch,
                     _ => AlwaysKind::Always,
                 };
+                // Skip optional inline attribute spec `(* ... *)` between
+                // `always_*` and the body. The preprocessor only strips
+                // standalone-line attributes; inline ones reach the parser.
+                self.skip_optional_attribute();
                 let stmt = self.parse_statement();
                 Some(ModuleItem::AlwaysConstruct(AlwaysConstruct { kind, stmt, span: self.span_from(start) }))
             }

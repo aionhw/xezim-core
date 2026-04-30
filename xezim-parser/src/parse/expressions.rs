@@ -430,15 +430,19 @@ impl Parser {
             TokenKind::ApostropheLBrace => {
                 self.bump();
                 let mut items = Vec::new();
+                let mut first = true;
                 loop {
                     if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
-                    
+
                     // Possible items:
                     // 1. default: expr
                     // 2. type: expr
                     // 3. name: expr
                     // 4. expr (ordered)
-                    
+                    // 5. count { expr {, expr} } — replication form,
+                    //    only as the first item: `'{N{expr}}` (IEEE 1800-2017
+                    //    §10.10.1).
+
                     if self.at(TokenKind::KwDefault) {
                         self.bump();
                         self.expect(TokenKind::Colon);
@@ -455,9 +459,26 @@ impl Parser {
                         let expr = self.parse_expression();
                         items.push(AssignmentPatternItem::Named(name, expr));
                     } else {
-                        items.push(AssignmentPatternItem::Ordered(self.parse_expression()));
+                        let count_expr = self.parse_expression();
+                        if first && self.at(TokenKind::LBrace) {
+                            // Replication form: count { e1, e2, ... }
+                            self.bump(); // '{'
+                            let mut rep_items = Vec::new();
+                            loop {
+                                rep_items.push(self.parse_expression());
+                                if self.eat(TokenKind::Comma).is_none() { break; }
+                            }
+                            self.expect(TokenKind::RBrace);
+                            items.push(AssignmentPatternItem::Ordered(Expression::new(
+                                ExprKind::Replication { count: Box::new(count_expr), exprs: rep_items },
+                                self.span_from(start),
+                            )));
+                        } else {
+                            items.push(AssignmentPatternItem::Ordered(count_expr));
+                        }
                     }
-                    
+                    first = false;
+
                     if self.eat(TokenKind::Comma).is_none() { break; }
                 }
                 self.expect(TokenKind::RBrace);
