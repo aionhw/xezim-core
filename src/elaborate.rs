@@ -3308,13 +3308,21 @@ pub fn inline_instantiations(
     }
 
     // Final rewrite of all blocks to convert MemberAccess to HierarchicalIdentifier and handle local signals
-    // #7 default consume: drain any deferred per-instance blocks into their
-    // materialized counterparts so the top-level rewrite pass below covers
-    // them. Streaming consumers (the bytecode compiler) should opt-in via
-    // `XEZIM_LAZY_PREFIX_STREAM=1` and then call `drain_pending_*_for_each`
-    // themselves, after running an equivalent top-level pass on each
-    // materialized block one at a time.
-    if std::env::var("XEZIM_LAZY_PREFIX_STREAM").ok().as_deref() != Some("1") {
+    // #7 default: keep pending_* lazy. The bytecode compiler in
+    // simulator.rs drains pending_always / pending_initial /
+    // pending_cont_assign one-at-a-time inside classify_always_blocks /
+    // build_comb_entries / event_loop, materializing per block instead
+    // of accumulating everything in always_blocks/initial_blocks/
+    // continuous_assigns first. Measured: c910 hello sim 220 s → 194 s
+    // (-12%) with lazy default; c906 hello sim 36.8 s → 35.3 s (-4%).
+    // Memory unchanged (the saving is materialize_pending wall time
+    // skipped, not peak memory).
+    //
+    // Set XEZIM_NO_LAZY_PREFIX=1 to fall back to eager materialization,
+    // useful for tools that need ElaboratedModule fully populated
+    // (e.g. write_compiled-then-read-back artifact roundtrips, since
+    // pending_* fields are #[serde(skip)]).
+    if std::env::var("XEZIM_NO_LAZY_PREFIX").ok().as_deref() == Some("1") {
         elab.materialize_pending();
     }
 
