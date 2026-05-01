@@ -3777,15 +3777,26 @@ fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -
     }
 }
 
+/// Pre-built `Rc`-shared sources for the deferred-rewrite kinds (#7).
+/// Built once per `(module, params)` cache hit; sibling instances share
+/// via `Rc::clone` (refcount bump) instead of cloning the AST per push.
+#[derive(Debug, Clone)]
+enum BodySource {
+    ContAssign(Vec<(std::rc::Rc<Expression>, std::rc::Rc<Expression>)>),
+    GateInst(Vec<(std::rc::Rc<Expression>, std::rc::Rc<Expression>)>),
+    NetInits(Vec<(String, std::rc::Rc<Expression>)>),
+    Always(AlwaysKind, std::rc::Rc<Statement>),
+    Initial(std::rc::Rc<Statement>),
+    Other,
+}
+
 #[derive(Debug, Clone)]
 struct PreparedModuleItems {
     effective_items: Vec<ModuleItem>,
+    body_sources: Vec<BodySource>,
     local_typedefs: std::collections::HashSet<String>,
     interface_ports: std::collections::HashSet<String>,
     port_directions: HashMap<String, PortDirection>,
-    /// Local-name set used by rewrite_expr/rewrite_stmt. Stored behind Rc so
-    /// the per-instance RewriteCtx can `Rc::clone` it cheaply (siblings of
-    /// the same submodule with the same parameters share one Rc).
     local_names: std::rc::Rc<std::collections::HashSet<String>>,
 }
 
@@ -3927,8 +3938,32 @@ fn prepare_module_items(
         }
     }
 
+    let body_sources: Vec<BodySource> = effective_items.iter().map(|item| {
+        match item {
+            ModuleItem::ContinuousAssign(ca) => BodySource::ContAssign(
+                ca.assignments.iter()
+                    .map(|(l, r)| (std::rc::Rc::new(l.clone()), std::rc::Rc::new(r.clone())))
+                    .collect()
+            ),
+            ModuleItem::GateInstantiation(gi) => BodySource::GateInst(
+                gate_inst_to_assign_pairs(gi).into_iter()
+                    .map(|(l, r)| (std::rc::Rc::new(l), std::rc::Rc::new(r)))
+                    .collect()
+            ),
+            ModuleItem::NetDeclaration(nd) => BodySource::NetInits(
+                nd.declarators.iter()
+                    .filter_map(|d| d.init.as_ref().map(|init| (d.name.name.clone(), std::rc::Rc::new(init.clone()))))
+                    .collect()
+            ),
+            ModuleItem::AlwaysConstruct(ac) => BodySource::Always(ac.kind, std::rc::Rc::new(ac.stmt.clone())),
+            ModuleItem::InitialConstruct(ic) => BodySource::Initial(std::rc::Rc::new(ic.stmt.clone())),
+            _ => BodySource::Other,
+        }
+    }).collect();
+
     let prepared = Rc::new(PreparedModuleItems {
         effective_items,
+        body_sources,
         local_typedefs,
         interface_ports,
         port_directions,
@@ -4400,7 +4435,7 @@ fn inline_module_items(
                     .collect();
 
                 // Inline the sub-module's continuous assigns
-                for sub_item in &prepared_sub.effective_items {
+                for (sub_item, body_src) in prepared_sub.effective_items.iter().zip(prepared_sub.body_sources.iter()) {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
                         new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
@@ -4427,56 +4462,47 @@ fn inline_module_items(
                             .collect();
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
-                    if let ModuleItem::ContinuousAssign(ca) = sub_item {
-                        // Deferred path (#7): push as PendingContAssign instead of
-                        // eagerly materializing. The rewrite runs at consumption.
-                        for (lhs, rhs) in &ca.assignments {
-                            elab.pending_cont_assign.push(PendingContAssign {
-                                lhs_source: std::rc::Rc::new(lhs.clone()),
-                                rhs_source: std::rc::Rc::new(rhs.clone()),
-                                ctx: RewriteCtx {
-                                    prefix: inst_prefix.clone(),
-                                    port_map: rewrite_port_map.clone(),
-                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                    interface_map: sub_interface_map.clone(),
-                                },
-                            });
+                    if matches!(sub_item, ModuleItem::ContinuousAssign(_)) {
+                        // #7: Rc-share source ASTs across sibling instances.
+                        if let BodySource::ContAssign(pairs) = body_src {
+                            for (lhs_rc, rhs_rc) in pairs {
+                                elab.pending_cont_assign.push(PendingContAssign {
+                                    lhs_source: std::rc::Rc::clone(lhs_rc),
+                                    rhs_source: std::rc::Rc::clone(rhs_rc),
+                                    ctx: RewriteCtx {
+                                        prefix: inst_prefix.clone(),
+                                        port_map: rewrite_port_map.clone(),
+                                        local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                        interface_map: sub_interface_map.clone(),
+                                    },
+                                });
+                            }
                         }
                     }
-                    if let ModuleItem::GateInstantiation(gi) = sub_item {
-                        // Gate instantiations expand to a small fixed set of
-                        // assigns (and/or/xor/buf/not, etc.). Inline-expand
-                        // and defer the rewrite of each via pending_cont_assign.
-                        let assigns = gate_inst_to_assign_pairs(gi);
-                        for (lhs, rhs) in assigns {
-                            elab.pending_cont_assign.push(PendingContAssign {
-                                lhs_source: std::rc::Rc::new(lhs),
-                                rhs_source: std::rc::Rc::new(rhs),
-                                ctx: RewriteCtx {
-                                    prefix: inst_prefix.clone(),
-                                    port_map: rewrite_port_map.clone(),
-                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                    interface_map: sub_interface_map.clone(),
-                                },
-                            });
+                    if matches!(sub_item, ModuleItem::GateInstantiation(_)) {
+                        if let BodySource::GateInst(pairs) = body_src {
+                            for (lhs_rc, rhs_rc) in pairs {
+                                elab.pending_cont_assign.push(PendingContAssign {
+                                    lhs_source: std::rc::Rc::clone(lhs_rc),
+                                    rhs_source: std::rc::Rc::clone(rhs_rc),
+                                    ctx: RewriteCtx {
+                                        prefix: inst_prefix.clone(),
+                                        port_map: rewrite_port_map.clone(),
+                                        local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                        interface_map: sub_interface_map.clone(),
+                                    },
+                                });
+                            }
                         }
                     }
-                    if let ModuleItem::NetDeclaration(nd) = sub_item {
-                        for decl in &nd.declarators {
-                            if let Some(init_expr) = &decl.init {
-                                // The lhs (the declared net name with the
-                                // sub-instance prefix) is an Ident that
-                                // rewrite_expr would only prefix-substitute,
-                                // and we can build it directly here. The rhs
-                                // (the init expression from the source) goes
-                                // through the deferred-rewrite path.
-                                let lhs_name = format!("{}{}", inst_prefix, decl.name.name);
+                    if matches!(sub_item, ModuleItem::NetDeclaration(_)) {
+                        if let BodySource::NetInits(inits) = body_src {
+                            for (decl_name, rhs_rc) in inits {
+                                let lhs_name = format!("{}{}", inst_prefix, decl_name);
                                 let new_lhs = make_ident_expr(&lhs_name);
                                 elab.pending_cont_assign.push(PendingContAssign {
-                                    // Pre-built lhs: wrap in Rc; ctx's prefix
-                                    // is empty so rewrite is a no-op for it.
                                     lhs_source: std::rc::Rc::new(new_lhs),
-                                    rhs_source: std::rc::Rc::new(init_expr.clone()),
+                                    rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: RewriteCtx {
                                         prefix: inst_prefix.clone(),
                                         port_map: rewrite_port_map.clone(),
@@ -4503,37 +4529,35 @@ fn inline_module_items(
                             }
                         }
                     }
-                    if let ModuleItem::AlwaysConstruct(ac) = sub_item {
-                        // Deferred path (#7): defer the per-instance AST
-                        // rewrite until consumption. Source body is wrapped
-                        // in Rc; in a future refactor PreparedModuleItems
-                        // can pre-build the Rc<Statement> once per
-                        // (module, params) so siblings of the same
-                        // submodule share storage and we skip the .clone().
-                        elab.pending_always.push(PendingAlways {
-                            kind: ac.kind,
-                            source: std::rc::Rc::new(ac.stmt.clone()),
-                            ctx: RewriteCtx {
-                                prefix: inst_prefix.clone(),
-                                port_map: rewrite_port_map.clone(),
-                                local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                interface_map: sub_interface_map.clone(),
-                            },
-                        });
-                    }
-                    if let ModuleItem::InitialConstruct(ic) = sub_item {
-                        if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
-                            eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);
+                    if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {
+                        if let BodySource::Always(kind, stmt_rc) = body_src {
+                            elab.pending_always.push(PendingAlways {
+                                kind: *kind,
+                                source: std::rc::Rc::clone(stmt_rc),
+                                ctx: RewriteCtx {
+                                    prefix: inst_prefix.clone(),
+                                    port_map: rewrite_port_map.clone(),
+                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                    interface_map: sub_interface_map.clone(),
+                                },
+                            });
                         }
-                        elab.pending_initial.push(PendingInitial {
-                            source: std::rc::Rc::new(ic.stmt.clone()),
-                            ctx: RewriteCtx {
-                                prefix: inst_prefix.clone(),
-                                port_map: rewrite_port_map.clone(),
-                                local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                interface_map: sub_interface_map.clone(),
-                            },
-                        });
+                    }
+                    if matches!(sub_item, ModuleItem::InitialConstruct(_)) {
+                        if let BodySource::Initial(stmt_rc) = body_src {
+                            if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
+                                eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);
+                            }
+                            elab.pending_initial.push(PendingInitial {
+                                source: std::rc::Rc::clone(stmt_rc),
+                                ctx: RewriteCtx {
+                                    prefix: inst_prefix.clone(),
+                                    port_map: rewrite_port_map.clone(),
+                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                                    interface_map: sub_interface_map.clone(),
+                                },
+                            });
+                        }
                     }
                 }
 
