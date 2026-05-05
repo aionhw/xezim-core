@@ -39,6 +39,7 @@ pub struct Signal {
 pub struct ContinuousAssignment {
     pub lhs: Expression,
     pub rhs: Expression,
+    pub delay: u64,
 }
 
 /// An always block for combinatorial logic.
@@ -169,7 +170,7 @@ impl PendingContAssign {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        ContinuousAssignment { lhs, rhs }
+        ContinuousAssignment { lhs, rhs, delay: 0 }
     }
 }
 
@@ -1142,6 +1143,7 @@ pub fn elaborate_module_with_defs(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
+                            delay: 0,
                         });
                     }
                 }
@@ -1594,8 +1596,9 @@ pub fn elaborate_module_with_defs(
                 elab.tasks.insert(td.name.name.name.clone(), td.clone());
             }
             ModuleItem::ContinuousAssign(ca) => {
+                let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
                 for (lhs, rhs) in &ca.assignments {
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone() });
+                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
                 }
             }
             ModuleItem::AlwaysConstruct(ac) => {
@@ -1720,7 +1723,7 @@ pub fn elaborate_module_with_defs(
                         span,
                     };
                 }
-                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc });
+                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0 });
             }
             elab.continuous_assigns = kept;
         }
@@ -2493,6 +2496,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         elab.continuous_assigns.push(ContinuousAssignment {
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
+                            delay: 0,
                         });
                     }
                 }
@@ -2614,8 +2618,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 }
             }
             ModuleItem::ContinuousAssign(ca) => {
+                let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
                 for (lhs, rhs) in &ca.assignments {
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone() });
+                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -4413,17 +4418,17 @@ fn inline_module_items(
                     match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                             elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: sub_expr, rhs: parent_expr.clone(),
+                                lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
                             });
                         }
                         Some(PortDirection::Output) => {
                             elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: parent_expr.clone(), rhs: sub_expr,
+                                lhs: parent_expr.clone(), rhs: sub_expr, delay: 0,
                             });
                         }
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: sub_expr, rhs: parent_expr.clone(),
+                                lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
                             });
                         }
                     }
@@ -4611,7 +4616,7 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
 fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
-        elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs });
+        elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay: 0 });
     }
 }
 

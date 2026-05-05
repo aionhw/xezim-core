@@ -310,19 +310,22 @@ impl Parser {
                 Some(ModuleItem::FinalConstruct(FinalConstruct { stmt: st, span: self.span_from(start) })) }
             TokenKind::KwAssign => {
                 self.bump();
-                if self.eat(TokenKind::Hash).is_some() {
+                let delay = if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
-                        let _ = self.parse_expression();
+                        let expr = self.parse_expression();
                         self.expect(TokenKind::RParen);
+                        Some(expr)
                     } else {
-                        let _ = self.parse_expression();
+                        Some(self.parse_expression())
                     }
-                }
+                } else {
+                    None
+                };
                 let mut asgns = Vec::new();
                 loop { let l = self.parse_expression(); self.expect(TokenKind::Assign); let r = self.parse_expression();
                     asgns.push((l, r)); if self.eat(TokenKind::Comma).is_none() { break; } }
                 self.expect(TokenKind::Semicolon);
-                Some(ModuleItem::ContinuousAssign(ContinuousAssign { strength: None, delay: None, assignments: asgns, span: self.span_from(start) }))
+                Some(ModuleItem::ContinuousAssign(ContinuousAssign { strength: None, delay, assignments: asgns, span: self.span_from(start) }))
             }
             TokenKind::KwGenerate => {
                 self.bump();
