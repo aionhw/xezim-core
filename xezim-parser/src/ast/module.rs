@@ -70,7 +70,7 @@ pub enum PortList {
 }
 
 impl PortList {
-    pub fn get(&self, i: usize) -> Option<GenericPort> {
+    pub fn get(&self, i: usize) -> Option<GenericPort<'_>> {
         match self {
             PortList::Ansi(ports) => ports.get(i).map(|p| GenericPort::Ansi(p)),
             PortList::NonAnsi(names) => names.get(i).map(|n| GenericPort::NonAnsi(n)),

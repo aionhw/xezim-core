@@ -228,7 +228,6 @@ impl Value {
     }
 
     /// Get bit at position i.
-    #[inline]
     /// Hot-path; called per gate input from `exec_fused_gate` on
     /// gate-level netlists (>1 billion calls on picorv32 test_synth).
     /// Marked `#[inline(always)]` so the Inline arm collapses to two
@@ -248,6 +247,56 @@ impl Value {
                 }
             }
             ValueStorage::Wide(bits) => bits.get(i).copied().unwrap_or(LogicBit::Zero),
+        }
+    }
+
+    /// Hot 4-state bit accessor returning compact codes:
+    /// 0=0, 1=1, 2=X, 3=Z. This avoids constructing/matching `LogicBit`
+    /// in fused gate simulation.
+    #[inline(always)]
+    pub fn get_bit_code(&self, i: usize) -> u8 {
+        if i as u32 >= self.width { return 0; }
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                (((*xz_bits >> i) & 1) << 1 | ((*val_bits >> i) & 1)) as u8
+            }
+            ValueStorage::Wide(bits) => match bits.get(i).copied().unwrap_or(LogicBit::Zero) {
+                LogicBit::Zero => 0,
+                LogicBit::One => 1,
+                LogicBit::X => 2,
+                LogicBit::Z => 3,
+            },
+        }
+    }
+
+    /// Set one bit from compact 4-state code. Returns true when the bit changed.
+    #[inline(always)]
+    pub fn set_bit_code(&mut self, i: usize, code: u8) -> bool {
+        if i as u32 >= self.width { return false; }
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let mask = 1u64 << i;
+                let cur = (((*xz_bits >> i) & 1) << 1 | ((*val_bits >> i) & 1)) as u8;
+                if cur == code { return false; }
+                if code & 1 == 0 { *val_bits &= !mask; } else { *val_bits |= mask; }
+                if code & 2 == 0 { *xz_bits &= !mask; } else { *xz_bits |= mask; }
+                true
+            }
+            ValueStorage::Wide(bits) => {
+                let bit = match code {
+                    0 => LogicBit::Zero,
+                    1 => LogicBit::One,
+                    2 => LogicBit::X,
+                    _ => LogicBit::Z,
+                };
+                if let Some(slot) = bits.get_mut(i) {
+                    if *slot == bit { return false; }
+                    *slot = bit;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -863,7 +912,10 @@ impl Value {
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() < other.to_f64()) as u64, 1);
         }
-        if self.is_signed || other.is_signed {
+        // Per IEEE 1364-2005 §5.5.1 (preserved through SystemVerilog): if
+        // EITHER operand is unsigned, the relational comparison is unsigned.
+        // Only when BOTH operands are signed do we use signed compare.
+        if self.is_signed && other.is_signed {
             let a = self.to_i64().unwrap_or(0);
             let b = other.to_i64().unwrap_or(0);
             Value::from_u64((a < b) as u64, 1)
@@ -880,7 +932,7 @@ impl Value {
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() <= other.to_f64()) as u64, 1);
         }
-        if self.is_signed || other.is_signed {
+        if self.is_signed && other.is_signed {
             Value::from_u64((self.to_i64().unwrap_or(0) <= other.to_i64().unwrap_or(0)) as u64, 1)
         } else {
             Value::from_u64((self.to_u64().unwrap_or(0) <= other.to_u64().unwrap_or(0)) as u64, 1)

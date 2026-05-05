@@ -233,11 +233,11 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 let is_signed = is_type_signed(&p.data_type);
                 let is_rand = p.qualifiers.contains(&ClassQualifier::Rand) || p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
-                let is_const = p.qualifiers.contains(&ClassQualifier::Const);
+                let _is_const = p.qualifiers.contains(&ClassQualifier::Const);
                 let is_real = is_type_real(&p.data_type);
                 for decl in &p.declarators {
                     let mut v = if let Some(init) = &decl.init {
-                        let mut val = eval_const_expr_val(init, &HashMap::new()).resize(width);
+                        let mut val = eval_init_for_width(init, &HashMap::new(), width);
                         if is_real { val = Value::from_f64(val.to_f64()); }
                         val
                     } else if is_real {
@@ -955,7 +955,7 @@ pub fn elaborate_module_with_defs(
                 let mut val = if let Some(override_val) = param_overrides.get(&assign.name.name) {
                     override_val.clone()
                 } else if let Some(init) = &assign.init {
-                    let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                    let mut v = eval_init_for_width(init, &elab.parameters, width);
                     if signed { v.is_signed = true; }
                     v
                 } else {
@@ -1028,7 +1028,7 @@ pub fn elaborate_module_with_defs(
                         let is_signed = is_type_signed(data_type);
                         for assign in assignments {
                             if let Some(init) = &assign.init {
-                                let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                let mut v = eval_init_for_width(init, &elab.parameters, width);
                                 if is_signed { v.is_signed = true; }
                                 elab.parameters.insert(assign.name.name.clone(), v);
                             }
@@ -1310,7 +1310,7 @@ pub fn elaborate_module_with_defs(
                         let w = width;
                         let (init_val, procedural_init) = if let Some(init_expr) = &decl.init {
                             if is_const_expr(init_expr, &elab.parameters) {
-                                let mut rv = eval_const_expr_val(init_expr, &elab.parameters).resize(w);
+                                let mut rv = eval_init_for_width(init_expr, &elab.parameters, w);
                                 if is_signed { rv.is_signed = true; }
                                 if is_real { rv = Value::from_f64(rv.to_f64()); }
                                 (rv, None)
@@ -1389,7 +1389,7 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         if let DataType::Struct(su) = dt_resolved {
-                            let is_union = matches!(su.kind, StructUnionKind::Union);
+                            let _is_union = matches!(su.kind, StructUnionKind::Union);
                             if su.packed {
                                 for member in &su.members {
                                     for mdecl in &member.declarators {
@@ -1452,7 +1452,7 @@ pub fn elaborate_module_with_defs(
                 if let ParameterKind::Data { data_type, assignments } = &pd.kind {
                     let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let mut signed = is_type_signed(data_type);
-                    let mut is_real = is_type_real(data_type);
+                    let is_real = is_type_real(data_type);
                     // IEEE 1800-2017 §6.20.2: implicit type → signed 32-bit
                     if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                         width = 32;
@@ -1489,7 +1489,7 @@ pub fn elaborate_module_with_defs(
                                 if current_signed { v.is_signed = true; }
                                 v
                             } else {
-                                let mut v = eval_const_expr_val(init, &elab.parameters).resize(current_width);
+                                let mut v = eval_init_for_width(init, &elab.parameters, current_width);
                                 if current_signed { v.is_signed = true; }
                                 v
                             }
@@ -2578,7 +2578,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         }
                     } else {
                         let init_val = if let Some(init_expr) = &decl.init {
-                            let mut rv = eval_const_expr_val(init_expr, &elab.parameters).resize(width);
+                            let mut rv = eval_init_for_width(init_expr, &elab.parameters, width);
                             if is_signed { rv.is_signed = true; }
                             if is_real { rv = Value::from_f64(rv.to_f64()); }
                             rv
@@ -2604,7 +2604,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         }
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
-                                let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                let mut v = eval_init_for_width(init, &elab.parameters, width);
                                 if signed { v.is_signed = true; }
                                 v
                             } else { Value::zero(width) };
@@ -3118,6 +3118,23 @@ fn eval_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
     eval_const_expr_val(expr, params).to_u64().unwrap_or(0)
 }
 
+/// Evaluate an initializer for a typed declaration of known target width.
+/// Handles SystemVerilog unsized fill literals (`'0` / `'1` / `'x` / `'z`)
+/// per IEEE 1800-2017 §11.4.7: they expand to the full target width filled
+/// with the indicated bit, not zero-extended from a 1-bit value.
+fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width: u32) -> Value {
+    if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &expr.kind {
+        return match c {
+            '0' => Value::zero(width),
+            '1' => Value::ones(width),
+            'x' | 'X' => Value::new(width),
+            'z' | 'Z' => Value::all_z(width),
+            _ => Value::new(width),
+        };
+    }
+    eval_const_expr_val(expr, params).resize(width)
+}
+
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
 fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
     let res = match &expr.kind {
@@ -3269,7 +3286,7 @@ pub fn inline_instantiations(
                                 }
                                 for assign in assignments {
                                     if let Some(init) = &assign.init {
-                                        let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                        let mut v = eval_init_for_width(init, &elab.parameters, width);
                                         if is_signed { v.is_signed = true; }
                                         elab.parameters.insert(assign.name.name.clone(), v);
                                     }
@@ -4397,7 +4414,7 @@ fn inline_module_items(
                                     let _ = is_signed;
                                 } else {
                                     let init_val = if let Some(init_expr) = &decl.init {
-                                        eval_const_expr_val(init_expr, &sub_merged_params).resize(width)
+                                        eval_init_for_width(init_expr, &sub_merged_params, width)
                                     } else { Value::new(width) };
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
@@ -4852,7 +4869,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             signed = true;
                                         }
                                         let v = if let Some(init) = &assign.init {
-                                            let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                            let mut v = eval_init_for_width(init, &elab.parameters, width);
                                             if signed { v.is_signed = true; }
                                             if is_real { v = Value::from_f64(v.to_f64()); }
                                             v
@@ -4912,7 +4929,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 for decl in &dd.declarators {
                                     if &decl.name.name == sym_name {
                                         let v = if let Some(init) = &decl.init {
-                                            eval_const_expr_val(init, &elab.parameters).resize(width)
+                                            eval_init_for_width(init, &elab.parameters, width)
                                         } else { Value::zero(width) };
                                         elab.signals.insert(decl.name.name.clone(), Signal {
                                             is_const: dd.const_kw, name: decl.name.name.clone(),
@@ -4946,7 +4963,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 }
                                 for assign in assignments {
                                     if let Some(init) = &assign.init {
-                                        let mut v = eval_const_expr_val(init, &elab.parameters).resize(width);
+                                        let mut v = eval_init_for_width(init, &elab.parameters, width);
                                         if signed { v.is_signed = true; }
                                         if is_real { v = Value::from_f64(v.to_f64()); }
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
@@ -4985,7 +5002,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             let is_real = is_type_real(&dd.data_type);
                             for decl in &dd.declarators {
                                 let v = if let Some(init) = &decl.init {
-                                    eval_const_expr_val(init, &elab.parameters).resize(width)
+                                    eval_init_for_width(init, &elab.parameters, width)
                                 } else { Value::zero(width) };
                                 elab.signals.insert(decl.name.name.clone(), Signal {
                                     is_const: dd.const_kw, name: decl.name.name.clone(),

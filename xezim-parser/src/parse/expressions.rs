@@ -842,7 +842,7 @@ impl Parser {
     pub(super) fn parse_hierarchical_identifier_expr(&mut self) -> Expression {
         let start = self.current().span.start;
         let id = self.parse_identifier();
-        let mut hier = HierarchicalIdentifier {
+        let hier = HierarchicalIdentifier {
             root: None,
             path: vec![HierPathSegment { name: id, selects: Vec::new() }],
             span: self.span_from(start),

@@ -491,11 +491,11 @@ impl Parser {
                 if self.peek_kind() == TokenKind::KwClass {
                     Some(PackageItem::Class(self.parse_class_declaration()))
                 } else if self.peek_kind() == TokenKind::KwFunction {
-                    let mut func = self.parse_function_declaration();
+                    let func = self.parse_function_declaration();
                     // Mark as virtual if we had the keyword (though PackageItem doesn't track it)
                     Some(PackageItem::Function(func))
                 } else if self.peek_kind() == TokenKind::KwTask {
-                    let mut task = self.parse_task_declaration();
+                    let task = self.parse_task_declaration();
                     Some(PackageItem::Task(task))
                 } else {
                     // This shouldn't happen at package level in valid SV, but let's be safe.
