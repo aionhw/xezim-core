@@ -13,27 +13,89 @@ pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};
 
 /// Magic bytes identifying a xezim compiled artifact.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x01";
+/// Version byte: \x02 = varint-encoded body (was \x01 = fixint).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x02";
 
-/// Serialize a compiled ElaboratedModule to a file.
+/// Bincode configuration for xezim compiled artifacts. Variable-int encoding
+/// shrinks length tags, enum discriminants, and small integers; the wire
+/// format is incompatible with the top-level `bincode::serialize` defaults
+/// (which use fixed 8-byte ints), so this is the single source of truth used
+/// by both writer and reader.
+pub fn xez_bincode_options() -> impl bincode::Options + Copy {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .with_little_endian()
+}
+
+fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
+    if &file_magic[..7] == &XEZIM_BYTECODE_MAGIC[..7] && file_magic[7] != XEZIM_BYTECODE_MAGIC[7] {
+        Some(format!(
+            "incompatible xezim artifact version (file v{}, expected v{}); recompile with current xezim",
+            file_magic[7], XEZIM_BYTECODE_MAGIC[7]
+        ))
+    } else {
+        None
+    }
+}
+
+/// Serialize a compiled ElaboratedModule to a file. Streams directly into
+/// the file via BufWriter; never holds the full serialized blob in memory.
 pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<(), String> {
-    let bytes = bincode::serialize(elab).map_err(|e| format!("serialize: {}", e))?;
-    let mut out = Vec::with_capacity(bytes.len() + 8);
-    out.extend_from_slice(XEZIM_BYTECODE_MAGIC);
-    out.extend_from_slice(&bytes);
-    std::fs::write(path, &out).map_err(|e| format!("write '{}': {}", path, e))
+    use bincode::Options;
+    use std::io::Write;
+    let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+    w.write_all(XEZIM_BYTECODE_MAGIC).map_err(|e| format!("write '{}': {}", path, e))?;
+    xez_bincode_options()
+        .serialize_into(&mut w, elab)
+        .map_err(|e| format!("serialize: {}", e))?;
+    w.flush().map_err(|e| format!("flush '{}': {}", path, e))
 }
 
 /// Read a compiled artifact from a file. Returns Ok(Some(elab)) if the file is
-/// a valid artifact, Ok(None) if it lacks the magic header, Err on I/O or
-/// deserialization failure.
+/// a valid artifact, Ok(None) if it lacks the magic header, Err on I/O,
+/// version-mismatch, or deserialization failure.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read '{}': {}", path, e))?;
-    if bytes.len() < 8 || &bytes[..8] != XEZIM_BYTECODE_MAGIC {
+    use bincode::Options;
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| format!("read '{}': {}", path, e))?;
+    let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+    let mut magic = [0u8; 8];
+    if r.read_exact(&mut magic).is_err() {
         return Ok(None);
     }
-    let elab = bincode::deserialize(&bytes[8..]).map_err(|e| format!("deserialize: {}", e))?;
+    if &magic != XEZIM_BYTECODE_MAGIC {
+        if let Some(err) = artifact_version_error(&magic) {
+            return Err(err);
+        }
+        return Ok(None);
+    }
+    let elab = xez_bincode_options()
+        .deserialize_from(r)
+        .map_err(|e| format!("deserialize: {}", e))?;
     Ok(Some(elab))
+}
+
+/// Like `read_compiled` but reads from an in-memory slice (e.g. an embedded
+/// `include_bytes!()` payload in a binary produced by `--emit-native`).
+pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, String> {
+    use bincode::Options;
+    if bytes.len() < 8 {
+        return Err("xezim artifact: payload shorter than magic header".to_string());
+    }
+    let (magic, body) = bytes.split_at(8);
+    if magic != XEZIM_BYTECODE_MAGIC {
+        let mut m = [0u8; 8];
+        m.copy_from_slice(magic);
+        if let Some(err) = artifact_version_error(&m) {
+            return Err(err);
+        }
+        return Err("xezim artifact: missing magic header".to_string());
+    }
+    xez_bincode_options()
+        .deserialize(body)
+        .map_err(|e| format!("deserialize: {}", e))
 }
 
 use std::rc::Rc;
@@ -304,24 +366,26 @@ fn parse_and_elaborate(
         // sizes correctly identify hot spots. On c910 hello this revealed
         // continuous_assigns at 394 MB, always_blocks at 193 MB, signals at
         // 173 MB — the three to target for memory work.
+        use bincode::Options;
+        let opts = xez_bincode_options();
         let try_size = |label: &str, bytes: Result<Vec<u8>, _>| match bytes {
             Ok(b) => eprintln!("[elab-bytes-bincode] {}: {:>10} bytes", label, b.len()),
             Err(_) => eprintln!("[elab-bytes-bincode] {}: <serialize failed>", label),
         };
-        try_size("always_blocks    ", bincode::serialize(&elab.always_blocks));
-        try_size("initial_blocks   ", bincode::serialize(&elab.initial_blocks));
-        try_size("continuous_assigns", bincode::serialize(&elab.continuous_assigns));
-        try_size("signals          ", bincode::serialize(&elab.signals));
-        try_size("parameters       ", bincode::serialize(&elab.parameters));
-        try_size("arrays           ", bincode::serialize(&elab.arrays));
-        try_size("arrays_2d        ", bincode::serialize(&elab.arrays_2d));
-        try_size("arrays_nd        ", bincode::serialize(&elab.arrays_nd));
-        try_size("functions        ", bincode::serialize(&elab.functions));
-        try_size("tasks            ", bincode::serialize(&elab.tasks));
-        try_size("typedefs         ", bincode::serialize(&elab.typedefs));
-        try_size("typedef_types    ", bincode::serialize(&elab.typedef_types));
-        try_size("classes          ", bincode::serialize(&elab.classes));
-        try_size("specify_delays   ", bincode::serialize(&elab.specify_delays));
+        try_size("always_blocks    ", opts.serialize(&elab.always_blocks));
+        try_size("initial_blocks   ", opts.serialize(&elab.initial_blocks));
+        try_size("continuous_assigns", opts.serialize(&elab.continuous_assigns));
+        try_size("signals          ", opts.serialize(&elab.signals));
+        try_size("parameters       ", opts.serialize(&elab.parameters));
+        try_size("arrays           ", opts.serialize(&elab.arrays));
+        try_size("arrays_2d        ", opts.serialize(&elab.arrays_2d));
+        try_size("arrays_nd        ", opts.serialize(&elab.arrays_nd));
+        try_size("functions        ", opts.serialize(&elab.functions));
+        try_size("tasks            ", opts.serialize(&elab.tasks));
+        try_size("typedefs         ", opts.serialize(&elab.typedefs));
+        try_size("typedef_types    ", opts.serialize(&elab.typedef_types));
+        try_size("classes          ", opts.serialize(&elab.classes));
+        try_size("specify_delays   ", opts.serialize(&elab.specify_delays));
     }
     Ok((definitions, elab))
 }
