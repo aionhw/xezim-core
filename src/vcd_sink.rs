@@ -222,29 +222,44 @@ impl Drop for VcdSink {
 /// Format a single `Value` as a VCD value-change record (scalar or vector).
 /// Shared by the inline path and the background writer thread.
 pub fn write_vcd_value<W: Write>(w: &mut W, val: &Value, id: &str) {
+    let payload = format_vcd_value_bytes(val);
+    if val.width == 1 {
+        let _ = w.write_all(&payload);
+        let _ = writeln!(w, "{}", id);
+    } else {
+        let _ = w.write_all(&payload);
+        let _ = writeln!(w, " {}", id);
+    }
+}
+
+/// Format a `Value` as the VCD value payload only.
+///
+/// This intentionally omits the VCD identifier and trailing newline. Surfer's
+/// simulator protocol expects exactly this payload inside `SignalValue::VCDValue`.
+pub fn format_vcd_value_bytes(val: &Value) -> Vec<u8> {
     if val.width == 1 {
         let ch = match val.bits_first() {
-            LogicBit::Zero => '0',
-            LogicBit::One => '1',
-            LogicBit::X => 'x',
-            LogicBit::Z => 'z',
+            LogicBit::Zero => b'0',
+            LogicBit::One => b'1',
+            LogicBit::X => b'x',
+            LogicBit::Z => b'z',
         };
-        let _ = writeln!(w, "{}{}", ch, id);
+        vec![ch]
     } else {
-        let mut s = String::with_capacity(val.width as usize + 2);
-        s.push('b');
+        let mut bytes = Vec::with_capacity(val.width as usize + 1);
+        bytes.push(b'b');
         let mut all_zero = true;
         for i in (0..val.width as usize).rev() {
             match val.get_bit(i) {
                 LogicBit::Zero => {
-                    if !all_zero { s.push('0'); }
+                    if !all_zero { bytes.push(b'0'); }
                 }
-                LogicBit::One => { all_zero = false; s.push('1'); }
-                LogicBit::X => { all_zero = false; s.push('x'); }
-                LogicBit::Z => { all_zero = false; s.push('z'); }
+                LogicBit::One => { all_zero = false; bytes.push(b'1'); }
+                LogicBit::X => { all_zero = false; bytes.push(b'x'); }
+                LogicBit::Z => { all_zero = false; bytes.push(b'z'); }
             }
         }
-        if all_zero { s.push('0'); }
-        let _ = writeln!(w, "{} {}", s, id);
+        if all_zero { bytes.push(b'0'); }
+        bytes
     }
 }
