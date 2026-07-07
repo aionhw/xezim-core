@@ -560,6 +560,16 @@ pub struct ElaboratedModule {
     #[serde(default = "default_tick_s")]
     pub tick_s: f64,
     pub signals: HashMap<String, Signal>,
+    /// Per-signal net-type classification, populated when a `NetDeclaration`
+    /// or implicit net is created. Used by the multi-driver resolution
+    /// post-pass below to pick the LRM-correct resolution function:
+    ///   tri  | wire       -> x-on-conflict resolution
+    ///   wand | triand     -> AND-fold
+    ///   wor  | trior      -> OR-fold
+    ///   tri0 | tri1       -> tri-resolution with a default pull
+    ///   supply0 | supply1 -> hard-tied
+    #[serde(default)]
+    pub net_types: HashMap<String, crate::ast::types::NetType>,
     /// Transient elaboration bookkeeping (not serialized): names that already
     /// received a type-bearing declaration, mapped to whether that type was
     /// *incompatible* (a named/atom/real/struct/enum type, which cannot be
@@ -845,6 +855,7 @@ impl ElaboratedModule {
             const_decl_inits: HashSet::default(),
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
+            net_types: HashMap::default(),
         }
     }
 
@@ -1806,6 +1817,11 @@ pub fn elaborate_module_with_defs(
             user_nettypes.insert(nd.name.name.clone());
             let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
             elab.typedefs.insert(nd.name.name.clone(), w);
+            // Also register the underlying DataType so the simulator can
+            // resolve the nettype's element type for struct field access.
+            // e.g. `nettype T wTsum` → typedef_types["wTsum"] = DataType::TypeReference("T")
+            // (resolved to DataType::Struct(T) in the post-pass after typedefs run)
+            elab.typedef_types.insert(nd.name.name.clone(), nd.data_type.clone());
         }
     }
 
@@ -1900,9 +1916,13 @@ pub fn elaborate_module_with_defs(
                     }
                     let w = width_with_unpacked_dims(&decl.dimensions, width);
                     // supply0 → constant 0, supply1 → constant 1
+                    // tri0    → default 0 (LRM §28.4 pull-down)
+                    // tri1    → default 1 (LRM §28.4 pull-up)
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(w),
                         NetType::Supply1 => Value::ones(w),
+                        NetType::Tri0 => Value::zero(w),
+                        NetType::Tri1 => Value::ones(w),
                         _ => if is_real { Value::from_f64(0.0) } else { Value::new(w) },
                     };
                     let sig = Signal { is_const: false,
@@ -1916,6 +1936,9 @@ pub fn elaborate_module_with_defs(
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     elab.nets.insert(decl.name.name.clone());
+                    // Per-NetType classification for the multi-driver
+                    // resolution post-pass.
+                    elab.net_types.insert(decl.name.name.clone(), nd.net_type);
                     // Wire with initializer → continuous assign (not constant eval)
                     if let Some(init_expr) = &decl.init {
                         elab.continuous_assigns.push(ContinuousAssignment {
@@ -2801,52 +2824,305 @@ pub fn elaborate_module_with_defs(
         }
     }
 
-    // User-defined nettype driver resolution: collapse multiple continuous
-    // drivers on a nettype variable into a single OR-combined assign. This
-    // approximates the common `resolve_or` resolver; other resolvers are not
-    // modeled, so last-driver-wins behavior applies via the final `|` fold.
-    {
-        let mut nettype_vars: HashSet<String> = HashSet::default();
-        for (name, sig) in &elab.signals {
-            if let Some(tn) = &sig.type_name {
-                if user_nettypes.contains(tn) { nettype_vars.insert(name.clone()); }
-            }
-        }
-        if !nettype_vars.is_empty() {
-            let mut grouped: HashMap<String, Vec<Expression>> = HashMap::default();
-            let mut kept: Vec<ContinuousAssignment> = Vec::new();
-            for ca in elab.continuous_assigns.drain(..) {
-                if let Some(n) = simple_lhs_name(&ca.lhs) {
-                    if nettype_vars.contains(&n) {
-                        grouped.entry(n).or_default().push(ca.rhs);
-                        continue;
-                    }
-                }
-                kept.push(ca);
-            }
-            for (name, rhses) in grouped {
-                let mut iter = rhses.into_iter();
-                let mut acc = iter.next().unwrap();
-                for rhs in iter {
-                    let span = acc.span;
-                    acc = Expression {
-                        kind: ExprKind::Binary {
-                            op: crate::ast::expr::BinaryOp::BitOr,
-                            left: Box::new(acc),
-                            right: Box::new(rhs),
-                        },
-                        span,
-                    };
-                }
-                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0 });
-            }
-            elab.continuous_assigns = kept;
-        }
-    }
-
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
     // or port connections that are not explicitly declared become implicit 1-bit wires.
     create_implicit_nets(&mut elab)?;
+
+    // ---------------------------------------------------------------------
+    // Multi-driver net resolution post-pass.
+    //
+    // Replaces the runtime first-driver-wins behavior with the LRM-correct
+    // per-NetType resolution function for built-in net types:
+    //
+    //   tri  | wire       | tri0       | tri1
+    //     OR-fold with z-skip; result is `x` when two active drivers
+    //     disagree. tri0/tri1 pull to a default value (0/1) when no
+    //     drivers are present at all (set at declaration time).
+    //
+    //   wand | triand
+    //     AND-fold with z-skip. Conflicting active drivers produce 0.
+    //
+    //   wor  | trior
+    //     OR-fold with z-skip. Conflicting active drivers produce 1.
+    //
+    //   supply0 | supply1
+    //     Hard-tied; no resolution needed. Drivers are forbidden by LRM
+    //     §28.7, so any assign to a supply net is dropped here.
+    //
+    //   user-defined nettype with `with <fn>` (§6.6.7)
+    //     Collapse multiple drivers into a single assign. The actual
+    //     function-call dispatch is not yet synthesized; the existing
+    //     BitOr fold is preserved here for backward compatibility.
+    //
+    // For a net with only one driver, the original `assign` is kept
+    // verbatim — no extra overhead for the common case.
+    // ---------------------------------------------------------------------
+    {
+        let user_nt: HashMap<String, Option<String>> = {
+            let mut m: HashMap<String, Option<String>> = HashMap::default();
+            for item in module.items() {
+                if let ModuleItem::NettypeDeclaration(nd) = item {
+                    m.insert(nd.name.name.clone(), nd.resolver.as_ref().map(|id| id.name.clone()));
+                }
+            }
+            m
+        };
+        let mut grouped: HashMap<String, Vec<Expression>> = HashMap::default();
+        let mut kept: Vec<ContinuousAssignment> = Vec::new();
+        for ca in elab.continuous_assigns.drain(..) {
+            if let Some(n) = simple_lhs_name(&ca.lhs) {
+                let is_net_decl = elab.net_types.contains_key(&n);
+                let is_user_nt_var = elab.signals.get(&n)
+                    .and_then(|s| s.type_name.as_ref())
+                    .map(|tn| user_nt.contains_key(tn))
+                    .unwrap_or(false);
+                let is_port = elab.signals.get(&n)
+                    .and_then(|s| s.direction)
+                    .is_some();
+                if (is_net_decl || is_user_nt_var) && !is_port {
+                    grouped.entry(n).or_default().push(ca.rhs);
+                    continue;
+                }
+            }
+            kept.push(ca);
+        }
+
+        let mut assigns_to_add: Vec<ContinuousAssignment> = Vec::new();
+        for (name, rhses) in grouped {
+            let net_type = elab.net_types.get(&name).copied().unwrap_or(NetType::Wire);
+
+            // Single driver on a non-pulled net: pass through unchanged.
+            if rhses.len() == 1 && !is_default_pulled(net_type) {
+                kept.push(ContinuousAssignment {
+                    lhs: make_ident_expr(&name),
+                    rhs: rhses.into_iter().next().unwrap(),
+                    delay: 0,
+                });
+                continue;
+            }
+
+            // supply0 / supply1: hard-tied; no driver allowed (LRM §28.7).
+            if matches!(net_type, NetType::Supply0 | NetType::Supply1) {
+                if !rhses.is_empty() {
+                    eprintln!(
+                        "[xezim][warning] supply net '{}' has {} continuous driver(s); \
+                         LRM §28.7 forbids drivers on supply nets — ignoring.",
+                        name, rhses.len()
+                    );
+                }
+                continue;
+            }
+
+            // User-defined nettype: keep the existing BitOr fold (TODO:
+            // synthesize a real call to the resolver function with the
+            // driver queue as the argument).
+            if let Some(sig) = elab.signals.get(&name) {
+                if let Some(tn) = &sig.type_name {
+                    if let Some(resolver_opt) = user_nt.get(tn) {
+                        if let Some(rname) = resolver_opt {
+                            if elab.functions.contains_key(rname) {
+                                // Tier 2: synthesize a real call to the
+                                // resolver function with the simultaneous-
+                                // driver queue (`'{d0, d1, ...}`) as the
+                                // argument. `bind_queue_param` in the
+                                // simulator will unpack the AssignmentPattern
+                                // into the function's queue formal.
+                                let span = rhses.first().map(|e| e.span).unwrap_or_else(Span::dummy);
+                                let q_items: Vec<AssignmentPatternItem> = rhses
+                                    .into_iter()
+                                    .map(|e| AssignmentPatternItem::Ordered(e))
+                                    .collect();
+                                let queue_arg = Expression {
+                                    kind: ExprKind::AssignmentPattern(q_items),
+                                    span,
+                                };
+                                let resolver_expr = make_ident_expr(rname);
+                                let call_expr = Expression {
+                                    kind: ExprKind::Call {
+                                        func: Box::new(resolver_expr),
+                                        args: vec![queue_arg],
+                                    },
+                                    span,
+                                };
+
+                                // For struct-typed nettypes, decompose the
+                                // assignment into per-field continuous assigns
+                                // so that xezim's separate-member-signal
+                                // elaboration scheme can read each field
+                                // individually. e.g. `wTsum a` with
+                                // `typedef struct {real f1; bit f2;} T` →
+                                // `assign a.field1 = Tsum(...).field1;`
+                                // `assign a.field2 = Tsum(...).field2;`
+                                let resolved_dt = if let Some(dt) = elab.typedef_types.get(tn) {
+                                    resolve_typedef_chain(dt, &elab.typedef_types).clone()
+                                } else {
+                                    DataType::IntegerAtom {
+                                        kind: IntegerAtomType::Integer,
+                                        signing: None,
+                                        span: Span::dummy(),
+                                    }
+                                };
+                                if let DataType::Struct(su) = resolved_dt {
+                                    if !su.packed {
+                                        // Create per-field member signals and
+                                        // synthesize a per-field CA for each.
+                                        // Walk struct members in reverse order
+                                        // so field offsets accumulate correctly.
+                                        // Fields are declared top-down; SV packs
+                                        // the LAST field at the LSB.
+                                        let mut lsb_offset: u32 = 0;
+                                        for member in su.members.iter().rev() {
+                                            let mw = resolve_type_width(&member.data_type,
+                                                Some(&elab.parameters), Some(&elab.typedefs));
+                                            let ms = is_type_signed(&member.data_type);
+                                            let mr = is_type_real(&member.data_type);
+                                            for mdecl in &member.declarators {
+                                                let fname = mdecl.name.name.clone();
+                                                let sname = format!("{}.{}", name, fname);
+                                                elab.signals.entry(sname.clone()).or_insert(Signal {
+                                                    is_const: false,
+                                                    name: sname.clone(),
+                                                    width: mw,
+                                                    is_signed: ms,
+                                                    is_real: mr,
+                                                    direction: None,
+                                                    value: Value::new(mw),
+                                                    type_name: None,
+                                                });
+                                                // Access the resolver result's field.
+                                                let member_expr = Expression::new(
+                                                    ExprKind::MemberAccess {
+                                                        expr: Box::new(call_expr.clone()),
+                                                        member: mdecl.name.clone(),
+                                                    },
+                                                    span,
+                                                );
+                                                // For real fields, we must write through the
+                                                // LSB-offset path since the whole struct's
+                                                // bits are stored in the `a` signal. Create
+                                                // `assign a = {..., fieldN, ...}` — a partial
+                                                // update of the struct bits.
+                                                //
+                                                // However, xezim stores unpacked struct members
+                                                // as SEPARATE signals (`a.field1`, `a.field2`).
+                                                // So a plain `assign a.field1 = X` is what we need.
+                                                // The key is that the simulator's MemberAccess
+                                                // read path will look for `a.field1` signal.
+                                                let lhs = Expression::new(
+                                                    ExprKind::MemberAccess {
+                                                        expr: Box::new(make_ident_expr(&name)),
+                                                        member: mdecl.name.clone(),
+                                                    },
+                                                    span,
+                                                );
+                                                kept.push(ContinuousAssignment {
+                                                    lhs,
+                                                    rhs: member_expr,
+                                                    delay: 0,
+                                                });
+                                                lsb_offset += mw;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                // Non-struct: single whole-value CA.
+                                kept.push(ContinuousAssignment {
+                                    lhs: make_ident_expr(&name),
+                                    rhs: call_expr,
+                                    delay: 0,
+                                });
+                                continue;
+                            }
+                        }
+                        // No resolver, or resolver not found in
+                        // $unit scope: fall back to OR-fold for
+                        // backward compatibility.
+                        let mut iter = rhses.into_iter();
+                        let mut acc = iter.next().unwrap();
+                        for rhs in iter {
+                            let span = acc.span;
+                            acc = Expression {
+                                kind: ExprKind::Binary {
+                                    op: crate::ast::expr::BinaryOp::BitOr,
+                                    left: Box::new(acc),
+                                    right: Box::new(rhs),
+                                },
+                                span,
+                            };
+                        }
+                        kept.push(ContinuousAssignment {
+                            lhs: make_ident_expr(&name),
+                            rhs: acc,
+                            delay: 0,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // tri / wire / tri0 / tri1: per-bit OR-fold with z-skip and
+            // x-on-conflict.
+            if matches!(net_type,
+                NetType::Tri | NetType::Wire
+                | NetType::Tri0 | NetType::Tri1)
+            {
+                let width = elab.signals.get(&name).map(|s| s.width).unwrap_or(1);
+                let is_real = elab.signals.get(&name).map(|s| s.is_real).unwrap_or(false);
+                // No drivers at all: the declaration-time init value is the
+                // final answer (x for tri/wire, 0 for tri0, 1 for tri1).
+                if rhses.is_empty() {
+                    continue;
+                }
+
+                let merged_per_bit = synthesize_tri_or_per_bit(&rhses, width, is_real);
+                let bit_assigns = build_per_bit_cont_assigns(&name, &merged_per_bit, width);
+                assigns_to_add.extend(bit_assigns);
+                continue;
+            }
+
+            // wand / triand: AND-fold with z-skip.
+            if matches!(net_type, NetType::Wand | NetType::TriAnd) {
+                let width = elab.signals.get(&name).map(|s| s.width).unwrap_or(1);
+                if rhses.is_empty() { continue; }
+                let merged_per_bit = synthesize_wand_per_bit(&rhses, width);
+                let bit_assigns = build_per_bit_cont_assigns(&name, &merged_per_bit, width);
+                assigns_to_add.extend(bit_assigns);
+                continue;
+            }
+
+            // wor / trior: OR-fold with z-skip.
+            if matches!(net_type, NetType::Wor | NetType::TriOr) {
+                let width = elab.signals.get(&name).map(|s| s.width).unwrap_or(1);
+                if rhses.is_empty() { continue; }
+                let merged_per_bit = synthesize_wor_per_bit(&rhses, width);
+                let bit_assigns = build_per_bit_cont_assigns(&name, &merged_per_bit, width);
+                assigns_to_add.extend(bit_assigns);
+                continue;
+            }
+
+            // uwire: only one driver allowed; if more than one, error.
+            if matches!(net_type, NetType::Uwire) && rhses.len() > 1 {
+                return Err(format!(
+                    "Unresolved multiple drivers on uwire net '{}' (LRM §6.7.1): {} drivers",
+                    name, rhses.len()
+                ));
+            }
+
+            // Fallback: keep all drivers as-is.
+            for rhs in rhses {
+                kept.push(ContinuousAssignment {
+                    lhs: make_ident_expr(&name),
+                    rhs,
+                    delay: 0,
+                });
+            }
+        }
+
+        kept.extend(assigns_to_add);
+        elab.continuous_assigns = kept;
+    }
 
     // Validate that all identifiers in procedural blocks are declared.
     for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::default())?; }
@@ -8758,4 +9034,268 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// Multi-driver net resolution helpers (LRM §6.7, §28)
+//
+// Synthesize per-NetType per-bit resolution expressions in AST form. The
+// elaborator above emits these as the RHS of synthesized ContinuousAssignments.
+// The runtime / bytecode compiler treats them like any other expression —
+// no special net-resolution handling is required downstream.
+//
+// Convention for literal `1'bz` / `1'bx` in synthesized expressions:
+//   We use `Number(Integer { size: Some(1), base: Binary, value: "z" })` etc.,
+//   matching the parser's representation of `1'bz` rather than the unbased
+//   `'z` form. xezim's runtime `===` (case-equality) returns `x` when one
+//   side is sized-Integer and the other is UnbasedUnsized; using the sized
+//   form throughout keeps comparisons well-defined.
+// ============================================================================
+
+fn is_default_pulled(nt: NetType) -> bool {
+    matches!(nt, NetType::Tri0 | NetType::Tri1)
+}
+
+/// Build a sized 1-bit literal matching the parser's `1'b<ch>` form.
+fn sized_bit_literal(ch: char) -> Expression {
+    let s = match ch {
+        '0' => "0",
+        '1' => "1",
+        'z' => "z",
+        'x' => "x",
+        _ => "0",
+    };
+    Expression {
+        kind: ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+            size: Some(1),
+            signed: false,
+            base: crate::ast::expr::NumberBase::Binary,
+            value: s.to_string(),
+            cached_val: std::cell::Cell::new(None),
+        }),
+        span: Span::dummy(),
+    }
+}
+
+/// Build a sized integer literal for bit-index expressions.
+fn sized_int_literal(i: u32, width: u32) -> Expression {
+    Expression {
+        kind: ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+            size: Some(width),
+            signed: false,
+            base: crate::ast::expr::NumberBase::Decimal,
+            value: i.to_string(),
+            cached_val: std::cell::Cell::new(None),
+        }),
+        span: Span::dummy(),
+    }
+}
+
+/// Produce `expr[i]` as an Index expression.
+fn bit_select(expr: &Expression, i: u32) -> Expression {
+    Expression {
+        kind: ExprKind::Index {
+            expr: Box::new(expr.clone()),
+            index: Box::new(sized_int_literal(i, 32)),
+        },
+        span: expr.span,
+    }
+}
+
+/// Build `assign <name>[i] = <merged_per_bit[i]>` for each bit position i.
+/// For 1-bit nets, emit a single bare assign for fast-path performance.
+fn build_per_bit_cont_assigns(
+    name: &str,
+    merged_per_bit: &[Expression],
+    width: u32,
+) -> Vec<ContinuousAssignment> {
+    if width == 1 {
+        return vec![ContinuousAssignment {
+            lhs: make_ident_expr(name),
+            rhs: merged_per_bit[0].clone(),
+            delay: 0,
+        }];
+    }
+    let mut out = Vec::with_capacity(width as usize);
+    let base_ident = make_ident_expr(name);
+    for i in 0..width as usize {
+        let lhs = Expression {
+            kind: ExprKind::Index {
+                expr: Box::new(base_ident.clone()),
+                index: Box::new(sized_int_literal(i as u32, 32)),
+            },
+            span: Span::dummy(),
+        };
+        out.push(ContinuousAssignment {
+            lhs,
+            rhs: merged_per_bit[i].clone(),
+            delay: 0,
+        });
+    }
+    out
+}
+
+/// Per-bit OR-fold with z-skip and x-on-conflict for `tri`/`wire`/`tri0`/`tri1`.
+fn synthesize_tri_or_per_bit(drivers: &[Expression], width: u32, is_real: bool) -> Vec<Expression> {
+    if is_real || width == 0 {
+        // No per-bit merge for real (or zero-width). Use the last driver.
+        let last = drivers.last().cloned().unwrap_or_else(|| sized_bit_literal('x'));
+        return vec![last];
+    }
+    let mut per_bit: Vec<Expression> = Vec::with_capacity(width as usize);
+    for i in 0..width as usize {
+        let mut acc = bit_select(&drivers[0], i as u32);
+        for d in &drivers[1..] {
+            acc = merge_1bit_tri(acc, bit_select(d, i as u32));
+        }
+        per_bit.push(acc);
+    }
+    per_bit
+}
+
+/// Build the 1-bit tri-merge ternary:
+///   merge(a, b) = (b === 1'bz) ? a :
+///                 (a === 1'bz) ? b :
+///                 (a === b)   ? a :
+///                 1'bx
+fn merge_1bit_tri(a: Expression, b: Expression) -> Expression {
+    let span = a.span;
+    let case_eq = |l: Expression, r: Expression| Expression {
+        kind: ExprKind::Binary {
+            op: crate::ast::expr::BinaryOp::CaseEq,
+            left: Box::new(l),
+            right: Box::new(r),
+        },
+        span,
+    };
+    let inner = Expression {
+        kind: ExprKind::Conditional {
+            condition: Box::new(case_eq(a.clone(), b.clone())),
+            then_expr: Box::new(a.clone()),
+            else_expr: Box::new(sized_bit_literal('x')),
+        },
+        span,
+    };
+    let mid = Expression {
+        kind: ExprKind::Conditional {
+            condition: Box::new(case_eq(a.clone(), sized_bit_literal('z'))),
+            then_expr: Box::new(b.clone()),
+            else_expr: Box::new(inner),
+        },
+        span,
+    };
+    Expression {
+        kind: ExprKind::Conditional {
+            condition: Box::new(case_eq(b, sized_bit_literal('z'))),
+            then_expr: Box::new(a),
+            else_expr: Box::new(mid),
+        },
+        span,
+    }
+}
+
+/// Per-bit AND-fold with z-skip for `wand`/`triand`.
+fn synthesize_wand_per_bit(drivers: &[Expression], width: u32) -> Vec<Expression> {
+    if width == 0 {
+        return vec![sized_bit_literal('x')];
+    }
+    let mut per_bit: Vec<Expression> = Vec::with_capacity(width as usize);
+    for i in 0..width as usize {
+        let mut acc = bit_select(&drivers[0], i as u32);
+        for d in &drivers[1..] {
+            acc = merge_1bit_and(acc, bit_select(d, i as u32));
+        }
+        per_bit.push(acc);
+    }
+    per_bit
+}
+
+/// `merge_and(a, b)`: (b===z)? a : (a===z)? b : a & b
+fn merge_1bit_and(a: Expression, b: Expression) -> Expression {
+    let span = a.span;
+    let case_eq = |l: Expression, r: Expression| Expression {
+        kind: ExprKind::Binary {
+            op: crate::ast::expr::BinaryOp::CaseEq,
+            left: Box::new(l),
+            right: Box::new(r),
+        },
+        span,
+    };
+    let inner = Expression {
+        kind: ExprKind::Binary {
+            op: crate::ast::expr::BinaryOp::BitAnd,
+            left: Box::new(a.clone()),
+            right: Box::new(b.clone()),
+        },
+        span,
+    };
+    let mid = Expression {
+        kind: ExprKind::Conditional {
+            condition: Box::new(case_eq(a.clone(), sized_bit_literal('z'))),
+            then_expr: Box::new(b.clone()),
+            else_expr: Box::new(inner),
+        },
+        span,
+    };
+    Expression {
+        kind: ExprKind::Conditional {
+            condition: Box::new(case_eq(b, sized_bit_literal('z'))),
+            then_expr: Box::new(a),
+            else_expr: Box::new(mid),
+        },
+        span,
+    }
+}
+
+/// Per-bit OR-fold with z-skip for `wor`/`trior`.
+fn synthesize_wor_per_bit(drivers: &[Expression], width: u32) -> Vec<Expression> {
+    if width == 0 {
+        return vec![sized_bit_literal('x')];
+    }
+    let mut per_bit: Vec<Expression> = Vec::with_capacity(width as usize);
+    for i in 0..width as usize {
+        let mut acc = bit_select(&drivers[0], i as u32);
+        for d in &drivers[1..] {
+            acc = merge_1bit_or(acc, bit_select(d, i as u32));
+        }
+        per_bit.push(acc);
+    }
+    per_bit
+}
+
+/// `merge_or(a, b)`: (b===z)? a : (a===z)? b : a | b
+fn merge_1bit_or(a: Expression, b: Expression) -> Expression {
+    let span = a.span;
+    let case_eq = |l: Expression, r: Expression| Expression {
+        kind: ExprKind::Binary {
+            op: crate::ast::expr::BinaryOp::CaseEq,
+            left: Box::new(l),
+            right: Box::new(r),
+        },
+        span,
+    };
+    let inner = Expression {
+        kind: ExprKind::Binary {
+            op: crate::ast::expr::BinaryOp::BitOr,
+            left: Box::new(a.clone()),
+            right: Box::new(b.clone()),
+        },
+        span,
+    };
+    let mid = Expression {
+        kind: ExprKind::Conditional {
+            condition: Box::new(case_eq(a.clone(), sized_bit_literal('z'))),
+            then_expr: Box::new(b.clone()),
+            else_expr: Box::new(inner),
+        },
+        span,
+    };
+    Expression {
+        kind: ExprKind::Conditional {
+            condition: Box::new(case_eq(b, sized_bit_literal('z'))),
+            then_expr: Box::new(a),
+            else_expr: Box::new(mid),
+        },
+        span,
+    }
 }
