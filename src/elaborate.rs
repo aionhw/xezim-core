@@ -495,6 +495,46 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             }
         }
     }
+    // Also collect class-body `localparam` declarations (e.g. UVM 2020.3.1's
+    // `localparam string prefix = "+uvm_set_verbosity="`). These are class
+    // constants accessible as static members, so they need entries in both
+    // `param_defaults` (for value lookup) and `static_properties` (for
+    // name resolution) as well as `properties` (for initial value seeding).
+    for item in &c.items {
+        if let ClassItem::Parameter(pd) = item {
+            if let crate::ast::decl::ParameterKind::Data { data_type, assignments, .. } = &pd.kind {
+                for a in assignments {
+                    param_defaults.push((a.name.name.clone(), a.init.clone()));
+                    static_properties.insert(a.name.name.clone());
+                    // Evaluate the initial value for the property.
+                    let width = resolve_type_width(data_type, None, None);
+                    let is_string = matches!(data_type, crate::ast::types::DataType::Simple { kind: crate::ast::types::SimpleType::String, .. });
+                    let v = if is_string {
+                        // String localparams: evaluate using the const-eval path.
+                        if let Some(init) = &a.init {
+                            eval_const_expr_val(init, &HashMap::default())
+                        } else {
+                            Value::from_string("")
+                        }
+                    } else if let Some(init) = &a.init {
+                        eval_init_for_width(init, &HashMap::default(), width)
+                    } else {
+                        Value::zero(width)
+                    };
+                    properties.insert(a.name.name.clone(), Signal {
+                        is_const: true,
+                        name: a.name.name.clone(),
+                        width,
+                        is_signed: false,
+                        is_real: false,
+                        direction: None,
+                        value: v,
+                        type_name: get_type_name(data_type),
+                    });
+                }
+            }
+        }
+    }
     let has_pure_virtual = c.items.iter().any(|it|
         matches!(it, ClassItem::Method(m) if matches!(m.kind, ClassMethodKind::PureVirtual(_))));
     let mut type_param_names = Vec::new();
@@ -5074,7 +5114,7 @@ fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, tick_s: f64) {
 /// several aliases (black-parrot's CCE types) loses its layout. Follow the chain
 /// until a non-`TypeReference` (or an unresolved name) is hit; a small iteration
 /// guard prevents looping on recursive typedefs (caught separately at decl time).
-fn resolve_typedef_chain<'a>(
+pub fn resolve_typedef_chain<'a>(
     dt: &'a DataType,
     typedef_types: &'a HashMap<String, DataType>,
 ) -> &'a DataType {
