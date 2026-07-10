@@ -1,6 +1,6 @@
 [package]
 name = "xezim-core"
-version = "0.4.0"
+version = "0.8.3"
 edition = "2021"
 rust-version = "1.75"
 description = "Shared SystemVerilog elaboration and runtime primitives for xezim and xezim-b"

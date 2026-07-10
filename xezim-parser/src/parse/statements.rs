@@ -583,10 +583,10 @@ impl Parser {
 
         // IEEE 1800-2017 §12.6.1: pattern case statement
         // `case (expr) matches { pattern [&&& expr] : stmt } endcase`.
-        // Parse-accept only: consume each item's pattern (via parse_pattern,
-        // which handles `tagged X '{…}`, `.field`, etc.) plus an optional
-        // `&&& <guard>`, and lower it to an ordinary CaseItem with the guard
-        // dropped. The pattern's structure is consumed but not modelled.
+        // The pattern and its optional `&&& <guard>` are retained on the
+        // CaseItem so the simulator can test them and bind the `.v` pattern
+        // variables (which it injects as locals for the item's statement —
+        // hence no VarDecl wrapper here, which would reset them to X).
         if self.eat(TokenKind::KwMatches).is_some() {
             let mut items = Vec::new();
             while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
@@ -595,22 +595,22 @@ impl Parser {
                 if self.eat(TokenKind::KwDefault).is_some() {
                     self.eat(TokenKind::Colon);
                     let stmt = self.parse_statement();
-                    items.push(CaseItem { patterns: Vec::new(), is_default: true, stmt, span: self.span_from(istart) });
+                    items.push(CaseItem { patterns: Vec::new(), is_default: true, stmt, span: self.span_from(istart), pattern: None, guard: None });
                 } else {
                     self.pending_pattern_bindings.clear();
-                    self.parse_pattern();
+                    let pattern = self.parse_pattern();
                     // Optional pattern guard: `&&& <expression>`.
                     // `&&&` lexes as LogAnd (`&&`) followed by BitAnd (`&`).
-                    if self.at(TokenKind::LogAnd) && self.peek_kind() == TokenKind::BitAnd {
+                    let guard = if self.at(TokenKind::LogAnd) && self.peek_kind() == TokenKind::BitAnd {
                         self.bump(); self.bump();
-                        let _ = self.parse_expression();
-                    }
+                        Some(self.parse_expression())
+                    } else {
+                        None
+                    };
                     self.expect(TokenKind::Colon);
-                    // §12.6.1: the item's `.v` bindings are visible in its stmt.
-                    let bindings = std::mem::take(&mut self.pending_pattern_bindings);
-                    let body = self.parse_statement();
-                    let stmt = self.wrap_with_pattern_bindings(bindings, body);
-                    items.push(CaseItem { patterns: Vec::new(), is_default: false, stmt, span: self.span_from(istart) });
+                    self.pending_pattern_bindings.clear();
+                    let stmt = self.parse_statement();
+                    items.push(CaseItem { patterns: Vec::new(), is_default: false, stmt, span: self.span_from(istart), pattern: Some(pattern), guard });
                 }
                 if self.pos == before { self.bump(); }
             }
@@ -626,7 +626,7 @@ impl Parser {
             if self.eat(TokenKind::KwDefault).is_some() {
                 self.eat(TokenKind::Colon);
                 let stmt = self.parse_statement();
-                items.push(CaseItem { patterns: Vec::new(), is_default: true, stmt, span: self.span_from(istart) });
+                items.push(CaseItem { patterns: Vec::new(), is_default: true, stmt, span: self.span_from(istart), pattern: None, guard: None });
             } else {
                 let mut patterns = Vec::new();
                 loop {
@@ -652,7 +652,7 @@ impl Parser {
                 }
                 self.expect(TokenKind::Colon);
                 let stmt = self.parse_statement();
-                items.push(CaseItem { patterns, is_default: false, stmt, span: self.span_from(istart) });
+                items.push(CaseItem { patterns, is_default: false, stmt, span: self.span_from(istart), pattern: None, guard: None });
             }
         }
         self.expect(TokenKind::KwEndcase);
@@ -863,10 +863,29 @@ impl Parser {
                     TokenKind::KwEdge => { self.bump(); Some(Edge::Edge) }
                     _ => None,
                 };
-                let expr = self.parse_expression();
-                let iff = if self.eat(TokenKind::KwIff).is_some() {
-                    Some(self.parse_expression())
-                } else { None };
+                // LRM §9.4.2.3 `@(posedge clk iff guard)`. `parse_expression`
+                // treats `iff` as a low-precedence binary operator
+                // (`BinaryOp::Iff`), so it slurps the whole tail into
+                // `Binary(Iff, clk, guard)` and the dedicated `KwIff` eat
+                // below never fires. Peel that back out into the `iff` field
+                // so the edge expression is just the signal (otherwise the
+                // signal is buried inside a Binary node and the sensitivity
+                // list comes up empty — the `@` never suspends). The explicit
+                // `KwIff` eat is kept as a fallback in case expression
+                // precedence ever stops treating `iff` as an operator.
+                let parsed = self.parse_expression();
+                let (expr, iff) = match parsed.kind {
+                    ExprKind::Binary { op: BinaryOp::Iff, left, right } => {
+                        (*left, Some(*right))
+                    }
+                    other => {
+                        let expr = Expression { kind: other, span: parsed.span };
+                        let iff = if self.eat(TokenKind::KwIff).is_some() {
+                            Some(self.parse_expression())
+                        } else { None };
+                        (expr, iff)
+                    }
+                };
                 events.push(EventExpr { edge, expr, iff, span: self.span_from(estart) });
                 if self.eat(TokenKind::KwOr).is_some() || self.eat(TokenKind::Comma).is_some() {
                     continue;
@@ -1424,6 +1443,8 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                     is_default: false,
                     stmt: expand_alt(prods, alt, depth, span),
                     span,
+                    pattern: None,
+                    guard: None,
                 }
             }).collect();
             if let Some(d) = default {
@@ -1432,6 +1453,8 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                     is_default: true,
                     stmt: expand_alt(prods, d, depth, span),
                     span,
+                    pattern: None,
+                    guard: None,
                 });
             }
             *depth -= 1;

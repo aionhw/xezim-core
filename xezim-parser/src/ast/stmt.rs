@@ -82,6 +82,22 @@ pub enum UniquePriority { Unique, Unique0, Priority }
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CaseKind { Case, Casex, Casez, CaseInside }
 
+/// IEEE 1800-2017 §12.6 pattern (for `case … matches` / `if … matches`).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Pattern {
+    /// `.*` — matches anything, binds nothing.
+    Wildcard,
+    /// `.name` — matches anything and binds the subject to `name`.
+    Binding(crate::ast::Identifier),
+    /// `tagged Tag [sub_pattern]` — matches a tagged-union member (§7.3.2).
+    Tagged { tag: crate::ast::Identifier, inner: Option<Box<Pattern>> },
+    /// A constant expression the subject must equal.
+    Expr(Expression),
+    /// `'{ [name:] pat, … }` — structure pattern.
+    Struct(Vec<(Option<crate::ast::Identifier>, Pattern)>),
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CaseItem {
@@ -89,6 +105,13 @@ pub struct CaseItem {
     pub is_default: bool,
     pub stmt: Statement,
     pub span: Span,
+    /// §12.6: the item's pattern in a `case (…) matches` statement. `None` for
+    /// an ordinary case item (which uses `patterns` instead).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pattern: Option<Pattern>,
+    /// §12.6: the item's optional `&&& <guard>` expression.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub guard: Option<Expression>,
 }
 
 #[derive(Debug, Clone)]

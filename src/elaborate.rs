@@ -53,6 +53,19 @@ pub struct AlwaysBlock {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InitialBlock {
     pub stmt: Statement,
+    /// Instance scope this block belongs to (e.g. `"TB.p1"`), empty for the
+    /// top module. The simulator sets it as the name-resolution hint while the
+    /// block's process runs, so AST-evaluated bare names (e.g. a
+    /// `std::randomize(sig)` target) resolve to THIS instance's signal rather
+    /// than the first instance of a multiply-instantiated module.
+    #[serde(default)]
+    pub scope: String,
+}
+
+impl InitialBlock {
+    pub fn new(stmt: Statement) -> Self {
+        InitialBlock { stmt, scope: String::new() }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -150,7 +163,10 @@ impl PendingInitial {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        InitialBlock { stmt }
+        // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
+        // record it (dot-trimmed) as the block's scope for name resolution.
+        let scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        InitialBlock { stmt, scope }
     }
 }
 
@@ -180,9 +196,18 @@ pub struct ElaboratedClass {
     pub name: String,
     pub extends: Option<String>,
     pub properties: HashMap<String, Signal>,
+    /// Property names in DECLARATION order. `properties` is a HashMap and so
+    /// loses source order; `%p` (LRM §21.2.1.7) must print a class object as
+    /// `'{prop:value, ...}` in declaration order.
+    #[serde(default)]
+    pub property_order: Vec<String>,
     pub methods: HashMap<String, ClassMethod>,
     /// Properties marked as 'rand' or 'randc'.
     pub random_properties: HashSet<String>,
+    /// Properties declared with type `string`, so `%p` renders them as text
+    /// rather than the packed byte value (LRM §21.2.1.7).
+    #[serde(default)]
+    pub string_properties: HashSet<String>,
     /// LRM §25.8 — properties declared as `virtual <iface_t>` or
     /// `virtual <iface_t>.<modport>`. For each such property the
     /// simulator captures a binding (an interface instance name) at the
@@ -284,6 +309,8 @@ pub struct DpiImportSpec {
 
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut properties = HashMap::default();
+    let mut property_order: Vec<String> = Vec::new();
+    let mut string_properties: HashSet<String> = HashSet::default();
     let mut methods = HashMap::default();
     let mut random_properties = HashSet::default();
     let mut randc_properties = HashSet::default();
@@ -448,6 +475,13 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                         default_value_for_type(&p.data_type, width)
                     };
                     if is_signed { v.is_signed = true; }
+                    // Track source order for `%p` (§21.2.1.7).
+                    if !property_order.contains(&decl.name.name) {
+                        property_order.push(decl.name.name.clone());
+                    }
+                    if matches!(&p.data_type, DataType::Simple { kind: SimpleType::String, .. }) {
+                        string_properties.insert(decl.name.name.clone());
+                    }
                     properties.insert(decl.name.name.clone(), Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width,
@@ -519,6 +553,8 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         name: c.name.name.clone(),
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
         properties,
+        property_order,
+        string_properties,
         methods,
         random_properties,
         virtual_iface_properties,
@@ -650,6 +686,19 @@ pub struct ElaboratedModule {
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
     /// Members are stored by bit offset so MemberAccess can slice the container.
     pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    /// Variable -> its declared (element) data type. For an array this is the
+    /// ELEMENT type; array-ness comes from `arrays`/`dynamic_arrays`/
+    /// `associative_arrays`. Drives the type-directed `%p` renderer
+    /// (LRM §21.2.1.7), which must walk nested structs/arrays/enums.
+    #[serde(default)]
+    pub var_decl_types: HashMap<String, DataType>,
+    /// Struct variable -> its top-level member names in DECLARATION order, for
+    /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
+    /// offset (i.e. reversed) and unpacked members live in separate signals, so
+    /// neither preserves source order. Used by `%p` (LRM §21.2.1.7), which must
+    /// print `'{member:value, ...}` in declaration order.
+    #[serde(default)]
+    pub struct_members: HashMap<String, Vec<String>>,
     /// Packed multi-dimensional signal element width: signal_name -> element_width.
     /// For `logic [3:0][7:0] words;` stores `"words" -> 8` so that `words[i]`
     /// resolves to an 8-bit slice rather than a 1-bit select. Also keyed for
@@ -833,6 +882,8 @@ impl ElaboratedModule {
             packages: HashSet::default(),
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
+            var_decl_types: HashMap::default(),
+            struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
@@ -993,10 +1044,23 @@ fn dpi_proto_sv_name(proto: &DPIProto) -> String {
 
 fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
     let sv_name = dpi_proto_sv_name(&di.proto);
-    if elab.dpi_imports.contains_key(&sv_name) {
-        return Err(format!("Duplicate DPI import declaration '{}'", sv_name));
-    }
     let c_name = di.c_name.clone().unwrap_or_else(|| sv_name.clone());
+    // LRM §35.5.2: the same foreign function may be imported more than once,
+    // as long as the declarations are consistent (same C binding and import
+    // property). This is common in real libraries — UVM re-imports helpers
+    // such as `uvm_hdl_check_path` from headers pulled into more than one
+    // scope. Accept a consistent re-import as a no-op; only a genuine
+    // mismatch (different c_identifier or context/pure property) is illegal.
+    if let Some(existing) = elab.dpi_imports.get(&sv_name) {
+        if existing.c_name == c_name && existing.property == di.property {
+            return Ok(());
+        }
+        return Err(format!(
+            "Conflicting DPI import declaration '{}': already imported as \
+             (c=\"{}\", {:?}), redeclared as (c=\"{}\", {:?})",
+            sv_name, existing.c_name, existing.property, c_name, di.property
+        ));
+    }
     elab.dpi_imports.insert(sv_name, DpiImportSpec {
         c_name,
         property: di.property,
@@ -2016,12 +2080,21 @@ pub fn elaborate_module_with_defs(
                 for decl in &dd.declarators {
                     elab.note_explicit_type(&decl.name.name, &dd.data_type)?;
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
-                        // Demoted to a warning so DataDeclaration-vs-existing
-                        // collisions (e.g. cv32e40p UVM TB's `bit tp;`
-                        // colliding with a same-named class-function local
-                        // that was wrongly merged into module scope) don't
-                        // block elaboration. The real fix is to keep class
-                        // function locals out of the module scope map.
+                        // LRM §6.x: re-declaring a name already declared in the
+                        // same scope is illegal. In strict mode (the default)
+                        // this is a hard error. It stays a warning under
+                        // --no-strict because xezim sometimes merges class-
+                        // function locals into module scope (e.g. cv32e40p UVM
+                        // TB's `bit tp;` colliding with a same-named function
+                        // local), which would otherwise be a false-positive
+                        // collision; --no-strict keeps those designs elaborating
+                        // until that scope-merge is fixed.
+                        if sv_parser::strict_checks() {
+                            return Err(format!(
+                                "duplicate declaration of '{}' in the same scope",
+                                decl.name.name
+                            ));
+                        }
                         eprintln!("[xezim][warning] duplicate declaration of '{}' (data); keeping first definition", decl.name.name);
                         continue;
                     }
@@ -2040,6 +2113,10 @@ pub fn elaborate_module_with_defs(
                     } else {
                         decl.dimensions.clone()
                     };
+                    // `a[N]` (N a parameter) parses as an associative dim keyed by
+                    // "type" N; rewrite it back to a fixed size.
+                    let effective_dims =
+                        normalize_unpacked_dims(&effective_dims, &elab.parameters, &elab.typedef_types);
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = effective_dims.first() {
                         let is_string_key = key_dt.as_ref().map_or(false, |dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
@@ -2112,10 +2189,21 @@ pub fn elaborate_module_with_defs(
                             if let DataType::TypeReference { name, .. } = &dd.data_type {
                                 elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
                             } else { &dd.data_type };
-                        if let Some(fields) = flatten_elem(elem_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
-                            if !fields.is_empty() {
-                                tls_register_struct_layout(&decl.name.name, &fields);
-                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                        // Only a PACKED struct element has a contiguous bit layout that
+                        // `arr[i].member` can slice. An UNPACKED struct element stores each
+                        // member as its own signal (`arr[i].member`); bit-slicing it drops
+                        // `real` members' is_real (they read back as raw bits) and shifts the
+                        // offsets of any member following a string / nested aggregate.
+                        let elem_is_packed = matches!(
+                            resolve_typedef_chain(elem_resolved, &elab.typedef_types),
+                            DataType::Struct(su) if su.packed
+                        );
+                        if elem_is_packed {
+                            if let Some(fields) = flatten_elem(elem_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                                if !fields.is_empty() {
+                                    tls_register_struct_layout(&decl.name.name, &fields);
+                                    elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                }
                             }
                         }
                     };
@@ -2189,6 +2277,23 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // Element type, for the type-directed `%p` renderer.
+                        elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
+                        // An UNPACKED struct element keeps each member in its own
+                        // signal (recursively: nested unpacked members expand, nested
+                        // packed members get a signal + slice layout). Without this
+                        // they are created lazily on first assignment and lose their
+                        // declared type (a `real` member reads back as raw bits).
+                        if let DataType::Struct(su) =
+                            resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone()
+                        {
+                            if !su.packed && hi >= lo && (hi - lo) < 4096 {
+                                for i in lo..=hi {
+                                    let ebase = format!("{}[{}]", decl.name.name, i);
+                                    register_unpacked_aggregate(&mut elab, &ebase, &dd.data_type);
+                                }
+                            }
+                        }
                         // LRM §8.4: if the array element type is a known
                         // class, stash the class name so the simulator's
                         // `arr[i] = new(...)` path can construct the right
@@ -2251,15 +2356,13 @@ pub fn elaborate_module_with_defs(
                                     elab.signals.insert(size_name, size_sig);
                                 }
                                 elab.initial_blocks.push(InitialBlock {
-                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                });
+                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                             } else if !is_dynamic_dim {
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(StatementKind::BlockingAssign {
                                         lvalue: make_ident_expr(&decl.name.name),
                                         rvalue: init_expr.clone(),
-                                    }, Span::dummy()),
-                                });
+                                    }, Span::dummy()), scope: String::new(), });
                             }
                         }
                     } else {
@@ -2307,15 +2410,17 @@ pub fn elaborate_module_with_defs(
                                 stmt: Statement::new(StatementKind::BlockingAssign {
                                     lvalue: make_ident_expr(&decl.name.name),
                                     rvalue: expr,
-                                }, decl.name.span),
-                            });
+                                }, decl.name.span), scope: String::new(), });
                         }
                         // Unpacked-struct member default initializers:
                         //   struct { bit [3:0] lo = c; ... } p1;
                         // Packed structs forbid member defaults (IEEE 7.2.2).
-                        let dt_resolved: &DataType = if let DataType::TypeReference { name, .. } = &dd.data_type {
-                            elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
-                        } else { &dd.data_type };
+                        // Owned so later `&mut elab` calls (member pre-registration)
+                        // don't conflict with a borrow of `elab.typedef_types`.
+                        let dt_resolved_owned: DataType = if let DataType::TypeReference { name, .. } = &dd.data_type {
+                            elab.typedef_types.get(&name.name.name).cloned().unwrap_or_else(|| dd.data_type.clone())
+                        } else { dd.data_type.clone() };
+                        let dt_resolved: &DataType = &dt_resolved_owned;
                         // Recursively flatten nested struct/union members so multi-segment
                         // paths like u.s.a resolve via a single packed_struct_fields lookup.
                         fn flatten_subfields(dt: &DataType, params: &HashMap<String, Value>, typedefs: &HashMap<String, u32>, typedef_types: &HashMap<String, DataType>) -> Option<Vec<(String, u32, u32)>> {
@@ -2366,6 +2471,26 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
+                        // Record top-level member names in DECLARATION order for
+                        // `%p` (LRM §21.2.1.7). Applies to packed and unpacked
+                        // structs alike, since neither existing map preserves
+                        // source order. Skip declarators carrying unpacked
+                        // dimensions (`rec_t arr[N]`, `rec_t m[int]`): those are
+                        // ARRAYS of structs, and `%p` must print them as an
+                        // element list, not as a single struct.
+                        elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
+                        if decl.dimensions.is_empty() {
+                            if let DataType::Struct(su) = dt_resolved {
+                                let names: Vec<String> = su
+                                    .members
+                                    .iter()
+                                    .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                                    .collect();
+                                if !names.is_empty() {
+                                    elab.struct_members.insert(decl.name.name.clone(), names);
+                                }
+                            }
+                        }
                         // Per-field packed-array element widths so that
                         // `obj.field[i]` slices instead of bit-selects when
                         // the field is `logic [3:0][7:0] field;`. Walks
@@ -2399,24 +2524,10 @@ pub fn elaborate_module_with_defs(
                             if !su.packed {
                                 // Pre-register member signals with their declared widths,
                                 // so later assignments from wider rvalues don't widen them.
-                                for member in &su.members {
-                                    let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                                    let ms = is_type_signed(&member.data_type);
-                                    let mr = is_type_real(&member.data_type);
-                                    for mdecl in &member.declarators {
-                                        let sname = format!("{}.{}", decl.name.name, mdecl.name.name);
-                                        elab.signals.entry(sname.clone()).or_insert(Signal {
-                                            is_const: false,
-                                            name: sname,
-                                            width: mw,
-                                            is_signed: ms,
-                                            is_real: mr,
-                                            direction: None,
-                                            value: Value::new(mw),
-                                            type_name: None,
-                                        });
-                                    }
-                                }
+                                // Recursive: an array member expands per element and a
+                                // nested packed member gets its own slice layout, so
+                                // `c.nodes[1].status` addresses its own signal.
+                                register_unpacked_aggregate(&mut elab, &decl.name.name, &dd.data_type);
                                 let mut stmts: Vec<Statement> = Vec::new();
                                 for member in &su.members {
                                     for mdecl in &member.declarators {
@@ -2434,8 +2545,7 @@ pub fn elaborate_module_with_defs(
                                 }
                                 if !stmts.is_empty() {
                                     elab.initial_blocks.push(InitialBlock {
-                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                    });
+                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                                 }
                             }
                         }
@@ -2697,7 +2807,7 @@ pub fn elaborate_module_with_defs(
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                     eprintln!("[xezim][elab] elaborate_items: pushing initial (top-level path)");
                 }
-                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
+                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: String::new(), });
             }
             // LRM §16.5: module-level `assert/assume/cover property (…)`.
             // Previously the elaborator ignored AssertionItem entirely,
@@ -2711,14 +2821,13 @@ pub fn elaborate_module_with_defs(
                     stmt: crate::ast::stmt::Statement::new(
                         crate::ast::stmt::StatementKind::Assertion(a.clone()),
                         a.span,
-                    ),
-                });
+                    ), scope: String::new(), });
             }
             ModuleItem::FinalConstruct(fc) => {
                 // LRM §9.2.3 — `final` executes once after the event loop
                 // exits (e.g. on $finish). Collected here; the simulator drains
                 // `final_blocks` before VCD/coverage flush.
-                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone() });
+                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone(), scope: String::new(), });
             }
             ModuleItem::GenerateRegion(gr) => {
                 // Recursively process generate region items
@@ -4284,6 +4393,21 @@ fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
     Ok(())
 }
 
+/// Names bound by a §12.6 pattern's `.v` sub-patterns.
+fn collect_pattern_bindings(p: &crate::ast::stmt::Pattern, out: &mut Vec<String>) {
+    use crate::ast::stmt::Pattern as P;
+    match p {
+        P::Binding(id) => out.push(id.name.clone()),
+        P::Tagged { inner: Some(i), .. } => collect_pattern_bindings(i, out),
+        P::Struct(ms) => {
+            for (_, sp) in ms {
+                collect_pattern_bindings(sp, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut HashSet<String>) -> Result<(), String> {
     match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
@@ -4334,7 +4458,19 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
             validate_expr_idents(expr, elab, locals)?;
             for item in items {
                 for p in &item.patterns { validate_expr_idents(p, elab, locals)?; }
-                validate_stmt_idents(&item.stmt, elab, locals)?;
+                // §12.6.1: a pattern item's `.v` bindings are declared for the
+                // scope of that item's statement (and its `&&&` guard). Add
+                // them, validate, then remove so they don't leak to siblings.
+                let mut bound: Vec<String> = Vec::new();
+                if let Some(pat) = &item.pattern {
+                    collect_pattern_bindings(pat, &mut bound);
+                }
+                let fresh: Vec<String> =
+                    bound.iter().filter(|b| locals.insert((*b).clone())).cloned().collect();
+                if let Some(g) = &item.guard { validate_expr_idents(g, elab, locals)?; }
+                let r = validate_stmt_idents(&item.stmt, elab, locals);
+                for b in fresh { locals.remove(&b); }
+                r?;
             }
         }
         StatementKind::For { init, condition, step, body } => {
@@ -4878,8 +5014,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                     elab.signals.insert(size_name, size_sig);
                                 }
                                 elab.initial_blocks.push(InitialBlock {
-                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                });
+                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                             }
                         }
                     } else {
@@ -4939,7 +5074,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                     eprintln!("[xezim][elab] @2453 pushing initial (other path)");
                 }
-                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
+                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: String::new(), });
             }
             // Mirror the AssertionItem hoist in elaborate_module_with_defs
             // so module-level `assert/assume/cover property (…)` inside
@@ -4949,11 +5084,10 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     stmt: crate::ast::stmt::Statement::new(
                         crate::ast::stmt::StatementKind::Assertion(a.clone()),
                         a.span,
-                    ),
-                });
+                    ), scope: String::new(), });
             }
             ModuleItem::FinalConstruct(fc) => {
-                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone() });
+                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone(), scope: String::new(), });
             }
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &inst.instances {
@@ -6148,6 +6282,185 @@ fn eval_param_value(
 
 /// assigned LSB-first by walking members in reverse. Returns None if `dt`
 /// does not resolve to a struct/union.
+/// Bit-slice layout (name, offset, width) of a *packed* struct type, or `None`
+/// for a non-struct or an *unpacked* struct. An unpacked struct's members are
+/// separate storage, not bit-packed, so their offsets are meaningless and must
+/// never be registered as a packed slice layout. Used by the simulator to give
+/// a local packed-struct variable the same whole/member aliasing that
+/// module-level packed-struct signals get.
+/// `arr[N]` where `N` is a *parameter* is indistinguishable, to the parser, from
+/// `arr[key_t]` (an associative array keyed by type `key_t`) — a bare identifier
+/// before `]` is assumed to name a type. Rewrite an associative dimension whose
+/// "key type" is really a known parameter (and not a known type) back into a
+/// fixed-size dimension. Without this, `rec_t a[N];` is registered as an
+/// associative array and never gets a size (`%p`, `$size`, `foreach` all lose).
+pub fn normalize_unpacked_dims(
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Vec<UnpackedDimension> {
+    dims.iter()
+        .map(|d| match d {
+            UnpackedDimension::Associative { data_type: Some(dt), span } => {
+                if let DataType::TypeReference { name, .. } = dt.as_ref() {
+                    let n = &name.name.name;
+                    if !typedef_types.contains_key(n) && params.contains_key(n) {
+                        return UnpackedDimension::Expression {
+                            expr: Box::new(make_ident_expr(n)),
+                            span: *span,
+                        };
+                    }
+                }
+                d.clone()
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Constant element indices of a declarator's (single) unpacked dimension.
+/// Empty for a scalar; empty for dynamic/queue/associative (size unknown here).
+fn const_dim_indices(
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+) -> Option<Vec<i64>> {
+    match dims.first() {
+        None => Some(Vec::new()),
+        Some(UnpackedDimension::Expression { expr, .. }) => {
+            match const_eval_i64_with_params(expr, Some(params)) {
+                Some(n) if n > 0 && n <= 4096 => Some((0..n).collect()),
+                _ => None,
+            }
+        }
+        Some(UnpackedDimension::Range { left, right, .. }) => {
+            match (
+                const_eval_i64_with_params(left, Some(params)),
+                const_eval_i64_with_params(right, Some(params)),
+            ) {
+                (Some(l), Some(r)) => {
+                    let (lo, hi) = if l <= r { (l, r) } else { (r, l) };
+                    if hi - lo < 4096 { Some((lo..=hi).collect()) } else { None }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) {
+    let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
+    let signed = is_type_signed(dt);
+    let real = is_type_real(dt);
+    let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
+    match &resolved {
+        // A nested PACKED struct member keeps a contiguous bit layout: give it
+        // its own signal plus the field offsets so `base.m.f` can slice it.
+        DataType::Struct(su) if su.packed => {
+            elab.signals.entry(name.to_string()).or_insert(Signal {
+                is_const: false, name: name.to_string(), width: w, is_signed: signed,
+                is_real: false, direction: None, value: Value::new(w), type_name: None,
+            });
+            if let Some(fields) =
+                flatten_struct_fields(dt, &elab.parameters, &elab.typedefs, &elab.typedef_types)
+            {
+                if !fields.is_empty() {
+                    elab.packed_struct_fields.insert(name.to_string(), fields);
+                }
+            }
+        }
+        // A nested UNPACKED struct member: recurse into its own members.
+        DataType::Struct(_) => register_unpacked_aggregate(elab, name, dt),
+        _ => {
+            elab.signals.entry(name.to_string()).or_insert(Signal {
+                is_const: false, name: name.to_string(), width: w, is_signed: signed,
+                is_real: real, direction: None,
+                value: if real { Value::from_f64(0.0) } else { Value::new(w) },
+                type_name: None,
+            });
+        }
+    }
+}
+
+/// Recursively pre-register the per-member signals of an UNPACKED aggregate
+/// rooted at `base` (e.g. `arr[3]`, `c`). Each leaf keeps its declared width /
+/// signedness / real-ness, array members expand per element, and nested packed
+/// members get their own signal + bit-slice layout. Without this, elements are
+/// created lazily on first assignment and lose their type (a `real` reads back
+/// as raw bits) or alias each other through a bogus packed layout.
+fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &DataType) {
+    let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
+    let DataType::Struct(su) = resolved else { return };
+    if su.packed {
+        return;
+    }
+    // IEEE 1800-2017 §7.3: a union is ONE piece of storage accessed through any
+    // of its member names — writing `u.a` must be readable as `u.b`. So an
+    // untagged union gets a single signal whose members all start at bit 0,
+    // exactly like a packed one. (A TAGGED union is tag-checked: §7.3.2.)
+    if matches!(su.kind, StructUnionKind::Union) && !su.tagged {
+        let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
+        elab.signals.entry(base.to_string()).or_insert(Signal {
+            is_const: false, name: base.to_string(), width: w, is_signed: false,
+            is_real: false, direction: None, value: Value::new(w), type_name: None,
+        });
+        if let Some(fields) =
+            flatten_struct_fields(dt, &elab.parameters, &elab.typedefs, &elab.typedef_types)
+        {
+            if !fields.is_empty() {
+                elab.packed_struct_fields.insert(base.to_string(), fields);
+            }
+        }
+        return;
+    }
+    for member in &su.members {
+        for mdecl in &member.declarators {
+            let mbase = format!("{}.{}", base, mdecl.name.name);
+            if mdecl.dimensions.is_empty() {
+                register_member_leaf(elab, &mbase, &member.data_type);
+            } else if let Some(idxs) = const_dim_indices(
+                &normalize_unpacked_dims(&mdecl.dimensions, &elab.parameters, &elab.typedef_types),
+                &elab.parameters,
+            ) {
+                for i in idxs {
+                    register_member_leaf(elab, &format!("{}[{}]", mbase, i), &member.data_type);
+                }
+            }
+            // Dynamic / queue / associative members stay lazily created.
+        }
+    }
+}
+
+/// Top-level member names of a struct/union type in DECLARATION order (packed
+/// or unpacked). `None` for a non-struct type. Nested members are not expanded.
+pub fn struct_member_names(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<String>> {
+    match resolve_typedef_chain(dt, typedef_types) {
+        DataType::Struct(su) => Some(
+            su.members
+                .iter()
+                .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+pub fn packed_struct_field_layout(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<(String, u32, u32)>> {
+    match resolve_typedef_chain(dt, typedef_types) {
+        DataType::Struct(su) if su.packed => {}
+        _ => return None,
+    }
+    flatten_struct_fields(dt, params, typedefs, typedef_types)
+}
+
 fn flatten_struct_fields(
     dt: &DataType,
     params: &HashMap<String, Value>,
@@ -6736,16 +7049,14 @@ pub fn inline_instantiations(
                                         elab.signals.insert(size_name.clone(), Signal { is_const: false, name: size_name, width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None });
                                     }
                                     elab.static_init_blocks.push(InitialBlock {
-                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                    });
+                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                                 } else if decl.dimensions.is_empty() {
                                     let _ = (width, is_signed);
                                     elab.static_init_blocks.push(InitialBlock {
                                         stmt: Statement::new(StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
                                             rvalue: init_expr.clone(),
-                                        }, Span::dummy()),
-                                    });
+                                        }, Span::dummy()), scope: String::new(), });
                                 }
                             }
                         }
@@ -8689,6 +9000,36 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
     Expression::new(new_kind, expr.span)
 }
 
+/// Rewrite the constant-expression leaves of a §12.6 pattern for an instance.
+/// Tag names and `.v` binding names are not signals and are left alone.
+fn rewrite_pattern(
+    p: &crate::ast::stmt::Pattern,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> crate::ast::stmt::Pattern {
+    use crate::ast::stmt::Pattern as P;
+    match p {
+        P::Wildcard => P::Wildcard,
+        P::Binding(id) => P::Binding(id.clone()),
+        P::Tagged { tag, inner } => P::Tagged {
+            tag: tag.clone(),
+            inner: inner
+                .as_ref()
+                .map(|i| Box::new(rewrite_pattern(i, prefix, port_map, local_names, interface_map))),
+        },
+        P::Expr(e) => P::Expr(rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+        P::Struct(ms) => P::Struct(
+            ms.iter()
+                .map(|(n, sp)| {
+                    (n.clone(), rewrite_pattern(sp, prefix, port_map, local_names, interface_map))
+                })
+                .collect(),
+        ),
+    }
+}
+
 fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
@@ -8716,6 +9057,10 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
                 is_default: item.is_default,
                 stmt: rewrite_stmt(&item.stmt, prefix, port_map, local_names, interface_map),
                 span: item.span,
+                // §12.6: rewrite constant-expression sub-patterns and the
+                // `&&&` guard; tags and `.v` binding names are not signals.
+                pattern: item.pattern.as_ref().map(|p| rewrite_pattern(p, prefix, port_map, local_names, interface_map)),
+                guard: item.guard.as_ref().map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
             }).collect(),
         },
         StatementKind::For { init, condition, step, body } => StatementKind::For {

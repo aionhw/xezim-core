@@ -1467,6 +1467,36 @@ mod tests {
         // sanity: bit() helper round-trips
         assert_eq!(bit(LogicBit::X).get_bit(0), LogicBit::X);
     }
+
+    #[test]
+    fn test_to_dec_string_wide_no_overflow() {
+        // Regression: values wider than 128 bits used to overflow the u128
+        // accumulator in to_dec_string and panic (UVM prints 4096-bit
+        // uvm_bitstream_t fields). Must produce the exact decimal instead.
+        assert_eq!(
+            Value::ones(128).to_dec_string(),
+            "340282366920938463463374607431768211455"
+        );
+        assert_eq!(
+            Value::ones(256).to_dec_string(),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        // Small magnitude carried in a wide storage still prints plainly.
+        assert_eq!(Value::from_u64(12345, 200).to_dec_string(), "12345");
+        assert_eq!(Value::from_u64(0, 200).to_dec_string(), "0");
+        // Signed wide all-ones is -1 (two's complement, no shift overflow).
+        let mut neg1 = Value::ones(128);
+        neg1.is_signed = true;
+        assert_eq!(neg1.to_dec_string(), "-1");
+        // Signed wide most-negative: MSB set, rest zero at width 128 => -2^127.
+        let mut most_neg = Value::from_u64(0, 128);
+        most_neg.set_bit(127, LogicBit::One);
+        most_neg.is_signed = true;
+        assert_eq!(
+            most_neg.to_dec_string(),
+            "-170141183460469231731687303715884105728"
+        );
+    }
 }
 
 // Compatibility shims for the simulator
@@ -1513,18 +1543,57 @@ impl Value {
                 return format!("{}", v);
             }
         }
-        // Wide value: compute from bits
-        let mut result = 0u128;
-        for i in (0..self.width as usize).rev() {
-            result = result * 2 + if self.get_bit(i) == LogicBit::One { 1 } else { 0 };
+        // Wide value (> 64 bits): a fixed-width integer accumulator would
+        // overflow for anything wider than 128 bits (UVM prints fields such
+        // as the 4096-bit `uvm_bitstream_t`), so build the decimal string
+        // with a schoolbook base-10 accumulator that handles any width.
+        let width = self.width as usize;
+        let neg = self.is_signed && self.get_bit(width - 1) == LogicBit::One;
+
+        // Magnitude bits, LSB at index 0. For a negative signed value take
+        // the two's-complement (invert + 1) so we print the magnitude.
+        let mut mag: Vec<u8> = (0..width)
+            .map(|i| (self.get_bit(i) == LogicBit::One) as u8)
+            .collect();
+        if neg {
+            for b in mag.iter_mut() {
+                *b ^= 1;
+            }
+            let mut carry = 1u8;
+            for b in mag.iter_mut() {
+                let sum = *b + carry;
+                *b = sum & 1;
+                carry = sum >> 1;
+                if carry == 0 {
+                    break;
+                }
+            }
         }
-        if self.is_signed && self.get_bit(self.width as usize - 1) == LogicBit::One {
-            // Negative: 2's complement
-            let max = 1u128 << self.width;
-            format!("-{}", max - result)
-        } else {
-            format!("{}", result)
+
+        // Convert magnitude (MSB→LSB) to little-endian decimal digits:
+        // digits = digits * 2 + bit, propagating base-10 carries.
+        let mut digits: Vec<u8> = vec![0];
+        for i in (0..width).rev() {
+            let mut carry = mag[i];
+            for d in digits.iter_mut() {
+                let v = *d * 2 + carry;
+                *d = v % 10;
+                carry = v / 10;
+            }
+            while carry > 0 {
+                digits.push(carry % 10);
+                carry /= 10;
+            }
         }
+
+        let mut s = String::with_capacity(digits.len() + neg as usize);
+        if neg {
+            s.push('-');
+        }
+        for d in digits.iter().rev() {
+            s.push((b'0' + d) as char);
+        }
+        s
     }
 
     /// Convert packed bytes to a SystemVerilog-style string.

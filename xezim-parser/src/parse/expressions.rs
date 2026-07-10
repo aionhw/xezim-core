@@ -106,38 +106,53 @@ impl Parser {
     /// — consumes the pattern structure; bindings/semantics aren't modelled.
     ///   pattern ::= `.` ident | `.*` | `tagged` ident [pattern]
     ///             | `'{` pattern {, [name:] pattern} `}` | expression
-    pub(super) fn parse_pattern(&mut self) {
+    /// §12.6 pattern. Returns the parsed structure so `case … matches` can
+    /// actually test it at run time (it used to be consumed and discarded,
+    /// which left every pattern item unmatchable).
+    pub(super) fn parse_pattern(&mut self) -> crate::ast::stmt::Pattern {
+        use crate::ast::stmt::Pattern;
         if self.eat(TokenKind::KwTagged).is_some() {
-            let _ = self.parse_identifier();
+            let tag = self.parse_identifier();
             // Optional member sub-pattern.
-            if matches!(self.current_kind(),
+            let inner = if matches!(self.current_kind(),
                 TokenKind::ApostropheLBrace | TokenKind::KwTagged | TokenKind::Dot) {
-                self.parse_pattern();
-            }
+                Some(Box::new(self.parse_pattern()))
+            } else {
+                None
+            };
+            Pattern::Tagged { tag, inner }
         } else if self.eat(TokenKind::Dot).is_some() {
             // `.field` binding or `.*` wildcard. `.name` introduces a pattern
             // variable (§12.6) visible in the matched statement — record it so
             // the enclosing if/case can declare it.
-            if self.eat(TokenKind::Star).is_none() {
+            if self.eat(TokenKind::Star).is_some() {
+                Pattern::Wildcard
+            } else {
                 let id = self.parse_identifier();
-                self.pending_pattern_bindings.push(id);
+                self.pending_pattern_bindings.push(id.clone());
+                Pattern::Binding(id)
             }
         } else if self.eat(TokenKind::ApostropheLBrace).is_some() {
+            let mut members = Vec::new();
             loop {
                 if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
                 // optional `name:` member tag
-                if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
+                let name = if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
                     && self.peek_kind() == TokenKind::Colon {
-                    let _ = self.parse_identifier();
+                    let id = self.parse_identifier();
                     self.bump(); // :
-                }
-                self.parse_pattern();
+                    Some(id)
+                } else {
+                    None
+                };
+                members.push((name, self.parse_pattern()));
                 if self.eat(TokenKind::Comma).is_none() { break; }
             }
             self.expect(TokenKind::RBrace);
+            Pattern::Struct(members)
         } else {
             // Constant-expression pattern.
-            let _ = self.parse_expr_bp(16);
+            Pattern::Expr(self.parse_expr_bp(16))
         }
     }
 
