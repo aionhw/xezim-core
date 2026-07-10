@@ -890,7 +890,13 @@ impl Value {
         }
     }
 
+    /// IEEE 1800-2017 §11.4.10: `>>>` fills with the sign bit ONLY when the left
+    /// operand is signed. On an unsigned operand it is a plain logical shift —
+    /// filling with the MSB there silently corrupts the high bits.
     pub fn arith_shift_right(&self, amount: &Value) -> Value {
+        if !self.is_signed {
+            return self.shift_right(amount);
+        }
         let amt = amount.to_u64().unwrap_or(0) as u32;
         if amount.has_xz() { return Value::new(self.width); }
         let sign = self.get_bit(self.width.saturating_sub(1) as usize);

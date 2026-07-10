@@ -239,7 +239,14 @@ impl Parser {
                     self.expect(TokenKind::RParen);
                     chosen
                 } else {
-                    self.parse_expression()
+                    // A bare delay is a delay_value primary (§9.4.1), not a full
+                    // expression: `#5 -> ev;` must be a 5-tick delay followed by
+                    // an event trigger. `->` is also the constraint-implication
+                    // infix operator, so `parse_expression` swallowed the trigger
+                    // as `#(5 -> ev)` and the delay silently became 0.
+                    // Binding power 3 stops below `->`, `|->`, `iff` and the
+                    // sequence operators, while `#CLK/2` still parses.
+                    self.parse_expr_bp(3)
                 };
                 let stmt = self.parse_statement();
                 Statement::new(StatementKind::TimingControl {
@@ -548,11 +555,12 @@ impl Parser {
         self.pending_pattern_bindings.clear();
         let condition = self.parse_expression();
         self.expect(TokenKind::RParen);
-        // §12.6.2: `if (expr matches pattern '{… .v})` — the `.v` binding is
-        // visible in the then-branch. Declare it there.
-        let bindings = std::mem::take(&mut self.pending_pattern_bindings);
-        let then_body = self.parse_statement();
-        let then_stmt = self.wrap_with_pattern_bindings(bindings, then_body);
+        // §12.6.2: `if (expr matches pattern)` — the pattern's `.v` bindings are
+        // visible in the then-branch. They are bound at RUNTIME from the matched
+        // subject; a synthesized declaration here would re-initialise them to X
+        // and clobber the binding. Elaboration knows they are declared.
+        self.pending_pattern_bindings.clear();
+        let then_stmt = self.parse_statement();
         let else_stmt = if self.eat(TokenKind::KwElse).is_some() {
             Some(Box::new(self.parse_statement()))
         } else { None };

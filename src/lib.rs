@@ -546,6 +546,10 @@ fn parse_and_elaborate(
     elab.tick_s = tick_s;
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
+    // §28.8: bidirectional switches need every terminal's drivers in hand.
+    elaborate::resolve_bidirectional_switches(&mut elab);
+    // §6.6.1: a net with several continuous drivers resolves them all.
+    elaborate::resolve_multi_driver_nets(&mut elab);
     // Link `function ClassName::m(); ...` out-of-class bodies into their
     // classes — must run after inline_instantiations repopulates classes.
     elaborate::link_extern_methods(&mut elab, &def_refs);

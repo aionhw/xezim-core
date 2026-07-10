@@ -156,7 +156,7 @@ impl Parser {
         }
     }
 
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Expression {
+    pub(super) fn parse_expr_bp(&mut self, min_bp: u8) -> Expression {
         let start = self.current().span.start;
         let mut lhs = self.parse_prefix();
 
@@ -168,13 +168,12 @@ impl Parser {
             if self.at(TokenKind::KwMatches) {
                 if 15 < min_bp { break; }
                 self.bump();
-                self.parse_pattern();
+                let pattern = self.parse_pattern();
                 lhs = Expression::new(
-                    ExprKind::Number(NumberLiteral::Integer {
-                        size: Some(1), signed: false, base: NumberBase::Binary,
-                        value: "0".to_string(),
-                        cached_val: std::cell::Cell::new(Some((0u64, 0u64, 1u32))),
-                    }),
+                    ExprKind::Matches {
+                        expr: Box::new(lhs),
+                        pattern: Box::new(pattern),
+                    },
                     self.span_from(start),
                 );
                 continue;
@@ -1008,12 +1007,28 @@ impl Parser {
                     }
                 } =>
             {
+                let cast_kw = self.current_kind();
                 self.bump(); // skip type keyword
                 self.bump(); // skip '
                 self.expect(TokenKind::LParen);
                 let inner = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
+                // §6.24.1: `signed'(e)` / `unsigned'(e)` REINTERPRET the operand's
+                // signedness — `signed'(4'hF)` is -1. Every other type cast is a
+                // width/type hint the assignment context already applies, so it
+                // stays a pass-through. Lower the two signedness casts onto the
+                // equivalent system functions rather than dropping them.
+                match cast_kw {
+                    TokenKind::KwSigned => Expression::new(
+                        ExprKind::SystemCall { name: "$signed".to_string(), args: vec![inner] },
+                        self.span_from(start),
+                    ),
+                    TokenKind::KwUnsigned => Expression::new(
+                        ExprKind::SystemCall { name: "$unsigned".to_string(), args: vec![inner] },
+                        self.span_from(start),
+                    ),
+                    _ => Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start)),
+                }
             }
 
             // new expression: new(args) or new[size] or just new

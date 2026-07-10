@@ -307,6 +307,14 @@ pub struct DpiImportSpec {
     pub proto: DPIProto,
 }
 
+/// Run `f` with the current thread-local typedef table, if one has been
+/// installed. `elaborate_class` takes no typedef parameter and has eight
+/// call sites; this reads the snapshot the typedef registration already
+/// maintains rather than threading a table through all of them.
+fn typedefs_snapshot<R>(f: impl FnOnce(Option<&HashMap<String, u32>>) -> R) -> R {
+    TYPEDEFS_TLS.with(|cell| f(cell.borrow().as_ref()))
+}
+
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut properties = HashMap::default();
     let mut property_order: Vec<String> = Vec::new();
@@ -339,7 +347,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     for item in &c.items {
         match item {
             ClassItem::Property(p) => {
-                let width = resolve_type_width(&p.data_type, None, None);
+                // Resolve against the typedef table, not `None`. A property
+                // declared with a typedef'd type (`u2_t v;`) hits
+                // `resolve_type_width`'s TypeReference branch, which returns a
+                // flat 32 when it has no table — so every such property was
+                // recorded 32 bits wide however narrow its type.
+                let width = typedefs_snapshot(|td| resolve_type_width(&p.data_type, None, td));
                 let is_signed = is_type_signed(&p.data_type);
                 let is_rand = p.qualifiers.contains(&ClassQualifier::Rand) || p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
@@ -626,6 +639,23 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     }
 }
 
+/// One module/interface instance in the design hierarchy.
+///
+/// The design is flattened into a single `ElaboratedModule` with dotted
+/// signal names, so this is the only surviving record of the instance
+/// tree. VPI's `vpi_iterate(vpiModule, ...)` and `vpi_handle(vpiScope, ..)`
+/// walk it, and `vpi_get_str(vpiDefName, ..)` reads `def_name` from it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElabInstance {
+    /// Dotted path below the top module, e.g. `u_sub_block` or `a.b`.
+    /// Never carries the top module's own name.
+    pub path: String,
+    /// The module (or interface) definition this instantiates.
+    pub def_name: String,
+    /// Dotted path of the containing scope; empty for a child of the top.
+    pub parent: String,
+}
+
 /// Elaborated module ready for simulation.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ElaboratedModule {
@@ -645,6 +675,10 @@ pub struct ElaboratedModule {
     pub typed_decls: HashMap<String, bool>,
     pub port_order: Vec<String>,
     pub continuous_assigns: Vec<ContinuousAssignment>,
+    /// §28.8 bidirectional switches (`tran`/`tranif0`/`tranif1`), pending
+    /// resolution against each terminal's own drivers.
+    #[serde(default)]
+    pub tran_switches: Vec<TranSwitch>,
     pub always_blocks: Vec<AlwaysBlock>,
     pub initial_blocks: Vec<InitialBlock>,
     /// `final` blocks — LRM §9.2.3. Identical AST shape to `initial`, but
@@ -789,6 +823,12 @@ pub struct ElaboratedModule {
     /// Used to enforce §6.5 driver-conflict rules only against variables.
     #[serde(default)]
     pub nets: HashSet<String>,
+    /// The design's instance tree, in elaboration order. Inlining flattens
+    /// every module into this one, so without this the hierarchy is only
+    /// implicit in dotted signal names — enough to resolve a name, not
+    /// enough to enumerate a scope's children. Drives the VPI object model.
+    #[serde(default)]
+    pub instances: Vec<ElabInstance>,
     /// Out-of-class constraint definitions: `(class_name, constraint_name)`.
     #[serde(default)]
     pub out_of_class_constraints: HashSet<(String, String)>,
@@ -839,6 +879,17 @@ pub struct ElaboratedModule {
     pub events: HashSet<String>,
 }
 
+/// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
+/// control. `active_high` distinguishes `tranif1` from `tranif0`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TranSwitch {
+    pub a: Expression,
+    pub b: Expression,
+    pub ctl: Option<Expression>,
+    pub active_high: bool,
+}
+
+
 impl ElaboratedModule {
     /// Record an *explicit* data-type declaration for `name`. Returns Err if
     /// `name` was already explicitly typed — a §23.2.2.1 redeclaration with
@@ -882,6 +933,7 @@ impl ElaboratedModule {
             typed_decls: HashMap::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
+            tran_switches: Vec::new(),
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
             final_blocks: Vec::new(),
@@ -925,6 +977,7 @@ impl ElaboratedModule {
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
+            instances: Vec::new(),
             out_of_class_constraints: HashSet::default(),
             timeunit_exp: default_timeunit_exp(),
             timeprecision_exp: default_timeunit_exp(),
@@ -1721,6 +1774,15 @@ pub fn elaborate_module_with_defs(
                         }
                     }
                 }
+                // §6.20.2 unpacked-array parameter: `u32_t A[N] = {a, b}`.
+                if !assign.dimensions.is_empty() {
+                    let ov = param_overrides.get(&assign.name.name).cloned();
+                    let params_snapshot = elab.parameters.clone();
+                    if register_array_param(&mut elab, "", &assign.name.name, &assign.dimensions,
+                        assign.init.as_ref(), ov.as_ref(), data_type, &params_snapshot) {
+                        continue;
+                    }
+                }
                 let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let mut signed = is_type_signed(data_type);
                 let mut is_real = is_type_real(data_type);
@@ -2155,6 +2217,69 @@ pub fn elaborate_module_with_defs(
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
                         if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
                     }
+                    // IEEE 1800-2017 §7.4.5 / §7.8: an unpacked array whose
+                    // ELEMENT is itself a dynamic collection —
+                    //   `int q[3][$]`      array of queues
+                    //   `int d[3][]`       array of dynamic arrays
+                    //   `int a[2][u8_t]`   array of associative arrays
+                    // The leading dimensions give the (fixed) shape; the
+                    // trailing one makes every element its own collection.
+                    // Without this the trailing dimension was simply dropped and
+                    // `q[i]` was a plain scalar.
+                    // A leading dynamic dim is fine too (`int qq[$][$]`): its
+                    // backing buffer gives the outer shape.
+                    if effective_dims.len() >= 2 {
+                        if let Some(qd) = effective_dims.last() {
+                            if matches!(qd, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }
+                                            | UnpackedDimension::Associative { .. }) {
+                                let outer = &effective_dims[..effective_dims.len() - 1];
+                                let shape: Option<Vec<(i64, i64)>> = outer
+                                    .iter()
+                                    .map(|d| extract_array_range(std::slice::from_ref(d), &elab.parameters))
+                                    .collect();
+                                if let Some(shape) = shape.filter(|sh| {
+                                    sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                }) {
+                                    let name = decl.name.name.clone();
+                                    match shape.len() {
+                                        1 => { elab.arrays.insert(name.clone(), (shape[0].0, shape[0].1, width)); }
+                                        2 => { elab.arrays_2d.insert(name.clone(), (shape[0], shape[1], width)); }
+                                        _ => { elab.arrays_nd.insert(name.clone(), (shape.clone(), width)); }
+                                    }
+                                    let qmax = if let UnpackedDimension::Queue { max_size: Some(ms), .. } = qd {
+                                        const_eval_i64_with_params(ms, Some(&elab.parameters))
+                                            .filter(|n| *n >= 0).map(|n| (n + 1) as u32)
+                                    } else { None };
+                                    // Each element gets exactly the registration a
+                                    // standalone `int q[$]` / `int a[key_t]` gets.
+                                    let assoc_key = match qd {
+                                        UnpackedDimension::Associative { data_type: kdt, .. } => Some(
+                                            kdt.as_ref().map_or(false, |dt| {
+                                                matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
+                                            }),
+                                        ),
+                                        _ => None,
+                                    };
+                                    for suffix in index_tuples(&shape) {
+                                        let en = format!("{}{}", name, suffix);
+                                        if let Some(is_str) = assoc_key {
+                                            // Associative elements are sparse: no
+                                            // backing buffer, no `.size` shadow.
+                                            elab.associative_arrays.insert(en, is_str);
+                                            continue;
+                                        }
+                                        elab.dynamic_arrays.insert(en.clone());
+                                        if let Some(m) = qmax {
+                                            elab.queue_max_sizes.insert(en.clone(), m);
+                                        }
+                                        elab.arrays.insert(en, (0, 63, width));
+                                    }
+                                    elab.var_decl_types.insert(name, dd.data_type.clone());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // Helper: if the element type resolves to a packed struct,
                     // register the FLATTENED field layout (including nested
                     // dotted paths like `outer.inner.leaf`) under the array
@@ -2226,18 +2351,30 @@ pub fn elaborate_module_with_defs(
                     };
                     // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
                     if effective_dims.len() == 2 {
-                        let r1 = if let UnpackedDimension::Range { left, right, .. } = &effective_dims[0] {
-                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
-                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
-                            Some((l.min(r), l.max(r)))
-                        } else { None };
-                        let r2 = if let UnpackedDimension::Range { left, right, .. } = &effective_dims[1] {
-                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
-                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
-                            Some((l.min(r), l.max(r)))
-                        } else { None };
+                        // Both `[0:1][0:2]` (range) and `[2][3]` (size) spell the
+                        // same 2-D array. Only the range form was recognised, so
+                        // `int m[2][3]` fell through to the 1-D path and every
+                        // `m[i][j]` was a bit-select that read X. The N-D branch
+                        // below already accepted both forms.
+                        let dim_range = |d: &UnpackedDimension, params: &HashMap<String, Value>| {
+                            extract_array_range(std::slice::from_ref(d), params)
+                        };
+                        let r1 = match &effective_dims[0] {
+                            d @ (UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }) => {
+                                dim_range(d, &elab.parameters)
+                            }
+                            _ => None,
+                        };
+                        let r2 = match &effective_dims[1] {
+                            d @ (UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }) => {
+                                dim_range(d, &elab.parameters)
+                            }
+                            _ => None,
+                        };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                            // Element type, for the type-directed `%p` renderer.
+                            elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                             // LRM §8.4 (2D class arrays). Same as the 1D
                             // path: record the element class so the
                             // simulator's `arr[i][j] = new(...)` route
@@ -2278,6 +2415,7 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         if let DataType::TypeReference { name, .. } = &dd.data_type {
                             elab.array_elem_class
                                 .insert(decl.name.name.clone(), name.name.name.clone());
@@ -4215,7 +4353,17 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
         }
         StatementKind::If { condition, then_stmt, else_stmt, .. } => {
             validate_expr_idents(condition, elab, locals)?;
-            validate_stmt_idents(then_stmt, elab, locals)?;
+            // §12.6.2: `if (e matches p)` declares the pattern's `.v` bindings
+            // for the then-branch (not the else-branch).
+            let mut bound: Vec<String> = Vec::new();
+            if let ExprKind::Matches { pattern, .. } = &condition.kind {
+                collect_pattern_bindings(pattern, &mut bound);
+            }
+            let fresh: Vec<String> =
+                bound.iter().filter(|b| locals.insert((*b).clone())).cloned().collect();
+            let r = validate_stmt_idents(then_stmt, elab, locals);
+            for b in fresh { locals.remove(&b); }
+            r?;
             if let Some(eb) = else_stmt { validate_stmt_idents(eb, elab, locals)?; }
         }
         StatementKind::Case { expr, items, .. } => {
@@ -4513,8 +4661,8 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
     for pending in &elab.pending_cont_assign {
         let prefix = &pending.ctx.prefix;
         let mut bare = Vec::new();
-        collect_ident_names(&pending.lhs_source, &mut bare);
-        collect_ident_names(&pending.rhs_source, &mut bare);
+        collect_implicit_net_candidates(&pending.lhs_source, &mut bare);
+        collect_implicit_net_candidates(&pending.rhs_source, &mut bare);
         for name in bare {
             // If the bare name is a port (in port_map), it gets rewritten
             // to the parent's signal — don't create an implicit net here.
@@ -4582,6 +4730,39 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Names that §6.10 may implicitly declare as 1-bit nets. Unlike
+/// `collect_ident_names` this does NOT descend into a `MemberAccess` base: a
+/// dotted reference (`testbench.chip_inst.dqs`) is a HIERARCHICAL path, and its
+/// first segment names an instance, not an undeclared net. Descending created a
+/// bogus `<prefix>.testbench` net that then drove the real one to X.
+fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Ident(hier) => {
+            if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                out.push(hier.path[0].name.name.clone());
+            }
+        }
+        ExprKind::MemberAccess { .. } => {}
+        ExprKind::Unary { operand, .. } => collect_implicit_net_candidates(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_implicit_net_candidates(left, out);
+            collect_implicit_net_candidates(right, out);
+        }
+        ExprKind::Paren(i) => collect_implicit_net_candidates(i, out),
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                collect_implicit_net_candidates(p, out);
+            }
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            collect_implicit_net_candidates(condition, out);
+            collect_implicit_net_candidates(then_expr, out);
+            collect_implicit_net_candidates(else_expr, out);
+        }
+        _ => {}
+    }
 }
 
 /// Collect all plain identifier names from an expression tree.
@@ -5796,6 +5977,21 @@ pub fn with_arrays<R>(arrays: &HashMap<String, (i64, i64, u32)>, f: impl FnOnce(
 
 /// Extract array range from unpacked dimensions. Returns Some((lo, hi)) for
 /// `[lo:hi]` or `[size]` (which means [0:size-1]).
+/// Every `[i]`/`[i][j]` suffix of a fixed shape, in row-major order.
+fn index_tuples(shape: &[(i64, i64)]) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for &(lo, hi) in shape {
+        let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1) as usize));
+        for prefix in &out {
+            for i in lo..=hi {
+                next.push(format!("{}[{}]", prefix, i));
+            }
+        }
+        out = next;
+    }
+    out
+}
+
 fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
     if dims.is_empty() { return None; }
     match &dims[0] {
@@ -6152,6 +6348,75 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
 /// members get their own signal + bit-slice layout. Without this, elements are
 /// created lazily on first assignment and lose their type (a `real` reads back
 /// as raw bits) or alias each other through a bogus packed layout.
+/// IEEE 1800-2017 §6.20.2: an UNPACKED-ARRAY parameter — `u32_t A[N] = {a, b}`.
+/// Give each element its own const signal (`<prefix>A[i]`) so `A[i]` reads at
+/// run time, and register the array so `A[i]` is an element select rather than
+/// a bit-select of a scalar.
+///
+/// An OVERRIDE arrives already collapsed to one packed value, so slice it:
+/// `{a, b}` puts `a` in the high bits (§11.4.12) and `a` is element 0.
+/// Returns false when the size or the element values can't be resolved, so the
+/// caller falls back to treating the parameter as a scalar.
+fn register_array_param(
+    elab: &mut ElaboratedModule,
+    prefix: &str,
+    name: &str,
+    dims: &[UnpackedDimension],
+    init: Option<&Expression>,
+    override_val: Option<&Value>,
+    data_type: &DataType,
+    params: &HashMap<String, Value>,
+) -> bool {
+    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
+    let Some(idxs) = const_dim_indices(&dims, params) else { return false };
+    let n = idxs.len();
+    if n == 0 {
+        return false;
+    }
+    let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    let mut vals: Vec<Value> = Vec::new();
+    if let Some(p) = override_val {
+        if (p.width as usize) < n * elem_w as usize {
+            return false;
+        }
+        for i in 0..n {
+            let off = (n - 1 - i) * elem_w as usize;
+            let mut v = Value::zero(elem_w);
+            for b in 0..elem_w as usize {
+                v.set_bit(b, p.get_bit(off + b));
+            }
+            vals.push(v);
+        }
+    } else if let Some(init) = init {
+        let items: Vec<&Expression> = match &init.kind {
+            ExprKind::Concatenation(v) => v.iter().collect(),
+            ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
+            _ => return false,
+        };
+        if items.len() != n {
+            return false;
+        }
+        for it in items {
+            vals.push(eval_init_for_width(it, params, elem_w));
+        }
+    } else {
+        return false;
+    }
+    let signed = is_type_signed(data_type);
+    let full = format!("{}{}", prefix, name);
+    // Needed so `A[i]` is an ELEMENT select, not a bit-select of a scalar.
+    // Simulator::new seeds each element from the signal written just below.
+    elab.arrays.insert(full, (0, n as i64 - 1, elem_w));
+    for (i, v) in idxs.iter().zip(vals) {
+        let sn = format!("{}{}[{}]", prefix, name, i);
+        elab.signals.insert(sn.clone(), Signal {
+            is_const: true, name: sn, width: elem_w, is_signed: signed,
+            is_real: false, direction: None, value: v, type_name: None,
+        });
+    }
+    true
+}
+
 fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &DataType) {
     let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
     let DataType::Struct(su) = resolved else { return };
@@ -7531,12 +7796,17 @@ fn prepare_module_items(
             match item {
                 ModuleItem::ContinuousAssign(ca) => {
                     for (lhs, _) in &ca.assignments {
-                        collect_ident_names(lhs, &mut implicit);
+                        // A dotted lvalue (`top.inst.net`) is a HIERARCHICAL
+                        // reference, not an undeclared net. Registering its root
+                        // here made `rewrite_expr` prefix it with the instance
+                        // path (`wr.top.inst.net`), so the assign wrote a name
+                        // that resolves to nothing.
+                        collect_implicit_net_candidates(lhs, &mut implicit);
                     }
                 }
                 ModuleItem::GateInstantiation(gi) => {
                     for (lhs, _) in gate_inst_to_assign_pairs(gi) {
-                        collect_ident_names(&lhs, &mut implicit);
+                        collect_implicit_net_candidates(&lhs, &mut implicit);
                     }
                 }
                 _ => {}
@@ -7913,6 +8183,20 @@ fn inline_module_items(
                 for p_decl in sub_mod.params() {
                     if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
                         for assign in assignments {
+                            // §6.20.2 unpacked-array parameter. This runs even when the
+                            // parameter is OVERRIDDEN: the override arrives as a single
+                            // packed value, so without slicing it here no element ever
+                            // gets a value and `A[i]` reads 0.
+                            if !assign.dimensions.is_empty() {
+                                let ov = sub_local_params.get(&assign.name.name).cloned();
+                                let snapshot = sub_local_params.clone();
+                                if register_array_param(elab, &inst_prefix, &assign.name.name,
+                                    &assign.dimensions, assign.init.as_ref(), ov.as_ref(),
+                                    data_type, &snapshot)
+                                {
+                                    continue;
+                                }
+                            }
                             if !sub_local_params.contains_key(&assign.name.name) {
                                 if let Some(init) = &assign.init {
                                     // IEEE 1800-2023: associative-array
@@ -8347,7 +8631,18 @@ fn inline_module_items(
                             }
                         }
                     }
-                    if matches!(sub_item, ModuleItem::GateInstantiation(_)) {
+                    if let ModuleItem::GateInstantiation(gi) = sub_item {
+                        // §28.8 switches produce no assign pairs; record them
+                        // with terminals rewritten into this instance's scope.
+                        record_tran_switches(gi, elab, |e| {
+                            rewrite_expr(
+                                e,
+                                &pend_ctx.prefix,
+                                &pend_ctx.port_map,
+                                &pend_ctx.local_names,
+                                &pend_ctx.interface_map,
+                            )
+                        });
                         if let BodySource::GateInst(pairs) = body_src {
                             for (lhs_rc, rhs_rc) in pairs {
                                 elab.pending_cont_assign.push(PendingContAssign {
@@ -8408,6 +8703,15 @@ fn inline_module_items(
                         }
                     }
                 }
+
+                // Record the instance before descending. Inlining is about to
+                // dissolve this module into the parent, so this is the only
+                // place the (path, definition) pair still exists.
+                elab.instances.push(ElabInstance {
+                    path: inst_prefix.trim_end_matches('.').to_string(),
+                    def_name: sub_mod_name.clone(),
+                    parent: prefix.trim_end_matches('.').to_string(),
+                });
 
                 // Recurse into sub-module instantiations
                 inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache)?;
@@ -8490,21 +8794,11 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                     pairs.push((out, make_tristate(cond, in1, sp)));
                 }
             }
-            // §28 bidirectional switches: model as a one-directional connection
-            // so simulation runs (functional value flow only, no real bidi).
-            GateType::Tran | GateType::Rtran => {
-                pairs.push((out, in1));
-            }
-            GateType::Tranif1 | GateType::Rtranif1 | GateType::Tranif0 | GateType::Rtranif0 => {
-                if inst.terminals.len() >= 3 {
-                    let ctl = inst.terminals[2].clone();
-                    let active_high = matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
-                    let cond = if active_high { ctl } else {
-                        Expression::new(ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(ctl) }, sp)
-                    };
-                    pairs.push((out, make_tristate(cond, in1, sp)));
-                }
-            }
+            // §28.8 bidirectional switches are not one-directional assigns.
+            // They are recorded and resolved against each terminal's own
+            // drivers by `resolve_bidirectional_switches`.
+            GateType::Tran | GateType::Rtran => {}
+            GateType::Tranif1 | GateType::Rtranif1 | GateType::Tranif0 | GateType::Rtranif0 => {}
             GateType::And => {
                 let mut rhs = in1;
                 for i in 2..inst.terminals.len() {
@@ -8617,7 +8911,220 @@ fn rewrite_module_item_subst(
     }
 }
 
+/// Flat dotted name of an identifier expression. A hierarchical reference may
+/// parse as an `Ident` with several path segments OR as a `MemberAccess` chain
+/// (`top.inst.net`), so fold both shapes.
+fn ident_flat_name(e: &Expression) -> Option<String> {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
+            h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."),
+        ),
+        ExprKind::MemberAccess { expr, member } => {
+            Some(format!("{}.{}", ident_flat_name(expr)?, member.name))
+        }
+        _ => None,
+    }
+}
+
+fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
+    Expression::new(ExprKind::SystemCall { name: name.to_string(), args }, span)
+}
+
+/// IEEE 1800-2017 §28.8. A bidirectional switch is not a one-directional
+/// assign: both terminals settle to the resolution of BOTH sides' drivers when
+/// the switch conducts, and keep their own driver when it does not.
+///
+/// Rewrite each terminal's own continuous drivers into a single bridged assign:
+///
+/// ```text
+/// assign a = $__tranif(own_a, own_b, ctl, active);
+/// assign b = $__tranif(own_b, own_a, ctl, active);
+/// ```
+///
+/// `$__tranif` resolves the two sides when the switch conducts (`z` yields to a
+/// driven value; conflicting values give `x`), passes the terminal's own value
+/// through when it does not, and gives `x` per differing bit when the control
+/// is unknown. An unconditional `tran` always conducts.
+///
+/// Only terminals that are plain (possibly dotted) names are handled; a switch
+/// whose terminal is an expression is left unconnected, as before.
+/// IEEE 1800-2017 §6.6.1: a NET with more than one continuous driver takes the
+/// wired-net resolution of all of them, not whichever assign happened to run
+/// last. Fold the drivers of each such net into a single `$__wres` chain.
+///
+/// Only whole-net drivers (`assign w = ...`) participate; a driver of a slice
+/// (`assign w[3:0] = ...`) is left alone, and variables are untouched — they
+/// legitimately have one driver.
+pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    for ca in &elab.continuous_assigns {
+        if let Some(n) = ident_flat_name(&ca.lhs) {
+            *counts.entry(n).or_insert(0) += 1;
+        }
+    }
+    let multi: HashSet<String> = counts
+        .into_iter()
+        .filter(|(n, c)| *c > 1 && elab.nets.contains(n))
+        .map(|(n, _)| n)
+        .collect();
+    if multi.is_empty() {
+        return;
+    }
+    let all = std::mem::take(&mut elab.continuous_assigns);
+    let mut folded: HashMap<String, (Expression, Expression, u64)> = HashMap::default();
+    let mut order: Vec<String> = Vec::new();
+    for ca in all {
+        let name = ident_flat_name(&ca.lhs).filter(|n| multi.contains(n));
+        let Some(name) = name else {
+            elab.continuous_assigns.push(ca);
+            continue;
+        };
+        match folded.get_mut(&name) {
+            Some((_, rhs, _)) => {
+                let span = ca.rhs.span;
+                let acc = std::mem::replace(rhs, make_z_expr(span));
+                *rhs = make_syscall("$__wres", vec![acc, ca.rhs], span);
+            }
+            None => {
+                order.push(name.clone());
+                folded.insert(name, (ca.lhs, ca.rhs, ca.delay));
+            }
+        }
+    }
+    for name in order {
+        if let Some((lhs, rhs, delay)) = folded.remove(&name) {
+            elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay });
+        }
+    }
+}
+
+pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
+    let switches = std::mem::take(&mut elab.tran_switches);
+    if switches.is_empty() {
+        return;
+    }
+    // A terminal's drivers may live in a sub-module and still be pending. The
+    // pass needs every driver of every terminal in hand, so materialize them.
+    // Only designs that actually contain a switch pay for this.
+    let pending = std::mem::take(&mut elab.pending_cont_assign);
+    for p in pending {
+        elab.continuous_assigns.push(p.materialize());
+    }
+    // A cross-module terminal names the top module explicitly; signals and
+    // driver lvalues are keyed without that root.
+    let root = format!("{}.", elab.name);
+    let norm = |n: String| -> String {
+        n.strip_prefix(root.as_str()).map(|r| r.to_string()).unwrap_or(n)
+    };
+    for sw in switches {
+        let (Some(na), Some(nb)) = (
+            ident_flat_name(&sw.a).map(&norm),
+            ident_flat_name(&sw.b).map(&norm),
+        ) else {
+            continue;
+        };
+        let (term_a, term_b) = (make_ident_expr(&na), make_ident_expr(&nb));
+        let span = sw.a.span;
+
+        // Each terminal's OWN drivers, folded with the wired-net resolution.
+        let mut take_drivers = |name: &str| -> Option<Expression> {
+            let mut rhs: Vec<Expression> = Vec::new();
+            elab.continuous_assigns.retain(|ca| {
+                if ident_flat_name(&ca.lhs).map(&norm).as_deref() == Some(name) {
+                    rhs.push(ca.rhs.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let mut it = rhs.into_iter();
+            let first = it.next()?;
+            Some(it.fold(first, |acc, r| make_syscall("$__wres", vec![acc, r], span)))
+        };
+        let own_a = take_drivers(&na);
+        let own_b = take_drivers(&nb);
+        // A terminal with no driver of its own contributes high impedance.
+        let z = || make_z_expr(span);
+        let own_a = own_a.unwrap_or_else(z);
+        let own_b = own_b.unwrap_or_else(z);
+
+        let ctl = sw.ctl.clone().unwrap_or_else(|| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('1')),
+                span,
+            )
+        });
+        let active = Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(
+                if sw.active_high { '1' } else { '0' },
+            )),
+            span,
+        );
+
+        elab.continuous_assigns.push(ContinuousAssignment {
+            lhs: term_a,
+            rhs: make_syscall(
+                "$__tranif",
+                vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
+                span,
+            ),
+            delay: 0,
+        });
+        elab.continuous_assigns.push(ContinuousAssignment {
+            lhs: term_b,
+            rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
+            delay: 0,
+        });
+    }
+}
+
+/// Record a `tran`/`tranif0`/`tranif1` instantiation. `map` brings each terminal
+/// into the enclosing scope (identity at the top level, `rewrite_expr` when the
+/// gate lives in an inlined sub-module). Returns true if `gi` was a switch.
+fn record_tran_switches<F>(gi: &GateInstantiation, elab: &mut ElaboratedModule, map: F) -> bool
+where
+    F: Fn(&Expression) -> Expression,
+{
+    if !matches!(
+        gi.gate_type,
+        GateType::Tran | GateType::Rtran | GateType::Tranif0
+            | GateType::Rtranif0 | GateType::Tranif1 | GateType::Rtranif1
+    ) {
+        return false;
+    }
+    let conditional = !matches!(gi.gate_type, GateType::Tran | GateType::Rtran);
+    // An unconditional `tran` always conducts: it is modelled with a synthetic
+    // control of 1, so it must be ACTIVE HIGH. Treating it like a `tranif0`
+    // left the switch permanently open.
+    let active_high =
+        !conditional || matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
+    for inst in &gi.instances {
+        if inst.terminals.len() < 2 {
+            continue;
+        }
+        let ctl = if conditional {
+            match inst.terminals.get(2) {
+                Some(c) => Some(map(c)),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        elab.tran_switches.push(TranSwitch {
+            a: map(&inst.terminals[0]),
+            b: map(&inst.terminals[1]),
+            ctl,
+            active_high,
+        });
+    }
+    true
+}
+
 fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
+    // §28.8 bidirectional switches: record, don't lower to an assign.
+    if record_tran_switches(gi, elab, |e| e.clone()) {
+        return;
+    }
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
         elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay: 0 });
