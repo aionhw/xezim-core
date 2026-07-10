@@ -1778,7 +1778,13 @@ impl Value {
         // iterations of get_bit/set_bit. Profile on c906 hello showed this
         // function consuming 53% of CPU due to the per-bit loop.
         if let ValueStorage::Inline { val_bits, xz_bits } = self.storage {
-            if width <= 64 {
+            // Inline storage is a u64, so only `lo < 64` is shift-safe. An
+            // out-of-range part-select (`lo >= 64`, which since Inline ⇒
+            // width <= 64 means every requested bit is beyond the value) must
+            // not enter the fast path — `val_bits >> lo` would overflow.
+            // Fall through to the generic get_bit loop, which returns Zero
+            // for bits beyond `self.width` (LRM §11.5.1 out-of-range reads).
+            if width <= 64 && lo < 64 {
                 let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
                 return Value {
                     storage: ValueStorage::Inline {
