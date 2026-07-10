@@ -118,6 +118,18 @@ impl Parser {
                 {
                     break;
                 }
+                // A USER-DEFINED type also begins a new typed parameter:
+                //   #(parameter int N = 1, u32_t A[N] = '{0}, pkg::t B = 0)
+                // `Ident Ident` / `Ident ::` can only be `<type> <name>`, never a
+                // continuation assignment (`#(int A, B)` has `)` after `B`).
+                if matches!(next, TokenKind::Identifier | TokenKind::EscapedIdentifier)
+                    && matches!(
+                        self.peek_kind_n(2),
+                        TokenKind::Identifier | TokenKind::EscapedIdentifier | TokenKind::DoubleColon
+                    )
+                {
+                    break;
+                }
                 self.bump(); // consume comma
             } else {
                 break;

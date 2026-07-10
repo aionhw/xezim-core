@@ -31,6 +31,10 @@ pub enum ExprKind {
     SystemCall { name: String, args: Vec<Expression> },
     NamedArg { name: Identifier, expr: Option<Box<Expression>> },
     Inside { expr: Box<Expression>, ranges: Vec<Expression> },
+    /// §12.6 `expr matches pattern` — a boolean conditional-pattern match.
+    /// Any `.name` bindings in the pattern are visible in the enclosing `if`'s
+    /// then-branch.
+    Matches { expr: Box<Expression>, pattern: Box<crate::ast::stmt::Pattern> },
     MemberAccess { expr: Box<Expression>, member: Identifier },
     /// §8.25 parameterized-class specialization in a scoped reference, e.g. the
     /// `C#(int,"a")` in `C#(int,"a")::member`. `base` is the (unparameterized)
