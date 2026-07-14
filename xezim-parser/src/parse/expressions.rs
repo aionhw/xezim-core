@@ -628,6 +628,15 @@ impl Parser {
                         name: "$__xz_size_cast".to_string(),
                         args: vec![lhs, inner],
                     }, self.span_from(start));
+                } else if matches!(lhs.kind, ExprKind::TypeLiteral(_)) {
+                    // §6.24.1 TYPE cast `int'(2.7)` / `real'(3)` — it CONVERTS
+                    // (a real to int rounds; an int to real widens). It used
+                    // to be a pass-through, so the operand kept its own type
+                    // and only an assignment to a typed target coerced it.
+                    lhs = Expression::new(ExprKind::SystemCall {
+                        name: "$__xz_type_cast".to_string(),
+                        args: vec![lhs, inner],
+                    }, self.span_from(start));
                 } else {
                     lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
                 }
@@ -638,6 +647,28 @@ impl Parser {
         }
 
         lhs
+    }
+
+    /// The `DataType` a cast keyword denotes (`int'(x)`, `byte'(x)`, …).
+    fn cast_keyword_type(kw: TokenKind, span: crate::ast::Span) -> crate::ast::types::DataType {
+        use crate::ast::types::{DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType};
+        let atom = |k| DataType::IntegerAtom { kind: k, signing: None, span };
+        let vec_ = |k| DataType::IntegerVector { kind: k, signing: None, dimensions: Vec::new(), span };
+        match kw {
+            TokenKind::KwInt => atom(IntegerAtomType::Int),
+            TokenKind::KwByte => atom(IntegerAtomType::Byte),
+            TokenKind::KwShortint => atom(IntegerAtomType::ShortInt),
+            TokenKind::KwLongint => atom(IntegerAtomType::LongInt),
+            TokenKind::KwInteger => atom(IntegerAtomType::Integer),
+            TokenKind::KwReal | TokenKind::KwRealtime => {
+                DataType::Real { kind: RealType::Real, span }
+            }
+            TokenKind::KwShortreal => DataType::Real { kind: RealType::ShortReal, span },
+            TokenKind::KwString => DataType::Simple { kind: SimpleType::String, span },
+            TokenKind::KwBit => vec_(IntegerVectorType::Bit),
+            TokenKind::KwReg => vec_(IntegerVectorType::Reg),
+            _ => vec_(IntegerVectorType::Logic),
+        }
     }
 
     /// Parse prefix / primary expression.
@@ -1059,7 +1090,27 @@ impl Parser {
                         ExprKind::SystemCall { name: "$unsigned".to_string(), args: vec![inner] },
                         self.span_from(start),
                     ),
-                    _ => Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start)),
+                    TokenKind::KwVoid => {
+                        Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
+                    }
+                    // §6.24.1: every other type cast CONVERTS — `int'(2.7)` is 3
+                    // (§6.12.2 rounds), `real'(3)` is 3.0, `byte'(x)` truncates.
+                    // It used to be a pass-through, so the value kept its own
+                    // type unless an assignment context happened to coerce it.
+                    kw => {
+                        let dt = Self::cast_keyword_type(kw, self.span_from(start));
+                        let tl = Expression::new(
+                            ExprKind::TypeLiteral(Box::new(dt)),
+                            self.span_from(start),
+                        );
+                        Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$__xz_type_cast".to_string(),
+                                args: vec![tl, inner],
+                            },
+                            self.span_from(start),
+                        )
+                    }
                 }
             }
 

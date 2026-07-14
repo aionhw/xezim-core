@@ -360,7 +360,8 @@ fn parse_and_elaborate(
     let mut top_level_vars: Vec<ast::decl::DataDeclaration> = Vec::new();
     let mut top_level_binds: Vec<ast::decl::BindDirective> = Vec::new();
     // §18.5.1 $unit-scope out-of-class constraint definitions (class, name).
-    let mut top_level_ooc_constraints: Vec<(String, String)> = Vec::new();
+    let mut top_level_ooc_constraints: Vec<(String, String, Vec<ast::decl::ConstraintItem>)> =
+        Vec::new();
     for desc in all_descriptions {
         match desc {
             ast::Description::Module(mut m) => {
@@ -452,8 +453,8 @@ fn parse_and_elaborate(
             ast::Description::Bind(b) => {
                 top_level_binds.push(b);
             }
-            ast::Description::OutOfClassConstraint { class_name, constraint_name } => {
-                top_level_ooc_constraints.push((class_name, constraint_name));
+            ast::Description::OutOfClassConstraint { class_name, constraint_name, items } => {
+                top_level_ooc_constraints.push((class_name, constraint_name, items));
             }
             _ => {}
         }

@@ -50,7 +50,11 @@ pub enum ModuleItem {
     DPIExport(DPIExport),
     /// Out-of-class constraint definition: `constraint ClassName::cname { ... }`.
     /// Only the qualified name is tracked; body is not modeled.
-    OutOfClassConstraint { class_name: String, constraint_name: String },
+    /// §18.5.1 `constraint Class::name { ... }` — the BODY is carried so the
+    /// class's extern-constraint prototype can be filled in at elaboration
+    /// (it used to be brace-skipped and discarded, so the constraints simply
+    /// did not exist at solve time).
+    OutOfClassConstraint { class_name: String, constraint_name: String, items: Vec<crate::ast::decl::ConstraintItem> },
     /// `bind <target> <module> <inst>(<ports>);` appearing as a module item
     /// (rather than at compilation-unit scope). Treated by elaboration the
     /// same way as a top-level bind: the wrapped instantiation is appended

@@ -471,21 +471,17 @@ impl Parser {
                 } else {
                     (String::new(), hid.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
                 };
+                let mut items = Vec::new();
                 if self.at(TokenKind::LBrace) {
                     self.bump();
-                    let mut depth = 1;
-                    while depth > 0 && !self.at(TokenKind::Eof) {
-                        match self.current_kind() {
-                            TokenKind::LBrace => depth += 1,
-                            TokenKind::RBrace => depth -= 1,
-                            _ => {}
-                        }
-                        self.bump();
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        items.push(self.parse_constraint_item());
                     }
+                    self.expect(TokenKind::RBrace);
                 } else if self.at(TokenKind::Semicolon) {
                     self.bump();
                 }
-                Some(ModuleItem::OutOfClassConstraint { class_name, constraint_name })
+                Some(ModuleItem::OutOfClassConstraint { class_name, constraint_name, items })
             }
             TokenKind::KwVirtual => {
                 if self.peek_kind() == TokenKind::KwInterface { Some(self.parse_identifier_starting_item()) }

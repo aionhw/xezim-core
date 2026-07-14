@@ -325,6 +325,26 @@ fn typedefs_snapshot<R>(f: impl FnOnce(Option<&HashMap<String, u32>>) -> R) -> R
     TYPEDEFS_TLS.with(|cell| f(cell.borrow().as_ref()))
 }
 
+/// §18.5.1: fill an `extern constraint name;` prototype with the body parsed
+/// from an out-of-class `constraint Class::name { ... }` definition. Without
+/// this the prototype stays empty and its constraints never reach the solver.
+fn install_ooc_constraint_body(
+    elab: &mut ElaboratedModule,
+    class_name: &str,
+    constraint_name: &str,
+    items: &[crate::ast::decl::ConstraintItem],
+) {
+    if items.is_empty() {
+        return;
+    }
+    if let Some(cd) = elab.classes.get_mut(class_name) {
+        if let Some(existing) = cd.constraints.get_mut(constraint_name) {
+            existing.items = items.to_vec();
+            existing.has_body = true;
+        }
+    }
+}
+
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut properties = HashMap::default();
     let mut property_order: Vec<String> = Vec::new();
@@ -1672,16 +1692,18 @@ pub fn elaborate_module_with_defs(
     all_defs: Option<&HashMap<String, Definition>>,
     top_level_imports: &[ImportDeclaration],
     top_level_lets: &[LetDeclaration],
-    seed_ooc_constraints: &[(String, String)],
+    seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
     let mut elab = ElaboratedModule::new(module.name().to_string());
 
     // §18.5.1: seed $unit-scope out-of-class constraint definitions so a class's
     // `extern constraint c;` is satisfied regardless of whether the design has a
     // module (the definition is parsed at compilation-unit scope, outside any).
-    for (c, n) in seed_ooc_constraints {
+    for (c, n, _items) in seed_ooc_constraints {
         elab.out_of_class_constraints.insert((c.clone(), n.clone()));
     }
+    // The class table is populated just below (from `all_defs`); the bodies of
+    // $unit-scope definitions are installed after that, see `seed_ooc_bodies`.
 
     // Process top-level typedefs and other global definitions from all_defs
     if let Some(defs) = all_defs {
@@ -1692,6 +1714,13 @@ pub fn elaborate_module_with_defs(
                     validate_class_constraints(c, Some(defs), Some(&elab.enum_members))?;
                     register_class_enum_members(c, &mut elab);
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                    // §18.5.1: a `constraint Class::name {...}` written at
+                    // $unit scope fills this class's extern prototype.
+                    for (cn, nn, items) in seed_ooc_constraints {
+                        if cn == &c.name.name {
+                            install_ooc_constraint_body(&mut elab, cn, nn, items);
+                        }
+                    }
                 }
                 Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
                 Definition::Package(p) => {
@@ -3186,8 +3215,9 @@ pub fn elaborate_module_with_defs(
             ModuleItem::DPIImport(di) => {
                 register_dpi_import(di, &mut elab)?;
             }
-            ModuleItem::OutOfClassConstraint { class_name, constraint_name } => {
+            ModuleItem::OutOfClassConstraint { class_name, constraint_name, items } => {
                 elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
+                install_ooc_constraint_body(&mut elab, class_name, constraint_name, items);
             }
             _ => {}
         }
@@ -4589,8 +4619,12 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                 let name = &hier.path[0].name.name;
                 // `std` is the built-in package (§18.12 std::randomize,
                 // std::mailbox, std::semaphore, …) — always a legal root.
+                // `process` is the built-in class of §9.7 — `process::self()`
+                // plus its §18.14 random-stability methods (srandom,
+                // get_randstate, set_randstate). It is never user-declared, so
+                // its use as a scope root must not be flagged undeclared.
                 if name == "new" || name.starts_with('$') || name == "super" || name == "this"
-                    || name == "std"
+                    || name == "std" || name == "process"
                 {
                     return Ok(());
                 }

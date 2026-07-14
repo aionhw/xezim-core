@@ -254,23 +254,19 @@ impl Parser {
                     (String::new(),
                      hid.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
                 };
+                let mut items = Vec::new();
                 if self.at(TokenKind::LBrace) {
                     self.bump();
-                    let mut depth = 1;
-                    while depth > 0 && !self.at(TokenKind::Eof) {
-                        match self.current_kind() {
-                            TokenKind::LBrace => depth += 1,
-                            TokenKind::RBrace => depth -= 1,
-                            _ => {}
-                        }
-                        self.bump();
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        items.push(self.parse_constraint_item());
                     }
+                    self.expect(TokenKind::RBrace);
                 }
                 if self.at(TokenKind::Semicolon) { self.bump(); }
                 if class_name.is_empty() {
                     self.parse_description()
                 } else {
-                    Some(Description::OutOfClassConstraint { class_name, constraint_name })
+                    Some(Description::OutOfClassConstraint { class_name, constraint_name, items })
                 }
             }
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision =>

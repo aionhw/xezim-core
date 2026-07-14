@@ -1087,24 +1087,9 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndcase);
         let span = self.span_from(start);
-        // Build chain from the back.
-        let mut acc: Option<Statement> = None;
-        for (w, s) in items.into_iter().rev() {
-            let zero = Expression::new(ExprKind::Number(NumberLiteral::Integer {
-                size: None, signed: true, base: NumberBase::Decimal,
-                value: "0".into(), cached_val: Cell::new(None),
-            }), w.span);
-            let cond = Expression::new(ExprKind::Binary {
-                op: BinaryOp::Neq, left: Box::new(w.clone()), right: Box::new(zero),
-            }, w.span);
-            acc = Some(Statement::new(StatementKind::If {
-                unique_priority: None,
-                condition: cond,
-                then_stmt: Box::new(s),
-                else_stmt: acc.map(Box::new),
-            }, span));
-        }
-        acc.unwrap_or(Statement::new(StatementKind::Null, span))
+        // §18.16: the branch is drawn at RUNTIME, weighted by the (possibly
+        // non-constant) weight expressions.
+        Statement::new(StatementKind::RandCase { items }, span)
     }
 
     /// `randsequence ( name ) production_list endsequence`.
@@ -1192,7 +1177,11 @@ impl Parser {
         loop {
             let seq = self.parse_rs_seq();
             let weight = if self.eat(TokenKind::ColonAssign).is_some() {
-                Some(self.parse_expression())
+                // §18.17.1: `|` separates ALTERNATIVES here, so the weight must
+                // not be parsed as a bitwise-OR expression — bind tighter than
+                // `|` (bp 7/8) so `a := 0 | b := 1` yields two alternatives
+                // rather than one weight of `0 | b`.
+                Some(self.parse_expr_bp(9))
             } else { None };
             alts.push((seq, weight));
             if self.eat(TokenKind::BitOr).is_none() { break; }
@@ -1420,15 +1409,28 @@ fn is_zero_const(e: &Expression) -> bool {
 type ProdMap = HashMap<String, (Vec<(DataType, String)>, RsAlt)>;
 
 fn expand_alt(prods: &ProdMap, alt: &RsAlt, depth: &mut u32, span: crate::ast::Span) -> Statement {
-    // Pick first alternative whose weight isn't a constant zero.
-    for (seq, w) in &alt.alts {
-        if let Some(e) = w { if is_zero_const(e) { continue; } }
-        return expand_seq(prods, seq, depth, span);
+    // §18.17.1: one alternative is chosen at RUNTIME, weighted by its `:= w`
+    // (default 1). A single alternative needs no draw. (This used to pick the
+    // first non-zero-weight alternative at parse time — never random.)
+    if alt.alts.len() == 1 {
+        return expand_seq(prods, &alt.alts[0].0, depth, span);
     }
-    if let Some((seq, _)) = alt.alts.first() {
-        return expand_seq(prods, seq, depth, span);
+    let one = |sp| Expression::new(ExprKind::Number(NumberLiteral::Integer {
+        size: None, signed: true, base: NumberBase::Decimal,
+        value: "1".into(), cached_val: Cell::new(None),
+    }), sp);
+    let items: Vec<(Expression, Statement)> = alt
+        .alts
+        .iter()
+        .map(|(seq, w)| {
+            let body = expand_seq(prods, seq, depth, span);
+            (w.clone().unwrap_or_else(|| one(span)), body)
+        })
+        .collect();
+    if items.is_empty() {
+        return Statement::new(StatementKind::Null, span);
     }
-    Statement::new(StatementKind::Null, span)
+    Statement::new(StatementKind::RandCase { items }, span)
 }
 
 fn expand_seq(prods: &ProdMap, seq: &RsSeq, depth: &mut u32, span: crate::ast::Span) -> Statement {

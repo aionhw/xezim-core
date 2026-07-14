@@ -54,6 +54,11 @@ pub enum StatementKind {
     Assertion(AssertionStatement),
     ProceduralContinuous(ProceduralContinuous),
     VarDecl { data_type: DataType, lifetime: Option<Lifetime>, declarators: Vec<VarDeclarator> },
+    /// §18.16 `randcase` (and the alternatives of a §18.17 `randsequence`
+    /// production): ONE branch is chosen at RUNTIME with probability
+    /// weight_i / sum(weights). Both used to be lowered at parse time to the
+    /// first non-zero-weight branch — i.e. not random at all.
+    RandCase { items: Vec<(Expression, Statement)> },
     /// Block-local `typedef ...;` (§6.18). Registered when the enclosing
     /// process first executes it, so later VarDecls in the block resolve
     /// the name. Was parsed and DISCARDED before, which broke member access

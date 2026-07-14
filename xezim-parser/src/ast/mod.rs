@@ -72,5 +72,9 @@ pub enum Description {
     /// §18.5.1 compilation-unit-scope out-of-class constraint definition
     /// `constraint ClassName::name { ... }`. Records that the class's
     /// `extern constraint name;` has an external body.
-    OutOfClassConstraint { class_name: String, constraint_name: String },
+    /// §18.5.1 `constraint Class::name { ... }` — the BODY is carried so the
+    /// class's extern-constraint prototype can be filled in at elaboration
+    /// (it used to be brace-skipped and discarded, so the constraints simply
+    /// did not exist at solve time).
+    OutOfClassConstraint { class_name: String, constraint_name: String, items: Vec<crate::ast::decl::ConstraintItem> },
 }
