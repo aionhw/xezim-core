@@ -570,6 +570,12 @@ pub struct ElaboratedClass {
     /// CLASS PROPERTY (the module-scope map cannot see it).
     #[serde(default)]
     pub assoc_key_types: HashMap<String, String>,
+    /// Associative-array property INDEX (key) width + signedness: `shortint
+    /// aa[shortint]` -> (16, true). Used to narrow a wider index expression
+    /// before keying at runtime. String-keyed arrays are excluded (the
+    /// `assoc_properties` bool distinguishes them).
+    #[serde(default)]
+    pub assoc_index_props: HashMap<String, (u32, bool)>,
     /// Properties declared as queues / dynamic arrays (`T m[$];`, `T m[];`) —
     /// name mapped to (element width, optional bounded-queue max+1). Stored
     /// per-instance like associative arrays, so each object's queue is
@@ -744,6 +750,7 @@ pub fn elaborate_class_with_params(
     let mut static_methods = HashSet::default();
     let mut assoc_properties: HashMap<String, bool> = HashMap::default();
     let mut assoc_key_types: HashMap<String, String> = HashMap::default();
+    let mut assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
@@ -875,6 +882,21 @@ pub fn elaborate_class_with_params(
                         if let Some(DataType::TypeReference { name: kt, .. }) = key_dt.as_deref() {
                             assoc_key_types
                                 .insert(decl.name.name.clone(), kt.name.name.clone());
+                        }
+                        // §7.8.2: record the declared key width + signedness
+                        // so the runtime narrows a wider index expression.
+                        if !is_string_key {
+                            if let Some(kdt) = key_dt.as_ref() {
+                                let kw = resolve_type_width(
+                                    kdt, class_params, None,
+                                );
+                                if kw > 0 {
+                                    assoc_index_props.insert(
+                                        decl.name.name.clone(),
+                                        (kw, is_type_signed(kdt)),
+                                    );
+                                }
+                            }
                         }
                     }
                     // Queue (`m[$]`) / dynamic-array (`m[]`) member — track so
@@ -1200,6 +1222,7 @@ pub fn elaborate_class_with_params(
         static_methods,
         assoc_properties,
         assoc_key_types,
+        assoc_index_props,
         queue_properties,
         property_inits,
         static_collections,
@@ -1290,6 +1313,13 @@ pub struct ElaboratedModule {
     /// declared width attached, so the width has to be carried here.
     #[serde(default)]
     pub assoc_elem_widths: HashMap<String, u32>,
+    /// Associative-array INDEX (key) width + signedness: `shortint aa[shortint]`
+    /// -> (16, true). A key written with a wider expression must be narrowed to
+    /// the declared index type before stringifying (`assoc_key_str`), else the
+    /// stored key text diverges from a read that correctly narrows. String-keyed
+    /// arrays are excluded (handled by the `bool` flag above).
+    #[serde(default)]
+    pub assoc_index_widths: HashMap<String, (u32, bool)>,
     /// Class definitions: name -> elaborated class.
     pub classes: HashMap<String, ElaboratedClass>,
     /// Covergroup definitions: name -> AST declaration.
@@ -1770,6 +1800,7 @@ impl ElaboratedModule {
             arrays: HashMap::default(),
             associative_arrays: HashMap::default(),
             assoc_elem_widths: HashMap::default(),
+            assoc_index_widths: HashMap::default(),
             classes: HashMap::default(),
             covergroups: HashMap::default(),
             functions: HashMap::default(),
@@ -4589,6 +4620,23 @@ pub fn elaborate_module_with_defs(
                         }
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
+                        }
+                        // §7.8.2: an AA index is narrowed to the declared key
+                        // type. Record the key width + signedness so the runtime
+                        // can narrow a wider index expression before keying
+                        // (`int k; aa[k]` on `shortint aa[shortint]`).
+                        if !is_string_key {
+                            if let Some(kdt) = key_dt.as_ref() {
+                                let kw = crate::elaborate::resolve_type_width(
+                                    kdt, Some(&elab.parameters), Some(&elab.typedefs),
+                                );
+                                if kw > 0 {
+                                    elab.assoc_index_widths.insert(
+                                        decl.name.name.clone(),
+                                        (kw, crate::elaborate::is_type_signed(kdt)),
+                                    );
+                                }
+                            }
                         }
                         if let Some(init_expr) = &decl.init {
                             if let ExprKind::AssignmentPattern(items) = &init_expr.kind {

@@ -60,6 +60,10 @@ pub enum StatementKind {
         body: Box<Statement>,
         keys: Vec<String>,
         is_str: bool,
+        /// (key_width, key_signed) — the AA index type, so signed/narrowed
+        /// keys round-trip through the tail continuation without a failed
+        /// u64 parse clobbering them to 0.
+        key_type: (u32, bool),
         idx: usize,
         fe_auto_len: usize,
         /// When set, `idx` is bounds-checked against the LIVE queue/dynamic-
