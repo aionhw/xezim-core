@@ -1285,6 +1285,13 @@ pub struct ElaboratedModule {
     /// Class-typed signal parameter overrides captured from `Type #(args) name;`
     /// declarations. Signal name -> positional type_args expressions.
     pub class_type_args: HashMap<String, Vec<Expression>>,
+    /// User-defined nettype resolver functions: nettype name -> resolver function name.
+    /// IEEE 1800-2023 §6.6.7 — the resolver receives an unpacked queue of driver
+    /// values and returns the resolved value. Populated from NettypeDeclaration.resolver
+    /// at elaboration pre-pass. Consumed by the simulator when evaluating
+    /// continuous assigns on multi-driver nettype variables.
+    #[serde(default)]
+    pub nettype_resolvers: HashMap<String, String>,
     /// LRM §25.9: known interface type names. Used by the runtime to
     /// detect virtual-interface formal args (`task drive(virtual
     /// bus_if vif)`) so the call hook can alias `vif → bus` for the
@@ -1641,6 +1648,7 @@ impl ElaboratedModule {
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
             class_type_args: HashMap::default(),
+            nettype_resolvers: HashMap::default(),
             interfaces: HashSet::default(),
             checker_decls: HashMap::default(),
             property_decls: HashMap::default(),
@@ -3179,13 +3187,21 @@ pub fn elaborate_module_with_defs(
     // Pre-pass: collect user-defined nettype names so variables declared with
     // those types can be classified as nets (§6.6.7 — nettype resolution permits
     // multiple continuous drivers). Also register each nettype's width as a
-    // typedef so TypeReference lookups resolve correctly.
+    // typedef so TypeReference lookups resolve correctly, and store the resolver
+    // function name for later continuous-assign generation.
     let mut user_nettypes: HashSet<String> = HashSet::default();
     for item in module.items() {
         if let ModuleItem::NettypeDeclaration(nd) = item {
             user_nettypes.insert(nd.name.name.clone());
             let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
             elab.typedefs.insert(nd.name.name.clone(), w);
+            // §6.6.7: register the nettype's ELEMENT type under the nettype
+            // name too, so a struct-typed nettype variable's members resolve
+            // through the same TypeReference path as a plain typedef'd struct.
+            elab.typedef_types.insert(nd.name.name.clone(), nd.data_type.clone());
+            if let Some(resolver) = &nd.resolver {
+                elab.nettype_resolvers.insert(nd.name.name.clone(), resolver.name.clone());
+            }
         }
     }
 
@@ -5494,10 +5510,13 @@ pub fn elaborate_module_with_defs(
     // collapses the whole bus to ONE BIT. The only symptom is a width warning;
     // the design then simulates wrongly. A reference simulator resolves the
     // declarations order-independently.
-    // User-defined nettype driver resolution: collapse multiple continuous
-    // drivers on a nettype variable into a single OR-combined assign. This
-    // approximates the common `resolve_or` resolver; other resolvers are not
-    // modeled, so last-driver-wins behavior applies via the final `|` fold.
+    // IEEE 1800-2023 §6.6.7: user-defined nettype driver resolution.
+    // The nettype declaration specifies a resolver function that takes an
+    // unpacked queue of the nettype's element type (all simultaneous drivers)
+    // and returns the resolved value. For multi-driver nettype variables,
+    // generate a continuous assign whose RHS is a call to that resolver with
+    // the driver queue as an argument. Single-driver nets also call the resolver
+    // with a single-element queue so the resolver logic is uniformly applied.
     {
         let mut nettype_vars: HashSet<String> = HashSet::default();
         for (name, sig) in &elab.signals {
@@ -5518,20 +5537,40 @@ pub fn elaborate_module_with_defs(
                 kept.push(ca);
             }
             for (name, rhses) in grouped {
-                let mut iter = rhses.into_iter();
-                let mut acc = iter.next().unwrap();
-                for rhs in iter {
-                    let span = acc.span;
-                    acc = Expression {
-                        kind: ExprKind::Binary {
-                            op: crate::ast::expr::BinaryOp::BitOr,
-                            left: Box::new(acc),
-                            right: Box::new(rhs),
-                        },
-                        span,
-                    };
+                // Look up the resolver function for this nettype
+                if let Some(tn) = elab.signals.get(&name).and_then(|s| s.type_name.as_ref()) {
+                    if let Some(resolver_name) = elab.nettype_resolvers.get(tn) {
+                        // Build an assignment pattern (queue literal) from all drivers
+                        let mut queue_elems = Vec::new();
+                        for rhs in rhses {
+                            queue_elems.push(crate::ast::expr::AssignmentPatternItem::Ordered(rhs));
+                        }
+                        let func_expr = Expression {
+                            kind: ExprKind::Ident(HierarchicalIdentifier {
+                                root: None,
+                                path: vec![HierPathSegment {
+                                    name: Identifier { name: resolver_name.clone(), span: Span::dummy() },
+                                    selects: Vec::new(),
+                                }],
+                                span: Span::dummy(),
+                                cached_signal_id: std::cell::Cell::new(None),
+                                cached_resolved_name: std::cell::OnceCell::new(),
+                            }),
+                            span: Span::dummy(),
+                        };
+                        let call_expr = Expression {
+                            kind: ExprKind::Call {
+                                func: Box::new(func_expr),
+                                args: vec![Expression {
+                                    kind: ExprKind::AssignmentPattern(queue_elems),
+                                    span: Span::dummy(),
+                                }],
+                            },
+                            span: Span::dummy(),
+                        };
+                        kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: call_expr, delay: 0 });
+                    }
                 }
-                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0 });
             }
             elab.continuous_assigns = kept;
         }
