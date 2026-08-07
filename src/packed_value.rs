@@ -51,11 +51,7 @@ impl PackedBits {
 
     /// Create PackedBits with given width, all bits initialized to X.
     pub fn new_x(width: u32) -> Self {
-        let num_bytes = Self::bytes_needed(width);
-        Self {
-            data: vec![0xAA; num_bytes],  // 0xAA = 10101010 = X X X X
-            len: width,
-        }
+        Self::new_fill(width, LogicBit::X)
     }
 
     /// Create PackedBits with given width, all bits initialized to Zero.
@@ -68,14 +64,23 @@ impl PackedBits {
     }
 
     /// Create PackedBits with given width, all bits initialized to specified value.
+    ///
+    /// The unused slots above `width` in the last byte (the padding bits) are
+    /// masked back to Zero. This keeps the invariant that `has_xz`, `==` and
+    /// `Hash` only observe the `width` live bits — without it, an all-X
+    /// `new_x(66)` would read X in the two padding slots of the 17th byte and
+    /// `has_xz()` would report true, and two values with identical live bits
+    /// but different construction histories could compare unequal.
     pub fn new_fill(width: u32, bit: LogicBit) -> Self {
         let code = bit.to_code();
         let fill_byte = code * 0x55;  // Replicate 2-bit code across byte
         let num_bytes = Self::bytes_needed(width);
-        Self {
-            data: vec![fill_byte; num_bytes],
-            len: width,
+        let mut data = vec![fill_byte; num_bytes];
+        let pad = width % 4;
+        if pad != 0 {
+            data[num_bytes - 1] &= (1u8 << (pad * 2)) - 1;
         }
+        Self { data, len: width }
     }
 
     /// Calculate number of bytes needed to store `num_bits` bits.

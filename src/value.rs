@@ -15,8 +15,8 @@ use crate::packed_value::PackedBits;
 ///
 /// `#[repr(u8)]` pins the discriminants to the 2-bit codes already used by
 /// `to_code`/`from_code` (Zero=0, One=1, X=2, Z=3). That makes one `LogicBit`
-/// exactly one byte with no padding, which `wide_bits_eq` relies on to compare
-/// `Wide` storage a machine word at a time instead of a byte at a time.
+/// exactly one byte with no padding, which is the code the packed `Wide`
+/// storage reads back with `PackedBits` (4 bits per byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum LogicBit {
@@ -118,56 +118,6 @@ mod wide_serde {
     }
 }
 
-/// Bit-vector equality for `Wide` storage, a machine word at a time.
-///
-/// `LogicBit` is not one of the primitive types std marks `BytewiseEq`, so the
-/// derived `Vec<LogicBit> == Vec<LogicBit>` lowers to `iter().zip().all()` —
-/// one byte compared per loop iteration, which is what showed up as the
-/// dominant cost of `signal_table[id] != val` change detection on wide buses.
-/// Because `LogicBit` is `#[repr(u8)]` (one byte, no padding, no provenance,
-/// and `==` is exactly byte equality) the two vectors can be compared as raw
-/// bytes, 8 at a time.
-#[inline]
-fn wide_bits_eq(a: &[LogicBit], b: &[LogicBit]) -> bool {
-    const _: () = assert!(std::mem::size_of::<LogicBit>() == 1);
-    let n = a.len();
-    if n != b.len() {
-        return false;
-    }
-    let pa = a.as_ptr().cast::<u8>();
-    let pb = b.as_ptr().cast::<u8>();
-    // SAFETY: `pa`/`pb` are the starts of two live byte ranges of `n` bytes
-    // each (LogicBit is one byte, so len == byte length). Every read below is
-    // an unaligned read fully inside `0..n` of its own range.
-    unsafe {
-        let mut i = 0usize;
-        while i + 8 <= n {
-            if pa.add(i).cast::<u64>().read_unaligned() != pb.add(i).cast::<u64>().read_unaligned()
-            {
-                return false;
-            }
-            i += 8;
-        }
-        if i < n {
-            if n >= 8 {
-                // Overlapping tail word — cheaper than a byte loop.
-                if pa.add(n - 8).cast::<u64>().read_unaligned()
-                    != pb.add(n - 8).cast::<u64>().read_unaligned()
-                {
-                    return false;
-                }
-            } else {
-                while i < n {
-                    if *pa.add(i) != *pb.add(i) {
-                        return false;
-                    }
-                    i += 1;
-                }
-            }
-        }
-    }
-    true
-}
 
 /// Mask selecting bit 0 of every byte of a `u64`.
 const LSB_OF_EACH_BYTE: u64 = 0x0101_0101_0101_0101;
@@ -212,21 +162,20 @@ fn storage_eq_slow(a: &ValueStorage, b: &ValueStorage) -> bool {
 
 impl PartialEq for ValueStorage {
     /// Same result as the previous `#[derive(PartialEq)]` (Inline compares its
-    /// two words, Wide compares its bits, mixed variants are never equal); only
-    /// the Wide arm is faster (see `wide_bits_eq`).
-    ///
-    /// The two-word arm is the one `signal_table[id] != val` runs on every
-    /// signal write, so it stays in the caller; the `Wide` word-at-a-time
-    /// comparison is an out-of-line tail rather than a loop LLVM has to price
-    /// into every inlining decision about `Value::eq`.
+    /// two words, Wide compares its bits, mixed variants are never equal).
+    /// PackedBits' derived PartialEq compares the packed bytes, which visits
+    /// 4× fewer bytes than the old `Vec<LogicBit>` word loop; padding bits in
+    /// the top byte are canonicalized to 0 at construction, so byte equality
+    /// ⇔ bit equality for every width.
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        if let (
-            ValueStorage::Inline { val_bits: av, xz_bits: ax },
-            ValueStorage::Inline { val_bits: bv, xz_bits: bx },
-        ) = (self, other)
-        {
-            return av == bv && ax == bx;
+        match (self, other) {
+            (
+                ValueStorage::Inline { val_bits: av, xz_bits: ax },
+                ValueStorage::Inline { val_bits: bv, xz_bits: bx },
+            ) => av == bv && ax == bx,
+            (ValueStorage::Wide(a), ValueStorage::Wide(b)) => a == b,
+            _ => false,
         }
         storage_eq_slow(self, other)
     }
@@ -2196,48 +2145,22 @@ impl Value {
             };
         }
 
-        // Wide result. Build the bit vector ONCE with the exact capacity and
-        // append each operand's bits LSB-first, instead of allocating a
-        // zero-filled `Value::zero(total_width)` and then driving `set_bit`
-        // (bounds check + storage `match` + read-modify-write) for every one
-        // of `total_width` bits.
+        // Wide result. Build the packed bit vector ONCE by appending each
+        // operand's bits LSB-first, instead of allocating a zero-filled
+        // `Value::zero(total_width)` and then driving `set_bit` (bounds check +
+        // storage `match` + read-modify-write) for every one of
+        // `total_width` bits. An inline operand is unpacked straight from its
+        // two words.
         //
         // `Value::zero` capped its width at `MAX_WIDTH` and silently dropped
         // the `set_bit`s past the cap, so `capped` reproduces that exactly.
-        //
-        // `LogicBit` is `#[repr(u8)]` with discriminants equal to the 2-bit
-        // codes, so the buffer is filled as raw BYTES. What the VM actually
-        // feeds this function is a BIT BLAST: on c906, 1.33 M calls averaging
-        // 153 operands each, of which 99.2% are ONE BIT wide. So the cost that
-        // matters is the per-OPERAND constant, not the per-bit one, and the
-        // loop below is shaped around that:
-        //   * a 1-bit inline operand is a single byte store, with no width
-        //     clamp, no sub-loop and no bounds check;
-        //   * a wider inline operand unpacks eight bits per `u64` store via
-        //     `scatter_bits_to_bytes`, allowed to overhang into the 8 bytes of
-        //     slack reserved below (the next operand rewrites them, and the
-        //     final `set_len` excludes any that survive);
-        //   * a `Wide` operand is one `copy_nonoverlapping`.
-        const _: () = assert!(std::mem::size_of::<LogicBit>() == 1);
-        let total = total_width as usize;
-        let capped = Self::cap_width(total_width) as usize;
-        let mut out: Vec<LogicBit> = Vec::with_capacity(capped + 8);
-        let dst: *mut u8 = out.as_mut_ptr().cast::<u8>();
-        let mut len = 0usize;
-        // The per-operand "trim to remaining room" clamp can only ever fire
-        // when `cap_width` actually clamped, i.e. for an underflowed width;
-        // hoisting the test keeps it out of the common operand's path.
-        let clamped = capped != total;
+        let capped = Self::cap_width(total_width);
+        let capped_len = capped as usize;
+        let mut pb = PackedBits::new();
         for val in values.rev() {
-            let mut take = val.width as usize;
-            if clamped {
-                let room = capped - len;
-                if room == 0 {
-                    break;
-                }
-                if take > room {
-                    take = room;
-                }
+            let room = capped_len - pb.len() as usize;
+            if room == 0 {
+                break;
             }
             match &val.storage {
                 ValueStorage::Inline { val_bits, xz_bits } => {
@@ -2276,38 +2199,41 @@ impl Value {
                     }
                 }
                 ValueStorage::Wide(bits) => {
-                    let n = take.min(bits.len());
-                    // SAFETY: `dst[len..len+take]` is reserved, and `bits` is
-                    // `n` readable bytes. A short `Wide` buffer reads as 0 past
-                    // its end, matching `get_bit`'s `unwrap_or(LogicBit::Zero)`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            bits.as_ptr().cast::<u8>(),
-                            dst.add(len),
-                            n,
-                        );
+                    let n = take.min(bits.len() as usize);
+                    for i in 0..n {
+                        pb.push(bits.get(i));
                     }
-                    len += n;
-                    if n < take {
-                        // SAFETY: as above, for the zero pad.
-                        unsafe { std::ptr::write_bytes(dst.add(len), 0u8, take - n) };
-                        len += take - n;
+                    // A short `Wide` buffer reads as 0 past its end, matching
+                    // `get_bit`'s `unwrap_or(LogicBit::Zero)`.
+                    for _ in n..take {
+                        pb.push(LogicBit::Zero);
+                    }
+                }
+                ValueStorage::Inline { val_bits, xz_bits } => {
+                    for i in 0..take {
+                        pb.push(if i < 64 {
+                            LogicBit::from_code(
+                                ((((*xz_bits >> i) & 1) << 1) | ((*val_bits >> i) & 1)) as u8,
+                            )
+                        } else {
+                            // Inline storage declared wider than 64 bits: keep
+                            // the pre-existing `get_bit` behaviour verbatim.
+                            val.get_bit(i)
+                        });
                     }
                 }
             }
         }
-        if len < capped {
-            // SAFETY: `dst[len..capped]` is the remaining reservation.
-            unsafe { std::ptr::write_bytes(dst.add(len), 0u8, capped - len) };
-            len = capped;
+        while pb.len() < capped {
+            pb.push(LogicBit::Zero);
         }
         // SAFETY: bytes `0..len` were all initialised above with valid
         // `LogicBit` bit patterns (codes 0..=3, or bytes copied out of another
         // `Wide` buffer).
         unsafe { out.set_len(len) };
         Value {
-            storage: ValueStorage::Wide(out),
-            width: capped as u32,
+            storage: ValueStorage::Wide(Box::new(pb)),
+            width: capped,
             is_signed: false,
             is_real: false, is_fill: false,
         }
@@ -3088,6 +3014,36 @@ mod tests {
         assert!(!ts.has_xz());
         assert_eq!(ts.range_select(15, 12).to_u64(), Some(0xF));
         assert_eq!(ts.range_select(11, 8).to_u64(), Some(0x0));
+    }
+
+    // Padding bits above `width` in the last packed byte (widths not a
+    // multiple of 4, e.g. 66 bits → 17 bytes with 2 padding slots) must never
+    // leak X/Z into has_xz/==/Hash. `new_fill` canonicalizes them to Zero.
+    #[test]
+    fn wide_padding_bits_are_canonical_zero() {
+        let mut v = Value::new(66); // all-X, width not a multiple of 4
+        for i in 0..66 {
+            v.set_bit(i, LogicBit::Zero);
+        }
+        assert!(!v.has_xz(), "all-zero 66-bit value must have no X/Z");
+
+        // Deserialize re-packs via `push` (padding left zero); it must equal
+        // the canonical construction and round-trip unchanged.
+        use bincode::Options;
+        let opts = crate::xez_bincode_options();
+        let back: Value = opts.deserialize(&opts.serialize(&v).unwrap()).unwrap();
+        assert_eq!(back, v);
+
+        // All-X 66-bit: has_xz true, and equality with itself is unaffected.
+        let x = Value::new(66);
+        assert!(x.has_xz());
+        assert_eq!(x, x);
+        // Clearing every live bit leaves padding zero too.
+        let mut y = Value::new(66);
+        for i in 0..66 {
+            y.set_bit(i, LogicBit::Zero);
+        }
+        assert!(!y.has_xz());
     }
 
     // IEEE 1800-2017 §5.7.1: a single-`x` decimal literal is all-X and a
