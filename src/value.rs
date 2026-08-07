@@ -2,10 +2,14 @@
 //! Supports 4-state logic (0, 1, X, Z) with arbitrary-width bit vectors.
 //!
 //! Optimized representation: values ≤64 bits use inline u64 storage,
-//! avoiding heap allocation entirely. Wider values fall back to Vec<LogicBit>.
+//! avoiding heap allocation entirely. Wider values (>64 bits) use the packed
+//! 2-bit `PackedBits` representation (4 logic bits per byte, ~4× less memory
+//! than a `Vec<LogicBit>`), boxed so the storage enum stays 24 bytes.
 
 use std::fmt;
 use serde::{Serialize, Deserialize};
+
+use crate::packed_value::PackedBits;
 
 /// A single 4-state logic bit.
 ///
@@ -84,8 +88,34 @@ enum ValueStorage {
     /// bit i: val=bit i of val_bits, xz=bit i of xz_bits
     /// 0: val=0,xz=0  1: val=1,xz=0  X: val=0,xz=1  Z: val=1,xz=1
     Inline { val_bits: u64, xz_bits: u64 },
-    /// Fallback for width > 64.
-    Wide(Vec<LogicBit>),
+    /// Fallback for width > 64: a boxed, 2-bit-packed array of logic bits.
+    /// The serialized wire format stays a `Vec<LogicBit>` (see `wide_serde`)
+    /// so on-disk artifacts written by earlier versions remain readable.
+    #[serde(with = "wide_serde")]
+    Wide(Box<PackedBits>),
+}
+
+/// Serialize the boxed packed storage as the historical `Vec<LogicBit>` wire
+/// format (Varint bit-count + one `LogicBit` discriminant per bit). This keeps
+/// `-o` compile artifacts and design-cache files byte-identical with versions
+/// that predate the packed storage, and lets them deserialize into the new
+/// representation.
+mod wide_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::LogicBit;
+    use crate::packed_value::PackedBits;
+
+    // serde `with` passes the field's exact type (`Box<PackedBits>`).
+    #[allow(clippy::ptr_arg)]
+    pub fn serialize<S: Serializer>(pb: &Box<PackedBits>, s: S) -> Result<S::Ok, S::Error> {
+        pb.iter().collect::<Vec<LogicBit>>().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Box<PackedBits>, D::Error> {
+        let bits = Vec::<LogicBit>::deserialize(d)?;
+        Ok(Box::new(PackedBits::from_bits(bits)))
+    }
 }
 
 /// Bit-vector equality for `Wide` storage, a machine word at a time.
@@ -238,7 +268,7 @@ impl PartialEq for Value {
 
 /// Build Wide storage with every bit set to `bit` (top clamped by width).
 fn wide_filled_bits(width: u32, bit: LogicBit) -> ValueStorage {
-    ValueStorage::Wide(vec![bit; width as usize])
+    ValueStorage::Wide(Box::new(PackedBits::new_fill(width, bit)))
 }
 
 impl Value {
@@ -407,7 +437,7 @@ impl Value {
             }
         } else {
             Self {
-                storage: ValueStorage::Wide(vec![LogicBit::X; width as usize]),
+                storage: ValueStorage::Wide(Box::new(PackedBits::new_x(width))),
                 width,
                 is_signed: false, is_real: false, is_fill: false,
             }
@@ -420,7 +450,7 @@ impl Value {
         if width <= 64 {
             Self { storage: ValueStorage::Inline { val_bits: 0, xz_bits: 0 }, width, is_signed: false, is_real: false, is_fill: false }
         } else {
-            Self { storage: ValueStorage::Wide(vec![LogicBit::Zero; width as usize]), width, is_signed: false, is_real: false, is_fill: false }
+            Self { storage: ValueStorage::Wide(Box::new(PackedBits::new_zero(width))), width, is_signed: false, is_real: false, is_fill: false }
         }
     }
 
@@ -431,11 +461,11 @@ impl Value {
             let mask = Self::mask(width);
             Self { storage: ValueStorage::Inline { val_bits: val & mask, xz_bits: 0 }, width, is_signed: false, is_real: false, is_fill: false }
         } else {
-            let mut bits = vec![LogicBit::Zero; width as usize];
+            let mut pb = PackedBits::new_zero(width);
             for i in 0..64.min(width as usize) {
-                if (val >> i) & 1 == 1 { bits[i] = LogicBit::One; }
+                if (val >> i) & 1 == 1 { pb.set(i, LogicBit::One); }
             }
-            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false, is_fill: false }
+            Self { storage: ValueStorage::Wide(Box::new(pb)), width, is_signed: false, is_real: false, is_fill: false }
         }
     }
 
@@ -448,12 +478,12 @@ impl Value {
             let mask = Self::mask(width);
             Self { storage: ValueStorage::Inline { val_bits: (val as u64) & mask, xz_bits: 0 }, width, is_signed: false, is_real: false, is_fill: false }
         } else {
-            let mut bits = vec![LogicBit::Zero; width as usize];
+            let mut pb = PackedBits::new_zero(width);
             let lim = 128.min(width as usize);
             for i in 0..lim {
-                if (val >> i) & 1 == 1 { bits[i] = LogicBit::One; }
+                if (val >> i) & 1 == 1 { pb.set(i, LogicBit::One); }
             }
-            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false, is_fill: false }
+            Self { storage: ValueStorage::Wide(Box::new(pb)), width, is_signed: false, is_real: false, is_fill: false }
         }
     }
 
@@ -464,9 +494,8 @@ impl Value {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits & !*xz_bits) as u128,
             ValueStorage::Wide(bits) => {
                 let mut result: u128 = 0;
-                for (i, bit) in bits.iter().enumerate() {
-                    if i >= 128 { break; }
-                    if *bit == LogicBit::One { result |= 1u128 << i; }
+                for i in 0..128.min(bits.len() as usize) {
+                    if bits.get(i) == LogicBit::One { result |= 1u128 << i; }
                 }
                 result
             }
@@ -505,13 +534,10 @@ impl Value {
             }
             Self { storage: ValueStorage::Inline { val_bits, xz_bits: 0 }, width, is_signed: false, is_real: false, is_fill: false }
         } else {
-            let mut bits = Vec::with_capacity(width as usize);
-            for &b in bytes.iter().rev() {
-                for i in 0..8 {
-                    bits.push(if (b >> i) & 1 == 1 { LogicBit::One } else { LogicBit::Zero });
-                }
-            }
-            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false, is_fill: false }
+            let bits = bytes.iter().rev().flat_map(|&b| (0..8).map(move |i| {
+                if (b >> i) & 1 == 1 { LogicBit::One } else { LogicBit::Zero }
+            }));
+            Self { storage: ValueStorage::Wide(Box::new(PackedBits::from_bits(bits))), width, is_signed: false, is_real: false, is_fill: false }
         }
     }
 
@@ -559,19 +585,7 @@ impl Value {
     pub fn raw_bits(&self) -> (u64, u64) {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits, *xz_bits),
-            ValueStorage::Wide(bits) => {
-                let mut v = 0u64;
-                let mut x = 0u64;
-                for (i, &b) in bits.iter().take(64).enumerate() {
-                    match b {
-                        LogicBit::One => v |= 1u64 << i,
-                        LogicBit::X => x |= 1u64 << i,
-                        LogicBit::Z => { v |= 1u64 << i; x |= 1u64 << i; },
-                        LogicBit::Zero => {},
-                    }
-                }
-                (v, x)
-            }
+            ValueStorage::Wide(bits) => bits.raw_bits_low64(),
         }
     }
 
@@ -593,7 +607,7 @@ impl Value {
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
-            ValueStorage::Wide(bits) => bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)),
+            ValueStorage::Wide(bits) => bits.has_xz(),
         }
     }
 
@@ -620,11 +634,7 @@ impl Value {
             ValueStorage::Wide(_bits) => {
                 let mut out = self.clone();
                 if let ValueStorage::Wide(ob) = &mut out.storage {
-                    for b in ob.iter_mut() {
-                        if matches!(b, LogicBit::X | LogicBit::Z) {
-                            *b = LogicBit::Zero;
-                        }
-                    }
+                    ob.transform(|b| if matches!(b, LogicBit::X | LogicBit::Z) { LogicBit::Zero } else { b });
                 }
                 out
             }
@@ -661,7 +671,7 @@ impl Value {
                     (_, _) => LogicBit::Z,
                 }
             }
-            ValueStorage::Wide(bits) => bits.get(i).copied().unwrap_or(LogicBit::Zero),
+            ValueStorage::Wide(bits) => bits.get(i),
         }
     }
 
@@ -680,10 +690,12 @@ impl Value {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 (((*xz_bits >> i) & 1) << 1 | ((*val_bits >> i) & 1)) as u8
             }
-            // `LogicBit` is `#[repr(u8)]` with exactly these discriminants, so
-            // the four-way match this used to run IS the identity cast (and
-            // `LogicBit::Zero as u8 == 0` covers the out-of-range default).
-            ValueStorage::Wide(bits) => bits.get(i).map_or(0, |b| *b as u8),
+            ValueStorage::Wide(bits) => match bits.get(i) {
+                LogicBit::Zero => 0,
+                LogicBit::One => 1,
+                LogicBit::X => 2,
+                LogicBit::Z => 3,
+            },
         }
     }
 
@@ -707,13 +719,10 @@ impl Value {
                     2 => LogicBit::X,
                     _ => LogicBit::Z,
                 };
-                if let Some(slot) = bits.get_mut(i) {
-                    if *slot == bit { return false; }
-                    *slot = bit;
-                    true
-                } else {
-                    false
-                }
+                if i >= bits.len() as usize { return false; }
+                if bits.get(i) == bit { return false; }
+                bits.set(i, bit);
+                true
             }
         }
     }
@@ -734,7 +743,7 @@ impl Value {
                 }
             }
             ValueStorage::Wide(bits) => {
-                if let Some(b) = bits.get_mut(i) { *b = bit; }
+                if i < bits.len() as usize { bits.set(i, bit); }
             }
         }
     }
@@ -756,12 +765,8 @@ impl Value {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => Some(*val_bits & !*xz_bits),
             ValueStorage::Wide(bits) => {
-                let mut result: u64 = 0;
-                for (i, bit) in bits.iter().enumerate() {
-                    if i >= 64 { break; }
-                    if *bit == LogicBit::One { result |= 1u64 << i; }
-                }
-                Some(result)
+                let (v, x) = bits.raw_bits_low64();
+                Some(v & !x)
             }
         }
     }
@@ -903,7 +908,7 @@ impl Value {
                         let fill_val = if fill == LogicBit::One { Self::mask(target) } else { 0 };
                         ValueStorage::Inline { val_bits: fill_val, xz_bits: 0 }
                     } else {
-                        ValueStorage::Wide(vec![fill; target as usize])
+                        ValueStorage::Wide(Box::new(PackedBits::new_fill(target, fill)))
                     }, width: target, is_signed: self.is_signed , is_real: false, is_fill: false }
                 } else {
                     Value::zero(target)
@@ -1448,12 +1453,13 @@ impl Value {
                 }
             }
             ValueStorage::Wide(bits) => {
-                let new_bits: Vec<LogicBit> = bits.iter().map(|b| match b {
+                let mut nb = bits.clone();
+                nb.transform(|b| match b {
                     LogicBit::Zero => LogicBit::One,
                     LogicBit::One => LogicBit::Zero,
                     _ => LogicBit::X,
-                }).collect();
-                Value { storage: ValueStorage::Wide(new_bits), width: self.width, is_signed: self.is_signed , is_real: false, is_fill: false }
+                });
+                Value { storage: ValueStorage::Wide(nb), width: self.width, is_signed: self.is_signed , is_real: false, is_fill: false }
             }
         }
     }
@@ -2092,8 +2098,8 @@ impl Value {
                 else { Some(false) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.contains(&LogicBit::One) { Some(true) }
-                else if bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)) { None }
+                if bits.iter().any(|b| b == LogicBit::One) { Some(true) }
+                else if bits.has_xz() { None }
                 else { Some(false) }
             }
         }
@@ -2116,7 +2122,7 @@ impl Value {
                 else { Value::from_u64(1, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.contains(&LogicBit::Zero) { Value::from_u64(0, 1) }
+                if bits.iter().any(|b| b == LogicBit::Zero) { Value::from_u64(0, 1) }
                 else if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
                 else { Value::from_u64(1, 1) }
             }
@@ -2133,7 +2139,7 @@ impl Value {
                 else { Value::from_u64(0, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.contains(&LogicBit::One) { Value::from_u64(1, 1) }
+                if bits.iter().any(|b| b == LogicBit::One) { Value::from_u64(1, 1) }
                 else if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
                 else { Value::from_u64(0, 1) }
             }
@@ -3003,6 +3009,47 @@ mod tests {
         assert_eq!(dst, wider);
     }
 
+
+    // Packed wide storage must keep the historical on-wire representation
+    // (`u8` variant tag, then a Varint bit count, then one `LogicBit`
+    // discriminant per bit). `-o` compile artifacts and design-cache files
+    // written before packed storage rely on that byte layout.
+    #[test]
+    fn wide_serde_keeps_legacy_vec_wire_format() {
+        use bincode::Options;
+        let opts = crate::xez_bincode_options();
+        let mut val = Value::zero(120);
+        val.set_bit(0, LogicBit::One);
+        val.set_bit(5, LogicBit::X);
+        val.set_bit(119, LogicBit::Z);
+        assert!(matches!(&val.storage, ValueStorage::Wide(_)));
+
+        let bytes = opts.serialize(&val).unwrap();
+        // Value = storage, then width (Varint), then three bools. Storage:
+        // tag byte 1 (Wide), Varint count 120, then 120 LogicBit codes.
+        assert_eq!(bytes[0], 1, "Wide variant tag");
+        assert_eq!(bytes[1], 120, "Varint bit count (single byte < 128)");
+        for i in 0..120usize {
+            let want = match i { 0 => 1, 5 => 2, 119 => 3, _ => 0 };
+            assert_eq!(bytes[2 + i], want, "bit {} LogicBit code", i);
+        }
+    }
+
+    // A wide value must survive a bincode round trip (artifacts + design cache).
+    #[test]
+    fn wide_serde_round_trip_preserves_bits() {
+        use bincode::Options;
+        let opts = crate::xez_bincode_options();
+        let val = Value::from_str_radix(&"10xz".repeat(40), 2, 160);
+        let bytes = opts.serialize(&val).unwrap();
+        let back: Value = opts.deserialize(&bytes).unwrap();
+        assert_eq!(back, val);
+        assert_eq!(back.width, 160);
+        for i in 0..160 {
+            assert_eq!(back.get_bit(i), val.get_bit(i), "bit {}", i);
+        }
+    }
+
     // IEEE 1800-2017 §5.7.1: a single-`x` decimal literal is all-X and a
     // single-`z`/`?` decimal literal is all-Z (previously mis-rendered as
     // all-X). Higher radices are unaffected.
@@ -3243,7 +3290,7 @@ impl Value {
     pub fn has_unknown(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
-            ValueStorage::Wide(bits) => bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)),
+            ValueStorage::Wide(bits) => bits.has_xz(),
         }
     }
 
@@ -3254,8 +3301,7 @@ impl Value {
         if width <= 64 {
             Self::from_u64(Self::mask(width), width)
         } else {
-            let bits = vec![LogicBit::One; width as usize];
-            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false, is_fill: false }
+            Self { storage: ValueStorage::Wide(Box::new(PackedBits::new_fill(width, LogicBit::One))), width, is_signed: false, is_real: false, is_fill: false }
         }
     }
 
@@ -3729,19 +3775,20 @@ impl Value {
         // Inline→Inline fast path landed (set_bit fan-out was ~40% of
         // range_select self-time on its own).
         if let ValueStorage::Wide(bits) = &self.storage {
-            // Wide → Wide fast path for width > 64: replace the per-bit
-            // get_bit/set_bit loop with a single slice copy. The source
-            // already stores `Vec<LogicBit>` (1 byte per bit) so the copy
-            // is just a memcpy.
+            // Wide → Wide: copy the selected bits into a fresh packed value.
+            // (The packed 2-bit encoding no longer gives a byte-aligned memcpy
+            // for arbitrary `lo`; the per-bit copy below is correct and still
+            // O(width). A packed-shift fast path can follow if profiling ever
+            // shows this hot for wide signals.)
             if width > 64 {
-                let mut out = vec![LogicBit::Zero; width];
-                let len = bits.len();
-                if lo < len {
-                    let copy_len = (lo + width).min(len) - lo;
-                    out[..copy_len].copy_from_slice(&bits[lo..lo + copy_len]);
+                let mut out = PackedBits::new_zero(width as u32);
+                let len = bits.len() as usize;
+                let copy_len = width.min(len.saturating_sub(lo));
+                for i in 0..copy_len {
+                    out.set(i, bits.get(lo + i));
                 }
                 return Value {
-                    storage: ValueStorage::Wide(out),
+                    storage: ValueStorage::Wide(Box::new(out)),
                     width: width as u32,
                     is_signed: false,
                     is_real: false, is_fill: false,
@@ -3751,30 +3798,11 @@ impl Value {
                 let mut val_bits: u64 = 0;
                 let mut xz_bits: u64 = 0;
                 let end = lo + width;
-                let len = bits.len();
-                let stop = end.min(len);
-                // `LogicBit` is `#[repr(u8)]` with the 2-bit code as its
-                // discriminant, so eight source bits are eight bytes whose bit
-                // 0 is the value plane and bit 1 the xz plane. Read them as one
-                // unaligned word and re-pack each plane with a single multiply
-                // (`gather_byte_lsbs`) instead of running the match per bit.
-                const _: () = assert!(std::mem::size_of::<LogicBit>() == 1);
-                let src = bits.as_ptr().cast::<u8>();
-                let mut i = lo;
-                let mut pos = 0u32;
-                while i + 8 <= stop {
-                    // SAFETY: `i + 8 <= stop <= len`, so the 8 bytes read here
-                    // are inside `bits`. `pos <= 56` because the loop runs at
-                    // most `width / 8 <= 8` times.
-                    let lanes = unsafe { src.add(i).cast::<u64>().read_unaligned() };
-                    val_bits |= (gather_byte_lsbs(lanes) as u64) << pos;
-                    xz_bits |= (gather_byte_lsbs(lanes >> 1) as u64) << pos;
-                    i += 8;
-                    pos += 8;
-                }
-                while i < stop {
+                let len = bits.len() as usize;
+                for i in lo..end.min(len) {
+                    let pos = i - lo;
                     let m = 1u64 << pos;
-                    match bits[i] {
+                    match bits.get(i) {
                         LogicBit::Zero => {}
                         LogicBit::One => { val_bits |= m; }
                         LogicBit::X => { xz_bits |= m; }
@@ -3830,10 +3858,10 @@ impl Value {
     #[inline(always)]
     pub fn copy_from(&mut self, other: &Value) {
         // Fast path: Inline→Inline is just a word-level overwrite (no alloc).
-        // Wide→Wide with the same length reuses `self`'s existing Vec buffer
-        // via `extend_from_slice` after `clear()`, avoiding the per-iter
-        // allocation that `storage.clone()` would do. Mixed variants fall
-        // back to the generic clone.
+        // Wide→Wide with the same width memcpys the packed bytes into the
+        // existing boxed slice, avoiding the per-iter allocation that
+        // `storage.clone()` would do. Mixed variants fall back to the generic
+        // clone.
         //
         // Copies `width`, `is_signed`, and `is_real` as well — this is the
         // drop-in equivalent of `*self = other.clone()` minus the heap
@@ -3846,16 +3874,14 @@ impl Value {
                 *sv = *ov; *sx = *ox;
             }
             (ValueStorage::Wide(sv), ValueStorage::Wide(ov)) => {
-                // Equal lengths (the norm — a signal keeps its width) copy
-                // straight over the existing buffer: one memcpy, no length
-                // store, no capacity check, and no `RawVec::grow` call kept
-                // alive on the path. Only a genuine width change needs the
-                // clear + reserve + extend dance.
+                // Equal widths (the norm — a signal keeps its width) copy
+                // straight over the existing packed bytes: one memcpy, no
+                // length store, no capacity check, no realloc. Only a genuine
+                // width change reallocates the boxed storage.
                 if sv.len() == ov.len() {
-                    sv.copy_from_slice(ov);
+                    sv.data_mut().copy_from_slice(ov.data());
                 } else {
-                    sv.clear();
-                    sv.extend_from_slice(ov);
+                    *sv = Box::new(PackedBits::from_data(ov.data().to_vec(), ov.len()));
                 }
             }
             _ => {
@@ -3890,7 +3916,7 @@ impl Value {
             }
         } else {
             Self {
-                storage: ValueStorage::Wide(vec![LogicBit::Z; width as usize]),
+                storage: ValueStorage::Wide(Box::new(PackedBits::new_fill(width, LogicBit::Z))),
                 width,
                 is_signed: false, is_real: false, is_fill: false,
             }

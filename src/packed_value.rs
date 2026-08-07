@@ -181,6 +181,62 @@ impl PackedBits {
     pub fn memory_size(&self) -> usize {
         self.data.capacity()
     }
+
+    /// Build from raw packed bytes and an explicit bit length (deserialization
+    /// / slice-copy fast path). The caller guarantees `data` holds
+    /// `Self::bytes_needed(len)` bytes.
+    pub fn from_data(data: Vec<u8>, len: u32) -> Self {
+        Self { data, len }
+    }
+
+    /// Build by appending bits in LSB-first order.
+    pub fn from_bits(bits: impl IntoIterator<Item = LogicBit>) -> Self {
+        let mut pb = PackedBits::new();
+        for b in bits {
+            pb.push(b);
+        }
+        pb
+    }
+
+    /// Append a single bit, growing the backing byte as needed.
+    pub fn push(&mut self, bit: LogicBit) {
+        if self.len % 4 == 0 {
+            self.data.push(0);
+        }
+        let byte_idx = self.data.len() - 1;
+        let shift = (self.len % 4) * 2;
+        self.data[byte_idx] |= bit.to_code() << shift;
+        self.len += 1;
+    }
+
+    /// A new packed value of `new_len` bits: the overlap with `self` is copied
+    /// and any remaining bits are filled with `fill` (§10.7 resize semantics).
+    pub fn resized(&self, new_len: u32, fill: LogicBit) -> Self {
+        let mut out = PackedBits::new_fill(new_len, fill);
+        let copy = new_len.min(self.len);
+        for i in 0..copy as usize {
+            out.set(i, self.get(i));
+        }
+        out
+    }
+
+    /// Map every bit through `f` in place (2-state coercion, bitwise NOT, …).
+    pub fn transform(&mut self, mut f: impl FnMut(LogicBit) -> LogicBit) {
+        for i in 0..self.len as usize {
+            self.set(i, f(self.get(i)));
+        }
+    }
+
+    /// Mutable access to the packed bytes (length-preserving writes).
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+}
+
+impl Default for PackedBits {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Iterator over packed bits.
