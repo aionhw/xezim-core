@@ -214,17 +214,6 @@ impl PackedBits {
         self.len += 1;
     }
 
-    /// A new packed value of `new_len` bits: the overlap with `self` is copied
-    /// and any remaining bits are filled with `fill` (§10.7 resize semantics).
-    pub fn resized(&self, new_len: u32, fill: LogicBit) -> Self {
-        let mut out = PackedBits::new_fill(new_len, fill);
-        let copy = new_len.min(self.len);
-        for i in 0..copy as usize {
-            out.set(i, self.get(i));
-        }
-        out
-    }
-
     /// Map every bit through `f` in place (2-state coercion, bitwise NOT, …).
     pub fn transform(&mut self, mut f: impl FnMut(LogicBit) -> LogicBit) {
         for i in 0..self.len as usize {

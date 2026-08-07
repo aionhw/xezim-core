@@ -106,8 +106,9 @@ mod wide_serde {
     use super::LogicBit;
     use crate::packed_value::PackedBits;
 
-    // serde `with` passes the field's exact type (`Box<PackedBits>`).
-    #[allow(clippy::ptr_arg)]
+    // serde `with` passes the field's exact type (`Box<PackedBits>`), so the
+    // boxed reference is required by the serde contract.
+    #[allow(clippy::borrowed_box)]
     pub fn serialize<S: Serializer>(pb: &Box<PackedBits>, s: S) -> Result<S::Ok, S::Error> {
         pb.iter().collect::<Vec<LogicBit>>().serialize(s)
     }
@@ -692,7 +693,9 @@ impl Value {
                 }
             }
             ValueStorage::Wide(bits) => {
-                if i < bits.len() as usize { bits.set(i, bit); }
+                if i < bits.len() as usize {
+                    bits.set(i, bit);
+                }
             }
         }
     }
