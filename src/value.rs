@@ -3050,6 +3050,46 @@ mod tests {
         }
     }
 
+    // Exercise every rewritten Wide arm against a known 160-bit pattern, so a
+    // packing bug cannot hide behind another packed path.
+    #[test]
+    fn wide_ops_are_bit_accurate() {
+        let a = Value::from_str_radix(&"f0".repeat(20), 16, 160); // 0xF0F0…F0
+        let b = Value::from_str_radix(&"0f".repeat(20), 16, 160); // 0x0F0F…0F
+        assert_eq!(a.bitwise_and(&b), Value::zero(160));
+        assert_eq!(a.bitwise_or(&b), Value::ones(160));
+        assert_eq!(a.bitwise_xor(&b), Value::ones(160));
+        assert_eq!(a.bitwise_not(), b);
+        assert_eq!(b.bitwise_not(), a);
+
+        // Reductions (Table 11-13 / 11-14 semantics).
+        assert_eq!(a.reduce_and().to_u64(), Some(0), "0xF0… has zero nibbles");
+        assert_eq!(b.reduce_or().to_u64(), Some(1), "0x0F… has one nibbles");
+        assert_eq!(Value::ones(160).reduce_and().to_u64(), Some(1));
+        assert_eq!(Value::zero(160).reduce_or().to_u64(), Some(0));
+
+        // Part-select: Wide→Inline and Wide→Wide.
+        assert_eq!(a.range_select(7, 0).to_u64(), Some(0xF0));
+        assert_eq!(a.range_select(159, 152).to_u64(), Some(0xF0));
+        assert_eq!(a.range_select(95, 64).to_u64(), Some(0xF0F0F0F0));
+        assert_eq!(a.range_select(127, 64), Value::from_u64(0xF0F0F0F0F0F0F0F0, 64));
+        assert_eq!(a.range_select(159, 0), a);
+
+        // Resize keeps the low bits; wide→inline at exactly 64.
+        assert_eq!(a.resize(96).width, 96);
+        assert_eq!(a.resize(96), a.range_select(95, 0));
+        assert_eq!(a.resize(64), a.range_select(63, 0));
+
+        // 2-state coercion drops X/Z, preserving known nibbles.
+        let x = Value::from_str_radix(&"x".repeat(40), 16, 160);
+        assert_eq!(x.to_two_state(), Value::zero(160));
+        let mix = Value::from_str_radix(&"f0xz".repeat(10), 16, 160);
+        let ts = mix.to_two_state();
+        assert!(!ts.has_xz());
+        assert_eq!(ts.range_select(15, 12).to_u64(), Some(0xF));
+        assert_eq!(ts.range_select(11, 8).to_u64(), Some(0x0));
+    }
+
     // IEEE 1800-2017 §5.7.1: a single-`x` decimal literal is all-X and a
     // single-`z`/`?` decimal literal is all-Z (previously mis-rendered as
     // all-X). Higher radices are unaffected.
@@ -3923,3 +3963,4 @@ impl Value {
         }
     }
 }
+
