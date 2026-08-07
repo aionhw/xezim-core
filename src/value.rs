@@ -6,8 +6,8 @@
 //! 2-bit `PackedBits` representation (4 logic bits per byte, ~4× less memory
 //! than a `Vec<LogicBit>`), boxed so the storage enum stays 24 bytes.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use serde::{Serialize, Deserialize};
 
 use crate::packed_value::PackedBits;
 
@@ -119,48 +119,6 @@ mod wide_serde {
     }
 }
 
-
-/// Mask selecting bit 0 of every byte of a `u64`.
-const LSB_OF_EACH_BYTE: u64 = 0x0101_0101_0101_0101;
-
-/// Scatter the 8 bits of `b` into the low bit of 8 consecutive bytes
-/// (little-endian: bit `i` of `b` lands in bit 0 of byte `i`).
-///
-/// Used to unpack the packed `Inline` 4-state encoding into the one-byte-per-bit
-/// `Wide` representation eight bits at a time. `x * 0x0101…` broadcasts the byte
-/// to all eight lanes, the `& 0x8040…0201` keeps only bit `i` in lane `i`, and
-/// the `+ 0x7f7f…` / `>> 7` pair normalises "lane is nonzero" to 1 without any
-/// inter-lane carry (the largest lane value is `0x80 + 0x7f = 0xff`).
-#[inline(always)]
-fn scatter_bits_to_bytes(b: u8) -> u64 {
-    let lanes = (b as u64).wrapping_mul(LSB_OF_EACH_BYTE) & 0x8040_2010_0804_0201;
-    (lanes.wrapping_add(0x7f7f_7f7f_7f7f_7f7f) >> 7) & LSB_OF_EACH_BYTE
-}
-
-/// Inverse of `scatter_bits_to_bytes`: gather bit 0 of each of 8 bytes into one
-/// byte (byte `i` -> bit `i`).
-///
-/// The multiplier `0x0102040810204080` is `Σ_{j<8} 2^(56-7j)`, which moves lane
-/// `i`'s bit from position `8i` to position `56+i`. No two (lane,
-/// multiplier-term) products share an exponent — `8i - 7j = 8i' - 7j'` forces
-/// `i-i' = 7k` and `j-j' = 8k`, impossible for distinct indices in `0..8` — so
-/// the product is a sum of distinct powers of two and carries cannot corrupt
-/// the result. (Note the low byte is `0x80`, not the `0x81` of the superficially
-/// similar bit-reversal constant: a `2^0` term would fold lane 7 back onto
-/// bit 0.)
-#[inline(always)]
-fn gather_byte_lsbs(lanes: u64) -> u8 {
-    ((lanes & LSB_OF_EACH_BYTE).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8
-}
-
-#[inline(never)]
-fn storage_eq_slow(a: &ValueStorage, b: &ValueStorage) -> bool {
-    match (a, b) {
-        (ValueStorage::Wide(a), ValueStorage::Wide(b)) => wide_bits_eq(a, b),
-        _ => false,
-    }
-}
-
 impl PartialEq for ValueStorage {
     /// Same result as the previous `#[derive(PartialEq)]` (Inline compares its
     /// two words, Wide compares its bits, mixed variants are never equal).
@@ -178,7 +136,6 @@ impl PartialEq for ValueStorage {
             (ValueStorage::Wide(a), ValueStorage::Wide(b)) => a == b,
             _ => false,
         }
-        storage_eq_slow(self, other)
     }
 }
 
@@ -232,16 +189,7 @@ impl Value {
     /// width is under 32), so this only ever widens a constant that would have lost
     /// data.
     pub fn unsized_literal_width(value: &str, radix: u32) -> u32 {
-        // ONE byte pass where `chars().filter(..).count()` decoded UTF-8. A
-        // UTF-8 continuation byte (`0b10xxxxxx`) is never the start of a
-        // character and `_` is ASCII, so counting non-continuation bytes that
-        // are not `_` is exactly the original character count — for non-ASCII
-        // input too. This runs once per number literal.
-        let digits = value
-            .as_bytes()
-            .iter()
-            .filter(|&&b| b & 0xC0 != 0x80 && b != b'_')
-            .count() as u32;
+        let digits = value.chars().filter(|c| *c != '_').count() as u32;
         let natural = match radix {
             2 => digits,
             8 => digits.saturating_mul(3),
@@ -249,16 +197,8 @@ impl Value {
             // Decimal: use the magnitude when it fits, else a safe upper bound
             // (log2(10) < 3.33, so 4 bits per digit never under-counts).
             _ => {
-                // `parse` the borrowed string directly when there is no `_` to
-                // strip, which is the overwhelmingly common case; only a
-                // separator-bearing literal still pays for a scratch `String`.
-                let parsed = if value.len() == digits as usize {
-                    value.parse::<u128>()
-                } else {
-                    let cleaned: String = value.chars().filter(|c| *c != '_').collect();
-                    cleaned.parse::<u128>()
-                };
-                match parsed {
+                let cleaned: String = value.chars().filter(|c| *c != '_').collect();
+                match cleaned.parse::<u128>() {
                     Ok(v) => (128 - v.leading_zeros()).max(1),
                     Err(_) => digits.saturating_mul(4),
                 }
@@ -669,8 +609,12 @@ impl Value {
                     2 => LogicBit::X,
                     _ => LogicBit::Z,
                 };
-                if i >= bits.len() as usize { return false; }
-                if bits.get(i) == bit { return false; }
+                if i >= bits.len() as usize {
+                    return false;
+                }
+                if bits.get(i) == bit {
+                    return false;
+                }
                 bits.set(i, bit);
                 true
             }
@@ -748,19 +692,12 @@ impl Value {
     /// `resize_slow`, whose body is unchanged. Previously the whole function
     /// (including the `Vec`-building generic arm) was one unannotated
     /// `pub fn`, i.e. a cross-crate call for every resize.
-    ///
-    /// The head no longer carries the `target == self.width` early-out: for
-    /// `Inline` storage the widen arm below already reproduces `self.clone()`
-    /// exactly when `target == self.width` (the sign-extension mask
-    /// `mask(target) & !mask(self.width)` is empty, so both words pass through
-    /// and every header field is copied), and for `Wide` storage the clone
-    /// belongs in the out-of-line tail rather than in a head that every VM
-    /// `Resize` wants inlined. Dropping it takes the `Vec`-clone code — the
-    /// only bulky thing left in the head — out of the inlining cost estimate,
-    /// which is what kept LLVM emitting a real cross-crate call here.
     #[inline]
     pub fn resize(&self, target: u32) -> Value {
         if !self.is_fill && !self.is_real && target != 0 {
+            if target == self.width {
+                return self.clone();
+            }
             if let ValueStorage::Inline { val_bits, xz_bits } = self.storage {
                 if target <= 64 {
                     let mask = Self::mask(target);
@@ -867,50 +804,8 @@ impl Value {
                 };
                 result.is_signed = self.is_signed;
                 let copy_bits = self.width.min(target) as usize;
-                // `set_bit` ignores any index past `result.width` (which the
-                // unsigned branch's `Value::zero` may have capped below
-                // `target`), so clamping the copy to the destination buffer is
-                // the same work with the per-bit dispatch removed.
-                match (&mut result.storage, &self.storage) {
-                    (ValueStorage::Wide(dst), ValueStorage::Wide(src)) => {
-                        let n = copy_bits.min(dst.len());
-                        let m = n.min(src.len());
-                        dst[..m].copy_from_slice(&src[..m]);
-                        // Past the source buffer `get_bit` reads Zero, which
-                        // overwrites the sign/zero fill already in place.
-                        dst[m..n].fill(LogicBit::Zero);
-                    }
-                    (ValueStorage::Wide(dst), ValueStorage::Inline { val_bits, xz_bits }) => {
-                        // Same eight-bits-per-word unpack `concat_refs` uses.
-                        let n = copy_bits.min(dst.len()).min(64);
-                        let p: *mut u8 = dst.as_mut_ptr().cast::<u8>();
-                        let mut i = 0usize;
-                        // SAFETY: every store is inside `dst[..n]`, and
-                        // `i + 8 <= n <= 64` keeps both shifts under 64.
-                        unsafe {
-                            while i + 8 <= n {
-                                let v = scatter_bits_to_bytes((*val_bits >> i) as u8);
-                                let x = scatter_bits_to_bytes((*xz_bits >> i) as u8);
-                                p.add(i).cast::<u64>().write_unaligned(v | (x << 1));
-                                i += 8;
-                            }
-                            while i < n {
-                                *p.add(i) =
-                                    ((((*xz_bits >> i) & 1) << 1) | ((*val_bits >> i) & 1)) as u8;
-                                i += 1;
-                            }
-                        }
-                        // An `Inline` source declared wider than 64 bits keeps
-                        // the pre-existing `get_bit` behaviour verbatim.
-                        for i in n..copy_bits.min(dst.len()) {
-                            dst[i] = self.get_bit(i);
-                        }
-                    }
-                    _ => {
-                        for i in 0..copy_bits {
-                            result.set_bit(i, self.get_bit(i));
-                        }
-                    }
+                for i in 0..copy_bits {
+                    result.set_bit(i, self.get_bit(i));
                 }
                 result
             }
@@ -937,40 +832,27 @@ impl Value {
     /// IEEE 1800-2017 §10.7 assignment-padding resize. When widening, if the MSB
     /// of the source is X or Z the extension bits are X or Z respectively;
     /// otherwise behaves like `resize` (zero- or sign-extension). Used when padding
-    /// a nonblocking/blocking assignment RHS to the LHS width. Only a SIGNED
-    /// source replicates its MSB; an unsigned source always zero-extends, even
-    /// when its MSB (or any lower bit) is X/Z.
-    ///
-    /// Every case that is a plain `resize` — which is all of them but a signed
-    /// widening off an X/Z MSB — is decided here in flag tests and one
-    /// `get_bit`, so `resize`'s inline arm lands directly in the caller instead
-    /// of behind two calls. The `||` chain short-circuits before the `get_bit`
-    /// whenever `self.width == 0`, so the `width - 1` cannot underflow.
+    /// a nonblocking/blocking assignment RHS to the LHS width.
     #[inline]
     pub fn resize_for_assign(&self, target: u32) -> Value {
-        if !self.is_fill
-            && (!self.is_signed
-                || target <= self.width
-                || self.width == 0
-                || self.is_real
-                || {
-                    let msb = self.get_bit(self.width as usize - 1);
-                    msb != LogicBit::X && msb != LogicBit::Z
-                })
-        {
-            return self.resize(target);
-        }
-        self.resize_for_assign_slow(target)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn resize_for_assign_slow(&self, target: u32) -> Value {
         if self.is_fill {
             // §5.7.1: an unbased-unsized literal replicates into the target.
             return self.fill_at(target);
         }
+        if target == self.width || self.width == 0 || self.is_real {
+            return self.resize(target);
+        }
+        if target < self.width {
+            return self.resize(target);
+        }
         let msb = self.get_bit(self.width.saturating_sub(1) as usize);
+        // §10.7: the RHS is padded to the LHS width using its OWN signedness.
+        // Only a signed source replicates its MSB — and when that MSB is X or Z
+        // the extension bits take X/Z. An unsigned source always zero-extends,
+        // even when its MSB (or any lower bit) is X/Z.
+        if !self.is_signed || (msb != LogicBit::X && msb != LogicBit::Z) {
+            return self.resize(target);
+        }
         // X/Z extend
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } if target <= 64 => {
@@ -1256,136 +1138,74 @@ impl Value {
 
     #[inline]
     pub fn bitwise_and(&self, other: &Value) -> Value {
-        if !self.is_fill && !other.is_fill {
-            if let (ValueStorage::Inline { val_bits: av, xz_bits: ax },
-                    ValueStorage::Inline { val_bits: bv, xz_bits: bx })
-                = (&self.storage, &other.storage)
-            {
-                let w = self.width.max(other.width);
-                if *ax == 0 && *bx == 0 {
-                    // Fast path: no X/Z
-                    return Value { storage: ValueStorage::Inline { val_bits: av & bv, xz_bits: 0 }, width: w, is_signed: false, is_real: false, is_fill: false };
-                }
-                // X propagation for AND: 0 & X = 0, 1 & X = X
-                let any_xz = ax | bx;
-                let result_val = av & bv & !any_xz;
-                let result_xz = any_xz & !((!av & !ax) | (!bv & !bx)); // known 0 kills X
-                return Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false, is_fill: false };
-            }
-        }
-        self.bitwise_and_slow(other)
-    }
-
-    /// `Wide` operand or a §5.7.1 fill — same two steps `bitwise_and` used to
-    /// run inline. Out of line so the monomorphised `bitwise_op_slow` closure
-    /// and the `fill_pair` widening stop counting against the inlining budget
-    /// of the two-word arm above, which is the one the VM executes.
-    #[cold]
-    #[inline(never)]
-    fn bitwise_and_slow(&self, other: &Value) -> Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.bitwise_and(&b);
         }
-        let op_bit = |a: LogicBit, b: LogicBit| match (a, b) {
-            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
-            (LogicBit::One, LogicBit::One) => LogicBit::One,
-            _ => LogicBit::X,
-        };
-        if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
-            // A KNOWN 0 on either side forces 0; two known 1s give 1; anything
-            // else is x. "known 0" is `!val & !xz`, "known 1" is `val & !xz`.
-            let bits = Self::wide_bitwise_lanes(a, b, w, |av, ax, bv, bx| {
-                let zero_out = ((!av & !ax) | (!bv & !bx)) & LSB_OF_EACH_BYTE;
-                let one_out = av & !ax & bv & !bx & LSB_OF_EACH_BYTE;
-                (one_out, !zero_out & !one_out & LSB_OF_EACH_BYTE)
-            }, op_bit);
-            return Self::wide_bitwise_value(bits, w);
+        let w = self.width.max(other.width);
+        match (&self.storage, &other.storage) {
+            (ValueStorage::Inline { val_bits: av, xz_bits: ax }, ValueStorage::Inline { val_bits: bv, xz_bits: bx }) => {
+                if *ax == 0 && *bx == 0 {
+                    // Fast path: no X/Z
+                    Value { storage: ValueStorage::Inline { val_bits: av & bv, xz_bits: 0 }, width: w, is_signed: false, is_real: false, is_fill: false }
+                } else {
+                    // X propagation for AND: 0 & X = 0, 1 & X = X
+                    let any_xz = ax | bx;
+                    let result_val = av & bv & !any_xz;
+                    let result_xz = any_xz & !((!av & !ax) | (!bv & !bx)); // known 0 kills X
+                    Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false, is_fill: false }
+                }
+            }
+            _ => self.bitwise_op_slow(other, |a, b| match (a, b) {
+                (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
+                (LogicBit::One, LogicBit::One) => LogicBit::One,
+                _ => LogicBit::X,
+            }),
         }
-        self.bitwise_op_slow(other, op_bit)
     }
 
     #[inline]
     pub fn bitwise_or(&self, other: &Value) -> Value {
-        if !self.is_fill && !other.is_fill {
-            if let (ValueStorage::Inline { val_bits: av, xz_bits: ax },
-                    ValueStorage::Inline { val_bits: bv, xz_bits: bx })
-                = (&self.storage, &other.storage)
-            {
-                let w = self.width.max(other.width);
-                if *ax == 0 && *bx == 0 {
-                    return Value { storage: ValueStorage::Inline { val_bits: av | bv, xz_bits: 0 }, width: w, is_signed: false, is_real: false, is_fill: false };
-                }
-                let any_xz = ax | bx;
-                let result_val = (av | bv) & !any_xz;
-                let result_xz = any_xz & !((av & !ax) | (bv & !bx)); // known 1 kills X
-                return Value { storage: ValueStorage::Inline { val_bits: result_val | ((av & !ax) | (bv & !bx)), xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false, is_fill: false };
-            }
-        }
-        self.bitwise_or_slow(other)
-    }
-
-    /// See `bitwise_and_slow`.
-    #[cold]
-    #[inline(never)]
-    fn bitwise_or_slow(&self, other: &Value) -> Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.bitwise_or(&b);
         }
-        let op_bit = |a: LogicBit, b: LogicBit| match (a, b) {
-            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
-            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
-            _ => LogicBit::X,
-        };
-        if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
-            // A KNOWN 1 on either side forces 1; two known 0s give 0; anything
-            // else is x.
-            let bits = Self::wide_bitwise_lanes(a, b, w, |av, ax, bv, bx| {
-                let one_out = ((av & !ax) | (bv & !bx)) & LSB_OF_EACH_BYTE;
-                let zero_out = !av & !ax & !bv & !bx & LSB_OF_EACH_BYTE;
-                (one_out, !one_out & !zero_out & LSB_OF_EACH_BYTE)
-            }, op_bit);
-            return Self::wide_bitwise_value(bits, w);
+        let w = self.width.max(other.width);
+        match (&self.storage, &other.storage) {
+            (ValueStorage::Inline { val_bits: av, xz_bits: ax }, ValueStorage::Inline { val_bits: bv, xz_bits: bx }) => {
+                if *ax == 0 && *bx == 0 {
+                    Value { storage: ValueStorage::Inline { val_bits: av | bv, xz_bits: 0 }, width: w, is_signed: false, is_real: false, is_fill: false }
+                } else {
+                    let any_xz = ax | bx;
+                    let result_val = (av | bv) & !any_xz;
+                    let result_xz = any_xz & !((av & !ax) | (bv & !bx)); // known 1 kills X
+                    Value { storage: ValueStorage::Inline { val_bits: result_val | ((av & !ax) | (bv & !bx)), xz_bits: result_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false, is_fill: false }
+                }
+            }
+            _ => self.bitwise_op_slow(other, |a, b| match (a, b) {
+                (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
+                (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+                _ => LogicBit::X,
+            }),
         }
-        self.bitwise_op_slow(other, op_bit)
     }
 
     #[inline]
     pub fn bitwise_xor(&self, other: &Value) -> Value {
-        if !self.is_fill && !other.is_fill {
-            if let (ValueStorage::Inline { val_bits: av, xz_bits: ax },
-                    ValueStorage::Inline { val_bits: bv, xz_bits: bx })
-                = (&self.storage, &other.storage)
-            {
-                let w = self.width.max(other.width);
-                let any_xz = ax | bx;
-                let result_val = (av ^ bv) & !any_xz;
-                return Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: any_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false, is_fill: false };
-            }
-        }
-        self.bitwise_xor_slow(other)
-    }
-
-    /// See `bitwise_and_slow`.
-    #[cold]
-    #[inline(never)]
-    fn bitwise_xor_slow(&self, other: &Value) -> Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.bitwise_xor(&b);
         }
-        let op_bit = |a: LogicBit, b: LogicBit| match (a, b) {
-            (LogicBit::Zero, LogicBit::Zero) | (LogicBit::One, LogicBit::One) => LogicBit::Zero,
-            (LogicBit::Zero, LogicBit::One) | (LogicBit::One, LogicBit::Zero) => LogicBit::One,
-            _ => LogicBit::X,
-        };
-        if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
-            // Known on BOTH sides gives their xor; any unknown gives x.
-            let bits = Self::wide_bitwise_lanes(a, b, w, |av, ax, bv, bx| {
-                let unknown = (ax | bx) & LSB_OF_EACH_BYTE;
-                ((av ^ bv) & !unknown & LSB_OF_EACH_BYTE, unknown)
-            }, op_bit);
-            return Self::wide_bitwise_value(bits, w);
+        let w = self.width.max(other.width);
+        match (&self.storage, &other.storage) {
+            (ValueStorage::Inline { val_bits: av, xz_bits: ax }, ValueStorage::Inline { val_bits: bv, xz_bits: bx }) => {
+                let any_xz = ax | bx;
+                let result_val = (av ^ bv) & !any_xz;
+                Value { storage: ValueStorage::Inline { val_bits: result_val, xz_bits: any_xz & Self::mask(w) }, width: w, is_signed: false, is_real: false, is_fill: false }
+            }
+            _ => self.bitwise_op_slow(other, |a, b| match (a, b) {
+                (LogicBit::Zero, LogicBit::Zero) | (LogicBit::One, LogicBit::One) => LogicBit::Zero,
+                (LogicBit::Zero, LogicBit::One) | (LogicBit::One, LogicBit::Zero) => LogicBit::One,
+                _ => LogicBit::X,
+            }),
         }
-        self.bitwise_op_slow(other, op_bit)
     }
 
     #[inline]
@@ -1411,94 +1231,14 @@ impl Value {
                     LogicBit::One => LogicBit::Zero,
                     _ => LogicBit::X,
                 });
-                Value { storage: ValueStorage::Wide(nb), width: self.width, is_signed: self.is_signed , is_real: false, is_fill: false }
+                Value {
+                    storage: ValueStorage::Wide(nb),
+                    width: self.width,
+                    is_signed: self.is_signed,
+                    is_real: false,
+                    is_fill: false,
+                }
             }
-        }
-    }
-
-    /// `Some(width)` when both operands are `Wide` buffers of the SAME declared
-    /// width, with at least that many bytes of storage, and a width the
-    /// `MAX_WIDTH` clamp cannot touch. That is exactly the shape for which the
-    /// byte-parallel bitwise path reproduces the `get_bit`/`set_bit` loop
-    /// verbatim: no index reads Zero past a short operand, neither operand is
-    /// narrower than the result, and `Value::zero(w)` would not have clamped.
-    #[inline]
-    fn wide_bitwise_pair<'v>(&'v self, other: &'v Value)
-        -> Option<(&'v [LogicBit], &'v [LogicBit], usize)>
-    {
-        if self.width != other.width || self.width <= 64 || self.width > Self::MAX_WIDTH {
-            return None;
-        }
-        let w = self.width as usize;
-        match (&self.storage, &other.storage) {
-            (ValueStorage::Wide(a), ValueStorage::Wide(b)) if a.len() >= w && b.len() >= w => {
-                Some((a, b, w))
-            }
-            _ => None,
-        }
-    }
-
-    /// Evaluate a 4-state bitwise operator over two `Wide` operands eight bits
-    /// at a time.
-    ///
-    /// `Wide` storage is one byte per bit holding the `(xz << 1) | val` code, so
-    /// eight bits are one `u64`. Split each operand into its value and xz LANE
-    /// planes (the payload sits in bit 0 of every byte, all other bits zero),
-    /// let `op_lanes` evaluate the operator's truth table as lane algebra, and
-    /// re-pack. `op_bit` is the same truth table on `LogicBit`s and finishes the
-    /// sub-8 tail, so the two can never disagree by construction.
-    ///
-    /// This replaces `bitwise_op_slow`'s loop, which ran two `get_bit`s, a
-    /// closure call and a `set_bit` (bounds check + storage match +
-    /// read-modify-write) for every single bit of a bus.
-    #[inline(always)]
-    fn wide_bitwise_lanes(
-        a: &[LogicBit],
-        b: &[LogicBit],
-        w: usize,
-        op_lanes: impl Fn(u64, u64, u64, u64) -> (u64, u64),
-        op_bit: impl Fn(LogicBit, LogicBit) -> LogicBit,
-    ) -> Vec<LogicBit> {
-        const _: () = assert!(std::mem::size_of::<LogicBit>() == 1);
-        // 8 bytes of slack so the last full word may overhang the tail.
-        let mut out: Vec<LogicBit> = Vec::with_capacity(w + 8);
-        let dst: *mut u8 = out.as_mut_ptr().cast::<u8>();
-        let pa = a.as_ptr().cast::<u8>();
-        let pb = b.as_ptr().cast::<u8>();
-        let mut i = 0usize;
-        // SAFETY: `a` and `b` each hold at least `w` bytes and `out` reserved
-        // `w + 8`, so every 8-byte window below stays inside all three.
-        unsafe {
-            while i + 8 <= w {
-                let wa = pa.add(i).cast::<u64>().read_unaligned();
-                let wb = pb.add(i).cast::<u64>().read_unaligned();
-                let (rv, rx) = op_lanes(
-                    wa & LSB_OF_EACH_BYTE,
-                    (wa >> 1) & LSB_OF_EACH_BYTE,
-                    wb & LSB_OF_EACH_BYTE,
-                    (wb >> 1) & LSB_OF_EACH_BYTE,
-                );
-                dst.add(i).cast::<u64>().write_unaligned(rv | (rx << 1));
-                i += 8;
-            }
-            while i < w {
-                *dst.add(i) = op_bit(a[i], b[i]) as u8;
-                i += 1;
-            }
-            // SAFETY: bytes `0..w` were all written with codes 0..=3.
-            out.set_len(w);
-        }
-        out
-    }
-
-    #[inline(always)]
-    fn wide_bitwise_value(bits: Vec<LogicBit>, w: usize) -> Value {
-        Value {
-            storage: ValueStorage::Wide(bits),
-            width: w as u32,
-            is_signed: false,
-            is_real: false,
-            is_fill: false,
         }
     }
 
@@ -1794,20 +1534,7 @@ impl Value {
     /// casez wildcard equality (IEEE 1800 §12.5.1): Z bits (also written
     /// `?` in literals — both lex to LogicBit::Z) on either side are
     /// treated as don't-care positions and always match.
-    #[inline]
     pub fn casez_eq(&self, other: &Value) -> Value {
-        // `wildcard_mask` = Z on either side: Z is the only code with both the
-        // value and the xz bit set. See `case_wildcard_operands`.
-        if let Some((av, ax, bv, bx, m)) = self.case_wildcard_operands(other) {
-            let wild = (av & ax) | (bv & bx);
-            return Self::case_wildcard_result(av, ax, bv, bx, wild, m);
-        }
-        self.casez_eq_slow(other)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn casez_eq_slow(&self, other: &Value) -> Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.casez_eq(&b);
         }
@@ -1823,20 +1550,7 @@ impl Value {
 
     /// casex wildcard equality: X and Z bits on either side are
     /// treated as don't-care.
-    #[inline]
     pub fn casex_eq(&self, other: &Value) -> Value {
-        // `wildcard_mask` = X or Z on either side, i.e. simply "the xz bit is
-        // set" — X and Z are exactly the two codes with `xz = 1`.
-        if let Some((av, ax, bv, bx, m)) = self.case_wildcard_operands(other) {
-            let wild = ax | bx;
-            return Self::case_wildcard_result(av, ax, bv, bx, wild, m);
-        }
-        self.casex_eq_slow(other)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn casex_eq_slow(&self, other: &Value) -> Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.casex_eq(&b);
         }
@@ -1848,42 +1562,6 @@ impl Value {
             if a != b { return Value::from_u64(0, 1); }
         }
         Value::from_u64(1, 1)
-    }
-
-    /// Shared entry test for the `casez`/`casex` bit-algebra fast paths.
-    ///
-    /// Returns `(a_val, a_xz, b_val, b_xz, compare_mask)` when BOTH operands
-    /// are ordinary inline (≤64-bit) values, which is what every dynamic
-    /// `casez`/`casex` arm in RTL actually is. Each operand's words are masked
-    /// to its OWN width first, reproducing `get_bit`'s "reads Zero past
-    /// `width`" rule (neither wildcard comparison sign-extends — the per-bit
-    /// loops call `get_bit` for the full `max(width)` range regardless of
-    /// signedness). `compare_mask` covers `max(width)` bits.
-    #[inline(always)]
-    fn case_wildcard_operands(&self, other: &Value) -> Option<(u64, u64, u64, u64, u64)> {
-        if self.is_fill || other.is_fill || self.width > 64 || other.width > 64 {
-            return None;
-        }
-        let (av, ax) = self.inline_bits()?;
-        let (bv, bx) = other.inline_bits()?;
-        let am = Self::mask(self.width);
-        let bm = Self::mask(other.width);
-        Some((
-            av & am,
-            ax & am,
-            bv & bm,
-            bx & bm,
-            Self::mask(self.width.max(other.width)),
-        ))
-    }
-
-    /// The per-bit loops keep a position when it is a wildcard on either side
-    /// and otherwise demand an exact 4-state match, i.e. the result is 1 iff no
-    /// non-wildcard position differs in EITHER of the two encoding planes.
-    #[inline(always)]
-    fn case_wildcard_result(av: u64, ax: u64, bv: u64, bx: u64, wild: u64, mask: u64) -> Value {
-        let differs = ((av ^ bv) | (ax ^ bx)) & !wild & mask;
-        Value::from_u64((differs == 0) as u64, 1)
     }
 
     /// SV §11.4.6 wildcard equality (`==?`). X/Z bits in *either*
@@ -2165,42 +1843,8 @@ impl Value {
             if room == 0 {
                 break;
             }
+            let take = (val.width as usize).min(room);
             match &val.storage {
-                ValueStorage::Inline { val_bits, xz_bits } => {
-                    if take == 1 {
-                        // SAFETY: `len < capped` (the widths sum to `capped`,
-                        // and `clamped` handles the truncating case), so this
-                        // byte is inside the reservation.
-                        unsafe {
-                            *dst.add(len) = ((((*xz_bits & 1) << 1) | (*val_bits & 1)) as u8)
-                        };
-                        len += 1;
-                        continue;
-                    }
-                    let n = take.min(64);
-                    let mut i = 0usize;
-                    // SAFETY: the stores cover `dst[len .. len + n.next_multiple_of(8)]`,
-                    // and `len + n <= capped` with 8 spare bytes reserved past
-                    // `capped`. `i < n <= 64` keeps both shifts under 64.
-                    unsafe {
-                        while i < n {
-                            let v = scatter_bits_to_bytes((*val_bits >> i) as u8);
-                            let x = scatter_bits_to_bytes((*xz_bits >> i) as u8);
-                            dst.add(len + i)
-                                .cast::<u64>()
-                                .write_unaligned(v | (x << 1));
-                            i += 8;
-                        }
-                    }
-                    len += n;
-                    // Inline storage declared wider than 64 bits: keep the
-                    // pre-existing `get_bit` behaviour verbatim.
-                    for j in n..take {
-                        // SAFETY: still inside the reserved `take` bytes.
-                        unsafe { *dst.add(len) = val.get_bit(j) as u8 };
-                        len += 1;
-                    }
-                }
                 ValueStorage::Wide(bits) => {
                     let n = take.min(bits.len() as usize);
                     for i in 0..n {
@@ -2230,10 +1874,6 @@ impl Value {
         while pb.len() < capped {
             pb.push(LogicBit::Zero);
         }
-        // SAFETY: bytes `0..len` were all initialised above with valid
-        // `LogicBit` bit patterns (codes 0..=3, or bytes copied out of another
-        // `Wide` buffer).
-        unsafe { out.set_len(len) };
         Value {
             storage: ValueStorage::Wide(Box::new(pb)),
             width: capped,
@@ -2537,365 +2177,6 @@ mod tests {
         assert_eq!(with_empty, got);
     }
 
-    /// Deterministic 4-state pattern generator for widths that are too large to
-    /// enumerate exhaustively. `seed` selects the pattern.
-    fn patterned(width: u32, seed: u64, signed: bool) -> Value {
-        let mut v = Value::zero(width);
-        v.is_signed = signed;
-        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-        for i in 0..width as usize {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            v.set_bit(i, LogicBit::from_code(((s >> 33) & 3) as u8));
-        }
-        v
-    }
-
-    /// The bit-per-byte scatter/gather helpers must be exact inverses over all
-    /// 256 byte patterns — `concat_refs`, `resize` and `range_select` all encode
-    /// their 4-state planes through them.
-    #[test]
-    fn scatter_gather_round_trip() {
-        for b in 0u16..=255 {
-            let b = b as u8;
-            let lanes = scatter_bits_to_bytes(b);
-            for i in 0..8 {
-                assert_eq!(
-                    (lanes >> (8 * i)) & 0xff,
-                    ((b >> i) & 1) as u64,
-                    "scatter byte {i} of {b:#04x}"
-                );
-            }
-            assert_eq!(gather_byte_lsbs(lanes), b, "round trip {b:#04x}");
-            // A payload in the other bit lanes must not leak into the gather.
-            assert_eq!(gather_byte_lsbs(lanes | 0xfefe_fefe_fefe_fefe), b);
-        }
-    }
-
-    /// Per-bit reference for the `casez`/`casex` wildcard comparisons,
-    /// transcribed from the `get_bit` loops the bit-algebra fast paths replaced.
-    /// Neither comparison sign-extends: positions past an operand's width read
-    /// Zero regardless of signedness.
-    fn case_wildcard_reference(a: &Value, b: &Value, casex: bool) -> Value {
-        let w = a.width.max(b.width) as usize;
-        for i in 0..w {
-            let x = a.get_bit(i);
-            let y = b.get_bit(i);
-            let wild = if casex {
-                matches!(x, LogicBit::X | LogicBit::Z) || matches!(y, LogicBit::X | LogicBit::Z)
-            } else {
-                x == LogicBit::Z || y == LogicBit::Z
-            };
-            if wild {
-                continue;
-            }
-            if x != y {
-                return Value::from_u64(0, 1);
-            }
-        }
-        Value::from_u64(1, 1)
-    }
-
-    // `casez_eq`/`casex_eq` grew a whole-word bit-algebra fast path for two
-    // inline operands. Exhaustive over every 4-state pattern of widths 1..=4 on
-    // both sides, in all four signedness combinations, plus the mixed-width
-    // cases that exercise the "reads Zero past `width`" masking.
-    #[test]
-    fn casez_casex_match_per_bit_reference() {
-        for wa in 1u32..=4 {
-            for wb in 1u32..=4 {
-                for ca in 0..(1usize << (2 * wa)) {
-                    for cb in 0..(1usize << (2 * wb)) {
-                        for sa in [false, true] {
-                            for sb in [false, true] {
-                                let a = four_state(ca, wa, sa);
-                                let b = four_state(cb, wb, sb);
-                                assert_eq!(
-                                    a.casez_eq(&b),
-                                    case_wildcard_reference(&a, &b, false),
-                                    "casez {a} ({wa},{sa}) vs {b} ({wb},{sb})"
-                                );
-                                assert_eq!(
-                                    a.casex_eq(&b),
-                                    case_wildcard_reference(&a, &b, true),
-                                    "casex {a} ({wa},{sa}) vs {b} ({wb},{sb})"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Wide (>64-bit) operands still take the per-bit path, and a §5.7.1
-        // fill operand still replicates before comparing.
-        for w in [65u32, 96, 100] {
-            for seed in 0..8u64 {
-                let a = patterned(w, seed, false);
-                let b = patterned(w, seed ^ 1, true);
-                assert_eq!(a.casez_eq(&b), case_wildcard_reference(&a, &b, false));
-                assert_eq!(a.casex_eq(&b), case_wildcard_reference(&a, &b, true));
-                assert_eq!(a.casez_eq(&a), Value::from_u64(1, 1));
-            }
-        }
-        for c in ['0', '1', 'x', 'z'] {
-            let f = Value::fill_of(c);
-            for code in 0..(1usize << 6) {
-                let v = four_state(code, 3, false);
-                let widened = f.resize(3);
-                assert_eq!(f.casez_eq(&v), widened.casez_eq(&v), "fill '{c}' casez vs {v}");
-                assert_eq!(f.casex_eq(&v), widened.casex_eq(&v), "fill '{c}' casex vs {v}");
-            }
-        }
-    }
-
-    /// Per-bit reference for `concat_refs`: append each operand's `get_bit`s
-    /// LSB-first, right-most operand first, stopping at `MAX_WIDTH`.
-    fn concat_reference(parts: &[Value]) -> Value {
-        let total: u32 = parts.iter().map(|v| v.width).sum();
-        let capped = total.min(Value::MAX_WIDTH);
-        let mut out = Value::zero(capped);
-        let mut off = 0usize;
-        for v in parts.iter().rev() {
-            for i in 0..v.width as usize {
-                if off >= capped as usize {
-                    break;
-                }
-                out.set_bit(off, v.get_bit(i));
-                off += 1;
-            }
-        }
-        out
-    }
-
-    // `concat_refs`' >64-bit arm unpacks inline operands eight bits per store
-    // and memcpy's wide ones. Differential against the per-bit reference over
-    // operand shapes that straddle every boundary the byte-parallel code has:
-    // widths that are and are not multiples of 8, operands that are inline
-    // (≤64) and wide (>64), and totals just above 64.
-    #[test]
-    fn wide_concat_byte_parallel_matches_reference() {
-        let shapes: &[&[u32]] = &[
-            &[65],
-            &[64, 1],
-            &[1, 64],
-            &[33, 32],
-            &[7, 58],
-            &[3, 5, 7, 11, 13, 17, 19],
-            &[72, 8],
-            &[8, 72],
-            &[100, 100],
-            &[64, 64, 64],
-            &[1; 70],
-            &[0, 65, 0, 3],
-            &[65, 0],
-            &[130, 2, 9],
-        ];
-        for shape in shapes {
-            for seed in 0..4u64 {
-                let parts: Vec<Value> = shape
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &w)| patterned(w, seed * 31 + i as u64, i % 2 == 0))
-                    .collect();
-                let got = Value::concat(&parts);
-                let want = concat_reference(&parts);
-                assert_eq!(got.width, want.width, "width for {shape:?} seed {seed}");
-                for i in 0..want.width as usize {
-                    assert_eq!(
-                        got.get_bit(i),
-                        want.get_bit(i),
-                        "bit {i} of concat {shape:?} seed {seed}"
-                    );
-                }
-                assert_eq!(got, want, "concat {shape:?} seed {seed}");
-            }
-        }
-    }
-
-    // `range_select`'s Wide→Inline gather now re-packs eight source bytes per
-    // multiply. It must agree with the per-bit reference for every offset and
-    // every result width up to 64, including the unaligned head and tail and
-    // selects that run off the end of the source.
-    #[test]
-    fn wide_range_select_gather_matches_reference() {
-        for src_w in [65u32, 71, 128, 130] {
-            for seed in 0..3u64 {
-                let v = patterned(src_w, seed, seed % 2 == 0);
-                for lo in 0..(src_w as usize + 4) {
-                    for w in [1usize, 2, 7, 8, 9, 15, 16, 31, 63, 64] {
-                        let got = v.range_select(lo + w - 1, lo);
-                        let want = v.range_select_signed((lo + w - 1) as i64, lo as i64);
-                        assert_eq!(
-                            got, want,
-                            "range_select({}, {lo}) on width {src_w} seed {seed}",
-                            lo + w - 1
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // `resize_slow`'s generic arm builds its destination with a slice copy
-    // (Wide→Wide) or the byte-parallel unpack (Inline→Wide) instead of driving
-    // `set_bit` per bit. Same reference as `resize_matches_per_bit_reference`,
-    // over widths that force the Wide paths.
-    #[test]
-    fn wide_resize_matches_per_bit_reference() {
-        for width in [1u32, 7, 8, 33, 63, 64, 65, 70, 96, 129] {
-            for seed in 0..3u64 {
-                for signed in [false, true] {
-                    let v = patterned(width, seed, signed);
-                    for target in [1u32, 3, 8, 31, 63, 64, 65, 66, 71, 96, 128, 200] {
-                        let got = v.resize(target);
-                        let mut want = Value::zero(target);
-                        want.is_signed = signed;
-                        let msb = v.get_bit((width - 1) as usize);
-                        let pad = if signed && msb == LogicBit::One {
-                            LogicBit::One
-                        } else {
-                            LogicBit::Zero
-                        };
-                        for i in 0..target as usize {
-                            want.set_bit(
-                                i,
-                                if i < width as usize { v.get_bit(i) } else { pad },
-                            );
-                        }
-                        assert_eq!(
-                            got, want,
-                            "resize({target}) on width {width} seed {seed} signed {signed}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // `bitwise_and`/`or`/`xor` and `resize_for_assign` were split into an
-    // inline two-word head and a `#[cold]` tail. Differential against the
-    // per-bit truth tables / §10.7 padding rule they encode, exhaustively over
-    // every 4-state pattern of widths 1..=3 on both sides and both
-    // signednesses, plus §5.7.1 fill operands and `Wide` storage (which take
-    // the tail).
-    #[test]
-    fn split_bitwise_and_assign_resize_match_reference() {
-        let and = |a: LogicBit, b: LogicBit| match (a, b) {
-            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
-            (LogicBit::One, LogicBit::One) => LogicBit::One,
-            _ => LogicBit::X,
-        };
-        let or = |a: LogicBit, b: LogicBit| match (a, b) {
-            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
-            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
-            _ => LogicBit::X,
-        };
-        let xor = |a: LogicBit, b: LogicBit| match (a, b) {
-            (LogicBit::Zero, LogicBit::Zero) | (LogicBit::One, LogicBit::One) => LogicBit::Zero,
-            (LogicBit::Zero, LogicBit::One) | (LogicBit::One, LogicBit::Zero) => LogicBit::One,
-            _ => LogicBit::X,
-        };
-        // The per-bit reference the `Wide`/mixed arm still runs.
-        let per_bit = |a: &Value, b: &Value, op: &dyn Fn(LogicBit, LogicBit) -> LogicBit| {
-            let w = a.width.max(b.width) as usize;
-            let mut r = Value::zero(w as u32);
-            for i in 0..w {
-                r.set_bit(i, op(a.get_bit(i), b.get_bit(i)));
-            }
-            r
-        };
-        for wa in 1u32..=3 {
-            for wb in 1u32..=3 {
-                for ca in 0..(1usize << (2 * wa)) {
-                    for cb in 0..(1usize << (2 * wb)) {
-                        for sa in [false, true] {
-                            for sb in [false, true] {
-                                let a = four_state(ca, wa, sa);
-                                let b = four_state(cb, wb, sb);
-                                for (got, want, nm) in [
-                                    (a.bitwise_and(&b), per_bit(&a, &b, &and), "and"),
-                                    (a.bitwise_or(&b), per_bit(&a, &b, &or), "or"),
-                                    (a.bitwise_xor(&b), per_bit(&a, &b, &xor), "xor"),
-                                ] {
-                                    assert_eq!(
-                                        got.width, want.width,
-                                        "{nm} width {a} vs {b}"
-                                    );
-                                    for i in 0..want.width as usize {
-                                        assert_eq!(
-                                            got.get_bit(i),
-                                            want.get_bit(i),
-                                            "{nm} bit {i}: {a} vs {b}"
-                                        );
-                                    }
-                                }
-                                // §10.7 assignment padding: only a signed source
-                                // with an x/z MSB extends with x/z.
-                                for target in 1u32..=8 {
-                                    let got = a.resize_for_assign(target);
-                                    let msb = a.get_bit((wa - 1) as usize);
-                                    let want = if target > wa
-                                        && sa
-                                        && (msb == LogicBit::X || msb == LogicBit::Z)
-                                    {
-                                        let mut r = a.resize(target);
-                                        for i in wa as usize..target as usize {
-                                            r.set_bit(i, msb);
-                                        }
-                                        r
-                                    } else {
-                                        a.resize(target)
-                                    };
-                                    assert_eq!(
-                                        got, want,
-                                        "resize_for_assign({target}) on {a} signed={sa}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Fill operands and Wide storage take the `#[cold]` tails.
-        for c in ['0', '1', 'x', 'z'] {
-            let f = Value::fill_of(c);
-            let v = four_state(0b11_10_01_00, 4, false);
-            let w = f.resize(4);
-            assert_eq!(f.bitwise_and(&v), w.bitwise_and(&v), "fill '{c}' and");
-            assert_eq!(f.bitwise_or(&v), w.bitwise_or(&v), "fill '{c}' or");
-            assert_eq!(f.bitwise_xor(&v), w.bitwise_xor(&v), "fill '{c}' xor");
-            assert_eq!(f.resize_for_assign(5), f.resize(5), "fill '{c}' rfa");
-        }
-        // The byte-parallel `Wide` arm handles eight bits per word with a
-        // per-bit tail, and only engages for two equal-width `Wide` buffers —
-        // so cover widths that are and are not multiples of 8, and the mixed
-        // shapes (unequal widths, Wide-vs-inline) that must still fall back.
-        for &wa in &[65u32, 66, 71, 72, 96, 100, 128, 129] {
-            for seed in 0..3u64 {
-                for &wb in &[wa, wa + 1, 64, 8] {
-                    let a = patterned(wa, seed, seed % 2 == 0);
-                    let b = patterned(wb, seed + 7, wb % 2 == 0);
-                    assert_eq!(a.bitwise_and(&b), per_bit(&a, &b, &and), "and {wa}x{wb}");
-                    assert_eq!(a.bitwise_or(&b), per_bit(&a, &b, &or), "or {wa}x{wb}");
-                    assert_eq!(a.bitwise_xor(&b), per_bit(&a, &b, &xor), "xor {wa}x{wb}");
-                    assert_eq!(b.bitwise_and(&a), per_bit(&b, &a, &and), "and {wb}x{wa}");
-                    assert_eq!(b.bitwise_or(&a), per_bit(&b, &a, &or), "or {wb}x{wa}");
-                    assert_eq!(b.bitwise_xor(&a), per_bit(&b, &a, &xor), "xor {wb}x{wa}");
-                }
-            }
-        }
-        for seed in 0..4u64 {
-            let a = patterned(96, seed, seed % 2 == 0);
-            let b = patterned(96, seed + 7, false);
-            // `ValueStorage::eq`'s Wide comparison moved to a `#[cold]` tail.
-            let bits_equal = a.width == b.width
-                && (0..a.width as usize).all(|i| a.get_bit(i) == b.get_bit(i));
-            assert_eq!(a == b, bits_equal && a.is_signed == b.is_signed);
-            assert!(a == a.clone());
-            assert!(a != a.resize(97));
-        }
-    }
-
     // `Wide` equality is now compared a machine word at a time; it must still
     // detect a difference at ANY bit position, including the unaligned tail.
     #[test]
@@ -2938,7 +2219,6 @@ mod tests {
         assert_eq!(dst, wider);
     }
 
-
     // Packed wide storage must keep the historical on-wire representation
     // (`u8` variant tag, then a Varint bit count, then one `LogicBit`
     // discriminant per bit). `-o` compile artifacts and design-cache files
@@ -2959,7 +2239,12 @@ mod tests {
         assert_eq!(bytes[0], 1, "Wide variant tag");
         assert_eq!(bytes[1], 120, "Varint bit count (single byte < 128)");
         for i in 0..120usize {
-            let want = match i { 0 => 1, 5 => 2, 119 => 3, _ => 0 };
+            let want = match i {
+                0 => 1,
+                5 => 2,
+                119 => 3,
+                _ => 0,
+            };
             assert_eq!(bytes[2 + i], want, "bit {} LogicBit code", i);
         }
     }
@@ -3001,7 +2286,10 @@ mod tests {
         assert_eq!(a.range_select(7, 0).to_u64(), Some(0xF0));
         assert_eq!(a.range_select(159, 152).to_u64(), Some(0xF0));
         assert_eq!(a.range_select(95, 64).to_u64(), Some(0xF0F0F0F0));
-        assert_eq!(a.range_select(127, 64), Value::from_u64(0xF0F0F0F0F0F0F0F0, 64));
+        assert_eq!(
+            a.range_select(127, 64),
+            Value::from_u64(0xF0F0F0F0F0F0F0F0, 64)
+        );
         assert_eq!(a.range_select(159, 0), a);
 
         // Resize keeps the low bits; wide→inline at exactly 64.
@@ -3585,38 +2873,17 @@ impl Value {
     /// cross-crate call on top (no `#[inline]`, `lto = false`).
     #[inline]
     pub fn bit_select(&self, index: usize) -> Value {
-        match &self.storage {
-            ValueStorage::Inline { val_bits, xz_bits } => {
-                // `index < 64` keeps the shifts in range for the (rare) inline
-                // value whose declared width exceeds 64.
-                if index < self.width as usize && index < 64 {
-                    return Value {
-                        storage: ValueStorage::Inline {
-                            val_bits: (*val_bits >> index) & 1,
-                            xz_bits: (*xz_bits >> index) & 1,
-                        },
-                        width: 1, is_signed: false, is_real: false, is_fill: false,
-                    };
-                }
-            }
-            // `Wide` storage is one byte per bit and `LogicBit`'s discriminant
-            // IS the `(xz << 1) | val` code, so an in-range select is a byte
-            // load and two masks — the same result `bit_select_slow` produced,
-            // without the out-of-line call. `index < self.width` rules out
-            // §11.5.1's x-on-overrun, and a short buffer still falls through.
-            ValueStorage::Wide(bits) => {
-                if index < self.width as usize {
-                    if let Some(&b) = bits.get(index) {
-                        let code = b as u64;
-                        return Value {
-                            storage: ValueStorage::Inline {
-                                val_bits: code & 1,
-                                xz_bits: (code >> 1) & 1,
-                            },
-                            width: 1, is_signed: false, is_real: false, is_fill: false,
-                        };
-                    }
-                }
+        if let ValueStorage::Inline { val_bits, xz_bits } = self.storage {
+            // `index < 64` keeps the shifts in range for the (rare) inline
+            // value whose declared width exceeds 64.
+            if index < self.width as usize && index < 64 {
+                return Value {
+                    storage: ValueStorage::Inline {
+                        val_bits: (val_bits >> index) & 1,
+                        xz_bits: (xz_bits >> index) & 1,
+                    },
+                    width: 1, is_signed: false, is_real: false, is_fill: false,
+                };
             }
         }
         self.bit_select_slow(index)
@@ -3629,15 +2896,10 @@ impl Value {
         if (index as u32) >= self.width && !self.is_fill {
             return Value::new(1);
         }
-        // Same result as `Value::zero(1)` + `set_bit(0, get_bit(index))` —
-        // `get_bit_code`'s code is exactly (xz << 1) | val, which is how
-        // `set_bit` lays a `LogicBit` into the two inline words — but built in
-        // one step instead of a constructor plus a read-modify-write.
-        let code = self.get_bit_code(index) as u64;
-        Value {
-            storage: ValueStorage::Inline { val_bits: code & 1, xz_bits: (code >> 1) & 1 },
-            width: 1, is_signed: false, is_real: false, is_fill: false,
-        }
+        let bit = self.get_bit(index);
+        let mut v = Value::zero(1);
+        v.set_bit(0, bit);
+        v
     }
 
     /// Select a range of bits [left:right] (§11.5.1). Source indices outside
@@ -3807,8 +3069,6 @@ impl Value {
                         LogicBit::X => { xz_bits |= m; }
                         LogicBit::Z => { val_bits |= m; xz_bits |= m; }
                     }
-                    i += 1;
-                    pos += 1;
                 }
                 return Value {
                     storage: ValueStorage::Inline { val_bits, xz_bits },
