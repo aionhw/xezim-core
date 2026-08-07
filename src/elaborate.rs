@@ -11053,6 +11053,18 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                             // `localparam W = $bits(int)` used as a vector
                             // width then declared a degenerate vector.
                             .or_else(|| atom_keyword_width(name).map(|w| w as i64))
+                            // LRM §20.7: fixed intrinsic widths for the
+                            // non-atom builtin types (`real`/`string`/`void`),
+                            // which `atom_keyword_width` does not answer.
+                            .or_else(|| match name {
+                                "real" => Some(64),
+                                "shortreal" => Some(32),
+                                "realtime" => Some(64),
+                                "string" => Some(1024),
+                                "bit" | "logic" | "reg" => Some(1),
+                                "void" => Some(0),
+                                _ => None,
+                            })
                     }
                     // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
                     // `::` lowers to the SAME `MemberAccess` node as a struct
