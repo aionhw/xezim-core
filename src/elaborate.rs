@@ -5538,38 +5538,60 @@ pub fn elaborate_module_with_defs(
             }
             for (name, rhses) in grouped {
                 // Look up the resolver function for this nettype
-                if let Some(tn) = elab.signals.get(&name).and_then(|s| s.type_name.as_ref()) {
-                    if let Some(resolver_name) = elab.nettype_resolvers.get(tn) {
-                        // Build an assignment pattern (queue literal) from all drivers
-                        let mut queue_elems = Vec::new();
-                        for rhs in rhses {
-                            queue_elems.push(crate::ast::expr::AssignmentPatternItem::Ordered(rhs));
-                        }
-                        let func_expr = Expression {
-                            kind: ExprKind::Ident(HierarchicalIdentifier {
-                                root: None,
-                                path: vec![HierPathSegment {
-                                    name: Identifier { name: resolver_name.clone(), span: Span::dummy() },
-                                    selects: Vec::new(),
-                                }],
-                                span: Span::dummy(),
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
-                            }),
-                            span: Span::dummy(),
-                        };
-                        let call_expr = Expression {
-                            kind: ExprKind::Call {
-                                func: Box::new(func_expr),
-                                args: vec![Expression {
-                                    kind: ExprKind::AssignmentPattern(queue_elems),
-                                    span: Span::dummy(),
-                                }],
-                            },
-                            span: Span::dummy(),
-                        };
-                        kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: call_expr, delay: 0 });
+                let resolver = elab
+                    .signals
+                    .get(&name)
+                    .and_then(|s| s.type_name.as_ref())
+                    .and_then(|tn| elab.nettype_resolvers.get(tn))
+                    .cloned();
+                if let Some(resolver_name) = resolver {
+                    // Build an assignment pattern (queue literal) from all drivers
+                    let mut queue_elems = Vec::new();
+                    for rhs in rhses {
+                        queue_elems.push(crate::ast::expr::AssignmentPatternItem::Ordered(rhs));
                     }
+                    let func_expr = Expression {
+                        kind: ExprKind::Ident(HierarchicalIdentifier {
+                            root: None,
+                            path: vec![HierPathSegment {
+                                name: Identifier { name: resolver_name.clone(), span: Span::dummy() },
+                                selects: Vec::new(),
+                            }],
+                            span: Span::dummy(),
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        span: Span::dummy(),
+                    };
+                    let call_expr = Expression {
+                        kind: ExprKind::Call {
+                            func: Box::new(func_expr),
+                            args: vec![Expression {
+                                kind: ExprKind::AssignmentPattern(queue_elems),
+                                span: Span::dummy(),
+                            }],
+                        },
+                        span: Span::dummy(),
+                    };
+                    kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: call_expr, delay: 0 });
+                } else {
+                    // Nettype with no resolver: fall back to the legacy
+                    // OR-combined fold so every driver is kept. Dropping
+                    // them here would leave the net permanently x.
+                    let mut iter = rhses.into_iter();
+                    let mut acc = iter.next().unwrap();
+                    for rhs in iter {
+                        let span = acc.span;
+                        acc = Expression {
+                            kind: ExprKind::Binary {
+                                op: crate::ast::expr::BinaryOp::BitOr,
+                                left: Box::new(acc),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        };
+                    }
+                    kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0 });
                 }
             }
             elab.continuous_assigns = kept;
