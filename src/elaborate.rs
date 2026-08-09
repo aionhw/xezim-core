@@ -502,6 +502,12 @@ pub struct ElaboratedClass {
     /// mapped to whether the key type is `string`. Stored per-instance.
     #[serde(default)]
     pub assoc_properties: HashMap<String, bool>,
+    /// Associative-array property INDEX (key) width + signedness: `shortint
+    /// aa[shortint]` -> (16, true). Used to narrow a wider index expression
+    /// before keying at runtime. String-keyed arrays are excluded (the
+    /// `assoc_properties` bool distinguishes them).
+    #[serde(default)]
+    pub assoc_index_props: HashMap<String, (u32, bool)>,
     /// Properties declared as queues / dynamic arrays (`T m[$];`, `T m[];`) —
     /// name mapped to (element width, optional bounded-queue max+1). Stored
     /// per-instance like associative arrays, so each object's queue is
@@ -675,6 +681,7 @@ pub fn elaborate_class_with_params(
     let mut static_properties = HashSet::default();
     let mut static_methods = HashSet::default();
     let mut assoc_properties: HashMap<String, bool> = HashMap::default();
+    let mut assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
@@ -801,6 +808,21 @@ pub fn elaborate_class_with_params(
                                 DataType::Simple { kind: SimpleType::String, .. })
                         });
                         assoc_properties.insert(decl.name.name.clone(), is_string_key);
+                        // §7.8.2: record the declared key width + signedness
+                        // so the runtime narrows a wider index expression.
+                        if !is_string_key {
+                            if let Some(kdt) = key_dt.as_ref() {
+                                let kw = resolve_type_width(
+                                    kdt, class_params, None,
+                                );
+                                if kw > 0 {
+                                    assoc_index_props.insert(
+                                        decl.name.name.clone(),
+                                        (kw, is_type_signed(kdt)),
+                                    );
+                                }
+                            }
+                        }
                     }
                     // Queue (`m[$]`) / dynamic-array (`m[]`) member — track so
                     // it gets independent per-instance storage. Bounded queues
@@ -1123,6 +1145,7 @@ pub fn elaborate_class_with_params(
         static_properties,
         static_methods,
         assoc_properties,
+        assoc_index_props,
         queue_properties,
         property_inits,
         static_collections,
@@ -1213,6 +1236,13 @@ pub struct ElaboratedModule {
     /// declared width attached, so the width has to be carried here.
     #[serde(default)]
     pub assoc_elem_widths: HashMap<String, u32>,
+    /// Associative-array INDEX (key) width + signedness: `shortint aa[shortint]`
+    /// -> (16, true). A key written with a wider expression must be narrowed to
+    /// the declared index type before stringifying (`assoc_key_str`), else the
+    /// stored key text diverges from a read that correctly narrows. String-keyed
+    /// arrays are excluded (handled by the `bool` flag above).
+    #[serde(default)]
+    pub assoc_index_widths: HashMap<String, (u32, bool)>,
     /// Class definitions: name -> elaborated class.
     pub classes: HashMap<String, ElaboratedClass>,
     /// Covergroup definitions: name -> AST declaration.
@@ -1676,6 +1706,7 @@ impl ElaboratedModule {
             arrays: HashMap::default(),
             associative_arrays: HashMap::default(),
             assoc_elem_widths: HashMap::default(),
+            assoc_index_widths: HashMap::default(),
             classes: HashMap::default(),
             covergroups: HashMap::default(),
             functions: HashMap::default(),
@@ -4234,6 +4265,23 @@ pub fn elaborate_module_with_defs(
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
+                        }
+                        // §7.8.2: an AA index is narrowed to the declared key
+                        // type. Record the key width + signedness so the runtime
+                        // can narrow a wider index expression before keying
+                        // (`int k; aa[k]` on `shortint aa[shortint]`).
+                        if !is_string_key {
+                            if let Some(kdt) = key_dt.as_ref() {
+                                let kw = crate::elaborate::resolve_type_width(
+                                    kdt, Some(&elab.parameters), Some(&elab.typedefs),
+                                );
+                                if kw > 0 {
+                                    elab.assoc_index_widths.insert(
+                                        decl.name.name.clone(),
+                                        (kw, crate::elaborate::is_type_signed(kdt)),
+                                    );
+                                }
+                            }
                         }
                         if let Some(init_expr) = &decl.init {
                             if let ExprKind::AssignmentPattern(items) = &init_expr.kind {
@@ -10261,13 +10309,23 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                                     .and_then(|m| m.get(name).copied())
                                     .map(|w| w as i64)
                             }))
-                            // §20.6.2 over a BUILT-IN integer atom type.
-                            // `$bits(int)` parses to a bare Ident (the operand
-                            // is not a typedef and not a parameter), so both
-                            // lookups above miss and the call answered 0 — a
-                            // `localparam W = $bits(int)` used as a vector
-                            // width then declared a degenerate vector.
+                            // LRM §20.7: `$bits(<builtin type name>)`.
+                            // A builtin like `shortint` / `int` / `byte` is not
+                            // a parameter or typedef, so without this fallback
+                            // `bit[SIZE-1:0] where SIZE=$bits(shortint)`
+                            // elaborated to ONE BIT and truncated the key. The
+                            // atom keyword width `atom_keyword_width` answers
+                            // the fixed intrinsic width.
                             .or_else(|| atom_keyword_width(name).map(|w| w as i64))
+                            .or_else(|| match name {
+                                "real" => Some(64),
+                                "shortreal" => Some(32),
+                                "realtime" => Some(64),
+                                "string" => Some(1024),
+                                "bit" | "logic" | "reg" => Some(1),
+                                "void" => Some(0),
+                                _ => None,
+                            })
                     }
                     // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
                     // `::` lowers to the SAME `MemberAccess` node as a struct
