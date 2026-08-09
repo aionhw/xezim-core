@@ -364,6 +364,40 @@ impl Parser {
                                     out.push(member.name.clone());
                                     true
                                 }
+                                // `-> base[idx].field` (and chained selects):
+                                // an event member reached through an
+                                // associative-array / indexed element (UVM
+                                // objection `-> m_events[obj].all_dropped`).
+                                // Flatten the base recursively, then bake the
+                                // index — a variable ident OR an integer literal
+                                // — onto the last part as `base[idx]` so the
+                                // simulator's fire-side resolves the receiver to
+                                // the same heap handle the wait-side used.
+                                // Without this the whole MemberAccess falls
+                                // through to the `"event"` placeholder, so a
+                                // process suspended on `@(arr[k].ev)` is never
+                                // woken by `-> arr[k].ev`.
+                                ExprKind::Index { expr, index } => {
+                                    if !flatten(expr, out) {
+                                        return false;
+                                    }
+                                    let idx = match &index.kind {
+                                        ExprKind::Ident(h) if h.path.len() == 1
+                                            && h.path[0].selects.is_empty() => {
+                                            h.path[0].name.name.clone()
+                                        }
+                                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) => {
+                                            value.clone()
+                                        }
+                                        _ => return false,
+                                    };
+                                    if let Some(last) = out.last_mut() {
+                                        *last = format!("{}[{}]", *last, idx);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
                                 ExprKind::Ident(h) if h.path.len() == 1 => {
                                     out.push(h.path[0].name.name.clone());
                                     true
