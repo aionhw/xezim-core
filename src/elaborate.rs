@@ -89,6 +89,64 @@ pub(crate) fn type_trace(site: &str, key: &str, detail: &str) {
     }
 }
 
+/// XEZIM_TRACE_PARAM=name[,name...] — trace every WRITE to the global
+/// parameter table and every constant-evaluation MISS (an identifier the
+/// const evaluator could not resolve, which callers silently default to 0)
+/// whose key CONTAINS one of the comma-separated substrings; `*` traces
+/// everything. Exists because a `[N-1:0]` underflow (the "sane cap" clamp)
+/// only names the parameter whose VALUE went negative — the actual defect is
+/// usually an UPSTREAM name in its defining expression resolving to nothing,
+/// and only the write/miss sequence identifies it.
+fn param_trace_patterns() -> Option<&'static Vec<String>> {
+    static PATS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    PATS.get_or_init(|| {
+        let v = std::env::var("XEZIM_TRACE_PARAM").ok()?;
+        let pats: Vec<String> = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if pats.is_empty() { None } else { Some(pats) }
+    })
+    .as_ref()
+}
+
+pub(crate) fn param_trace_on(key: &str) -> bool {
+    match param_trace_patterns() {
+        None => false,
+        Some(pats) => pats
+            .iter()
+            .any(|p| p == "*" || key.contains(p.as_str())),
+    }
+}
+
+pub(crate) fn param_trace(site: &str, key: &str, detail: &str) {
+    if param_trace_on(key) {
+        eprintln!("[xezim][trace-param] {site} key={key} {detail}");
+    }
+}
+
+/// Insert into a parameter-value table, logging the written value and the
+/// value it replaced when the key is traced. Same result as
+/// `HashMap::insert`; the untraced path is the plain insert.
+fn params_insert_traced(
+    map: &mut HashMap<String, Value>,
+    site: u32,
+    key: String,
+    v: Value,
+) -> Option<Value> {
+    if param_trace_on(&key) {
+        let prev = map.get(&key).map(|p| p.to_i64().unwrap_or(0));
+        eprintln!(
+            "[xezim][trace-param] insert@{site} key={key} value={} prev={:?}",
+            v.to_i64().unwrap_or(0),
+            prev
+        );
+    }
+    map.insert(key, v)
+}
+
 /// Insert into a typedef-width table, logging the written width and the value
 /// it replaced when the key is traced. Same result as `HashMap::insert`; the
 /// untraced path is the plain insert.
@@ -409,6 +467,10 @@ pub struct ElaboratedClass {
     /// Has at least one `pure virtual` method prototype.
     #[serde(default)]
     pub has_pure_virtual: bool,
+    /// §8.23: for a class declared INSIDE another class, the lexically
+    /// enclosing class — its statics are visible to this class's methods.
+    #[serde(default)]
+    pub enclosing: Option<String>,
     /// Names listed in the `implements` clause.
     #[serde(default)]
     pub implements: Vec<String>,
@@ -1099,6 +1161,7 @@ pub fn elaborate_class_with_params(
     }
     ElaboratedClass {
         name: c.name.name.clone(),
+        enclosing: None,
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
         extends_args: c.extends.as_ref().map(|e| {
             e.args.iter().filter_map(|a| match a {
@@ -1327,6 +1390,11 @@ pub struct ElaboratedModule {
     pub typedef_unpacked_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// Bounded queue max sizes: name -> max element count (i.e., $:N means N+1).
     pub queue_max_sizes: HashMap<String, u32>,
+    /// Variables declared as QUEUES (`[$]`/`[$:N]`) — distinguishes them from
+    /// dynamic arrays inside `dynamic_arrays` (§7.10.1 out-of-range write
+    /// semantics differ: a queue write at index==size appends).
+    #[serde(default)]
+    pub queue_vars: HashSet<String>,
     /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
     pub arrays_2d: HashMap<String, ((i64, i64), (i64, i64), u32)>,
     pub packages: HashSet<String>,
@@ -1730,6 +1798,7 @@ impl ElaboratedModule {
             ascending_packed: HashMap::default(),
             typedef_unpacked_dims: HashMap::default(),
             queue_max_sizes: HashMap::default(),
+            queue_vars: HashSet::default(),
             arrays_2d: HashMap::default(),
             packages: HashSet::default(),
             pkg_subr_owner: HashMap::default(),
@@ -2220,7 +2289,7 @@ fn overlay_pkg_params(
             let key = format!("{}::{}", p.name.name, a.name.name);
             if let Some(v) = elab.parameters.get(&key).cloned() {
                 saved.push((a.name.name.clone(), elab.parameters.get(&a.name.name).cloned()));
-                elab.parameters.insert(a.name.name.clone(), v);
+                params_insert_traced(&mut elab.parameters, line!(), a.name.name.clone(), v);
             }
         }
     }
@@ -2231,7 +2300,7 @@ fn restore_overlay(elab: &mut ElaboratedModule, saved: Vec<(String, Option<Value
     for (k, prev) in saved.into_iter().rev() {
         match prev {
             Some(v) => {
-                elab.parameters.insert(k, v);
+                params_insert_traced(&mut elab.parameters, line!(), k, v);
             }
             None => {
                 elab.parameters.remove(&k);
@@ -2442,6 +2511,63 @@ fn ordered_typedefs<'a>(
     out
 }
 
+/// §20.6.2: `$bits(<signal>)` inside a TYPE's packed dims (`typedef
+/// logic[$bits(sig)-1:0] t;`) — rewrite the dims with the signal's known
+/// width so `resolve_type_width` sees a constant. Without this the dim
+/// silently evaluated to nothing and the typedef registered 1 bit wide.
+fn prebind_type_dims(dt: &DataType, elab: &ElaboratedModule) -> Option<DataType> {
+    fn dims_mention_bits(dims: &[PackedDimension]) -> bool {
+        dims.iter().any(|d| match d {
+            PackedDimension::Range { left, right, .. } => {
+                expr_mentions_bits(left) || expr_mentions_bits(right)
+            }
+            PackedDimension::Unsized(_) => false,
+        })
+    }
+    let rewrite = |dims: &[PackedDimension]| -> Vec<PackedDimension> {
+        dims.iter()
+            .map(|d| match d {
+                PackedDimension::Range { left, right, span } => PackedDimension::Range {
+                    left: Box::new(prebind_bits_of_signals(
+                        left, &elab.signals, &elab.parameters, "",
+                        &elab.typedefs, &elab.typedef_types,
+                        &elab.packed_struct_fields, &elab.arrays,
+                    )),
+                    right: Box::new(prebind_bits_of_signals(
+                        right, &elab.signals, &elab.parameters, "",
+                        &elab.typedefs, &elab.typedef_types,
+                        &elab.packed_struct_fields, &elab.arrays,
+                    )),
+                    span: *span,
+                },
+                other => other.clone(),
+            })
+            .collect()
+    };
+    match dt {
+        DataType::IntegerVector { kind, signing, dimensions, span }
+            if dims_mention_bits(dimensions) =>
+        {
+            Some(DataType::IntegerVector {
+                kind: *kind,
+                signing: *signing,
+                dimensions: rewrite(dimensions),
+                span: *span,
+            })
+        }
+        DataType::Implicit { signing, dimensions, span }
+            if dims_mention_bits(dimensions) =>
+        {
+            Some(DataType::Implicit {
+                signing: *signing,
+                dimensions: rewrite(dimensions),
+                span: *span,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
@@ -2523,7 +2649,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                     &format!("enum member of '{}'", td.name.name),
                     false,
                 );
-                elab.parameters.insert(nm.clone(), v.clone());
+                params_insert_traced(&mut elab.parameters, line!(), nm.clone(), v.clone());
                 signals_insert_traced(&mut elab.signals, line!(), nm.clone(), Signal { is_const: false,
                     name: nm.clone(),
                     width: base_width,
@@ -2546,10 +2672,15 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             .insert(td.name.name.clone(), td.data_type.clone());
         elab.enum_members.insert(td.name.name.clone(), members_ordered);
     } else {
-        // Non-enum typedef: resolve width from the underlying type
-        let w = resolve_type_width(&td.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+        // Non-enum typedef: resolve width from the underlying type.
+        // `$bits(<signal>)` in the dims is prebound against the signal
+        // table first (and the REWRITTEN type is what gets recorded, so
+        // every later resolution agrees).
+        let bound_dt = prebind_type_dims(&td.data_type, elab);
+        let eff_dt: &DataType = bound_dt.as_ref().unwrap_or(&td.data_type);
+        let w = resolve_type_width(eff_dt, Some(&elab.parameters), Some(&elab.typedefs));
         typedefs_insert_traced(&mut elab.typedefs, "insert:process_typedef", td.name.name.clone(), w);
-        elab.typedef_types.insert(td.name.name.clone(), td.data_type.clone());
+        elab.typedef_types.insert(td.name.name.clone(), eff_dt.clone());
     }
     // §6.18/§7.4: record any unpacked dimensions on the typedef
     // (`typedef logic [7:0] A [0:3];`) so a variable `A v;` inherits them.
@@ -3262,7 +3393,7 @@ pub fn elaborate_module_with_defs(
                         .entry(assign.name.name.clone())
                         .or_insert(fields);
                 }
-                elab.parameters.insert(assign.name.name.clone(), val);
+                params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), val);
             }
         } else if let ParameterKind::Type { assignments } = &param.kind {
             // §6.20.3 type parameter (`parameter type T1 = integer`): register
@@ -3449,7 +3580,7 @@ pub fn elaborate_module_with_defs(
                                 let mut v = eval_init_for_width(init_eval, &elab.parameters, eff_width);
                                 if is_signed { v.is_signed = true; }
                                 alias_pkg_param(&mut elab, &p.name.name, &assign.name.name, &v);
-                                elab.parameters.insert(assign.name.name.clone(), v);
+                                params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), v);
                                 // §7.2.1: a STRUCT-typed package parameter needs
                                 // its field layout registered, or member selects
                                 // (`pkg::CDEF.a`) read x at runtime and 0 in
@@ -3607,7 +3738,7 @@ pub fn elaborate_module_with_defs(
                     continue; // real parameters keep the walk's own handling
                 }
                 if elab.parameters.get(*name) != Some(&v) {
-                    elab.parameters.insert((*name).to_string(), v);
+                    params_insert_traced(&mut elab.parameters, line!(), (*name).to_string(), v);
                     preseeded_params.insert((*name).to_string());
                     preseed_dup_exempt.insert((*name).to_string());
                     changed = true;
@@ -4296,6 +4427,9 @@ pub fn elaborate_module_with_defs(
                     let is_dynamic_dim = effective_dims.first().is_some_and(|d| matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
                     if is_dynamic_dim {
                         elab.dynamic_arrays.insert(decl.name.name.clone());
+                    }
+                    if matches!(effective_dims.first(), Some(UnpackedDimension::Queue { .. })) {
+                        elab.queue_vars.insert(decl.name.name.clone());
                     }
                     if let Some(UnpackedDimension::Queue { max_size: Some(ms), .. }) = effective_dims.first() {
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
@@ -5126,6 +5260,26 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
+                        // §7.8: an ASSOCIATIVE array OF STRUCTS
+                        // (`S sa[string]`) — the struct-var path never
+                        // registered the container, so `num()/exists()/
+                        // foreach` all treated `sa` as a scalar while the
+                        // composed element writes worked.
+                        if matches!(dt_resolved, DataType::Struct(_)) {
+                            if let Some(UnpackedDimension::Associative {
+                                data_type: key_dt, ..
+                            }) = decl.dimensions.first()
+                            {
+                                let is_string_key = key_dt.as_ref().is_some_and(|dt| {
+                                    matches!(
+                                        dt.as_ref(),
+                                        DataType::Simple { kind: SimpleType::String, .. }
+                                    )
+                                });
+                                elab.associative_arrays
+                                    .insert(decl.name.name.clone(), is_string_key);
+                            }
+                        }
                         // Per-field packed-array element widths so that
                         // `obj.field[i]` slices instead of bit-selects when
                         // the field is `logic [3:0][7:0] field;`. Walks
@@ -5133,11 +5287,80 @@ pub fn elaborate_module_with_defs(
                         // for now — covers the most common case).
                         if let DataType::Struct(su) = dt_resolved {
                             for m in &su.members {
+                                // §7.2.1: a DYNAMIC member (`int d[]` /
+                                // `int q[$]` / `int a[key_t]`) is its own
+                                // collection object under "var.member".
+                                // Unregistered, `new[n]`, `.size()` and
+                                // `push_back` on the member silently no-op'd
+                                // (size read 0 while direct element writes
+                                // worked) — the whole struct-with-dynamic-
+                                // member family was broken.
+                                for mdecl in &m.declarators {
+                                    let dyn_dim = mdecl.dimensions.first().filter(|d| {
+                                        matches!(
+                                            d,
+                                            UnpackedDimension::Unsized(_)
+                                                | UnpackedDimension::Queue { .. }
+                                                | UnpackedDimension::Associative { .. }
+                                        )
+                                    });
+                                    if let Some(dyn_dim) = dyn_dim {
+                                        let key = format!(
+                                            "{}.{}",
+                                            decl.name.name, mdecl.name.name
+                                        );
+                                        let mw = resolve_type_width(
+                                            &m.data_type,
+                                            Some(&elab.parameters),
+                                            Some(&elab.typedefs),
+                                        )
+                                        .max(1);
+                                        match dyn_dim {
+                                            UnpackedDimension::Associative {
+                                                data_type: kdt, ..
+                                            } => {
+                                                let is_str = kdt.as_ref().is_some_and(|dt| {
+                                                    matches!(
+                                                        dt.as_ref(),
+                                                        DataType::Simple {
+                                                            kind: SimpleType::String,
+                                                            ..
+                                                        }
+                                                    )
+                                                });
+                                                elab.associative_arrays.insert(key, is_str);
+                                            }
+                                            _ => {
+                                                elab.dynamic_arrays.insert(key.clone());
+                                                if matches!(dyn_dim, UnpackedDimension::Queue { .. }) {
+                                                    elab.queue_vars.insert(key.clone());
+                                                }
+                                                if let UnpackedDimension::Queue {
+                                                    max_size: Some(ms),
+                                                    ..
+                                                } = dyn_dim
+                                                {
+                                                    if let Some(n) =
+                                                        const_eval_i64_with_params(
+                                                            ms,
+                                                            Some(&elab.parameters),
+                                                        )
+                                                        .filter(|n| *n >= 0)
+                                                    {
+                                                        elab.queue_max_sizes.insert(
+                                                            key.clone(),
+                                                            (n + 1) as u32,
+                                                        );
+                                                    }
+                                                }
+                                                elab.arrays.insert(key, (0, 63, mw));
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(ew) = packed_inner_elem_width(&m.data_type, &elab.parameters, &elab.typedefs) {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
-                                        if std::env::var_os("XEZIM_PEW_DBG").is_some() {
-                                        }
                                         elab.packed_signal_elem_widths.insert(key, ew);
                                     }
                                 }
@@ -5552,7 +5775,7 @@ pub fn elaborate_module_with_defs(
                                 .or_insert(fields);
                         }
                         if !elab.parameters.contains_key(&assign.name.name) {
-                            elab.parameters.insert(assign.name.name.clone(), val.clone());
+                            params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), val.clone());
                         }
 
                         // Also add as a signal so it can be read in expressions
@@ -7899,6 +8122,16 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                 {
                     return Ok(());
                 }
+                // §27.6: `genblk<N>` — the implicit name of an unnamed
+                // generate block, legal as a hierarchical-reference root.
+                // (The simulator resolves through it by stripping the
+                // implicit segment; unnamed-block decls keep bare names.)
+                if name.starts_with("genblk")
+                    && name.len() > 6
+                    && name[6..].chars().all(|c| c.is_ascii_digit())
+                {
+                    return Ok(());
+                }
                 // A built-in type keyword captured as an Ident — only the parser's
                 // `$bits(<type>)` / `$size(<type>)` type-argument path produces
                 // these (a bare keyword can't appear in normal expression
@@ -8360,7 +8593,7 @@ fn resolve_forward_referenced_params(
                 v.is_signed = true;
             }
             if elab.parameters.get(*name) != Some(&v) {
-                elab.parameters.insert((*name).to_string(), v.clone());
+                params_insert_traced(&mut elab.parameters, line!(), (*name).to_string(), v.clone());
                 if let Some(sig) = elab.signals.get_mut(*name) {
                     sig.value = v;
                 }
@@ -8916,7 +9149,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                         // §6.20.2 self-determined: 1-bit, unsigned, plain.
                                         let mut pv = Value::fill_of(*c);
                                         pv.is_fill = false;
-                                        elab.parameters.insert(assign.name.name.clone(), pv.clone());
+                                        params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), pv.clone());
                                         signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal { is_const: false,
                                             name: assign.name.name.clone(), width: 1, is_signed: false,
                                             direction: None, value: pv, is_real: false, type_name: get_type_name(data_type),
@@ -8958,7 +9191,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                 if !v.is_real { v.is_signed = signed; }
                                 v
                             } else { Value::zero(width) };
-                            elab.parameters.insert(assign.name.name.clone(), val.clone());
+                            params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), val.clone());
                             signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal { is_const: false,
                                 name: assign.name.name.clone(), width, is_signed: signed,
                                 direction: None, value: val, is_real: is_type_real(data_type), type_name: get_type_name(data_type),
@@ -9385,10 +9618,14 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
     let mut i = gf.init_val;
     let trace = elab_trace_enabled();
     let mut iter_count = 0u32;
+    let mut hit_cap = true;
     for _ in 0..10000 {
-        elab.parameters.insert(var.clone(), Value::from_u64(i as u64, 32));
+        params_insert_traced(&mut elab.parameters, line!(), var.clone(), Value::from_u64(i as u64, 32));
         let cond_val = eval_const_expr(&gf.cond, &elab.parameters);
-        if cond_val == 0 { break; }
+        if cond_val == 0 {
+            hit_cap = false;
+            break;
+        }
         // Rename per-iteration declarations so each iteration owns a fresh
         // copy. Without this, two iterations both declare e.g. `valid_q` and
         // the elaborator's flat signal table flags a duplicate.
@@ -9465,6 +9702,36 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
         }
     }
     elab.parameters.remove(var);
+    if hit_cap {
+        return Err(format!(
+            "generate-for loop for genvar '{}' exceeded 10000 iterations \
+             without its condition becoming false (IEEE 1800-2017 \u{a7}27.4)",
+            var
+        ));
+    }
+    // §27.4: bounds must be elaboration-time constants. An unresolvable
+    // name in the condition made it evaluate 0 and the whole loop silently
+    // elaborated ZERO iterations — hardware vanished without a diagnostic.
+    if iter_count == 0 {
+        let mut names: Vec<String> = Vec::new();
+        collect_ident_names(&gf.cond, &mut names);
+        let unresolved: Vec<String> = names
+            .into_iter()
+            .filter(|n| {
+                n != var
+                    && !elab.parameters.contains_key(n)
+                    && param_fallback_get(n).is_none()
+            })
+            .collect();
+        if !unresolved.is_empty() {
+            return Err(format!(
+                "generate-for condition references non-constant name(s) {:?}; \
+                 generate bounds must be elaboration-time constants \
+                 (IEEE 1800-2017 \u{a7}27.4)",
+                unresolved
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -10125,6 +10392,18 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                 // the whole dimension — which otherwise mis-sized black-parrot's
                 // bp_pte_leaf_s and wrapped r_entry_high_bits_lp.
                 .or_else(|| param_fallback_get(name).and_then(|v| v.to_i64()))
+                // XEZIM_TRACE_PARAM: a name the const evaluator cannot
+                // resolve is what most callers silently turn into 0 — the
+                // classic seed of a `[N-1:0]` underflow (`LOG_X - 6` with
+                // `LOG_X` unresolved → −6). Loud only when traced.
+                .or_else(|| {
+                    param_trace(
+                        "const-eval:MISS",
+                        name,
+                        "unresolved identifier (callers default it to 0)",
+                    );
+                    None
+                })
         }
         ExprKind::Binary { op, left, right } => {
             // LRM §11.4 — full operator set, evaluated in i64 context.
@@ -11877,7 +12156,7 @@ fn sized_literal_width(init: &Expression) -> Option<u32> {
 /// spellings; parameters did not.
 fn alias_pkg_param(elab: &mut ElaboratedModule, pkg: &str, name: &str, v: &Value) {
     if !pkg.is_empty() {
-        elab.parameters.insert(format!("{}::{}", pkg, name), v.clone());
+        params_insert_traced(&mut elab.parameters, line!(), format!("{}::{}", pkg, name), v.clone());
     }
 }
 
@@ -12414,7 +12693,7 @@ fn register_array_param(
         // Also into the parameter env under the ELEMENT name, so a CONSTANT
         // context (`localparam A1 = A[1];`) can resolve the element — the
         // const-eval Index arm consults `params` by "name[idx]".
-        elab.parameters.insert(sn.clone(), v.clone());
+        params_insert_traced(&mut elab.parameters, line!(), sn.clone(), v.clone());
         signals_insert_traced(&mut elab.signals, line!(), sn.clone(), Signal {
             is_const: true, name: sn, width: elem_w, is_signed: signed,
             is_real: false, direction: None, value: v, type_name: None,
@@ -12707,7 +12986,17 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 .and_then(|k| params.get(k).cloned())
                 .or_else(|| params.get(name).cloned())
                 .or_else(|| param_fallback_get(name))
-                .unwrap_or(Value::zero(32))
+                .unwrap_or_else(|| {
+                    // XEZIM_TRACE_PARAM: this silent zero-default is the
+                    // classic seed of a `[N-1:0]` underflow (`LOG_X - 6`
+                    // with `LOG_X` unresolved → −6). Loud only when traced.
+                    param_trace(
+                        "const-eval:MISS",
+                        name,
+                        "unresolved identifier, defaulting to 0",
+                    );
+                    Value::zero(32)
+                })
         }
         ExprKind::Binary { op, left, right } => {
             let l = eval_const_expr_val(left, params);
@@ -12969,6 +13258,33 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             } else {
                 v.resize(n)
             }
+        }
+        ExprKind::SystemCall { name, args } if name == "$__xz_named_cast" && args.len() == 2 => {
+            // §6.24.1: `id'(v)` where `id` resolves to a CONSTANT — a size
+            // cast at that width (`localparam [AW-1:0] TOP = AW'(6);` read 0
+            // because this intrinsic had no const arm at all).
+            let nm = match &args[0].kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
+                _ => None,
+            };
+            if let Some(nm) = nm {
+                if let Some(w) = params
+                    .get(&nm)
+                    .and_then(|v| v.to_u64())
+                    .or_else(|| param_fallback_get(&nm).and_then(|v| v.to_u64()))
+                {
+                    let w = (w.max(1)) as u32;
+                    if let Some(iv) = const_eval_i64_with_params(&args[1], Some(params)) {
+                        let mut out = Value::from_u64(iv as u64, 64).resize(w);
+                        out.is_signed = false;
+                        return out;
+                    }
+                    let mut out = eval_const_expr_val(&args[1], params).resize(w);
+                    out.is_signed = false;
+                    return out;
+                }
+            }
+            eval_const_expr_val(&args[1], params)
         }
         ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" && args.len() == 2 => {
             let v = eval_const_expr_val(&args[1], params);
@@ -13256,6 +13572,30 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
 }
 
 /// Inline module instantiations: replace instances with their continuous assigns and always blocks.
+/// §8.23 nested class declarations: hoist each `class Inner` found inside a
+/// class body into the class table, keyed BOTH as `Outer::Inner` (the
+/// qualified reference form) and — first declaration wins — as the bare
+/// inner name. Records the enclosing class so methods of the inner class
+/// can resolve the outer class's statics. Without this the inner class was
+/// silently invisible: `Outer::Inner x = new;` produced a null handle.
+fn register_nested_classes(
+    c: &crate::ast::decl::ClassDeclaration,
+    outer: &str,
+    elab: &mut ElaboratedModule,
+) {
+    for item in &c.items {
+        if let ClassItem::Class(inner) = item {
+            register_class_enum_members(inner, elab);
+            let mut cls = elaborate_class_with_params(inner, Some(&elab.parameters));
+            cls.enclosing = Some(outer.to_string());
+            let scoped = format!("{}::{}", outer, inner.name.name);
+            elab.classes.insert(scoped.clone(), cls.clone());
+            elab.classes.entry(inner.name.name.clone()).or_insert(cls);
+            register_nested_classes(inner, &scoped, elab);
+        }
+    }
+}
+
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
@@ -13268,6 +13608,7 @@ pub fn inline_instantiations(
                 register_class_enum_members(c, elab);
                 let cls = elaborate_class_with_params(c, Some(&elab.parameters));
                 elab.classes.insert(name.clone(), cls);
+                register_nested_classes(c, name, elab);
             }
             Definition::Covergroup(cg) => { elab.covergroups.insert(name.clone(), (*cg).clone()); }
             Definition::Package(p) => {
@@ -13326,7 +13667,7 @@ pub fn inline_instantiations(
                                             let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                             if is_signed { v.is_signed = true; }
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
-                                            elab.parameters.insert(assign.name.name.clone(), v);
+                                            params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), v);
                                         }
                                     }
                                 }
@@ -13388,7 +13729,7 @@ pub fn inline_instantiations(
                                     if let Some(init) = &assign.init {
                                         let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                         if is_signed { v.is_signed = true; }
-                                        elab.parameters.insert(assign.name.name.clone(), v);
+                                        params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), v);
                                     }
                                 }
                             }
@@ -15838,6 +16179,23 @@ fn inline_module_items(
                 let __th = std::time::Instant::now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                // §3.3/§23.3.2: one instance name per scope. Accepting a
+                // duplicate elaborated BOTH instances and applied the second
+                // #() override to each (the override map is name-keyed) —
+                // silent parameter cross-contamination. decl_sites keeps
+                // first-seen spans, so the collision check is one lookup.
+                {
+                    let key = format!("\u{2}inst:{}", inst_prefix);
+                    if elab.decl_sites.contains_key(&key) {
+                        return Err(format!(
+                            "duplicate instance name '{}' in the same scope \
+                             (IEEE 1800-2017 \u{a7}23.3.2); a second #() override \
+                             would silently apply to both instances",
+                            inst_name
+                        ));
+                    }
+                    elab.note_decl_site(&key, hi.name.span, "instance", true);
+                }
                 // §6.8: child-module declaration initializers that are NOT
                 // constant expressions are deferred to an initial-block
                 // assignment (mirroring the top-level path). Collected during
@@ -16211,6 +16569,26 @@ fn inline_module_items(
                             if assignments.iter().any(|a| a.name.name == formal)))
                 };
                 let mut type_overrides: Vec<(String, DataType)> = Vec::new();
+                // §23.10: ORDERED overrides bind to the flattened assignment
+                // list — `parameter A=1, B=2` is ONE declaration with TWO
+                // positional slots. Indexing declarations dropped every value
+                // after the first of each group.
+                enum FlatSlot<'a> {
+                    Data(&'a DataType, &'a crate::ast::decl::ParamAssignment),
+                    Type(&'a crate::ast::decl::TypeParamAssignment),
+                }
+                let flat_slots: Vec<FlatSlot> = sub_param_decls
+                    .iter()
+                    .flat_map(|p| match &p.kind {
+                        ParameterKind::Data { data_type, assignments } => assignments
+                            .iter()
+                            .map(|a| FlatSlot::Data(data_type, a))
+                            .collect::<Vec<_>>(),
+                        ParameterKind::Type { assignments } => {
+                            assignments.iter().map(FlatSlot::Type).collect()
+                        }
+                    })
+                    .collect();
                 if let Some(param_conns) = &inst.params {
                     for (i, conn) in param_conns.iter().enumerate() {
                         match conn {
@@ -16232,6 +16610,25 @@ fn inline_module_items(
                                         &elab.typedefs, &elab.typedef_types,
                                         &elab.packed_struct_fields, &elab.arrays,
                                     );
+                                    // §13.4.3: const function calls in the
+                                    // override expression (`.N(pkg::f(5))`)
+                                    // — unsubstituted they eval to 0.
+                                    let subbed_ov;
+                                    let v: &Expression = if expr_has_call(v) {
+                                        match substitute_const_fn_calls(
+                                            v, scoped_eval_params, elab, 0,
+                                        )
+                                        .filter(|e| !expr_has_call(e))
+                                        {
+                                            Some(e) => {
+                                                subbed_ov = e;
+                                                &subbed_ov
+                                            }
+                                            None => v,
+                                        }
+                                    } else {
+                                        v
+                                    };
                                     let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     // Check if target parameter is real or implicit real
                                     for p_decl in sub_mod.params() {
@@ -16274,53 +16671,62 @@ fn inline_module_items(
                                         }));
                                 }
                                 if let Some(ParamValue::Type(dt)) = value {
-                                    if let Some(p_decl) = sub_param_decls.get(i) {
-                                        if let ParameterKind::Type { assignments } = &p_decl.kind {
-                                            if let Some(a) = assignments.first() {
-                                                type_overrides.push((a.name.name.clone(), dt.clone()));
-                                            }
+                                    if let Some(FlatSlot::Type(a)) = flat_slots.get(i) {
+                                        type_overrides.push((a.name.name.clone(), dt.clone()));
+                                    }
+                                }
+                                if let Some(ParamValue::Expr(v)) = value {
+                                    if let Some(FlatSlot::Type(a)) = flat_slots.get(i) {
+                                        if let Some(dt) = expr_as_type_ref(v) {
+                                            type_overrides.push((a.name.name.clone(), dt));
+                                            continue;
                                         }
                                     }
                                 }
                                 if let Some(ParamValue::Expr(v)) = value {
-                                    if let Some(p_decl) = sub_param_decls.get(i) {
-                                        if let ParameterKind::Type { assignments } = &p_decl.kind {
-                                            if let Some(a) = assignments.first() {
-                                                if let Some(dt) = expr_as_type_ref(v) {
-                                                    type_overrides.push((a.name.name.clone(), dt));
-                                                    continue;
+                                    if let Some(FlatSlot::Data(data_type, a)) = flat_slots.get(i) {
+                                        let data_type: &DataType = data_type;
+                                        // §13.4.3: const-fn calls, as in the
+                                        // Named branch.
+                                        let subbed_ov;
+                                        let v: &Expression = if expr_has_call(v) {
+                                            match substitute_const_fn_calls(
+                                                v, scoped_eval_params, elab, 0,
+                                            )
+                                            .filter(|e| !expr_has_call(e))
+                                            {
+                                                Some(e) => {
+                                                    subbed_ov = e;
+                                                    &subbed_ov
                                                 }
+                                                None => v,
                                             }
+                                        } else {
+                                            v
+                                        };
+                                        let mut val = eval_const_expr_val(v, scoped_eval_params);
+                                        if dbg_param {
+                                            eprintln!("[DBG_PARAM]     eval -> {} = {}",
+                                                a.name.name, val.to_u64().unwrap_or(0));
                                         }
-                                    }
-                                }
-                                if let Some(ParamValue::Expr(v)) = value {
-                                    if let Some(p_decl) = sub_param_decls.get(i) {
-                                        if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
-                                            let mut val = eval_const_expr_val(v, scoped_eval_params);
-                                            if dbg_param {
-                                                eprintln!("[DBG_PARAM]     eval -> {} = {}",
-                                                    assignments[0].name.name, val.to_u64().unwrap_or(0));
-                                            }
-                                            if is_type_real(data_type) {
+                                        if is_type_real(data_type) {
+                                            val = Value::from_f64(val.to_f64());
+                                        } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                                            && val.is_real {
                                                 val = Value::from_f64(val.to_f64());
-                                            } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                                                && val.is_real {
-                                                    val = Value::from_f64(val.to_f64());
-                                                }
-                                            // See the Named branch: a pattern
-                                            // override needs the formal's type.
-                                            if let Some(pv) = pack_packed_vector_pattern(
-                                                data_type, v, scoped_eval_params,
-                                                &elab.typedef_types,
-                                            ).or_else(|| pack_struct_const_value(
-                                                data_type, v, scoped_eval_params,
-                                                &elab.typedefs, &elab.typedef_types,
-                                            )) {
-                                                val = pv;
                                             }
-                                            sub_params.insert(assignments[0].name.name.clone(), val);
+                                        // See the Named branch: a pattern
+                                        // override needs the formal's type.
+                                        if let Some(pv) = pack_packed_vector_pattern(
+                                            data_type, v, scoped_eval_params,
+                                            &elab.typedef_types,
+                                        ).or_else(|| pack_struct_const_value(
+                                            data_type, v, scoped_eval_params,
+                                            &elab.typedefs, &elab.typedef_types,
+                                        )) {
+                                            val = pv;
                                         }
+                                        sub_params.insert(a.name.name.clone(), val);
                                     }
                                 }
                             }
@@ -16484,6 +16890,20 @@ fn inline_module_items(
                                                 } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                                                     if val.is_real {
                                                         val = Value::from_f64(val.to_f64());
+                                                    }
+                                                } else if !val.is_real {
+                                                    // §5.7.1/§10.9: a DECLARED
+                                                    // shape sizes the init —
+                                                    // `localparam [N-1:0] X='1`
+                                                    // must fill N bits, not
+                                                    // stay a 1-bit fill.
+                                                    let w = resolve_type_width(
+                                                        data_type,
+                                                        Some(local_map),
+                                                        Some(&elab_ro.typedefs),
+                                                    );
+                                                    if w > 0 && (val.is_fill || val.width != w) {
+                                                        val = val.resize(w);
                                                     }
                                                 }
                                                 if local_map.get(&assign.name.name) != Some(&val) {
@@ -16732,7 +17152,7 @@ fn inline_module_items(
                 // Inline all resolved parameters into global map with prefix
                 for (name, val) in &sub_local_params {
                     let full_name = format!("{}{}", inst_prefix, name);
-                    elab.parameters.insert(full_name.clone(), val.clone());
+                    params_insert_traced(&mut elab.parameters, line!(), full_name.clone(), val.clone());
                     // Also add as a signal for simulation access
                     signals_insert_traced(&mut elab.signals, line!(), full_name.clone(), Signal { is_const: false,
                         name: full_name,
@@ -17054,7 +17474,7 @@ fn inline_module_items(
                                     Some(p) => p.to_u64() == Some(val),
                                 };
                                 if should_insert {
-                                    elab.parameters.insert(member.name.name.clone(), v.clone());
+                                    params_insert_traced(&mut elab.parameters, line!(), member.name.name.clone(), v.clone());
                                     signals_insert_traced(&mut elab.signals, line!(), member.name.name.clone(), Signal {
                                         is_const: false,
                                         name: member.name.name.clone(),
@@ -17266,7 +17686,7 @@ fn inline_module_items(
                                     next_val = val.wrapping_add(1);
                                     let v = Value::from_u64(val, base_width);
                                     let scoped = format!("{}.{}", inst_prefix_no_dot, member.name.name);
-                                    elab.parameters.insert(scoped.clone(), v.clone());
+                                    params_insert_traced(&mut elab.parameters, line!(), scoped.clone(), v.clone());
                                     signals_insert_traced(&mut elab.signals, line!(), scoped.clone(), Signal {
                                         is_const: false,
                                         name: scoped,
@@ -17306,11 +17726,21 @@ fn inline_module_items(
                                     elab.string_signals.insert(scoped);
                                 }
                             }
+                            // The BARE key is FIRST-WINS: these tables are
+                            // global bare-name maps, and an instance variable
+                            // that happens to share a name with an OUTER-scope
+                            // signal of a different shape must not stomp the
+                            // outer entry — a 128-bit `[1:0][63:0] x` inside
+                            // an instance redefined the TB's 292-bit struct-
+                            // array `x`'s element geometry, so every
+                            // `x[i][j]` read in the TB sliced with the
+                            // submodule's dims (the §5g bare-name family).
+                            // The scoped key is always this instance's own.
                             if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &sub_merged_params, &elab.typedefs) {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_signal_elem_widths.insert(bare, elem_w);
+                                    elab.packed_signal_elem_widths.entry(bare).or_insert(elem_w);
                                     elab.packed_signal_elem_widths.insert(scoped, elem_w);
                                 }
                             }
@@ -17318,7 +17748,7 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_full_dims.insert(bare, fdims.clone());
+                                    elab.packed_full_dims.entry(bare).or_insert_with(|| fdims.clone());
                                     elab.packed_full_dims.insert(scoped, fdims.clone());
                                 }
                             }
@@ -17356,8 +17786,12 @@ fn inline_module_items(
                                                 let scoped = format!("{}{}", inst_prefix, bare);
                                                 tls_register_struct_layout(&bare, &fields);
                                                 tls_register_struct_layout(&scoped, &fields);
+                                                // First-wins on the bare key
+                                                // (see the packed-dim blocks
+                                                // above).
                                                 elab.packed_struct_fields
-                                                    .insert(bare.clone(), fields.clone());
+                                                    .entry(bare.clone())
+                                                    .or_insert_with(|| fields.clone());
                                                 elab.packed_struct_fields
                                                     .insert(scoped.clone(), fields.clone());
                                                 // Per-MEMBER packed-array element
@@ -18908,11 +19342,48 @@ fn substitute_const_fn_calls(
     let sub = |e: &Expression| substitute_const_fn_calls(e, params, elab, depth);
     Some(match &expr.kind {
         ExprKind::Call { func, args } => {
-            let fname = match &func.kind {
-                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone())?,
-                _ => return None,
+            // §26.3: a scoped call `pkg::f(...)` reaches this pass as
+            // MemberAccess{Ident(pkg), f} in inlined-submodule items (the
+            // top-module path sees a flat 2-segment Ident) — both forms
+            // resolve, preferring the package-qualified registration.
+            let (fname, scoped_key) = match &func.kind {
+                ExprKind::Ident(h) => {
+                    let leaf = h.path.last().map(|s| s.name.name.clone())?;
+                    let sk = (h.path.len() >= 2).then(|| {
+                        format!("{}::{}", h.path[h.path.len() - 2].name.name, leaf)
+                    });
+                    (leaf, sk)
+                }
+                ExprKind::MemberAccess { expr: base, member } => {
+                    let sk = match &base.kind {
+                        ExprKind::Ident(bh) if bh.path.len() == 1 => Some(format!(
+                            "{}::{}",
+                            bh.path[0].name.name, member.name
+                        )),
+                        _ => None,
+                    };
+                    (member.name.clone(), sk)
+                }
+                other => {
+                    param_trace(
+                        "const-fn:unsupported-func-shape",
+                        "call",
+                        &format!("{:?}", std::mem::discriminant(other)),
+                    );
+                    return None;
+                }
             };
-            let fd = elab.functions.get(&fname)?.clone();
+            let fd = match scoped_key
+                .as_deref()
+                .and_then(|k| elab.functions.get(k))
+                .or_else(|| elab.functions.get(&fname))
+            {
+                Some(fd) => fd.clone(),
+                None => {
+                    param_trace("const-fn:MISS", &fname, "no function registration");
+                    return None;
+                }
+            };
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
                 if !const_fn_expr_supported(a) {
@@ -20785,7 +21256,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
-                                        elab.parameters.insert(assign.name.name.clone(), v.clone());
+                                        params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), v.clone());
                                         signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),
                                             width, is_signed: signed, is_real, direction: None,
@@ -20831,7 +21302,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                                     &format!("imported from package '{}'", pkg_name),
                                                     false,
                                                 );
-                                                elab.parameters.insert(nm.clone(), v.clone());
+                                                params_insert_traced(&mut elab.parameters, line!(), nm.clone(), v.clone());
                                                 signals_insert_traced(&mut elab.signals, line!(), nm.clone(), Signal {
                                                     is_const: false,
                                                     name: nm.clone(),
@@ -21027,7 +21498,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
-                                        elab.parameters.insert(assign.name.name.clone(), v.clone());
+                                        params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), v.clone());
                                         signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),
                                             width, is_signed: signed, is_real, direction: None,
