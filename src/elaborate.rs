@@ -4621,6 +4621,19 @@ pub fn elaborate_module_with_defs(
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
+                        // Record the element DataType keyed by the array's base
+                        // name so an inline `arr[k] = new` can resolve the
+                        // element CLASS from its declared type (module- OR
+                        // package-scope associative arrays; the runtime maps
+                        // `array_elem_class` / `var_class_types` only cover
+                        // local/fixed arrays). Without this the constructor
+                        // falls through to an OPAQUE unknown-LHS instance and
+                        // the stored handle deref's null — e.g. UVM's
+                        // `uvm_seed_map uvm_random_seed_table_lookup [string]`
+                        // then `uvm_create_random_seed` reads
+                        // `seed_map.seed_table` through null at t=0.
+                        elab.var_decl_types
+                            .insert(decl.name.name.clone(), dd.data_type.clone());
                         // §7.8.2: an AA index is narrowed to the declared key
                         // type. Record the key width + signedness so the runtime
                         // can narrow a wider index expression before keying
@@ -14415,10 +14428,9 @@ pub fn inline_instantiations(
                                     }
                                 }
                                 if is_assoc {
-                                    // The key type was hardcoded non-string here,
-                                    // unlike the module-scope path — a package-level
-                                    // `[string]` map indexed by a string key then
-                                    // hashed through the integer path.
+                                    // Keep main's string-key detection: a package-level
+                                    // `[string]` map indexed by a string key must hash
+                                    // through the string path, not the integer one.
                                     let is_string_key = matches!(
                                         first_dim,
                                         Some(UnpackedDimension::Associative { data_type: Some(kdt), .. })
@@ -14429,6 +14441,18 @@ pub fn inline_instantiations(
                                     );
                                     elab.associative_arrays
                                         .insert(decl.name.name.clone(), is_string_key);
+                                    // Record the element DataType keyed by the base
+                                    // name so an inline `arr[k] = new` can resolve the
+                                    // element CLASS from its declared type. Packages
+                                    // (unlike module Data decls) were only classed as
+                                    // associative here and never recorded the element
+                                    // type, so a package-scoped `uvm_seed_map m [string]`
+                                    // then `m[k] = new()` fell through to an OPAQUE
+                                    // unknown-LHS instance whose stored handle deref'd
+                                    // null (`seed_map.seed_table` / `seed_map.count`
+                                    // null deref in UVM's uvm_create_random_seed).
+                                    elab.var_decl_types
+                                        .insert(decl.name.name.clone(), dd.data_type.clone());
                                     continue;
                                 }
                                 // Element reads/writes go through `module.arrays`
