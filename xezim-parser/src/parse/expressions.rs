@@ -1230,18 +1230,20 @@ impl Parser {
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
                 let new_expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
-                // `new <expr>` shallow-copy constructor (SV 8.13): `obj = new src;`
-                // copies `src` into a fresh object. The `()` / `[size]` forms are
-                // left to the postfix parser (call / array-new); a bare expression
-                // operand here is a copy source, which we model as a call to `new`
-                // with the source as its sole argument.
+                // `new <expr>` shallow-copy constructor (SV 8.8, Syntax 8-2):
+                // `obj = new src;` copies `src` into a fresh object (footnote 23
+                // — `<expr>` evaluates to an object handle). This PARENTHESELESS
+                // form is distinct from the ordinary constructor call `new(args)`
+                // (which the postfix parser handles as a regular `Call`): it is
+                // emitted as an explicit `ShallowCopy` node so the simulator can
+                // tell a copy from a `new(handle_ctor_arg)` constructor call.
                 if matches!(
                     self.current_kind(),
                     TokenKind::Identifier | TokenKind::KwThis | TokenKind::KwSuper
                 ) {
                     let src = self.parse_expr_bp(30);
                     Expression::new(
-                        ExprKind::Call { func: Box::new(new_expr), args: vec![src] },
+                        ExprKind::ShallowCopy { source: Box::new(src) },
                         self.span_from(start),
                     )
                 } else {

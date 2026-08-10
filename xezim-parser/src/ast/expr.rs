@@ -68,6 +68,14 @@ pub enum ExprKind {
     StreamOp { left_to_right: bool, slice_size: Option<Box<Expression>>, exprs: Vec<Expression> },
     /// Tagged union constructor: `tagged Name` or `tagged Name (expr)`.
     Tagged { tag: Identifier, inner: Option<Box<Expression>> },
+    /// LRM §8.8: the shallow-copy constructor `new <handle>` (the
+    /// SVA-clause variant: `class_new ::= [class_scope] new [ ( args ) ] | new
+    /// expression`). ONLY the parentheseless `new <expr>` (where `<expr>`
+    /// evaluates to an object handle, footnote 23) is a shallow copy — pass
+    /// `source` as a constructor argument. The parenthesized constructor call
+    /// `new(args)` remains an ordinary `Call` and always invokes the
+    /// constructor, never a copy.
+    ShallowCopy { source: Box<Expression> },
     /// LRM §16.5: SVA property body wrapped by a clocking event,
     /// e.g. `@(posedge clk) a |=> b`. `clock` is the trigger; `body`
     /// is the predicate. The executor evaluates this only at the
