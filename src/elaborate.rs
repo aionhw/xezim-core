@@ -16428,18 +16428,32 @@ fn inline_module_items(
                 // that default. Its sub-scope constant is substituted verbatim
                 // for the port name throughout the inlined body.
                 if let PortList::Ansi(ports) = sub_mod.ports() {
+                    // §22.9: if this module was declared inside an active
+                    // `unconnected_drive region, its unconnected INPUT ports
+                    // read the pulled value ('1 for pull1, '0 for pull0)
+                    // instead of Z.
+                    let pulled = sv_parser::unconnected_drive_for(sub_mod_name);
                     for port in ports {
                         let name = &port.name.name;
+                        let is_input =
+                            !matches!(port.direction, Some(PortDirection::Output)
+                                | Some(PortDirection::Inout));
+                        if !is_input
+                            || port_map.contains_key(name)
+                            || sub_interface_map.contains_key(name)
+                        {
+                            continue;
+                        }
                         if let Some(def) = &port.default {
-                            let is_input =
-                                !matches!(port.direction, Some(PortDirection::Output)
-                                    | Some(PortDirection::Inout));
-                            if is_input
-                                && !port_map.contains_key(name)
-                                && !sub_interface_map.contains_key(name)
-                            {
-                                port_map.insert(name.clone(), def.clone());
-                            }
+                            port_map.insert(name.clone(), def.clone());
+                        } else if let Some(pull1) = pulled {
+                            let lit = Expression::new(
+                                ExprKind::Number(NumberLiteral::UnbasedUnsized(
+                                    if pull1 { '1' } else { '0' },
+                                )),
+                                port.name.span,
+                            );
+                            port_map.insert(name.clone(), lit);
                         }
                     }
                 }

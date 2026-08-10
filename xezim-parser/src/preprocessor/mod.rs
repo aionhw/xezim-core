@@ -61,6 +61,9 @@ pub struct Preprocessor {
     /// Nesting depth of open design elements (module/interface/package/…),
     /// tracked line-by-line so `\`resetall` inside one can be flagged (§22.3).
     design_element_depth: i32,
+    /// §22.9: pull direction of the ACTIVE `unconnected_drive region
+    /// (Some(true)=pull1, Some(false)=pull0), None outside a region.
+    unconnected_pull: Option<bool>,
     /// Macro-expansion-time strict errors (bad argument counts). Interior
     /// mutability because `expand_macros*` run behind `&self`; drained into
     /// `errors` after each line is expanded.
@@ -126,6 +129,7 @@ impl Preprocessor {
             current_file_ts: false,
             errors: Vec::new(),
             design_element_depth: 0,
+            unconnected_pull: None,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
             reported_undefined: std::cell::RefCell::new(HashSet::new()),
         }
@@ -255,7 +259,14 @@ impl Preprocessor {
         } else if let Some(end) = after_num[1..].find('"') {
             let level = after_num[1 + end + 1..].trim();
             if !matches!(level, "0" | "1" | "2") {
-                bad = true; why = format!("level `{}` must be 0, 1, or 2", level);
+                // Reference tools accept an out-of-range level with a
+                // WARNING (number/filename still apply) — a hard error here
+                // failed otherwise-valid third-party sources.
+                eprintln!(
+                    "[PP] warning: {}:{}: `line level `{}` is not 0/1/2 \
+                     (IEEE 1800-2017 §22.12) — ignored",
+                    self.current_file, self.current_line, level
+                );
             }
         } else {
             bad = true; why = "unterminated filename string".into();
@@ -517,7 +528,13 @@ impl Preprocessor {
                 out.push('\n');
                 continue;
             }
-            if trimmed.starts_with('`') || !line.contains('`') {
+            // A line STARTING with a conditional directive may still carry
+            // trailing content (`\`endif initial ...`; `\`endif junk`) —
+            // §22.6 makes the directive its own token, so the tail must be
+            // split off and processed, not swallowed with the directive.
+            let starts_cond =
+                trimmed.starts_with('`') && Self::conditional_directive_len(trimmed).is_some();
+            if (trimmed.starts_with('`') && !starts_cond) || !line.contains('`') {
                 out.push_str(line);
                 out.push('\n');
                 continue;
@@ -741,7 +758,20 @@ impl Preprocessor {
 
             // Handle `include — read and recursively preprocess the included file
             if trimmed.starts_with("`include") {
-                if let Some(inc_file) = Self::parse_include_path(trimmed) {
+                // §22.4: the filename may come from a text macro
+                // (`include `DEFINED_PATH). Silently dropping the line left
+                // the file un-included and everything downstream undefined.
+                let parsed = Self::parse_include_path(trimmed).or_else(|| {
+                    let expanded = self.expand_macros_once(trimmed);
+                    Self::parse_include_path(expanded.trim())
+                });
+                if parsed.is_none() {
+                    self.errors.push(format!(
+                        "malformed `include directive: {}", trimmed
+                    ));
+                    eprintln!("[PP] error: malformed `include directive: {}", trimmed);
+                }
+                if let Some(inc_file) = parsed {
                     if self.include_depth < MAX_INCLUDE_DEPTH {
                         if let Some(resolved) = self.resolve_include(&inc_file, source_dir.as_deref()) {
                             // Lossy decode — tolerate stray non-UTF-8 bytes in
@@ -797,6 +827,31 @@ impl Preprocessor {
             // flag on first appearance; the test for IEEE 1800-2017
             // §6.10 only needs to fail when implicit-net usage occurs
             // anywhere a `none` directive is in effect.
+            // §22.9 `unconnected_drive pull0|pull1 ... `nounconnected_drive:
+            // record the region; modules declared inside get their
+            // unconnected INPUT ports pulled instead of Z.
+            if trimmed.starts_with("`unconnected_drive") {
+                let arg = trimmed["`unconnected_drive".len()..].trim();
+                match arg.split_whitespace().next() {
+                    Some("pull1") => self.unconnected_pull = Some(true),
+                    Some("pull0") => self.unconnected_pull = Some(false),
+                    other => {
+                        if crate::strict_checks() {
+                            self.push_error_here(format!(
+                                "`unconnected_drive requires pull0 or pull1 (IEEE                                  1800-2017 §22.9), found `{}`",
+                                other.unwrap_or("")
+                            ));
+                        }
+                    }
+                }
+                output.push('\n');
+                continue;
+            }
+            if trimmed.starts_with("`nounconnected_drive") {
+                self.unconnected_pull = None;
+                output.push('\n');
+                continue;
+            }
             if trimmed.starts_with("`default_nettype") {
                 let rest = trimmed.trim_start_matches("`default_nettype").trim();
                 if rest.starts_with("none") {
@@ -884,6 +939,31 @@ impl Preprocessor {
             if Self::is_directive(trimmed, "line") {
                 if crate::strict_checks() {
                     self.check_line_directive(trimmed);
+                }
+                // §22.12: APPLY the override — `__LINE__`/`__FILE__` after
+                // this directive report the VIRTUAL position. (Previously
+                // validated but ignored.) An out-of-range level is tolerated
+                // with a warning, matching reference-tool behavior.
+                let rest = trimmed["`line".len()..].trim();
+                let num_tok = rest.split_whitespace().next().unwrap_or("");
+                if let Ok(n) = num_tok.parse::<u32>() {
+                    let after_num = rest[num_tok.len()..].trim_start();
+                    if let Some(end) =
+                        after_num.strip_prefix('"').and_then(|r| r.find('"'))
+                    {
+                        let fname = &after_num[1..1 + end];
+                        let level = after_num[1 + end + 1..].trim();
+                        if !matches!(level, "0" | "1" | "2") && !crate::strict_checks() {
+                            eprintln!(
+                                "[PP] warning: {}:{}: `line level `{}` is not 0/1/2                                  (IEEE 1800-2017 §22.12) — ignored",
+                                self.current_file, self.current_line, level
+                            );
+                        }
+                        self.current_file = fname.to_string();
+                        // The NEXT source line must read as `n`; the loop
+                        // increments before use.
+                        self.current_line = n.saturating_sub(1);
+                    }
                 }
                 output.push('\n');
                 continue;
@@ -981,6 +1061,9 @@ impl Preprocessor {
                 // the keyword. Standard one-declaration-per-line form (which
                 // black-parrot uses); good enough for timescale association.
                 if let Some(name) = Self::design_element_name(&expanded) {
+                    if let Some(pull1) = self.unconnected_pull {
+                        crate::record_unconnected_drive(&name, pull1);
+                    }
                     // Only record a design element when a `\`timescale` directive
                     // is actually ACTIVE. An entry therefore means "has an
                     // explicit source-level timescale", which the
@@ -1275,6 +1358,19 @@ fn apply_token_pasting(text: &str) -> String {
                     // Stringification: replace with normal quote
                     result.push('\"');
                     i += 2;
+                    continue;
+                }
+                if i + 3 < bytes.len()
+                    && bytes[i + 1] == b'\\'
+                    && bytes[i + 2] == b'`'
+                    && bytes[i + 3] == b'\"'
+                {
+                    // §22.5.1 `\`" — an ESCAPED quote inside the expanded
+                    // string literal. Previously fell into the macro-name
+                    // scan and came out mangled.
+                    result.push('\\');
+                    result.push('\"');
+                    i += 4;
                     continue;
                 }
                 

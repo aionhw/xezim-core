@@ -115,6 +115,25 @@ pub(crate) fn current_class_name() -> Option<String> {
     CLASS_CONTEXT.with(|s| s.borrow().last().cloned())
 }
 
+thread_local! {
+    /// §22.9 `unconnected_drive`: modules declared while the directive is
+    /// active, mapped to `true` for pull1 / `false` for pull0. Recorded by
+    /// the preprocessor, consumed by elaboration when an INPUT port is left
+    /// unconnected (which then reads the pulled value instead of Z).
+    static UNCONNECTED_DRIVE_MODULES: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn record_unconnected_drive(module: &str, pull1: bool) {
+    UNCONNECTED_DRIVE_MODULES.with(|m| {
+        m.borrow_mut().entry(module.to_string()).or_insert(pull1);
+    });
+}
+
+pub fn unconnected_drive_for(module: &str) -> Option<bool> {
+    UNCONNECTED_DRIVE_MODULES.with(|m| m.borrow().get(module).copied())
+}
+
 pub fn set_default_nettype_none_seen(v: bool) {
     DEFAULT_NETTYPE_NONE_SEEN.with(|c| c.set(v));
 }
