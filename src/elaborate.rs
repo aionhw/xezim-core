@@ -611,6 +611,12 @@ pub struct ElaboratedClass {
     /// `foo[i][j]` writes were dropped and `foreach (foo[i,j])` left `j` at X.
     #[serde(default)]
     pub array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)>,
+    /// Fixed-size unpacked-array dimensions for class `localparam` array
+    /// declarations (e.g. `localparam T Rows [3];` → `"Rows"` → `[(0, 2)]`).
+    /// Static constants are excluded from `array_properties` (`!is_static` guard)
+    /// but `foreach` still needs the declared shape for the ForeachTail async path.
+    #[serde(default)]
+    pub localparam_array_dims: HashMap<String, Vec<(i64, i64)>>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -754,6 +760,7 @@ pub fn elaborate_class_with_params(
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
+    let mut localparam_array_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
@@ -1139,6 +1146,20 @@ pub fn elaborate_class_with_params(
                         value: v,
                         type_name: get_type_name(data_type),
                     });
+                    // Record unpacked array dimensions for localparam arrays so
+                    // `foreach_materialize_keys_1d` can produce iteration keys in
+                    // the async (ForeachTail) path.  Static members are excluded
+                    // from `array_properties` (`!is_static` guard), so this is
+                    // the only place the shape is preserved for the runtime.
+                    if !a.dimensions.is_empty() {
+                        let shape: Option<Vec<(i64, i64)>> = a.dimensions
+                            .iter()
+                            .map(|d| extract_array_range(std::slice::from_ref(d), &const_scope))
+                            .collect();
+                        if let Some(shape) = shape {
+                            localparam_array_dims.insert(a.name.name.clone(), shape);
+                        }
+                    }
                 }
             }
         }
@@ -1228,6 +1249,7 @@ pub fn elaborate_class_with_params(
         static_collections,
         array_properties,
         array_nd_properties,
+        localparam_array_dims,
     }
 }
 
