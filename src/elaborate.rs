@@ -5589,6 +5589,18 @@ pub fn elaborate_module_with_defs(
                                 .cloned()
                                 .unwrap_or_else(|| dd.data_type.clone())
                         } else { dd.data_type.clone() };
+                        // Follow the WHOLE typedef chain, not one hop. One hop
+                        // lands on another TypeReference whenever the declared
+                        // type is an ALIAS of a struct typedef — `typedef T T2;
+                        // T2 b;` and, since a nettype registers its own data
+                        // type here, `nettype T wT; wT n;`. The `Struct` arms
+                        // below (notably `register_unpacked_aggregate`) then
+                        // never fired, so the declaration got ONE flat
+                        // container signal instead of per-member leaves: member
+                        // writes had nowhere to land and every member read back
+                        // 0 / x.
+                        let dt_resolved_owned: DataType =
+                            resolve_typedef_chain(&dt_resolved_owned, &elab.typedef_types).clone();
                         let dt_resolved: &DataType = &dt_resolved_owned;
                         // Member dims of a scoped package type reference the
                         // OWNING package's params by bare name (see
