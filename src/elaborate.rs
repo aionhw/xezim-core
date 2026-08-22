@@ -23054,6 +23054,38 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             clock: Box::new(rewrite_expr_impl(clock, prefix, port_map, local_names, interface_map)),
             body: Box::new(rewrite_expr_impl(body, prefix, port_map, local_names, interface_map)),
         },
+        // §10.9.2: an assignment pattern is an EXPRESSION, and its items name
+        // parameters and signals of the module it was written in. Falling
+        // through to `other.clone()` left every one of them unprefixed, so once
+        // the instance was inlined they resolved to nothing in the parent scope
+        // and read 0:
+        //
+        //     module ch #(parameter real P = 3.5) (output S o);
+        //       assign o = '{P, 1.0};        // o.a read 0, not 3.5
+        //
+        // A plain `assign direct = P;` in the same module was always correct,
+        // which is what made this look like a struct bug rather than a
+        // port-rewriting one. Member NAMES in `Named` items are field
+        // identifiers, not references, so only the value side is rewritten; a
+        // `Keyed` item's key IS an expression (associative-array index) and is.
+        ExprKind::AssignmentPattern(items) => ExprKind::AssignmentPattern(
+            items
+                .iter()
+                .map(|it| {
+                    use crate::ast::expr::AssignmentPatternItem as Api;
+                    let rw = |e: &Expression| {
+                        rewrite_expr_impl(e, prefix, port_map, local_names, interface_map)
+                    };
+                    match it {
+                        Api::Ordered(e) => Api::Ordered(rw(e)),
+                        Api::Named(n, e) => Api::Named(n.clone(), rw(e)),
+                        Api::Typed(t, e) => Api::Typed(t.clone(), rw(e)),
+                        Api::Default(e) => Api::Default(rw(e)),
+                        Api::Keyed(k, e) => Api::Keyed(rw(k), rw(e)),
+                    }
+                })
+                .collect(),
+        ),
         other => other.clone(),
     };
     Expression::new(new_kind, expr.span)
