@@ -4104,16 +4104,59 @@ pub fn elaborate_module_with_defs(
     // wraps — without it a `nettype real rn;` net lost `is_real` and read back
     // as the raw f64 bit pattern.
     let mut nettype_info: HashMap<String, (DataType, Option<String>)> = HashMap::default();
-    for item in module.items() {
-        if let ModuleItem::NettypeDeclaration(nd) = item {
-            user_nettypes.insert(nd.name.name.clone());
+    let mut register_nettype =
+        |elab: &mut ElaboratedModule,
+         info: &mut HashMap<String, (DataType, Option<String>)>,
+         seen: &mut HashSet<String>,
+         nd: &crate::ast::decl::NettypeDeclaration,
+         key: String| {
+            seen.insert(key.clone());
             let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-            typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", nd.name.name.clone(), w);
-            elab.typedef_types.insert(nd.name.name.clone(), nd.data_type.clone());
-            nettype_info.insert(
-                nd.name.name.clone(),
+            typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", key.clone(), w);
+            elab.typedef_types.insert(key.clone(), nd.data_type.clone());
+            info.insert(
+                key,
                 (nd.data_type.clone(), nd.resolver.as_ref().map(|r| r.name.clone())),
             );
+        };
+
+    // §6.6.7 + §26.2: a nettype may be declared in a PACKAGE — which is the
+    // natural place for one, since a nettype crossing a port boundary has to be
+    // named identically on both sides. Only `$unit`-scope declarations reached
+    // here (`lib.rs` copies those into every module's item list), so a
+    // package-declared nettype was never registered: its nets were not even
+    // classified as nets, and a second driver failed with the generic
+    // "Variable 'n' has multiple continuous drivers" rather than resolving.
+    //
+    // Registered under the bare name and the qualified `Pkg::name` (§26.3), so
+    // both `import P::*; pnet n;` and `P::pnet n;` resolve. Packages are walked
+    // in sorted order: `all_defs` is a hash map and a module-local declaration
+    // below must be the last writer, so registration order is observable.
+    if let Some(defs) = all_defs {
+        let mut pkg_names: Vec<&String> = defs
+            .iter()
+            .filter(|(_, d)| matches!(d, Definition::Package(_)))
+            .map(|(n, _)| n)
+            .collect();
+        pkg_names.sort();
+        for pname in pkg_names {
+            let Some(Definition::Package(pkg)) = defs.get(pname) else { continue };
+            for item in &pkg.items {
+                if let crate::ast::decl::PackageItem::Nettype(nd) = item {
+                    let bare = nd.name.name.clone();
+                    let qualified = format!("{}::{}", pkg.name.name, bare);
+                    register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, qualified);
+                    register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, bare);
+                }
+            }
+        }
+    }
+
+    // A module-local declaration shadows an imported one, so it registers last.
+    for item in module.items() {
+        if let ModuleItem::NettypeDeclaration(nd) = item {
+            let key = nd.name.name.clone();
+            register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, key);
         }
     }
     // §6.6.7 nettype ALIAS: `nettype T wT; nettype wT wT2;` — a nettype may be
