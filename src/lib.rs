@@ -1976,6 +1976,13 @@ fn parse_and_elaborate(
     elaborate::expand_whole_struct_continuous_assigns(&mut elab);
     // §28.8: bidirectional switches need every terminal's drivers in hand.
     elaborate::resolve_bidirectional_switches(&mut elab);
+    // §6.6.7: fold user-defined nettype drivers — after inlining, so drivers
+    // arriving from several instances through ports resolve together with any
+    // written in the parent. Must precede the bitwise fold below.
+    elaborate::resolve_user_nettype_drivers(&mut elab)?;
+    // §7.2.2: a whole-struct continuous assign that arrived through inlining
+    // still needs splitting into per-member assigns.
+    elaborate::expand_unpacked_struct_assigns(&mut elab);
     // §6.6.1: a net with several continuous drivers resolves them all.
     elaborate::resolve_multi_driver_nets(&mut elab);
     // Link `function ClassName::m(); ...` out-of-class bodies into their
