@@ -585,6 +585,61 @@ pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
         .unwrap_or_default()
 }
 
+/// The preprocessing context `-v`/`-y` indexing ran under: the include dirs
+/// and the macro snapshot taken AFTER the primary sources (so a library file
+/// sees defines from the design, exactly as `index_library_file` did).
+/// Recorded once per run by `resolve_library_modules`; consumed by
+/// `preprocess_adopted_lib` so `--dump-merged-sv` can append library text
+/// with includes/macros resolved instead of raw bytes (raw text broke
+/// standalone re-compiles of the merged file the moment it left the original
+/// directory).
+static ADOPTED_LIB_PP_CONTEXT: std::sync::OnceLock<
+    std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>>,
+> = std::sync::OnceLock::new();
+
+fn adopted_lib_pp_context_cell(
+) -> &'static std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>> {
+    ADOPTED_LIB_PP_CONTEXT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub(crate) fn record_adopted_lib_pp_context(
+    include_dirs: &[String],
+    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+) {
+    if let Ok(mut g) = adopted_lib_pp_context_cell().lock() {
+        *g = Some((
+            include_dirs.to_vec(),
+            lib_defines
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ));
+    }
+}
+
+/// Preprocess one adopted library file exactly as the `-v`/`-y` indexing pass
+/// did: a FRESH preprocessor per file with the recorded include dirs and the
+/// post-primary-source macro snapshot, resolving includes relative to the
+/// file itself. Returns None when no context was recorded (no library pass
+/// ran) or when preprocessing reports errors — callers fall back to the raw
+/// bytes so the merged dump still contains the file either way.
+pub fn preprocess_adopted_lib(path: &std::path::Path) -> Option<String> {
+    let ctx = adopted_lib_pp_context_cell().lock().ok()?.clone()?;
+    let source = std::fs::read_to_string(path).ok()?;
+    let mut pp = preprocessor::Preprocessor::new();
+    for dir in &ctx.0 {
+        pp.add_include_dir(std::path::PathBuf::from(dir));
+    }
+    for (name, def) in &ctx.1 {
+        pp.define(name.clone(), def.clone());
+    }
+    let text = pp.preprocess_file(&source, Some(path));
+    if !pp.errors().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
 static MODULE_TIMESCALE_CLI: std::sync::OnceLock<std::sync::Mutex<ModuleTimescaleCli>> =
     std::sync::OnceLock::new();
 
@@ -2130,6 +2185,9 @@ fn resolve_library_modules(
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
     lib_cli: &LibraryCli,
 ) -> Result<(), String> {
+    // Remember this pass's preprocessing context so --dump-merged-sv can
+    // re-preprocess ADOPTED files identically (see preprocess_adopted_lib).
+    record_adopted_lib_pp_context(include_dirs, lib_defines);
     fn collect_sv_files(
         dir: &std::path::Path,
         exts: &[String],
