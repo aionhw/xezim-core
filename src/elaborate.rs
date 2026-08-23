@@ -15929,7 +15929,7 @@ pub fn inline_instantiations(
     // resolve imported package parameters like black-parrot's `all_cfgs_gp`.
     set_param_fallback(&top_params);
     let mut cache = HashMap::default();
-    inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache, &[])?;
+    inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache, &HashMap::default(), &[])?;
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
@@ -18192,6 +18192,15 @@ fn inline_module_items(
     interface_map: &mut HashMap<String, String>,
     local_params: &HashMap<String, Value>,
     cache: &mut InlinePrepCache,
+    // §23.3.3: THIS instance's formal->actual substitution. The module's own
+    // statements are rewritten through it (via `RewriteCtx`), so a nested
+    // instantiation's connection ACTUALS must be too: without it
+    // `mid(input p); leaf u(.a(p));` connected `leaf.a` to the formal's own
+    // signal (`mid_inst.p`) instead of the parent net, and a driver reaching
+    // the port from inside — a child's output tied to it, which is what a
+    // bound interface's output does — landed on the formal only and never
+    // propagated up to the actual (the parent read `z`).
+    parent_port_map: &HashMap<String, Expression>,
     // §23.10.1 pending `defparam` overrides targeting instances in THIS scope:
     // `(path_segments, value)` where the value was already evaluated in the
     // scope that declared the defparam. Path[0] is a child instance name.
@@ -18509,7 +18518,7 @@ fn inline_module_items(
                             if let PortConnection::Named { name, expr, implicit } = conn {
                                 explicit.insert(name.name.clone());
                                 if let Some(e) = expr {
-                                    let mut rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    let mut rewritten_e = rewrite_expr(e, prefix, parent_port_map, parent_local_names, interface_map);
                                     // Whole-net identity actuals keep the plain
                                     // substitution machinery (port_aliases &
                                     // friends key on un-rooted idents).
@@ -18568,7 +18577,7 @@ fn inline_module_items(
                         for (i, conn) in hi.connections.iter().enumerate() {
                             if let PortConnection::Ordered(expr) = conn {
                                 if let Some(e) = expr {
-                                    let mut rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    let mut rewritten_e = rewrite_expr(e, prefix, parent_port_map, parent_local_names, interface_map);
                                     // See the named-connection site above.
                                     if whole_net_ident_name(&rewritten_e).is_none() {
                                         mark_actual_rooted(&mut rewritten_e);
@@ -21102,7 +21111,7 @@ fn inline_module_items(
                         ));
                     }
                 }
-                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache, &sub_defparams)?;
+                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache, &rewrite_port_map, &sub_defparams)?;
                 iprof_add("recursion", __te.elapsed());
 
                 // Restore typedef entries shadowed by this instance's TYPE
