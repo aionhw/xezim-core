@@ -7060,14 +7060,7 @@ pub fn elaborate_module_with_defs(
                         // regress from "always correct" to silently wrong.
                         // Diagnose at elaboration, where `elab.functions` is
                         // fully populated.
-                        if !resolver_is_declared(&elab, &res_fn) {
-                            return Err(format!(
-                                "nettype '{}' names resolution function '{}', which is not declared \
-                                 (IEEE 1800-2017 6.6.7). Note a package-qualified resolver \
-                                 (`nettype T w with pkg::f;`) is not yet representable.",
-                                ntname, res_fn
-                            ));
-                        }
+                        validate_resolver(&elab, &ntname, &res_fn)?;
                         let items: Vec<crate::ast::expr::AssignmentPatternItem> = rhses
                             .into_iter()
                             .map(crate::ast::expr::AssignmentPatternItem::Ordered)
@@ -11757,15 +11750,88 @@ pub fn is_type_signed(dt: &DataType) -> bool {
     }
 }
 
-/// True when `name` names a declared subroutine reachable as a §6.6.7 nettype
-/// resolution function — either by its bare name, or as a package member
-/// hoisted under a `pkg::name` key.
-fn resolver_is_declared(elab: &ElaboratedModule, name: &str) -> bool {
-    if elab.functions.contains_key(name) {
-        return true;
+/// Look up a §6.6.7 nettype resolution function — by bare name, or as a package
+/// member hoisted under a `pkg::name` key.
+fn lookup_resolver<'a>(
+    elab: &'a ElaboratedModule,
+    name: &str,
+) -> Option<&'a crate::ast::decl::FunctionDeclaration> {
+    if let Some(fd) = elab.functions.get(name) {
+        return Some(fd);
     }
     let suffix = format!("::{}", name);
-    elab.functions.keys().any(|k| k.ends_with(&suffix))
+    let mut keys: Vec<&String> = elab.functions.keys().filter(|k| k.ends_with(&suffix)).collect();
+    keys.sort();
+    keys.first().and_then(|k| elab.functions.get(*k))
+}
+
+/// §6.6.7 constraints on a nettype resolution function, checked at elaboration
+/// where a wrong one can still be reported instead of silently mis-resolving.
+fn validate_resolver(elab: &ElaboratedModule, nettype: &str, name: &str) -> Result<(), String> {
+    // A call to a name that resolves to nothing lands on `eval_call_inner`'s
+    // terminal fallback, which returns `Value::zero(32)` — a misspelled or
+    // out-of-scope resolver would silently drive the net to 0, and
+    // single-driver nets (routed through the resolver too) would regress from
+    // always-correct to silently wrong.
+    let Some(fd) = lookup_resolver(elab, name) else {
+        return Err(format!(
+            "nettype '{}' names resolution function '{}', which is not declared \
+             (IEEE 1800-2017 6.6.7). Note a package-qualified resolver \
+             (`nettype T w with pkg::f;`) is not yet representable.",
+            nettype, name
+        ));
+    };
+
+    // §6.6.7: "the resolution function shall be an automatic function". A
+    // static one leaks the previous call's locals and return value between
+    // resolutions of different nets, which surfaces as a stale value rather
+    // than an error.
+    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic) {
+        return Err(format!(
+            "nettype '{}' resolution function '{}' must be declared `automatic` \
+             (IEEE 1800-2017 6.6.7)",
+            nettype, name
+        ));
+    }
+
+    // §6.6.7: the function takes a single input formal that is an UNPACKED
+    // ARRAY of the nettype's data type. A scalar formal otherwise falls through
+    // to the ordinary scalar call path and receives the drivers concatenated
+    // into one packed value, so the body's `foreach` reads stale state and the
+    // net resolves to a silently wrong value.
+    //
+    // Only checked for an ANSI declaration: a non-ANSI `function f; input T d[];`
+    // parses its ports into the body, leaving `ports` empty, and rejecting that
+    // would be a false positive.
+    if !fd.ports.is_empty() {
+        if fd.ports.len() != 1 {
+            return Err(format!(
+                "nettype '{}' resolution function '{}' takes {} formals; it must take exactly one, \
+                 an unpacked array of the nettype data type (IEEE 1800-2017 6.6.7)",
+                nettype,
+                name,
+                fd.ports.len()
+            ));
+        }
+        let port = &fd.ports[0];
+        if port.dimensions.is_empty() {
+            return Err(format!(
+                "nettype '{}' resolution function '{}' declares formal '{}' as a scalar; it must be \
+                 an unpacked array of the nettype data type, e.g. `input T {} []` \
+                 (IEEE 1800-2017 6.6.7)",
+                nettype, name, port.name.name, port.name.name
+            ));
+        }
+        if !matches!(port.direction, PortDirection::Input) {
+            return Err(format!(
+                "nettype '{}' resolution function '{}' declares formal '{}' as {:?}; it must be an \
+                 `input` (IEEE 1800-2017 6.6.7)",
+                nettype, name, port.name.name, port.direction
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn is_type_real(dt: &DataType) -> bool {
