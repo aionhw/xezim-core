@@ -3962,6 +3962,18 @@ pub fn elaborate_module_with_defs(
                 elab.port_order.push(port.name.name.clone());
                 if port_shape.is_empty() {
                     signals_insert_traced(&mut elab.signals, line!(), port.name.name.clone(), sig);
+                    // §7.2/§23.2.2: a port whose type is an UNPACKED STRUCT is
+                    // stored member-wise, exactly like a variable of the same
+                    // type — the flat container above only carries the width.
+                    // Without the leaves the submodule's own `assign o.a = …`
+                    // had nowhere to land and a member read through the port
+                    // fell back to a raw slice of the container, losing
+                    // `is_real` (a `real` member read back as its f64 BIT
+                    // PATTERN: 9.25 as 4621396905123905536).
+                    if let Some(dt) = &port.data_type {
+                        register_unpacked_aggregate(&mut elab, &port.name.name, dt);
+                        elab.var_decl_types.insert(port.name.name.clone(), dt.clone());
+                    }
                 } else {
                     register_fixed_unpacked_array(
                         &mut elab,
@@ -7098,98 +7110,8 @@ pub fn elaborate_module_with_defs(
         }
     }
 
-    // §7.2.2 / §6.6.7: continuous assignment whose TARGET is an UNPACKED
-    // struct. xezim stores an unpacked struct as one signal per member
-    // (`s.f1`, `s.f2`), so a whole-struct `assign s = <expr>;` had nowhere to
-    // land — every member read back 0. That hit plain struct CAs
-    // (`assign s = '{1.5, 1'b1}`, `assign s = other_struct`) and, once nettype
-    // resolution started emitting `assign n = res('{...})`, every struct-typed
-    // user-defined nettype as well.
-    //
-    // Expand one whole-struct assign into one assign per member:
-    //
-    //     assign s = e;   ->   assign s.f1 = e.f1;  assign s.f2 = e.f2;
-    //
-    // Member-select on an arbitrary RHS (including a call result) is already
-    // supported, so each expanded CA evaluates through existing machinery and
-    // keeps normal dependency tracking. Note the RHS is evaluated once per
-    // member; §6.6.7 requires a resolution function to be side-effect free, so
-    // repeating the call is observationally equivalent (it costs N calls).
-    {
-        let mut expanded: Vec<ContinuousAssignment> = Vec::new();
-        for ca in elab.continuous_assigns.drain(..) {
-            let members = simple_lhs_name(&ca.lhs)
-                .and_then(|n| {
-                    let tn = elab.signals.get(&n).and_then(|s| s.type_name.clone())?;
-                    Some((n, tn))
-                })
-                .and_then(|(n, tn)| {
-                    let dt = elab.typedef_types.get(&tn)?;
-                    match resolve_typedef_chain(dt, &elab.typedef_types) {
-                        // PACKED structs keep a contiguous bit layout that a
-                        // whole-value write already fills correctly; only
-                        // UNPACKED ones are stored per member.
-                        DataType::Struct(su) if !su.packed => {
-                            let mut ms: Vec<String> = Vec::new();
-                            for m in &su.members {
-                                for d in &m.declarators {
-                                    ms.push(d.name.name.clone());
-                                }
-                            }
-                            if ms.is_empty() { None } else { Some((n, ms)) }
-                        }
-                        _ => None,
-                    }
-                });
-            match members {
-                Some((base, ms)) => {
-                    // An ORDERED assignment pattern on the RHS (`'{1.5, 1'b1}`)
-                    // maps position-wise onto the members, so take each item
-                    // directly. Member-selecting the literal instead
-                    // (`'{1.5, 1'b1}.f1`) has no evaluation path and yielded 0.
-                    let pat_items: Option<Vec<Expression>> = match &ca.rhs.kind {
-                        ExprKind::AssignmentPattern(items) if items.len() == ms.len() => items
-                            .iter()
-                            .map(|it| match it {
-                                crate::ast::expr::AssignmentPatternItem::Ordered(e) => {
-                                    Some(e.clone())
-                                }
-                                _ => None,
-                            })
-                            .collect(),
-                        _ => None,
-                    };
-                    for (i, m) in ms.iter().enumerate() {
-                        let mident = Identifier { name: m.clone(), span: Span::dummy() };
-                        let rhs = match &pat_items {
-                            Some(items) => items[i].clone(),
-                            None => Expression {
-                                kind: ExprKind::MemberAccess {
-                                    expr: Box::new(ca.rhs.clone()),
-                                    member: mident.clone(),
-                                },
-                                span: ca.rhs.span,
-                            },
-                        };
-                        expanded.push(ContinuousAssignment {
-                            lhs: Expression {
-                                kind: ExprKind::MemberAccess {
-                                    expr: Box::new(make_ident_expr(&base)),
-                                    member: mident,
-                                },
-                                span: ca.lhs.span,
-                            },
-                            rhs,
-                            delay: ca.delay,
-                            rhs_parent_scoped: ca.rhs_parent_scoped,
-                        });
-                    }
-                }
-                None => expanded.push(ca),
-            }
-        }
-        elab.continuous_assigns = expanded;
-    }
+    // §7.2.2: whole-struct continuous assigns expand member-wise.
+    expand_whole_struct_continuous_assigns(&mut elab);
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
     // or port connections that are not explicitly declared become implicit 1-bit wires.
@@ -14478,6 +14400,129 @@ fn register_array_param(
     true
 }
 
+/// `base.member` as a hierarchical IDENTIFIER when `base` is a whole-net
+/// identifier, falling back to a `MemberAccess` node otherwise.
+///
+/// An inlined instance port is a FLAT signal whose NAME contains dots
+/// (`u1.o`), so `MemberAccess(Ident("u1.o"), a)` has no resolution path — the
+/// member lookup wants a struct object, not a dotted signal key. Appending the
+/// member as a path SEGMENT yields `u1.o.a`, which is exactly the registered
+/// leaf. For an ordinary base (`s`) the two forms resolve identically.
+fn member_ref_expr(base: &Expression, member: &Identifier) -> Expression {
+    if let ExprKind::Ident(h) = &base.kind {
+        if h.root.is_none() && !h.path.is_empty() && h.path.iter().all(|sg| sg.selects.is_empty()) {
+            let mut segs = h.path.clone();
+            segs.push(HierPathSegment {
+                name: member.clone(),
+                selects: Vec::new(),
+            });
+            return Expression::new(
+                ExprKind::Ident(HierarchicalIdentifier {
+                    root: None,
+                    path: segs,
+                    span: base.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                base.span,
+            );
+        }
+    }
+    Expression::new(
+        ExprKind::MemberAccess {
+            expr: Box::new(base.clone()),
+            member: member.clone(),
+        },
+        base.span,
+    )
+}
+
+/// §7.2.2: expand every continuous assignment whose TARGET is an UNPACKED
+/// struct into one assignment per member.
+///
+/// §7.2.2 / §6.6.7: continuous assignment whose TARGET is an UNPACKED
+/// struct. xezim stores an unpacked struct as one signal per member
+/// (`s.f1`, `s.f2`), so a whole-struct `assign s = <expr>;` had nowhere to
+/// land — every member read back 0. That hit plain struct CAs
+/// (`assign s = '{1.5, 1'b1}`, `assign s = other_struct`) and, once nettype
+/// resolution started emitting `assign n = res('{...})`, every struct-typed
+/// user-defined nettype as well.
+///
+/// Expand one whole-struct assign into one assign per member:
+///
+/// ```text
+/// assign s = e;   ->   assign s.f1 = e.f1;  assign s.f2 = e.f2;
+/// ```
+///
+/// Member-select on an arbitrary RHS (including a call result) is already
+/// supported, so each expanded CA evaluates through existing machinery and
+/// keeps normal dependency tracking. Note the RHS is evaluated once per
+/// member; §6.6.7 requires a resolution function to be side-effect free, so
+/// repeating the call is observationally equivalent (it costs N calls).
+pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
+    let mut expanded: Vec<ContinuousAssignment> = Vec::new();
+    for ca in elab.continuous_assigns.drain(..) {
+        let members = simple_lhs_name(&ca.lhs)
+            .and_then(|n| {
+                let tn = elab.signals.get(&n).and_then(|s| s.type_name.clone())?;
+                Some((n, tn))
+            })
+            .and_then(|(n, tn)| {
+                let dt = elab.typedef_types.get(&tn)?;
+                match resolve_typedef_chain(dt, &elab.typedef_types) {
+                    // PACKED structs keep a contiguous bit layout that a
+                    // whole-value write already fills correctly; only
+                    // UNPACKED ones are stored per member.
+                    DataType::Struct(su) if !su.packed => {
+                        let mut ms: Vec<String> = Vec::new();
+                        for m in &su.members {
+                            for d in &m.declarators {
+                                ms.push(d.name.name.clone());
+                            }
+                        }
+                        if ms.is_empty() { None } else { Some((n, ms)) }
+                    }
+                    _ => None,
+                }
+            });
+        match members {
+            Some((base, ms)) => {
+                // An ORDERED assignment pattern on the RHS (`'{1.5, 1'b1}`)
+                // maps position-wise onto the members, so take each item
+                // directly. Member-selecting the literal instead
+                // (`'{1.5, 1'b1}.f1`) has no evaluation path and yielded 0.
+                let pat_items: Option<Vec<Expression>> = match &ca.rhs.kind {
+                    ExprKind::AssignmentPattern(items) if items.len() == ms.len() => items
+                        .iter()
+                        .map(|it| match it {
+                            crate::ast::expr::AssignmentPatternItem::Ordered(e) => {
+                                Some(e.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => None,
+                };
+                for (i, m) in ms.iter().enumerate() {
+                    let mident = Identifier { name: m.clone(), span: Span::dummy() };
+                    let rhs = match &pat_items {
+                        Some(items) => items[i].clone(),
+                        None => member_ref_expr(&ca.rhs, &mident),
+                    };
+                    expanded.push(ContinuousAssignment {
+                        lhs: member_ref_expr(&make_ident_expr(&base), &mident),
+                        rhs,
+                        delay: ca.delay,
+                        rhs_parent_scoped: ca.rhs_parent_scoped,
+                    });
+                }
+            }
+            None => expanded.push(ca),
+        }
+    }
+    elab.continuous_assigns = expanded;
+}
+
 fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &DataType) {
     let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
     let DataType::Struct(su) = resolved else { return };
@@ -19568,6 +19613,13 @@ fn inline_module_items(
                                 }
                             }
                             if port_shape.is_empty() {
+                                // §7.2: unpacked-struct port of an INLINED
+                                // instance — register the member leaves too,
+                                // so `<inst>.<port>.<member>` is a real signal
+                                // (see the module-port arm for the symptom).
+                                if let Some(dt) = &port.data_type {
+                                    register_unpacked_aggregate(elab, &sig_name, dt);
+                                }
                                 signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: port.data_type.as_ref().map(is_type_signed).unwrap_or(false),

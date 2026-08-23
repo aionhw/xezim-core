@@ -1890,6 +1890,11 @@ fn parse_and_elaborate(
     }
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
+    // §7.2/§23.3: port CONNECTIONS are emitted as continuous assigns during
+    // inlining — after the in-module expansion pass — so an unpacked-struct
+    // port connection (`assign s = u1.o;`) arrives here whole. Expand those
+    // member-wise too, or the parent never sees any member of the value.
+    elaborate::expand_whole_struct_continuous_assigns(&mut elab);
     // §28.8: bidirectional switches need every terminal's drivers in hand.
     elaborate::resolve_bidirectional_switches(&mut elab);
     // §6.6.1: a net with several continuous drivers resolves them all.
