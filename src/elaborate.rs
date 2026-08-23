@@ -4097,11 +4097,99 @@ pub fn elaborate_module_with_defs(
     // multiple continuous drivers). Also register each nettype's width as a
     // typedef so TypeReference lookups resolve correctly.
     let mut user_nettypes: HashSet<String> = HashSet::default();
+    // §6.6.7 nettype registry: name -> (data type, resolution function).
+    // The DATA TYPE registration into `typedef_types` is what lets every
+    // existing type-resolving helper (real/signed/two-state detection, struct
+    // field layout, member access) see THROUGH a nettype name to the type it
+    // wraps — without it a `nettype real rn;` net lost `is_real` and read back
+    // as the raw f64 bit pattern.
+    let mut nettype_info: HashMap<String, (DataType, Option<String>)> = HashMap::default();
+    let mut register_nettype =
+        |elab: &mut ElaboratedModule,
+         info: &mut HashMap<String, (DataType, Option<String>)>,
+         seen: &mut HashSet<String>,
+         nd: &crate::ast::decl::NettypeDeclaration,
+         key: String| {
+            seen.insert(key.clone());
+            let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+            typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", key.clone(), w);
+            elab.typedef_types.insert(key.clone(), nd.data_type.clone());
+            info.insert(
+                key,
+                (nd.data_type.clone(), nd.resolver.as_ref().map(|r| r.name.clone())),
+            );
+        };
+
+    // §6.6.7 + §26.2: a nettype may be declared in a PACKAGE — which is the
+    // natural place for one, since a nettype crossing a port boundary has to be
+    // named identically on both sides. Only `$unit`-scope declarations reached
+    // here (`lib.rs` copies those into every module's item list), so a
+    // package-declared nettype was never registered: its nets were not even
+    // classified as nets, and a second driver failed with the generic
+    // "Variable 'n' has multiple continuous drivers" rather than resolving.
+    //
+    // Registered under the bare name and the qualified `Pkg::name` (§26.3), so
+    // both `import P::*; pnet n;` and `P::pnet n;` resolve. Packages are walked
+    // in sorted order: `all_defs` is a hash map and a module-local declaration
+    // below must be the last writer, so registration order is observable.
+    if let Some(defs) = all_defs {
+        let mut pkg_names: Vec<&String> = defs
+            .iter()
+            .filter(|(_, d)| matches!(d, Definition::Package(_)))
+            .map(|(n, _)| n)
+            .collect();
+        pkg_names.sort();
+        for pname in pkg_names {
+            let Some(Definition::Package(pkg)) = defs.get(pname) else { continue };
+            for item in &pkg.items {
+                if let crate::ast::decl::PackageItem::Nettype(nd) = item {
+                    let bare = nd.name.name.clone();
+                    let qualified = format!("{}::{}", pkg.name.name, bare);
+                    register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, qualified);
+                    register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, bare);
+                }
+            }
+        }
+    }
+
+    // A module-local declaration shadows an imported one, so it registers last.
     for item in module.items() {
         if let ModuleItem::NettypeDeclaration(nd) = item {
-            user_nettypes.insert(nd.name.name.clone());
-            let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-            typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", nd.name.name.clone(), w);
+            let key = nd.name.name.clone();
+            register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, key);
+        }
+    }
+    // §6.6.7 nettype ALIAS: `nettype T wT; nettype wT wT2;` — a nettype may be
+    // declared from another nettype name, inheriting its data type AND its
+    // resolution function. Resolve transitively (bounded, so a malformed cycle
+    // diagnoses instead of hanging).
+    for _ in 0..64 {
+        let mut changed = false;
+        let aliases: Vec<(String, String)> = nettype_info
+            .iter()
+            .filter_map(|(n, (dt, res))| match dt {
+                DataType::TypeReference { name, .. }
+                    if res.is_none() && nettype_info.contains_key(&name.name.name) =>
+                {
+                    Some((n.clone(), name.name.name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (alias, target) in aliases {
+            if alias == target {
+                continue;
+            }
+            if let Some((tdt, tres)) = nettype_info.get(&target).cloned() {
+                if tres.is_some() || !matches!(tdt, DataType::TypeReference { .. }) {
+                    nettype_info.insert(alias.clone(), (tdt.clone(), tres));
+                    elab.typedef_types.insert(alias, tdt);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
@@ -4854,7 +4942,7 @@ pub fn elaborate_module_with_defs(
                         && !elab.parameters.contains_key(&decl.name.name)
                     {
                         let explicit_type = !matches!(dd.data_type, DataType::Implicit { .. });
-                        let decl_is_real = is_type_real(&dd.data_type);
+                        let decl_is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                         let existing = elab.signals.get_mut(&decl.name.name).unwrap();
                         if explicit_type {
                             if let Some(pats) = signal_trace_patterns() {
@@ -5487,7 +5575,7 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     } else {
-                        let is_real = is_type_real(&dd.data_type);
+                        let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                         let w = width;
                         let (init_val, procedural_init) = if let Some(init_expr) = &decl.init {
                             if is_const_expr(init_expr, &elab.parameters) {
@@ -5589,6 +5677,18 @@ pub fn elaborate_module_with_defs(
                                 .cloned()
                                 .unwrap_or_else(|| dd.data_type.clone())
                         } else { dd.data_type.clone() };
+                        // Follow the WHOLE typedef chain, not one hop. One hop
+                        // lands on another TypeReference whenever the declared
+                        // type is an ALIAS of a struct typedef — `typedef T T2;
+                        // T2 b;` and, since a nettype registers its own data
+                        // type here, `nettype T wT; wT n;`. The `Struct` arms
+                        // below (notably `register_unpacked_aggregate`) then
+                        // never fired, so the declaration got ONE flat
+                        // container signal instead of per-member leaves: member
+                        // writes had nowhere to land and every member read back
+                        // 0 / x.
+                        let dt_resolved_owned: DataType =
+                            resolve_typedef_chain(&dt_resolved_owned, &elab.typedef_types).clone();
                         let dt_resolved: &DataType = &dt_resolved_owned;
                         // Member dims of a scoped package type reference the
                         // OWNING package's params by bare name (see
@@ -6899,47 +6999,196 @@ pub fn elaborate_module_with_defs(
     // collapses the whole bus to ONE BIT. The only symptom is a width warning;
     // the design then simulates wrongly. A reference simulator resolves the
     // declarations order-independently.
-    // User-defined nettype driver resolution: collapse multiple continuous
-    // drivers on a nettype variable into a single OR-combined assign. This
-    // approximates the common `resolve_or` resolver; other resolvers are not
-    // modeled, so last-driver-wins behavior applies via the final `|` fold.
+    // §6.6.7 user-defined nettype driver resolution. Every continuous driver of
+    // a nettype net is collected and the net's RESOLUTION FUNCTION is called
+    // once with the whole driver set:
+    //
+    //     assign n = d0;  assign n = d1;   ->   assign n = res('{d0, d1});
+    //
+    // Rewriting to a Call (rather than resolving here) keeps the existing
+    // continuous-assign dependency tracking intact: the synthesized RHS names
+    // every driver expression, so the resolver re-runs whenever any driver
+    // changes, at every time step, exactly like any other CA.
+    //
+    // This replaced a hardcoded BitOr fold that never invoked the declared
+    // resolver at all — `resolve_or` passed by coincidence, while AND/XOR/
+    // custom and every struct- or real-valued resolver produced wrong values.
     {
-        let mut nettype_vars: HashSet<String> = HashSet::default();
+        // net name -> nettype name, so each net finds its own resolver.
+        let mut nettype_vars: HashMap<String, String> = HashMap::default();
         for (name, sig) in &elab.signals {
             if let Some(tn) = &sig.type_name {
-                if user_nettypes.contains(tn) { nettype_vars.insert(name.clone()); }
+                if user_nettypes.contains(tn) {
+                    nettype_vars.insert(name.clone(), tn.clone());
+                }
             }
         }
         if !nettype_vars.is_empty() {
             let mut grouped: HashMap<String, Vec<Expression>> = HashMap::default();
+            let mut order: Vec<String> = Vec::new();
             let mut kept: Vec<ContinuousAssignment> = Vec::new();
             for ca in elab.continuous_assigns.drain(..) {
                 if let Some(n) = simple_lhs_name(&ca.lhs) {
-                    if nettype_vars.contains(&n) {
+                    if nettype_vars.contains_key(&n) {
+                        if !grouped.contains_key(&n) {
+                            order.push(n.clone());
+                        }
                         grouped.entry(n).or_default().push(ca.rhs);
                         continue;
                     }
                 }
                 kept.push(ca);
             }
-            for (name, rhses) in grouped {
-                let mut iter = rhses.into_iter();
-                let mut acc = iter.next().unwrap();
-                for rhs in iter {
-                    let span = acc.span;
-                    acc = Expression {
-                        kind: ExprKind::Binary {
-                            op: crate::ast::expr::BinaryOp::BitOr,
-                            left: Box::new(acc),
-                            right: Box::new(rhs),
-                        },
-                        span,
-                    };
-                }
+            // Deterministic order: HashMap iteration is randomized and the
+            // emitted CA order is observable through settle ordering.
+            for name in order {
+                let rhses = grouped.remove(&name).unwrap();
+                let ntname = nettype_vars[&name].clone();
+                let resolver = nettype_info.get(&ntname).and_then(|(_, r)| r.clone());
+                let span = rhses[0].span;
+                let acc = match resolver {
+                    Some(res_fn) => {
+                        // §6.6.7: the resolution function has to exist. A call
+                        // to a name that resolves to nothing lands on
+                        // `eval_call_inner`'s terminal fallback, which returns
+                        // `Value::zero(32)` — so a misspelled or out-of-scope
+                        // resolver would silently drive the net to 0 with no
+                        // diagnostic, indistinguishable from a legitimate zero.
+                        //
+                        // The blast radius is wider than it looks: single-driver
+                        // nets route through the resolver too, so they would
+                        // regress from "always correct" to silently wrong.
+                        // Diagnose at elaboration, where `elab.functions` is
+                        // fully populated.
+                        validate_resolver(&elab, &ntname, &res_fn)?;
+                        let items: Vec<crate::ast::expr::AssignmentPatternItem> = rhses
+                            .into_iter()
+                            .map(crate::ast::expr::AssignmentPatternItem::Ordered)
+                            .collect();
+                        let arr = Expression {
+                            kind: ExprKind::AssignmentPattern(items),
+                            span,
+                        };
+                        Expression {
+                            kind: ExprKind::Call {
+                                func: Box::new(make_ident_expr(&res_fn)),
+                                args: vec![arr],
+                            },
+                            span,
+                        }
+                    }
+                    None => {
+                        // §6.6.7: a nettype declared WITHOUT a resolution
+                        // function may have at most one driver. More than one
+                        // is a hard error, not a silent fold.
+                        if rhses.len() > 1 {
+                            return Err(format!(
+                                "net '{}' of unresolved nettype '{}' has {} continuous drivers; a nettype declared without a resolution function permits only one (IEEE 1800-2017 6.6.7)",
+                                name,
+                                ntname,
+                                rhses.len()
+                            ));
+                        }
+                        rhses.into_iter().next().unwrap()
+                    }
+                };
                 kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0, rhs_parent_scoped: false });
             }
             elab.continuous_assigns = kept;
         }
+    }
+
+    // §7.2.2 / §6.6.7: continuous assignment whose TARGET is an UNPACKED
+    // struct. xezim stores an unpacked struct as one signal per member
+    // (`s.f1`, `s.f2`), so a whole-struct `assign s = <expr>;` had nowhere to
+    // land — every member read back 0. That hit plain struct CAs
+    // (`assign s = '{1.5, 1'b1}`, `assign s = other_struct`) and, once nettype
+    // resolution started emitting `assign n = res('{...})`, every struct-typed
+    // user-defined nettype as well.
+    //
+    // Expand one whole-struct assign into one assign per member:
+    //
+    //     assign s = e;   ->   assign s.f1 = e.f1;  assign s.f2 = e.f2;
+    //
+    // Member-select on an arbitrary RHS (including a call result) is already
+    // supported, so each expanded CA evaluates through existing machinery and
+    // keeps normal dependency tracking. Note the RHS is evaluated once per
+    // member; §6.6.7 requires a resolution function to be side-effect free, so
+    // repeating the call is observationally equivalent (it costs N calls).
+    {
+        let mut expanded: Vec<ContinuousAssignment> = Vec::new();
+        for ca in elab.continuous_assigns.drain(..) {
+            let members = simple_lhs_name(&ca.lhs)
+                .and_then(|n| {
+                    let tn = elab.signals.get(&n).and_then(|s| s.type_name.clone())?;
+                    Some((n, tn))
+                })
+                .and_then(|(n, tn)| {
+                    let dt = elab.typedef_types.get(&tn)?;
+                    match resolve_typedef_chain(dt, &elab.typedef_types) {
+                        // PACKED structs keep a contiguous bit layout that a
+                        // whole-value write already fills correctly; only
+                        // UNPACKED ones are stored per member.
+                        DataType::Struct(su) if !su.packed => {
+                            let mut ms: Vec<String> = Vec::new();
+                            for m in &su.members {
+                                for d in &m.declarators {
+                                    ms.push(d.name.name.clone());
+                                }
+                            }
+                            if ms.is_empty() { None } else { Some((n, ms)) }
+                        }
+                        _ => None,
+                    }
+                });
+            match members {
+                Some((base, ms)) => {
+                    // An ORDERED assignment pattern on the RHS (`'{1.5, 1'b1}`)
+                    // maps position-wise onto the members, so take each item
+                    // directly. Member-selecting the literal instead
+                    // (`'{1.5, 1'b1}.f1`) has no evaluation path and yielded 0.
+                    let pat_items: Option<Vec<Expression>> = match &ca.rhs.kind {
+                        ExprKind::AssignmentPattern(items) if items.len() == ms.len() => items
+                            .iter()
+                            .map(|it| match it {
+                                crate::ast::expr::AssignmentPatternItem::Ordered(e) => {
+                                    Some(e.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => None,
+                    };
+                    for (i, m) in ms.iter().enumerate() {
+                        let mident = Identifier { name: m.clone(), span: Span::dummy() };
+                        let rhs = match &pat_items {
+                            Some(items) => items[i].clone(),
+                            None => Expression {
+                                kind: ExprKind::MemberAccess {
+                                    expr: Box::new(ca.rhs.clone()),
+                                    member: mident.clone(),
+                                },
+                                span: ca.rhs.span,
+                            },
+                        };
+                        expanded.push(ContinuousAssignment {
+                            lhs: Expression {
+                                kind: ExprKind::MemberAccess {
+                                    expr: Box::new(make_ident_expr(&base)),
+                                    member: mident,
+                                },
+                                span: ca.lhs.span,
+                            },
+                            rhs,
+                            delay: ca.delay,
+                            rhs_parent_scoped: ca.rhs_parent_scoped,
+                        });
+                    }
+                }
+                None => expanded.push(ca),
+            }
+        }
+        elab.continuous_assigns = expanded;
     }
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
@@ -11501,8 +11750,126 @@ pub fn is_type_signed(dt: &DataType) -> bool {
     }
 }
 
+/// Look up a §6.6.7 nettype resolution function — by bare name, or as a package
+/// member hoisted under a `pkg::name` key.
+fn lookup_resolver<'a>(
+    elab: &'a ElaboratedModule,
+    name: &str,
+) -> Option<&'a crate::ast::decl::FunctionDeclaration> {
+    if let Some(fd) = elab.functions.get(name) {
+        return Some(fd);
+    }
+    let suffix = format!("::{}", name);
+    let mut keys: Vec<&String> = elab.functions.keys().filter(|k| k.ends_with(&suffix)).collect();
+    keys.sort();
+    keys.first().and_then(|k| elab.functions.get(*k))
+}
+
+/// §6.6.7 constraints on a nettype resolution function, checked at elaboration
+/// where a wrong one can still be reported instead of silently mis-resolving.
+fn validate_resolver(elab: &ElaboratedModule, nettype: &str, name: &str) -> Result<(), String> {
+    // A call to a name that resolves to nothing lands on `eval_call_inner`'s
+    // terminal fallback, which returns `Value::zero(32)` — a misspelled or
+    // out-of-scope resolver would silently drive the net to 0, and
+    // single-driver nets (routed through the resolver too) would regress from
+    // always-correct to silently wrong.
+    let Some(fd) = lookup_resolver(elab, name) else {
+        return Err(format!(
+            "nettype '{}' names resolution function '{}', which is not declared \
+             (IEEE 1800-2017 6.6.7). Note a package-qualified resolver \
+             (`nettype T w with pkg::f;`) is not yet representable.",
+            nettype, name
+        ));
+    };
+
+    // §6.6.7: "the resolution function shall be an automatic function". A
+    // static one leaks the previous call's locals and return value between
+    // resolutions of different nets, which surfaces as a stale value rather
+    // than an error.
+    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic) {
+        return Err(format!(
+            "nettype '{}' resolution function '{}' must be declared `automatic` \
+             (IEEE 1800-2017 6.6.7)",
+            nettype, name
+        ));
+    }
+
+    // §6.6.7: the function takes a single input formal that is an UNPACKED
+    // ARRAY of the nettype's data type. A scalar formal otherwise falls through
+    // to the ordinary scalar call path and receives the drivers concatenated
+    // into one packed value, so the body's `foreach` reads stale state and the
+    // net resolves to a silently wrong value.
+    //
+    // Only checked for an ANSI declaration: a non-ANSI `function f; input T d[];`
+    // parses its ports into the body, leaving `ports` empty, and rejecting that
+    // would be a false positive.
+    if !fd.ports.is_empty() {
+        if fd.ports.len() != 1 {
+            return Err(format!(
+                "nettype '{}' resolution function '{}' takes {} formals; it must take exactly one, \
+                 an unpacked array of the nettype data type (IEEE 1800-2017 6.6.7)",
+                nettype,
+                name,
+                fd.ports.len()
+            ));
+        }
+        let port = &fd.ports[0];
+        if port.dimensions.is_empty() {
+            return Err(format!(
+                "nettype '{}' resolution function '{}' declares formal '{}' as a scalar; it must be \
+                 an unpacked array of the nettype data type, e.g. `input T {} []` \
+                 (IEEE 1800-2017 6.6.7)",
+                nettype, name, port.name.name, port.name.name
+            ));
+        }
+        if !matches!(port.direction, PortDirection::Input) {
+            return Err(format!(
+                "nettype '{}' resolution function '{}' declares formal '{}' as {:?}; it must be an \
+                 `input` (IEEE 1800-2017 6.6.7)",
+                nettype, name, port.name.name, port.direction
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn is_type_real(dt: &DataType) -> bool {
     matches!(dt, DataType::Real { .. })
+}
+
+/// `is_type_real` that resolves a type reference through the typedef/nettype
+/// table, so `nettype real rn; rn n;` (and `typedef real r_t; r_t v;`) mark the
+/// signal `is_real`. Without this a real-typed NET kept `is_real == false` and
+/// read back as its raw f64 bit pattern (3.5 printed as 4615063718147915776).
+/// Same bounded iterative walk as `is_type_signed_resolved` — a malformed
+/// typedef cycle must diagnose, never overflow the stack.
+pub fn is_type_real_resolved(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> bool {
+    let mut cur = dt;
+    for _ in 0..64 {
+        if matches!(cur, DataType::Real { .. }) {
+            return true;
+        }
+        let DataType::TypeReference { name, .. } = cur else { break };
+        let key = &name.name.name;
+        let inner = name
+            .scope
+            .as_ref()
+            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, key)))
+            .or_else(|| typedef_types.get(key));
+        match inner {
+            Some(next)
+                if !matches!(next, DataType::TypeReference { name: n, .. } if &n.name.name == key) =>
+            {
+                cur = next
+            }
+            _ => break,
+        }
+    }
+    is_type_real(cur)
 }
 
 /// `is_type_signed` that resolves a typedef reference (`typedef logic signed
@@ -15357,7 +15724,7 @@ pub fn inline_instantiations(
                                         elab.packed_full_dims.entry(decl.name.name.clone()).or_insert(fd);
                                     }
                                     let w = width.max(1);
-                                    let is_real = is_type_real(&dd.data_type);
+                                    let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                                     // `C c = new;` cannot const-evaluate — run
                                     // it as a static init (same machinery the
                                     // array initializers use) so `P::c.f1()`
@@ -19804,7 +20171,7 @@ fn inline_module_items(
                                     && !elab.parameters.contains_key(&sig_name)
                                 {
                                     let explicit_type = !matches!(dd.data_type, DataType::Implicit { .. });
-                                    let decl_is_real = is_type_real(&dd.data_type);
+                                    let decl_is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                                     let existing = elab.signals.get_mut(&sig_name).unwrap();
                                     if explicit_type {
                                         if let Some(pats) = signal_trace_patterns() {
@@ -23648,7 +24015,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                                 };
                                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
-                                let is_real = is_type_real(&dd.data_type);
+                                let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                                 for decl in &dd.declarators {
                                     if &decl.name.name == sym_name {
                                         let v = if let Some(init) = &decl.init {
@@ -23847,7 +24214,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                             };
                             let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
-                            let is_real = is_type_real(&dd.data_type);
+                            let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                             // Register the packed-struct field layout for an
                             // imported struct variable so a package subroutine's
                             // member write (`s.v = ...` in an imported task)
