@@ -388,6 +388,25 @@ pub fn set_implicit_net_warn(on: bool) {
     IMPLICIT_NET_WARN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `--strict-top`: a `-s <name>` that names no known module is an ERROR
+/// instead of a warning plus auto-detection of the hierarchy root.
+///
+/// The lenient default exists to recover from wrong `:top_module:` values in
+/// generated corpora (sv-tests' veer-el2 names a module that does not exist),
+/// and there is no way to tell that case apart from a plain typo — both are
+/// "named top absent, other modules present". So the strictness is opt-in:
+/// scripted flows that key success off the exit status turn it on and get a
+/// nonzero exit, while the corpus keeps running (xezim#107).
+static STRICT_TOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_strict_top(on: bool) {
+    STRICT_TOP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn strict_top() -> bool {
+    STRICT_TOP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `--verbose`: per-file compile progress — which file is being parsed and
 /// which definitions it contributed to the working library. The point is
 /// debuggability of big `-f` builds ("did my testbench actually get compiled,
@@ -1349,12 +1368,27 @@ fn parse_and_elaborate(
     // definition or the specialized instance would miss it (the reference
     // applies module binds to path-specialized instances too).
     let mut bind_spec_counter = 0usize;
+    // A bind whose target definition is not in `definitions` YET is deferred,
+    // not dropped: `-v`/`-y` library modules are adopted further below
+    // (`resolve_library_modules`), so a bind reaching THROUGH a library module
+    // — `bind tb.u_lib_inst.u_sub chk c();` where `u_lib_inst`'s type lives in
+    // a `-v` file — resolved against a half-populated map and was silently
+    // ignored. Exactly the same source passes when the library file is given
+    // as an ordinary source, which is what made this look like a path bug.
+    // Both passes below record their failures; the retry after library
+    // adoption re-runs only those, and only IT reports a diagnostic.
+    let mut deferred_module_binds: Vec<&ast::decl::BindDirective> = Vec::new();
+    let mut deferred_path_binds: Vec<(&ast::decl::BindDirective, Vec<ast::Identifier>)> =
+        Vec::new();
     for b in &top_level_binds {
         if b.target_path.len() >= 2 {
             continue;
         }
         let tname = b.target_module.name.clone();
-        let Some(def) = definitions.get_mut(&tname) else { continue };
+        let Some(def) = definitions.get_mut(&tname) else {
+            deferred_module_binds.push(b);
+            continue;
+        };
         if let SourceDefinition::Module(m) = def {
             let m = Rc::make_mut(m);
             m.items.push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
@@ -1362,9 +1396,10 @@ fn parse_and_elaborate(
     }
     for b in &top_level_binds {
         if b.target_path.len() >= 2 {
-            apply_instance_bind(&mut definitions, b, &b.target_path, &mut bind_spec_counter);
-            for extra in &b.extra_paths {
-                apply_instance_bind(&mut definitions, b, extra, &mut bind_spec_counter);
+            for p in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
+                if !apply_instance_bind(&mut definitions, b, p, &mut bind_spec_counter, true) {
+                    deferred_path_binds.push((b, p.clone()));
+                }
             }
         } else if !b.target_path.is_empty() {
             // Colon form with a SINGLE-segment instance name: an instance of
@@ -1372,7 +1407,9 @@ fn parse_and_elaborate(
             // every top-level module definition that instantiates it.
             for extra in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
                 let full = extra.clone();
-                apply_instance_bind(&mut definitions, b, &full, &mut bind_spec_counter);
+                if !apply_instance_bind(&mut definitions, b, &full, &mut bind_spec_counter, true) {
+                    deferred_path_binds.push((b, full));
+                }
             }
         }
     }
@@ -1569,6 +1606,28 @@ fn parse_and_elaborate(
                 }
             }
         }
+    }
+
+    // §23.11 + §23.3.2: apply the binds deferred above. Their targets may
+    // only have become visible with the `-v`/`-y` library modules adopted
+    // just now; anything STILL unresolvable is a genuine bad path and reports
+    // here (the first pass stays quiet so a library-provided target does not
+    // produce a spurious warning).
+    for b in deferred_module_binds.drain(..) {
+        let tname = b.target_module.name.clone();
+        if let Some(SourceDefinition::Module(m)) = definitions.get_mut(&tname) {
+            let m = Rc::make_mut(m);
+            m.items
+                .push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
+        } else {
+            eprintln!(
+                "[elab] bind target module '{}' is not a module definition; bind ignored",
+                tname
+            );
+        }
+    }
+    for (b, p) in deferred_path_binds.drain(..) {
+        apply_instance_bind(&mut definitions, b, &p, &mut bind_spec_counter, false);
     }
 
     // §6.18 + §3.12.1: a $unit typedef's DIMENSIONS are evaluated in the
@@ -1768,6 +1827,26 @@ fn parse_and_elaborate(
         // veer-el2 specifies `veer-el2_wrapper`, but the module is
         // `el2_veer_wrapper`).
         if let Some(name) = top_module_name {
+            if strict_top() {
+                let mut known: Vec<&str> = definitions
+                    .iter()
+                    .filter(|(n, d)| {
+                        explicit_def_names.contains(n.as_str())
+                            && !matches!(d, SourceDefinition::Typedef(_) | SourceDefinition::Udp(_))
+                    })
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                known.sort_unstable();
+                return Err(format!(
+                    "top module '{}' not found (--strict-top); known top-level definitions: {}",
+                    name,
+                    if known.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            }
             eprintln!("[xezim][warning] top module '{}' not found; auto-detecting the design root", name);
         }
         let mut instantiated: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2014,27 +2093,35 @@ fn apply_instance_bind(
     b: &ast::decl::BindDirective,
     path: &[ast::Identifier],
     counter: &mut usize,
-) {
+    quiet: bool,
+) -> bool {
     let segs: Vec<&str> = path.iter().map(|i| i.name.as_str()).collect();
     let root = segs[0];
     if !matches!(definitions.get(root), Some(SourceDefinition::Module(_))) {
-        eprintln!(
-            "[elab] bind target path '{}' does not start at a module definition; bind ignored",
-            segs.join(".")
-        );
-        return;
+        if !quiet {
+            eprintln!(
+                "[elab] bind target path '{}' does not start at a module definition; bind ignored",
+                segs.join(".")
+            );
+        }
+        return false;
     }
     // Resolve the spine: (parent_def_name, instance_name, child_def_name).
     let mut spine: Vec<(String, String, String)> = Vec::new();
     let mut cur = root.to_string();
     for seg in &segs[1..] {
         let Some(SourceDefinition::Module(m)) = definitions.get(&cur) else {
-            eprintln!(
-                "[elab] bind target path '{}': '{}' is not a module; bind ignored",
-                segs.join("."),
-                cur
-            );
-            return;
+            // Not necessarily fatal on the FIRST pass: the definition may be
+            // a `-v`/`-y` library module that has not been adopted yet (see
+            // the deferred retry after `resolve_library_modules`).
+            if !quiet {
+                eprintln!(
+                    "[elab] bind target path '{}': '{}' is not a module; bind ignored",
+                    segs.join("."),
+                    cur
+                );
+            }
+            return false;
         };
         let child = m.items.iter().find_map(|it| match it {
             ast::decl::ModuleItem::ModuleInstantiation(mi)
@@ -2045,13 +2132,15 @@ fn apply_instance_bind(
             _ => None,
         });
         let Some(child) = child else {
-            eprintln!(
-                "[elab] bind target path '{}': no instance '{}' in module '{}'; bind ignored",
-                segs.join("."),
-                seg,
-                cur
-            );
-            return;
+            if !quiet {
+                eprintln!(
+                    "[elab] bind target path '{}': no instance '{}' in module '{}'; bind ignored",
+                    segs.join("."),
+                    seg,
+                    cur
+                );
+            }
+            return false;
         };
         spine.push((cur.clone(), (*seg).to_string(), child.clone()));
         cur = child;
@@ -2062,7 +2151,7 @@ fn apply_instance_bind(
     let target_def = cur;
     let spec_of = |base: &str| format!("{base}__bind{n}");
     let Some(SourceDefinition::Module(tm)) = definitions.get(&target_def) else {
-        return;
+        return false;
     };
     let mut tclone = (**tm).clone();
     tclone.name.name = spec_of(&target_def);
@@ -2077,7 +2166,7 @@ fn apply_instance_bind(
     for (level, (parent, inst_name, child_def)) in spine.iter().enumerate().rev() {
         let is_root = level == 0;
         let Some(SourceDefinition::Module(pm)) = definitions.get(parent) else {
-            return;
+            return false;
         };
         let mut pclone = (**pm).clone();
         if !is_root {
@@ -2124,6 +2213,7 @@ fn apply_instance_bind(
         definitions.insert(key.clone(), SourceDefinition::Module(Rc::new(pclone)));
         child_spec = key;
     }
+    true
 }
 
 fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::collections::HashSet<String>) {
