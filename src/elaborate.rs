@@ -14437,6 +14437,80 @@ fn member_ref_expr(base: &Expression, member: &Identifier) -> Expression {
     )
 }
 
+/// Emit one continuous assign per LEAF of an unpacked struct, recursing into
+/// members that are themselves unpacked structs.
+///
+/// A single-level expansion is not enough: `assign nn = <expr>;` where member
+/// `nn.inner` is itself a struct produced `assign nn.inner = <expr>.inner;`,
+/// and THAT has nowhere to land either — `nn.inner` is not a stored signal
+/// (only its leaves are), and the pass had already moved past it, so a nested
+/// member read back 0 while sibling scalar members were correct.
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_member_assigns(
+    lhs_base: &Expression,
+    rhs: &Expression,
+    su: &crate::ast::types::StructUnionType,
+    ca: &ContinuousAssignment,
+    typedef_types: &HashMap<String, DataType>,
+    out: &mut Vec<ContinuousAssignment>,
+    depth: u32,
+) {
+    // Bounded against a malformed self-referential typedef.
+    if depth > 16 {
+        out.push(ContinuousAssignment {
+            lhs: lhs_base.clone(),
+            rhs: rhs.clone(),
+            delay: ca.delay,
+            rhs_parent_scoped: ca.rhs_parent_scoped,
+        });
+        return;
+    }
+    // Flat (member, declared type) list in declaration order — the order an
+    // ORDERED assignment pattern maps onto position-wise.
+    let mut flat: Vec<(String, DataType)> = Vec::new();
+    for m in &su.members {
+        for d in &m.declarators {
+            flat.push((d.name.name.clone(), m.data_type.clone()));
+        }
+    }
+    // An ORDERED assignment pattern on the RHS (`'{1.5, 1'b1}`) maps
+    // position-wise onto the members, so take each item directly.
+    // Member-selecting the literal instead (`'{1.5, 1'b1}.f1`) has no
+    // evaluation path and yielded 0.
+    let pat_items: Option<Vec<Expression>> = match &rhs.kind {
+        ExprKind::AssignmentPattern(items) if items.len() == flat.len() => items
+            .iter()
+            .map(|it| match it {
+                crate::ast::expr::AssignmentPatternItem::Ordered(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    };
+    for (i, (mname, mdt)) in flat.iter().enumerate() {
+        let mident = Identifier { name: mname.clone(), span: Span::dummy() };
+        let mlhs = member_ref_expr(lhs_base, &mident);
+        let mrhs = match &pat_items {
+            Some(items) => items[i].clone(),
+            None => member_ref_expr(rhs, &mident),
+        };
+        match resolve_typedef_chain(mdt, typedef_types) {
+            DataType::Struct(inner) if !inner.packed && !inner.members.is_empty() => {
+                let inner = inner.clone();
+                emit_struct_member_assigns(
+                    &mlhs, &mrhs, &inner, ca, typedef_types, out, depth + 1,
+                );
+            }
+            _ => out.push(ContinuousAssignment {
+                lhs: mlhs,
+                rhs: mrhs,
+                delay: ca.delay,
+                rhs_parent_scoped: ca.rhs_parent_scoped,
+            }),
+        }
+    }
+}
+
 /// §7.2.2: expand every continuous assignment whose TARGET is an UNPACKED
 /// struct into one assignment per member.
 ///
@@ -14473,49 +14547,23 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
                     // PACKED structs keep a contiguous bit layout that a
                     // whole-value write already fills correctly; only
                     // UNPACKED ones are stored per member.
-                    DataType::Struct(su) if !su.packed => {
-                        let mut ms: Vec<String> = Vec::new();
-                        for m in &su.members {
-                            for d in &m.declarators {
-                                ms.push(d.name.name.clone());
-                            }
-                        }
-                        if ms.is_empty() { None } else { Some((n, ms)) }
+                    DataType::Struct(su) if !su.packed && !su.members.is_empty() => {
+                        Some((n, su.clone()))
                     }
                     _ => None,
                 }
             });
         match members {
-            Some((base, ms)) => {
-                // An ORDERED assignment pattern on the RHS (`'{1.5, 1'b1}`)
-                // maps position-wise onto the members, so take each item
-                // directly. Member-selecting the literal instead
-                // (`'{1.5, 1'b1}.f1`) has no evaluation path and yielded 0.
-                let pat_items: Option<Vec<Expression>> = match &ca.rhs.kind {
-                    ExprKind::AssignmentPattern(items) if items.len() == ms.len() => items
-                        .iter()
-                        .map(|it| match it {
-                            crate::ast::expr::AssignmentPatternItem::Ordered(e) => {
-                                Some(e.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                    _ => None,
-                };
-                for (i, m) in ms.iter().enumerate() {
-                    let mident = Identifier { name: m.clone(), span: Span::dummy() };
-                    let rhs = match &pat_items {
-                        Some(items) => items[i].clone(),
-                        None => member_ref_expr(&ca.rhs, &mident),
-                    };
-                    expanded.push(ContinuousAssignment {
-                        lhs: member_ref_expr(&make_ident_expr(&base), &mident),
-                        rhs,
-                        delay: ca.delay,
-                        rhs_parent_scoped: ca.rhs_parent_scoped,
-                    });
-                }
+            Some((base, su)) => {
+                emit_struct_member_assigns(
+                    &make_ident_expr(&base),
+                    &ca.rhs,
+                    &su,
+                    &ca,
+                    &elab.typedef_types,
+                    &mut expanded,
+                    0,
+                );
             }
             None => expanded.push(ca),
         }
