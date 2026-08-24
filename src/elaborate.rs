@@ -7054,7 +7054,10 @@ pub fn elaborate_module_with_defs(
     // or port connections that are not explicitly declared become implicit 1-bit wires.
     let mut port_conn_nets: Vec<String> = Vec::new();
     collect_port_connection_net_candidates(module.items(), &mut port_conn_nets);
-    create_implicit_nets(&mut elab, &port_conn_nets)?;
+    // §6.6.8 coercion: which of those actuals connect to a nettype formal.
+    let mut nettype_actuals: HashMap<String, String> = HashMap::default();
+    collect_nettype_port_actuals(module.items(), all_defs, &user_nettypes, &mut nettype_actuals);
+    create_implicit_nets(&mut elab, &port_conn_nets, &nettype_actuals)?;
 
     // Validate that all identifiers in procedural blocks are declared.
     // §27.6: make every labelled generate block a known SCOPE name before the
@@ -9504,6 +9507,68 @@ fn resolve_forward_referenced_params(
 /// constructs too, since an instantiation inside `generate`/`if`/`for` binds
 /// nets the same way. Only the connection EXPRESSION is scanned — the formal
 /// port name (`.foo` in `.foo(bar)`) names a port of the child, not a net here.
+/// §6.6.8: for each instance port actual that is a bare undeclared identifier,
+/// record the NETTYPE of the formal it connects to, when the formal has one.
+///
+/// The plain candidate collector above yields names only, which is all §6.10
+/// needs to make a scalar implicit net. Coercion needs the formal's type, so
+/// this walks the same instantiations and resolves each connection against the
+/// instantiated module's port list.
+fn collect_nettype_port_actuals(
+    items: &[ModuleItem],
+    defs: Option<&HashMap<String, Definition>>,
+    nettypes: &HashSet<String>,
+    out: &mut HashMap<String, String>,
+) {
+    let Some(defs) = defs else { return };
+    // The nettype of module `m`'s port, by name and by position.
+    let port_nettype = |mname: &str, pname: Option<&str>, idx: usize| -> Option<String> {
+        let Some(Definition::Module(md)) = defs.get(mname) else { return None };
+        let PortList::Ansi(ports) = &md.ports else { return None };
+        let port = match pname {
+            Some(n) => ports.iter().find(|p| p.name.name == n)?,
+            None => ports.get(idx)?,
+        };
+        let dt = port.data_type.as_ref()?;
+        let DataType::TypeReference { name, .. } = dt else { return None };
+        let tn = &name.name.name;
+        if nettypes.contains(tn) { Some(tn.clone()) } else { None }
+    };
+    for item in items {
+        match item {
+            ModuleItem::ModuleInstantiation(inst) => {
+                for hi in &inst.instances {
+                    for (idx, c) in hi.connections.iter().enumerate() {
+                        let (expr, pname) = match c {
+                            PortConnection::Ordered(Some(e)) => (e, None),
+                            PortConnection::Named { name, expr: Some(e), implicit: false } => {
+                                (e, Some(name.name.as_str()))
+                            }
+                            _ => continue,
+                        };
+                        let mut bare = Vec::new();
+                        collect_implicit_net_candidates(expr, &mut bare);
+                        // Only a WHOLE-net actual coerces; a concatenation or
+                        // select of undeclared names is not a nettype value.
+                        if bare.len() != 1 {
+                            continue;
+                        }
+                        if let Some(nt) =
+                            port_nettype(&inst.module_name.name, pname, idx)
+                        {
+                            out.entry(bare.pop().unwrap()).or_insert(nt);
+                        }
+                    }
+                }
+            }
+            ModuleItem::GenerateRegion(g) => {
+                collect_nettype_port_actuals(&g.items, Some(defs), nettypes, out)
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_port_connection_net_candidates(items: &[ModuleItem], out: &mut Vec<String>) {
     for item in items {
         match item {
@@ -9536,6 +9601,7 @@ fn collect_port_connection_net_candidates(items: &[ModuleItem], out: &mut Vec<St
 fn create_implicit_nets(
     elab: &mut ElaboratedModule,
     port_conn_names: &[String],
+    nettype_actuals: &HashMap<String, String>,
 ) -> Result<(), String> {
     let mut implicit_names = Vec::new();
     for ca in &elab.continuous_assigns {
@@ -9618,6 +9684,54 @@ fn create_implicit_nets(
                 "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
                 name
             ));
+        }
+        // §6.6.8: an implicit net connected to a port of a USER-DEFINED
+        // NETTYPE takes that nettype, rather than the §6.10 scalar default —
+        // the "nets are automatically coerced" rule that lets an analog node be
+        // named at the point of connection. Without it a 64-bit nettype port
+        // truncated onto a 1-bit wire and the node resolved to 0 with only a
+        // width warning.
+        //
+        // Deliberately narrow: an implicit net for an ordinary port stays
+        // scalar, which is what §6.10 specifies and what the reference tooling
+        // does. Only a nettype formal coerces.
+        if let Some(nt) = nettype_actuals.get(&name) {
+            let dt = elab.typedef_types.get(nt).cloned();
+            let width = elab
+                .typedefs
+                .get(nt)
+                .copied()
+                .unwrap_or_else(|| {
+                    dt.as_ref()
+                        .map(|d| resolve_type_width(d, Some(&elab.parameters), Some(&elab.typedefs)))
+                        .unwrap_or(1)
+                });
+            let is_real = dt
+                .as_ref()
+                .is_some_and(|d| is_type_real_resolved(d, &elab.typedef_types));
+            signals_insert_traced(&mut elab.signals, line!(), name.clone(), Signal {
+                is_const: false,
+                name: name.clone(),
+                width: width.max(1),
+                is_signed: false,
+                direction: None,
+                value: if is_real { Value::from_f64(0.0) } else { Value::new(width.max(1)) },
+                is_real,
+                type_name: Some(nt.clone()),
+            });
+            // Registering the struct member leaves is what makes a struct-typed
+            // nettype readable; a scalar one needs nothing further.
+            if let Some(d) = dt {
+                if matches!(
+                    resolve_typedef_chain(&d, &elab.typedef_types),
+                    DataType::Struct(su) if !su.packed
+                ) {
+                    register_unpacked_aggregate(elab, &name, &d);
+                }
+            }
+            elab.implicit_nets.insert(name.clone());
+            elab.nets.insert(name);
+            continue;
         }
         if crate::implicit_net_warn() {
             crate::elab_diag(format!(
