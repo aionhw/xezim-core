@@ -18541,11 +18541,32 @@ fn inline_module_items(
                                     }
                                 } else if *implicit {
                                     // `.p` — connect to the same-named parent net.
+                                    // §23.3.2: the implicitly-connected actual is the
+                                    // same-named net IN THE PARENT SCOPE — which may
+                                    // itself be a PORT of the enclosing instance. Resolve
+                                    // it through that instance's formal->actual map, as an
+                                    // EXPLICIT connection already is. Binding straight to
+                                    // `prefix + name` ties the connection to the formal's
+                                    // own signal, so a driver reaching it from inside (a
+                                    // bound interface output driving an input port) never
+                                    // propagated to the real parent net and every reader
+                                    // of it read z. `rewrite_expr`'s fallback IS
+                                    // `prefix + name`, so the unmapped case is unchanged.
                                     let parent_name = format!("{}{}", prefix, name.name);
+                                    let actual = rewrite_expr(
+                                        &make_ident_expr(&name.name),
+                                        prefix,
+                                        parent_port_map,
+                                        parent_local_names,
+                                        interface_map,
+                                    );
                                     if sub_iface_ports.contains(&name.name) {
-                                        sub_interface_map.insert(name.name.clone(), parent_name);
+                                        sub_interface_map.insert(
+                                            name.name.clone(),
+                                            whole_net_ident_name(&actual).unwrap_or(parent_name),
+                                        );
                                     } else {
-                                        port_map.insert(name.name.clone(), make_ident_expr(&parent_name));
+                                        port_map.insert(name.name.clone(), actual);
                                     }
                                 }
                                 // `.p()` — explicit no-connect: leave unbound.
@@ -18561,14 +18582,35 @@ fn inline_module_items(
                                     {
                                         continue;
                                     }
+                                    // §23.3.2: the implicitly-connected actual is the
+                                    // same-named net IN THE PARENT SCOPE — which may
+                                    // itself be a PORT of the enclosing instance. Resolve
+                                    // it through that instance's formal->actual map, as an
+                                    // EXPLICIT connection already is. Binding straight to
+                                    // `prefix + name` ties the connection to the formal's
+                                    // own signal, so a driver reaching it from inside (a
+                                    // bound interface output driving an input port) never
+                                    // propagated to the real parent net and every reader
+                                    // of it read z. `rewrite_expr`'s fallback IS
+                                    // `prefix + name`, so the unmapped case is unchanged.
                                     let parent_name = format!("{}{}", prefix, name);
+                                    let actual = rewrite_expr(
+                                        &make_ident_expr(name),
+                                        prefix,
+                                        parent_port_map,
+                                        parent_local_names,
+                                        interface_map,
+                                    );
                                     let is_if_port = port.data_type.as_ref()
                                         .map(|dt| is_interface_type(dt, definitions))
                                         .unwrap_or(false);
                                     if is_if_port {
-                                        sub_interface_map.insert(name.clone(), parent_name);
+                                        sub_interface_map.insert(
+                                            name.clone(),
+                                            whole_net_ident_name(&actual).unwrap_or(parent_name),
+                                        );
                                     } else {
-                                        port_map.insert(name.clone(), make_ident_expr(&parent_name));
+                                        port_map.insert(name.clone(), actual);
                                     }
                                 }
                             }
