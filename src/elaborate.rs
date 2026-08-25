@@ -9984,6 +9984,68 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     if is_dynamic_dim {
                         elab.dynamic_arrays.insert(decl.name.name.clone());
                     }
+                    // IEEE 1800-2017 §7.4.5 / §7.8: unpacked array whose
+                    // ELEMENT is itself a dynamic collection (`int q[3][$]`,
+                    // `int d[3][]`, `int a[2][u8_t]`) declared in a generate /
+                    // submodule-routed scope. Mirrors the module-scope
+                    // DataDecl arm — without this the trailing dimension was
+                    // dropped, `q[i]` registered as a plain scalar, and
+                    // `q[i].push_back(x)` inside an instance was a silent
+                    // no-op (`q[i].size()` read 0 forever).
+                    if decl.dimensions.len() >= 2 {
+                        let eff_dims = normalize_unpacked_dims(
+                            &decl.dimensions, &elab.parameters, &elab.typedef_types);
+                        if let Some(qd) = eff_dims.last() {
+                            if matches!(qd, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }
+                                            | UnpackedDimension::Associative { .. }) {
+                                let outer = &eff_dims[..eff_dims.len() - 1];
+                                let shape: Option<Vec<(i64, i64)>> = outer
+                                    .iter()
+                                    .map(|d| extract_array_range(std::slice::from_ref(d), &elab.parameters))
+                                    .collect();
+                                if let Some(shape) = shape.filter(|sh| {
+                                    sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                }) {
+                                    let name = decl.name.name.clone();
+                                    match shape.len() {
+                                        1 => { elab.arrays.insert(name.clone(), (shape[0].0, shape[0].1, width)); }
+                                        2 => { elab.arrays_2d.insert(name.clone(), (shape[0], shape[1], width)); }
+                                        _ => { elab.arrays_nd.insert(name.clone(), (shape.clone(), width)); }
+                                    }
+                                    let qmax = if let UnpackedDimension::Queue { max_size: Some(ms), .. } = qd {
+                                        const_eval_i64_with_params(ms, Some(&elab.parameters))
+                                            .filter(|n| *n >= 0).map(|n| (n + 1) as u32)
+                                    } else { None };
+                                    // Each element gets exactly the registration a
+                                    // standalone `int q[$]` / `int a[key_t]` gets.
+                                    let assoc_key = match qd {
+                                        UnpackedDimension::Associative { data_type: kdt, .. } => Some(
+                                            kdt.as_ref().is_some_and(|dt| {
+                                                matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
+                                            }),
+                                        ),
+                                        _ => None,
+                                    };
+                                    for suffix in index_tuples(&shape) {
+                                        let en = format!("{}{}", name, suffix);
+                                        if let Some(is_str) = assoc_key {
+                                            // Associative elements are sparse: no
+                                            // backing buffer, no `.size` shadow.
+                                            elab.associative_arrays.insert(en, is_str);
+                                            continue;
+                                        }
+                                        elab.dynamic_arrays.insert(en.clone());
+                                        if let Some(m) = qmax {
+                                            elab.queue_max_sizes.insert(en.clone(), m);
+                                        }
+                                        elab.arrays.insert(en, (0, 63, width));
+                                    }
+                                    elab.var_decl_types.insert(name, dd.data_type.clone());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
@@ -20388,6 +20450,65 @@ fn inline_module_items(
                                         }
                                     }
                                     _ => {}
+                                }
+                                // IEEE 1800-2017 §7.4.5 / §7.8: unpacked array
+                                // whose ELEMENT is itself a dynamic collection
+                                // (`int q[3][$]`, `int d[3][]`, `int a[2][k_t]`)
+                                // declared in a SUBMODULE. Mirrors the
+                                // module-scope DataDecl arm, under the scoped
+                                // name — without this the trailing dimension
+                                // was dropped, `q[i]` registered as a plain
+                                // fixed array element, and `q[i].push_back(x)`
+                                // inside an instance was a silent no-op
+                                // (`q[i].size()` read 0 forever).
+                                if effective_decl_dims.len() >= 2 {
+                                    if let Some(qd) = effective_decl_dims.last() {
+                                        if matches!(qd, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }
+                                                        | UnpackedDimension::Associative { .. }) {
+                                            let outer = &effective_decl_dims[..effective_decl_dims.len() - 1];
+                                            let shape: Option<Vec<(i64, i64)>> = outer
+                                                .iter()
+                                                .map(|d| extract_array_range(std::slice::from_ref(d), &sub_merged_params))
+                                                .collect();
+                                            if let Some(shape) = shape.filter(|sh| {
+                                                sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                            }) {
+                                                match shape.len() {
+                                                    1 => { elab.arrays.insert(sig_name.clone(), (shape[0].0, shape[0].1, width)); }
+                                                    2 => { elab.arrays_2d.insert(sig_name.clone(), (shape[0], shape[1], width)); }
+                                                    _ => { elab.arrays_nd.insert(sig_name.clone(), (shape.clone(), width)); }
+                                                }
+                                                let qmax = if let UnpackedDimension::Queue { max_size: Some(ms), .. } = qd {
+                                                    const_eval_i64_with_params(ms, Some(&sub_merged_params))
+                                                        .filter(|n| *n >= 0).map(|n| (n + 1) as u32)
+                                                } else { None };
+                                                let assoc_key = match qd {
+                                                    UnpackedDimension::Associative { data_type: kdt, .. } => Some(
+                                                        kdt.as_ref().is_some_and(|dt| {
+                                                            matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
+                                                        }),
+                                                    ),
+                                                    _ => None,
+                                                };
+                                                for suffix in index_tuples(&shape) {
+                                                    let en = format!("{}{}", sig_name, suffix);
+                                                    if let Some(is_str) = assoc_key {
+                                                        // Associative elements are sparse: no
+                                                        // backing buffer, no `.size` shadow.
+                                                        elab.associative_arrays.insert(en, is_str);
+                                                        continue;
+                                                    }
+                                                    elab.dynamic_arrays.insert(en.clone());
+                                                    if let Some(m) = qmax {
+                                                        elab.queue_max_sizes.insert(en.clone(), m);
+                                                    }
+                                                    elab.arrays.insert(en, (0, 63, width));
+                                                }
+                                                elab.var_decl_types.insert(sig_name.clone(), dd.data_type.clone());
+                                                continue;
+                                            }
+                                        }
+                                    }
                                 }
                                 // A MULTI-dimensional unpacked variable in a
                                 // submodule (`logic [15:0] grid [0:1][0:1];`).
