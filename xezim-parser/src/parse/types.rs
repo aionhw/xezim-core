@@ -643,6 +643,10 @@ fn parse_enum_type(&mut self) -> DataType {
             TokenKind::KwSupply1 => { self.bump(); Some(NetType::Supply1) }
             TokenKind::KwTrireg => { self.bump(); Some(NetType::TriReg) }
             TokenKind::KwUwire => { self.bump(); Some(NetType::Uwire) }
+            // §6.6.8 interconnect: a typeless net — declaration and port
+            // forms both route through the normal net machinery; the
+            // elaborator adopts the connected formal's type.
+            TokenKind::KwInterconnect => { self.bump(); Some(NetType::Interconnect) }
             _ => None,
         }
     }

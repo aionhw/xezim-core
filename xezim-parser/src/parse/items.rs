@@ -182,6 +182,8 @@ impl Parser {
         if self.eat(TokenKind::LParen).is_none() { return PortList::Empty; }
         if self.at(TokenKind::RParen) { self.bump(); return PortList::Empty; }
         if self.is_port_direction() || self.is_data_type_keyword() || self.at(TokenKind::KwVar)
+            // §6.6.8 — `interconnect p` opens an ANSI port list too.
+            || self.at(TokenKind::KwInterconnect)
             || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Dot)
             || (self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash))
             // LRM §25.9 — `virtual <iface_t> <name>` port form.
@@ -195,6 +197,7 @@ impl Parser {
             let mut last_direction: Option<PortDirection> = None;
             let mut last_data_type: Option<DataType> = None;
             let mut last_net_type: Option<NetType> = None;
+            let mut last_var_kw = false;
             loop {
                 if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
                 let mut port = self.parse_ansi_port();
@@ -208,9 +211,17 @@ impl Parser {
                 if port.net_type.is_none() && last_net_type.is_some() && !direction_was_explicit {
                     port.net_type = last_net_type;
                 }
+                // §23.2.2.3: `output var a, b` — b continues the SAME port
+                // declaration and is a variable too. `var` carried across the
+                // comma like the data type; without this b registered as an
+                // untyped default net.
+                if !port.var_kw && last_var_kw && !direction_was_explicit {
+                    port.var_kw = true;
+                }
                 if port.direction.is_some() { last_direction = port.direction; }
                 if port.data_type.is_some() { last_data_type = port.data_type.clone(); }
                 if port.net_type.is_some() { last_net_type = port.net_type; }
+                last_var_kw = port.var_kw;
                 ports.push(port);
                 if self.eat(TokenKind::Comma).is_none() { break; }
             }
@@ -484,11 +495,14 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 None
             }
-            // §6.6.8 interconnect net — parse-accept; consume to ';'.
+            // §6.6.8 interconnect net — a REAL declaration (it used to be
+            // consumed to ';' and dropped, so the name looked undeclared,
+            // §6.10 gave it a 1-bit implicit wire, and a nettype port
+            // truncated onto it while the diagnostic blamed a missing
+            // declaration). Parsed like any net; the elaborator registers it
+            // and adopts the connected formal's type.
             TokenKind::KwInterconnect => {
-                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
-                self.expect(TokenKind::Semicolon);
-                None
+                Some(ModuleItem::NetDeclaration(self.parse_net_declaration()))
             }
             TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass => {
                 // `interface class Name; ... endclass` — treat as a class decl.

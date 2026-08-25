@@ -1594,6 +1594,11 @@ pub struct ElaboratedModule {
     /// these — the classic signature of a dropped/unresolved vendor cell.
     #[serde(default)]
     pub implicit_nets: HashSet<String>,
+    /// §6.6.8 `interconnect` nets: typeless — the net adopts the type of the
+    /// port it connects. Declared here so the port-binding pass can shape the
+    /// placeholder (1-bit z) signal from the first definitely-typed formal.
+    #[serde(default)]
+    pub interconnect_nets: HashSet<String>,
     /// Elaboration-time diagnostics (implicit-net warnings, port-width lint,
     /// unresolved-module notes, width-underflow) captured during a cold run so
     /// a warm design-cache HIT — which skips elaboration — can replay them
@@ -1927,6 +1932,7 @@ impl ElaboratedModule {
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
             implicit_nets: HashSet::default(),
+            interconnect_nets: HashSet::default(),
             elab_diagnostics: Vec::new(),
             instances: Vec::new(),
             out_of_class_constraints: HashSet::default(),
@@ -4621,6 +4627,9 @@ pub fn elaborate_module_with_defs(
                     // at the first settle; bits nothing drives stay z).
                     if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
                         elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
+                    }
+                    if matches!(nd.net_type, NetType::Interconnect) {
+                        elab.interconnect_nets.insert(decl.name.name.clone());
                     }
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(w),
@@ -9851,6 +9860,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 for decl in &nd.declarators {
                     if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
                         elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
+                    }
+                    if matches!(nd.net_type, NetType::Interconnect) {
+                        elab.interconnect_nets.insert(decl.name.name.clone());
                     }
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(width),
@@ -20080,7 +20092,10 @@ fn inline_module_items(
                                     // Simulator::new from the array metadata.
                                     continue;
                                 }
-                                let init_value = match nd.net_type {
+                                if matches!(nd.net_type, NetType::Interconnect) {
+                        elab.interconnect_nets.insert(decl.name.name.clone());
+                    }
+                    let init_value = match nd.net_type {
                                     NetType::Supply0 => Value::zero(width),
                                     NetType::Supply1 => Value::ones(width),
                                     _ => {
@@ -20673,6 +20688,39 @@ fn inline_module_items(
                 for (port_name, parent_expr) in &port_map {
                     if prepared_sub.interface_ports.contains(port_name) { continue; }
                     let sub_sig_name = format!("{}{}", inst_prefix, port_name);
+                    // §6.6.8: a declared `interconnect` net is TYPELESS — it
+                    // adopts the type of the port it connects. The declaration
+                    // registered a 1-bit z placeholder; the first
+                    // definitely-typed formal shapes it (width, realness, and
+                    // the nettype name the §6.6.7 resolver machinery keys on).
+                    // A dimensioned interconnect (width > 1) keeps its
+                    // declared width, per the declaration's own constraint.
+                    if let Some(an) = whole_net_ident_name(parent_expr) {
+                        if elab.interconnect_nets.contains(&an) {
+                            let formal = elab
+                                .signals
+                                .get(&sub_sig_name)
+                                .map(|f| (f.width, f.is_real, f.type_name.clone()));
+                            if let Some((fw, freal, ftn)) = formal {
+                                if fw > 1 || freal {
+                                    if let Some(asig) = elab.signals.get_mut(&an) {
+                                        if asig.width <= 1 && !asig.is_real {
+                                            asig.width = fw;
+                                            asig.is_real = freal;
+                                            if asig.type_name.is_none() {
+                                                asig.type_name = ftn;
+                                            }
+                                            asig.value = if freal {
+                                                Value::from_f64(0.0)
+                                            } else {
+                                                Value::all_z(fw)
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let port_shape = match sub_mod.ports() {
                         PortList::Ansi(ports) => ports
                             .iter()
@@ -22971,7 +23019,13 @@ fn same_const_range(a: &Expression, b: &Expression) -> bool {
 fn whole_net_ident_name(expr: &Expression) -> Option<String> {
     match &expr.kind {
         ExprKind::Ident(hier) => {
-            if hier.root.is_some() || hier.path.is_empty() {
+            // Root-TOLERANT on purpose: a rooted whole-net ident (a substituted
+            // actual whose name collided with a child declaration — see
+            // `rewrite_expr_impl`) is still the same physical net under the
+            // same absolute name, and `port_aliases` / interface paths must
+            // keep collapsing it. Rooting only changes RESOLUTION, not
+            // identity.
+            if hier.path.is_empty() {
                 return None;
             }
             if hier.path.iter().any(|s| !s.selects.is_empty()) {
@@ -23135,8 +23189,35 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                 // coherence-NoC multi-segment port references (the 6th write /
                 // header-length field).
                 let has_tail = hier.path.len() > 1 || !hier.path[0].selects.is_empty();
+                // §23.3.3 (issue #128): the substituted actual's bare name may
+                // ALSO be declared by this child (`.v_node(out_val)` into a
+                // module whose own output port is `out_val`). Pasted un-rooted
+                // into the child's body, the name re-resolves child-first
+                // under the child's scope hint, so the block reads its own
+                // output and the parent feedback path is silently severed.
+                // Root exactly the colliding whole-net substitutions — the
+                // rewritten actual is already the absolute parent name — and
+                // leave every other actual on the plain machinery
+                // (`whole_net_ident_name` is root-tolerant, so port_aliases
+                // and interface path collapsing still see these).
+                // Gate on the mapped LEAF differing from the key being
+                // substituted: a generate-scope RENAME map (`vec` →
+                // `gen_arbiter.vec`) flows through this same function, its
+                // values are not yet instance-prefixed, and rooting them
+                // freezes the un-prefixed name (every genfor CA write
+                // vanished). A rename always has leaf == key; a genuine
+                // port-actual collision (`v_node` → `out_val`) never does.
+                let collides = whole_net_ident_name(mapped).is_some_and(|an| {
+                    let leaf = an.rsplit('.').next().unwrap_or(an.as_str());
+                    leaf != name.as_str()
+                        && (local_names.contains(leaf) || port_map.contains_key(leaf))
+                });
                 if !has_tail {
-                    return mapped.clone();
+                    let mut m = mapped.clone();
+                    if collides {
+                        mark_actual_rooted(&mut m);
+                    }
+                    return m;
                 }
                 // Graft only when the mapped target's last segment carries NO
                 // selects of its own: stacking the port reference's select
@@ -23146,6 +23227,12 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                 // Selected connections fall through to the Index-node path
                 // below, which the evaluator normalizes correctly.
                 if let ExprKind::Ident(mut mhier) = mapped.kind.clone() {
+                    // Colliding actual under a member/select tail: root the
+                    // grafted head too — the appended segments name FIELDS of
+                    // the actual's net, so the whole path stays absolute.
+                    if collides && mhier.root.is_none() {
+                        mhier.root = Some("$root".to_string());
+                    }
                     // Graft seg0's selects onto the mapped target's last
                     // segment, then append the trailing segments verbatim
                     // (each keeps its own selects).
