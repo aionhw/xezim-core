@@ -19708,7 +19708,17 @@ fn inline_module_items(
                                 .map(|dt| resolve_type_width(dt, Some(&sub_merged_params), Some(&elab.typedefs)))
                                 .unwrap_or(1);
                             let sig_name = format!("{}{}", inst_prefix, port.name.name);
-                            let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
+                            // §6.6.7: resolve REALNESS through the typedef
+                            // table — a nettype port formal (`inout rnet p`,
+                            // rnet = `nettype real`) is a real signal. The
+                            // bare is_type_real left it integral, so `%f` on
+                            // the formal printed raw bits and a real consumer
+                            // through it could read 0.0.
+                            let is_real = port
+                                .data_type
+                                .as_ref()
+                                .map(|dt| is_type_real_resolved(dt, &elab.typedef_types))
+                                .unwrap_or(false);
                             // §6.18: the port's unpacked dimensions may come
                             // from its TYPEDEF (`typedef t_byte t_word [0:3];
                             // input t_word din;`), not the declarator. The
@@ -19921,6 +19931,16 @@ fn inline_module_items(
                                             elab.packed_struct_fields.entry(sig_name.clone()).or_insert(fields);
                                         }
                                     }
+                                    // §6.6.7: resolve REALNESS through the
+                                    // typedef table — a nettype port formal
+                                    // (`inout rnet p`, rnet = `nettype real`)
+                                    // is a real signal. The bare is_type_real
+                                    // left it integral, so `%f` on the formal
+                                    // printed raw bits and any true real
+                                    // consumer read 0.0 (reads only worked
+                                    // when both sides were bit-identical).
+                                    let port_is_real =
+                                        is_type_real_resolved(&pd.data_type, &elab.typedef_types);
                                     signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                         name: sig_name, width, is_signed,
                                         direction: Some(pd.direction),
@@ -19928,9 +19948,9 @@ fn inline_module_items(
                                             Some(pd.direction),
                                             Some(&pd.data_type),
                                             width,
-                                            is_type_real(&pd.data_type),
+                                            port_is_real,
                                         ),
-                                        is_real: is_type_real(&pd.data_type), type_name: get_type_name(&pd.data_type),
+                                        is_real: port_is_real, type_name: get_type_name(&pd.data_type),
                                     });
                                 }
                             }
@@ -20173,7 +20193,11 @@ fn inline_module_items(
                                 signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: is_type_signed(&nd.data_type),
-                                    is_real: is_type_real(&nd.data_type),
+                                    // Resolved through the typedef table so a
+                                    // NETTYPE net declared in a submodule
+                                    // (`rnet n;`) is real like its top-level
+                                    // twin (§6.6.7).
+                                    is_real: is_type_real_resolved(&nd.data_type, &elab.typedef_types),
                                     direction: None, value: init_value,
                                     type_name: get_type_name(&nd.data_type),
                                 });                            }
