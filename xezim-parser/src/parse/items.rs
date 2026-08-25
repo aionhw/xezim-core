@@ -275,7 +275,7 @@ impl Parser {
                 self.bump();
                 Some(self.parse_identifier())
             } else { None };
-            Some(DataType::Interface { name: if_name, modport, span: self.span_from(start) })
+            Some(DataType::Interface { name: if_name, modport, type_args: Vec::new(), span: self.span_from(start) })
         } else if self.at(TokenKind::KwInterface) {
             // §25.3.2 generic interface port: `interface [.<modport>] <name>`.
             self.bump(); // interface
@@ -285,7 +285,7 @@ impl Parser {
             } else { None };
             Some(DataType::Interface {
                 name: crate::ast::Identifier { name: "interface".to_string(), span: self.span_from(start) },
-                modport, span: self.span_from(start),
+                modport, type_args: Vec::new(), span: self.span_from(start),
             })
         } else if self.is_data_type_keyword() {
             Some(self.parse_data_type())
@@ -296,7 +296,7 @@ impl Parser {
             let if_name = self.parse_identifier();
             self.expect(TokenKind::Dot);
             let mp_name = self.parse_identifier();
-            Some(DataType::Interface { name: if_name, modport: Some(mp_name), span: self.span_from(start) })
+            Some(DataType::Interface { name: if_name, modport: Some(mp_name), type_args: Vec::new(), span: self.span_from(start) })
         } else if self.at(TokenKind::Identifier)
             && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)
         {
@@ -1759,6 +1759,7 @@ impl Parser {
             let dt = DataType::Interface {
                 name: first_name.clone(),
                 modport: Some(modport),
+                type_args: Vec::new(),
                 span: self.span_from(start),
             };
             let decls = self.parse_var_declarator_list();

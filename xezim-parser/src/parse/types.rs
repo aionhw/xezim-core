@@ -33,11 +33,11 @@ impl Parser {
                 self.bump();
                 self.eat(TokenKind::KwInterface);
                 let name = self.parse_identifier();
-                if self.at(TokenKind::Hash) { let _ = self.parse_param_args(); }
+                let type_args = if self.at(TokenKind::Hash) { self.parse_type_args_hash(start) } else { Vec::new() };
                 let modport = if self.eat(TokenKind::Dot).is_some() {
                     Some(self.parse_identifier())
                 } else { None };
-                DataType::Interface { name, modport, span: self.span_from(start) }
+                DataType::Interface { name, modport, type_args, span: self.span_from(start) }
             }
             // §6.23 type operator `type(expr_or_data_type)` — parse-accept and
             // treat as implicit (the resolved type is not modelled).
@@ -90,7 +90,7 @@ impl Parser {
                 let modport = if self.eat(TokenKind::Dot).is_some() {
                     Some(self.parse_identifier())
                 } else { None };
-                DataType::Interface { name, modport, span: self.span_from(start) }
+                DataType::Interface { name, modport, type_args: Vec::new(), span: self.span_from(start) }
             }
             TokenKind::KwVoid => { self.bump(); DataType::Void(self.span_from(start)) }
             // IEEE 1800-2023 §6.20.2.1: `type(expr)` typeof operator in
@@ -147,7 +147,7 @@ impl Parser {
                     self.bump();
                     let modport = Some(self.parse_identifier());
                     let _dimensions = self.parse_packed_dimensions();
-                    DataType::Interface { name: name.name, modport, span: self.span_from(start) }
+                    DataType::Interface { name: name.name, modport, type_args: type_args.clone(), span: self.span_from(start) }
                 } else {
                     let dimensions = self.parse_packed_dimensions();
                     DataType::TypeReference { name, dimensions, type_args, span: self.span_from(start) }
@@ -229,17 +229,32 @@ impl Parser {
                                     // matching the builtin-keyword path above.
                                     let tok_text = self.current().text.clone(); // 'virtual'
                                     let tsp = self.current().span;
+                                    // Reconstruct the FULL interface type
+                                    // (`mem_if#(8,8)`) from the tokens that
+                                    // `parse_data_type()` consumes. The old code
+                                    // grabbed `self.pos - 1` afterwards, which is
+                                    // the LAST token of that type — the closing
+                                    // `)` of a parameterized interface — so
+                                    // `uvc_env#(virtual mem_if#(8,8))` recorded
+                                    // `virtual )` and every resource/pool type
+                                    // key using it diverged.
+                                    let name_start = self.pos + 1;
                                     let _dt = self.parse_data_type();
+                                    let mut toks: Vec<String> = (name_start..self.pos)
+                                        .filter_map(|i| self.tokens.get(i).map(|t| t.text.clone()))
+                                        .collect();
+                                    if toks.is_empty() {
+                                        toks.push(tok_text.clone());
+                                    }
+                                    let raw = toks.join(" ");
+                                    let compact = raw
+                                        .replace(" # ", "#")
+                                        .replace("# (", "#(")
+                                        .replace("( ", "(")
+                                        .replace(" )", ")")
+                                        .replace(" ,", ",");
+                                    let full_name = format!("virtual {}", compact);
                                     let sp = self.span_from(start);
-                                    let iface_name = self
-                                        .tokens
-                                        .get(self.pos - 1)
-                                        .map(|t| t.text.clone())
-                                        .unwrap_or_else(|| tok_text);
-                                    let full_name = format!(
-                                        "virtual {}",
-                                        iface_name
-                                    );
                                     let id = crate::ast::Identifier {
                                         name: full_name,
                                         span: crate::ast::Span { start: tsp.start, end: tsp.end },

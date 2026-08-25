@@ -15,7 +15,7 @@ pub enum DataType {
     Enum(EnumType),
     Void(Span),
     TypeReference { name: TypeName, dimensions: Vec<PackedDimension>, type_args: Vec<expr::Expression>, span: Span },
-    Interface { name: Identifier, modport: Option<Identifier>, span: Span },
+    Interface { name: Identifier, modport: Option<Identifier>, type_args: Vec<expr::Expression>, span: Span },
     Implicit { signing: Option<Signing>, dimensions: Vec<PackedDimension>, span: Span },
 }
 
