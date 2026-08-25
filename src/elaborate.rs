@@ -626,6 +626,15 @@ pub struct ElaboratedClass {
     /// under their bare name at simulator startup.
     #[serde(default)]
     pub static_collections: Vec<(String, bool, u32)>,
+    /// Fixed-size `static` array members (`static int S[3]`, `static bit
+    /// m[2:0]`): (name, lo, hi, element width). §8.9 gives every instance of
+    /// the class ONE shared copy, so — exactly like `static_collections` —
+    /// these are kept OUT of the per-instance `array_properties` and are
+    /// registered under their bare name at simulator startup instead. They
+    /// need their own list because `static_collections` carries no bounds:
+    /// a queue/assoc store is unsized, a fixed array is not.
+    #[serde(default)]
+    pub static_fixed_arrays: Vec<(String, i64, i64, u32)>,
     /// Fixed-size unpacked-array members with a compile-time-constant size
     /// (`rand reg_t gpr[4]`, `int m[2:0]`): name -> (lo, hi, element width).
     /// Stored per-instance as `<handle>#<member>` registered in `module.arrays`
@@ -788,6 +797,7 @@ pub fn elaborate_class_with_params(
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
+    let mut static_fixed_arrays: Vec<(String, i64, i64, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
     // Class-local typedefs carrying unpacked dimensions
@@ -896,6 +906,47 @@ pub fn elaborate_class_with_params(
                             Some(UnpackedDimension::Queue { .. })
                             | Some(UnpackedDimension::Unsized(_)) => {
                                 static_collections.push((decl.name.name.clone(), false, width.max(1)));
+                            }
+                            // A FIXED-size static array (`static int S[3]`,
+                            // `static bit m[2:0]`) used to fall through here
+                            // registering nothing at all: the whole
+                            // `array_properties` block below is gated to
+                            // non-statics, so the member collapsed onto the
+                            // scalar cell built further down. That made
+                            // element reads return x, writes bit-selects into
+                            // a 32-bit scalar, `$size` report the scalar's
+                            // WIDTH (32, not 3), and `foreach` bind a single
+                            // garbage element — and the cross-instance
+                            // sharing §8.9 promises never happened. Record
+                            // the constant bounds so startup can build one
+                            // shared global store, the same way the
+                            // queue/assoc statics above get one.
+                            Some(UnpackedDimension::Expression { expr, .. }) => {
+                                if let Some(n) =
+                                    const_eval_i64_with_params(expr, unpacked_params)
+                                {
+                                    if n > 0 {
+                                        static_fixed_arrays.push((
+                                            decl.name.name.clone(),
+                                            0,
+                                            n - 1,
+                                            width.max(1),
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(UnpackedDimension::Range { left, right, .. }) => {
+                                if let (Some(l), Some(r)) = (
+                                    const_eval_i64_with_params(left, unpacked_params),
+                                    const_eval_i64_with_params(right, unpacked_params),
+                                ) {
+                                    static_fixed_arrays.push((
+                                        decl.name.name.clone(),
+                                        l.min(r),
+                                        l.max(r),
+                                        width.max(1),
+                                    ));
+                                }
                             }
                             _ => {}
                         }
@@ -1297,6 +1348,7 @@ pub fn elaborate_class_with_params(
         queue_properties,
         property_inits,
         static_collections,
+        static_fixed_arrays,
         array_properties,
         array_nd_properties,
     }
