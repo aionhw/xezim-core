@@ -22815,6 +22815,38 @@ fn make_ident_expr(name: &str) -> Expression {
 /// `None` for a bit-select, part-select, array index, concat, literal or any other
 /// expression: those name a *part of* (or a *function of*) a net, not the net, and
 /// must stay a distinct object in a dump.
+/// Do these two selects denote the SAME constant range? Used to collapse a
+/// redundant part-select stacked over an identical part-select connection;
+/// anything non-constant, or a differently-bounded range, is left alone.
+/// Do these two expressions evaluate to the SAME constant? Non-constant
+/// operands never compare equal, so only provably redundant selects collapse.
+fn same_const_expr(a: &Expression, b: &Expression) -> bool {
+    match (
+        const_eval_i64_with_params(a, None),
+        const_eval_i64_with_params(b, None),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn same_const_range(a: &Expression, b: &Expression) -> bool {
+    let bounds = |e: &Expression| -> Option<(i64, i64)> {
+        if let ExprKind::Range(l, r) = &e.kind {
+            Some((
+                const_eval_i64_with_params(l, None)?,
+                const_eval_i64_with_params(r, None)?,
+            ))
+        } else {
+            None
+        }
+    };
+    match (bounds(a), bounds(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 fn whole_net_ident_name(expr: &Expression) -> Option<String> {
     match &expr.kind {
         ExprKind::Ident(hier) => {
@@ -23015,6 +23047,25 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                                     .any(|s| matches!(s.kind, ExprKind::Range(..)))
                             {
                                 last.selects.clear();
+                            } else if last.selects.len() == 1
+                                && hier.path[0].selects.len() == 1
+                                && same_const_range(
+                                    &last.selects[0],
+                                    &hier.path[0].selects[0],
+                                )
+                            {
+                                // §11.5.1: an IDENTICAL constant part-select
+                                // over a part-select connection selects the
+                                // very same bits, so it is a no-op. Stacking
+                                // it built `net[7:0][7:0]`, which resolves to
+                                // nothing — with a part-select actual at TWO
+                                // nested levels a `.*`-bound interface output
+                                // stopped aliasing the port net and every
+                                // reader below read z instead of the driven
+                                // value. One level was fine (a single select);
+                                // it took two to stack. Drop the redundant
+                                // repeat and keep a single select.
+                                last.selects.clear();
                             }
                             last.selects.extend(hier.path[0].selects.iter().cloned());
                         }
@@ -23103,12 +23154,31 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             expr: Box::new(rewrite_expr_impl(base, prefix, port_map, local_names, interface_map)),
             index: Box::new(rewrite_expr_impl(index, prefix, port_map, local_names, interface_map)),
         },
-        ExprKind::RangeSelect { expr: base, kind, left, right } => ExprKind::RangeSelect {
-            expr: Box::new(rewrite_expr_impl(base, prefix, port_map, local_names, interface_map)),
-            kind: *kind,
-            left: Box::new(rewrite_expr_impl(left, prefix, port_map, local_names, interface_map)),
-            right: Box::new(rewrite_expr_impl(right, prefix, port_map, local_names, interface_map)),
-        },
+        ExprKind::RangeSelect { expr: base, kind, left, right } => {
+            let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
+            let nl = rewrite_expr_impl(left, prefix, port_map, local_names, interface_map);
+            let nr = rewrite_expr_impl(right, prefix, port_map, local_names, interface_map);
+            // §11.5.1: substituting a part-select actual THROUGH another
+            // part-select connection stacks the two selects. When the inner
+            // one denotes the SAME constant range the repeat is a no-op, and
+            // stacking it built `net[7:0][7:0]`, which resolves to nothing:
+            // with a part-select actual at TWO nested levels a `.*`-bound
+            // interface output stopped aliasing the port net and every reader
+            // below read z instead of the driven value. ONE level was fine —
+            // it takes two to stack. Differently-bounded ranges are left
+            // alone; they genuinely re-select.
+            if let ExprKind::RangeSelect { kind: ik, left: il, right: ir, .. } = &nb.kind {
+                if ik == kind && same_const_expr(il, &nl) && same_const_expr(ir, &nr) {
+                    return nb;
+                }
+            }
+            ExprKind::RangeSelect {
+                expr: Box::new(nb),
+                kind: *kind,
+                left: Box::new(nl),
+                right: Box::new(nr),
+            }
+        }
         ExprKind::MemberAccess { expr: base, member } => {
             let rewritten_base = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             if let ExprKind::Ident(mut hier) = rewritten_base.kind {
