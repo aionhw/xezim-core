@@ -438,15 +438,19 @@ impl Value {
         Some(magnitude as u32 as i32)
     }
 
-    /// §5.7.1 — natural width of an UNSIZED based literal (`'h1234…`).
+    /// §5.7.1 — size of an UNSIZED literal (`'h1234…`, `254`).
     ///
-    /// An unsized number is at least 32 bits, but its size must never DROP digits
-    /// the source actually wrote: `'h123456789ABCDEF0` carries 64 bits of value and
-    /// parsing it at a flat 32 silently kept only the low half. Returns
-    /// `max(32, bits implied by the digit string)`; the usual context resize then
-    /// widens or truncates from there. Small literals are unaffected (their natural
-    /// width is under 32), so this only ever widens a constant that would have lost
-    /// data.
+    /// The size must never DROP digits the source actually wrote:
+    /// `'h123456789ABCDEF0` carries 64 bits of value and parsing it at a flat
+    /// 32 silently kept only the low half. An UNSIZED BASED number takes its
+    /// natural width (bits implied by the digit string) — §5.7.1 gives it the
+    /// width of its value, so `'hfe` is 8 bits and compares equal to a `byte`
+    /// `'hfe`, and `'h12…F0` is 64 bits. Only an UNSIZED DECIMAL number is at
+    /// least 32 bits (it is treated as an `integer` in a self/context sized
+    /// slot), so the 32-bit floor applies to radix 10 alone. Reference-verified:
+    /// `byte b='hfe; b == 'hfe` is true, `b == 254` is false, and
+    /// `time t=-1; t == -1` is true (`-1` stays 32-bit signed and sign-extends
+    /// into the comparison).
     pub fn unsized_literal_width(value: &str, radix: u32) -> u32 {
         // ONE byte pass where `chars().filter(..).count()` decoded UTF-8. A
         // UTF-8 continuation byte (`0b10xxxxxx`) is never the start of a
@@ -479,8 +483,14 @@ impl Value {
                     Err(_) => digits.saturating_mul(4),
                 }
             }
-        };
-        natural.max(32)
+        }; // natural
+        // A DECIMAL unsized number is at least 32 bits (treated as an
+        // `integer`); a BASED unsized number keeps its natural width. So the
+        // 32-bit floor applies to decimal only.
+        match radix {
+            10 => natural.max(32),
+            _ => natural,
+        }
     }
 
     /// §5.7.1 — an UNSIZED based literal whose digits are uniformly x (or
