@@ -15055,6 +15055,51 @@ fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width
     eval_const_expr_val(expr, params).resize_for_assign(width)
 }
 
+/// §5.7.1 makes an unsized decimal literal SIGNED, and it is exactly 32 bits
+/// wide, so a value from 2^31 up reads back negative: `localparam real P =
+/// 3000000000` evaluates to -1294967296, and 4294967297 collapses to 1.
+///
+/// That wrap is deliberate and stays. §5.7's "at least 32 bits" leaves the
+/// >= 2^31 decimal case tool-defined, and the reference simulator sizes it 32
+/// signed and wraps exactly as we do (`$bits(3000000000)` is 32 there, and
+/// there too the literal reads -1294967296). Widening to fit would be a
+/// visible divergence -- `$bits` would answer 33, and every expression-width
+/// rule keyed on a literal's self-determined width would shift with it.
+///
+/// What the reference ALSO does, and what xezim was missing, is SAY so. The
+/// wrap is otherwise completely silent, and it is not a corner case for
+/// analog modelling: a fitted pole above 2^31 rad/s (about 342 MHz) that
+/// happens to come out integral gets written without a decimal point, and the
+/// sign flip turns `dx/dt = -WP*x` into positive feedback. A real-number model
+/// built that way elaborates, runs, and produces a plausible waveform for
+/// thousands of steps before it runs away to inf.
+fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &str) {
+    let radix = match base {
+        NumberBase::Decimal => 10,
+        _ => return,
+    };
+    let Some(wrapped) = Value::unsized_decimal_wrap(size, radix, value) else {
+        return;
+    };
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if !seen
+        .lock()
+        .map(|mut g| g.insert(value.to_string()))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    crate::elab_diag(format!(
+        "[xezim][warning] unsized decimal literal '{}' is treated as a 32-bit \
+         signed integer and wraps to {} (IEEE 1800-2017 \u{00a7}5.7); \
+         write it as '{}.0' for a real constant, or size it explicitly \
+         (e.g. 64'd{})",
+        value, wrapped, value, value
+    ));
+}
+
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
 fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
     let res = match &expr.kind {
@@ -15089,6 +15134,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     };
                     let mut v = Value::from_str_radix(&value.replace('_', ""), r, w);
                     v.is_signed = *signed;
+                    warn_unsized_decimal_wrap(*size, base, value);
                     v
                 }
                 NumberLiteral::Real(f) => Value::from_f64(*f),

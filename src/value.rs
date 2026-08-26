@@ -415,6 +415,29 @@ fn wide_filled_bits(width: u32, bit: LogicBit) -> ValueStorage {
 }
 
 impl Value {
+    /// The value an UNSIZED DECIMAL literal actually takes once §5.7.1's
+    /// signed, exactly-32-bit sizing is applied: `Some(wrapped)` when that
+    /// changes it, `None` when the literal is unaffected.
+    ///
+    /// `3000000000` comes back as `Some(-1294967296)`; `4294967297` as
+    /// `Some(1)`. Anything below 2^31 fits and returns `None`, as does a sized
+    /// literal (`64'd3000000000`) or a based one (`'hffffffff`), which §5.7.1
+    /// makes unsigned.
+    ///
+    /// This reports the wrap rather than avoiding it — see
+    /// `warn_unsized_decimal_wrap` in `elaborate.rs` for why the wrap itself
+    /// is deliberate.
+    pub fn unsized_decimal_wrap(size: Option<u32>, radix: u32, value: &str) -> Option<i32> {
+        if size.is_some() || radix != 10 {
+            return None;
+        }
+        let magnitude = value.replace('_', "").parse::<u128>().ok()?;
+        if magnitude < (1u128 << 31) {
+            return None;
+        }
+        Some(magnitude as u32 as i32)
+    }
+
     /// §5.7.1 — natural width of an UNSIZED based literal (`'h1234…`).
     ///
     /// An unsized number is at least 32 bits, but its size must never DROP digits
@@ -2764,6 +2787,42 @@ impl fmt::Display for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsized_decimal_literal_wrap_is_reported_at_the_2_31_boundary() {
+        // §5.7.1 sizes an unsized decimal literal signed and exactly 32 bits,
+        // so from 2^31 up it reads back negative. That matches the reference
+        // simulator and stays; this helper is what lets elaboration SAY so
+        // instead of wrapping silently (issue #31: a fitted RNM pole above
+        // 2^31 rad/s written without a decimal point got its sign flipped,
+        // turning a stable state into positive feedback).
+        assert_eq!(
+            Value::unsized_decimal_wrap(None, 10, "3000000000"),
+            Some(-1294967296)
+        );
+        // Above 2^32 the value truncates rather than merely flipping sign.
+        assert_eq!(Value::unsized_decimal_wrap(None, 10, "4294967297"), Some(1));
+        // Digit separators are not part of the value.
+        assert_eq!(
+            Value::unsized_decimal_wrap(None, 10, "3_000_000_000"),
+            Some(-1294967296)
+        );
+
+        // The boundary itself, from both sides.
+        assert_eq!(
+            Value::unsized_decimal_wrap(None, 10, "2147483648"),
+            Some(i32::MIN)
+        );
+        assert_eq!(Value::unsized_decimal_wrap(None, 10, "2147483647"), None);
+        assert_eq!(Value::unsized_decimal_wrap(None, 10, "254837413"), None);
+        assert_eq!(Value::unsized_decimal_wrap(None, 10, "0"), None);
+
+        // A SIZED literal carries its own width and does not wrap.
+        assert_eq!(Value::unsized_decimal_wrap(Some(64), 10, "3000000000"), None);
+        // A BASED literal is unsigned by default (§5.7.1), so there is no sign
+        // bit to lose -- 'hffffffff is 4294967295, not -1.
+        assert_eq!(Value::unsized_decimal_wrap(None, 16, "ffffffff"), None);
+    }
 
     #[test]
     fn test_basic_ops() {
