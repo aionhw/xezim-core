@@ -21126,13 +21126,19 @@ fn inline_module_items(
                     // Both sides are already instance-qualified (LHS is
                     // `sig_name`, RHS went through `rewrite_expr`), so the block
                     // carries NO scope — a scope would look for
-                    // `<inst>.<inst>.name`.
+                    // `<inst>.<inst>.name`. However, a `%m` in the RHS (e.g. a
+                    // class `A a = new($sformatf("%m.xxx"))`) MUST see this
+                    // instance's scope or it degrades to the top module name.
+                    // The block IS instance-scoped, so carry the instance
+                    // prefix; name resolution tolerates the wrap (a scoped
+                    // lookup that misses falls back to the bare name). Covered
+                    // by the hierarchy group's percent_m_module_init_scope self-test.
                     elab.static_init_blocks.push(InitialBlock {
                         stmt: Statement::new(
                             StatementKind::SeqBlock { name: None, stmts },
                             Span::dummy(),
                         ),
-                        scope: String::new(),
+                        scope: inst_prefix.trim_end_matches('.').to_string(),
                     });
                 }
 
