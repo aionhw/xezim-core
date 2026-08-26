@@ -15073,7 +15073,7 @@ fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width
 /// sign flip turns `dx/dt = -WP*x` into positive feedback. A real-number model
 /// built that way elaborates, runs, and produces a plausible waveform for
 /// thousands of steps before it runs away to inf.
-fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &str) {
+pub fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &str) {
     let radix = match base {
         NumberBase::Decimal => 10,
         _ => return,
