@@ -331,6 +331,20 @@ impl Parser {
                 None
             }
         } else { None };
+        // An ANSI `wreal` port carries a real and declares no data type of
+        // its own. Same reason as the net path: fill one in so the width
+        // and real-ness queries downstream have something to read. A ranged
+        // one (`input wreal [3:0] p`) reaches here as an `Implicit` with
+        // packed dimensions and is rejected by the shared helper.
+        let wreal_span = self.span_from(start);
+        let data_type = match (net_type, data_type) {
+            (Some(NetType::Wreal), None) => Some(DataType::Real {
+                kind: RealType::Real,
+                span: wreal_span,
+            }),
+            (Some(nt), Some(dt)) => Some(self.wreal_data_type(nt, dt, wreal_span)),
+            (_, dt) => dt,
+        };
         let mut dimensions = if data_type.is_some() {
             self.parse_unpacked_dimensions()
         } else {
@@ -474,13 +488,19 @@ impl Parser {
                         DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
                     }
                     else { DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) } };
+                let wreal_span = self.span_from(start);
+                let dt = match nt {
+                    Some(n) => self.wreal_data_type(n, dt, wreal_span),
+                    None => dt,
+                };
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
                 Some(ModuleItem::PortDeclaration(PortDeclaration { direction: dir, net_type: nt, data_type: dt, declarators: decls, span: self.span_from(start) }))
             }
             TokenKind::KwWire | TokenKind::KwTri | TokenKind::KwWand | TokenKind::KwWor |
             TokenKind::KwSupply0 | TokenKind::KwSupply1 | TokenKind::KwTriand | TokenKind::KwTrior |
-            TokenKind::KwTri0 | TokenKind::KwTri1 | TokenKind::KwTrireg | TokenKind::KwUwire =>
+            TokenKind::KwTri0 | TokenKind::KwTri1 | TokenKind::KwTrireg | TokenKind::KwUwire |
+            TokenKind::KwWreal =>
                 Some(ModuleItem::NetDeclaration(self.parse_net_declaration())),
             // §14.3: `global clocking …` — consume the `global` qualifier and
             // reuse the clocking-block parse via the KwClocking arm below.
@@ -1377,6 +1397,8 @@ impl Parser {
                 DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
             }
             else { DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) } };
+        let wreal_span = self.span_from(start);
+        let data_type = self.wreal_data_type(net_type, data_type, wreal_span);
         let declarators = self.parse_net_declarator_list();
         self.expect(TokenKind::Semicolon);
         NetDeclaration { net_type, strength: None, data_type, delay: None, declarators, span: self.span_from(start) }
@@ -2723,6 +2745,45 @@ impl Parser {
             ConstraintRange::Range { lo, hi }
         } else {
             ConstraintRange::Value(self.parse_expression())
+        }
+    }
+}
+
+impl Parser {
+    /// A `wreal` net or port carries a real value and names no data type of
+    /// its own -- `wreal n;` is a net type and nothing else. Substituting
+    /// `real` here means every downstream question ("how wide is it", "is it
+    /// real") reads the answer off the data type as usual, instead of each of
+    /// those sites having to know about `NetType::Wreal`. An explicit data
+    /// type is left alone.
+    ///
+    /// A PACKED RANGE is rejected. Verilog-AMS has no ranged `wreal`: the net
+    /// carries one real value, not a vector of bits. Allowed to fall through,
+    /// `wreal [3:0] w` stayed an `Implicit` type and became an ordinary 4-bit
+    /// net -- `$bits` answered 4 and every value written to it was silently
+    /// ROUNDED (2.5 read back 3.0), which is the exact corruption `wreal`
+    /// exists to prevent, reported by nothing. Recovery substitutes `real` so
+    /// the rest of the parse stays useful.
+    fn wreal_data_type(
+        &mut self,
+        net_type: NetType,
+        dt: DataType,
+        span: crate::parse::Span,
+    ) -> DataType {
+        if !matches!(net_type, NetType::Wreal) {
+            return dt;
+        }
+        match &dt {
+            DataType::Implicit { dimensions, .. } => {
+                if !dimensions.is_empty() {
+                    self.error(
+                        "a 'wreal' net cannot have a packed range: it carries a real value, \
+                         not a vector of bits (Verilog-AMS 2.4 §3.8)",
+                    );
+                }
+                DataType::Real { kind: RealType::Real, span }
+            }
+            _ => dt,
         }
     }
 }

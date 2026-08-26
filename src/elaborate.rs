@@ -22467,6 +22467,14 @@ pub enum ResolvedNetKind {
     /// §6.6.4 `trireg` charge storage: bits no driver is driving HOLD the
     /// last driven value (modeled as an implicit weak self-driver).
     ChargeStorage,
+    /// Verilog-AMS `wreal`: drivers are SUMMED rather than resolved
+    /// bitwise. Verilog-AMS leaves multi-driver `wreal` resolution to the
+    /// tool; summing is the one that makes a current-summing wrapper mean
+    /// what it says -- several stages each drive their contribution onto a
+    /// shared node and the node integrator sees the total, which is exactly
+    /// Kirchhoff's current law. Bitwise `$__wres` would instead call two
+    /// drivers a conflict and yield x.
+    RealSum,
 }
 
 impl ResolvedNetKind {
@@ -22477,6 +22485,7 @@ impl ResolvedNetKind {
             NetType::Tri0 => Some(Self::Tri0),
             NetType::Tri1 => Some(Self::Tri1),
             NetType::TriReg => Some(Self::ChargeStorage),
+            NetType::Wreal => Some(Self::RealSum),
             _ => None,
         }
     }
@@ -23164,7 +23173,22 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             _ => "$__wres",
         };
         let chain = if weak { &mut slot.weak } else { &mut slot.strong };
+        let sums = matches!(
+            elab.resolved_net_kinds.get(&name),
+            Some(ResolvedNetKind::RealSum)
+        );
         *chain = Some(match chain.take() {
+            // A `wreal` net adds its drivers. Plain `+` rather than a
+            // marker syscall, so this rides the ordinary real arithmetic
+            // path and folds like any other sum.
+            Some(acc) if sums => Expression::new(
+                ExprKind::Binary {
+                    op: crate::ast::expr::BinaryOp::Add,
+                    left: Box::new(acc),
+                    right: Box::new(rhs),
+                },
+                span,
+            ),
             Some(acc) => make_syscall(fold_op, vec![acc, rhs], span),
             None => rhs,
         });

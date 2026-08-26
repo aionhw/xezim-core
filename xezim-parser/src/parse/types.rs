@@ -664,6 +664,7 @@ fn parse_enum_type(&mut self) -> DataType {
             // typeless one. Recognising it as a NET TYPE rather than a data
             // type is what lets an ANSI port list carry one.
             TokenKind::KwInterconnect => { self.bump(); Some(NetType::Interconnect) }
+            TokenKind::KwWreal => { self.bump(); Some(NetType::Wreal) }
             _ => None,
         }
     }
