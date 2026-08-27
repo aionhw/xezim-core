@@ -2085,8 +2085,14 @@ impl Value {
             if w == 0 {
                 return Value::from_u64(1, 1);
             }
-            let sign_a = self.is_signed && (self.width as usize) < w;
-            let sign_b = other.is_signed && (other.width as usize) < w;
+            // §11.6.1: the comparison is signed only when BOTH operands are
+            // signed; if either is unsigned the propagated type is unsigned and
+            // the narrower operand is ZERO-extended. Extending by each
+            // operand's OWN signedness made `byte b = 8'hfe; b == 32'hfe`
+            // false (b sign-extended to 0xFFFFFFFE). Mirrors `case_eq_slow`.
+            let both_signed_x = self.is_signed && other.is_signed;
+            let sign_a = both_signed_x && (self.width as usize) < w;
+            let sign_b = both_signed_x && (other.width as usize) < w;
             let top_a = if self.width > 0 { self.get_bit((self.width - 1) as usize) } else { LogicBit::Zero };
             let top_b = if other.width > 0 { other.get_bit((other.width - 1) as usize) } else { LogicBit::Zero };
             for i in 0..w {
@@ -2100,12 +2106,35 @@ impl Value {
             }
             return Value::new(1);
         }
-        // IEEE 1800: if either operand is signed, sign-extend both to max width
-        if (self.is_signed || other.is_signed) && self.width != other.width {
+        // §11.6.1/§11.8.2: the expression is signed only when BOTH operands
+        // are signed. Sign-extending whenever EITHER was signed made a signed
+        // narrow operand compare as negative against a wider unsigned one
+        // (`byte b = 8'hfe; b == 32'hfe` was false; the reference gives true).
+        if self.width != other.width {
             let w = self.width.max(other.width);
-            let a = self.resize(w).to_u64().unwrap_or(0);
-            let b = other.resize(w).to_u64().unwrap_or(0);
-            return Value::from_u64((a == b) as u64, 1);
+            let both_signed = self.is_signed && other.is_signed;
+            let widen = |v: &Value| -> Value {
+                if both_signed {
+                    v.resize(w)
+                } else {
+                    let mut u = v.clone();
+                    u.is_signed = false;
+                    u.resize(w)
+                }
+            };
+            let (a, b) = (widen(self), widen(other));
+            if let (Some(x), Some(y)) = (a.to_u64(), b.to_u64()) {
+                return Value::from_u64((x == y) as u64, 1);
+            }
+            // Wider than 64 bits: compare bit by bit rather than through the
+            // `to_u64().unwrap_or(0)` fallback, which made two DIFFERENT wide
+            // values of unequal width compare equal (both read back as 0).
+            for i in 0..w as usize {
+                if a.get_bit(i) != b.get_bit(i) {
+                    return Value::from_u64(0, 1);
+                }
+            }
+            return Value::from_u64(1, 1);
         }
         let eq = self.to_u64().unwrap_or(0) == other.to_u64().unwrap_or(0);
         Value::from_u64(eq as u64, 1)
