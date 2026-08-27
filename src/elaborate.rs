@@ -2874,6 +2874,44 @@ fn prebind_type_dims(dt: &DataType, elab: &ElaboratedModule) -> Option<DataType>
     }
 }
 
+/// §6.19: an enum's member names are implicitly declared in the ENCLOSING
+/// scope, so two members of the same enum may not share a name --
+/// `typedef enum { IDLE, RUN, IDLE } state_t;` is a duplicate declaration and
+/// was accepted in silence, leaving `IDLE` bound to whichever member happened
+/// to register first.
+///
+/// Checked against the enum's OWN member list rather than at registration,
+/// because registration deliberately tolerates a name that is already present:
+/// a package's enum members are re-registered once per import site and per
+/// re-export hop (see the §26.3 note in `process_typedef`), and those repeats
+/// are not duplicates. Comparing within one declaration cannot confuse the
+/// two. Ranged members are expanded first, so a `[0:1]` range colliding with a
+/// literal sibling is caught as well.
+fn check_enum_member_duplicates(
+    td: &TypedefDeclaration,
+    elab: &ElaboratedModule,
+) -> Result<(), String> {
+    let DataType::Enum(et) = &td.data_type else {
+        return Ok(());
+    };
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut next_val: u64 = 0;
+    for member in &et.members {
+        let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
+        next_val = nv;
+        for (nm, _) in entries {
+            if !seen.insert(nm.clone()) {
+                // `kind` reads as a short noun in the message template
+                // ("duplicate {kind} declaration is at ..."), so it stays
+                // "enum member"; the enum's own name is already evident from
+                // the reported location.
+                return Err(duplicate_decl_error(elab, &nm, member.name.span, "enum member"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
@@ -3613,6 +3651,7 @@ pub fn elaborate_module_with_defs(
             }
         }
         for td in ordered_typedefs(defs) {
+            check_enum_member_duplicates(td, &elab)?;
             process_typedef(td, &mut elab);
         }
         for def in defs.values() {
@@ -4407,6 +4446,7 @@ pub fn elaborate_module_with_defs(
                 && struct_typedef_self_reference(&td.name.name, &td.data_type, &elab.typedef_types)
                     .is_none()
             {
+                check_enum_member_duplicates(td, &elab)?;
                 process_typedef(td, &mut elab);
             }
         }
