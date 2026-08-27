@@ -491,9 +491,33 @@ impl Parser {
             // §6.20.5 specparam — parse-accept (xezim doesn't model specify
             // timing); consume through the terminating ';'.
             TokenKind::KwSpecparam => {
-                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
-                self.expect(TokenKind::Semicolon);
-                None
+                // §6.20.5: a specparam is a module-scoped elaboration-time
+                // constant, and §23.3.3 makes it reachable by hierarchical
+                // name. The whole declaration used to be skipped to the `;`
+                // and DROPPED, so `u_child.SPEC_DELAY` resolved to nothing and
+                // read x while the sibling localparam read fine. Parse it as a
+                // localparam instead: it then lands in the same constant table
+                // that hierarchical resolution already searches.
+                //
+                // Backtracks to the old whole-declaration skip for any shape
+                // this parser does not model — notably `specparam PATHPULSE$ =
+                // ...`, whose name is not a plain identifier — so an exotic
+                // form is still tolerated rather than becoming a hard error.
+                let start_pos = self.pos;
+                let diag_len = self.diagnostics.len();
+                self.bump(); // specparam
+                let mut decl = self.parse_parameter_declaration();
+                if self.at(TokenKind::Semicolon) && self.diagnostics.len() == diag_len {
+                    self.bump(); // ;
+                    decl.local = true;
+                    Some(ModuleItem::LocalparamDeclaration(decl))
+                } else {
+                    self.diagnostics.truncate(diag_len);
+                    self.pos = start_pos;
+                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                    self.expect(TokenKind::Semicolon);
+                    None
+                }
             }
             // §6.6.8 interconnect net — a REAL declaration (it used to be
             // consumed to ';' and dropped, so the name looked undeclared,
