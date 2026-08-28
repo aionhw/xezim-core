@@ -61,6 +61,12 @@ pub enum TokenKind {
     // Compiler directive
     Directive,
 
+    // Verilog-AMS (Accellera LRM 2.4.0) keywords. Reserved ONLY in AMS mode
+    // (`sv_parser::set_ams`) — see `ams_keyword`.
+    KwWreal, KwWrealSum, KwWrealAvg, KwWrealMin, KwWrealMax,
+    KwNature, KwEndnature, KwDiscipline, KwEnddiscipline,
+    KwPotential, KwFlow, KwDomain, KwContinuous, KwDiscrete, KwGround,
+
     // Keywords (IEEE 1800-2017 Annex B)
     KwAccept_on, KwAlias, KwAlways, KwAlways_comb, KwAlways_ff, KwAlways_latch,
     KwAnd, KwAssert, KwAssign, KwAssume, KwAutomatic,
@@ -122,6 +128,42 @@ impl TokenKind {
             KwWeak0 | KwWeak1 | KwHighz0 | KwHighz1 |
             KwStrong | KwWeak |
             KwSmall | KwMedium | KwLarge)
+    }
+}
+
+/// Look up a Verilog-AMS keyword. Kept SEPARATE from [`keyword`] because
+/// these words are reserved only when AMS mode is on: `wreal` and friends are
+/// legal SystemVerilog identifiers, and reserving them unconditionally would
+/// break designs that lex clean today. The scanner consults this only under
+/// `sv_parser::is_ams()`.
+///
+/// The resolved forms (`wrealsum` … `wrealmax`) are the spelling in common
+/// vendor use for AMS §3.8 real-net driver resolution; see the note on
+/// `NetType::Wreal`.
+pub fn ams_keyword(s: &str) -> Option<TokenKind> {
+    use TokenKind::*;
+    match s {
+        "wreal" => Some(KwWreal),
+        "wrealsum" => Some(KwWrealSum),
+        "wrealavg" => Some(KwWrealAvg),
+        "wrealmin" => Some(KwWrealMin),
+        "wrealmax" => Some(KwWrealMax),
+        // AMS §3.4 natures / §3.5 disciplines. The nature and discipline
+        // ATTRIBUTES (`units`, `access`, `abstol`, `ddt_nature`, …) are
+        // deliberately NOT reserved: they parse as `<identifier> = <expr>;`
+        // inside the body, so a design using one of those words as an
+        // ordinary identifier elsewhere still lexes.
+        "nature" => Some(KwNature),
+        "endnature" => Some(KwEndnature),
+        "discipline" => Some(KwDiscipline),
+        "enddiscipline" => Some(KwEnddiscipline),
+        "potential" => Some(KwPotential),
+        "flow" => Some(KwFlow),
+        "domain" => Some(KwDomain),
+        "continuous" => Some(KwContinuous),
+        "discrete" => Some(KwDiscrete),
+        "ground" => Some(KwGround),
+        _ => None,
     }
 }
 

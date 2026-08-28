@@ -662,6 +662,14 @@ fn parse_enum_type(&mut self) -> DataType {
             // forms both route through the normal net machinery; the
             // elaborator adopts the connected formal's type.
             TokenKind::KwInterconnect => { self.bump(); Some(NetType::Interconnect) }
+            // AMS §3.8 real nets. These token kinds only exist under
+            // `--ams`; outside it the words lex as identifiers and never
+            // reach here.
+            TokenKind::KwWreal => { self.bump(); Some(NetType::Wreal(WrealResolution::None)) }
+            TokenKind::KwWrealSum => { self.bump(); Some(NetType::Wreal(WrealResolution::Sum)) }
+            TokenKind::KwWrealAvg => { self.bump(); Some(NetType::Wreal(WrealResolution::Avg)) }
+            TokenKind::KwWrealMin => { self.bump(); Some(NetType::Wreal(WrealResolution::Min)) }
+            TokenKind::KwWrealMax => { self.bump(); Some(NetType::Wreal(WrealResolution::Max)) }
             _ => None,
         }
     }

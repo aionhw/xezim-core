@@ -1,6 +1,6 @@
 //! Lexer/Scanner for SystemVerilog (IEEE 1800-2017 §5)
 
-use super::token::{Token, TokenKind, keyword};
+use super::token::{Token, TokenKind, ams_keyword, keyword};
 use crate::ast::Span;
 
 pub struct Lexer<'a> {
@@ -420,6 +420,15 @@ impl<'a> Lexer<'a> {
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
         let mut kind = keyword(&text).unwrap_or(TokenKind::Identifier);
+        // Verilog-AMS adds reserved words that are legal SV identifiers, so
+        // they are keywords only under `--ams` (see `sv_parser::is_ams`).
+        // Checked after the IEEE 1800 table and only on a would-be identifier,
+        // so AMS mode can never shadow a SystemVerilog keyword.
+        if kind == TokenKind::Identifier && crate::is_ams() {
+            if let Some(k) = ams_keyword(&text) {
+                kind = k;
+            }
+        }
         // §22.14: inside a `begin_keywords "1364-*"` region, a SystemVerilog-
         // only keyword is a legal identifier (e.g. `reg logic;` declares a reg
         // named `logic` in Verilog-2001).

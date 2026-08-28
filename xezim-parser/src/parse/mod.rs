@@ -155,8 +155,111 @@ impl Parser {
         None
     }
 
+    /// AMS §3.4 `nature <name> [: <parent>] ; <attr> = <expr>; … endnature`.
+    /// `nature` is only a keyword under `--ams`, so this is unreachable
+    /// otherwise.
+    fn parse_nature_declaration(&mut self) -> crate::ast::decl::NatureDeclaration {
+        let start = self.current().span.start;
+        self.expect(TokenKind::KwNature);
+        let name = self.parse_identifier();
+        // `nature derived : base;` — a nature refining another.
+        let parent = if self.eat(TokenKind::Colon).is_some() {
+            Some(self.parse_identifier())
+        } else {
+            None
+        };
+        let _ = self.eat(TokenKind::Semicolon);
+        let mut attributes = Vec::new();
+        while !self.at(TokenKind::KwEndnature) && !self.at(TokenKind::Eof) {
+            // `<attr> = <expr> ;`. Attribute names are NOT reserved words, so
+            // they arrive as identifiers; anything else in the body is skipped
+            // to the next `;` rather than failing the file, keeping the parser
+            // permissive on the standard's open attribute set.
+            if !self.at(TokenKind::Identifier) {
+                self.bump();
+                continue;
+            }
+            let attr = self.parse_identifier();
+            if self.eat(TokenKind::Assign).is_none() {
+                while !self.at(TokenKind::Semicolon)
+                    && !self.at(TokenKind::KwEndnature)
+                    && !self.at(TokenKind::Eof)
+                {
+                    self.bump();
+                }
+                let _ = self.eat(TokenKind::Semicolon);
+                continue;
+            }
+            let value = self.parse_expression();
+            let _ = self.eat(TokenKind::Semicolon);
+            attributes.push((attr, value));
+        }
+        self.expect(TokenKind::KwEndnature);
+        crate::ast::decl::NatureDeclaration { name, parent, attributes, span: self.span_from(start) }
+    }
+
+    /// AMS §3.5 `discipline <name>; [potential N;] [flow N;] [domain D;]
+    /// enddiscipline`.
+    fn parse_discipline_declaration(&mut self) -> crate::ast::decl::DisciplineDeclaration {
+        use crate::ast::decl::DisciplineDomain;
+        let start = self.current().span.start;
+        self.expect(TokenKind::KwDiscipline);
+        let name = self.parse_identifier();
+        let _ = self.eat(TokenKind::Semicolon);
+        let mut potential = None;
+        let mut flow = None;
+        let mut domain = None;
+        while !self.at(TokenKind::KwEnddiscipline) && !self.at(TokenKind::Eof) {
+            match self.current_kind() {
+                TokenKind::KwPotential => {
+                    self.bump();
+                    potential = Some(self.parse_identifier());
+                    let _ = self.eat(TokenKind::Semicolon);
+                }
+                TokenKind::KwFlow => {
+                    self.bump();
+                    flow = Some(self.parse_identifier());
+                    let _ = self.eat(TokenKind::Semicolon);
+                }
+                TokenKind::KwDomain => {
+                    self.bump();
+                    domain = match self.current_kind() {
+                        TokenKind::KwContinuous => { self.bump(); Some(DisciplineDomain::Continuous) }
+                        TokenKind::KwDiscrete => { self.bump(); Some(DisciplineDomain::Discrete) }
+                        _ => {
+                            self.error("expected `continuous` or `discrete` after `domain` (Verilog-AMS 2.4.0 3.5)");
+                            None
+                        }
+                    };
+                    let _ = self.eat(TokenKind::Semicolon);
+                }
+                // Anything else in the body (binding an attribute override,
+                // a vendor extension): skip to the next `;` and keep going.
+                _ => {
+                    while !self.at(TokenKind::Semicolon)
+                        && !self.at(TokenKind::KwEnddiscipline)
+                        && !self.at(TokenKind::Eof)
+                    {
+                        self.bump();
+                    }
+                    let _ = self.eat(TokenKind::Semicolon);
+                }
+            }
+        }
+        self.expect(TokenKind::KwEnddiscipline);
+        crate::ast::decl::DisciplineDeclaration { name, potential, flow, domain, span: self.span_from(start) }
+    }
+
     fn parse_description(&mut self) -> Option<Description> {
         match self.current_kind() {
+            // Verilog-AMS §3.4 / §3.5. These token kinds only exist under
+            // `--ams`; the words lex as ordinary identifiers otherwise.
+            TokenKind::KwNature => {
+                return Some(Description::Nature(self.parse_nature_declaration()));
+            }
+            TokenKind::KwDiscipline => {
+                return Some(Description::Discipline(self.parse_discipline_declaration()));
+            }
             // §23.5: `extern module <name> [#(params)] (ports);` — a PROTOTYPE
             // for a module defined elsewhere. The definition itself is what
             // gets elaborated; consume the prototype through its `;` and move

@@ -29,6 +29,7 @@ fn main() {
         eprintln!("  --dump-ast      Print parsed AST (Rust Debug format)");
         eprintln!("  --dump-json     Print parsed AST as JSON");
         eprintln!("  --check         Parse and report errors (default)");
+        eprintln!("  --ams           Enable Verilog-AMS syntax (also on for .vams/.va files)");
         eprintln!("  -I <dir>        Add include directory");
         eprintln!("  -D <name=val>   Define preprocessor macro");
         eprintln!("  --help          Show this help");
@@ -49,6 +50,10 @@ fn main() {
             "--dump-ast" => dump_ast = true,
             "--dump-json" => dump_json = true,
             "--check" => {}
+            // Verilog-AMS syntax. Off by default — AMS reserves words that
+            // are legal SystemVerilog identifiers, so enabling it
+            // unconditionally would reject files that parse today.
+            "--ams" => crate::set_ams(true),
             "-I" => {
                 i += 1;
                 if i < args.len() {
@@ -80,6 +85,19 @@ fn main() {
             _ => files.push(args[i].clone()),
         }
         i += 1;
+    }
+
+    // A `.vams` / `.va` input turns AMS syntax on for the run, matching the
+    // xezim CLI. The gate is process-wide (one keyword table), so it is set
+    // once from the full file list. `--ams` already set it; this only ever
+    // turns it on.
+    if files.iter().any(|f| {
+        matches!(
+            std::path::Path::new(f).extension().and_then(|e| e.to_str()),
+            Some("vams") | Some("va")
+        )
+    }) {
+        crate::set_ams(true);
     }
 
     if files.is_empty() {

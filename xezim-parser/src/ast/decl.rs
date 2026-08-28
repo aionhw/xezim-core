@@ -2,7 +2,7 @@
 
 
 use super::{Identifier, Span};
-use super::expr::Expression;
+use super::expr::{Expression, ExprKind};
 use super::stmt::{Statement, VarDeclarator};
 use super::types::*;
 
@@ -186,6 +186,86 @@ pub struct NettypeDeclaration {
     pub name: Identifier,
     pub resolver: Option<Identifier>,
     pub span: Span,
+}
+
+/// Verilog-AMS §3.4 nature declaration.
+///
+/// ```verilog
+/// nature Voltage;
+///   units   = "V";
+///   access  = V;
+///   abstol  = 1e-6;
+/// endnature
+///
+/// nature Voltage_hi : Voltage;   // derived; inherits then overrides
+///   abstol = 1e-9;
+/// endnature
+/// ```
+///
+/// Attributes are kept as `(name, expression)` pairs rather than named
+/// fields: the standard's set is open (`units`, `access`, `abstol`,
+/// `ddt_nature`, `idt_nature`, `huge`, `blowup`, plus user attributes), and a
+/// parse-only stage has no reason to privilege five of them. `access` is the
+/// one an analog stage needs by name — it is the function that names a branch
+/// quantity (`V(a,b)`), so it is surfaced by [`NatureDeclaration::access`].
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NatureDeclaration {
+    pub name: Identifier,
+    /// `nature derived : base;` — the nature this one refines, if any.
+    pub parent: Option<Identifier>,
+    /// Attribute assignments in source order.
+    pub attributes: Vec<(Identifier, Expression)>,
+    pub span: Span,
+}
+
+impl NatureDeclaration {
+    /// The `access = <f>;` attribute — the access function that names this
+    /// nature's quantity in a contribution (`V(n)`, `I(a,b)`).
+    pub fn access(&self) -> Option<&Identifier> {
+        self.attributes.iter().find_map(|(k, v)| {
+            if k.name != "access" {
+                return None;
+            }
+            match &v.kind {
+                ExprKind::Ident(h) => h.path.last().map(|seg| &seg.name),
+                _ => None,
+            }
+        })
+    }
+}
+
+/// Verilog-AMS §3.5 discipline declaration.
+///
+/// ```verilog
+/// discipline electrical;
+///   potential Voltage;
+///   flow      Current;
+/// enddiscipline
+/// ```
+///
+/// A discipline binds a domain (continuous by default when it names a
+/// potential/flow nature) to the natures its nets carry. A discipline with
+/// neither is a `domain discrete` one, which is how AMS types a plain digital
+/// net.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DisciplineDeclaration {
+    pub name: Identifier,
+    /// `potential <nature>;`
+    pub potential: Option<Identifier>,
+    /// `flow <nature>;`
+    pub flow: Option<Identifier>,
+    /// `domain continuous | discrete;`
+    pub domain: Option<DisciplineDomain>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DisciplineDomain {
+    Continuous,
+    Discrete,
 }
 
 #[derive(Debug, Clone)]

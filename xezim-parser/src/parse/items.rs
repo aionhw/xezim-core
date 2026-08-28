@@ -330,6 +330,12 @@ impl Parser {
             } else {
                 None
             }
+        } else if matches!(net_type, Some(NetType::Wreal(_))) {
+            // AMS §3.8: `output wreal o` — the real data type is implicit in
+            // the net type. Without this the port stayed implicit 1-bit, and
+            // every real driven through it truncated to its LSB while the
+            // diagnostic blamed a width mismatch.
+            Some(DataType::Real { kind: RealType::Real, span: self.span_from(start) })
         } else { None };
         let mut dimensions = if data_type.is_some() {
             self.parse_unpacked_dimensions()
@@ -473,6 +479,11 @@ impl Parser {
                         let dimensions = self.parse_packed_dimensions();
                         DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
                     }
+                    // AMS §3.8: `wreal` implies a real data type on a port
+                    // exactly as it does on a net declaration.
+                    else if matches!(nt, Some(NetType::Wreal(_))) {
+                        DataType::Real { kind: RealType::Real, span: self.span_from(start) }
+                    }
                     else { DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) } };
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
@@ -480,7 +491,12 @@ impl Parser {
             }
             TokenKind::KwWire | TokenKind::KwTri | TokenKind::KwWand | TokenKind::KwWor |
             TokenKind::KwSupply0 | TokenKind::KwSupply1 | TokenKind::KwTriand | TokenKind::KwTrior |
-            TokenKind::KwTri0 | TokenKind::KwTri1 | TokenKind::KwTrireg | TokenKind::KwUwire =>
+            TokenKind::KwTri0 | TokenKind::KwTri1 | TokenKind::KwTrireg | TokenKind::KwUwire |
+            // AMS §3.8 `wreal` (and its resolved forms) — an ordinary net
+            // declaration whose data type is implicitly `real`. Only reachable
+            // under `--ams`; the words lex as identifiers otherwise.
+            TokenKind::KwWreal | TokenKind::KwWrealSum | TokenKind::KwWrealAvg |
+            TokenKind::KwWrealMin | TokenKind::KwWrealMax =>
                 Some(ModuleItem::NetDeclaration(self.parse_net_declaration())),
             // §14.3: `global clocking …` — consume the `global` qualifier and
             // reuse the clocking-block parse via the KwClocking arm below.
@@ -1375,6 +1391,13 @@ impl Parser {
             else if self.at(TokenKind::LBracket) {
                 let dimensions = self.parse_packed_dimensions();
                 DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
+            }
+            // AMS §3.8: a `wreal` carries a real value, not a bit vector.
+            // The data type is implicit in the net type, so synthesize it —
+            // otherwise the net elaborates as a 1-bit implicit wire and every
+            // real driven onto it truncates to its LSB.
+            else if matches!(net_type, NetType::Wreal(_)) {
+                DataType::Real { kind: RealType::Real, span: self.span_from(start) }
             }
             else { DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) } };
         let declarators = self.parse_net_declarator_list();

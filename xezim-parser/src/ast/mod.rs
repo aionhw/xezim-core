@@ -79,4 +79,10 @@ pub enum Description {
     /// (it used to be brace-skipped and discarded, so the constraints simply
     /// did not exist at solve time).
     OutOfClassConstraint { class_name: String, constraint_name: String, items: Vec<crate::ast::decl::ConstraintItem> },
+    /// Verilog-AMS §3.4 `nature … endnature`. Top-level only (a nature is not
+    /// a module item). Parse-only at this stage: recorded so an analog stage
+    /// can resolve `access` functions and tolerances without re-parsing.
+    Nature(decl::NatureDeclaration),
+    /// Verilog-AMS §3.5 `discipline … enddiscipline`. Top-level only.
+    Discipline(decl::DisciplineDeclaration),
 }

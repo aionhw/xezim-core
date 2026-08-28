@@ -70,9 +70,12 @@ cargo build                          # debug
 cargo build --release                # optimized (lto=true, codegen-units=1)
 cargo test                           # unit tests in src/ + xezim-parser/src/tests.rs
 cargo test -p sv-parser              # just the parser subcrate
-cargo run -p sv-parser -- --check design.sv    # sv-parse CLI: parse-only, report errors
-cargo run -p sv-parser -- --dump-ast design.sv  # dump the AST (Rust Debug format)
-cargo run -p sv-parser -- --dump-json design.sv # one JSON object per file
+# sv-parse CLI. `-p sv-parser` does NOT work for `cargo run` (the subcrate is a
+# path dependency, not a workspace member) — run it from its own directory:
+(cd xezim-parser && cargo run --bin sv-parse -- --check design.sv)     # parse-only, report errors
+(cd xezim-parser && cargo run --bin sv-parse -- --dump-ast design.sv)  # dump the AST (Rust Debug format)
+(cd xezim-parser && cargo run --bin sv-parse -- --dump-json design.sv) # one JSON object per file
+(cd xezim-parser && cargo run --bin sv-parse -- --ams --check design.sv) # Verilog-AMS syntax
 ```
 
 Tests live next to code (`#[cfg(test)] mod tests` in `src/value.rs`,
@@ -115,10 +118,10 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
   this is the shared lib — declaring it here covers xezim, xezim-b, and every
   test binary. **Never add another `#[global_allocator]`.** A consumer opting
   out uses `xezim-core = { path = "../xezim-core", default-features = false }`.
-- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x0c"`
+- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x19"`
   (`src/lib.rs`). The last byte is the serialized-format version. When you add
   or change a serialized field in `ElaboratedModule` (or any bincode-serialized
-  type), **bump `\x0c` to `\x0d`** and add one line to the version-ladder
+  type), **bump the last byte** and add one line to the version-ladder
   comment above it, so stale `.xez` artifacts fail with a clear "recompile with
   current xezim" error instead of deserializing garbage.
 - **Artifacts are zstd-compressed bincode.** Default level 3 (overridable via

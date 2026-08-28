@@ -70,6 +70,32 @@ pub fn is_sv2023() -> bool {
     SV2023_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Process-wide gate for Verilog-AMS (Accellera LRM 2.4.0) syntax. **Off by
+/// default, and it must stay that way.**
+///
+/// Verilog-AMS adds ~60 reserved words over IEEE 1800, and several are
+/// plausible identifiers in existing SystemVerilog (`analog`, `nature`,
+/// `discipline`, `branch`, `flow`, `potential`, `access`, `ground`, `timer`,
+/// `above`, `ddt`, `idt`). Reserving them unconditionally would break designs
+/// that lex clean today, so AMS keywords lex as ordinary identifiers unless
+/// this gate is on — the same "only a keyword in some dialects" treatment
+/// `is_sv_only_keyword` gives the SV-over-Verilog-1364 additions.
+///
+/// Enabled by the `--ams` CLI flag (and by a `.vams`/`.va` source file);
+/// tests opt in via `set_ams`.
+static AMS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable Verilog-AMS syntax for subsequent lex/parse/simulate
+/// calls in this process.
+pub fn set_ams(enabled: bool) {
+    AMS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether Verilog-AMS syntax is currently enabled.
+pub fn is_ams() -> bool {
+    AMS_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Process-wide gate for "strict" negative-test diagnostics — the extra
 /// validation that lets xezim *reject* illegal constructs the LRM forbids
 /// (bad `\`line`/`\`define`/`\`pragma` directives, illegal sized-literal

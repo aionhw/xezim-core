@@ -4747,6 +4747,23 @@ pub fn elaborate_module_with_defs(
                         NetType::TriReg => Value::all_x(w),
                         _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
                     };
+                    // AMS §3.8: a `wreal` is a real net whose multiple
+                    // drivers fold through a BUILT-IN resolution. Rather than
+                    // a parallel mechanism, it reuses §6.6.7's: the net is
+                    // tagged with a synthetic nettype name whose "resolver" is
+                    // a reserved marker, and `resolve_user_nettype_drivers`
+                    // (which already unions nets joined across ports, so a
+                    // node is resolved exactly ONCE) expands the marker into
+                    // the reduction. A plain `wreal` registers with an empty
+                    // resolver, which is that function's existing
+                    // one-driver-only check.
+                    let mut type_name = get_type_name(&nd.data_type);
+                    if let NetType::Wreal(res) = nd.net_type {
+                        let tn = wreal_nettype_name(res);
+                        elab.nettype_resolvers
+                            .insert(tn.to_string(), wreal_resolver_marker(res).to_string());
+                        type_name = Some(tn.to_string());
+                    }
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width: w,
@@ -4754,7 +4771,7 @@ pub fn elaborate_module_with_defs(
                         is_real,
                         direction: None,
                         value: init_value,
-                        type_name: get_type_name(&nd.data_type),
+                        type_name,
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     elab.nets.insert(decl.name.name.clone());
@@ -11902,6 +11919,123 @@ fn lookup_resolver<'a>(
     let mut keys: Vec<&String> = elab.functions.keys().filter(|k| k.ends_with(&suffix)).collect();
     keys.sort();
     keys.first().and_then(|k| elab.functions.get(*k))
+}
+
+/// AMS §3.8 — the synthetic nettype name a `wreal` net is tagged with, so it
+/// rides the §6.6.7 resolution path (see the `NetDeclaration` arm). The `$`
+/// makes it unspellable as a user type, so it can never collide with a real
+/// typedef or be named in source.
+fn wreal_nettype_name(res: WrealResolution) -> &'static str {
+    match res {
+        WrealResolution::None => "$wreal",
+        WrealResolution::Sum => "$wrealsum",
+        WrealResolution::Avg => "$wrealavg",
+        WrealResolution::Min => "$wrealmin",
+        WrealResolution::Max => "$wrealmax",
+    }
+}
+
+/// Reserved "resolver name" marking a BUILT-IN wreal resolution.
+/// `resolve_user_nettype_drivers` expands these into an expression instead of
+/// emitting a call, so no synthetic SystemVerilog function has to exist.
+/// A plain `wreal` maps to `""`, which is that function's existing
+/// declared-without-a-resolver (one driver only) path.
+fn wreal_resolver_marker(res: WrealResolution) -> &'static str {
+    match res {
+        WrealResolution::None => "",
+        WrealResolution::Sum => WREAL_SUM,
+        WrealResolution::Avg => WREAL_AVG,
+        WrealResolution::Min => WREAL_MIN,
+        WrealResolution::Max => WREAL_MAX,
+    }
+}
+
+const WREAL_SUM: &str = "$wreal:sum";
+const WREAL_AVG: &str = "$wreal:avg";
+const WREAL_MIN: &str = "$wreal:min";
+const WREAL_MAX: &str = "$wreal:max";
+
+/// Whether a resolver name is one of the built-in wreal markers.
+fn is_wreal_marker(name: &str) -> bool {
+    matches!(name, WREAL_SUM | WREAL_AVG | WREAL_MIN | WREAL_MAX)
+}
+
+/// AMS §3.8: fold N `wreal` drivers into the single resolved value.
+///
+/// Built as an EXPRESSION rather than a call to a synthesized function, so it
+/// goes through the same constant folding, width/real typing and bytecode
+/// compilation as hand-written source — and needs no injected prelude.
+///
+/// * sum — `d0 + d1 + …` (a left fold, so the emitted expression reads in
+///   declaration order)
+/// * avg — that sum `/ n.0` (real division; the count is a real literal so an
+///   integer division can't truncate the average)
+/// * min/max — `(a <op> b) ? a : b`, folded as a BALANCED TREE
+///
+/// The balancing is not cosmetic. `?:` has no way to bind a temporary, so each
+/// fold step duplicates its accumulator into both the condition and one arm.
+/// Folded left, that doubles the node count per driver — 20 drivers on one
+/// node is a million-node expression. Halving instead makes the size quadratic
+/// in the driver count (S(n) = 4·S(n/2)), which is unremarkable at any driver
+/// count a real design has. Min and max are associative and
+/// order-independent, so the regrouping cannot change the value.
+///
+/// `drivers` is never empty (the caller skips empty components).
+fn wreal_reduction(marker: &str, drivers: Vec<Expression>, span: Span) -> Expression {
+    let n = drivers.len();
+    if marker == WREAL_MIN || marker == WREAL_MAX {
+        let op = if marker == WREAL_MIN { BinaryOp::Lt } else { BinaryOp::Gt };
+        return wreal_minmax_tree(op, drivers, span);
+    }
+    let mut it = drivers.into_iter();
+    let mut acc = it.next().expect("wreal_reduction: no drivers");
+    for d in it {
+        acc = Expression::new(
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(acc),
+                right: Box::new(d),
+            },
+            span,
+        );
+    }
+    if marker == WREAL_AVG && n > 1 {
+        acc = Expression::new(
+            ExprKind::Binary {
+                op: BinaryOp::Div,
+                left: Box::new(Expression::new(ExprKind::Paren(Box::new(acc)), span)),
+                right: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::Real(n as f64)),
+                    span,
+                )),
+            },
+            span,
+        );
+    }
+    acc
+}
+
+/// Balanced `(a <op> b) ? a : b` fold over `drivers` — see `wreal_reduction`
+/// for why it is halved rather than folded left.
+fn wreal_minmax_tree(op: BinaryOp, mut drivers: Vec<Expression>, span: Span) -> Expression {
+    debug_assert!(!drivers.is_empty(), "wreal_minmax_tree: no drivers");
+    if drivers.len() == 1 {
+        return drivers.pop().expect("len checked");
+    }
+    let right = drivers.split_off(drivers.len() / 2);
+    let a = wreal_minmax_tree(op, drivers, span);
+    let b = wreal_minmax_tree(op, right, span);
+    Expression::new(
+        ExprKind::Conditional {
+            condition: Box::new(Expression::new(
+                ExprKind::Binary { op, left: Box::new(a.clone()), right: Box::new(b.clone()) },
+                span,
+            )),
+            then_expr: Box::new(a),
+            else_expr: Box::new(b),
+        },
+        span,
+    )
 }
 
 /// §6.6.7 constraints on a nettype resolution function, checked at elaboration
@@ -22957,6 +23091,23 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // instances driving one node is an error just as two local
             // continuous assigns would be.
             if drivers.len() > 1 {
+                // AMS §3.8 spells the same rule with its own remedy: name a
+                // resolved form (`wrealsum`/`wrealavg`/`wrealmin`/`wrealmax`)
+                // instead of a plain `wreal`.
+                let is_wreal = elab
+                    .signals
+                    .get(&root)
+                    .and_then(|sig| sig.type_name.as_deref())
+                    == Some("$wreal");
+                if is_wreal {
+                    return Err(format!(
+                        "wreal net '{}' has {} continuous drivers; a plain `wreal` permits only one \
+                         — declare it `wrealsum`, `wrealavg`, `wrealmin` or `wrealmax` to resolve \
+                         them (Verilog-AMS 2.4.0 3.8)",
+                        root,
+                        drivers.len()
+                    ));
+                }
                 return Err(format!(
                     "net '{}' of an unresolved nettype has {} continuous drivers; a nettype declared without a resolution function permits only one (IEEE 1800-2017 6.6.7)",
                     root,
@@ -22964,6 +23115,10 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 ));
             }
             drivers.into_iter().next().unwrap()
+        } else if is_wreal_marker(&resolver) {
+            // AMS §3.8 built-in resolution: expand to the reduction rather
+            // than call a function (there is none to call).
+            wreal_reduction(&resolver, drivers, span)
         } else {
             // §6.6.7: the resolution function must exist, be `automatic`, and
             // take a single unpacked-array input. Checked here because this is
