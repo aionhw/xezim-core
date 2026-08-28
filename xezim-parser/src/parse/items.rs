@@ -1385,30 +1385,12 @@ impl Parser {
                 self.bump(); // #10 / #delay_id
             }
         }
-        // AMS §3.7:
-        //   wreal [ discipline_identifier ] [ range ] list_of_net_identifiers ;
-        // Both optional pieces have to be consumed HERE. Left to the generic
-        // net-declaration heuristics below, `wreal electrical wd;` matched
-        // "identifier followed by identifier" and took `electrical` as the
-        // DATA TYPE, and `wreal [3:0] wv;` matched the packed-dims branch —
-        // either way the net lost `real` and every real driven onto it
-        // truncated to its LSB, silently.
-        let data_type = if matches!(net_type, NetType::Wreal(_)) {
-            // A discipline identifier is present only when another identifier
-            // (the first net name) follows it; `wreal plain;` must not eat the
-            // name as a discipline.
-            if self.at(TokenKind::Identifier)
-                && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::LBracket)
-            {
-                self.bump(); // discipline_identifier — recorded nowhere yet
-            }
-            // `[msb:lsb]` — a vector of wreal. Consumed so the declaration
-            // parses; the elaborated net is still scalar, which is why the
-            // range is not carried into the data type.
-            let _ = self.parse_packed_dimensions();
-            DataType::Real { kind: RealType::Real, span: self.span_from(start) }
-        }
-        else if self.is_data_type_keyword() { self.parse_data_type() }
+        // A `wreal` declaration is parsed like any other net here; §3.7's
+        // optional discipline identifier and range are normalized afterwards
+        // by `wreal_data_type`, the one helper the port forms also go through.
+        // Handling them at this point instead left the two forms disagreeing:
+        // a ranged declaration was accepted and a ranged PORT rejected.
+        let data_type = if self.is_data_type_keyword() { self.parse_data_type() }
             // User-defined typedef net type — `wire dword foo;`,
             // `wire word_t a, b;`, `wire pkg::t x;`, `wire t#(8) x;`. A bare
             // identifier followed by another identifier / `::` / `#` is a type
