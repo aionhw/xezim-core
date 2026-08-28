@@ -660,12 +660,16 @@ fn parse_enum_type(&mut self) -> DataType {
             TokenKind::KwUwire => { self.bump(); Some(NetType::Uwire) }
             // §6.6.8 interconnect: a typeless net — declaration and port
             // forms both route through the normal net machinery; the
-            // elaborator adopts the connected formal's type.
+            // elaborator shapes whichever side of a port connection is the
+            // typeless one. Recognising it as a NET TYPE rather than a data
+            // type is what lets an ANSI port list carry one.
             TokenKind::KwInterconnect => { self.bump(); Some(NetType::Interconnect) }
-            // AMS §3.7 real nets. These token kinds only exist under
-            // `--ams`; outside it the words lex as identifiers and never
-            // reach here.
-            TokenKind::KwWreal => { self.bump(); Some(NetType::Wreal(WrealResolution::None)) }
+            // AMS §3.7 `wreal`. Ungated: it is an ordinary net type here,
+            // reserved for every run like `uwire`.
+            TokenKind::KwWreal => { self.bump(); Some(NetType::Wreal(WrealResolution::Sum)) }
+            // The resolved VENDOR spellings. Not in the LRM (§3.7 admits
+            // `wreal` alone), so these token kinds exist only under `--ams`;
+            // outside it the words lex as identifiers and never reach here.
             TokenKind::KwWrealSum => { self.bump(); Some(NetType::Wreal(WrealResolution::Sum)) }
             TokenKind::KwWrealAvg => { self.bump(); Some(NetType::Wreal(WrealResolution::Avg)) }
             TokenKind::KwWrealMin => { self.bump(); Some(NetType::Wreal(WrealResolution::Min)) }

@@ -63,7 +63,7 @@ pub enum TokenKind {
 
     // Verilog-AMS (Accellera LRM 2.4.0) keywords. Reserved ONLY in AMS mode
     // (`sv_parser::set_ams`) — see `ams_keyword`.
-    KwWreal, KwWrealSum, KwWrealAvg, KwWrealMin, KwWrealMax,
+    KwWrealSum, KwWrealAvg, KwWrealMin, KwWrealMax,
     KwNature, KwEndnature, KwDiscipline, KwEnddiscipline,
     KwPotential, KwFlow, KwDomain, KwContinuous, KwDiscrete, KwGround,
 
@@ -107,7 +107,7 @@ pub enum TokenKind {
     KwTable, KwTagged, KwTask, KwThis, KwThroughout, KwTime, KwTimeprecision,
     KwTimeunit, KwTran, KwTranif0, KwTranif1, KwTri, KwTri0, KwTri1,
     KwTriand, KwTrior, KwTrireg, KwType, KwTypedef,
-    KwUnion, KwUnique, KwUnique0, KwUnsigned, KwUntil, KwUntil_with, KwUntyped, KwUse, KwUwire,
+    KwUnion, KwUnique, KwUnique0, KwUnsigned, KwUntil, KwUntil_with, KwUntyped, KwUse, KwUwire, KwWreal,
     KwVar, KwVectored, KwVirtual, KwVoid,
     KwWait, KwWait_order, KwWand, KwWeak, KwWeak0, KwWeak1, KwWhile,
     KwWildcard, KwWire, KwWith, KwWithin, KwWor,
@@ -137,13 +137,13 @@ impl TokenKind {
 /// break designs that lex clean today. The scanner consults this only under
 /// `sv_parser::is_ams()`.
 ///
-/// The resolved forms (`wrealsum` … `wrealmax`) are the spelling in common
-/// vendor use for AMS §3.7 real-net driver resolution; see the note on
-/// `NetType::Wreal`.
+/// `wreal` itself is NOT here — it is an ordinary reserved word in the main
+/// table, like `uwire`. Only the resolved forms (`wrealsum` … `wrealmax`) are
+/// gated: those are vendor spellings that appear in neither Verilog-AMS 2.4.0
+/// nor VAMS-2023, whose §3.7 grammar admits `wreal` alone.
 pub fn ams_keyword(s: &str) -> Option<TokenKind> {
     use TokenKind::*;
     match s {
-        "wreal" => Some(KwWreal),
         "wrealsum" => Some(KwWrealSum),
         "wrealavg" => Some(KwWrealAvg),
         "wrealmin" => Some(KwWrealMin),
@@ -255,7 +255,7 @@ pub fn keyword(s: &str) -> Option<TokenKind> {
         "type" => Some(KwType), "typedef" => Some(KwTypedef),
         "union" => Some(KwUnion), "unique" => Some(KwUnique), "unique0" => Some(KwUnique0),
         "unsigned" => Some(KwUnsigned), "until" => Some(KwUntil), "until_with" => Some(KwUntil_with),
-        "untyped" => Some(KwUntyped), "use" => Some(KwUse), "uwire" => Some(KwUwire),
+        "untyped" => Some(KwUntyped), "use" => Some(KwUse), "uwire" => Some(KwUwire), "wreal" => Some(KwWreal),
         "var" => Some(KwVar), "vectored" => Some(KwVectored), "virtual" => Some(KwVirtual), "void" => Some(KwVoid),
         "wait" => Some(KwWait), "wait_order" => Some(KwWait_order), "wand" => Some(KwWand),
         "weak" => Some(KwWeak), "weak0" => Some(KwWeak0), "weak1" => Some(KwWeak1), "while" => Some(KwWhile),

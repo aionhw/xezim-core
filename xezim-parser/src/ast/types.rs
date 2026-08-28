@@ -141,27 +141,35 @@ pub struct EnumMember {
 pub enum NetType {
     Wire, Tri, Wand, Wor, TriAnd, TriOr, Tri0, Tri1, Supply0, Supply1, TriReg,
     Uwire, Interconnect,
-    /// Verilog-AMS §3.7 real net (`wreal`), carrying its driver-resolution
-    /// mode. A `wreal` holds a real value rather than a bit vector, and is the
-    /// discrete real-number-modeling net every AMS-lite design is built from.
+    /// Verilog-AMS §3.7 real net (`wreal`) — a net whose value is a real, not
+    /// a vector of bits. Carries the driver resolution to apply, so the
+    /// resolved vendor spellings (`wrealsum` and friends) are the same net
+    /// type with a different fold rather than four more variants.
+    ///
+    /// A plain `wreal` is `Sum`: §3.7 defines `wreal` for a net "driven by a
+    /// single driver" and says nothing about more, so the fold is
+    /// tool-defined. Summing is what makes a current-summing wrapper mean what
+    /// it says — several stages each drive a contribution onto a shared node
+    /// and the node sees the total, which is Kirchhoff's current law. It is
+    /// also an identity on one driver, so the single-driver case §3.7 does
+    /// define is unaffected.
     ///
     /// Appended last so the bincode variant indices of the existing net types
     /// are unchanged.
     Wreal(WrealResolution),
 }
 
-/// Verilog-AMS §3.7 driver resolution for a `wreal` net.
+/// Driver resolution for a `wreal` net.
 ///
-/// `None` is a plain `wreal`, which accepts a single driver. The resolved
-/// forms are declared with a distinct net-type keyword (`wrealsum x;`) —
-/// the spelling in common vendor use. Confirm against AMS §3.7 before
-/// treating the set as complete; adding an alias later is additive.
+/// `Sum` is the default and the only one the LRM's own single-driver case
+/// needs. The rest are the de-facto VENDOR spellings (`wrealavg x;` etc.) —
+/// they appear nowhere in Verilog-AMS 2.4.0 or VAMS-2023, whose §3.7 grammar
+/// admits `wreal` alone, so they are gated behind `--ams` and documented as a
+/// non-standard extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WrealResolution {
-    /// Plain `wreal` — one driver only.
-    None,
-    /// Sum of all drivers (a current-summing node).
+    /// Plain `wreal`, and `wrealsum`: the drivers are summed.
     Sum,
     /// Arithmetic mean of all drivers.
     Avg,

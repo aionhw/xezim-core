@@ -334,9 +334,26 @@ impl Parser {
             // AMS §3.7: `output wreal o` — the real data type is implicit in
             // the net type. Without this the port stayed implicit 1-bit, and
             // every real driven through it truncated to its LSB while the
-            // diagnostic blamed a width mismatch.
+            // diagnostic blamed a width mismatch. The `(Some(Wreal), None)`
+            // arm just below covers the same case for a port whose data type
+            // never parsed at all; both are kept because they are reached by
+            // different branches of the type-or-name disambiguation.
             Some(DataType::Real { kind: RealType::Real, span: self.span_from(start) })
         } else { None };
+        // An ANSI `wreal` port carries a real and declares no data type of
+        // its own. Same reason as the net path: fill one in so the width
+        // and real-ness queries downstream have something to read. A ranged
+        // one (`input wreal [3:0] p`) reaches here as an `Implicit` with
+        // packed dimensions and is rejected by the shared helper.
+        let wreal_span = self.span_from(start);
+        let data_type = match (net_type, data_type) {
+            (Some(NetType::Wreal(_)), None) => Some(DataType::Real {
+                kind: RealType::Real,
+                span: wreal_span,
+            }),
+            (Some(nt), Some(dt)) => Some(self.wreal_data_type(nt, dt, wreal_span)),
+            (_, dt) => dt,
+        };
         let mut dimensions = if data_type.is_some() {
             self.parse_unpacked_dimensions()
         } else {
@@ -485,6 +502,11 @@ impl Parser {
                         DataType::Real { kind: RealType::Real, span: self.span_from(start) }
                     }
                     else { DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) } };
+                let wreal_span = self.span_from(start);
+                let dt = match nt {
+                    Some(n) => self.wreal_data_type(n, dt, wreal_span),
+                    None => dt,
+                };
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
                 Some(ModuleItem::PortDeclaration(PortDeclaration { direction: dir, net_type: nt, data_type: dt, declarators: decls, span: self.span_from(start) }))
@@ -492,9 +514,9 @@ impl Parser {
             TokenKind::KwWire | TokenKind::KwTri | TokenKind::KwWand | TokenKind::KwWor |
             TokenKind::KwSupply0 | TokenKind::KwSupply1 | TokenKind::KwTriand | TokenKind::KwTrior |
             TokenKind::KwTri0 | TokenKind::KwTri1 | TokenKind::KwTrireg | TokenKind::KwUwire |
-            // AMS §3.7 `wreal` (and its resolved forms) — an ordinary net
-            // declaration whose data type is implicitly `real`. Only reachable
-            // under `--ams`; the words lex as identifiers otherwise.
+            // AMS §3.7 `wreal` (and the vendor resolved forms) — a net
+            // declaration whose data type is implicitly `real`. `wreal` itself
+            // is ungated; the resolved spellings need `--ams`.
             TokenKind::KwWreal | TokenKind::KwWrealSum | TokenKind::KwWrealAvg |
             TokenKind::KwWrealMin | TokenKind::KwWrealMax =>
                 Some(ModuleItem::NetDeclaration(self.parse_net_declaration())),
@@ -1431,6 +1453,8 @@ impl Parser {
                 DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
             }
             else { DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) } };
+        let wreal_span = self.span_from(start);
+        let data_type = self.wreal_data_type(net_type, data_type, wreal_span);
         let declarators = self.parse_net_declarator_list();
         self.expect(TokenKind::Semicolon);
         NetDeclaration { net_type, strength: None, data_type, delay: None, declarators, span: self.span_from(start) }
@@ -2777,6 +2801,57 @@ impl Parser {
             ConstraintRange::Range { lo, hi }
         } else {
             ConstraintRange::Value(self.parse_expression())
+        }
+    }
+}
+
+impl Parser {
+    /// A `wreal` net or port carries a real value and names no data type of
+    /// its own -- `wreal n;` is a net type and nothing else. Substituting
+    /// `real` here means every downstream question ("how wide is it", "is it
+    /// real") reads the answer off the data type as usual, instead of each of
+    /// those sites having to know about `NetType::Wreal`. An explicit data
+    /// type is left alone.
+    ///
+    /// A PACKED RANGE is rejected. Verilog-AMS has no ranged `wreal`: the net
+    /// carries one real value, not a vector of bits. Allowed to fall through,
+    /// `wreal [3:0] w` stayed an `Implicit` type and became an ordinary 4-bit
+    /// net -- `$bits` answered 4 and every value written to it was silently
+    /// ROUNDED (2.5 read back 3.0), which is the exact corruption `wreal`
+    /// exists to prevent, reported by nothing. Recovery substitutes `real` so
+    /// the rest of the parse stays useful.
+    fn wreal_data_type(
+        &mut self,
+        net_type: NetType,
+        dt: DataType,
+        span: crate::parse::Span,
+    ) -> DataType {
+        if !matches!(net_type, NetType::Wreal(_)) {
+            return dt;
+        }
+        match &dt {
+            DataType::Implicit { dimensions, .. } => {
+                if !dimensions.is_empty() {
+                    self.error(
+                        "a ranged 'wreal' is not supported: the net is modelled as ONE real, \
+                         not a vector of them, and accepting the range silently would make it \
+                         an ordinary bit vector that rounds every value written to it \
+                         (Verilog-AMS 2.4.0 3.7)",
+                    );
+                }
+                DataType::Real { kind: RealType::Real, span }
+            }
+            // §3.7's optional `discipline_identifier`:
+            //   wreal [ discipline_identifier ] [ range ] list_of_net_identifiers ;
+            // `wreal electrical w;` matches the generic "identifier followed by
+            // identifier" rule first and arrives here as a NAMED TYPE, so the
+            // net kept `electrical` as its data type and lost `real` — the same
+            // silent rounding the range case causes, and reported by nothing.
+            // The discipline is dropped: nets carry no discipline yet.
+            DataType::TypeReference { dimensions, .. } if dimensions.is_empty() => {
+                DataType::Real { kind: RealType::Real, span }
+            }
+            _ => dt,
         }
     }
 }

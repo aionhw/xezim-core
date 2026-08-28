@@ -4759,10 +4759,15 @@ pub fn elaborate_module_with_defs(
                     // one-driver-only check.
                     let mut type_name = get_type_name(&nd.data_type);
                     if let NetType::Wreal(res) = nd.net_type {
-                        let tn = wreal_nettype_name(res);
-                        elab.nettype_resolvers
-                            .insert(tn.to_string(), wreal_resolver_marker(res).to_string());
-                        type_name = Some(tn.to_string());
+                        // `Sum` is the default and is resolved by
+                        // `ResolvedNetKind::RealSum` with the other net kinds;
+                        // only the vendor folds need the §6.6.7 path.
+                        if res != WrealResolution::Sum {
+                            let tn = wreal_nettype_name(res);
+                            elab.nettype_resolvers
+                                .insert(tn.to_string(), wreal_resolver_marker(res).to_string());
+                            type_name = Some(tn.to_string());
+                        }
                     }
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
@@ -11927,7 +11932,6 @@ fn lookup_resolver<'a>(
 /// typedef or be named in source.
 fn wreal_nettype_name(res: WrealResolution) -> &'static str {
     match res {
-        WrealResolution::None => "$wreal",
         WrealResolution::Sum => "$wrealsum",
         WrealResolution::Avg => "$wrealavg",
         WrealResolution::Min => "$wrealmin",
@@ -11942,7 +11946,6 @@ fn wreal_nettype_name(res: WrealResolution) -> &'static str {
 /// declared-without-a-resolver (one driver only) path.
 fn wreal_resolver_marker(res: WrealResolution) -> &'static str {
     match res {
-        WrealResolution::None => "",
         WrealResolution::Sum => WREAL_SUM,
         WrealResolution::Avg => WREAL_AVG,
         WrealResolution::Min => WREAL_MIN,
@@ -21046,6 +21049,22 @@ fn inline_module_items(
                     }
                 }
 
+                // §6.6.8: an `interconnect` port has NO data type of its own --
+                // it takes whatever the things connected to it agree on. Every
+                // other port kind knows its type from its own declaration, so
+                // this is the one case that has to be resolved HERE, where the
+                // actual is finally visible. Left untyped it lands as a 1-bit
+                // net and silently truncates: a UVM-MS wrapper carrying an
+                // analog value saw 1.0 where the parent net held 1.25.
+                let interconnect_ports: HashSet<String> =
+                    match sub_mod.ports() {
+                        PortList::Ansi(ps) => ps
+                            .iter()
+                            .filter(|q| matches!(q.net_type, Some(NetType::Interconnect)))
+                            .map(|q| q.name.name.clone())
+                            .collect(),
+                        _ => Default::default(),
+                    };
                 for (port_name, parent_expr) in &port_map {
                     if prepared_sub.interface_ports.contains(port_name) { continue; }
                     let sub_sig_name = format!("{}{}", inst_prefix, port_name);
@@ -21078,6 +21097,34 @@ fn inline_module_items(
                                             };
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                    // §6.6.8, the other direction: an `interconnect` PORT is
+                    // typeless and adopts the shape of the actual it is
+                    // connected to. The block above shapes a typeless ACTUAL
+                    // from a typed formal; this one shapes a typeless FORMAL
+                    // from a typed actual. Both are needed — either side of a
+                    // port connection may be the typeless one.
+                    if interconnect_ports.contains(port_name) {
+                        // Adopt the actual's shape. Only the attributes that
+                        // decide how the value is STORED are copied -- width,
+                        // real-ness, signedness, and the nettype name so a
+                        // resolved net stays resolved; direction stays the
+                        // port's own.
+                        if let Some(src) = whole_net_ident_name(parent_expr)
+                            .and_then(|n| elab.signals.get(&n).cloned())
+                        {
+                            if let Some(dst) = elab.signals.get_mut(&sub_sig_name) {
+                                dst.width = src.width;
+                                dst.is_real = src.is_real;
+                                dst.is_signed = src.is_signed;
+                                dst.type_name = src.type_name.clone();
+                                if dst.is_real {
+                                    dst.value = Value::from_f64(0.0);
+                                } else {
+                                    dst.value = Value::zero(src.width.max(1));
                                 }
                             }
                         }
@@ -22557,6 +22604,14 @@ pub enum ResolvedNetKind {
     /// §6.6.4 `trireg` charge storage: bits no driver is driving HOLD the
     /// last driven value (modeled as an implicit weak self-driver).
     ChargeStorage,
+    /// Verilog-AMS `wreal`: drivers are SUMMED rather than resolved
+    /// bitwise. Verilog-AMS leaves multi-driver `wreal` resolution to the
+    /// tool; summing is the one that makes a current-summing wrapper mean
+    /// what it says -- several stages each drive their contribution onto a
+    /// shared node and the node integrator sees the total, which is exactly
+    /// Kirchhoff's current law. Bitwise `$__wres` would instead call two
+    /// drivers a conflict and yield x.
+    RealSum,
 }
 
 impl ResolvedNetKind {
@@ -22567,6 +22622,13 @@ impl ResolvedNetKind {
             NetType::Tri0 => Some(Self::Tri0),
             NetType::Tri1 => Some(Self::Tri1),
             NetType::TriReg => Some(Self::ChargeStorage),
+            // Only the default (and its explicit `wrealsum` spelling) folds
+            // here. The other vendor resolutions cannot: `wrealavg` needs the
+            // driver COUNT and `wrealmin`/`wrealmax` need all the drivers at
+            // once to fold without duplicating the accumulator, neither of
+            // which a streaming chain has. Those ride the §6.6.7 resolver
+            // path instead (see `wreal_resolver_marker`).
+            NetType::Wreal(WrealResolution::Sum) => Some(Self::RealSum),
             _ => None,
         }
     }
@@ -23091,23 +23153,6 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // instances driving one node is an error just as two local
             // continuous assigns would be.
             if drivers.len() > 1 {
-                // AMS §3.7 spells the same rule with its own remedy: name a
-                // resolved form (`wrealsum`/`wrealavg`/`wrealmin`/`wrealmax`)
-                // instead of a plain `wreal`.
-                let is_wreal = elab
-                    .signals
-                    .get(&root)
-                    .and_then(|sig| sig.type_name.as_deref())
-                    == Some("$wreal");
-                if is_wreal {
-                    return Err(format!(
-                        "wreal net '{}' has {} continuous drivers; a plain `wreal` permits only one \
-                         — declare it `wrealsum`, `wrealavg`, `wrealmin` or `wrealmax` to resolve \
-                         them (Verilog-AMS 2.4.0 3.7)",
-                        root,
-                        drivers.len()
-                    ));
-                }
                 return Err(format!(
                     "net '{}' of an unresolved nettype has {} continuous drivers; a nettype declared without a resolution function permits only one (IEEE 1800-2017 6.6.7)",
                     root,
@@ -23275,7 +23320,22 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             _ => "$__wres",
         };
         let chain = if weak { &mut slot.weak } else { &mut slot.strong };
+        let sums = matches!(
+            elab.resolved_net_kinds.get(&name),
+            Some(ResolvedNetKind::RealSum)
+        );
         *chain = Some(match chain.take() {
+            // A `wreal` net adds its drivers. Plain `+` rather than a
+            // marker syscall, so this rides the ordinary real arithmetic
+            // path and folds like any other sum.
+            Some(acc) if sums => Expression::new(
+                ExprKind::Binary {
+                    op: crate::ast::expr::BinaryOp::Add,
+                    left: Box::new(acc),
+                    right: Box::new(rhs),
+                },
+                span,
+            ),
             Some(acc) => make_syscall(fold_op, vec![acc, rhs], span),
             None => rhs,
         });
