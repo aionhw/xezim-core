@@ -3338,11 +3338,47 @@ fn collect_class_member_names(
     }
     if let Some(ext) = &c.extends {
         if let Some(defs) = all_defs {
-            if let Some(Definition::Class(parent)) = defs.get(&ext.name.name) {
+            // §8.16/§26.3: the base of a class declared in a MODULE body (or
+            // another package) may live INSIDE an imported package
+            // (`mypacket extends packet` where `packet` is `packet_pkg`'s
+            // class) rather than as a top-level Class definition. Packages
+            // are kept whole in `all_defs` (Definition::Package), so a bare
+            // `defs.get(base)` lookup misses package members and an inherited
+            // property reference in a derived constraint is wrongly rejected
+            // as undeclared. Fall back to searching every package's classes.
+            let parent: Option<&ClassDeclaration> = match defs.get(&ext.name.name) {
+                Some(Definition::Class(p)) => Some(p),
+                Some(Definition::Package(_)) | None => {
+                    find_base_class_in_packages(defs, &ext.name.name)
+                }
+                _ => None,
+            };
+            if let Some(parent) = parent {
                 collect_class_member_names(parent, all_defs, allowed, seen);
             }
         }
     }
+}
+
+/// Search every package in `defs` for a class named `name`, used to resolve
+/// a bare base-class name over which a module/package class `extends` when
+/// the base lives inside an imported package (not as a top-level Class def).
+fn find_base_class_in_packages<'a>(
+    defs: &'a HashMap<String, Definition<'a>>,
+    name: &str,
+) -> Option<&'a ClassDeclaration> {
+    for def in defs.values() {
+        if let Definition::Package(pkg) = def {
+            for item in &pkg.items {
+                if let crate::ast::decl::PackageItem::Class(c) = item {
+                    if c.name.name == name {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Add the enum constant names introduced by an enum typedef to `allowed`.
