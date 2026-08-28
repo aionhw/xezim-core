@@ -138,7 +138,13 @@ pub struct EnumMember {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum NetType { Wire, Tri, Wand, Wor, TriAnd, TriOr, Tri0, Tri1, Supply0, Supply1, TriReg, Uwire, Interconnect }
+pub enum NetType { Wire, Tri, Wand, Wor, TriAnd, TriOr, Tri0, Tri1, Supply0, Supply1, TriReg, Uwire, Interconnect,
+                   /// Verilog-AMS `wreal` -- a net whose value is a real, not a
+                   /// vector of bits. Multiple drivers are SUMMED (see
+                   /// `ResolvedNetKind::RealSum`), which is the resolution the
+                   /// current-summing wrappers this simulator is pointed at rely
+                   /// on; the Verilog-AMS default leaves it tool-defined.
+                   Wreal }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
