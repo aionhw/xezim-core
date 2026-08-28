@@ -1833,6 +1833,18 @@ impl Parser {
                     if self.eat(TokenKind::Comma).is_none() { break; }
                 }
                 self.expect(TokenKind::RParen); Some(p)
+            } else if matches!(
+                self.current_kind(),
+                TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
+            ) {
+                // §28.3 primitive delay without parens — `ubuf #2 u (o, i)`.
+                // Eating the `#` and returning None left the literal in the
+                // stream to trip the instance-name parse. A single NUMERIC
+                // literal becomes the one positional value, converging with
+                // `#(2)` downstream (the UDP elaborator reads a scalar delay
+                // out of `params`). Literals only: an identifier here would
+                // be ambiguous against too many neighbors.
+                Some(vec![ParamConnection::Ordered(Some(self.parse_param_value()))])
             } else { None }
         } else { None };
 

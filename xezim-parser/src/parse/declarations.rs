@@ -625,6 +625,23 @@ impl Parser {
     pub(super) fn parse_param_args(&mut self) -> Vec<ParamValue> {
         let mut args = Vec::new();
         let _has_hash = self.eat(TokenKind::Hash).is_some();
+        // §28.3 gate/primitive delay without parens — `buf #2 b(o,i)`,
+        // `ubuf #1.5 u(o,i)`. The old code ate the `#`, found no `(`, and
+        // returned EMPTY, leaving the literal in the stream to trip the
+        // instance-name parse ("expected identifier, found IntegerLiteral").
+        // Accept a single NUMERIC literal as the one positional value; the
+        // elaborator already reads a scalar delay out of `inst.params`, so
+        // `#2` and `#(2)` converge downstream. Literals only — an identifier
+        // delay would be ambiguous against too many neighbors.
+        if _has_hash
+            && matches!(
+                self.current_kind(),
+                TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
+            )
+        {
+            args.push(self.parse_param_value());
+            return args;
+        }
         if self.eat(TokenKind::LParen).is_none() { return args; }
         if self.at(TokenKind::RParen) { self.bump(); return args; }
         loop {
