@@ -601,8 +601,25 @@ impl Preprocessor {
                 }
                 i += 1;
             }
-            out.push_str(&line[seg..]);
-            out.push('\n');
+            // Trailing segment. When the line ENDED at a directive (`seg` is
+            // at end-of-line, or only whitespace remains) there is nothing
+            // left to emit — and emitting it anyway appended a spurious blank
+            // line. A conditional directive on its own line is the common
+            // shape by far, so every `\`ifdef`/`\`ifndef`/`\`else`/`\`elsif`/
+            // `\`endif` in a file shifted every later line by one: a marker on
+            // source line 7 behind two `\`ifndef` guards reported `__LINE__`
+            // as 11, and file:line diagnostics drifted with it.
+            //
+            // `seg == 0` means the scan split nothing (a line that merely uses
+            // a macro), and there the whole line must be emitted as-is —
+            // including when it is blank.
+            if seg == 0 {
+                out.push_str(line);
+                out.push('\n');
+            } else if !line[seg..].trim().is_empty() {
+                out.push_str(&line[seg..]);
+                out.push('\n');
+            }
         }
         out
     }

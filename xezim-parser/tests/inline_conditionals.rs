@@ -60,3 +60,67 @@ fn a_conditional_in_a_define_body_is_not_split() {
         norm(&out)
     );
 }
+
+// ── line accounting ───────────────────────────────────────────────────────
+
+/// A conditional directive on its OWN line must not shift the lines after it.
+///
+/// The splitter lifts every inline conditional onto its own line, then flushed
+/// whatever followed the directive as one more line. When the directive WAS
+/// the whole line, that trailing flush was empty — and emitted a blank line
+/// anyway. Every `` `ifdef ``/`` `ifndef ``/`` `else ``/`` `elsif ``/
+/// `` `endif `` in a file therefore pushed everything below it down by one,
+/// which is every file with an include guard.
+///
+/// IEEE 1800-2023 §22.13 makes this observable through `` `__LINE__ ``, and it
+/// silently skewed `file:line` in every diagnostic below a guard.
+#[test]
+fn an_own_line_conditional_does_not_shift_later_line_numbers() {
+    use std::path::Path;
+    use sv_parser::preprocessor::Preprocessor;
+
+    // marker sits on source line 7, behind two guards.
+    let src = "`ifndef __FILE__\n\
+               `define __FILE__ 0\n\
+               `endif\n\
+               `ifndef __LINE__\n\
+               `define __LINE__ 0\n\
+               `endif\n\
+               marker `__LINE__\n";
+    let mut pp = Preprocessor::new();
+    let out = pp.preprocess_file(src, Some(Path::new("/w/f.svh")));
+    assert!(out.contains("marker 7"), "expected `marker 7`, got:\n{out}");
+    assert_eq!(
+        out.lines().count(),
+        7,
+        "the preprocessed text must stay line-for-line with the source:\n{out}"
+    );
+}
+
+/// The ubiquitous include-guard shape, checked one directive at a time so a
+/// regression names which one drifted.
+#[test]
+fn every_conditional_directive_keeps_the_line_count() {
+    for directive in ["`ifdef X", "`ifndef X", "`endif", "`else", "`elsif X"] {
+        let src = format!("{directive}\n`endif\nlast\n");
+        let out = sv_parser::preprocess(&src);
+        assert_eq!(
+            out.lines().count(),
+            3,
+            "`{directive}` changed the line count:\n{out}"
+        );
+    }
+}
+
+/// The mid-line form still splits onto separate lines — that is what makes the
+/// line-based resolver see it at all — so it necessarily adds lines. Pinned so
+/// the behaviour is deliberate rather than assumed: a fix would need the
+/// splitter to carry an output→source line map.
+#[test]
+fn a_mid_line_conditional_still_splits_and_is_known_to_add_lines() {
+    let out = sv_parser::preprocess("static `ifndef FOO local `endif bit x;\n");
+    assert!(
+        out.lines().count() > 1,
+        "the inline form must be lifted onto its own lines: {out:?}"
+    );
+}
