@@ -1760,6 +1760,66 @@ impl Parser {
         } else { (self.parse_module_item().into_iter().collect(), None) }
     }
 
+    /// Convert a `#(...)` parameter VALUE into a TYPE-ARG expression when it
+    /// is used as the specialization of a parameterized CLASS in a data-
+    /// declaration type (`param_obj #(int) x;`). `parse_param_value` returns
+    /// `ParamValue::Type(dt)` for a type keyword (`int`, `bit`) or a
+    /// typedef/class name; data declarations need those as identifier
+    /// expressions so the specialize's `type_args` list is non-empty and
+    /// downstream per-spec binding (type_bindings / current_spec / the
+    /// class registry's `type_name`) can reconstruct `param_obj#(int)`. A
+    /// position that drops them leaves the type_args empty and the variable
+    /// default-specializes (`param_obj#(bit)`), which is what broke UVM's
+    /// `type_id::type_name()` for parameterized-class fields/collections.
+    fn param_value_to_type_arg(&self, pv: &ParamValue) -> Option<crate::ast::expr::Expression> {
+        use crate::ast::expr::{ExprKind, Expression, HierarchicalIdentifier, HierPathSegment};
+        use crate::ast::Identifier as PIdent;
+        use crate::ast::types::DataType;
+        let (leaf, span) = match pv {
+            ParamValue::Expr(e) => return Some(e.clone()),
+            ParamValue::Type(dt) => match dt {
+                DataType::TypeReference { name, .. } => (name.name.name.clone(), name.name.span),
+                DataType::IntegerAtom { kind, span, .. } => (
+                    match kind {
+                        crate::ast::types::IntegerAtomType::Byte => "byte",
+                        crate::ast::types::IntegerAtomType::ShortInt => "shortint",
+                        crate::ast::types::IntegerAtomType::Int => "int",
+                        crate::ast::types::IntegerAtomType::LongInt => "longint",
+                        crate::ast::types::IntegerAtomType::Integer => "integer",
+                        crate::ast::types::IntegerAtomType::Time => "time",
+                    }
+                    .to_string(),
+                    *span,
+                ),
+                DataType::IntegerVector { kind, span, .. } => (
+                    match kind {
+                        crate::ast::types::IntegerVectorType::Bit => "bit",
+                        crate::ast::types::IntegerVectorType::Logic => "logic",
+                        crate::ast::types::IntegerVectorType::Reg => "reg",
+                    }
+                    .to_string(),
+                    *span,
+                ),
+                DataType::Simple {
+                    kind: crate::ast::types::SimpleType::String,
+                    span,
+                } => ("string".to_string(), *span),
+                _ => return None,
+            },
+        };
+        let hier = HierarchicalIdentifier {
+            root: None,
+            path: vec![HierPathSegment {
+                name: PIdent { name: leaf, span },
+                selects: Vec::new(),
+            }],
+            span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        Some(Expression::new(ExprKind::Ident(hier), span))
+    }
+
     fn parse_identifier_starting_item(&mut self) -> ModuleItem {
         let start = self.current().span.start;
         let first_name = self.parse_identifier();
@@ -1856,8 +1916,8 @@ impl Parser {
             let dimensions = self.parse_packed_dimensions();
             let type_args: Vec<crate::ast::expr::Expression> = match &params {
                 Some(ps) => ps.iter().filter_map(|pc| match pc {
-                    ParamConnection::Ordered(Some(ParamValue::Expr(e))) => Some(e.clone()),
-                    ParamConnection::Named { value: Some(ParamValue::Expr(e)), .. } => Some(e.clone()),
+                    ParamConnection::Ordered(Some(pv)) => self.param_value_to_type_arg(pv),
+                    ParamConnection::Named { value: Some(pv), .. } => self.param_value_to_type_arg(pv),
                     _ => None,
                 }).collect(),
                 None => Vec::new(),
@@ -1897,8 +1957,8 @@ impl Parser {
                 self.pos = initial_pos;
                 let type_args: Vec<crate::ast::expr::Expression> = match &params {
                     Some(ps) => ps.iter().filter_map(|pc| match pc {
-                        ParamConnection::Ordered(Some(ParamValue::Expr(e))) => Some(e.clone()),
-                        ParamConnection::Named { value: Some(ParamValue::Expr(e)), .. } => Some(e.clone()),
+                        ParamConnection::Ordered(Some(pv)) => self.param_value_to_type_arg(pv),
+                        ParamConnection::Named { value: Some(pv), .. } => self.param_value_to_type_arg(pv),
                         _ => None,
                     }).collect(),
                     None => Vec::new(),
