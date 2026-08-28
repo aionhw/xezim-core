@@ -138,7 +138,7 @@ impl TokenKind {
 /// `sv_parser::is_ams()`.
 ///
 /// The resolved forms (`wrealsum` … `wrealmax`) are the spelling in common
-/// vendor use for AMS §3.8 real-net driver resolution; see the note on
+/// vendor use for AMS §3.7 real-net driver resolution; see the note on
 /// `NetType::Wreal`.
 pub fn ams_keyword(s: &str) -> Option<TokenKind> {
     use TokenKind::*;
@@ -148,7 +148,7 @@ pub fn ams_keyword(s: &str) -> Option<TokenKind> {
         "wrealavg" => Some(KwWrealAvg),
         "wrealmin" => Some(KwWrealMin),
         "wrealmax" => Some(KwWrealMax),
-        // AMS §3.4 natures / §3.5 disciplines. The nature and discipline
+        // AMS §3.6.1 natures / §3.5 disciplines. The nature and discipline
         // ATTRIBUTES (`units`, `access`, `abstol`, `ddt_nature`, …) are
         // deliberately NOT reserved: they parse as `<identifier> = <expr>;`
         // inside the body, so a design using one of those words as an

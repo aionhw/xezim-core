@@ -4747,7 +4747,7 @@ pub fn elaborate_module_with_defs(
                         NetType::TriReg => Value::all_x(w),
                         _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
                     };
-                    // AMS §3.8: a `wreal` is a real net whose multiple
+                    // AMS §3.7: a `wreal` is a real net whose multiple
                     // drivers fold through a BUILT-IN resolution. Rather than
                     // a parallel mechanism, it reuses §6.6.7's: the net is
                     // tagged with a synthetic nettype name whose "resolver" is
@@ -11921,7 +11921,7 @@ fn lookup_resolver<'a>(
     keys.first().and_then(|k| elab.functions.get(*k))
 }
 
-/// AMS §3.8 — the synthetic nettype name a `wreal` net is tagged with, so it
+/// AMS §3.7 — the synthetic nettype name a `wreal` net is tagged with, so it
 /// rides the §6.6.7 resolution path (see the `NetDeclaration` arm). The `$`
 /// makes it unspellable as a user type, so it can never collide with a real
 /// typedef or be named in source.
@@ -11960,7 +11960,7 @@ fn is_wreal_marker(name: &str) -> bool {
     matches!(name, WREAL_SUM | WREAL_AVG | WREAL_MIN | WREAL_MAX)
 }
 
-/// AMS §3.8: fold N `wreal` drivers into the single resolved value.
+/// AMS §3.7: fold N `wreal` drivers into the single resolved value.
 ///
 /// Built as an EXPRESSION rather than a call to a synthesized function, so it
 /// goes through the same constant folding, width/real typing and bytecode
@@ -23091,7 +23091,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // instances driving one node is an error just as two local
             // continuous assigns would be.
             if drivers.len() > 1 {
-                // AMS §3.8 spells the same rule with its own remedy: name a
+                // AMS §3.7 spells the same rule with its own remedy: name a
                 // resolved form (`wrealsum`/`wrealavg`/`wrealmin`/`wrealmax`)
                 // instead of a plain `wreal`.
                 let is_wreal = elab
@@ -23103,7 +23103,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     return Err(format!(
                         "wreal net '{}' has {} continuous drivers; a plain `wreal` permits only one \
                          — declare it `wrealsum`, `wrealavg`, `wrealmin` or `wrealmax` to resolve \
-                         them (Verilog-AMS 2.4.0 3.8)",
+                         them (Verilog-AMS 2.4.0 3.7)",
                         root,
                         drivers.len()
                     ));
@@ -23116,7 +23116,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             }
             drivers.into_iter().next().unwrap()
         } else if is_wreal_marker(&resolver) {
-            // AMS §3.8 built-in resolution: expand to the reduction rather
+            // AMS §3.7 built-in resolution: expand to the reduction rather
             // than call a function (there is none to call).
             wreal_reduction(&resolver, drivers, span)
         } else {

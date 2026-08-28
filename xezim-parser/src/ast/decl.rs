@@ -188,7 +188,7 @@ pub struct NettypeDeclaration {
     pub span: Span,
 }
 
-/// Verilog-AMS §3.4 nature declaration.
+/// Verilog-AMS §3.6.1 nature declaration.
 ///
 /// ```verilog
 /// nature Voltage;
@@ -213,7 +213,7 @@ pub struct NettypeDeclaration {
 pub struct NatureDeclaration {
     pub name: Identifier,
     /// `nature derived : base;` — the nature this one refines, if any.
-    pub parent: Option<Identifier>,
+    pub parent: Option<ParentNature>,
     /// Attribute assignments in source order.
     pub attributes: Vec<(Identifier, Expression)>,
     pub span: Span,
@@ -235,7 +235,7 @@ impl NatureDeclaration {
     }
 }
 
-/// Verilog-AMS §3.5 discipline declaration.
+/// Verilog-AMS §3.6.2 discipline declaration.
 ///
 /// ```verilog
 /// discipline electrical;
@@ -248,6 +248,32 @@ impl NatureDeclaration {
 /// potential/flow nature) to the natures its nets carry. A discipline with
 /// neither is a `domain discrete` one, which is how AMS types a plain digital
 /// net.
+/// AMS §3.6.1 `parent_nature` — what a derived nature refines.
+///
+/// ```verilog
+/// nature n1 : Voltage;                // Nature
+/// nature n2 : electrical.potential;   // DisciplineAccess
+/// ```
+///
+/// The dotted form names whichever nature the discipline bound to its
+/// potential or flow, so it cannot be flattened to the discipline's own name.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ParentNature {
+    /// `nature derived : base;`
+    Nature(Identifier),
+    /// `nature derived : discipline.potential;` / `.flow`
+    DisciplineAccess { discipline: Identifier, which: PotentialOrFlow },
+}
+
+/// AMS §3.6.1 `potential_or_flow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PotentialOrFlow {
+    Potential,
+    Flow,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DisciplineDeclaration {
@@ -258,6 +284,10 @@ pub struct DisciplineDeclaration {
     pub flow: Option<Identifier>,
     /// `domain continuous | discrete;`
     pub domain: Option<DisciplineDomain>,
+    /// AMS §3.6.2 `nature_attribute_override` — `potential.abstol = 1u;`.
+    /// A discipline narrowing a tolerance it inherited from the bound nature,
+    /// in source order. Appended last for bincode index stability.
+    pub overrides: Vec<(PotentialOrFlow, Identifier, Expression)>,
     pub span: Span,
 }
 

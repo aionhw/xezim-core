@@ -155,16 +155,37 @@ impl Parser {
         None
     }
 
-    /// AMS §3.4 `nature <name> [: <parent>] ; <attr> = <expr>; … endnature`.
+    /// AMS §3.6.1 `nature <name> [: <parent>] ; <attr> = <expr>; … endnature`.
     /// `nature` is only a keyword under `--ams`, so this is unreachable
     /// otherwise.
     fn parse_nature_declaration(&mut self) -> crate::ast::decl::NatureDeclaration {
+        use crate::ast::decl::{ParentNature, PotentialOrFlow};
         let start = self.current().span.start;
         self.expect(TokenKind::KwNature);
         let name = self.parse_identifier();
-        // `nature derived : base;` — a nature refining another.
+        // AMS §3.6.1: `nature derived : parent;`, where
+        //   parent_nature ::= nature_identifier
+        //                   | discipline_identifier . potential_or_flow
+        // The dotted form names the nature a discipline bound to its potential
+        // or flow. It used to fall out of `parse_identifier` after the bare
+        // name, leaving `.potential` to be skipped by the attribute loop — the
+        // parent was silently recorded as the DISCIPLINE, which is a different
+        // object with different attributes.
         let parent = if self.eat(TokenKind::Colon).is_some() {
-            Some(self.parse_identifier())
+            let base = self.parse_identifier();
+            if self.eat(TokenKind::Dot).is_some() {
+                let sel = match self.current_kind() {
+                    TokenKind::KwPotential => { self.bump(); PotentialOrFlow::Potential }
+                    TokenKind::KwFlow => { self.bump(); PotentialOrFlow::Flow }
+                    _ => {
+                        self.error("expected `potential` or `flow` after a discipline in a parent nature (Verilog-AMS 2.4.0 3.6.1)");
+                        PotentialOrFlow::Potential
+                    }
+                };
+                Some(ParentNature::DisciplineAccess { discipline: base, which: sel })
+            } else {
+                Some(ParentNature::Nature(base))
+            }
         } else {
             None
         };
@@ -198,10 +219,10 @@ impl Parser {
         crate::ast::decl::NatureDeclaration { name, parent, attributes, span: self.span_from(start) }
     }
 
-    /// AMS §3.5 `discipline <name>; [potential N;] [flow N;] [domain D;]
+    /// AMS §3.6.2 `discipline <name>; [potential N;] [flow N;] [domain D;]
     /// enddiscipline`.
     fn parse_discipline_declaration(&mut self) -> crate::ast::decl::DisciplineDeclaration {
-        use crate::ast::decl::DisciplineDomain;
+        use crate::ast::decl::{DisciplineDomain, PotentialOrFlow};
         let start = self.current().span.start;
         self.expect(TokenKind::KwDiscipline);
         let name = self.parse_identifier();
@@ -209,16 +230,39 @@ impl Parser {
         let mut potential = None;
         let mut flow = None;
         let mut domain = None;
+        let mut overrides = Vec::new();
         while !self.at(TokenKind::KwEnddiscipline) && !self.at(TokenKind::Eof) {
             match self.current_kind() {
-                TokenKind::KwPotential => {
+                // AMS §3.6.2:
+                //   nature_binding          ::= potential_or_flow nature_identifier ;
+                //   nature_attribute_override ::= potential_or_flow . nature_attribute
+                // The two start with the same keyword and are told apart by the
+                // dot. Without the override arm, `potential.abstol = 1u;` — a
+                // discipline narrowing its inherited tolerance, which is most of
+                // why a design declares its own discipline — was a hard parse
+                // error on legal source.
+                TokenKind::KwPotential | TokenKind::KwFlow => {
+                    let which = if self.at(TokenKind::KwPotential) {
+                        PotentialOrFlow::Potential
+                    } else {
+                        PotentialOrFlow::Flow
+                    };
                     self.bump();
-                    potential = Some(self.parse_identifier());
-                    let _ = self.eat(TokenKind::Semicolon);
-                }
-                TokenKind::KwFlow => {
-                    self.bump();
-                    flow = Some(self.parse_identifier());
+                    if self.eat(TokenKind::Dot).is_some() {
+                        let attr = self.parse_identifier();
+                        if self.eat(TokenKind::Assign).is_some() {
+                            let value = self.parse_expression();
+                            overrides.push((which, attr, value));
+                        } else {
+                            self.error("expected `=` in a nature attribute override (Verilog-AMS 2.4.0 3.6.2)");
+                        }
+                    } else {
+                        let nature = self.parse_identifier();
+                        match which {
+                            PotentialOrFlow::Potential => potential = Some(nature),
+                            PotentialOrFlow::Flow => flow = Some(nature),
+                        }
+                    }
                     let _ = self.eat(TokenKind::Semicolon);
                 }
                 TokenKind::KwDomain => {
@@ -227,7 +271,7 @@ impl Parser {
                         TokenKind::KwContinuous => { self.bump(); Some(DisciplineDomain::Continuous) }
                         TokenKind::KwDiscrete => { self.bump(); Some(DisciplineDomain::Discrete) }
                         _ => {
-                            self.error("expected `continuous` or `discrete` after `domain` (Verilog-AMS 2.4.0 3.5)");
+                            self.error("expected `continuous` or `discrete` after `domain` (Verilog-AMS 2.4.0 3.6.2)");
                             None
                         }
                     };
@@ -247,12 +291,14 @@ impl Parser {
             }
         }
         self.expect(TokenKind::KwEnddiscipline);
-        crate::ast::decl::DisciplineDeclaration { name, potential, flow, domain, span: self.span_from(start) }
+        crate::ast::decl::DisciplineDeclaration {
+            name, potential, flow, domain, overrides, span: self.span_from(start),
+        }
     }
 
     fn parse_description(&mut self) -> Option<Description> {
         match self.current_kind() {
-            // Verilog-AMS §3.4 / §3.5. These token kinds only exist under
+            // Verilog-AMS §3.6.1 / §3.5. These token kinds only exist under
             // `--ams`; the words lex as ordinary identifiers otherwise.
             TokenKind::KwNature => {
                 return Some(Description::Nature(self.parse_nature_declaration()));

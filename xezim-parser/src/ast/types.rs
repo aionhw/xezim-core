@@ -141,7 +141,7 @@ pub struct EnumMember {
 pub enum NetType {
     Wire, Tri, Wand, Wor, TriAnd, TriOr, Tri0, Tri1, Supply0, Supply1, TriReg,
     Uwire, Interconnect,
-    /// Verilog-AMS §3.8 real net (`wreal`), carrying its driver-resolution
+    /// Verilog-AMS §3.7 real net (`wreal`), carrying its driver-resolution
     /// mode. A `wreal` holds a real value rather than a bit vector, and is the
     /// discrete real-number-modeling net every AMS-lite design is built from.
     ///
@@ -150,11 +150,11 @@ pub enum NetType {
     Wreal(WrealResolution),
 }
 
-/// Verilog-AMS §3.8 driver resolution for a `wreal` net.
+/// Verilog-AMS §3.7 driver resolution for a `wreal` net.
 ///
 /// `None` is a plain `wreal`, which accepts a single driver. The resolved
 /// forms are declared with a distinct net-type keyword (`wrealsum x;`) —
-/// the spelling in common vendor use. Confirm against AMS §3.8 before
+/// the spelling in common vendor use. Confirm against AMS §3.7 before
 /// treating the set as complete; adding an alias later is additive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

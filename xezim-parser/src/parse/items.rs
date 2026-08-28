@@ -331,7 +331,7 @@ impl Parser {
                 None
             }
         } else if matches!(net_type, Some(NetType::Wreal(_))) {
-            // AMS §3.8: `output wreal o` — the real data type is implicit in
+            // AMS §3.7: `output wreal o` — the real data type is implicit in
             // the net type. Without this the port stayed implicit 1-bit, and
             // every real driven through it truncated to its LSB while the
             // diagnostic blamed a width mismatch.
@@ -479,7 +479,7 @@ impl Parser {
                         let dimensions = self.parse_packed_dimensions();
                         DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
                     }
-                    // AMS §3.8: `wreal` implies a real data type on a port
+                    // AMS §3.7: `wreal` implies a real data type on a port
                     // exactly as it does on a net declaration.
                     else if matches!(nt, Some(NetType::Wreal(_))) {
                         DataType::Real { kind: RealType::Real, span: self.span_from(start) }
@@ -492,12 +492,27 @@ impl Parser {
             TokenKind::KwWire | TokenKind::KwTri | TokenKind::KwWand | TokenKind::KwWor |
             TokenKind::KwSupply0 | TokenKind::KwSupply1 | TokenKind::KwTriand | TokenKind::KwTrior |
             TokenKind::KwTri0 | TokenKind::KwTri1 | TokenKind::KwTrireg | TokenKind::KwUwire |
-            // AMS §3.8 `wreal` (and its resolved forms) — an ordinary net
+            // AMS §3.7 `wreal` (and its resolved forms) — an ordinary net
             // declaration whose data type is implicitly `real`. Only reachable
             // under `--ams`; the words lex as identifiers otherwise.
             TokenKind::KwWreal | TokenKind::KwWrealSum | TokenKind::KwWrealAvg |
             TokenKind::KwWrealMin | TokenKind::KwWrealMax =>
                 Some(ModuleItem::NetDeclaration(self.parse_net_declaration())),
+            // AMS §3.6.4 `ground [discipline] [range] nets;` — a net
+            // declaration form that marks an already-declared continuous net
+            // as the global reference node. Parse-accepted and dropped: the
+            // reference node only means something to the analog solver, which
+            // does not exist yet. It MUST be consumed rather than left to the
+            // generic path — reserving the keyword without a rule turned the
+            // LRM's own example (`electrical gnd; ground gnd;`) into a hard
+            // parse error.
+            TokenKind::KwGround => {
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                self.expect(TokenKind::Semicolon);
+                Some(ModuleItem::Null)
+            }
             // §14.3: `global clocking …` — consume the `global` qualifier and
             // reuse the clocking-block parse via the KwClocking arm below.
             TokenKind::KwGlobal if self.peek_kind() == TokenKind::KwClocking => {
@@ -1348,7 +1363,30 @@ impl Parser {
                 self.bump(); // #10 / #delay_id
             }
         }
-        let data_type = if self.is_data_type_keyword() { self.parse_data_type() }
+        // AMS §3.7:
+        //   wreal [ discipline_identifier ] [ range ] list_of_net_identifiers ;
+        // Both optional pieces have to be consumed HERE. Left to the generic
+        // net-declaration heuristics below, `wreal electrical wd;` matched
+        // "identifier followed by identifier" and took `electrical` as the
+        // DATA TYPE, and `wreal [3:0] wv;` matched the packed-dims branch —
+        // either way the net lost `real` and every real driven onto it
+        // truncated to its LSB, silently.
+        let data_type = if matches!(net_type, NetType::Wreal(_)) {
+            // A discipline identifier is present only when another identifier
+            // (the first net name) follows it; `wreal plain;` must not eat the
+            // name as a discipline.
+            if self.at(TokenKind::Identifier)
+                && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::LBracket)
+            {
+                self.bump(); // discipline_identifier — recorded nowhere yet
+            }
+            // `[msb:lsb]` — a vector of wreal. Consumed so the declaration
+            // parses; the elaborated net is still scalar, which is why the
+            // range is not carried into the data type.
+            let _ = self.parse_packed_dimensions();
+            DataType::Real { kind: RealType::Real, span: self.span_from(start) }
+        }
+        else if self.is_data_type_keyword() { self.parse_data_type() }
             // User-defined typedef net type — `wire dword foo;`,
             // `wire word_t a, b;`, `wire pkg::t x;`, `wire t#(8) x;`. A bare
             // identifier followed by another identifier / `::` / `#` is a type
@@ -1391,13 +1429,6 @@ impl Parser {
             else if self.at(TokenKind::LBracket) {
                 let dimensions = self.parse_packed_dimensions();
                 DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
-            }
-            // AMS §3.8: a `wreal` carries a real value, not a bit vector.
-            // The data type is implicit in the net type, so synthesize it —
-            // otherwise the net elaborates as a 1-bit implicit wire and every
-            // real driven onto it truncates to its LSB.
-            else if matches!(net_type, NetType::Wreal(_)) {
-                DataType::Real { kind: RealType::Real, span: self.span_from(start) }
             }
             else { DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) } };
         let declarators = self.parse_net_declarator_list();
