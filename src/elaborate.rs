@@ -24249,6 +24249,24 @@ fn substitute_type_params_stmt(
         StatementKind::Wait { condition, stmt } => {
             StatementKind::Wait { condition, stmt: sub(stmt) }
         }
+        // Same missing-arm class as rewrite_stmt's Assertion gap: recurse
+        // into the remaining compound kinds so a VarDecl of a bound type
+        // param inside them still resolves.
+        StatementKind::Assertion(mut a) => {
+            a.action = a.action.map(sub);
+            a.else_action = a.else_action.map(sub);
+            StatementKind::Assertion(a)
+        }
+        StatementKind::RandCase { items } => StatementKind::RandCase {
+            items: items
+                .into_iter()
+                .map(|(w, st)| (w, substitute_type_params_stmt(st, binds)))
+                .collect(),
+        },
+        StatementKind::WaitOrder { events, pass, fail, armed, idx, span } => {
+            StatementKind::WaitOrder { events, pass: pass.map(sub), fail: fail.map(sub), armed, idx, span }
+        }
+        StatementKind::RsAction { body } => StatementKind::RsAction { body: sub(body) },
         other => other,
     };
     Statement { kind, span }
@@ -24490,6 +24508,65 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         StatementKind::Foreach { array, vars, body } => StatementKind::Foreach {
             array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
             vars: vars.clone(),
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
+        },
+        // Sibling of the missing-Assertion-arm bug: these kinds also fell
+        // through `other => other.clone()` un-rewritten, so a dotted
+        // reference inside them stayed a raw MemberAccess (and, in prefix
+        // mode, skipped prefixing/port substitution). Observed live on
+        // `force tgt = host.sig;` in a bound module: the un-collapsed
+        // rvalue broke continuous-force tracking. The rest are the same
+        // class, fixed for uniformity.
+        StatementKind::DoWhile { body, condition } => StatementKind::DoWhile {
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
+            condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
+        },
+        StatementKind::Wait { condition, stmt } => StatementKind::Wait {
+            condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
+            stmt: Box::new(rewrite_stmt(stmt, prefix, port_map, local_names, interface_map)),
+        },
+        StatementKind::ProceduralContinuous(pc) => {
+            use crate::ast::stmt::ProceduralContinuous as PC;
+            StatementKind::ProceduralContinuous(match pc {
+                PC::Assign { lvalue, rvalue } => PC::Assign {
+                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
+                },
+                PC::Deassign(lv) => PC::Deassign(rewrite_expr(lv, prefix, port_map, local_names, interface_map)),
+                PC::Force { lvalue, rvalue } => PC::Force {
+                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
+                },
+                PC::Release(lv) => PC::Release(rewrite_expr(lv, prefix, port_map, local_names, interface_map)),
+            })
+        }
+        // Declared names and dimensions stay untouched (they are introduced
+        // by the declaration itself); only the initializer reads outer names.
+        StatementKind::VarDecl { data_type, lifetime, declarators } => StatementKind::VarDecl {
+            data_type: data_type.clone(),
+            lifetime: *lifetime,
+            declarators: declarators.iter().map(|d| crate::ast::stmt::VarDeclarator {
+                name: d.name.clone(),
+                dimensions: d.dimensions.clone(),
+                init: d.init.as_ref().map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+                span: d.span,
+            }).collect(),
+        },
+        StatementKind::RandCase { items } => StatementKind::RandCase {
+            items: items.iter().map(|(w, st)| (
+                rewrite_expr(w, prefix, port_map, local_names, interface_map),
+                rewrite_stmt(st, prefix, port_map, local_names, interface_map),
+            )).collect(),
+        },
+        StatementKind::WaitOrder { events, pass, fail, armed, idx, span } => StatementKind::WaitOrder {
+            events: events.clone(),
+            pass: pass.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            fail: fail.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            armed: *armed,
+            idx: *idx,
+            span: *span,
+        },
+        StatementKind::RsAction { body } => StatementKind::RsAction {
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
         },
         StatementKind::Repeat { count, body } => StatementKind::Repeat {
