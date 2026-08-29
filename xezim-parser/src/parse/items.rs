@@ -2795,7 +2795,20 @@ impl Parser {
                 }
                 DataType::Real { kind: RealType::Real, span }
             }
-            _ => dt,
+            // The redundant explicit spelling (`wreal real x`) is harmless.
+            DataType::Real { kind: RealType::Real, .. } => dt,
+            // Issue #37: any OTHER explicit data type was silently accepted
+            // AS that type — `wreal logic [3:0] p` elaborated as a 4-bit
+            // vector, quietly reintroducing the integer-rounding corruption
+            // the packed-range rejection above exists to prevent. Same
+            // diagnostic, same recovery.
+            _ => {
+                self.error(
+                    "a 'wreal' net carries a real value and cannot take a data type \
+                     (Verilog-AMS 2.4 §3.8)",
+                );
+                DataType::Real { kind: RealType::Real, span }
+            }
         }
     }
 }
