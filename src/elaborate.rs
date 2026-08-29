@@ -24499,6 +24499,23 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         StatementKind::Forever { body } => StatementKind::Forever {
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
         },
+        // §16.3/§16.4: an immediate assertion's condition and action blocks
+        // are ordinary procedural code. This arm was missing, so the whole
+        // statement fell through `other => other.clone()` un-rewritten: a
+        // dotted reference in the condition (`sub.sig`, parsed as
+        // MemberAccess) never collapsed to a hierarchical Ident, and the
+        // interpreter read it as a (nonexistent) object property — 0. An
+        // `assert (sub.sig >= lo) else $error(...)` in a bound checker
+        // module falsely fired while the same read in a plain `if` (which
+        // IS rewritten) resolved fine.
+        StatementKind::Assertion(a) => StatementKind::Assertion(crate::ast::stmt::AssertionStatement {
+            kind: a.kind,
+            expr: rewrite_expr(&a.expr, prefix, port_map, local_names, interface_map),
+            action: a.action.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            else_action: a.else_action.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            is_property: a.is_property,
+            span: a.span,
+        }),
         StatementKind::TimingControl { control, stmt: body } => StatementKind::TimingControl {
             control: match control {
                 TimingControl::Delay(e) => TimingControl::Delay(rewrite_expr(e, prefix, port_map, local_names, interface_map)),
