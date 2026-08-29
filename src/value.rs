@@ -3793,19 +3793,18 @@ impl Value {
     /// `len()`/`getc()` must observe.
     pub fn sv_string_bytes(&self) -> Vec<u8> {
         let num_bytes = self.width.div_ceil(8) as usize;
-        let mut out: Vec<u8> = Vec::new();
+        let mut out: Vec<u8> = Vec::with_capacity(num_bytes);
         let mut started = false;
+        // Whole bytes via the SWAR slice reader (word extraction) instead of
+        // eight get_bit calls per byte — string values are wide (one byte per
+        // char) and this ran per formatted UVM message.
         for bi in (0..num_bytes).rev() {
-            let mut byte = 0u8;
-            for b in 0..8usize {
-                let bit_idx = bi * 8 + b;
-                if bit_idx >= self.width as usize {
-                    break;
-                }
-                if self.get_bit(bit_idx) == LogicBit::One {
-                    byte |= 1u8 << b;
-                }
-            }
+            let lo = bi * 8;
+            let w = core::cmp::min(8, self.width as usize - lo);
+            let (v, xz) = self.slice_bits_swar(lo, w);
+            // get_bit == One only when val=1 AND xz=0 — an X bit (val=1,
+            // xz=1 in this encoding) must keep reading as 0 here.
+            let byte = ((v & !xz) & 0xff) as u8;
             if byte != 0 {
                 started = true;
             }
