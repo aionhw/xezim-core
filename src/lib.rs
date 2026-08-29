@@ -396,10 +396,16 @@ pub fn set_implicit_net_warn(on: bool) {
 /// The lenient default exists to recover from wrong `:top_module:` values in
 /// generated corpora (sv-tests' veer-el2 names a module that does not exist),
 /// and there is no way to tell that case apart from a plain typo — both are
-/// "named top absent, other modules present". So the strictness is opt-in:
-/// scripted flows that key success off the exit status turn it on and get a
-/// nonzero exit, while the corpus keeps running (xezim#107).
-static STRICT_TOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// "named top absent, other modules present".
+///
+/// Strict is now the DEFAULT (xezim#107): `-s name` is an explicit user
+/// assertion about the design, and silently simulating a DIFFERENT root on a
+/// typo is exactly the CI failure mode reported — a warning line is the
+/// easiest thing to lose in a CI log. The tolerance worth keeping is "you
+/// didn't say" (no `-s` still auto-detects), not "you said wrong". A
+/// generated corpus that knowingly carries stale `:top_module:` names (the
+/// sv-tests case above) opts back out with `--no-strict-top`.
+static STRICT_TOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub fn set_strict_top(on: bool) {
     STRICT_TOP.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1840,7 +1846,8 @@ fn parse_and_elaborate(
                     .collect();
                 known.sort_unstable();
                 return Err(format!(
-                    "top module '{}' not found (--strict-top); known top-level definitions: {}",
+                    "top module '{}' not found; known top-level definitions: {} \
+                     (use --no-strict-top to auto-detect the design root instead)",
                     name,
                     if known.is_empty() {
                         "(none)".to_string()
