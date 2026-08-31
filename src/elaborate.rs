@@ -9393,7 +9393,19 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             // fabricated doubled names (`u0.l0.u0.l0.w0`) and phantom 1-bit
             // nets for signals that exist. If the candidate as-is is a known
             // signal or net, it needs nothing.
-            if elab.signals.contains_key(&name) || elab.nets.contains(&name) { continue; }
+            // ...but only when the candidate ALREADY LOOKS ABSOLUTE. A bare
+            // sub-module-local identifier still needs its own `<prefix>name`
+            // net even when something elsewhere shares the bare spelling, and
+            // something usually does: instance names and generate-block labels
+            // are both registered as placeholder SIGNALS. A cell's
+            // `buf B (gen, A);` beside a `begin : gen` generate block lost its
+            // implicit net and the cell read x. Nested-inlining candidates are
+            // dotted, so the dot test keeps their protection intact.
+            if name.contains('.')
+                && (elab.signals.contains_key(&name) || elab.nets.contains(&name))
+            {
+                continue;
+            }
             // The bare name is a sub-module-local identifier; after rewrite
             // it becomes `<prefix>name`.
             let prefixed = format!("{}{}", prefix, name);
@@ -18750,8 +18762,17 @@ fn inline_module_items(
                             continue;
                         }
                         let scoped = format!("{}{}", inst_prefix, name);
+                        // §6.10: the implicit net belongs to THIS instance, so
+                        // the existence test must be SCOPED. A bare
+                        // `signals.contains_key(name)` skipped creation
+                        // whenever anything ANYWHERE shared the bare spelling —
+                        // including an INSTANCE-NAME placeholder, since
+                        // instantiating `foo c (...)` registers a signal named
+                        // `c`. A gate library hits this constantly: a cell's
+                        // `buf IC (clk, dCK);` wants its own implicit `clk`,
+                        // every design has some other `clk`, and the cell's
+                        // flops were then never clocked and read x.
                         if elab.signals.contains_key(&scoped)
-                            || elab.signals.contains_key(&name)
                             || elab.parameters.contains_key(&name)
                             || elab.parameters.contains_key(&scoped)
                             || elab.nets.contains(&scoped)
