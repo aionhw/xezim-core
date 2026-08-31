@@ -11562,6 +11562,356 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
     }
 }
 
+/// §6.20.2/§23.10: fold this instance's parameters into the dimensions of
+/// declarations that live INSIDE a statement — task and function locals, named
+/// blocks, fork branches.
+///
+/// Such a declaration is sized long after elaboration, from the flat
+/// design-wide parameter map — where a submodule's parameters live under their
+/// INSTANCE-QUALIFIED keys (`u_fifo.DW`). The bare `DW` the declaration spells
+/// missed that map, `const_eval_i64_with_params` returned None, and
+/// `resolve_type_width` then silently SKIPPED the dimension, leaving the local
+/// ONE BIT wide: every value stored in it was truncated to its LSB. A
+/// module-level declaration escapes this only because elaboration sizes it
+/// while the instance's parameters are still bound to their bare names.
+///
+/// Running the fold here fixes both consumers at once — the bytecode compiler
+/// and the AST interpreter read the same declaration, and after this pass its
+/// range is a literal. `prepare_module_items` caches per (module,
+/// parameter-set), so two instances with different parameters get different
+/// constants.
+///
+/// A name the body declares itself is left alone: it shadows the parameter.
+fn literalize_stmt_decl_dims(items: &mut [ModuleItem], params: &HashMap<String, Value>) {
+    // The module's own typedefs, with this instance's parameters already
+    // folded in. A statement-local declaration spelled with one of these names
+    // cannot be resolved after elaboration either: the bare typedef key is
+    // REMOVED once the module is finished (only the instance-scoped `u.vl_t`
+    // survives, and the declaration does not spell that), so the lookup missed
+    // and `resolve_type_width` fell back to its 32-bit default — silently
+    // truncating every local of a wider typedef. Same asymmetry as the
+    // parameters above: a module-level declaration is sized while the bare
+    // name is still bound, a statement-local one is not.
+    let mut tds: HashMap<String, DataType> = HashMap::default();
+    for item in items.iter() {
+        if let ModuleItem::TypedefDeclaration(td) = item {
+            let mut dt = td.data_type.clone();
+            lsdd_data_type(&mut dt, params);
+            tds.insert(td.name.name.clone(), dt);
+        }
+    }
+    if params.is_empty() && tds.is_empty() {
+        return;
+    }
+    lsdd_items(items, params, &tds);
+}
+
+fn lsdd_items(
+    items: &mut [ModuleItem],
+    params: &HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    for item in items.iter_mut() {
+        match item {
+            ModuleItem::AlwaysConstruct(ac) => {
+                lsdd_body(std::slice::from_mut(&mut ac.stmt), params, tds)
+            }
+            ModuleItem::InitialConstruct(ic) => {
+                lsdd_body(std::slice::from_mut(&mut ic.stmt), params, tds)
+            }
+            ModuleItem::FinalConstruct(fc) => {
+                lsdd_body(std::slice::from_mut(&mut fc.stmt), params, tds)
+            }
+            ModuleItem::TaskDeclaration(td) => lsdd_body(&mut td.items, params, tds),
+            ModuleItem::FunctionDeclaration(fd) => lsdd_body(&mut fd.items, params, tds),
+            ModuleItem::ClassDeclaration(cd) => lsdd_class(cd, params, tds),
+            // A module-level typedef is resolved for its own WIDTH while the
+            // parameters are still bare-bound, but its member LAYOUT is built
+            // later from the flat map — so a `logic [DW-1:0]` member still
+            // needs the fold.
+            ModuleItem::TypedefDeclaration(td) => lsdd_data_type(&mut td.data_type, params),
+            ModuleItem::GenerateFor(gf) => lsdd_items(&mut gf.items, params, tds),
+            ModuleItem::GenerateRegion(gr) => lsdd_items(&mut gr.items, params, tds),
+            ModuleItem::GenerateIf(gi) => {
+                for (_c, its) in gi.branches.iter_mut() {
+                    lsdd_items(its, params, tds);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in gc.arms.iter_mut() {
+                    lsdd_items(&mut arm.items, params, tds);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lsdd_class(
+    c: &mut crate::ast::decl::ClassDeclaration,
+    params: &HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    use crate::ast::decl::{ClassItem, ClassMethodKind};
+    for item in &mut c.items {
+        match item {
+            ClassItem::Method(m) => match &mut m.kind {
+                ClassMethodKind::Function(fd)
+                | ClassMethodKind::PureVirtual(fd)
+                | ClassMethodKind::Extern(fd) => lsdd_body(&mut fd.items, params, tds),
+                ClassMethodKind::Task(td) => lsdd_body(&mut td.items, params, tds),
+            },
+            ClassItem::Class(nc) => lsdd_class(nc, params, tds),
+            _ => {}
+        }
+    }
+}
+
+/// Replace a reference to one of this module's own typedefs with the type it
+/// names, when that type is a shape whose width would otherwise silently
+/// default to 32 bits. Deliberately narrow: enums, classes, strings and
+/// unpacked aggregates keep their named form, since only packed vectors and
+/// packed structs showed the truncation.
+fn lsdd_resolve_local_typedef(
+    dt: &DataType,
+    tds: &HashMap<String, DataType>,
+) -> Option<DataType> {
+    // Dimensions written on the REFERENCE are outer relative to the type they
+    // qualify: `vl_t [1:0]` is `logic [1:0][127:0]`. Collect them outermost
+    // first as the chain is walked, then put them in front of the target's own.
+    let mut outer: Vec<PackedDimension> = Vec::new();
+    let mut cur = dt.clone();
+    let mut hops = 0;
+    loop {
+        let DataType::TypeReference { name, dimensions, .. } = &cur else { break };
+        if name.scope.is_some() {
+            break;
+        }
+        let Some(next) = tds.get(&name.name.name) else { break };
+        outer.extend(dimensions.iter().cloned());
+        cur = next.clone();
+        hops += 1;
+        // A typedef of a typedef is legal; a cycle is not, so cap the walk.
+        if hops > 8 {
+            return None;
+        }
+    }
+    if hops == 0 {
+        return None;
+    }
+    match &mut cur {
+        DataType::IntegerVector { dimensions, .. } => {
+            if dimensions.is_empty() && outer.is_empty() {
+                return None;
+            }
+            outer.extend(dimensions.iter().cloned());
+            *dimensions = outer;
+        }
+        DataType::Struct(su) if su.packed => {
+            outer.extend(su.dimensions.iter().cloned());
+            su.dimensions = outer;
+        }
+        // An enum keeps its members, so inlining it preserves `.name()` and
+        // `$cast` — which a bare 32-bit fallback had already lost anyway.
+        DataType::Enum(et) => {
+            outer.extend(et.dimensions.iter().cloned());
+            et.dimensions = outer;
+        }
+        _ => return None,
+    }
+    Some(cur)
+}
+
+/// One subroutine/process body. The fold runs against a lexically scoped
+/// environment seeded from the instance's parameters — see `lsdd_scope`.
+fn lsdd_body(
+    stmts: &mut [Statement],
+    params: &HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    let mut env = params.clone();
+    lsdd_scope(stmts, &mut env, tds);
+}
+
+/// Fold one lexical scope, having first bound what the scope itself declares.
+///
+/// §6.20.4: a block-scope `localparam` lowers to a plain `VarDecl` with a
+/// constant initializer, so it is the only thing that can legally size a
+/// declaration in that block — and it SHADOWS a module parameter of the same
+/// name. A declaration whose initializer is not constant un-binds the name
+/// instead, which stops the enclosing parameter from being folded in where the
+/// source never meant it.
+///
+/// Bindings are pushed and popped on one map (rather than cloning it per
+/// block) because this walks every statement of every module.
+fn lsdd_scope(
+    stmts: &mut [Statement],
+    env: &mut HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    let mut saved: Vec<(String, Option<Value>)> = Vec::new();
+    for s in stmts.iter() {
+        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            for d in declarators {
+                let cv = d
+                    .init
+                    .as_ref()
+                    .and_then(|i| const_eval_i64_with_params(i, Some(env)));
+                saved.push((d.name.name.clone(), env.get(&d.name.name).cloned()));
+                match cv {
+                    Some(v) => {
+                        let mut val = Value::from_u64(v as u64, 64);
+                        val.is_signed = true;
+                        env.insert(d.name.name.clone(), val);
+                    }
+                    None => {
+                        env.remove(&d.name.name);
+                    }
+                }
+            }
+        }
+    }
+    for s in stmts.iter_mut() {
+        lsdd_stmt(s, env, tds);
+    }
+    for (k, prev) in saved.into_iter().rev() {
+        match prev {
+            Some(v) => {
+                env.insert(k, v);
+            }
+            None => {
+                env.remove(&k);
+            }
+        }
+    }
+}
+
+fn lsdd_stmt(
+    s: &mut Statement,
+    env: &mut HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    match &mut s.kind {
+        StatementKind::VarDecl { data_type, declarators, .. } => {
+            if let Some(rt) = lsdd_resolve_local_typedef(data_type, tds) {
+                *data_type = rt;
+            }
+            lsdd_data_type(data_type, env);
+            for d in declarators.iter_mut() {
+                for dim in d.dimensions.iter_mut() {
+                    match dim {
+                        UnpackedDimension::Range { left, right, .. } => {
+                            lsdd_expr(left, env);
+                            lsdd_expr(right, env);
+                        }
+                        UnpackedDimension::Expression { expr, .. } => lsdd_expr(expr, env),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // §6.18: a typedef declared inside a block sizes from the same scope.
+        StatementKind::Typedef(td) => {
+            if let Some(rt) = lsdd_resolve_local_typedef(&td.data_type, tds) {
+                td.data_type = rt;
+            }
+            lsdd_data_type(&mut td.data_type, env)
+        }
+        // A named block is a new scope; the loop/branch forms below are not.
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            lsdd_scope(stmts, env, tds)
+        }
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            lsdd_stmt(stmt, env, tds)
+        }
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            lsdd_stmt(then_stmt, env, tds);
+            if let Some(e) = else_stmt {
+                lsdd_stmt(e, env, tds);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body, .. } => lsdd_stmt(body, env, tds),
+        StatementKind::Case { items, .. } => {
+            for it in items.iter_mut() {
+                lsdd_stmt(&mut it.stmt, env, tds);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lsdd_data_type(dt: &mut DataType, env: &HashMap<String, Value>) {
+    // A packed struct/union sizes its MEMBERS from the same parameters, and a
+    // member left unresolved collapses the whole layout — the aggregate is
+    // then short and every member above the bad one reads x.
+    if let DataType::Struct(su) = dt {
+        for m in su.members.iter_mut() {
+            lsdd_data_type(&mut m.data_type, env);
+            for d in m.declarators.iter_mut() {
+                for dim in d.dimensions.iter_mut() {
+                    match dim {
+                        UnpackedDimension::Range { left, right, .. } => {
+                            lsdd_expr(left, env);
+                            lsdd_expr(right, env);
+                        }
+                        UnpackedDimension::Expression { expr, .. } => lsdd_expr(expr, env),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    // An enum's BASE type carries the width. Left unresolved it collapses to
+    // one bit, and the §6.19 member-width check then REJECTS the design —
+    // `enum logic [DW-1:0] {…}` in any submodule was unusable.
+    if let DataType::Enum(et) = dt {
+        if let Some(bt) = et.base_type.as_mut() {
+            lsdd_data_type(bt, env);
+        }
+    }
+    let dims = match dt {
+        DataType::IntegerVector { dimensions, .. }
+        | DataType::Implicit { dimensions, .. }
+        | DataType::TypeReference { dimensions, .. }
+        | DataType::Struct(StructUnionType { dimensions, .. })
+        | DataType::Enum(EnumType { dimensions, .. }) => dimensions,
+        _ => return,
+    };
+    for dim in dims.iter_mut() {
+        if let PackedDimension::Range { left, right, .. } = dim {
+            lsdd_expr(left, env);
+            lsdd_expr(right, env);
+        }
+    }
+}
+
+/// Replace one dimension endpoint with its constant value, when it is not
+/// already a literal and it const-evaluates in this scope.
+fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
+    if matches!(e.kind, ExprKind::Number(_)) {
+        return;
+    }
+    // Nothing to gain on a name-free expression.
+    let mut names: Vec<String> = Vec::new();
+    collect_ident_names(e, &mut names);
+    if names.is_empty() {
+        return;
+    }
+    let Some(v) = const_eval_i64_with_params(e, Some(env)) else { return };
+    e.kind = ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+        size: None,
+        signed: true,
+        base: crate::ast::expr::NumberBase::Decimal,
+        value: v.to_string(),
+        cached_val: std::cell::Cell::new(None),
+    });
+}
+
 /// Replace a single delay expression with its tick-count equivalent.
 fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64) {
     use crate::ast::expr::NumberLiteral;
@@ -17872,6 +18222,12 @@ fn prepare_module_items(
     }
 
     let mut effective_items = collect_effective_items(source_def.items(), local_params);
+
+    // Bind this instance's parameters into statement-local declarations while
+    // they are still resolvable by their bare names — after elaboration only
+    // the instance-qualified keys survive, and a local sized `[DW-1:0]` would
+    // silently become 1 bit wide.
+    literalize_stmt_decl_dims(&mut effective_items, local_params);
 
     // §23.3.2: expand arrays of module instances into individual instances with
     // bit-sliced vector connections, before body_sources/driver derivation.
