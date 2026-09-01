@@ -1071,6 +1071,25 @@ impl Value {
         }
     }
 
+    /// Set the compact 4-state code of a one-bit value.
+    #[inline(always)]
+    pub fn set_scalar_code(&mut self, code: u8) -> bool {
+        debug_assert_eq!(self.width, 1);
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let new_val = (code & 1) as u64;
+                let new_xz = ((code >> 1) & 1) as u64;
+                if *val_bits == new_val && *xz_bits == new_xz {
+                    return false;
+                }
+                *val_bits = new_val;
+                *xz_bits = new_xz;
+                true
+            }
+            ValueStorage::Wide(_) => self.set_bit_code(0, code),
+        }
+    }
+
     /// Set bit at position i. Hot-path mirror of `get_bit`; same
     /// rationale for `#[inline(always)]`.
     #[inline(always)]
@@ -4373,5 +4392,20 @@ mod wide_probe_tests {
         assert_eq!(c.get_bit(1), LogicBit::Zero, "bit1");
         assert_eq!(c.get_bit(2), LogicBit::One, "bit2");
         assert_eq!(c.to_u128() & 0x7, 0b101);
+    }
+}
+
+#[cfg(test)]
+mod scalar_code_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_code_tracks_all_four_states() {
+        let mut value = Value::zero(1);
+        for code in [1, 2, 3, 0] {
+            assert!(value.set_scalar_code(code));
+            assert_eq!(value.get_bit_code(0), code);
+            assert!(!value.set_scalar_code(code));
+        }
     }
 }
