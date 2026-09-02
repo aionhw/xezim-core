@@ -19002,6 +19002,25 @@ fn defparam_path_segments(e: &Expression) -> Option<Vec<String>> {
     }
 }
 
+/// §6.18/§23.10: a submodule VARIABLE declared with one of the module's own
+/// typedefs records the INSTANCE-scoped typedef name as its `type_name`, so
+/// run-time reflection (`.name()`, `.num()`, `.first()`) keys the right
+/// member list — the bare name is unbound after inlining and collides across
+/// modules that reuse common typedef names like `state_e`.
+fn scope_local_type_name(
+    tn: Option<String>,
+    local_typedefs: &std::collections::HashSet<String>,
+    inst_prefix: &str,
+) -> Option<String> {
+    tn.map(|t| {
+        if local_typedefs.contains(&t) {
+            format!("{}{}", inst_prefix, t)
+        } else {
+            t
+        }
+    })
+}
+
 /// §6.18/§23.10: rename every bare `TypeReference` in `dt` that names one of
 /// `local_names` to its instance-scoped form `"<prefix><name>"`. A typedef
 /// stored under a scoped key still carried BARE member-type references, so a
@@ -20688,7 +20707,7 @@ fn inline_module_items(
                                             width,
                                             port_is_real,
                                         ),
-                                        is_real: port_is_real, type_name: get_type_name(&pd.data_type),
+                                        is_real: port_is_real, type_name: scope_local_type_name(get_type_name(&pd.data_type), &sub_typedef_names_all, &inst_prefix),
                                     });
                                 }
                             }
@@ -20709,11 +20728,20 @@ fn inline_module_items(
                             let mut next_val: u64 = 0;
                             let wide_vals = (base_width > 64)
                                 .then(|| wide_enum_value_map(et, base_width, &sub_merged_params));
+                            // §6.19.6: the member LIST of this instance's enum,
+                            // for `.name()/.first()/.num()` on its variables.
+                            // Submodule enums never reach `process_typedef`, so
+                            // `enum_members` had no entry for them at all —
+                            // `.name()` then fell back to a design-wide
+                            // by-value scan (a sibling's `PB` for our `SB`),
+                            // and `.num()` read 0.
+                            let mut inst_members: Vec<(String, u64)> = Vec::new();
                             for member in &et.members {
                                 let val = if let Some(init) = &member.init {
                                     eval_const_expr(init, &sub_merged_params)
                                 } else { next_val };
                                 next_val = val.wrapping_add(1);
+                                inst_members.push((member.name.name.clone(), val));
                                 let v = wide_vals
                                     .as_ref()
                                     .and_then(|m| m.get(&member.name.name))
@@ -20780,6 +20808,14 @@ fn inline_module_items(
                                     is_real: false,
                                 });
                             }
+                            // Keyed by the INSTANCE-scoped typedef name (the
+                            // signal's `type_name` is scoped to match); the
+                            // bare key is a first-wins fallback only.
+                            elab.enum_members
+                                .insert(format!("{}{}", inst_prefix, td.name.name), inst_members.clone());
+                            elab.enum_members
+                                .entry(td.name.name.clone())
+                                .or_insert(inst_members);
                             // Prior-or-keep restore — see the non-enum twin below.
                             saved_type_binds.push((
                                 td.name.name.clone(),
@@ -20980,7 +21016,7 @@ fn inline_module_items(
                                     // twin (§6.6.7).
                                     is_real: is_type_real_resolved(&nd.data_type, &elab.typedef_types),
                                     direction: None, value: init_value,
-                                    type_name: get_type_name(&nd.data_type),
+                                    type_name: scope_local_type_name(get_type_name(&nd.data_type), &sub_typedef_names_all, &inst_prefix),
                                 });                            }
                         }
                         ModuleItem::DataDeclaration(dd) => {
@@ -21282,7 +21318,7 @@ fn inline_module_items(
                             existing.width = width;
                                         existing.is_signed = is_signed;
                                         existing.is_real = decl_is_real;
-                                        existing.type_name = get_type_name(&dd.data_type);
+                                        existing.type_name = scope_local_type_name(get_type_name(&dd.data_type), &sub_typedef_names_all, &inst_prefix);
                                         existing.value = default_port_value(
                                             existing.direction,
                                             Some(&dd.data_type),
@@ -21524,6 +21560,20 @@ fn inline_module_items(
                                         }
                                         _ => false,
                                     };
+                                    // §6.19.6: an ANONYMOUS enum variable keys
+                                    // its member list by the variable's own
+                                    // (scoped) name; the top-level path did
+                                    // this, the instance path did not, so
+                                    // `anon.name()` in a submodule fell to the
+                                    // by-value scan.
+                                    if matches!(dd.data_type, DataType::Enum(_)) {
+                                        if let Some(m) = anon_enum_members_ordered(
+                                            &dd.data_type,
+                                            &sub_merged_params,
+                                        ) {
+                                            elab.enum_members.insert(sig_name.clone(), m);
+                                        }
+                                    }
                                     if unpacked_struct_decl {
                                         register_unpacked_aggregate(elab, &sig_name, &dd.data_type);
                                         elab.var_decl_types
@@ -21546,7 +21596,7 @@ fn inline_module_items(
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
                                         is_real: is_type_real_resolved(&dd.data_type, &elab.typedef_types),
-                                        type_name: get_type_name(&dd.data_type),
+                                        type_name: scope_local_type_name(get_type_name(&dd.data_type), &sub_typedef_names_all, &inst_prefix),
                                     });
                                 }
                             }
