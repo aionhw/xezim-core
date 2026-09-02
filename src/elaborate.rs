@@ -2332,6 +2332,72 @@ fn expand_enum_member(
     (out, val)
 }
 
+/// §6.19 Value-domain twin of `expand_enum_member`, for bases WIDER than 64
+/// bits: the u64 pipeline truncates every member to its low 64 bits — and
+/// runs the auto-increment chain there, so even an unspecified member
+/// carried only the low half of its predecessor. Same name expansion; the
+/// values and the increment chain are carried at full width.
+fn expand_enum_member_wide(
+    member: &crate::ast::types::EnumMember,
+    next_val: &Value,
+    width: u32,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> (Vec<(String, Value)>, Value) {
+    let one = Value::from_u64(1, width);
+    let mut val = if let Some(init) = &member.init {
+        let v = eval_const_expr_val(init, params);
+        if v.is_real {
+            Value::from_u64(eval_const_expr(init, params), width)
+        } else {
+            v.resize(width)
+        }
+    } else {
+        next_val.clone()
+    };
+    let mut out = Vec::new();
+    match &member.range {
+        None => {
+            out.push((member.name.name.clone(), val.clone()));
+            val = val.add(&one).resize(width);
+        }
+        Some((lo_e, hi_e)) => {
+            let lo = const_eval_i64_with_params(lo_e, Some(params)).unwrap_or(0);
+            let hi = const_eval_i64_with_params(hi_e, Some(params)).unwrap_or(lo);
+            let idxs: Vec<i64> = if lo <= hi {
+                (lo..=hi).collect()
+            } else {
+                (hi..=lo).rev().collect()
+            };
+            for i in idxs {
+                out.push((format!("{}{}", member.name.name, i), val.clone()));
+                val = val.add(&one).resize(width);
+            }
+        }
+    }
+    (out, val)
+}
+
+/// Full-width member values of an enum whose base exceeds 64 bits, keyed by
+/// member name — the override map the registration sites consult so the u64
+/// tables (`enum_members`, iteration order) keep their shape while the
+/// CONSTANTS the design reads carry every bit.
+pub fn wide_enum_value_map(
+    et: &crate::ast::types::EnumType,
+    width: u32,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> crate::hasher::HashMap<String, Value> {
+    let mut map: crate::hasher::HashMap<String, Value> = crate::hasher::HashMap::default();
+    let mut next = Value::from_u64(0, width);
+    for member in &et.members {
+        let (entries, nv) = expand_enum_member_wide(member, &next, width, params);
+        next = nv;
+        for (nm, v) in entries {
+            map.insert(nm, v);
+        }
+    }
+    map
+}
+
 /// Compute an anonymous enum's members in declaration order (which is the LRM
 /// §6.19.6 iteration order for first/last/next/prev/num). Mirrors the value
 /// expansion in `register_anonymous_enum_members`.
@@ -2370,11 +2436,16 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
             .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
             .unwrap_or(32);
         let mut next_val: u64 = 0;
+        let wide_vals = (base_width > 64)
+            .then(|| wide_enum_value_map(et, base_width, &elab.parameters));
         for member in &et.members {
             let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
             next_val = nv;
             for (nm, val) in entries {
-                let v = enum_member_4state(member, val, base_width, &elab.parameters);
+                let mut v = enum_member_4state(member, val, base_width, &elab.parameters);
+                if let Some(w) = wide_vals.as_ref().and_then(|m| m.get(&nm)) {
+                    v = w.clone();
+                }
                 elab.parameters.entry(nm.clone()).or_insert_with(|| v.clone());
                 elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
                     is_const: false,
@@ -2941,11 +3012,16 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             .unwrap_or(32);
         let mut next_val: u64 = 0;
         let mut members_ordered: Vec<(String, u64)> = Vec::new();
+        let wide_vals = (base_width > 64)
+            .then(|| wide_enum_value_map(et, base_width, &elab.parameters));
         for member in &et.members {
             let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
             next_val = nv;
             for (nm, val) in entries {
                 let mut v = enum_member_4state(member, val, base_width, &elab.parameters);
+                if let Some(w) = wide_vals.as_ref().and_then(|m| m.get(&nm)) {
+                    v = w.clone();
+                }
                 if !v.is_real {
                     v.is_signed = enum_signed;
                 }
@@ -16298,6 +16374,22 @@ pub fn inline_instantiations(
                     }
                     let Some(members) = elab.enum_members.get(&td.name.name).cloned() else { continue };
                     let w = elab.typedefs.get(&td.name.name).copied().unwrap_or(32).max(1);
+                    // §6.19 wide base: the (u64, width) table truncates past
+                    // 64 bits, so ALSO park the full Value under the
+                    // qualified spelling in `parameters` — the runtime's
+                    // qualified lookup consults it first for wide members.
+                    if w > 64 {
+                        if let DataType::Enum(et) = &td.data_type {
+                            for (m, v) in wide_enum_value_map(et, w, &elab.parameters) {
+                                params_insert_traced(
+                                    &mut elab.parameters,
+                                    line!(),
+                                    format!("{}::{}", name, m),
+                                    v,
+                                );
+                            }
+                        }
+                    }
                     let slot = elab.package_enum_members.entry(name.clone()).or_default();
                     for (m, v) in members {
                         slot.insert(m, (v, w));
@@ -20532,12 +20624,18 @@ fn inline_module_items(
                                 .map(|bt| resolve_type_width(bt, Some(&sub_merged_params), Some(&elab.typedefs)))
                                 .unwrap_or(32);
                             let mut next_val: u64 = 0;
+                            let wide_vals = (base_width > 64)
+                                .then(|| wide_enum_value_map(et, base_width, &sub_merged_params));
                             for member in &et.members {
                                 let val = if let Some(init) = &member.init {
                                     eval_const_expr(init, &sub_merged_params)
                                 } else { next_val };
                                 next_val = val.wrapping_add(1);
-                                let v = Value::from_u64(val, base_width);
+                                let v = wide_vals
+                                    .as_ref()
+                                    .and_then(|m| m.get(&member.name.name))
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
                                 // Don't clobber an already-registered member
                                 // with a DIFFERENT value: xezim's parameter
                                 // namespace is flat, but per LRM §22.1.4 +
@@ -20582,7 +20680,11 @@ fn inline_module_items(
                                 // and the bare slot stays the design-wide
                                 // §23.6 fallback.
                                 let sc = format!("{}{}", inst_prefix, member.name.name);
-                                let sv = Value::from_u64(val, base_width);
+                                let sv = wide_vals
+                                    .as_ref()
+                                    .and_then(|m| m.get(&member.name.name))
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
                                 params_insert_traced(&mut elab.parameters, line!(), sc.clone(), sv.clone());
                                 signals_insert_traced(&mut elab.signals, line!(), sc.clone(), Signal {
                                     is_const: false,
@@ -25626,13 +25728,22 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         .unwrap_or(32);
                                     let mut next_val: u64 = 0;
                                     let mut members_ordered: Vec<(String, u64)> = Vec::new();
+                                    let wide_vals = (base_width > 64).then(|| {
+                                        wide_enum_value_map(et, base_width, &elab.parameters)
+                                    });
                                     for member in &et.members {
                                         let (entries, nv) =
                                             expand_enum_member(member, next_val, &elab.parameters);
                                         next_val = nv;
                                         for (nm, val) in entries {
                                             if &nm == sym_name {
-                                                let v = Value::from_u64(val, base_width);
+                                                let v = wide_vals
+                                                    .as_ref()
+                                                    .and_then(|m| m.get(&nm))
+                                                    .cloned()
+                                                    .unwrap_or_else(|| {
+                                                        Value::from_u64(val, base_width)
+                                                    });
                                                 elab.note_decl_site(
                                                     &nm,
                                                     member.name.span,
