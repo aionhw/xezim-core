@@ -20523,7 +20523,7 @@ fn inline_module_items(
                                     });
                                 }
                             }
-                            // Width-only restore — see the non-enum twin below.
+                            // Prior-or-keep restore — see the non-enum twin below.
                             saved_type_binds.push((
                                 td.name.name.clone(),
                                 elab.typedefs.get(&td.name.name).copied(),
@@ -20534,8 +20534,7 @@ fn inline_module_items(
                             ));
                             typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_enum", td.name.name.clone(), base_width);
                             elab.typedef_types
-                                .entry(td.name.name.clone())
-                                .or_insert_with(|| td.data_type.clone());
+                                .insert(td.name.name.clone(), td.data_type.clone());
                             // §6.18/§23.10: the INSTANCE-scoped key. The bare
                             // key is last-writer-wins across differently
                             // parameterized instances of the same module, so a
@@ -20564,12 +20563,21 @@ fn inline_module_items(
                             // instance inlined last (order-dependent 64 vs 16).
                             // Same save/restore rail the type-parameter
                             // overrides use.
-                            // Restore the WIDTH slot only: typedef_types is
-                            // first-wins-and-KEPT (the struct-member machinery
-                            // consults it AFTER inlining — reverting it broke
-                            // every struct-typed member in an instance), so
-                            // hand the restore loop the POST-state type and it
-                            // no-ops there while healing the width table.
+                            // The TYPE slot is prior-or-KEEP: the saved value
+                            // is what the slot held before this instance — or,
+                            // for the FIRST instance, this instance's own type
+                            // — so the restore hands post-inlining consumers
+                            // (the struct-member machinery reads the bare slot
+                            // AFTER inlining; removing it broke every
+                            // struct-typed member) the same first-declared
+                            // fallback as before, while the overwrite below
+                            // makes the slot context-correct DURING inlining.
+                            // With first-wins (`entry().or_insert`) here, a
+                            // second differently-parameterized instance
+                            // resolved its `#(.T(rec_t))` overrides and its
+                            // own member writes through the FIRST instance's
+                            // baked layout — 39-bit field offsets in a 68-bit
+                            // struct, order-dependent on instance order.
                             saved_type_binds.push((
                                 td.name.name.clone(),
                                 elab.typedefs.get(&td.name.name).copied(),
@@ -20606,11 +20614,12 @@ fn inline_module_items(
                             // layout. Only the width was recorded before, so
                             // `flatten_struct_fields` below found nothing and the
                             // member cont-assign was silently dropped (struct
-                            // stayed X). `entry().or_insert` = first-declared
-                            // wins, matching the enum-member shadowing rule.
+                            // stayed X). Plain insert: THIS instance's type,
+                            // for the duration of its inlining (see the rail
+                            // comment above); first-declared still wins the
+                            // post-inlining fallback via the restore.
                             elab.typedef_types
-                                .entry(td.name.name.clone())
-                                .or_insert_with(|| td.data_type.clone());
+                                .insert(td.name.name.clone(), td.data_type.clone());
                             elab.typedef_types
                                 .entry(format!("{}{}", inst_prefix, td.name.name))
                                 .or_insert_with(|| {
