@@ -21498,11 +21498,25 @@ fn inline_module_items(
                     let sub_expr = make_ident_expr(&sub_sig_name);
                     match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
-                            // §23.3.3: a NARROWER actual drives only the low
-                            // bits of the formal; the unconnected high bits
-                            // read z (measured: 4-bit actual on an 8-bit
-                            // input -> "zzzz1010"). A plain resize would
-                            // zero-extend, silently driving the top bits 0.
+                            // §23.3.3.6: a port connection is an implicit
+                            // continuous assignment, so a NARROWER actual on
+                            // an INPUT extends to the formal width like any
+                            // assignment (`.p(1'b0)` on a 4-bit port reads
+                            // 0000). One reference simulator instead leaves
+                            // the unconnected high bits z ("zzzz1010"
+                            // measured) and this code used to copy that; the
+                            // LRM reading — which the other reference
+                            // implements — was chosen after the z bits walked
+                            // through a production DUT's CDC and stalled its
+                            // write path as X.
+                            //
+                            // An INOUT keeps the z-fill: it is bidirectional,
+                            // and driving the unconnected high bits would
+                            // fight the sub-module's own driver.
+                            let is_inout = matches!(
+                                prepared_sub.port_directions.get(port_name),
+                                Some(PortDirection::Inout)
+                            );
                             let mut rhs = parent_expr.clone();
                             let fw = elab
                                 .signals
@@ -21514,7 +21528,7 @@ fn inline_module_items(
                                 .get(&sub_sig_name)
                                 .map(|s| s.is_real)
                                 .unwrap_or(false);
-                            if !is_real_port && fw > 0 {
+                            if is_inout && !is_real_port && fw > 0 {
                                 if let Some(aw) = port_conn_width(parent_expr, elab) {
                                     if aw > 0 && aw < fw {
                                         let span = parent_expr.span;
