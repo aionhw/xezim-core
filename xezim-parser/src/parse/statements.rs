@@ -684,6 +684,12 @@ impl Parser {
                 matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon)
                 || (self.peek_kind() == TokenKind::LBracket && {
                     // Look-ahead: balance brackets and check what follows.
+                    // §7.4.1: a typedef may carry SEVERAL packed dims
+                    // (`s_t [1:0][1:0] m;`), so walk every consecutive
+                    // balanced group before judging — stopping at the
+                    // first `]` saw the second `[` and sent the declaration
+                    // down the expression path (a parse error), while the
+                    // same declaration at module scope parsed fine.
                     let mut depth: i32 = 0;
                     let mut k: usize = 0;
                     let mut next_after = TokenKind::Eof;
@@ -695,7 +701,9 @@ impl Parser {
                                 depth -= 1;
                                 if depth == 0 {
                                     next_after = self.peek_kind_n(k + 2);
-                                    break;
+                                    if next_after != TokenKind::LBracket {
+                                        break;
+                                    }
                                 }
                             }
                             TokenKind::Eof => break,
