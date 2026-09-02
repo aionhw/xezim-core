@@ -11757,6 +11757,21 @@ fn lsdd_class(
     }
 }
 
+/// Replace member types of a (substituted) packed struct that name one of the
+/// module's own typedefs with the resolved type, recursively.
+fn lsdd_subst_struct_members(
+    su: &mut StructUnionType,
+    tds: &HashMap<String, DataType>,
+) {
+    for m in su.members.iter_mut() {
+        if let Some(rt) = lsdd_resolve_local_typedef(&m.data_type, tds) {
+            m.data_type = rt;
+        } else if let DataType::Struct(inner) = &mut m.data_type {
+            lsdd_subst_struct_members(inner, tds);
+        }
+    }
+}
+
 /// Replace a reference to one of this module's own typedefs with the type it
 /// names, when that type is a shape whose width would otherwise silently
 /// default to 32 bits. Deliberately narrow: enums, classes, strings and
@@ -11800,6 +11815,11 @@ fn lsdd_resolve_local_typedef(
         DataType::Struct(su) if su.packed => {
             outer.extend(su.dimensions.iter().cloned());
             su.dimensions = outer;
+            // The MEMBERS may name this module's typedefs too (`in_t q;`).
+            // Left as references they resolve to the 32-bit default at run
+            // time in a submodule (the bare typedef key is gone), and every
+            // member laid out above them lands at the wrong offset.
+            lsdd_subst_struct_members(su, tds);
         }
         // An enum keeps its members, so inlining it preserves `.name()` and
         // `$cast` — which a bare 32-bit fallback had already lost anyway.
@@ -11885,6 +11905,10 @@ fn lsdd_stmt(
         StatementKind::VarDecl { data_type, declarators, .. } => {
             if let Some(rt) = lsdd_resolve_local_typedef(data_type, tds) {
                 *data_type = rt;
+            } else if let DataType::Struct(su) = data_type {
+                // A struct written INLINE in the declaration: its members
+                // may still name the module's typedefs.
+                lsdd_subst_struct_members(su, tds);
             }
             lsdd_data_type(data_type, env);
             for d in declarators.iter_mut() {
@@ -11904,6 +11928,8 @@ fn lsdd_stmt(
         StatementKind::Typedef(td) => {
             if let Some(rt) = lsdd_resolve_local_typedef(&td.data_type, tds) {
                 td.data_type = rt;
+            } else if let DataType::Struct(su) = &mut td.data_type {
+                lsdd_subst_struct_members(su, tds);
             }
             lsdd_data_type(&mut td.data_type, env)
         }
@@ -14277,6 +14303,12 @@ pub fn packed_full_dims_of(
         // element selects degrade to bit-selects and element continuous
         // assigns cannot resolve to a slice.
         DataType::Implicit { dimensions, .. } => dimensions,
+        // §7.4.2 inline packed array of packed structs: the dims written after
+        // the body are the element dims (each element is one struct); the
+        // slot flatten only consumes leading dims, so these plug in directly.
+        // Absent this arm a two-index select on such a local had no shape,
+        // and the element read collapsed to one bit.
+        DataType::Struct(su) if !su.dimensions.is_empty() => &su.dimensions,
         _ => return None,
     };
     if dims.is_empty() {
@@ -14456,6 +14488,33 @@ pub fn packed_inner_elem_width(
         }
         return Some(total / outer);
     } else { dt };
+    // §7.4.2 packed array of packed STRUCTS written inline
+    // (`struct packed {…} [1:0] a`): the element is one struct; the outer
+    // dims after the body count elements. Absent this arm the element width
+    // fell to one bit — `a[1] = '{…}` stored a single bit and `a[0].m` read x —
+    // and a typedef'd form folded into this shape by the submodule-local
+    // typedef substitution broke the same way.
+    if let DataType::Struct(su) = resolved {
+        if su.dimensions.is_empty() {
+            return None;
+        }
+        let mut no_dims = su.clone();
+        no_dims.dimensions.clear();
+        let elem = resolve_type_width(&DataType::Struct(no_dims), Some(params), Some(typedefs));
+        if elem == 0 {
+            return None;
+        }
+        // Several outer dims: an element of the outermost is the remaining
+        // sub-array, same rule as the vector case below.
+        let mut inner = elem;
+        for d in su.dimensions.iter().skip(1) {
+            let PackedDimension::Range { left, right, .. } = d else { return None };
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            inner = inner.checked_mul(((l - r).abs() + 1) as u32)?;
+        }
+        return Some(inner);
+    }
     if let DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } =
         resolved
     {
