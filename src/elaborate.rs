@@ -21846,6 +21846,43 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // §7.2.1/§23.3.3: a PACKED-STRUCT formal read member-wise
+                    // (`din.f0`) needs its own member layout. Substituting a
+                    // FLAT actual (a plain vector net, a concat, a select)
+                    // hands the body a name with no layout, so every member
+                    // read went x while the whole-port read stayed right —
+                    // the same conversion block worked when the parent net
+                    // happened to be struct-typed. Keep the formal's signal
+                    // unless the actual is a whole net carrying a layout.
+                    // Only for a PLAIN struct formal (an array-of-structs
+                    // formal carries element widths and takes the packed
+                    // element path, where substitution is right), and only
+                    // when the actual's ROOT net carries no layout at all —
+                    // an element/part select of a struct array keeps its
+                    // parent's layout through the select and substitutes
+                    // fine; a flat vector or a concat does not.
+                    let formal_key = format!("{}{}", inst_prefix, pname);
+                    if is_input
+                        && elab.packed_struct_fields.contains_key(&formal_key)
+                        && !elab.packed_signal_elem_widths.contains_key(&formal_key)
+                    {
+                        let mut root: &Expression = actual;
+                        loop {
+                            match &root.kind {
+                                ExprKind::Index { expr, .. }
+                                | ExprKind::RangeSelect { expr, .. } => root = expr,
+                                ExprKind::Paren(inner) => root = inner,
+                                _ => break,
+                            }
+                        }
+                        let root_has_layout = whole_net_ident_name(root).is_some_and(|n| {
+                            elab.packed_struct_fields.contains_key(&n)
+                                || elab.packed_signal_elem_widths.contains_key(&n)
+                        });
+                        if !root_has_layout {
+                            no_subst_ports.insert(pname.clone());
+                        }
+                    }
                     let Some(actual_w) = port_conn_width(actual, elab) else {
                         continue;
                     };
