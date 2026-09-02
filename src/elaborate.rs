@@ -18332,6 +18332,20 @@ fn prepare_module_items(
             ModuleItem::TaskDeclaration(td) => {
                 local_names.insert(td.name.name.name.clone());
             }
+            // §6.19: enum MEMBERS are named constants of this scope. Absent
+            // from this set, an inlined expression kept the bare member name
+            // and resolved through the flat first-wins slot, so a later
+            // differently-parameterized instance read the FIRST instance's
+            // member value (`OTHER = V + 1` stuck at the first V). The
+            // instance-scoped entries the rewrite will now point at are
+            // registered unconditionally at instance time.
+            ModuleItem::TypedefDeclaration(td) => {
+                if let DataType::Enum(et) = &td.data_type {
+                    for m in &et.members {
+                        local_names.insert(m.name.name.clone());
+                    }
+                }
+            }
             ModuleItem::ModuleInstantiation(inst) => {
                 // §23.6: CHILD INSTANCE names are local names of this module —
                 // a downward hierarchical reference (`child.grandchild.sig`,
@@ -19865,6 +19879,40 @@ fn inline_module_items(
                                 }
                             }
                         }
+                        // Enum typedef MEMBERS are elaboration constants of
+                        // this scope too (§6.19). They were never collected
+                        // here, so a member with a parameter-dependent value
+                        // (`MAGIC = V`) was absent from the instance's local
+                        // environment — the cont-assign const-folder then fell
+                        // back to the flat bare slot, which is first-wins
+                        // across instances, and every later instance folded
+                        // the FIRST instance's value in. Recomputed each
+                        // round like the localparams above, so a member
+                        // depending on a later-resolved name converges.
+                        for item in &effective_items {
+                            if let ModuleItem::TypedefDeclaration(td) = item {
+                                if let DataType::Enum(et) = &td.data_type {
+                                    let bw = et.base_type.as_ref()
+                                        .map(|bt| resolve_type_width(bt, Some(local_map), Some(&elab_ro.typedefs)))
+                                        .unwrap_or(32);
+                                    let mut next_val: u64 = 0;
+                                    for member in &et.members {
+                                        let val = if let Some(init) = &member.init {
+                                            eval_const_expr(init, local_map)
+                                        } else { next_val };
+                                        next_val = val.wrapping_add(1);
+                                        if frozen.contains(&member.name.name) { continue; }
+                                        let v = Value::from_u64(val, bw);
+                                        let stale = local_map.get(&member.name.name)
+                                            .is_none_or(|p| p.to_u64() != Some(val));
+                                        if stale {
+                                            local_map.insert(member.name.name.clone(), v);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if local_map.len() == before && !changed { break; }
                     }
                 };
@@ -20522,6 +20570,30 @@ fn inline_module_items(
                                         is_real: false,
                                     });
                                 }
+                                // INSTANCE-scoped key, unconditionally: a
+                                // member whose value depends on this
+                                // instance's parameters (`MAGIC = V`) loses
+                                // the first-wins race above, and every later
+                                // instance then read the FIRST instance's
+                                // value. Statement identifiers already
+                                // resolve through the instance prefix (that
+                                // is how a plain parameter is per-instance),
+                                // so the scoped entry wins where it matters
+                                // and the bare slot stays the design-wide
+                                // §23.6 fallback.
+                                let sc = format!("{}{}", inst_prefix, member.name.name);
+                                let sv = Value::from_u64(val, base_width);
+                                params_insert_traced(&mut elab.parameters, line!(), sc.clone(), sv.clone());
+                                signals_insert_traced(&mut elab.signals, line!(), sc.clone(), Signal {
+                                    is_const: false,
+                                    name: sc,
+                                    width: base_width,
+                                    is_signed: false,
+                                    direction: None,
+                                    value: sv,
+                                    type_name: None,
+                                    is_real: false,
+                                });
                             }
                             // Prior-or-keep restore — see the non-enum twin below.
                             saved_type_binds.push((
