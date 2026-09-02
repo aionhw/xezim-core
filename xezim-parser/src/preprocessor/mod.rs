@@ -1139,6 +1139,61 @@ impl Preprocessor {
     /// 1. The directory of the currently-processed source file
     /// 2. Each directory in include_dirs (in order)
     fn resolve_include(&self, filename: &str, source_dir: Option<&Path>) -> Option<PathBuf> {
+        let found = self.resolve_include_first(filename, source_dir);
+        if let Some(chosen) = &found {
+            self.warn_shadowed_include(filename, chosen, source_dir);
+        }
+        found
+    }
+
+    /// A same-named header in a LATER search directory with DIFFERENT
+    /// contents is silently shadowed by the search order; a stale copy that
+    /// lacks declarations the design calls then elaborates with no clue why.
+    /// Warn once per include name.
+    fn warn_shadowed_include(&self, filename: &str, chosen: &Path, source_dir: Option<&Path>) {
+        // One report per include name for the whole run: each source file
+        // gets its own preprocessor, and the same header is included by many.
+        static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+            std::sync::Mutex::new(None);
+        if Path::new(filename).is_absolute() {
+            return;
+        }
+        {
+            let guard = WARNED.lock().unwrap();
+            if guard.as_ref().is_some_and(|w| w.contains(filename)) {
+                return;
+            }
+        }
+        let chosen_bytes = std::fs::read(chosen).ok();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(d) = source_dir {
+            dirs.push(d.to_path_buf());
+        }
+        dirs.extend(self.include_dirs.iter().cloned());
+        for dir in dirs {
+            let other = dir.join(filename);
+            if !other.exists() || same_file(&other, chosen) {
+                continue;
+            }
+            if std::fs::read(&other).ok() == chosen_bytes {
+                continue;
+            }
+            WARNED
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Default::default)
+                .insert(filename.to_string());
+            eprintln!(
+                "[PP] warning: `include \"{}\" resolved to '{}'; a different copy in '{}' is shadowed by the search order",
+                filename,
+                chosen.display(),
+                other.display()
+            );
+            return;
+        }
+    }
+
+    fn resolve_include_first(&self, filename: &str, source_dir: Option<&Path>) -> Option<PathBuf> {
         let inc_path = Path::new(filename);
 
         // If the include path is absolute, use it directly
@@ -1753,5 +1808,14 @@ impl Preprocessor {
                     || directive_word(trimmed, "`define")
             )
         })
+    }
+}
+
+/// Two paths name the same file (after canonicalization), so a directory
+/// listed twice never counts as a shadowing copy.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
     }
 }

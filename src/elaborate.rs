@@ -16361,6 +16361,352 @@ fn register_nested_classes(
     }
 }
 
+/// Every function/task/DPI name declared ANYWHERE in the design — modules,
+/// interfaces, programs, packages, classes, generate blocks. The undefined-
+/// call check below only fires for a name absent from this set, so a call
+/// that merely resolves through a scope the elaborator does not model
+/// (a package imported only inside a sub-module, a class method, `$unit`)
+/// can never be flagged.
+fn collect_design_subroutine_names(definitions: &HashMap<String, Definition>) -> HashSet<String> {
+    fn class_items(c: &crate::ast::decl::ClassDeclaration, out: &mut HashSet<String>) {
+        for it in &c.items {
+            if let crate::ast::decl::ClassItem::Method(m) = it {
+                match &m.kind {
+                    crate::ast::decl::ClassMethodKind::Function(fd)
+                    | crate::ast::decl::ClassMethodKind::PureVirtual(fd) => {
+                        out.insert(fd.name.name.name.clone());
+                    }
+                    crate::ast::decl::ClassMethodKind::Task(td) => {
+                        out.insert(td.name.name.name.clone());
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {}
+                }
+            }
+        }
+    }
+    fn dpi_name(di: &crate::ast::decl::DPIImport) -> String {
+        match &di.proto {
+            crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
+            crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
+        }
+    }
+    fn module_items(items: &[ModuleItem], out: &mut HashSet<String>) {
+        for it in items {
+            match it {
+                ModuleItem::FunctionDeclaration(fd) => {
+                    out.insert(fd.name.name.name.clone());
+                }
+                ModuleItem::TaskDeclaration(td) => {
+                    out.insert(td.name.name.name.clone());
+                }
+                ModuleItem::DPIImport(di) => {
+                    out.insert(dpi_name(di));
+                }
+                ModuleItem::ClassDeclaration(c) => class_items(c, out),
+                ModuleItem::GenerateRegion(gr) => module_items(&gr.items, out),
+                ModuleItem::GenerateIf(gi) => {
+                    for (_, items) in &gi.branches {
+                        module_items(items, out);
+                    }
+                }
+                ModuleItem::GenerateFor(gf) => module_items(&gf.items, out),
+                ModuleItem::GenerateCase(gc) => {
+                    for arm in &gc.arms {
+                        module_items(&arm.items, out);
+                    }
+                }
+                ModuleItem::NestedModule(m) => module_items(&m.items, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::default();
+    for def in definitions.values() {
+        match def {
+            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_) => {
+                module_items(def.items(), &mut out);
+            }
+            Definition::Package(p) => {
+                for it in &p.items {
+                    match it {
+                        crate::ast::decl::PackageItem::Function(fd) => {
+                            out.insert(fd.name.name.name.clone());
+                        }
+                        crate::ast::decl::PackageItem::Task(td) => {
+                            out.insert(td.name.name.name.clone());
+                        }
+                        crate::ast::decl::PackageItem::DPIImport(di) => {
+                            out.insert(dpi_name(di));
+                        }
+                        crate::ast::decl::PackageItem::Class(c) => class_items(c, &mut out),
+                        _ => {}
+                    }
+                }
+            }
+            Definition::Class(c) => class_items(c, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Visit every expression reachable from a statement, in evaluation-agnostic
+/// order. Statement kinds with no expression payload are skipped.
+fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
+    use crate::ast::stmt::StatementKind as K;
+    match &stmt.kind {
+        K::Expr(e) => f(e),
+        K::BlockingAssign { lvalue, rvalue } => {
+            f(lvalue);
+            f(rvalue);
+        }
+        K::NonblockingAssign { lvalue, delay, rvalue } => {
+            f(lvalue);
+            if let Some(d) = delay {
+                f(d);
+            }
+            f(rvalue);
+        }
+        K::If { condition, then_stmt, else_stmt, .. } => {
+            f(condition);
+            for_each_stmt_expr(then_stmt, f);
+            if let Some(e) = else_stmt {
+                for_each_stmt_expr(e, f);
+            }
+        }
+        K::Case { expr, items, .. } => {
+            f(expr);
+            for it in items {
+                for p in &it.patterns {
+                    f(p);
+                }
+                if let Some(g) = &it.guard {
+                    f(g);
+                }
+                for_each_stmt_expr(&it.stmt, f);
+            }
+        }
+        K::For { init, condition, step, body } => {
+            for i in init {
+                match i {
+                    crate::ast::stmt::ForInit::VarDecl { init, .. } => f(init),
+                    crate::ast::stmt::ForInit::Assign { lvalue, rvalue } => {
+                        f(lvalue);
+                        f(rvalue);
+                    }
+                }
+            }
+            if let Some(c) = condition {
+                f(c);
+            }
+            for st in step {
+                f(st);
+            }
+            for_each_stmt_expr(body, f);
+        }
+        K::Foreach { array, body, .. } => {
+            f(array);
+            for_each_stmt_expr(body, f);
+        }
+        K::ForeachTail { body, .. }
+        | K::Forever { body }
+        | K::ForeverTail { body }
+        | K::RsAction { body } => for_each_stmt_expr(body, f),
+        K::While { condition, body } | K::DoWhile { body, condition } => {
+            f(condition);
+            for_each_stmt_expr(body, f);
+        }
+        K::Repeat { count, body } => {
+            f(count);
+            for_each_stmt_expr(body, f);
+        }
+        K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+            for st in stmts {
+                for_each_stmt_expr(st, f);
+            }
+        }
+        K::TimingControl { stmt, .. } => for_each_stmt_expr(stmt, f),
+        K::Wait { condition, stmt } => {
+            f(condition);
+            for_each_stmt_expr(stmt, f);
+        }
+        K::Return(Some(e)) => f(e),
+        K::VarDecl { declarators, .. } => {
+            for d in declarators {
+                if let Some(i) = &d.init {
+                    f(i);
+                }
+            }
+        }
+        K::RandCase { items } => {
+            for (w, st) in items {
+                f(w);
+                for_each_stmt_expr(st, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Visit every sub-expression (pre-order, `e` included).
+fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
+    f(e);
+    match &e.kind {
+        ExprKind::Unary { operand, .. } => for_each_sub_expr(operand, f),
+        ExprKind::Binary { left, right, .. } => {
+            for_each_sub_expr(left, f);
+            for_each_sub_expr(right, f);
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            for_each_sub_expr(condition, f);
+            for_each_sub_expr(then_expr, f);
+            for_each_sub_expr(else_expr, f);
+        }
+        ExprKind::Concatenation(xs) | ExprKind::StreamOp { exprs: xs, .. } => {
+            for x in xs {
+                for_each_sub_expr(x, f);
+            }
+        }
+        ExprKind::Replication { count, exprs } => {
+            for_each_sub_expr(count, f);
+            for x in exprs {
+                for_each_sub_expr(x, f);
+            }
+        }
+        ExprKind::AssignmentPattern(items) => {
+            for it in items {
+                for_each_sub_expr(it.expr(), f);
+            }
+        }
+        ExprKind::Call { func, args } => {
+            for_each_sub_expr(func, f);
+            for a in args {
+                for_each_sub_expr(a, f);
+            }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args {
+                for_each_sub_expr(a, f);
+            }
+        }
+        ExprKind::NamedArg { expr: Some(x), .. } => for_each_sub_expr(x, f),
+        ExprKind::Inside { expr, ranges } => {
+            for_each_sub_expr(expr, f);
+            for r in ranges {
+                for_each_sub_expr(r, f);
+            }
+        }
+        ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Specialization { base: expr, .. }
+        | ExprKind::Paren(expr)
+        | ExprKind::ShallowCopy { source: expr } => for_each_sub_expr(expr, f),
+        ExprKind::Index { expr, index } => {
+            for_each_sub_expr(expr, f);
+            for_each_sub_expr(index, f);
+        }
+        ExprKind::RangeSelect { expr, left, right, .. } => {
+            for_each_sub_expr(expr, f);
+            for_each_sub_expr(left, f);
+            for_each_sub_expr(right, f);
+        }
+        ExprKind::Range(a, b) | ExprKind::AssignExpr { lvalue: a, rvalue: b } => {
+            for_each_sub_expr(a, f);
+            for_each_sub_expr(b, f);
+        }
+        ExprKind::WithClause { expr, filter } => {
+            for_each_sub_expr(expr, f);
+            for_each_sub_expr(filter, f);
+        }
+        ExprKind::RandomizeWith { call, .. } => for_each_sub_expr(call, f),
+        ExprKind::SvaClocked { clock, body } => {
+            for_each_sub_expr(clock, f);
+            for_each_sub_expr(body, f);
+        }
+        _ => {}
+    }
+}
+
+/// A call whose callee is a plain name that no function, task or DPI import
+/// anywhere in the design declares is an error — the reference tooling
+/// rejects it at elaboration. The per-module validator only ever saw the
+/// TOP module's own blocks; a sub-instance's blocks are inlined afterwards
+/// and were never checked, so `chk_always(...)` in an RTL module bound to a
+/// stale header that lacked it simply never ran: assertions silently
+/// vanished and the run looked clean. Signals and other identifiers in
+/// sub-instances stay unchecked here; only callees are proven safe against
+/// the design-wide declaration set.
+fn validate_call_targets(
+    elab: &ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+) -> Result<(), String> {
+    let declared = collect_design_subroutine_names(definitions);
+    let mut first: Option<(String, Span)> = None;
+    let mut check = |e: &Expression| {
+        for_each_sub_expr(e, &mut |x| {
+            if first.is_some() {
+                return;
+            }
+            let ExprKind::Call { func, .. } = &x.kind else { return };
+            let ExprKind::Ident(h) = &func.kind else { return };
+            if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                return;
+            }
+            let name = h.path[0].name.name.as_str();
+            let bare = crate::sv_parser::strip_unit_scope_name(name).unwrap_or(name);
+            if bare.starts_with('$')
+                || bare.contains('.')
+                || matches!(bare, "new" | "super" | "this" | "randomize" | "std" | "process")
+                || declared.contains(bare)
+                || elab.functions.contains_key(bare)
+                || elab.tasks.contains_key(bare)
+                || elab.dpi_imports.contains_key(bare)
+                || elab.classes.contains_key(bare)
+                || elab.typedefs.contains_key(bare)
+                || elab.typedef_types.contains_key(bare)
+                || elab.lets.contains_key(bare)
+                || elab.sequences.contains(bare)
+                || elab.signals.contains_key(bare)
+                || elab.parameters.contains_key(bare)
+            {
+                return;
+            }
+            first = Some((bare.to_string(), func.span));
+        });
+    };
+    for ib in &elab.initial_blocks {
+        for_each_stmt_expr(&ib.stmt, &mut check);
+    }
+    for ab in &elab.always_blocks {
+        for_each_stmt_expr(&ab.stmt, &mut check);
+    }
+    for ca in &elab.continuous_assigns {
+        check(&ca.lhs);
+        check(&ca.rhs);
+    }
+    // Sub-instance bodies are still PENDING here (materialized lazily, and
+    // streamed in the fast paths), so check their un-rewritten sources: the
+    // callee is the bare name as written, which is exactly what the
+    // declaration set is keyed by.
+    for p in &elab.pending_always {
+        for_each_stmt_expr(&p.source, &mut check);
+    }
+    for p in &elab.pending_initial {
+        for_each_stmt_expr(&p.source, &mut check);
+    }
+    for p in &elab.pending_cont_assign {
+        check(&p.lhs_source);
+        check(&p.rhs_source);
+    }
+    if let Some((name, span)) = first {
+        let loc = span_location_unhinted(elab, span)
+            .map(|l| format!(" at {}", l))
+            .unwrap_or_default();
+        return Err(format!("Undeclared identifier '{}'{}", name, loc));
+    }
+    Ok(())
+}
+
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
@@ -16857,6 +17203,8 @@ pub fn inline_instantiations(
         assign.lhs = rewrite_expr(&assign.lhs, prefix, &port_map, &local_names, &interface_map);
         assign.rhs = rewrite_expr(&assign.rhs, prefix, &port_map, &local_names, &interface_map);
     }
+
+    validate_call_targets(elab, definitions)?;
 
     Ok(())
 }
