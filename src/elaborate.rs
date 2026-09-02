@@ -325,6 +325,9 @@ pub struct RewriteCtx {
     /// had no binding left at run time and `obj = new()` never constructed.
     /// `materialize` substitutes these into cloned statements' declarations.
     pub type_binds: HashMap<String, DataType>,
+    /// Packed width of each bound type parameter — folded into `$bits(T)`
+    /// while this instance's items are rewritten (see `TYPE_BIND_WIDTHS_TLS`).
+    pub type_bind_widths: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +371,7 @@ impl PendingAlways {
             eprintln!("[PEND-MAT] prefix={:?} keys={:?}", self.ctx.prefix,
                 self.ctx.port_map.keys().collect::<Vec<_>>());
         }
+        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
         let stmt = rewrite_stmt(
             &self.source,
             &self.ctx.prefix,
@@ -375,6 +379,7 @@ impl PendingAlways {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        clear_type_bind_widths_tls();
         let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope, like PendingInitial.
@@ -393,6 +398,7 @@ impl PendingAlways {
 
 impl PendingInitial {
     pub fn materialize(self) -> InitialBlock {
+        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
         let stmt = rewrite_stmt(
             &self.source,
             &self.ctx.prefix,
@@ -400,6 +406,7 @@ impl PendingInitial {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        clear_type_bind_widths_tls();
         let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope for name resolution.
@@ -418,6 +425,13 @@ impl PendingInitial {
 
 impl PendingContAssign {
     pub fn materialize(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
+        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
+        let out = self.materialize_inner(params);
+        clear_type_bind_widths_tls();
+        out
+    }
+
+    fn materialize_inner(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         let lhs = rewrite_expr(
             &self.lhs_source,
             &self.ctx.prefix,
@@ -13277,6 +13291,16 @@ fn funcs_tls_add<'a>(
 thread_local! {
     static TYPEDEFS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
         = const { std::cell::RefCell::new(None) };
+    /// §6.20.3 / §20.6.2 — the packed widths of the TYPE PARAMETERS of the
+    /// instance whose behavioral items are currently being materialized, so
+    /// `rewrite_expr_impl` can fold `$bits(T)` to a literal. The binding only
+    /// exists during inlining (the `saved_type_binds` rail restores the
+    /// bare typedef slot afterwards), so at run time `$bits(T)` found no `T`
+    /// and read 1 — wrong in every expression position (cont-assign,
+    /// procedural, loop bound) while a `localparam NB = $bits(T)` folded
+    /// correctly during elaboration. Same pattern as TYPEDEFS_TLS.
+    static TYPE_BIND_WIDTHS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
+        = const { std::cell::RefCell::new(None) };
     /// LRM §20.7 — thread-local array-range table for const-eval of
     /// `$size`/`$left`/`$right`/`$high`/`$low`/`$dimensions` on an
     /// array-name ident. Same pattern as TYPEDEFS_TLS to avoid touching
@@ -21786,12 +21810,22 @@ fn inline_module_items(
                         }
                     }
                 }
+                let pend_type_bind_widths: HashMap<String, u32> = pend_type_binds
+                    .iter()
+                    .map(|(n, dt)| {
+                        (
+                            n.clone(),
+                            resolve_type_width(dt, Some(&sub_merged_params), Some(&elab.typedefs)),
+                        )
+                    })
+                    .collect();
                 let pend_ctx = std::rc::Rc::new(RewriteCtx {
                     prefix: inst_prefix.clone(),
                     port_map: rewrite_port_map.clone(),
                     local_names: std::rc::Rc::clone(&prepared_sub.local_names),
                     interface_map: sub_interface_map.clone(),
                     type_binds: pend_type_binds,
+                    type_bind_widths: pend_type_bind_widths,
                 });
 
                 // §6.8: the deferred (non-constant) declaration initializers of
@@ -21890,6 +21924,10 @@ fn inline_module_items(
                 // Inline the sub-module's continuous assigns
                 iprof_add("ck6_before_fntask", __th.elapsed());
                 let __td = std::time::Instant::now();
+                // Function/task bodies are copied PER INSTANCE below through
+                // `rewrite_stmt`, so this instance's type-parameter widths
+                // must be live for `$bits(T)` to fold inside them too.
+                set_type_bind_widths_tls(&pend_ctx.type_bind_widths);
                 for (sub_item, body_src) in prepared_sub.effective_items.iter().zip(prepared_sub.body_sources.iter()) {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
@@ -22167,6 +22205,7 @@ fn inline_module_items(
                         });
                     }
                 }
+                clear_type_bind_widths_tls();
 
                 // Record the instance before descending. Inlining is about to
                 // dissolve this module into the parent, so this is the only
@@ -24656,10 +24695,17 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             func: Box::new(rewrite_expr_impl(func, prefix, port_map, local_names, interface_map)),
             args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
         },
-        ExprKind::SystemCall { name, args } => ExprKind::SystemCall {
-            name: name.clone(),
-            args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
-        },
+        ExprKind::SystemCall { name, args } => {
+            // `$bits(T)` on a bound type parameter folds to its width here,
+            // before the ident could be prefixed into a nonexistent signal.
+            if let Some(w) = bits_of_bound_type_param(name, args) {
+                return make_i64_literal(w as i64, expr.span);
+            }
+            ExprKind::SystemCall {
+                name: name.clone(),
+                args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
+            }
+        }
         // LRM §16.5 SVA property body — substitute formal-arg
         // references in both the clock signal and the body. Without
         // this, a checker like
@@ -24736,6 +24782,33 @@ fn rewrite_pattern(
                 .collect(),
         ),
     }
+}
+
+fn set_type_bind_widths_tls(w: &HashMap<String, u32>) {
+    // Always assign — an instance WITHOUT type parameters must clear
+    // whatever an enclosing instance left, or its `$bits(T)` on a typedef
+    // named `T` would fold to the parent's parameter width.
+    TYPE_BIND_WIDTHS_TLS.with(|c| {
+        *c.borrow_mut() = if w.is_empty() { None } else { Some(w.clone()) };
+    });
+}
+
+fn clear_type_bind_widths_tls() {
+    TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
+}
+
+/// `$bits(T)` with `T` a type parameter of the instance being materialized:
+/// its width, or None when the call is anything else.
+fn bits_of_bound_type_param(name: &str, args: &[Expression]) -> Option<u32> {
+    if name != "$bits" || args.len() != 1 {
+        return None;
+    }
+    let ExprKind::Ident(h) = &args[0].kind else { return None };
+    if h.path.len() != 1 || !h.path[0].selects.is_empty() || h.root.is_some() {
+        return None;
+    }
+    let t = &h.path[0].name.name;
+    TYPE_BIND_WIDTHS_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(t).copied()))
 }
 
 /// Substitute an instance's TYPE-PARAMETER bindings into the declarations of
