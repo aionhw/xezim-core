@@ -328,6 +328,9 @@ pub struct RewriteCtx {
     /// Packed width of each bound type parameter — folded into `$bits(T)`
     /// while this instance's items are rewritten (see `TYPE_BIND_WIDTHS_TLS`).
     pub type_bind_widths: HashMap<String, u32>,
+    /// Name of the module/interface definition this body came from — the
+    /// file a diagnostic's span belongs to.
+    pub owner: String,
 }
 
 #[derive(Debug, Clone)]
@@ -16361,96 +16364,6 @@ fn register_nested_classes(
     }
 }
 
-/// Every function/task/DPI name declared ANYWHERE in the design — modules,
-/// interfaces, programs, packages, classes, generate blocks. The undefined-
-/// call check below only fires for a name absent from this set, so a call
-/// that merely resolves through a scope the elaborator does not model
-/// (a package imported only inside a sub-module, a class method, `$unit`)
-/// can never be flagged.
-fn collect_design_subroutine_names(definitions: &HashMap<String, Definition>) -> HashSet<String> {
-    fn class_items(c: &crate::ast::decl::ClassDeclaration, out: &mut HashSet<String>) {
-        for it in &c.items {
-            if let crate::ast::decl::ClassItem::Method(m) = it {
-                match &m.kind {
-                    crate::ast::decl::ClassMethodKind::Function(fd)
-                    | crate::ast::decl::ClassMethodKind::PureVirtual(fd) => {
-                        out.insert(fd.name.name.name.clone());
-                    }
-                    crate::ast::decl::ClassMethodKind::Task(td) => {
-                        out.insert(td.name.name.name.clone());
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => {}
-                }
-            }
-        }
-    }
-    fn dpi_name(di: &crate::ast::decl::DPIImport) -> String {
-        match &di.proto {
-            crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
-            crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
-        }
-    }
-    fn module_items(items: &[ModuleItem], out: &mut HashSet<String>) {
-        for it in items {
-            match it {
-                ModuleItem::FunctionDeclaration(fd) => {
-                    out.insert(fd.name.name.name.clone());
-                }
-                ModuleItem::TaskDeclaration(td) => {
-                    out.insert(td.name.name.name.clone());
-                }
-                ModuleItem::DPIImport(di) => {
-                    out.insert(dpi_name(di));
-                }
-                ModuleItem::ClassDeclaration(c) => class_items(c, out),
-                ModuleItem::GenerateRegion(gr) => module_items(&gr.items, out),
-                ModuleItem::GenerateIf(gi) => {
-                    for (_, items) in &gi.branches {
-                        module_items(items, out);
-                    }
-                }
-                ModuleItem::GenerateFor(gf) => module_items(&gf.items, out),
-                ModuleItem::GenerateCase(gc) => {
-                    for arm in &gc.arms {
-                        module_items(&arm.items, out);
-                    }
-                }
-                ModuleItem::NestedModule(m) => module_items(&m.items, out),
-                _ => {}
-            }
-        }
-    }
-    let mut out = HashSet::default();
-    for def in definitions.values() {
-        match def {
-            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_) => {
-                module_items(def.items(), &mut out);
-            }
-            Definition::Package(p) => {
-                for it in &p.items {
-                    match it {
-                        crate::ast::decl::PackageItem::Function(fd) => {
-                            out.insert(fd.name.name.name.clone());
-                        }
-                        crate::ast::decl::PackageItem::Task(td) => {
-                            out.insert(td.name.name.name.clone());
-                        }
-                        crate::ast::decl::PackageItem::DPIImport(di) => {
-                            out.insert(dpi_name(di));
-                        }
-                        crate::ast::decl::PackageItem::Class(c) => class_items(c, &mut out),
-                        _ => {}
-                    }
-                }
-            }
-            Definition::Class(c) => class_items(c, &mut out),
-            _ => {}
-        }
-    }
-    out
-}
-
 /// Visit every expression reachable from a statement, in evaluation-agnostic
 /// order. Statement kinds with no expression payload are skipped.
 fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
@@ -16627,79 +16540,481 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
     }
 }
 
-/// A call whose callee is a plain name that no function, task or DPI import
-/// anywhere in the design declares is an error — the reference tooling
-/// rejects it at elaboration. The per-module validator only ever saw the
-/// TOP module's own blocks; a sub-instance's blocks are inlined afterwards
-/// and were never checked, so `chk_always(...)` in an RTL module bound to a
-/// stale header that lacked it simply never ran: assertions silently
-/// vanished and the run looked clean. Signals and other identifiers in
-/// sub-instances stay unchecked here; only callees are proven safe against
-/// the design-wide declaration set.
-fn validate_call_targets(
+/// Every name DECLARED anywhere in the design: ports, nets, variables,
+/// parameters, typedefs and their enum members, genvars, subroutines, class
+/// properties and methods, clocking/let/property/sequence/covergroup names —
+/// across modules, interfaces, programs, packages, classes, generate blocks.
+fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> HashSet<String> {
+    fn data_type_names(dt: &DataType, out: &mut HashSet<String>) {
+        if let DataType::Enum(e) = dt {
+            for m in &e.members {
+                out.insert(m.name.name.clone());
+            }
+        }
+    }
+    fn param(p: &ParameterDeclaration, out: &mut HashSet<String>) {
+        if let ParameterKind::Data { data_type, assignments } = &p.kind {
+            data_type_names(data_type, out);
+            for a in assignments {
+                out.insert(a.name.name.clone());
+            }
+        }
+    }
+    fn typedef(t: &crate::ast::decl::TypedefDeclaration, out: &mut HashSet<String>) {
+        out.insert(t.name.name.clone());
+        data_type_names(&t.data_type, out);
+    }
+    fn ports(pl: &PortList, out: &mut HashSet<String>) {
+        match pl {
+            PortList::Ansi(ps) => {
+                for p in ps {
+                    out.insert(p.name.name.clone());
+                }
+            }
+            PortList::NonAnsi(ids) => {
+                for id in ids {
+                    out.insert(id.name.clone());
+                }
+            }
+            PortList::Empty => {}
+        }
+    }
+    fn class_items(c: &crate::ast::decl::ClassDeclaration, out: &mut HashSet<String>) {
+        use crate::ast::decl::ClassItem as CI;
+        out.insert(c.name.name.clone());
+        for p in &c.params {
+            param(p, out);
+        }
+        for it in &c.items {
+            match it {
+                CI::Property(p) => {
+                    data_type_names(&p.data_type, out);
+                    for d in &p.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                CI::Method(m) => match &m.kind {
+                    crate::ast::decl::ClassMethodKind::Function(fd)
+                    | crate::ast::decl::ClassMethodKind::PureVirtual(fd) => {
+                        out.insert(fd.name.name.name.clone());
+                    }
+                    crate::ast::decl::ClassMethodKind::Task(td) => {
+                        out.insert(td.name.name.name.clone());
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {}
+                },
+                CI::Typedef(t) => typedef(t, out),
+                CI::Parameter(p) => param(p, out),
+                CI::Class(inner) => class_items(inner, out),
+                CI::Covergroup(cg) => {
+                    out.insert(cg.name.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    fn dpi_name(di: &crate::ast::decl::DPIImport) -> String {
+        match &di.proto {
+            crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
+            crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
+        }
+    }
+    fn module_items(items: &[ModuleItem], out: &mut HashSet<String>) {
+        for it in items {
+            match it {
+                ModuleItem::PortDeclaration(pd) => {
+                    data_type_names(&pd.data_type, out);
+                    for d in &pd.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::NetDeclaration(nd) => {
+                    data_type_names(&nd.data_type, out);
+                    for d in &nd.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::DataDeclaration(dd) => {
+                    data_type_names(&dd.data_type, out);
+                    for d in &dd.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                    param(p, out);
+                }
+                ModuleItem::TypedefDeclaration(t) => typedef(t, out),
+                ModuleItem::GenvarDeclaration(g) => {
+                    for n in &g.names {
+                        out.insert(n.name.clone());
+                    }
+                }
+                ModuleItem::FunctionDeclaration(fd) => {
+                    out.insert(fd.name.name.name.clone());
+                }
+                ModuleItem::TaskDeclaration(td) => {
+                    out.insert(td.name.name.name.clone());
+                }
+                ModuleItem::DPIImport(di) => {
+                    out.insert(dpi_name(di));
+                }
+                ModuleItem::ClassDeclaration(c) => class_items(c, out),
+                ModuleItem::ClockingDeclaration(c) => {
+                    out.insert(c.name.name.clone());
+                }
+                ModuleItem::LetDeclaration(l) => {
+                    out.insert(l.name.name.clone());
+                }
+                ModuleItem::PropertyDeclaration(p) => {
+                    out.insert(p.name.name.clone());
+                }
+                ModuleItem::SequenceDeclaration(sq) => {
+                    out.insert(sq.name.name.clone());
+                }
+                ModuleItem::CovergroupDeclaration(cg) => {
+                    out.insert(cg.name.name.clone());
+                }
+                ModuleItem::NettypeDeclaration(n) => {
+                    out.insert(n.name.name.clone());
+                }
+                ModuleItem::ModuleInstantiation(mi) => {
+                    for hi in &mi.instances {
+                        out.insert(hi.name.name.clone());
+                    }
+                }
+                ModuleItem::GenerateRegion(gr) => module_items(&gr.items, out),
+                ModuleItem::GenerateIf(gi) => {
+                    for (_, items) in &gi.branches {
+                        module_items(items, out);
+                    }
+                }
+                ModuleItem::GenerateFor(gf) => {
+                    out.insert(gf.var.clone());
+                    module_items(&gf.items, out);
+                }
+                ModuleItem::GenerateCase(gc) => {
+                    for arm in &gc.arms {
+                        module_items(&arm.items, out);
+                    }
+                }
+                ModuleItem::NestedModule(m) => {
+                    for p in &m.params {
+                        param(p, out);
+                    }
+                    ports(&m.ports, out);
+                    module_items(&m.items, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::default();
+    for def in definitions.values() {
+        out.insert(def.name().to_string());
+        for p in def.params() {
+            param(p, &mut out);
+        }
+        ports(def.ports(), &mut out);
+        match def {
+            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_) => {
+                module_items(def.items(), &mut out);
+            }
+            Definition::Package(p) => {
+                use crate::ast::decl::PackageItem as PI;
+                for it in &p.items {
+                    match it {
+                        PI::Parameter(pd) => param(pd, &mut out),
+                        PI::Typedef(t) => typedef(t, &mut out),
+                        PI::Function(fd) => {
+                            out.insert(fd.name.name.name.clone());
+                        }
+                        PI::Task(td) => {
+                            out.insert(td.name.name.name.clone());
+                        }
+                        PI::DPIImport(di) => {
+                            out.insert(dpi_name(di));
+                        }
+                        PI::Data(dd) => {
+                            data_type_names(&dd.data_type, &mut out);
+                            for d in &dd.declarators {
+                                out.insert(d.name.name.clone());
+                            }
+                        }
+                        PI::Class(c) => class_items(c, &mut out),
+                        PI::Let(l) => {
+                            out.insert(l.name.name.clone());
+                        }
+                        PI::Nettype(n) => {
+                            out.insert(n.name.name.clone());
+                        }
+                        PI::Property(pr) => {
+                            out.insert(pr.name.name.clone());
+                        }
+                        PI::Sequence(sq) => {
+                            out.insert(sq.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Definition::Class(c) => class_items(c, &mut out),
+            Definition::Typedef(t) => typedef(t, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Names a statement itself declares — block-local variables, for/foreach
+/// loop variables, named blocks. Flow-insensitive: a name declared anywhere
+/// in the body counts everywhere in it.
+fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
+    use crate::ast::stmt::StatementKind as K;
+    match &stmt.kind {
+        K::VarDecl { declarators, .. } => {
+            for d in declarators {
+                out.insert(d.name.name.clone());
+            }
+        }
+        K::For { init, body, .. } => {
+            for i in init {
+                if let crate::ast::stmt::ForInit::VarDecl { name, .. } = i {
+                    out.insert(name.name.clone());
+                }
+            }
+            collect_stmt_declared_names(body, out);
+        }
+        K::Foreach { vars, body, .. } => {
+            for v in vars.iter().flatten() {
+                out.insert(v.name.clone());
+            }
+            collect_stmt_declared_names(body, out);
+        }
+        K::ForeachTail { loop_var, body, keys, .. } => {
+            if let Some(v) = loop_var {
+                out.insert(v.clone());
+            }
+            for k in keys {
+                out.insert(k.clone());
+            }
+            collect_stmt_declared_names(body, out);
+        }
+        K::If { then_stmt, else_stmt, .. } => {
+            collect_stmt_declared_names(then_stmt, out);
+            if let Some(e) = else_stmt {
+                collect_stmt_declared_names(e, out);
+            }
+        }
+        K::Case { items, .. } => {
+            for it in items {
+                collect_stmt_declared_names(&it.stmt, out);
+            }
+        }
+        K::While { body, .. }
+        | K::DoWhile { body, .. }
+        | K::Repeat { body, .. }
+        | K::Forever { body }
+        | K::ForeverTail { body }
+        | K::RsAction { body } => collect_stmt_declared_names(body, out),
+        K::SeqBlock { name, stmts } | K::ParBlock { name, stmts, .. } => {
+            if let Some(n) = name {
+                out.insert(n.name.clone());
+            }
+            for st in stmts {
+                collect_stmt_declared_names(st, out);
+            }
+        }
+        K::TimingControl { stmt, .. } | K::Wait { stmt, .. } => {
+            collect_stmt_declared_names(stmt, out);
+        }
+        K::RandCase { items } => {
+            for (_, st) in items {
+                collect_stmt_declared_names(st, out);
+            }
+        }
+        K::Typedef(t) => {
+            out.insert(t.name.name.clone());
+            if let DataType::Enum(e) = &t.data_type {
+                for m in &e.members {
+                    out.insert(m.name.name.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An identifier or call in an inlined sub-instance body that NOTHING in the
+/// design declares is an error — the reference tooling rejects it at
+/// elaboration. The per-module validator only ever saw the TOP module's
+/// blocks; sub-instance bodies are inlined afterwards and were never checked,
+/// so `chk_always(...)` in an RTL module bound to a stale header that lacked
+/// it simply never ran (assertions silently vanished), and a typo'd signal in
+/// a child read x for the whole run.
+///
+/// The bar is deliberately "declared nowhere": a bare name is accepted if the
+/// instance's own module declares it (`local_names`, ports, interfaces), the
+/// body declares it, any elaborated table knows it under any scope, or any
+/// definition in the design declares it. Scope resolution is the runtime's
+/// job; this only catches names that cannot resolve anywhere.
+fn validate_inlined_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
-    let declared = collect_design_subroutine_names(definitions);
-    let mut first: Option<(String, Span)> = None;
-    let mut check = |e: &Expression| {
-        for_each_sub_expr(e, &mut |x| {
-            if first.is_some() {
-                return;
-            }
-            let ExprKind::Call { func, .. } = &x.kind else { return };
-            let ExprKind::Ident(h) = &func.kind else { return };
-            if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
-                return;
-            }
-            let name = h.path[0].name.name.as_str();
-            let bare = crate::sv_parser::strip_unit_scope_name(name).unwrap_or(name);
-            if bare.starts_with('$')
-                || bare.contains('.')
-                || matches!(bare, "new" | "super" | "this" | "randomize" | "std" | "process")
-                || declared.contains(bare)
-                || elab.functions.contains_key(bare)
-                || elab.tasks.contains_key(bare)
-                || elab.dpi_imports.contains_key(bare)
-                || elab.classes.contains_key(bare)
-                || elab.typedefs.contains_key(bare)
-                || elab.typedef_types.contains_key(bare)
-                || elab.lets.contains_key(bare)
-                || elab.sequences.contains(bare)
-                || elab.signals.contains_key(bare)
-                || elab.parameters.contains_key(bare)
-            {
-                return;
-            }
-            first = Some((bare.to_string(), func.span));
-        });
+    if elab.pending_always.is_empty()
+        && elab.pending_initial.is_empty()
+        && elab.pending_cont_assign.is_empty()
+    {
+        return Ok(());
+    }
+    let mut known = collect_design_declared_names(definitions);
+    // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
+    let mut add_key = |k: &str| {
+        let leaf = k.rsplit('.').next().unwrap_or(k);
+        let base = leaf.split('[').next().unwrap_or(leaf);
+        known.insert(base.to_string());
     };
-    for ib in &elab.initial_blocks {
-        for_each_stmt_expr(&ib.stmt, &mut check);
+    for k in elab.signals.keys() {
+        add_key(k);
     }
-    for ab in &elab.always_blocks {
-        for_each_stmt_expr(&ab.stmt, &mut check);
+    for k in elab.parameters.keys() {
+        add_key(k);
     }
-    for ca in &elab.continuous_assigns {
-        check(&ca.lhs);
-        check(&ca.rhs);
+    for k in elab.arrays.keys() {
+        add_key(k);
     }
-    // Sub-instance bodies are still PENDING here (materialized lazily, and
-    // streamed in the fast paths), so check their un-rewritten sources: the
-    // callee is the bare name as written, which is exactly what the
-    // declaration set is keyed by.
+    for k in elab.associative_arrays.keys() {
+        add_key(k);
+    }
+    for k in elab.arrays_2d.keys() {
+        add_key(k);
+    }
+    for k in elab.arrays_nd.keys() {
+        add_key(k);
+    }
+    for k in elab.dynamic_arrays.iter() {
+        add_key(k);
+    }
+    for k in elab.functions.keys() {
+        add_key(k);
+    }
+    for k in elab.tasks.keys() {
+        add_key(k);
+    }
+    for k in elab.dpi_imports.keys() {
+        add_key(k);
+    }
+    for k in elab.classes.keys() {
+        add_key(k);
+    }
+    for k in elab.typedefs.keys() {
+        add_key(k);
+    }
+    for k in elab.typedef_types.keys() {
+        add_key(k);
+    }
+    for k in elab.lets.keys() {
+        add_key(k);
+    }
+    for k in elab.sequences.iter() {
+        add_key(k);
+    }
+    for k in elab.clocking_blocks.keys() {
+        add_key(k);
+    }
+    for k in elab.interfaces.iter() {
+        add_key(k);
+    }
+    for ms in elab.enum_members.values() {
+        for (n, _) in ms {
+            add_key(n);
+        }
+    }
+    for m in elab.package_enum_members.values() {
+        for n in m.keys() {
+            add_key(n);
+        }
+    }
+    let known = known;
+
+    // One check per distinct source body: sibling instances share the Rc.
+    let mut seen: HashSet<usize> = HashSet::default();
+    let mut first: Option<(String, Span, String)> = None;
+    let mut check_body = |source_ptr: usize,
+                          ctx: &RewriteCtx,
+                          locals: &HashSet<String>,
+                          visit: &mut dyn FnMut(&mut dyn FnMut(&Expression))| {
+        if first.is_some() || !seen.insert(source_ptr) {
+            return;
+        }
+        let mut check_expr = |e: &Expression| {
+            for_each_sub_expr(e, &mut |x| {
+                if first.is_some() {
+                    return;
+                }
+                let h = match &x.kind {
+                    ExprKind::Ident(h) => h,
+                    ExprKind::Call { func, .. } => match &func.kind {
+                        ExprKind::Ident(h) => h,
+                        _ => return,
+                    },
+                    _ => return,
+                };
+                if h.root.is_some() || h.path.len() != 1 {
+                    return;
+                }
+                let raw = h.path[0].name.name.as_str();
+                let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+                if name.starts_with('$')
+                    || name.contains('.')
+                    || matches!(
+                        name,
+                        "new" | "super" | "this" | "randomize" | "std" | "process" | "null"
+                    )
+                    || (name.starts_with("genblk")
+                        && name.len() > 6
+                        && name[6..].chars().all(|c| c.is_ascii_digit()))
+                    || ctx.local_names.contains(name)
+                    || ctx.port_map.contains_key(name)
+                    || ctx.interface_map.contains_key(name)
+                    || ctx.type_binds.contains_key(name)
+                    || locals.contains(name)
+                    || known.contains(name)
+                {
+                    return;
+                }
+                first = Some((name.to_string(), x.span, ctx.owner.clone()));
+            });
+        };
+        visit(&mut check_expr);
+    };
     for p in &elab.pending_always {
-        for_each_stmt_expr(&p.source, &mut check);
+        let mut locals = HashSet::default();
+        collect_stmt_declared_names(&p.source, &mut locals);
+        let src = &p.source;
+        check_body(std::rc::Rc::as_ptr(src) as usize, &p.ctx, &locals, &mut |f| {
+            for_each_stmt_expr(src, f)
+        });
     }
     for p in &elab.pending_initial {
-        for_each_stmt_expr(&p.source, &mut check);
+        let mut locals = HashSet::default();
+        collect_stmt_declared_names(&p.source, &mut locals);
+        let src = &p.source;
+        check_body(std::rc::Rc::as_ptr(src) as usize, &p.ctx, &locals, &mut |f| {
+            for_each_stmt_expr(src, f)
+        });
     }
     for p in &elab.pending_cont_assign {
-        check(&p.lhs_source);
-        check(&p.rhs_source);
+        let locals = HashSet::default();
+        let (l, r) = (&p.lhs_source, &p.rhs_source);
+        check_body(std::rc::Rc::as_ptr(r) as usize, &p.ctx, &locals, &mut |f| {
+            f(l);
+            f(r);
+        });
     }
-    if let Some((name, span)) = first {
-        let loc = span_location_unhinted(elab, span)
+    if let Some((name, span, owner)) = first {
+        let loc = span_location_of(elab, span, &owner)
             .map(|l| format!(" at {}", l))
             .unwrap_or_default();
         return Err(format!("Undeclared identifier '{}'{}", name, loc));
@@ -17204,7 +17519,7 @@ pub fn inline_instantiations(
         assign.rhs = rewrite_expr(&assign.rhs, prefix, &port_map, &local_names, &interface_map);
     }
 
-    validate_call_targets(elab, definitions)?;
+    validate_inlined_bodies(elab, definitions)?;
 
     Ok(())
 }
@@ -22320,6 +22635,7 @@ fn inline_module_items(
                     interface_map: sub_interface_map.clone(),
                     type_binds: pend_type_binds,
                     type_bind_widths: pend_type_bind_widths,
+                    owner: sub_mod.name().to_string(),
                 });
 
                 // §6.8: the deferred (non-constant) declaration initializers of
