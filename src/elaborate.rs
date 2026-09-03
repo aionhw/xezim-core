@@ -16459,11 +16459,18 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
 /// inner name. Records the enclosing class so methods of the inner class
 /// can resolve the outer class's statics. Without this the inner class was
 /// silently invisible: `Outer::Inner x = new;` produced a null handle.
+///
+/// Returns every fully-qualified key inserted (`Outer::Inner`, and
+/// recursively `Outer::Inner::Deep`, ...), so a caller that also needs an
+/// alternate leading scope — e.g. the package-qualified `pkg::Outer::Inner`
+/// — can alias the SAME `Arc` onto those keys instead of re-elaborating the
+/// whole nested subtree once per outer spelling.
 fn register_nested_classes(
     c: &crate::ast::decl::ClassDeclaration,
     outer: &str,
     elab: &mut ElaboratedModule,
-) {
+) -> Vec<String> {
+    let mut all_scoped: Vec<String> = Vec::new();
     for item in &c.items {
         if let ClassItem::Class(inner) = item {
             register_class_enum_members(inner, elab);
@@ -16473,9 +16480,12 @@ fn register_nested_classes(
             let cls = std::sync::Arc::new(cls);
             elab.classes.insert(scoped.clone(), cls.clone());
             elab.classes.entry(inner.name.name.clone()).or_insert(cls);
-            register_nested_classes(inner, &scoped, elab);
+            all_scoped.push(scoped.clone());
+            // delve deeper; prepend each descendant key with its parents.
+            all_scoped.extend(register_nested_classes(inner, &scoped, elab));
         }
     }
+    all_scoped
 }
 
 /// Visit every expression reachable from a statement, in evaluation-agnostic
@@ -17261,8 +17271,19 @@ pub fn inline_instantiations(
                             let pkg_scoped = format!("{}::{}", name, c.name.name);
                             elab.classes.insert(pkg_scoped.clone(), cls.clone());
                             elab.classes.insert(c.name.name.clone(), cls);
-                            register_nested_classes(c, &c.name.name, elab);
-                            register_nested_classes(c, &pkg_scoped, elab);
+                            // Register the nested subtree ONCE (under the bare
+                            // `Class::Inner ...` keying); the fully-qualified
+                            // `pkg::Class::Inner ...` spellings alias the SAME
+                            // Arcs, so a class-heavy package tree is not
+                            // elaborated once per outer spelling (previously
+                            // it was done twice, doubling every inner class).
+                            for key in register_nested_classes(c, &c.name.name, elab) {
+                                let qualified = format!("{}::{}", name, key);
+                                if let Some(existing) = elab.classes.get(&key) {
+                                    let arc = existing.clone();
+                                    elab.classes.insert(qualified, arc);
+                                }
+                            }
                         }
                         crate::ast::decl::PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
