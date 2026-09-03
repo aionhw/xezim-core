@@ -1778,6 +1778,17 @@ impl Parser {
         let (leaf, span) = match pv {
             ParamValue::Expr(e) => return Some(e.clone()),
             ParamValue::Type(dt) => match dt {
+                // A DIMENSIONED vector (`bit [7:0]`) or a signed atom is not a
+                // bare name: rendering just the keyword would alias
+                // `P#(bit[7:0])` with `P#(bit)`. Carry the whole type instead;
+                // the spec-fragment renderer knows how to print a
+                // `TypeLiteral`.
+                DataType::IntegerVector { dimensions, span, .. } if !dimensions.is_empty() => {
+                    return Some(Expression::new(
+                        ExprKind::TypeLiteral(Box::new(dt.clone())),
+                        *span,
+                    ));
+                }
                 DataType::TypeReference { name, .. } => (name.name.name.clone(), name.name.span),
                 DataType::IntegerAtom { kind, span, .. } => (
                     match kind {

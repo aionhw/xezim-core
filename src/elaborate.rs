@@ -8636,14 +8636,37 @@ pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
         // The packed range is intentionally not rendered: a type ARGUMENT
         // loses its range at parse time too, so keeping the bare keyword here
         // matches what an explicit `#(logic [63:0])` produces.
-        DataType::IntegerVector { kind, .. } => Some(
-            match kind {
+        // Dimensions and signing are part of the type's identity:
+        // `P#(bit[7:0])` is not `P#(bit)`. Literal bounds render inline;
+        // a bound that is not a plain integer literal cannot be named here
+        // and declines, so the caller falls back rather than aliasing.
+        DataType::IntegerVector { kind, signing, dimensions, .. } => {
+            let mut out = match kind {
                 IntegerVectorType::Bit => "bit",
                 IntegerVectorType::Logic => "logic",
                 IntegerVectorType::Reg => "reg",
             }
-            .to_string(),
-        ),
+            .to_string();
+            if matches!(signing, Some(crate::ast::types::Signing::Signed)) {
+                out.push_str(" signed");
+            }
+            for d in dimensions {
+                match d {
+                    crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                        let lit = |e: &crate::ast::expr::Expression| match &e.kind {
+                            crate::ast::expr::ExprKind::Number(
+                                crate::ast::expr::NumberLiteral::Integer { value, .. },
+                            ) => Some(value.clone()),
+                            _ => None,
+                        };
+                        let (l, r) = (lit(left)?, lit(right)?);
+                        out.push_str(&format!("[{}:{}]", l, r));
+                    }
+                    crate::ast::types::PackedDimension::Unsized(_) => return None,
+                }
+            }
+            Some(out)
+        }
         DataType::Real { kind, .. } => Some(
             match kind {
                 RealType::Real => "real",
@@ -25873,16 +25896,24 @@ pub fn rename_process_shadowed_locals(
     let StatementKind::SeqBlock { name, stmts } = &stmt.kind else {
         return None;
     };
-    if name.is_some() {
-        return None;
-    }
+    // A LABELED block's locals are hierarchically addressable (`tb.p1.v`), so
+    // they are salted with the label itself (`p1.v`) rather than the opaque
+    // process salt: the stored name IS the hierarchical name, so references
+    // from other processes keep resolving, while two processes' same-named
+    // locals (or a local shadowing a module variable) no longer share one
+    // slot. Labeled blocks used to be skipped here entirely, which left
+    // exactly those collisions in place.
+    let label: Option<&str> = name.as_ref().map(|n| n.name.as_str());
     let mut map: HashMap<String, Expression> = HashMap::default();
     let mut renames: HashMap<String, String> = HashMap::default();
     for s in stmts.iter() {
         if let StatementKind::VarDecl { declarators, .. } = &s.kind {
             for d in declarators {
                 if module_names.contains(&d.name.name) && !renames.contains_key(&d.name.name) {
-                    let fresh = format!("{}__shadow_{}", d.name.name, salt);
+                    let fresh = match label {
+                        Some(l) => format!("{}.{}", l, d.name.name),
+                        None => format!("{}__shadow_{}", d.name.name, salt),
+                    };
                     let hier = crate::ast::expr::HierarchicalIdentifier {
                         root: None,
                         path: vec![crate::ast::expr::HierPathSegment {
