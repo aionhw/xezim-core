@@ -643,6 +643,24 @@ pub struct ElaboratedClass {
     /// under their bare name at simulator startup.
     #[serde(default)]
     pub static_collections: Vec<(String, bool, u32)>,
+    /// §7.8.2: the KEY type of a STATIC assoc member (`static T map[string];`)
+    /// — static member name -> key-type name (a plain `string` is stored as
+    /// the literal `"string"`). `static_collections` carries no key type, and
+    /// writing statics into `assoc_properties` (which is per-INSTANCE) confused
+    /// `is_associative_array`'s `handle#member` dispatch, so without a dedi-
+    /// cated map a `static T map[string]` param'd array fell into the NUMERIC
+    /// branch of `assoc_key_str` and stored its string keys as hashed integers
+    /// (consistent for set/get, but foreach()/first()/next() decoded garbage).
+    #[serde(default)]
+    pub static_assoc_key_types: HashMap<String, String>,
+    /// §7.8.2: the INDEX (key) width + signedness of a STATIC assoc member
+    /// (`static int m[int];` -> (32, true)). `assoc_index_props` is per-
+    /// INSTANCE (and recording statics there confuses `is_associative_array`'s
+    /// `handle#member` dispatch), so statics keep their own map. Consulted by
+    /// `assoc_index_width_for` for a per-spec `Class#spec::member` key so
+    /// `foreach` binds a SIGNED index with its true width.
+    #[serde(default)]
+    pub static_assoc_index_props: HashMap<String, (u32, bool)>,
     /// Fixed-size `static` array members (`static int S[3]`, `static bit
     /// m[2:0]`): (name, lo, hi, element width). §8.9 gives every instance of
     /// the class ONE shared copy, so — exactly like `static_collections` —
@@ -814,6 +832,8 @@ pub fn elaborate_class_with_params(
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
+    let mut static_assoc_key_types: HashMap<String, String> = HashMap::default();
+    let mut static_assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
     let mut static_fixed_arrays: Vec<(String, i64, i64, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
@@ -917,8 +937,44 @@ pub fn elaborate_class_with_params(
                     if is_static {
                         // Second field is `is_associative` (NOT key-is-string).
                         match effective_dims.first() {
-                            Some(UnpackedDimension::Associative { .. }) => {
+                            Some(UnpackedDimension::Associative { data_type: key_dt, .. }) => {
                                 static_collections.push((decl.name.name.clone(), true, width.max(1)));
+                                // §7.8.2: record the static assoc member's KEY
+                                // type in `static_assoc_key_types` (a plain
+                                // `string` is recorded as the literal "string").
+                                // This lets the runtime hash/store string keys
+                                // as strings and iterate/foreach them correctly.
+                                static_assoc_key_types.insert(
+                                    decl.name.name.clone(),
+                                    match key_dt.as_deref() {
+                                        Some(DataType::TypeReference { name: kt, .. }) =>
+                                            kt.name.name.clone(),
+                                        Some(DataType::Simple {
+                                            kind: SimpleType::String,
+                                            ..
+                                        }) => "string".to_string(),
+                                        _ => "int".to_string(),
+                                    },
+                                );
+                                // §7.8.2: record the static assoc member's
+                                // INDEX width + signedness (skipping a plain
+                                // string key — the full text key is handled
+                                // by the string branch). Mirrors the per-
+                                // instance `assoc_index_props` recording below
+                                // but in the STATIC-specific map.
+                                if let Some(kdt) = key_dt.as_ref() {
+                                    if !matches!(kdt.as_ref(),
+                                        DataType::Simple { kind: SimpleType::String, .. })
+                                    {
+                                        let kw = resolve_type_width(kdt, class_params, None);
+                                        if kw > 0 {
+                                            static_assoc_index_props.insert(
+                                                decl.name.name.clone(),
+                                                (kw, is_type_signed(kdt)),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Some(UnpackedDimension::Queue { .. })
                             | Some(UnpackedDimension::Unsized(_)) => {
@@ -1365,6 +1421,8 @@ pub fn elaborate_class_with_params(
         queue_properties,
         property_inits,
         static_collections,
+        static_assoc_key_types,
+        static_assoc_index_props,
         static_fixed_arrays,
         array_properties,
         array_nd_properties,
@@ -3373,11 +3431,47 @@ fn collect_class_member_names(
     }
     if let Some(ext) = &c.extends {
         if let Some(defs) = all_defs {
-            if let Some(Definition::Class(parent)) = defs.get(&ext.name.name) {
+            // §8.16/§26.3: the base of a class declared in a MODULE body (or
+            // another package) may live INSIDE an imported package
+            // (`mypacket extends packet` where `packet` is `packet_pkg`'s
+            // class) rather than as a top-level Class definition. Packages
+            // are kept whole in `all_defs` (Definition::Package), so a bare
+            // `defs.get(base)` lookup misses package members and an inherited
+            // property reference in a derived constraint is wrongly rejected
+            // as undeclared. Fall back to searching every package's classes.
+            let parent: Option<&ClassDeclaration> = match defs.get(&ext.name.name) {
+                Some(Definition::Class(p)) => Some(p),
+                Some(Definition::Package(_)) | None => {
+                    find_base_class_in_packages(defs, &ext.name.name)
+                }
+                _ => None,
+            };
+            if let Some(parent) = parent {
                 collect_class_member_names(parent, all_defs, allowed, seen);
             }
         }
     }
+}
+
+/// Search every package in `defs` for a class named `name`, used to resolve
+/// a bare base-class name over which a module/package class `extends` when
+/// the base lives inside an imported package (not as a top-level Class def).
+fn find_base_class_in_packages<'a>(
+    defs: &'a HashMap<String, Definition<'a>>,
+    name: &str,
+) -> Option<&'a ClassDeclaration> {
+    for def in defs.values() {
+        if let Definition::Package(pkg) = def {
+            for item in &pkg.items {
+                if let crate::ast::decl::PackageItem::Class(c) = item {
+                    if c.name.name == name {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Add the enum constant names introduced by an enum typedef to `allowed`.
@@ -12612,11 +12706,10 @@ pub fn is_type_two_state_resolved(
     if let DataType::Enum(e) = resolved {
         return match e.base_type.as_deref() {
             Some(bt) => is_type_two_state_resolved(bt, typedef_types),
-            // No explicit base: preserve the existing behaviour of
-            // `is_type_two_state` (`unwrap_or(false)`). Whether a default-base
-            // enum should be 2-state like its implied `int` is a separate
-            // question the audit did not settle; not changing it here.
-            None => false,
+            // §6.19: with NO base type the default is `int`, which is
+            // 2-state. Match `is_type_two_state` (`unwrap_or(true)`): a bare
+            // `enum {A0,A1} k;` default-initializes to 0, not x.
+            None => true,
         };
     }
     is_type_two_state(resolved)
