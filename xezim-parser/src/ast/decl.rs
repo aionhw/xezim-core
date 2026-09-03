@@ -464,6 +464,10 @@ pub struct ModportPort {
     pub direction: PortDirection,
     pub name: Identifier,
     pub span: Span,
+    /// §25.5.4 modport EXPRESSION: `.name(expr)` binds the modport member
+    /// to an expression over the interface's signals instead of a signal.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub expr: Option<super::expr::Expression>,
 }
 
 /// Verilog gate-level primitive instantiation (IEEE 1800-2017 §28)

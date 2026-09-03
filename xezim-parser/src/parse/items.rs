@@ -747,6 +747,7 @@ impl Parser {
                                 direction: PortDirection::Input,
                                 name: cb_name,
                                 span: self.span_from(pstart),
+                                expr: None,
                             });
                         } else if self.at(TokenKind::KwImport) || self.at(TokenKind::KwExport) {
                             // §25.5 modport import/export of a task/function.
@@ -760,6 +761,7 @@ impl Parser {
                                     direction: PortDirection::Input,
                                     name,
                                     span: self.span_from(pstart),
+                                    expr: None,
                                 });
                             }
                             while !self.at(TokenKind::Comma)
@@ -770,8 +772,19 @@ impl Parser {
                             }
                         } else {
                             if let Some(d) = self.parse_optional_direction() { last_dir = d; }
-                            let port_name = self.parse_identifier();
-                            ports.push(ModportPort { direction: last_dir, name: port_name, span: self.span_from(pstart) });
+                            // §25.5.4 modport expression: `.b(word[7:0])` —
+                            // the member `b` stands for an expression over
+                            // the interface's signals.
+                            if self.eat(TokenKind::Dot).is_some() {
+                                let port_name = self.parse_identifier();
+                                self.expect(TokenKind::LParen);
+                                let e = self.parse_expression();
+                                self.expect(TokenKind::RParen);
+                                ports.push(ModportPort { direction: last_dir, name: port_name, span: self.span_from(pstart), expr: Some(e) });
+                            } else {
+                                let port_name = self.parse_identifier();
+                                ports.push(ModportPort { direction: last_dir, name: port_name, span: self.span_from(pstart), expr: None });
+                            }
                         }
                         if self.eat(TokenKind::Comma).is_none() { break; }
                     }

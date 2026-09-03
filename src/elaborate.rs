@@ -17560,6 +17560,7 @@ pub fn inline_instantiations(
         None => return Err(format!("Top module '{}' not found in module map", module_name)),
     };
     // Recursively inline starting from the top module's items
+    MODPORT_EXPR_TLS.with(|m| m.borrow_mut().clear());
     let top_params = elab.parameters.clone();
     // Snapshot the now-complete package/$unit parameters as the const-eval
     // fallback so sub-module header localparams (evaluated in the instance-merge
@@ -19863,6 +19864,100 @@ fn qualify_sibling_conn(
     }
 }
 
+thread_local! {
+    /// §25.5.4 modport expression members, keyed `<interface instance>.<member>`
+    /// (instance name as it appears in signal names), valued by the member's
+    /// expression rewritten to that instance's signals. Filled per module by
+    /// `register_modport_expressions` before its sub-instances are inlined,
+    /// consulted by the interface-map arm of `rewrite_expr_impl`.
+    static MODPORT_EXPR_TLS: std::cell::RefCell<HashMap<String, Expression>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Signal names an interface definition declares (ports, nets, variables),
+/// so a modport expression's identifiers can be prefixed with the instance.
+fn interface_signal_names(idef: &crate::ast::module::InterfaceDeclaration) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    match &idef.ports {
+        PortList::Ansi(ps) => {
+            for p in ps {
+                out.insert(p.name.name.clone());
+            }
+        }
+        PortList::NonAnsi(ids) => {
+            for id in ids {
+                out.insert(id.name.clone());
+            }
+        }
+        PortList::Empty => {}
+    }
+    for it in &idef.items {
+        match it {
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators {
+                    out.insert(d.name.name.clone());
+                }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators {
+                    out.insert(d.name.name.clone());
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    out.insert(d.name.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Register every modport EXPRESSION member of the interface instances a
+/// module declares (`ifc i();` with `modport lo8 (output .b(word[7:0]))`)
+/// under `<prefix><inst>.<member>`, each expression rewritten onto the
+/// instance's signals. Must run before the module's sub-instances are inlined
+/// so a child's `p.b` (through `ifc.lo8 p`) can substitute it.
+fn register_modport_expressions(
+    items: &[ModuleItem],
+    prefix: &str,
+    definitions: &HashMap<String, Definition>,
+) {
+    for it in items {
+        let ModuleItem::ModuleInstantiation(inst) = it else { continue };
+        let Some(Definition::Interface(idef)) = definitions.get(&inst.module_name.name) else {
+            continue;
+        };
+        let has_exprs = idef.items.iter().any(|item| {
+            matches!(item, ModuleItem::ModportDeclaration(md)
+                if md.items.iter().any(|mp| mp.ports.iter().any(|p| p.expr.is_some())))
+        });
+        if !has_exprs {
+            continue;
+        }
+        let names = interface_signal_names(idef);
+        let empty_pm: HashMap<String, Expression> = HashMap::default();
+        let empty_if: HashMap<String, String> = HashMap::default();
+        for hi in &inst.instances {
+            let inst_name = format!("{}{}", prefix, hi.name.name);
+            let inst_prefix = format!("{}.", inst_name);
+            for item in &idef.items {
+                let ModuleItem::ModportDeclaration(md) = item else { continue };
+                for mp in &md.items {
+                    for p in &mp.ports {
+                        let Some(e) = &p.expr else { continue };
+                        let rewritten = rewrite_expr(e, &inst_prefix, &empty_pm, &names, &empty_if);
+                        MODPORT_EXPR_TLS.with(|m| {
+                            m.borrow_mut().insert(format!("{}.{}", inst_name, p.name.name), rewritten);
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -19898,6 +19993,7 @@ fn inline_module_items(
     // rewrite leaves it unprefixed — the connection then bound the port to a
     // phantom top-level name and, e.g., a whole-struct write through it
     // silently vanished for every NON-top instantiation of the module.
+    register_modport_expressions(source_def.items(), prefix, definitions);
     let sibling_inst_names: std::collections::HashSet<String> = prepared_source
         .effective_items
         .iter()
@@ -25391,11 +25487,54 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             }
             let name = &hier.path[0].name.name;
             if let Some(if_prefix) = interface_map.get(name) {
+                // §25.5.4: a modport EXPRESSION member (`.b(word[7:0])`)
+                // stands for an expression over the interface instance's
+                // signals — substitute it (registered by
+                // `register_modport_expressions`), applying any selects the
+                // reference carried on the member.
+                if hier.path.len() == 2 && hier.path[0].selects.is_empty() {
+                    let key = format!("{}.{}", if_prefix, hier.path[1].name.name);
+                    let hit = MODPORT_EXPR_TLS.with(|m| m.borrow().get(&key).cloned());
+                    if let Some(mut e) = hit {
+                        for sel in &hier.path[1].selects {
+                            e = Expression::new(
+                                ExprKind::Index {
+                                    expr: Box::new(e),
+                                    index: Box::new(rewrite_expr_impl(sel, prefix, port_map, local_names, interface_map)),
+                                },
+                                expr.span,
+                            );
+                        }
+                        return e;
+                    }
+                }
                 let mut new_hier = hier.clone();
                 new_hier.path[0].name.name = if_prefix.clone();
                 return Expression::new(ExprKind::Ident(new_hier), expr.span);
             }
             if let Some(mapped) = port_map.get(name) {
+                // §25.5.4: `p.b` through a modport-typed port whose actual is
+                // an interface instance — a modport EXPRESSION member
+                // substitutes its registered expression (see
+                // `register_modport_expressions`).
+                if hier.path.len() == 2 && hier.path[0].selects.is_empty() {
+                    if let Some(inst) = whole_net_ident_name(mapped) {
+                        let key = format!("{}.{}", inst, hier.path[1].name.name);
+                        let hit = MODPORT_EXPR_TLS.with(|m| m.borrow().get(&key).cloned());
+                        if let Some(mut e) = hit {
+                            for sel in &hier.path[1].selects {
+                                e = Expression::new(
+                                    ExprKind::Index {
+                                        expr: Box::new(e),
+                                        index: Box::new(rewrite_expr_impl(sel, prefix, port_map, local_names, interface_map)),
+                                    },
+                                    expr.span,
+                                );
+                            }
+                            return e;
+                        }
+                    }
+                }
                 // Preserve any trailing path segments and first-segment selects:
                 // `a.b.c` parsed as one ident with path=[a,b,c] where `a` is the
                 // port-mapped name must become `<mapped>.b.c`, not just
@@ -25572,10 +25711,40 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             count: Box::new(rewrite_expr_impl(count, prefix, port_map, local_names, interface_map)),
             exprs: exprs.iter().map(|e| rewrite_expr_impl(e, prefix, port_map, local_names, interface_map)).collect(),
         },
-        ExprKind::Index { expr: base, index } => ExprKind::Index {
-            expr: Box::new(rewrite_expr_impl(base, prefix, port_map, local_names, interface_map)),
-            index: Box::new(rewrite_expr_impl(index, prefix, port_map, local_names, interface_map)),
-        },
+        ExprKind::Index { expr: base, index } => {
+            let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
+            let ni = rewrite_expr_impl(index, prefix, port_map, local_names, interface_map);
+            // §11.5.1: a bit-select of a CONSTANT part-select (`word[7:0][k]`,
+            // which is what a modport-expression member `.b(word[7:0])`
+            // rewrites `p.b[k]` into) addresses bit `min(l,r) + k` of the
+            // base — fold it so the select stays a plain, assignable
+            // bit-select instead of an index over a part-select value.
+            if let ExprKind::RangeSelect { expr: inner, kind: RangeKind::Constant, left, right } = &nb.kind {
+                let lit = |e: &Expression| match &e.kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.parse::<i64>().ok(),
+                    _ => None,
+                };
+                if let (Some(l), Some(r)) = (lit(left), lit(right)) {
+                    let lo = l.min(r);
+                    let idx = match lit(&ni) {
+                        Some(k) => make_i64_literal(lo + k, ni.span),
+                        None => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Add,
+                                left: Box::new(make_i64_literal(lo, ni.span)),
+                                right: Box::new(ni.clone()),
+                            },
+                            ni.span,
+                        ),
+                    };
+                    return Expression::new(
+                        ExprKind::Index { expr: inner.clone(), index: Box::new(idx) },
+                        expr.span,
+                    );
+                }
+            }
+            ExprKind::Index { expr: Box::new(nb), index: Box::new(ni) }
+        }
         ExprKind::RangeSelect { expr: base, kind, left, right } => {
             let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             let nl = rewrite_expr_impl(left, prefix, port_map, local_names, interface_map);
@@ -25604,6 +25773,16 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
         ExprKind::MemberAccess { expr: base, member } => {
             let rewritten_base = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             if let ExprKind::Ident(mut hier) = rewritten_base.kind {
+                // §25.5.4: `p.b` where `p` rewrote to an interface instance
+                // and `b` is a modport EXPRESSION member — substitute the
+                // registered expression (see `register_modport_expressions`).
+                if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                    let key = format!("{}.{}", hier.path[0].name.name, member.name);
+                    let hit = MODPORT_EXPR_TLS.with(|m| m.borrow().get(&key).cloned());
+                    if let Some(e) = hit {
+                        return e;
+                    }
+                }
                 hier.path.push(HierPathSegment {
                     name: member.clone(),
                     selects: Vec::new(),
