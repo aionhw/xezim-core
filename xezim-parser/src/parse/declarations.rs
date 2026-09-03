@@ -776,7 +776,12 @@ impl Parser {
                             depth -= 1;
                             if depth == 0 {
                                 next_after = self.peek_kind_n(k + 2);
-                                break;
+                                // `u7_t [R-1:0][C-1:0] name`: several packed
+                                // dimension groups precede the port name —
+                                // keep scanning through consecutive groups.
+                                if next_after != TokenKind::LBracket {
+                                    break;
+                                }
                             }
                         }
                         TokenKind::Eof => break,
