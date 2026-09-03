@@ -7195,10 +7195,9 @@ pub fn elaborate_module_with_defs(
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, &mut elab);
-                elab.classes.insert(
-                    cd.name.name.clone(),
-                    std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
-                );
+                let cls = std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters)));
+                elab.classes.insert(cd.name.name.clone(), cls);
+                register_nested_classes(cd, &cd.name.name, &mut elab);
             }
             ModuleItem::LetDeclaration(ld) => {
                 elab.lets.insert(ld.name.name.clone(), ld.clone());
@@ -10730,10 +10729,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, elab);
-                elab.classes.insert(
-                    cd.name.name.clone(),
-                    std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
-                );
+                let cls = std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters)));
+                elab.classes.insert(cd.name.name.clone(), cls);
+                register_nested_classes(cd, &cd.name.name, elab);
             }
             ModuleItem::ClockingDeclaration(cd) => {
                 // §14.12 standalone designation `default clocking <name>;`
@@ -17259,10 +17257,12 @@ pub fn inline_instantiations(
                     match item {
                         crate::ast::decl::PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);
-                            elab.classes.insert(
-                        c.name.name.clone(),
-                        std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
-                    );
+                            let cls = std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters)));
+                            let pkg_scoped = format!("{}::{}", name, c.name.name);
+                            elab.classes.insert(pkg_scoped.clone(), cls.clone());
+                            elab.classes.insert(c.name.name.clone(), cls);
+                            register_nested_classes(c, &c.name.name, elab);
+                            register_nested_classes(c, &pkg_scoped, elab);
                         }
                         crate::ast::decl::PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
