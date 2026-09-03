@@ -21,6 +21,7 @@ pub mod value;
 pub mod bits2;
 pub mod elaborate;
 pub mod sdf;
+pub mod upf;
 pub mod vcd_sink;
 pub mod stdout_sink;
 
@@ -881,6 +882,9 @@ pub fn parse_and_elaborate_multi(
         preprocessed_texts.push(preprocessed);
     }
 
+    // IEEE 1801 power intent: splice the generated UPF package and glue
+    // processes into the parsed design before elaboration.
+    upf::inject(&mut all_descriptions, top_module_name)?;
     let lib_defines = pp.snapshot_defines();
     let module_timescales = pp.module_timescales.clone();
     let module_ts_own_file = pp.module_ts_own_file.clone();
