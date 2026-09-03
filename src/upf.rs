@@ -322,6 +322,9 @@ struct Model {
 
 impl Model {
     fn scoped(&self, name: &str) -> String {
+        if name == "." {
+            return self.scope.clone();
+        }
         if self.scope.is_empty() {
             name.to_string()
         } else {
@@ -363,9 +366,35 @@ fn parse_upf_file(
                     dir.clone().unwrap_or_default().join(p)
                 };
                 let full = full.to_string_lossy().to_string();
+                // `-scope <inst>`: the nested file's commands apply below that
+                // instance (its own `set_design_top` names that instance's
+                // module, not a new root). `-implementation`/`-version` flags
+                // carry no simulation meaning.
+                let saved_scope = model.scope.clone();
+                let saved_top = model.design_top.clone();
+                if let Some(sc) = a.opts.get("scope") {
+                    model.scope = if sc == "." || sc == "/" {
+                        model.scope.clone()
+                    } else if let Some(rest) = sc.strip_prefix('/') {
+                        rest.to_string()
+                    } else {
+                        model.scoped(sc)
+                    };
+                }
                 parse_upf_file(&full, model, vars, depth + 1)?;
+                model.scope = saved_scope;
+                if saved_top.is_some() {
+                    model.design_top = saved_top;
+                }
             }
-            "set_design_top" => model.design_top = Some(name.clone()),
+            "set_design_top" => {
+                // Only the outermost file names the design root; a
+                // `set_design_top` inside a `load_upf -scope` file names the
+                // sub-instance's module and is checked, not adopted.
+                if model.scope.is_empty() && model.design_top.is_none() {
+                    model.design_top = Some(name.clone());
+                }
+            }
             "set_scope" => {
                 model.scope = if name == "." || name.is_empty() {
                     String::new()
@@ -490,6 +519,22 @@ fn parse_upf_file(
                 if a.flags.iter().any(|f| f == "no_isolation") {
                     model.warnings.push(format!("set_isolation {}: -no_isolation, ignored", name));
                     continue;
+                }
+                if a.flags.iter().any(|f| f == "update") {
+                    if let Some(st) = model
+                        .isolations
+                        .iter_mut()
+                        .find(|st| st.name == name && (domain.is_empty() || st.domain == domain))
+                    {
+                        if let Some(v) = a.opts.get("applies_to") { st.applies_to = Some(v.clone()); }
+                        if !elements.is_empty() { st.elements = elements; }
+                        if let Some(v) = a.opts.get("clamp_value") { st.clamp = v.clone(); }
+                        if let Some(v) = a.opts.get("isolation_signal") { st.signal = Some(v.clone()); }
+                        if let Some(v) = a.opts.get("isolation_sense") { st.sense = v.clone(); }
+                        if let Some(v) = a.opts.get("isolation_power_net") { st.power = Some(v.clone()); }
+                        if let Some(v) = a.opts.get("isolation_ground_net") { st.ground = Some(v.clone()); }
+                        continue;
+                    }
                 }
                 model.isolations.push(Isolation {
                     name: name.clone(),
@@ -1105,6 +1150,7 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
         let mut targets: Vec<String> = Vec::new();
         for e in &dom.elements {
             let segs: Vec<String> = e.split('/').filter(|s| !s.is_empty()).map(String::from).collect();
+            // `-elements {.}`: the scope instance itself.
             match design.module_at(scope_mod, &segs) {
                 Some(m) => {
                     let prefix = hier(e);
@@ -1141,7 +1187,16 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
             pw,
             gd,
             targets.len(),
-            if retained.is_empty() { String::new() } else { format!(", retention exempt: {}", retained.join(",")) }
+            {
+                // Only this domain's retention strategies.
+                let mine: Vec<String> = model
+                    .retentions
+                    .iter()
+                    .filter(|r| r.domain == dom.name)
+                    .flat_map(|r| r.elements.iter().map(|e| format!("{}{}", scope_dot, e.replace('/', "."))))
+                    .collect();
+                if mine.is_empty() { String::new() } else { format!(", retention exempt: {}", mine.join(",")) }
+            }
         ));
     }
     for (n, d) in &model.level_shifters {
