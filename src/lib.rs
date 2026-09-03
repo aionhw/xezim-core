@@ -2511,11 +2511,35 @@ fn resolve_library_modules(
             }
             parse_issue_files.push(path.clone());
         }
+        // §3.12.1 / §33.3: a library file is its own compilation unit, so a
+        // subroutine declared at ITS top level (typically an `include`d
+        // simulation-helper header) is visible, unqualified, to every module
+        // in that file. The primary-file path injects `$unit` subroutines into
+        // every module; mirror that here for the file's own modules — before
+        // this they were dropped on adoption, and a call to one was reported
+        // as an undeclared identifier.
+        let unit_subs: Vec<ast::decl::ModuleItem> = result
+            .source
+            .descriptions
+            .iter()
+            .filter_map(|d| match d {
+                ast::Description::PackageItem(ast::decl::PackageItem::Function(f)) => {
+                    Some(ast::decl::ModuleItem::FunctionDeclaration(f.clone()))
+                }
+                ast::Description::PackageItem(ast::decl::PackageItem::Task(t)) => {
+                    Some(ast::decl::ModuleItem::TaskDeclaration(t.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         for desc in result.source.descriptions {
             match desc {
-                ast::Description::Module(m) => {
+                ast::Description::Module(mut m) => {
                     let name = m.name.name.clone();
                     if !lib.contains_key(&name) {
+                        for sub in unit_subs.iter().rev() {
+                            m.items.insert(0, sub.clone());
+                        }
                         lib.insert(name.clone(), SourceDefinition::Module(Rc::new(m)));
                         lib_origins.insert(name, (path.clone(), explicit_v, "module"));
                     }
