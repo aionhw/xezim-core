@@ -19872,6 +19872,11 @@ thread_local! {
     /// consulted by the interface-map arm of `rewrite_expr_impl`.
     static MODPORT_EXPR_TLS: std::cell::RefCell<HashMap<String, Expression>> =
         std::cell::RefCell::new(HashMap::default());
+    /// Set by the three substitution sites when they return a modport
+    /// expression, so the `Index` arm knows its base is a packed
+    /// part-select it may fold (an unpacked array SLICE keeps its original
+    /// indices, so the fold must never apply to arbitrary bases).
+    static MODPORT_SUBST_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Signal names an interface definition declares (ports, nets, variables),
@@ -25505,6 +25510,7 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                                 expr.span,
                             );
                         }
+                        MODPORT_SUBST_FLAG.with(|f| f.set(true));
                         return e;
                     }
                 }
@@ -25531,6 +25537,7 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                                     expr.span,
                                 );
                             }
+                            MODPORT_SUBST_FLAG.with(|f| f.set(true));
                             return e;
                         }
                     }
@@ -25712,14 +25719,18 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             exprs: exprs.iter().map(|e| rewrite_expr_impl(e, prefix, port_map, local_names, interface_map)).collect(),
         },
         ExprKind::Index { expr: base, index } => {
+            MODPORT_SUBST_FLAG.with(|f| f.set(false));
             let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
+            let from_modport = MODPORT_SUBST_FLAG.with(|f| f.replace(false));
             let ni = rewrite_expr_impl(index, prefix, port_map, local_names, interface_map);
             // §11.5.1: a bit-select of a CONSTANT part-select (`word[7:0][k]`,
             // which is what a modport-expression member `.b(word[7:0])`
             // rewrites `p.b[k]` into) addresses bit `min(l,r) + k` of the
             // base — fold it so the select stays a plain, assignable
             // bit-select instead of an index over a part-select value.
-            if let ExprKind::RangeSelect { expr: inner, kind: RangeKind::Constant, left, right } = &nb.kind {
+            if from_modport
+                && let ExprKind::RangeSelect { expr: inner, kind: RangeKind::Constant, left, right } = &nb.kind
+            {
                 let lit = |e: &Expression| match &e.kind {
                     ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.parse::<i64>().ok(),
                     _ => None,
@@ -25780,6 +25791,7 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                     let key = format!("{}.{}", hier.path[0].name.name, member.name);
                     let hit = MODPORT_EXPR_TLS.with(|m| m.borrow().get(&key).cloned());
                     if let Some(e) = hit {
+                        MODPORT_SUBST_FLAG.with(|f| f.set(true));
                         return e;
                     }
                 }
