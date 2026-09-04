@@ -1799,6 +1799,9 @@ pub struct ElaboratedModule {
     /// `$printtimescale` from it. Keyed by module name (= definition name).
     #[serde(default)]
     pub module_timescale_exp: HashMap<String, (i32, i32)>,
+    /// Module definitions that carried no `timescale (own, inherited, or
+    /// CLI) and therefore run on the 1ps/1ps tool default.
+    pub modules_without_timescale: Vec<String>,
     /// IEEE 1800-2017 §6.19: enum typedef members in declaration order.
     /// Keyed by typedef name; each entry is `(member_name, value)`.
     /// Used to resolve `.name()` / `.next()` / `.first()` etc.
@@ -2112,6 +2115,7 @@ impl ElaboratedModule {
             timeunit_exp: default_timeunit_exp(),
             timeprecision_exp: default_timeunit_exp(),
             module_timescale_exp: HashMap::default(),
+            modules_without_timescale: Vec::new(),
             enum_members: HashMap::default(),
             package_enum_members: HashMap::default(),
             decl_sites: HashMap::default(),

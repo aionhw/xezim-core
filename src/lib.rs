@@ -1082,8 +1082,10 @@ fn parse_and_elaborate(
                 Some(ts)
             } else {
                 // No CLI: keep a cross-file-inherited directive (single-compilation-
-                // unit sticky behavior) when present; else no timescale.
-                directive
+                // unit sticky behavior) when present; else the tool default
+                // (§3.14.2.2 leaves it tool-defined): 1ps/1ps, so an untimed
+                // module's `#1` and `$realtime` both count picoseconds.
+                directive.or(Some((-12, -12)))
             };
             if let Some((u, p)) = eff_exp {
                 eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
@@ -1097,7 +1099,7 @@ fn parse_and_elaborate(
     if any_explicit_ts {
         for name in &modules_without_ts {
             eprintln!(
-                "[warn] module '{}' has no timescale directive; defaulting its reported timescale to 1s/1s",
+                "[warn] module '{}' has no timescale directive; defaulting its timescale to 1ps/1ps",
                 name
             );
         }
@@ -2014,6 +2016,7 @@ fn parse_and_elaborate(
     )?;
     elab.tick_s = tick_s;
     elab.module_timescale_exp = module_timescale_exp;
+    elab.modules_without_timescale = modules_without_ts;
     // The top module's own unit/precision drives the default $time scaling and
     // $printtimescale when no per-scope entry is found.
     if let Some(&(u, p)) = elab.module_timescale_exp.get(&elab.name) {
