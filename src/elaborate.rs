@@ -1800,7 +1800,7 @@ pub struct ElaboratedModule {
     #[serde(default)]
     pub module_timescale_exp: HashMap<String, (i32, i32)>,
     /// Module definitions that carried no `timescale (own, inherited, or
-    /// CLI) and therefore run on the 1ps/1ps tool default.
+    /// CLI) and therefore run on the 1ns/1ns tool default.
     pub modules_without_timescale: Vec<String>,
     /// IEEE 1800-2017 §6.19: enum typedef members in declaration order.
     /// Keyed by typedef name; each entry is `(member_name, value)`.

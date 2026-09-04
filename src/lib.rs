@@ -1083,9 +1083,13 @@ fn parse_and_elaborate(
             } else {
                 // No CLI: keep a cross-file-inherited directive (single-compilation-
                 // unit sticky behavior) when present; else the tool default
-                // (§3.14.2.2 leaves it tool-defined): 1ps/1ps, so an untimed
-                // module's `#1` and `$realtime` both count picoseconds.
-                directive.or(Some((-12, -12)))
+                // (§3.14.2.2 leaves it tool-defined): 1ns/1ns, the unit the
+                // reference simulator applies, so an untimed module's `#1` and
+                // `$realtime` both count nanoseconds. (1ps/1ps was tried on
+                // 2026-09-04: testbenches that mix bare `#10` clocks with
+                // absolute `3000ns` literals then ran 1000x more clock cycles,
+                // 10x slower, and no longer matched the reference.)
+                directive.or(Some((-9, -9)))
             };
             if let Some((u, p)) = eff_exp {
                 eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
@@ -1099,7 +1103,7 @@ fn parse_and_elaborate(
     if any_explicit_ts {
         for name in &modules_without_ts {
             eprintln!(
-                "[warn] module '{}' has no timescale directive; defaulting its timescale to 1ps/1ps",
+                "[warn] module '{}' has no timescale directive; defaulting its timescale to 1ns/1ns",
                 name
             );
         }
