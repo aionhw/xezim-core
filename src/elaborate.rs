@@ -16680,6 +16680,184 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
     }
 }
 
+/// Leaf names of every `force` / `release` / procedural `assign` /
+/// `deassign` target in the design's procedural code: always, initial and
+/// final blocks, module tasks and functions, and class methods. A net that is
+/// ever overridden this way must keep storage of its own — the simulator's
+/// buffer-collapse pass aliases `assign y = x` onto `x`, and a later
+/// `force y = ...` would then reach the shared net. Leaf names (the last path
+/// segment) are an over-approximation on purpose: a target spelled without
+/// its instance prefix inside a task body must still exclude the prefixed net.
+pub fn collect_override_target_leaves(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
+    collect_write_targets(elab).0
+}
+
+/// Flat names of every variable written by a procedural assignment
+/// (blocking, nonblocking, `for` init, assignment expression, `++`/`--`) in
+/// the same procedural code. Names inside inlined instance bodies are
+/// already instance-prefixed by elaboration, so these are the exact spellings
+/// the signal table uses; a task-local spelling without its prefix is not
+/// recovered (tasks writing design nets are rare, and the buffer pass only
+/// needs this to keep the delta step between a procedurally written variable
+/// and a net that copies it).
+pub fn collect_procedural_write_names(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
+    collect_write_targets(elab).1
+}
+
+fn collect_write_targets(
+    elab: &ElaboratedModule,
+) -> (crate::hasher::HashSet<String>, crate::hasher::HashSet<String>) {
+    fn flat(e: &Expression, out: &mut crate::hasher::HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                out.insert(
+                    h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."),
+                );
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = crate::hasher::HashSet::default();
+                flat(expr, &mut base);
+                for b in base {
+                    out.insert(format!("{}.{}", b, member.name));
+                }
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => flat(expr, out),
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    flat(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn leaf(e: &Expression, out: &mut crate::hasher::HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if let Some(s) = h.path.last() {
+                    out.insert(s.name.name.clone());
+                }
+            }
+            ExprKind::MemberAccess { member, .. } => {
+                out.insert(member.name.clone());
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => leaf(expr, out),
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    leaf(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    struct Sets {
+        overrides: crate::hasher::HashSet<String>,
+        writes: crate::hasher::HashSet<String>,
+    }
+    fn write_expr(e: &Expression, out: &mut Sets) {
+        match &e.kind {
+            ExprKind::AssignExpr { lvalue, .. } => flat(lvalue, &mut out.writes),
+            ExprKind::Unary { operand, .. } => flat(operand, &mut out.writes),
+            _ => {}
+        }
+    }
+    fn walk(stmt: &Statement, out: &mut Sets) {
+        use crate::ast::stmt::ProceduralContinuous as PC;
+        use crate::ast::stmt::StatementKind as K;
+        match &stmt.kind {
+            K::ProceduralContinuous(pc) => match pc {
+                PC::Assign { lvalue, .. } | PC::Force { lvalue, .. } => {
+                    leaf(lvalue, &mut out.overrides)
+                }
+                PC::Deassign(e) | PC::Release(e) => leaf(e, &mut out.overrides),
+            },
+            K::BlockingAssign { lvalue, .. } | K::NonblockingAssign { lvalue, .. } => {
+                flat(lvalue, &mut out.writes)
+            }
+            K::Expr(e) => write_expr(e, out),
+            K::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    walk(e, out);
+                }
+            }
+            K::Case { items, .. } => {
+                for it in items {
+                    walk(&it.stmt, out);
+                }
+            }
+            K::For { init, step, body, .. } => {
+                for i in init {
+                    if let crate::ast::stmt::ForInit::Assign { lvalue, .. } = i {
+                        flat(lvalue, &mut out.writes);
+                    }
+                }
+                for st in step {
+                    write_expr(st, out);
+                }
+                walk(body, out);
+            }
+            K::Foreach { body, .. }
+            | K::ForeachTail { body, .. }
+            | K::Forever { body }
+            | K::ForeverTail { body }
+            | K::RsAction { body }
+            | K::While { body, .. }
+            | K::DoWhile { body, .. }
+            | K::Repeat { body, .. } => walk(body, out),
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+                for st in stmts {
+                    walk(st, out);
+                }
+            }
+            K::TimingControl { stmt, .. } | K::Wait { stmt, .. } => walk(stmt, out),
+            K::RandCase { items } => {
+                for (_, st) in items {
+                    walk(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    use crate::ast::decl::ClassMethodKind as CMK;
+    let mut out = Sets {
+        overrides: crate::hasher::HashSet::default(),
+        writes: crate::hasher::HashSet::default(),
+    };
+    for b in &elab.always_blocks {
+        walk(&b.stmt, &mut out);
+    }
+    for b in elab.initial_blocks.iter().chain(elab.final_blocks.iter()) {
+        walk(&b.stmt, &mut out);
+    }
+    for t in elab.tasks.values() {
+        for s in &t.items {
+            walk(s, &mut out);
+        }
+    }
+    for f in elab.functions.values() {
+        for s in &f.items {
+            walk(s, &mut out);
+        }
+    }
+    for c in elab.classes.values() {
+        for m in c.methods.values() {
+            match &m.kind {
+                CMK::Function(f) | CMK::Extern(f) | CMK::PureVirtual(f) => {
+                    for s in &f.items {
+                        walk(s, &mut out);
+                    }
+                }
+                CMK::Task(t) => {
+                    for s in &t.items {
+                        walk(s, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    (out.overrides, out.writes)
+}
+
 /// Visit every sub-expression (pre-order, `e` included).
 fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
     f(e);
