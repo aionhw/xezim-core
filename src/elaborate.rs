@@ -16338,7 +16338,10 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 }
                 _ => 0,
             };
-            Value::from_u64(result, 32)
+            // §20.9: `$onehot`/`$onehot0`/`$isunknown` return `bit`; the
+            // count functions return `int`.
+            let w = if matches!(name.as_str(), "$onehot" | "$onehot0" | "$isunknown") { 1 } else { 32 };
+            Value::from_u64(result, w)
         }
         // LRM §20.7 array-introspection on an array-name ident: consults
         // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
