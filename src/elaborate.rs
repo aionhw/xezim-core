@@ -20428,6 +20428,12 @@ fn inline_module_items(
                 let __th = std::time::Instant::now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                // Bare-name keys this instance adds to the design-wide
+                // geometry tables while its body is processed (see the
+                // DataDeclaration arm below); removed again when the
+                // instance is fully inlined, so they cannot be matched by
+                // an unrelated same-named declaration elsewhere.
+                let mut inst_bare_keys: Vec<(u8, String)> = Vec::new();
                 // §3.3/§23.3.2: one instance name per scope. Accepting a
                 // duplicate elaborated BOTH instances and applied the second
                 // #() override to each (the override map is name-keyed) —
@@ -22262,7 +22268,9 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.string_signals.insert(bare);
+                                    if elab.string_signals.insert(bare.clone()) {
+                                        inst_bare_keys.push((2, bare));
+                                    }
                                     elab.string_signals.insert(scoped);
                                 }
                             }
@@ -22280,7 +22288,10 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_signal_elem_widths.entry(bare).or_insert(elem_w);
+                                    if !elab.packed_signal_elem_widths.contains_key(&bare) {
+                                        elab.packed_signal_elem_widths.insert(bare.clone(), elem_w);
+                                        inst_bare_keys.push((0, bare));
+                                    }
                                     elab.packed_signal_elem_widths.insert(scoped, elem_w);
                                 }
                             }
@@ -22288,7 +22299,10 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_full_dims.entry(bare).or_insert_with(|| fdims.clone());
+                                    if !elab.packed_full_dims.contains_key(&bare) {
+                                        elab.packed_full_dims.insert(bare.clone(), fdims.clone());
+                                        inst_bare_keys.push((1, bare));
+                                    }
                                     elab.packed_full_dims.insert(scoped, fdims.clone());
                                 }
                             }
@@ -22329,9 +22343,10 @@ fn inline_module_items(
                                                 // First-wins on the bare key
                                                 // (see the packed-dim blocks
                                                 // above).
-                                                elab.packed_struct_fields
-                                                    .entry(bare.clone())
-                                                    .or_insert_with(|| fields.clone());
+                                                if !elab.packed_struct_fields.contains_key(&bare) {
+                                                    elab.packed_struct_fields.insert(bare.clone(), fields.clone());
+                                                    inst_bare_keys.push((3, bare.clone()));
+                                                }
                                                 elab.packed_struct_fields
                                                     .insert(scoped.clone(), fields.clone());
                                                 // Per-MEMBER packed-array element
@@ -23615,6 +23630,27 @@ fn inline_module_items(
                     match prev_dt {
                         Some(dt) => { elab.typedef_types.insert(tp_name, dt); }
                         None => { elab.typedef_types.remove(&tp_name); }
+                    }
+                }
+                // The instance is fully inlined: every name in its body now
+                // carries the instance prefix, so the bare geometry keys it
+                // registered are no longer needed — and leaving them made
+                // `inp.sram_renA[2]` on a struct member in another instance
+                // resolve against this instance's `[3:0][1:0] sram_renA`.
+                for (table, key) in inst_bare_keys.drain(..) {
+                    match table {
+                        0 => {
+                            elab.packed_signal_elem_widths.remove(&key);
+                        }
+                        1 => {
+                            elab.packed_full_dims.remove(&key);
+                        }
+                        2 => {
+                            elab.string_signals.remove(&key);
+                        }
+                        _ => {
+                            elab.packed_struct_fields.remove(&key);
+                        }
                     }
                 }
             }
