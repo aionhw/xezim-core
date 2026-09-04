@@ -9415,6 +9415,8 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                    !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
                    !elab.sequences.contains(name) &&
+                   // §19.7.1 `cg::type_option.f` scopes on the covergroup name.
+                   !elab.covergroups.contains_key(name) &&
                    !locals.contains(name) {
                    let loc = span_location(elab, expr.span)
                        .map(|l| format!(" at {}", l))
