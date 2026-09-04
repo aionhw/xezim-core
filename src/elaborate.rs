@@ -5704,6 +5704,17 @@ pub fn elaborate_module_with_defs(
                             // with large memories). The width/signed/real
                             // attributes are uniform across elements so we
                             // don't need a per-element Signal struct.
+                            // §6.8/§10.9: apply the declaration initializer as one
+                            // whole-pattern assignment (the per-element lowering of the
+                            // 1-D path walks a single dimension; this shape's initializer
+                            // was silently dropped).
+                            if let Some(init_expr) = &decl.init {
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(StatementKind::BlockingAssign {
+                                        lvalue: make_ident_expr(&decl.name.name),
+                                        rvalue: init_expr.clone(),
+                                    }, Span::dummy()), scope: String::new(), });
+                            }
                             let _ = (is_signed, width);
                             continue;
                         }
@@ -5746,6 +5757,17 @@ pub fn elaborate_module_with_defs(
                         // Per-element Signals synthesized by Simulator::new
                         // from arrays_nd — skip the per-element HashMap
                         // inserts here.
+                        // §6.8/§10.9: apply the declaration initializer as one
+                        // whole-pattern assignment (the per-element lowering of the
+                        // 1-D path walks a single dimension; this shape's initializer
+                        // was silently dropped).
+                        if let Some(init_expr) = &decl.init {
+                            elab.initial_blocks.push(InitialBlock {
+                                stmt: Statement::new(StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&decl.name.name),
+                                    rvalue: init_expr.clone(),
+                                }, Span::dummy()), scope: String::new(), });
+                        }
                         let _ = is_signed;
                         continue;
                     }
@@ -10421,6 +10443,28 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                 }
                             }
                         }
+                    }
+                    // A fixed MULTI-dimensional array declared in a generate
+                    // block (or any other elaborate_items-routed scope): register
+                    // its real shape — the 1-D path below kept only the first
+                    // dimension — and apply its initializer as one whole-pattern
+                    // assignment.
+                    if let Some(shape) = fixed_unpacked_shape(&decl.dimensions, &elab.parameters)
+                        .filter(|sh| sh.len() > 1)
+                    {
+                        let two_state = is_type_two_state_resolved(&dd.data_type, &elab.typedef_types);
+                        register_fixed_unpacked_array(elab, &decl.name.name, &shape, width, two_state);
+                        elab.var_decl_types
+                            .entry(decl.name.name.clone())
+                            .or_insert_with(|| dd.data_type.clone());
+                        if let Some(init_expr) = &decl.init {
+                            elab.initial_blocks.push(InitialBlock {
+                                stmt: Statement::new(StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&decl.name.name),
+                                    rvalue: init_expr.clone(),
+                                }, Span::dummy()), scope: String::new(), });
+                        }
+                        continue;
                     }
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
@@ -22338,11 +22382,24 @@ fn inline_module_items(
                                         );
                                         elab.var_decl_types
                                             .insert(sig_name.clone(), dd.data_type.clone());
+                                        // §6.8: its initializer is deferred like every
+                                        // other instance declaration's (one whole-pattern
+                                        // assignment, rewritten into the instance scope).
+                                        if let Some(init_expr) = &decl.init {
+                                            deferred_decl_inits.push((sig_name.clone(), init_expr.clone()));
+                                        }
                                         continue;
                                     }
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    // §6.8: a fixed array's declaration initializer is
+                                    // deferred like every other instance declaration's
+                                    // (one whole-pattern assignment, rewritten into the
+                                    // instance scope); it used to be dropped here.
+                                    if let Some(init_expr) = &decl.init {
+                                        deferred_decl_inits.push((sig_name.clone(), init_expr.clone()));
+                                    }
                                     // The ELEMENT type of a child array — the
                                     // top-level path records one and every
                                     // type-directed operation needs it
