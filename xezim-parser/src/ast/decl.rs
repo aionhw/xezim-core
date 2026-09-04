@@ -290,6 +290,14 @@ pub struct ClockingSignal {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CovergroupDeclaration {
     pub name: Identifier,
+    /// §19.3 constructor formals: `covergroup cg (int lo, int hi);` — bound
+    /// at `new(...)` and visible to coverpoint bins and options.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ports: Vec<FunctionPort>,
+    /// §19.8.1 `with function sample(tf_port_list)` formals: bound at each
+    /// `cg.sample(args)` call and visible to the coverpoint expressions.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sample_ports: Vec<FunctionPort>,
     pub event: Option<super::stmt::EventControl>,
     pub items: Vec<CovergroupItem>,
     pub endlabel: Option<Identifier>,

@@ -1131,6 +1131,14 @@ fn parse_and_elaborate(
     let mut top_level_functions: Vec<ast::decl::FunctionDeclaration> = Vec::new();
     let mut top_level_tasks: Vec<ast::decl::TaskDeclaration> = Vec::new();
     let mut top_level_nettypes: Vec<ast::decl::NettypeDeclaration> = Vec::new();
+    // §35.5.4: a compilation-unit `import "DPI-C"` is visible in every
+    // module of the unit, exactly like a $unit function — it was the one
+    // $unit declaration kind never injected, so `add(1, 2)` was undeclared.
+    let mut top_level_dpi_imports: Vec<ast::decl::DPIImport> = Vec::new();
+    // Likewise `export "DPI-C" function f;` at $unit: the exported
+    // subroutine is injected as a $unit function already; the export
+    // directive must follow it so the symbol is published.
+    let mut top_level_dpi_exports: Vec<ast::decl::DPIExport> = Vec::new();
     let mut top_level_params: Vec<ast::decl::ParameterDeclaration> = Vec::new();
     let mut top_level_vars: Vec<ast::decl::DataDeclaration> = Vec::new();
     let mut top_level_binds: Vec<ast::decl::BindDirective> = Vec::new();
@@ -1313,6 +1321,18 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
                 top_level_nettypes.push(n);
             }
+            ast::Description::PackageItem(ast::decl::PackageItem::DPIImport(di)) => {
+                top_level_dpi_imports.push(di);
+            }
+            ast::Description::DPIImport(di) => {
+                top_level_dpi_imports.push(di);
+            }
+            ast::Description::DPIExport(e) => {
+                top_level_dpi_exports.push(e);
+            }
+            ast::Description::PackageItem(ast::decl::PackageItem::DPIExport(e)) => {
+                top_level_dpi_exports.push(e);
+            }
             ast::Description::PackageItem(ast::decl::PackageItem::Parameter(p)) => {
                 top_level_params.push(p);
             }
@@ -1447,7 +1467,8 @@ fn parse_and_elaborate(
     }
     if !top_level_functions.is_empty() || !top_level_tasks.is_empty()
         || !top_level_nettypes.is_empty() || !top_level_params.is_empty()
-        || !top_level_vars.is_empty() {
+        || !top_level_vars.is_empty() || !top_level_dpi_imports.is_empty()
+        || !top_level_dpi_exports.is_empty() {
         for def in definitions.values_mut() {
             if let SourceDefinition::Module(m) = def {
                 let m = Rc::make_mut(m);
@@ -1519,6 +1540,25 @@ fn parse_and_elaborate(
                 }
                 for n in top_level_nettypes.iter().rev() {
                     m.items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+                }
+                for di in top_level_dpi_imports.iter().rev() {
+                    // A module's own import of the same name shadows the
+                    // $unit one (§3.12.1); do not inject a duplicate.
+                    let name = match &di.proto {
+                        ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
+                        ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
+                    };
+                    let own = m.items.iter().any(|it| matches!(it, ast::decl::ModuleItem::DPIImport(x)
+                        if match &x.proto {
+                            ast::decl::DPIProto::Function(fd) => fd.name.name.name == name,
+                            ast::decl::DPIProto::Task(td) => td.name.name.name == name,
+                        }));
+                    if !own {
+                        m.items.insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
+                    }
+                }
+                for e in top_level_dpi_exports.iter() {
+                    m.items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
                 }
                 // $unit-scope parameters become body localparams (constants):
                 // visible inside the module, not part of its override interface.

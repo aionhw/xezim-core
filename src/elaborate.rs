@@ -1200,6 +1200,40 @@ pub fn elaborate_class_with_params(
                     }
                 }
             }
+            // §19.3: a covergroup declared in a class body implicitly declares
+            // a variable of that covergroup type with the same name, which
+            // the constructor's `cg = new` assigns. Without the property the
+            // assignment had no target: the handle stayed x and every
+            // `cg.sample()` was a silent no-op.
+            ClassItem::Covergroup(cg) => {
+                let cg_name = cg.name.name.clone();
+                if !properties.contains_key(&cg_name) {
+                    property_types.insert(
+                        cg_name.clone(),
+                        DataType::TypeReference {
+                            name: TypeName {
+                                scope: None,
+                                name: Identifier { name: cg_name.clone(), span: cg.name.span },
+                                span: cg.name.span,
+                            },
+                            dimensions: Vec::new(),
+                            type_args: Vec::new(),
+                            span: cg.name.span,
+                        },
+                    );
+                    properties.insert(cg_name.clone(), Signal {
+                        is_const: false,
+                        name: cg_name.clone(),
+                        width: 32,
+                        is_signed: false,
+                        is_real: false,
+                        direction: None,
+                        value: Value::new(32),
+                        type_name: Some(cg_name.clone()),
+                    });
+                    property_order.push(cg_name);
+                }
+            }
             ClassItem::Method(m) => {
                 let name = match &m.kind {
                     ClassMethodKind::Function(f) => f.name.name.name.clone(),
@@ -2281,6 +2315,23 @@ fn dpi_proto_sv_name(proto: &DPIProto) -> String {
     match proto {
         DPIProto::Function(fd) => fd.name.name.name.clone(),
         DPIProto::Task(td) => td.name.name.name.clone(),
+    }
+}
+
+/// §19.3: a covergroup declared inside a class body is a type of that
+/// class. Register it under its bare name (the property's declared type,
+/// what `cg = new` resolves) and under `Class::cg` (what disambiguates two
+/// classes that both declare a `cg`). The bare key keeps the FIRST
+/// definition; the qualified key is exact.
+fn register_class_covergroups(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
+    for item in &c.items {
+        if let ClassItem::Covergroup(cg) = item {
+            elab.covergroups
+                .entry(cg.name.name.clone())
+                .or_insert_with(|| cg.clone());
+            elab.covergroups
+                .insert(format!("{}::{}", c.name.name, cg.name.name), cg.clone());
+        }
     }
 }
 
@@ -3847,6 +3898,7 @@ pub fn elaborate_module_with_defs(
                 Definition::Class(c) => {
                     validate_class_constraints(c, Some(defs), Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
+                    register_class_covergroups(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -3902,6 +3954,7 @@ pub fn elaborate_module_with_defs(
                             // `pkg::Class::method`.
                             crate::ast::decl::PackageItem::Class(c) => {
                                 register_class_enum_members(c, &mut elab);
+                                register_class_covergroups(c, &mut elab);
                                 // Snapshot so the closure does not hold a borrow
                                 // of `elab` while `elab.classes` is borrowed.
                                 let params_snapshot = elab.parameters.clone();
@@ -4384,6 +4437,7 @@ pub fn elaborate_module_with_defs(
                 crate::ast::decl::PackageItem::Class(c) => {
                     validate_class_constraints(c, all_defs, Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
+                    register_class_covergroups(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -19465,6 +19519,17 @@ fn prepare_module_items(
             ),
             ModuleItem::AlwaysConstruct(ac) => BodySource::Always(ac.kind, std::rc::Rc::new(ac.stmt.clone()), ac.gen_scope.clone()),
             ModuleItem::InitialConstruct(ic) => BodySource::Initial(std::rc::Rc::new(ic.stmt.clone()), ic.gen_scope.clone()),
+            // §16.5: a concurrent assertion in an INLINED instance (sub-module
+            // or interface) travels like the top-level hoist — one synthetic
+            // initial statement the runtime registers as a clocked site. It
+            // used to fall to `Other` and vanish: no site, no failure, ever.
+            ModuleItem::AssertionItem(a) => BodySource::Initial(
+                std::rc::Rc::new(crate::ast::stmt::Statement::new(
+                    crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                    a.span,
+                )),
+                String::new(),
+            ),
             _ => BodySource::Other,
         }
     }).collect();
@@ -23258,7 +23323,7 @@ fn inline_module_items(
                             });
                         }
                     }
-                    if matches!(sub_item, ModuleItem::InitialConstruct(_)) {
+                    if matches!(sub_item, ModuleItem::InitialConstruct(_) | ModuleItem::AssertionItem(_)) {
                         if let BodySource::Initial(stmt_rc, gen_scope) = body_src {
                             if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                                 eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);

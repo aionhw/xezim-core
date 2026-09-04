@@ -1072,6 +1072,25 @@ impl Parser {
                         },
                         self.span_from(bstart),
                     ))
+                } else if !self.at(TokenKind::KwEndsequence) {
+                    // Unclocked body (`sequence s; a ##1 b; endsequence`):
+                    // parse it speculatively so a named sequence used INSIDE
+                    // a property (`a |=> s`) has a body to expand. Any shape
+                    // the expression parser does not cover backtracks to the
+                    // token-skip path below, exactly as before.
+                    let save_pos = self.pos;
+                    let save_diag = self.diagnostics.len();
+                    self.in_sva_seq = true;
+                    let body = self.parse_expression();
+                    self.in_sva_seq = false;
+                    if self.diagnostics.len() == save_diag && self.at(TokenKind::Semicolon) {
+                        self.bump();
+                        Some(body)
+                    } else {
+                        self.diagnostics.truncate(save_diag);
+                        self.pos = save_pos;
+                        None
+                    }
                 } else { None };
                 while !self.at(TokenKind::KwEndsequence) && !self.at(TokenKind::Eof) { self.bump(); }
                 self.expect(TokenKind::KwEndsequence);
@@ -2258,22 +2277,26 @@ impl Parser {
         let start = self.current().span.start;
         self.bump();
         let name = self.parse_identifier();
-        // Optional formal argument list: `covergroup cg (ref int x, ...) ...`
-        if self.at(TokenKind::LParen) {
-            self.skip_balanced_parens();
-        }
+        // §19.3 constructor formal list (`covergroup cg (int lo, int hi)`),
+        // parsed like function ports and bound at `new(...)`.
+        let ports = if self.at(TokenKind::LParen) {
+            self.parse_function_ports()
+        } else {
+            Vec::new()
+        };
         // Optional coverage event: either `@(event)` / `@@(block_event)` or a
         // `with function sample(tf_port_list)` clause (SV 19.4). The sample
         // function turns the covergroup into one sampled explicitly by call.
         let event = if self.at(TokenKind::At) {
             Some(self.parse_event_control())
         } else { None };
+        let mut sample_ports: Vec<FunctionPort> = Vec::new();
         if self.at(TokenKind::KwWith) {
             self.bump();
             self.expect(TokenKind::KwFunction);
             let _ = self.parse_identifier(); // `sample`
             if self.at(TokenKind::LParen) {
-                self.skip_balanced_parens();
+                sample_ports = self.parse_function_ports();
             }
         }
         self.expect(TokenKind::Semicolon);
@@ -2283,7 +2306,7 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndgroup);
         let endlabel = self.parse_end_label();
-        CovergroupDeclaration { name, event, items, endlabel, span: self.span_from(start) }
+        CovergroupDeclaration { name, ports, sample_ports, event, items, endlabel, span: self.span_from(start) }
     }
 
     fn parse_covergroup_item(&mut self) -> CovergroupItem {
