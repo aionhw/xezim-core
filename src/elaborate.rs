@@ -26560,6 +26560,28 @@ pub fn rename_process_shadowed_locals(
     Some(out)
 }
 
+/// `local_names` minus the names a loop declares itself (a for-init
+/// `integer i`, foreach loop variables). A declared name that also exists at
+/// the child's module scope (`integer i, j;` next to `for (integer i = 0;
+/// ...)`) used to have its USES prefixed to the module variable while the
+/// declaration stayed bare, so the loop tested an x-valued `inst.i` and never
+/// ran. `None` when nothing collides (the common case). Block-local
+/// declarations (`begin integer k; ... end`) are deliberately NOT stripped:
+/// the runtime's process-context block locals are not yet consistent enough
+/// to stand on their own, and the prefixed form keeps today's behaviour.
+fn without_declared<'a>(
+    local_names: &std::collections::HashSet<String>,
+    declared: impl Iterator<Item = &'a str>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut reduced: Option<std::collections::HashSet<String>> = None;
+    for n in declared {
+        if local_names.contains(n) {
+            reduced.get_or_insert_with(|| local_names.clone()).remove(n);
+        }
+    }
+    reduced
+}
+
 fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
@@ -26593,22 +26615,35 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
                 guard: item.guard.as_ref().map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
             }).collect(),
         },
-        StatementKind::For { init, condition, step, body } => StatementKind::For {
-            init: init.iter().map(|fi| match fi {
-                ForInit::VarDecl { data_type, name, init } => ForInit::VarDecl {
-                    data_type: data_type.clone(),
-                    name: name.clone(),
-                    init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
-                },
-                ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
-                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
-                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
-                },
-            }).collect(),
-            condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, local_names, interface_map)),
-            step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, local_names, interface_map)).collect(),
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
-        },
+        StatementKind::For { init, condition, step, body } => {
+            // The loop variables shadow same-named child-scope variables in
+            // the condition, step and body; the init expressions are
+            // evaluated before the declaration and keep the outer set.
+            let reduced = without_declared(
+                local_names,
+                init.iter().filter_map(|fi| match fi {
+                    ForInit::VarDecl { name, .. } => Some(name.name.as_str()),
+                    _ => None,
+                }),
+            );
+            let inner = reduced.as_ref().unwrap_or(local_names);
+            StatementKind::For {
+                init: init.iter().map(|fi| match fi {
+                    ForInit::VarDecl { data_type, name, init } => ForInit::VarDecl {
+                        data_type: data_type.clone(),
+                        name: name.clone(),
+                        init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
+                    },
+                    ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
+                        lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                        rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
+                    },
+                }).collect(),
+                condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, inner, interface_map)),
+                step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, inner, interface_map)).collect(),
+                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
+            }
+        }
         StatementKind::While { condition, body } => StatementKind::While {
             condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
@@ -26622,11 +26657,18 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         // reaches, so it returned x while the identical read outside the loop
         // was fine. The loop VARIABLES stay untouched: they are declared by the
         // foreach itself, not inherited from the child's scope.
-        StatementKind::Foreach { array, vars, body } => StatementKind::Foreach {
-            array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
-            vars: vars.clone(),
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
-        },
+        StatementKind::Foreach { array, vars, body } => {
+            let reduced = without_declared(
+                local_names,
+                vars.iter().flatten().map(|v| v.name.as_str()),
+            );
+            let inner = reduced.as_ref().unwrap_or(local_names);
+            StatementKind::Foreach {
+                array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
+                vars: vars.clone(),
+                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
+            }
+        }
         // Sibling of the missing-Assertion-arm bug: these kinds also fell
         // through `other => other.clone()` un-rewritten, so a dotted
         // reference inside them stayed a raw MemberAccess (and, in prefix
