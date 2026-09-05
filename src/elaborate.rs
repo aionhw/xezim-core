@@ -1588,6 +1588,11 @@ pub struct ElaboratedModule {
     /// passes back to identify which subroutine to run.
     #[cfg_attr(feature = "serde", serde(default))]
     pub dpi_exports: Vec<String>,
+    /// The C linkage name of each entry of `dpi_exports` (same index): the
+    /// alias of `export "DPI-C" c_name = task sv_name;` when given, else the
+    /// SV name. The alias used to be dropped, so the C side's `c_name` was an
+    /// undefined symbol in the loaded library.
+    pub dpi_export_c_names: Vec<String>,
     /// Clocking block definitions: name -> AST declaration.
     pub clocking_blocks: HashMap<String, ClockingDeclaration>,
     /// Let declarations visible in the elaborated scope.
@@ -2068,6 +2073,7 @@ impl ElaboratedModule {
             func_decl_scope: HashMap::default(),
             dpi_imports: HashMap::default(),
             dpi_exports: Vec::new(),
+            dpi_export_c_names: Vec::new(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
             modport_views: HashMap::default(),
@@ -2337,6 +2343,18 @@ fn register_class_covergroups(c: &ClassDeclaration, elab: &mut ElaboratedModule)
                 .insert(format!("{}::{}", c.name.name, cg.name.name), cg.clone());
         }
     }
+}
+
+/// §35.5.4 `export "DPI-C" [c_name =] task|function sv_name;` — record the
+/// SV subroutine and the C linkage name the loaded library will call.
+fn register_dpi_export(e: &crate::ast::decl::DPIExport, elab: &mut ElaboratedModule) {
+    let name = dpi_proto_sv_name(&e.proto);
+    if elab.dpi_exports.contains(&name) {
+        return;
+    }
+    let c_name = e.c_name.clone().unwrap_or_else(|| name.clone());
+    elab.dpi_exports.push(name);
+    elab.dpi_export_c_names.push(c_name);
 }
 
 fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
@@ -4452,6 +4470,9 @@ pub fn elaborate_module_with_defs(
                 }
                 crate::ast::decl::PackageItem::DPIImport(di) => {
                     register_dpi_import(di, &mut elab)?;
+                }
+                crate::ast::decl::PackageItem::DPIExport(e) => {
+                    register_dpi_export(e, &mut elab);
                 }
                 _ => {}
             }
@@ -7366,13 +7387,7 @@ pub fn elaborate_module_with_defs(
                 register_dpi_import(di, &mut elab)?;
             }
             ModuleItem::DPIExport(e) => {
-                let name = match &e.proto {
-                    crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
-                    crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
-                };
-                if !elab.dpi_exports.contains(&name) {
-                    elab.dpi_exports.push(name);
-                }
+                register_dpi_export(e, &mut elab);
             }
             ModuleItem::OutOfClassConstraint { class_name, constraint_name, items } => {
                 elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
@@ -7415,6 +7430,48 @@ pub fn elaborate_module_with_defs(
     }
 
     // §7.2.2: whole-struct continuous assigns expand member-wise.
+    // §35.5.4: an `export "DPI-C"` declared in a package this module never
+    // imports still names a GLOBAL C symbol. Register it under the
+    // package-qualified subroutine name (with its C alias) and bring the
+    // subroutine in under that key so the callback can reach it.
+    if let Some(defs) = all_defs {
+        let mut pkg_names: Vec<&String> = defs
+            .iter()
+            .filter(|(_, d)| matches!(d, Definition::Package(_)))
+            .map(|(n, _)| n)
+            .collect();
+        pkg_names.sort();
+        for pname in pkg_names {
+            let Some(Definition::Package(p)) = defs.get(pname) else { continue };
+            for item in &p.items {
+                let crate::ast::decl::PackageItem::DPIExport(e) = item else { continue };
+                let sv = dpi_proto_sv_name(&e.proto);
+                let q = format!("{}::{}", pname, sv);
+                if elab.dpi_exports.contains(&sv) || elab.dpi_exports.contains(&q) {
+                    continue;
+                }
+                let mut found = false;
+                for it in &p.items {
+                    match it {
+                        crate::ast::decl::PackageItem::Task(td) if td.name.name.name == sv => {
+                            elab.tasks.entry(q.clone()).or_insert_with(|| td.clone());
+                            found = true;
+                        }
+                        crate::ast::decl::PackageItem::Function(fd) if fd.name.name.name == sv => {
+                            elab.functions.entry(q.clone()).or_insert_with(|| fd.clone());
+                            found = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if found {
+                    elab.pkg_subr_owner.entry(sv.clone()).or_insert_with(|| pname.clone());
+                    elab.dpi_exports.push(q);
+                    elab.dpi_export_c_names.push(e.c_name.clone().unwrap_or(sv));
+                }
+            }
+        }
+    }
     expand_whole_struct_continuous_assigns(&mut elab);
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
@@ -27386,6 +27443,11 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 register_dpi_import(di, elab)?;
                                 found = true;
                             }
+                        PackageItem::DPIExport(e)
+                            if &dpi_proto_sv_name(&e.proto) == sym_name => {
+                                register_dpi_export(e, elab);
+                                found = true;
+                            }
                         PackageItem::Class(c)
                             if &c.name.name == sym_name => {
                                 register_class_enum_members(c, elab);
@@ -27587,6 +27649,9 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         }
                         PackageItem::DPIImport(di) => {
                             register_dpi_import(di, elab)?;
+                        }
+                        PackageItem::DPIExport(e) => {
+                            register_dpi_export(e, elab);
                         }
                         PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);
