@@ -21827,7 +21827,17 @@ fn inline_module_items(
                                 {
                                     elab.packed_signal_elem_widths.insert(sig_name.clone(), ew);
                                 }
+                                // A TYPEDEF'd element type with declared dims
+                                // (`u7_t [4:0][1:0] a`): chain the declared dims
+                                // with the typedef's like the top-level path does.
+                                // Resolving the typedef first kept only ITS
+                                // dimension, so `foreach (a[i, j])` on an inlined
+                                // instance (every top under `__xezim_multi_top`)
+                                // walked the 70 bits instead of the 10 elements.
                                 if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params)
+                                    .or_else(|| {
+                                        packed_full_dims_chained(dt, &sub_merged_params, &elab.typedef_types)
+                                    })
                                     .or_else(|| packed_full_dims_of(&resolved_dt, &sub_merged_params))
                                 {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
@@ -22197,7 +22207,13 @@ fn inline_module_items(
                                         .insert(sig_name.clone(), elem_w);
                                 }
                                 if let Some(fdims) =
-                                    packed_full_dims_of(&nd.data_type, &sub_merged_params)
+                                    packed_full_dims_of(&nd.data_type, &sub_merged_params).or_else(|| {
+                                        packed_full_dims_chained(
+                                            &nd.data_type,
+                                            &sub_merged_params,
+                                            &elab.typedef_types,
+                                        )
+                                    })
                                 {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
@@ -22352,7 +22368,23 @@ fn inline_module_items(
                                     elab.packed_signal_elem_widths.insert(scoped, elem_w);
                                 }
                             }
-                            if let Some(fdims) = packed_full_dims_of(&dd.data_type, &sub_merged_params) {
+                            // A TYPEDEF'd element type with declared dims
+                            // (`u7_t [4:0][1:0] a`) has no dims of its own for
+                            // `packed_full_dims_of`: chain the declared dims with
+                            // the typedef's, as the top-level declaration path
+                            // does. Without this the inlined signal had NO dims
+                            // entry, and `foreach (a[i, j])` in an instance —
+                            // every top under `__xezim_multi_top` — walked the
+                            // 70 bits instead of the 10 elements.
+                            if let Some(fdims) = packed_full_dims_of(&dd.data_type, &sub_merged_params)
+                                .or_else(|| {
+                                    packed_full_dims_chained(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedef_types,
+                                    )
+                                })
+                            {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
