@@ -1863,6 +1863,41 @@ impl Parser {
         Some(Expression::new(ExprKind::Ident(hier), span))
     }
 
+    /// The optional `#(...)` parameter value assignment of an instantiation
+    /// (`mod #(.P(v), 3) u (...)`), shared by module items and `bind`
+    /// directives. `None` when no `#` follows.
+    pub(super) fn parse_instantiation_params(&mut self) -> Option<Vec<ParamConnection>> {
+        if !self.at(TokenKind::Hash) {
+            return None;
+        }
+        self.bump();
+        if self.eat(TokenKind::LParen).is_some() {
+            let mut p = Vec::new();
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                if self.at(TokenKind::Dot) {
+                    self.bump(); let pn = self.parse_identifier(); self.expect(TokenKind::LParen);
+                    let pv = if !self.at(TokenKind::RParen) { Some(self.parse_param_value()) } else { None };
+                    self.expect(TokenKind::RParen); p.push(ParamConnection::Named { name: pn, value: pv });
+                } else { p.push(ParamConnection::Ordered(Some(self.parse_param_value()))); }
+
+                if self.eat(TokenKind::Comma).is_none() { break; }
+            }
+            self.expect(TokenKind::RParen); Some(p)
+        } else if matches!(
+            self.current_kind(),
+            TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
+        ) {
+            // §28.3 primitive delay without parens — `ubuf #2 u (o, i)`.
+            // Eating the `#` and returning None left the literal in the
+            // stream to trip the instance-name parse. A single NUMERIC
+            // literal becomes the one positional value, converging with
+            // `#(2)` downstream (the UDP elaborator reads a scalar delay
+            // out of `params`). Literals only: an identifier here would
+            // be ambiguous against too many neighbors.
+            Some(vec![ParamConnection::Ordered(Some(self.parse_param_value()))])
+        } else { None }
+    }
+
     fn parse_identifier_starting_item(&mut self) -> ModuleItem {
         let start = self.current().span.start;
         let first_name = self.parse_identifier();
@@ -1922,34 +1957,7 @@ impl Parser {
                 span: self.span_from(start),
             });
         }
-        let params = if self.at(TokenKind::Hash) {
-            self.bump();
-            if self.eat(TokenKind::LParen).is_some() {
-                let mut p = Vec::new();
-                while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-                    if self.at(TokenKind::Dot) {
-                        self.bump(); let pn = self.parse_identifier(); self.expect(TokenKind::LParen);
-                        let pv = if !self.at(TokenKind::RParen) { Some(self.parse_param_value()) } else { None };
-                        self.expect(TokenKind::RParen); p.push(ParamConnection::Named { name: pn, value: pv });
-                        } else { p.push(ParamConnection::Ordered(Some(self.parse_param_value()))); }
-
-                    if self.eat(TokenKind::Comma).is_none() { break; }
-                }
-                self.expect(TokenKind::RParen); Some(p)
-            } else if matches!(
-                self.current_kind(),
-                TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
-            ) {
-                // §28.3 primitive delay without parens — `ubuf #2 u (o, i)`.
-                // Eating the `#` and returning None left the literal in the
-                // stream to trip the instance-name parse. A single NUMERIC
-                // literal becomes the one positional value, converging with
-                // `#(2)` downstream (the UDP elaborator reads a scalar delay
-                // out of `params`). Literals only: an identifier here would
-                // be ambiguous against too many neighbors.
-                Some(vec![ParamConnection::Ordered(Some(self.parse_param_value()))])
-            } else { None }
-        } else { None };
+        let params = self.parse_instantiation_params();
 
         // Packed dimensions on a user-typedef base: `MyType [hi:lo] var_name;`
         // After the optional #(params), if we see `[`, treat the construct as a

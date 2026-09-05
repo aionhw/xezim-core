@@ -112,6 +112,12 @@ impl Parser {
             }
         }
         let bind_mod = self.parse_identifier();
+        // `bind dut harness #(.N(N)) v_h (.*);` — the parameter value
+        // assignment used to make this routine give up, and the caller
+        // turned the whole directive into a silent `Null` item: the harness
+        // was never instantiated and every hierarchical call into it was a
+        // no-op.
+        let bind_params = self.parse_instantiation_params();
         if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
             let inst_start = self.current().span.start;
             let iname = self.parse_identifier();
@@ -128,7 +134,7 @@ impl Parser {
                 };
                 let instantiation = crate::ast::decl::ModuleInstantiation {
                     module_name: bind_mod,
-                    params: None,
+                    params: bind_params,
                     instances: vec![instance],
                     span,
                 };
