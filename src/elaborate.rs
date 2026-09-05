@@ -520,6 +520,13 @@ pub struct ElaboratedClass {
     /// enclosing class — its statics are visible to this class's methods.
     #[serde(default)]
     pub enclosing: Option<String>,
+    /// The MODULE this class is declared inside (`module wrapper; class
+    /// proxy_c; ... endclass ... endmodule`), if any. A method of such a
+    /// class resolves bare and sibling-instance names in that module's
+    /// scope (§23.6); the runtime needs the module to find the instance when
+    /// the object was not built inside it.
+    #[serde(default)]
+    pub declaring_module: Option<String>,
     /// Names listed in the `implements` clause.
     #[serde(default)]
     pub implements: Vec<String>,
@@ -1404,6 +1411,7 @@ pub fn elaborate_class_with_params(
     ElaboratedClass {
         name: c.name.name.clone(),
         enclosing: None,
+        declaring_module: None,
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
         extends_args: c.extends.as_ref().map(|e| {
             e.args.iter().filter_map(|a| match a {
@@ -7296,7 +7304,10 @@ pub fn elaborate_module_with_defs(
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, &mut elab);
-                let cls = std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters)));
+                let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
+                // A module-scope class remembers its module (issue #155).
+                ec.declaring_module = Some(module.name().to_string());
+                let cls = std::sync::Arc::new(ec);
                 elab.classes.insert(cd.name.name.clone(), cls);
                 register_nested_classes(cd, &cd.name.name, &mut elab);
             }
@@ -23439,10 +23450,9 @@ fn inline_module_items(
                         // re-registers the identical definition).
                         validate_class_constraints(cd, Some(definitions), Some(&elab.enum_members), Some(&elab))?;
                         register_class_enum_members(cd, elab);
-                        elab.classes.insert(
-                            cd.name.name.clone(),
-                            std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
-                        );
+                        let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
+                        ec.declaring_module = Some(sub_mod_name.clone());
+                        elab.classes.insert(cd.name.name.clone(), std::sync::Arc::new(ec));
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
                         // §14.3 interface-scoped clocking block: register it under
