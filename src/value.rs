@@ -823,6 +823,103 @@ impl Value {
         }
     }
 
+    /// Replace this value with `nbits` copies of one bit (`v`/`x` are the
+    /// bit's planes, 0 or 1), REUSING the existing wide allocation when it
+    /// already has the right word count. `{N{sel}}` masks over wide buses
+    /// are the RTL idiom this serves: a c906 CoreMark iteration replicates
+    /// a single bit 6.6 million times for 1.48 billion copies in total, and
+    /// the per-copy splice was the last wide-value hot spot.
+    pub fn assign_replicated_bit(&mut self, v: u64, x: u64, nbits: u32) {
+        let (vw, xw) = (0u64.wrapping_sub(v & 1), 0u64.wrapping_sub(x & 1));
+        if nbits <= 64 {
+            let m = Self::mask(nbits);
+            self.storage = ValueStorage::Inline { val_bits: vw & m, xz_bits: xw & m };
+        } else {
+            let n = WidePlanes::nwords(nbits);
+            match &mut self.storage {
+                ValueStorage::Wide(p) if p.val.len() == n && p.xz.len() == n => {
+                    p.val.fill(vw);
+                    p.xz.fill(xw);
+                    p.nbits = nbits;
+                    p.mask_top();
+                }
+                storage => {
+                    let mut p = WidePlanes { val: vec![vw; n], xz: vec![xw; n], nbits };
+                    p.mask_top();
+                    *storage = ValueStorage::Wide(Box::new(p));
+                }
+            }
+        }
+        self.width = nbits;
+        self.is_signed = false;
+        self.is_real = false;
+        self.is_fill = false;
+    }
+
+    /// `{n{self}}`: `n` copies of this value, MSB-first like `concat_refs`.
+    /// A one-bit source is a fill; a source of at most 64 bits is laid down
+    /// a word at a time from its period; anything wider takes the general
+    /// concatenation.
+    pub fn replicate(&self, n: usize) -> Value {
+        let total = (self.width as u64).saturating_mul(n as u64);
+        let total = if total > u32::MAX as u64 { u32::MAX } else { total as u32 };
+        let total = Self::cap_width(total);
+        if n == 0 || self.width == 0 || total == 0 {
+            return Value::zero(0);
+        }
+        if self.is_fill || self.is_real || self.width > 64 {
+            return Value::concat_refs(std::iter::repeat_n(self, n));
+        }
+        if self.width == 1 {
+            let (v, x) = self.raw_bits();
+            let mut out = Value::zero(0);
+            out.assign_replicated_bit(v, x, total);
+            return out;
+        }
+        let w = self.width as usize;
+        let (sv, sx) = self.raw_bits();
+        let m = Self::mask(self.width);
+        let (sv, sx) = (sv & m, sx & m);
+        let nw = WidePlanes::nwords(total);
+        let (mut val, mut xz) = (vec![0u64; nw], vec![0u64; nw]);
+        // Each output word collects the copies overlapping it: copy k
+        // occupies bits [k*w, k*w+w).
+        for wi in 0..nw {
+            let base = wi * 64;
+            let end = (base + 64).min(total as usize);
+            let mut k = base / w;
+            let (mut ov, mut ox) = (0u64, 0u64);
+            while k * w < end {
+                let pos = k * w;
+                if pos >= base {
+                    let sh = pos - base;
+                    ov |= sv << sh;
+                    ox |= sx << sh;
+                } else {
+                    let sh = base - pos;
+                    ov |= sv >> sh;
+                    ox |= sx >> sh;
+                }
+                k += 1;
+            }
+            val[wi] = ov;
+            xz[wi] = ox;
+        }
+        if total <= 64 {
+            let m = Self::mask(total);
+            return Value {
+                storage: ValueStorage::Inline { val_bits: val[0] & m, xz_bits: xz[0] & m },
+                width: total, is_signed: false, is_real: false, is_fill: false,
+            };
+        }
+        let mut p = WidePlanes { val, xz, nbits: total };
+        p.mask_top();
+        Value {
+            storage: ValueStorage::Wide(Box::new(p)),
+            width: total, is_signed: false, is_real: false, is_fill: false,
+        }
+    }
+
     /// Replace this value with a 65..=128-bit two-plane value given as
     /// 128-bit words, REUSING the existing wide allocation when this value
     /// already holds exactly two words. A bytecode register that receives
@@ -3024,6 +3121,48 @@ mod tests {
             assert_eq!(cat.get_bit(73 + i), a.get_bit(i), "a bit {i}");
         }
         assert!(cat.has_xz());
+        // Replication equals the concatenation definition for a 1-bit
+        // source (0/1/x/z), a 3-bit source, a 40-bit source, and reuses a
+        // register's storage in place.
+        for bit in [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z] {
+            let mut one = Value::zero(1);
+            one.set_bit(0, bit);
+            for n in [1usize, 7, 64, 65, 200, 257] {
+                let r = one.replicate(n);
+                let c = Value::concat_refs(std::iter::repeat_n(&one, n));
+                assert_eq!(r.width, c.width);
+                for i in 0..r.width as usize {
+                    assert_eq!(r.get_bit(i), c.get_bit(i), "1-bit {bit:?} n={n} bit {i}");
+                }
+            }
+        }
+        let mut three = Value::from_u64(0b101, 3);
+        three.set_bit(1, LogicBit::X);
+        for n in [1usize, 5, 21, 22, 43, 100] {
+            let r = three.replicate(n);
+            let c = Value::concat_refs(std::iter::repeat_n(&three, n));
+            assert_eq!(r.width, c.width);
+            for i in 0..r.width as usize {
+                assert_eq!(r.get_bit(i), c.get_bit(i), "3-bit n={n} bit {i}");
+            }
+        }
+        for n in [1usize, 2, 3, 9] {
+            let r = a.replicate(n);
+            let c = Value::concat_refs(std::iter::repeat_n(&a, n));
+            for i in 0..r.width as usize {
+                assert_eq!(r.get_bit(i), c.get_bit(i), "40-bit n={n} bit {i}");
+            }
+        }
+        let mut slot = Value::zero(200);
+        slot.assign_replicated_bit(1, 0, 200);
+        assert_eq!(slot.width, 200);
+        assert!(!slot.has_xz());
+        assert_eq!(slot.get_bit(199), LogicBit::One);
+        slot.assign_replicated_bit(0, 1, 150);
+        assert_eq!(slot.width, 150);
+        assert_eq!(slot.get_bit(149), LogicBit::X);
+        assert_eq!(slot.get_bit(0), LogicBit::X);
+
         let mut reused = cat.clone();
         let (v, x) = cat.bits128();
         reused.assign_wide128(x, v, 100);
