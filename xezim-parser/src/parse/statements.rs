@@ -1231,7 +1231,7 @@ impl Parser {
                         (*left, Some(*right))
                     }
                     other => {
-                        let expr = Expression { kind: other, span: parsed.span };
+                        let expr = Expression { kind: other, span: parsed.span, cached_width: std::cell::Cell::new(None) };
                         let iff = if self.eat(TokenKind::KwIff).is_some() {
                             Some(self.parse_expression())
                         } else { None };
