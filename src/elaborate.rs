@@ -325,6 +325,12 @@ pub struct RewriteCtx {
     /// had no binding left at run time and `obj = new()` never constructed.
     /// `materialize` substitutes these into cloned statements' declarations.
     pub type_binds: HashMap<String, DataType>,
+    /// Packed width of each bound type parameter — folded into `$bits(T)`
+    /// while this instance's items are rewritten (see `TYPE_BIND_WIDTHS_TLS`).
+    pub type_bind_widths: HashMap<String, u32>,
+    /// Name of the module/interface definition this body came from — the
+    /// file a diagnostic's span belongs to.
+    pub owner: String,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +374,7 @@ impl PendingAlways {
             eprintln!("[PEND-MAT] prefix={:?} keys={:?}", self.ctx.prefix,
                 self.ctx.port_map.keys().collect::<Vec<_>>());
         }
+        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
         let stmt = rewrite_stmt(
             &self.source,
             &self.ctx.prefix,
@@ -375,6 +382,7 @@ impl PendingAlways {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        clear_type_bind_widths_tls();
         let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope, like PendingInitial.
@@ -393,6 +401,7 @@ impl PendingAlways {
 
 impl PendingInitial {
     pub fn materialize(self) -> InitialBlock {
+        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
         let stmt = rewrite_stmt(
             &self.source,
             &self.ctx.prefix,
@@ -400,6 +409,7 @@ impl PendingInitial {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        clear_type_bind_widths_tls();
         let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope for name resolution.
@@ -418,6 +428,13 @@ impl PendingInitial {
 
 impl PendingContAssign {
     pub fn materialize(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
+        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
+        let out = self.materialize_inner(params);
+        clear_type_bind_widths_tls();
+        out
+    }
+
+    fn materialize_inner(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         let lhs = rewrite_expr(
             &self.lhs_source,
             &self.ctx.prefix,
@@ -503,6 +520,13 @@ pub struct ElaboratedClass {
     /// enclosing class — its statics are visible to this class's methods.
     #[serde(default)]
     pub enclosing: Option<String>,
+    /// The MODULE this class is declared inside (`module wrapper; class
+    /// proxy_c; ... endclass ... endmodule`), if any. A method of such a
+    /// class resolves bare and sibling-instance names in that module's
+    /// scope (§23.6); the runtime needs the module to find the instance when
+    /// the object was not built inside it.
+    #[serde(default)]
+    pub declaring_module: Option<String>,
     /// Names listed in the `implements` clause.
     #[serde(default)]
     pub implements: Vec<String>,
@@ -626,6 +650,24 @@ pub struct ElaboratedClass {
     /// under their bare name at simulator startup.
     #[serde(default)]
     pub static_collections: Vec<(String, bool, u32)>,
+    /// §7.8.2: the KEY type of a STATIC assoc member (`static T map[string];`)
+    /// — static member name -> key-type name (a plain `string` is stored as
+    /// the literal `"string"`). `static_collections` carries no key type, and
+    /// writing statics into `assoc_properties` (which is per-INSTANCE) confused
+    /// `is_associative_array`'s `handle#member` dispatch, so without a dedi-
+    /// cated map a `static T map[string]` param'd array fell into the NUMERIC
+    /// branch of `assoc_key_str` and stored its string keys as hashed integers
+    /// (consistent for set/get, but foreach()/first()/next() decoded garbage).
+    #[serde(default)]
+    pub static_assoc_key_types: HashMap<String, String>,
+    /// §7.8.2: the INDEX (key) width + signedness of a STATIC assoc member
+    /// (`static int m[int];` -> (32, true)). `assoc_index_props` is per-
+    /// INSTANCE (and recording statics there confuses `is_associative_array`'s
+    /// `handle#member` dispatch), so statics keep their own map. Consulted by
+    /// `assoc_index_width_for` for a per-spec `Class#spec::member` key so
+    /// `foreach` binds a SIGNED index with its true width.
+    #[serde(default)]
+    pub static_assoc_index_props: HashMap<String, (u32, bool)>,
     /// Fixed-size `static` array members (`static int S[3]`, `static bit
     /// m[2:0]`): (name, lo, hi, element width). §8.9 gives every instance of
     /// the class ONE shared copy, so — exactly like `static_collections` —
@@ -797,6 +839,8 @@ pub fn elaborate_class_with_params(
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
+    let mut static_assoc_key_types: HashMap<String, String> = HashMap::default();
+    let mut static_assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
     let mut static_fixed_arrays: Vec<(String, i64, i64, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
@@ -900,8 +944,44 @@ pub fn elaborate_class_with_params(
                     if is_static {
                         // Second field is `is_associative` (NOT key-is-string).
                         match effective_dims.first() {
-                            Some(UnpackedDimension::Associative { .. }) => {
+                            Some(UnpackedDimension::Associative { data_type: key_dt, .. }) => {
                                 static_collections.push((decl.name.name.clone(), true, width.max(1)));
+                                // §7.8.2: record the static assoc member's KEY
+                                // type in `static_assoc_key_types` (a plain
+                                // `string` is recorded as the literal "string").
+                                // This lets the runtime hash/store string keys
+                                // as strings and iterate/foreach them correctly.
+                                static_assoc_key_types.insert(
+                                    decl.name.name.clone(),
+                                    match key_dt.as_deref() {
+                                        Some(DataType::TypeReference { name: kt, .. }) =>
+                                            kt.name.name.clone(),
+                                        Some(DataType::Simple {
+                                            kind: SimpleType::String,
+                                            ..
+                                        }) => "string".to_string(),
+                                        _ => "int".to_string(),
+                                    },
+                                );
+                                // §7.8.2: record the static assoc member's
+                                // INDEX width + signedness (skipping a plain
+                                // string key — the full text key is handled
+                                // by the string branch). Mirrors the per-
+                                // instance `assoc_index_props` recording below
+                                // but in the STATIC-specific map.
+                                if let Some(kdt) = key_dt.as_ref() {
+                                    if !matches!(kdt.as_ref(),
+                                        DataType::Simple { kind: SimpleType::String, .. })
+                                    {
+                                        let kw = resolve_type_width(kdt, class_params, None);
+                                        if kw > 0 {
+                                            static_assoc_index_props.insert(
+                                                decl.name.name.clone(),
+                                                (kw, is_type_signed(kdt)),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Some(UnpackedDimension::Queue { .. })
                             | Some(UnpackedDimension::Unsized(_)) => {
@@ -1127,6 +1207,40 @@ pub fn elaborate_class_with_params(
                     }
                 }
             }
+            // §19.3: a covergroup declared in a class body implicitly declares
+            // a variable of that covergroup type with the same name, which
+            // the constructor's `cg = new` assigns. Without the property the
+            // assignment had no target: the handle stayed x and every
+            // `cg.sample()` was a silent no-op.
+            ClassItem::Covergroup(cg) => {
+                let cg_name = cg.name.name.clone();
+                if !properties.contains_key(&cg_name) {
+                    property_types.insert(
+                        cg_name.clone(),
+                        DataType::TypeReference {
+                            name: TypeName {
+                                scope: None,
+                                name: Identifier { name: cg_name.clone(), span: cg.name.span },
+                                span: cg.name.span,
+                            },
+                            dimensions: Vec::new(),
+                            type_args: Vec::new(),
+                            span: cg.name.span,
+                        },
+                    );
+                    properties.insert(cg_name.clone(), Signal {
+                        is_const: false,
+                        name: cg_name.clone(),
+                        width: 32,
+                        is_signed: false,
+                        is_real: false,
+                        direction: None,
+                        value: Value::new(32),
+                        type_name: Some(cg_name.clone()),
+                    });
+                    property_order.push(cg_name);
+                }
+            }
             ClassItem::Method(m) => {
                 let name = match &m.kind {
                     ClassMethodKind::Function(f) => f.name.name.name.clone(),
@@ -1297,6 +1411,7 @@ pub fn elaborate_class_with_params(
     ElaboratedClass {
         name: c.name.name.clone(),
         enclosing: None,
+        declaring_module: None,
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
         extends_args: c.extends.as_ref().map(|e| {
             e.args.iter().filter_map(|a| match a {
@@ -1348,6 +1463,8 @@ pub fn elaborate_class_with_params(
         queue_properties,
         property_inits,
         static_collections,
+        static_assoc_key_types,
+        static_assoc_index_props,
         static_fixed_arrays,
         array_properties,
         array_nd_properties,
@@ -1479,6 +1596,11 @@ pub struct ElaboratedModule {
     /// passes back to identify which subroutine to run.
     #[cfg_attr(feature = "serde", serde(default))]
     pub dpi_exports: Vec<String>,
+    /// The C linkage name of each entry of `dpi_exports` (same index): the
+    /// alias of `export "DPI-C" c_name = task sv_name;` when given, else the
+    /// SV name. The alias used to be dropped, so the C side's `c_name` was an
+    /// undefined symbol in the loaded library.
+    pub dpi_export_c_names: Vec<String>,
     /// Clocking block definitions: name -> AST declaration.
     pub clocking_blocks: HashMap<String, ClockingDeclaration>,
     /// Let declarations visible in the elaborated scope.
@@ -1690,6 +1812,9 @@ pub struct ElaboratedModule {
     /// `$printtimescale` from it. Keyed by module name (= definition name).
     #[serde(default)]
     pub module_timescale_exp: HashMap<String, (i32, i32)>,
+    /// Module definitions that carried no `timescale (own, inherited, or
+    /// CLI) and therefore run on the 1ns/1ns tool default.
+    pub modules_without_timescale: Vec<String>,
     /// IEEE 1800-2017 §6.19: enum typedef members in declaration order.
     /// Keyed by typedef name; each entry is `(member_name, value)`.
     /// Used to resolve `.name()` / `.next()` / `.first()` etc.
@@ -1956,6 +2081,7 @@ impl ElaboratedModule {
             func_decl_scope: HashMap::default(),
             dpi_imports: HashMap::default(),
             dpi_exports: Vec::new(),
+            dpi_export_c_names: Vec::new(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
             modport_views: HashMap::default(),
@@ -2003,6 +2129,7 @@ impl ElaboratedModule {
             timeunit_exp: default_timeunit_exp(),
             timeprecision_exp: default_timeunit_exp(),
             module_timescale_exp: HashMap::default(),
+            modules_without_timescale: Vec::new(),
             enum_members: HashMap::default(),
             package_enum_members: HashMap::default(),
             decl_sites: HashMap::default(),
@@ -2209,6 +2336,35 @@ fn dpi_proto_sv_name(proto: &DPIProto) -> String {
     }
 }
 
+/// §19.3: a covergroup declared inside a class body is a type of that
+/// class. Register it under its bare name (the property's declared type,
+/// what `cg = new` resolves) and under `Class::cg` (what disambiguates two
+/// classes that both declare a `cg`). The bare key keeps the FIRST
+/// definition; the qualified key is exact.
+fn register_class_covergroups(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
+    for item in &c.items {
+        if let ClassItem::Covergroup(cg) = item {
+            elab.covergroups
+                .entry(cg.name.name.clone())
+                .or_insert_with(|| cg.clone());
+            elab.covergroups
+                .insert(format!("{}::{}", c.name.name, cg.name.name), cg.clone());
+        }
+    }
+}
+
+/// §35.5.4 `export "DPI-C" [c_name =] task|function sv_name;` — record the
+/// SV subroutine and the C linkage name the loaded library will call.
+fn register_dpi_export(e: &crate::ast::decl::DPIExport, elab: &mut ElaboratedModule) {
+    let name = dpi_proto_sv_name(&e.proto);
+    if elab.dpi_exports.contains(&name) {
+        return;
+    }
+    let c_name = e.c_name.clone().unwrap_or_else(|| name.clone());
+    elab.dpi_exports.push(name);
+    elab.dpi_export_c_names.push(c_name);
+}
+
 fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
     let sv_name = dpi_proto_sv_name(&di.proto);
     let c_name = di.c_name.clone().unwrap_or_else(|| sv_name.clone());
@@ -2332,6 +2488,72 @@ fn expand_enum_member(
     (out, val)
 }
 
+/// §6.19 Value-domain twin of `expand_enum_member`, for bases WIDER than 64
+/// bits: the u64 pipeline truncates every member to its low 64 bits — and
+/// runs the auto-increment chain there, so even an unspecified member
+/// carried only the low half of its predecessor. Same name expansion; the
+/// values and the increment chain are carried at full width.
+fn expand_enum_member_wide(
+    member: &crate::ast::types::EnumMember,
+    next_val: &Value,
+    width: u32,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> (Vec<(String, Value)>, Value) {
+    let one = Value::from_u64(1, width);
+    let mut val = if let Some(init) = &member.init {
+        let v = eval_const_expr_val(init, params);
+        if v.is_real {
+            Value::from_u64(eval_const_expr(init, params), width)
+        } else {
+            v.resize(width)
+        }
+    } else {
+        next_val.clone()
+    };
+    let mut out = Vec::new();
+    match &member.range {
+        None => {
+            out.push((member.name.name.clone(), val.clone()));
+            val = val.add(&one).resize(width);
+        }
+        Some((lo_e, hi_e)) => {
+            let lo = const_eval_i64_with_params(lo_e, Some(params)).unwrap_or(0);
+            let hi = const_eval_i64_with_params(hi_e, Some(params)).unwrap_or(lo);
+            let idxs: Vec<i64> = if lo <= hi {
+                (lo..=hi).collect()
+            } else {
+                (hi..=lo).rev().collect()
+            };
+            for i in idxs {
+                out.push((format!("{}{}", member.name.name, i), val.clone()));
+                val = val.add(&one).resize(width);
+            }
+        }
+    }
+    (out, val)
+}
+
+/// Full-width member values of an enum whose base exceeds 64 bits, keyed by
+/// member name — the override map the registration sites consult so the u64
+/// tables (`enum_members`, iteration order) keep their shape while the
+/// CONSTANTS the design reads carry every bit.
+pub fn wide_enum_value_map(
+    et: &crate::ast::types::EnumType,
+    width: u32,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> crate::hasher::HashMap<String, Value> {
+    let mut map: crate::hasher::HashMap<String, Value> = crate::hasher::HashMap::default();
+    let mut next = Value::from_u64(0, width);
+    for member in &et.members {
+        let (entries, nv) = expand_enum_member_wide(member, &next, width, params);
+        next = nv;
+        for (nm, v) in entries {
+            map.insert(nm, v);
+        }
+    }
+    map
+}
+
 /// Compute an anonymous enum's members in declaration order (which is the LRM
 /// §6.19.6 iteration order for first/last/next/prev/num). Mirrors the value
 /// expansion in `register_anonymous_enum_members`.
@@ -2370,11 +2592,16 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
             .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
             .unwrap_or(32);
         let mut next_val: u64 = 0;
+        let wide_vals = (base_width > 64)
+            .then(|| wide_enum_value_map(et, base_width, &elab.parameters));
         for member in &et.members {
             let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
             next_val = nv;
             for (nm, val) in entries {
-                let v = enum_member_4state(member, val, base_width, &elab.parameters);
+                let mut v = enum_member_4state(member, val, base_width, &elab.parameters);
+                if let Some(w) = wide_vals.as_ref().and_then(|m| m.get(&nm)) {
+                    v = w.clone();
+                }
                 elab.parameters.entry(nm.clone()).or_insert_with(|| v.clone());
                 elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
                     is_const: false,
@@ -2941,11 +3168,16 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             .unwrap_or(32);
         let mut next_val: u64 = 0;
         let mut members_ordered: Vec<(String, u64)> = Vec::new();
+        let wide_vals = (base_width > 64)
+            .then(|| wide_enum_value_map(et, base_width, &elab.parameters));
         for member in &et.members {
             let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
             next_val = nv;
             for (nm, val) in entries {
                 let mut v = enum_member_4state(member, val, base_width, &elab.parameters);
+                if let Some(w) = wide_vals.as_ref().and_then(|m| m.get(&nm)) {
+                    v = w.clone();
+                }
                 if !v.is_real {
                     v.is_signed = enum_signed;
                 }
@@ -3280,11 +3512,47 @@ fn collect_class_member_names(
     }
     if let Some(ext) = &c.extends {
         if let Some(defs) = all_defs {
-            if let Some(Definition::Class(parent)) = defs.get(&ext.name.name) {
+            // §8.16/§26.3: the base of a class declared in a MODULE body (or
+            // another package) may live INSIDE an imported package
+            // (`mypacket extends packet` where `packet` is `packet_pkg`'s
+            // class) rather than as a top-level Class definition. Packages
+            // are kept whole in `all_defs` (Definition::Package), so a bare
+            // `defs.get(base)` lookup misses package members and an inherited
+            // property reference in a derived constraint is wrongly rejected
+            // as undeclared. Fall back to searching every package's classes.
+            let parent: Option<&ClassDeclaration> = match defs.get(&ext.name.name) {
+                Some(Definition::Class(p)) => Some(p),
+                Some(Definition::Package(_)) | None => {
+                    find_base_class_in_packages(defs, &ext.name.name)
+                }
+                _ => None,
+            };
+            if let Some(parent) = parent {
                 collect_class_member_names(parent, all_defs, allowed, seen);
             }
         }
     }
+}
+
+/// Search every package in `defs` for a class named `name`, used to resolve
+/// a bare base-class name over which a module/package class `extends` when
+/// the base lives inside an imported package (not as a top-level Class def).
+fn find_base_class_in_packages<'a>(
+    defs: &'a HashMap<String, Definition<'a>>,
+    name: &str,
+) -> Option<&'a ClassDeclaration> {
+    for def in defs.values() {
+        if let Definition::Package(pkg) = def {
+            for item in &pkg.items {
+                if let crate::ast::decl::PackageItem::Class(c) = item {
+                    if c.name.name == name {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Add the enum constant names introduced by an enum typedef to `allowed`.
@@ -3660,6 +3928,7 @@ pub fn elaborate_module_with_defs(
                 Definition::Class(c) => {
                     validate_class_constraints(c, Some(defs), Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
+                    register_class_covergroups(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -3715,6 +3984,7 @@ pub fn elaborate_module_with_defs(
                             // `pkg::Class::method`.
                             crate::ast::decl::PackageItem::Class(c) => {
                                 register_class_enum_members(c, &mut elab);
+                                register_class_covergroups(c, &mut elab);
                                 // Snapshot so the closure does not hold a borrow
                                 // of `elab` while `elab.classes` is borrowed.
                                 let params_snapshot = elab.parameters.clone();
@@ -4197,6 +4467,7 @@ pub fn elaborate_module_with_defs(
                 crate::ast::decl::PackageItem::Class(c) => {
                     validate_class_constraints(c, all_defs, Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
+                    register_class_covergroups(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -4207,6 +4478,9 @@ pub fn elaborate_module_with_defs(
                 }
                 crate::ast::decl::PackageItem::DPIImport(di) => {
                     register_dpi_import(di, &mut elab)?;
+                }
+                crate::ast::decl::PackageItem::DPIExport(e) => {
+                    register_dpi_export(e, &mut elab);
                 }
                 _ => {}
             }
@@ -5539,6 +5813,17 @@ pub fn elaborate_module_with_defs(
                             // with large memories). The width/signed/real
                             // attributes are uniform across elements so we
                             // don't need a per-element Signal struct.
+                            // §6.8/§10.9: apply the declaration initializer as one
+                            // whole-pattern assignment (the per-element lowering of the
+                            // 1-D path walks a single dimension; this shape's initializer
+                            // was silently dropped).
+                            if let Some(init_expr) = &decl.init {
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(StatementKind::BlockingAssign {
+                                        lvalue: make_ident_expr(&decl.name.name),
+                                        rvalue: init_expr.clone(),
+                                    }, Span::dummy()), scope: String::new(), });
+                            }
                             let _ = (is_signed, width);
                             continue;
                         }
@@ -5581,6 +5866,17 @@ pub fn elaborate_module_with_defs(
                         // Per-element Signals synthesized by Simulator::new
                         // from arrays_nd — skip the per-element HashMap
                         // inserts here.
+                        // §6.8/§10.9: apply the declaration initializer as one
+                        // whole-pattern assignment (the per-element lowering of the
+                        // 1-D path walks a single dimension; this shape's initializer
+                        // was silently dropped).
+                        if let Some(init_expr) = &decl.init {
+                            elab.initial_blocks.push(InitialBlock {
+                                stmt: Statement::new(StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&decl.name.name),
+                                    rvalue: init_expr.clone(),
+                                }, Span::dummy()), scope: String::new(), });
+                        }
                         let _ = is_signed;
                         continue;
                     }
@@ -7030,10 +7326,12 @@ pub fn elaborate_module_with_defs(
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, &mut elab);
-                elab.classes.insert(
-                    cd.name.name.clone(),
-                    std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
-                );
+                let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
+                // A module-scope class remembers its module (issue #155).
+                ec.declaring_module = Some(module.name().to_string());
+                let cls = std::sync::Arc::new(ec);
+                elab.classes.insert(cd.name.name.clone(), cls);
+                register_nested_classes(cd, &cd.name.name, &mut elab);
             }
             ModuleItem::LetDeclaration(ld) => {
                 elab.lets.insert(ld.name.name.clone(), ld.clone());
@@ -7122,13 +7420,7 @@ pub fn elaborate_module_with_defs(
                 register_dpi_import(di, &mut elab)?;
             }
             ModuleItem::DPIExport(e) => {
-                let name = match &e.proto {
-                    crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
-                    crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
-                };
-                if !elab.dpi_exports.contains(&name) {
-                    elab.dpi_exports.push(name);
-                }
+                register_dpi_export(e, &mut elab);
             }
             ModuleItem::OutOfClassConstraint { class_name, constraint_name, items } => {
                 elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
@@ -7171,6 +7463,48 @@ pub fn elaborate_module_with_defs(
     }
 
     // §7.2.2: whole-struct continuous assigns expand member-wise.
+    // §35.5.4: an `export "DPI-C"` declared in a package this module never
+    // imports still names a GLOBAL C symbol. Register it under the
+    // package-qualified subroutine name (with its C alias) and bring the
+    // subroutine in under that key so the callback can reach it.
+    if let Some(defs) = all_defs {
+        let mut pkg_names: Vec<&String> = defs
+            .iter()
+            .filter(|(_, d)| matches!(d, Definition::Package(_)))
+            .map(|(n, _)| n)
+            .collect();
+        pkg_names.sort();
+        for pname in pkg_names {
+            let Some(Definition::Package(p)) = defs.get(pname) else { continue };
+            for item in &p.items {
+                let crate::ast::decl::PackageItem::DPIExport(e) = item else { continue };
+                let sv = dpi_proto_sv_name(&e.proto);
+                let q = format!("{}::{}", pname, sv);
+                if elab.dpi_exports.contains(&sv) || elab.dpi_exports.contains(&q) {
+                    continue;
+                }
+                let mut found = false;
+                for it in &p.items {
+                    match it {
+                        crate::ast::decl::PackageItem::Task(td) if td.name.name.name == sv => {
+                            elab.tasks.entry(q.clone()).or_insert_with(|| td.clone());
+                            found = true;
+                        }
+                        crate::ast::decl::PackageItem::Function(fd) if fd.name.name.name == sv => {
+                            elab.functions.entry(q.clone()).or_insert_with(|| fd.clone());
+                            found = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if found {
+                    elab.pkg_subr_owner.entry(sv.clone()).or_insert_with(|| pname.clone());
+                    elab.dpi_exports.push(q);
+                    elab.dpi_export_c_names.push(e.c_name.clone().unwrap_or(sv));
+                }
+            }
+        }
+    }
     expand_whole_struct_continuous_assigns(&mut elab);
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
@@ -8471,14 +8805,37 @@ pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
         // The packed range is intentionally not rendered: a type ARGUMENT
         // loses its range at parse time too, so keeping the bare keyword here
         // matches what an explicit `#(logic [63:0])` produces.
-        DataType::IntegerVector { kind, .. } => Some(
-            match kind {
+        // Dimensions and signing are part of the type's identity:
+        // `P#(bit[7:0])` is not `P#(bit)`. Literal bounds render inline;
+        // a bound that is not a plain integer literal cannot be named here
+        // and declines, so the caller falls back rather than aliasing.
+        DataType::IntegerVector { kind, signing, dimensions, .. } => {
+            let mut out = match kind {
                 IntegerVectorType::Bit => "bit",
                 IntegerVectorType::Logic => "logic",
                 IntegerVectorType::Reg => "reg",
             }
-            .to_string(),
-        ),
+            .to_string();
+            if matches!(signing, Some(crate::ast::types::Signing::Signed)) {
+                out.push_str(" signed");
+            }
+            for d in dimensions {
+                match d {
+                    crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                        let lit = |e: &crate::ast::expr::Expression| match &e.kind {
+                            crate::ast::expr::ExprKind::Number(
+                                crate::ast::expr::NumberLiteral::Integer { value, .. },
+                            ) => Some(value.clone()),
+                            _ => None,
+                        };
+                        let (l, r) = (lit(left)?, lit(right)?);
+                        out.push_str(&format!("[{}:{}]", l, r));
+                    }
+                    crate::ast::types::PackedDimension::Unsized(_) => return None,
+                }
+            }
+            Some(out)
+        }
         DataType::Real { kind, .. } => Some(
             match kind {
                 RealType::Real => "real",
@@ -9152,6 +9509,8 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                    !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
                    !elab.sequences.contains(name) &&
+                   // §19.7.1 `cg::type_option.f` scopes on the covergroup name.
+                   !elab.covergroups.contains_key(name) &&
                    !locals.contains(name) {
                    let loc = span_location(elab, expr.span)
                        .map(|l| format!(" at {}", l))
@@ -9415,7 +9774,19 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             // fabricated doubled names (`u0.l0.u0.l0.w0`) and phantom 1-bit
             // nets for signals that exist. If the candidate as-is is a known
             // signal or net, it needs nothing.
-            if elab.signals.contains_key(&name) || elab.nets.contains(&name) { continue; }
+            // ...but only when the candidate ALREADY LOOKS ABSOLUTE. A bare
+            // sub-module-local identifier still needs its own `<prefix>name`
+            // net even when something elsewhere shares the bare spelling, and
+            // something usually does: instance names and generate-block labels
+            // are both registered as placeholder SIGNALS. A cell's
+            // `buf B (gen, A);` beside a `begin : gen` generate block lost its
+            // implicit net and the cell read x. Nested-inlining candidates are
+            // dotted, so the dot test keeps their protection intact.
+            if name.contains('.')
+                && (elab.signals.contains_key(&name) || elab.nets.contains(&name))
+            {
+                continue;
+            }
             // The bare name is a sub-module-local identifier; after rewrite
             // it becomes `<prefix>name`.
             let prefixed = format!("{}{}", prefix, name);
@@ -10223,6 +10594,28 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             }
                         }
                     }
+                    // A fixed MULTI-dimensional array declared in a generate
+                    // block (or any other elaborate_items-routed scope): register
+                    // its real shape — the 1-D path below kept only the first
+                    // dimension — and apply its initializer as one whole-pattern
+                    // assignment.
+                    if let Some(shape) = fixed_unpacked_shape(&decl.dimensions, &elab.parameters)
+                        .filter(|sh| sh.len() > 1)
+                    {
+                        let two_state = is_type_two_state_resolved(&dd.data_type, &elab.typedef_types);
+                        register_fixed_unpacked_array(elab, &decl.name.name, &shape, width, two_state);
+                        elab.var_decl_types
+                            .entry(decl.name.name.clone())
+                            .or_insert_with(|| dd.data_type.clone());
+                        if let Some(init_expr) = &decl.init {
+                            elab.initial_blocks.push(InitialBlock {
+                                stmt: Statement::new(StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&decl.name.name),
+                                    rvalue: init_expr.clone(),
+                                }, Span::dummy()), scope: String::new(), });
+                        }
+                        continue;
+                    }
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
@@ -10530,10 +10923,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, elab);
-                elab.classes.insert(
-                    cd.name.name.clone(),
-                    std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
-                );
+                let cls = std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters)));
+                elab.classes.insert(cd.name.name.clone(), cls);
+                register_nested_classes(cd, &cd.name.name, elab);
             }
             ModuleItem::ClockingDeclaration(cd) => {
                 // §14.12 standalone designation `default clocking <name>;`
@@ -11483,6 +11875,46 @@ pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, prec_s: 
     rewrite_module_item_delays(items, unit_s, prec_s, tick_s);
 }
 
+/// Package-scope counterpart of `rewrite_module_delays_pub`: a package's
+/// classes, tasks and functions take the `timescale in effect at the
+/// package. Without this a `#200` in a package class method stayed 200 raw
+/// ticks (0.2 ns under a 1ps precision) while the same method in a module
+/// class was scaled correctly.
+/// Class-level entry for a compilation-unit (`$unit`) class declaration.
+pub fn rewrite_class_delays_pub(cd: &mut ClassDeclaration, unit_s: f64, prec_s: f64, tick_s: f64) {
+    rewrite_class_delays(cd, unit_s, prec_s, tick_s);
+}
+
+/// Statement-level entry for the compilation-unit (`$unit`) subroutines.
+pub fn rewrite_stmt_delays_pub(stmt: &mut Statement, unit_s: f64, prec_s: f64, tick_s: f64) {
+    rewrite_stmt_delays(stmt, unit_s, prec_s, tick_s);
+}
+
+pub fn rewrite_package_delays_pub(
+    items: &mut [crate::ast::decl::PackageItem],
+    unit_s: f64,
+    prec_s: f64,
+    tick_s: f64,
+) {
+    use crate::ast::decl::PackageItem;
+    for item in items.iter_mut() {
+        match item {
+            PackageItem::Class(cd) => rewrite_class_delays(cd, unit_s, prec_s, tick_s),
+            PackageItem::Task(td) => {
+                for st in td.items.iter_mut() {
+                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
+                }
+            }
+            PackageItem::Function(f) => {
+                for st in f.items.iter_mut() {
+                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Rewrite every delay expression inside a module's items so it is expressed in
 /// GLOBAL TICK units (`tick_s` seconds each), given the module's own timeunit
 /// `unit_s`. A *bare* delay `#5` is a count of `unit_s`, so it scales by
@@ -11570,6 +12002,382 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
             _ => {}
         }
     }
+}
+
+/// §6.20.2/§23.10: fold this instance's parameters into the dimensions of
+/// declarations that live INSIDE a statement — task and function locals, named
+/// blocks, fork branches.
+///
+/// Such a declaration is sized long after elaboration, from the flat
+/// design-wide parameter map — where a submodule's parameters live under their
+/// INSTANCE-QUALIFIED keys (`u_fifo.DW`). The bare `DW` the declaration spells
+/// missed that map, `const_eval_i64_with_params` returned None, and
+/// `resolve_type_width` then silently SKIPPED the dimension, leaving the local
+/// ONE BIT wide: every value stored in it was truncated to its LSB. A
+/// module-level declaration escapes this only because elaboration sizes it
+/// while the instance's parameters are still bound to their bare names.
+///
+/// Running the fold here fixes both consumers at once — the bytecode compiler
+/// and the AST interpreter read the same declaration, and after this pass its
+/// range is a literal. `prepare_module_items` caches per (module,
+/// parameter-set), so two instances with different parameters get different
+/// constants.
+///
+/// A name the body declares itself is left alone: it shadows the parameter.
+fn literalize_stmt_decl_dims(items: &mut [ModuleItem], params: &HashMap<String, Value>) {
+    // The module's own typedefs, with this instance's parameters already
+    // folded in. A statement-local declaration spelled with one of these names
+    // cannot be resolved after elaboration either: the bare typedef key is
+    // REMOVED once the module is finished (only the instance-scoped `u.vl_t`
+    // survives, and the declaration does not spell that), so the lookup missed
+    // and `resolve_type_width` fell back to its 32-bit default — silently
+    // truncating every local of a wider typedef. Same asymmetry as the
+    // parameters above: a module-level declaration is sized while the bare
+    // name is still bound, a statement-local one is not.
+    let mut tds: HashMap<String, DataType> = HashMap::default();
+    for item in items.iter() {
+        if let ModuleItem::TypedefDeclaration(td) = item {
+            let mut dt = td.data_type.clone();
+            lsdd_data_type(&mut dt, params);
+            tds.insert(td.name.name.clone(), dt);
+        }
+    }
+    if params.is_empty() && tds.is_empty() {
+        return;
+    }
+    lsdd_items(items, params, &tds);
+}
+
+fn lsdd_items(
+    items: &mut [ModuleItem],
+    params: &HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    for item in items.iter_mut() {
+        match item {
+            ModuleItem::AlwaysConstruct(ac) => {
+                lsdd_body(std::slice::from_mut(&mut ac.stmt), params, tds)
+            }
+            ModuleItem::InitialConstruct(ic) => {
+                lsdd_body(std::slice::from_mut(&mut ic.stmt), params, tds)
+            }
+            ModuleItem::FinalConstruct(fc) => {
+                lsdd_body(std::slice::from_mut(&mut fc.stmt), params, tds)
+            }
+            ModuleItem::TaskDeclaration(td) => lsdd_body(&mut td.items, params, tds),
+            ModuleItem::FunctionDeclaration(fd) => lsdd_body(&mut fd.items, params, tds),
+            ModuleItem::ClassDeclaration(cd) => lsdd_class(cd, params, tds),
+            // A module-level typedef is resolved for its own WIDTH while the
+            // parameters are still bare-bound, but its member LAYOUT is built
+            // later from the flat map — so a `logic [DW-1:0]` member still
+            // needs the fold.
+            ModuleItem::TypedefDeclaration(td) => lsdd_data_type(&mut td.data_type, params),
+            ModuleItem::GenerateFor(gf) => lsdd_items(&mut gf.items, params, tds),
+            ModuleItem::GenerateRegion(gr) => lsdd_items(&mut gr.items, params, tds),
+            ModuleItem::GenerateIf(gi) => {
+                for (_c, its) in gi.branches.iter_mut() {
+                    lsdd_items(its, params, tds);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in gc.arms.iter_mut() {
+                    lsdd_items(&mut arm.items, params, tds);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lsdd_class(
+    c: &mut crate::ast::decl::ClassDeclaration,
+    params: &HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    use crate::ast::decl::{ClassItem, ClassMethodKind};
+    for item in &mut c.items {
+        match item {
+            ClassItem::Method(m) => match &mut m.kind {
+                ClassMethodKind::Function(fd)
+                | ClassMethodKind::PureVirtual(fd)
+                | ClassMethodKind::Extern(fd) => lsdd_body(&mut fd.items, params, tds),
+                ClassMethodKind::Task(td) => lsdd_body(&mut td.items, params, tds),
+            },
+            ClassItem::Class(nc) => lsdd_class(nc, params, tds),
+            _ => {}
+        }
+    }
+}
+
+/// Replace member types of a (substituted) packed struct that name one of the
+/// module's own typedefs with the resolved type, recursively.
+fn lsdd_subst_struct_members(
+    su: &mut StructUnionType,
+    tds: &HashMap<String, DataType>,
+) {
+    for m in su.members.iter_mut() {
+        if let Some(rt) = lsdd_resolve_local_typedef(&m.data_type, tds) {
+            m.data_type = rt;
+        } else if let DataType::Struct(inner) = &mut m.data_type {
+            lsdd_subst_struct_members(inner, tds);
+        }
+    }
+}
+
+/// Replace a reference to one of this module's own typedefs with the type it
+/// names, when that type is a shape whose width would otherwise silently
+/// default to 32 bits. Deliberately narrow: enums, classes, strings and
+/// unpacked aggregates keep their named form, since only packed vectors and
+/// packed structs showed the truncation.
+fn lsdd_resolve_local_typedef(
+    dt: &DataType,
+    tds: &HashMap<String, DataType>,
+) -> Option<DataType> {
+    // Dimensions written on the REFERENCE are outer relative to the type they
+    // qualify: `vl_t [1:0]` is `logic [1:0][127:0]`. Collect them outermost
+    // first as the chain is walked, then put them in front of the target's own.
+    let mut outer: Vec<PackedDimension> = Vec::new();
+    let mut cur = dt.clone();
+    let mut hops = 0;
+    loop {
+        let DataType::TypeReference { name, dimensions, .. } = &cur else { break };
+        if name.scope.is_some() {
+            break;
+        }
+        let Some(next) = tds.get(&name.name.name) else { break };
+        outer.extend(dimensions.iter().cloned());
+        cur = next.clone();
+        hops += 1;
+        // A typedef of a typedef is legal; a cycle is not, so cap the walk.
+        if hops > 8 {
+            return None;
+        }
+    }
+    if hops == 0 {
+        return None;
+    }
+    match &mut cur {
+        DataType::IntegerVector { dimensions, .. } => {
+            if dimensions.is_empty() && outer.is_empty() {
+                return None;
+            }
+            outer.extend(dimensions.iter().cloned());
+            *dimensions = outer;
+        }
+        DataType::Struct(su) if su.packed => {
+            outer.extend(su.dimensions.iter().cloned());
+            su.dimensions = outer;
+            // The MEMBERS may name this module's typedefs too (`in_t q;`).
+            // Left as references they resolve to the 32-bit default at run
+            // time in a submodule (the bare typedef key is gone), and every
+            // member laid out above them lands at the wrong offset.
+            lsdd_subst_struct_members(su, tds);
+        }
+        // An enum keeps its members, so inlining it preserves `.name()` and
+        // `$cast` — which a bare 32-bit fallback had already lost anyway.
+        DataType::Enum(et) => {
+            outer.extend(et.dimensions.iter().cloned());
+            et.dimensions = outer;
+        }
+        _ => return None,
+    }
+    Some(cur)
+}
+
+/// One subroutine/process body. The fold runs against a lexically scoped
+/// environment seeded from the instance's parameters — see `lsdd_scope`.
+fn lsdd_body(
+    stmts: &mut [Statement],
+    params: &HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    let mut env = params.clone();
+    lsdd_scope(stmts, &mut env, tds);
+}
+
+/// Fold one lexical scope, having first bound what the scope itself declares.
+///
+/// §6.20.4: a block-scope `localparam` lowers to a plain `VarDecl` with a
+/// constant initializer, so it is the only thing that can legally size a
+/// declaration in that block — and it SHADOWS a module parameter of the same
+/// name. A declaration whose initializer is not constant un-binds the name
+/// instead, which stops the enclosing parameter from being folded in where the
+/// source never meant it.
+///
+/// Bindings are pushed and popped on one map (rather than cloning it per
+/// block) because this walks every statement of every module.
+fn lsdd_scope(
+    stmts: &mut [Statement],
+    env: &mut HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    let mut saved: Vec<(String, Option<Value>)> = Vec::new();
+    for s in stmts.iter() {
+        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            for d in declarators {
+                let cv = d
+                    .init
+                    .as_ref()
+                    .and_then(|i| const_eval_i64_with_params(i, Some(env)));
+                saved.push((d.name.name.clone(), env.get(&d.name.name).cloned()));
+                match cv {
+                    Some(v) => {
+                        let mut val = Value::from_u64(v as u64, 64);
+                        val.is_signed = true;
+                        env.insert(d.name.name.clone(), val);
+                    }
+                    None => {
+                        env.remove(&d.name.name);
+                    }
+                }
+            }
+        }
+    }
+    for s in stmts.iter_mut() {
+        lsdd_stmt(s, env, tds);
+    }
+    for (k, prev) in saved.into_iter().rev() {
+        match prev {
+            Some(v) => {
+                env.insert(k, v);
+            }
+            None => {
+                env.remove(&k);
+            }
+        }
+    }
+}
+
+fn lsdd_stmt(
+    s: &mut Statement,
+    env: &mut HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    match &mut s.kind {
+        StatementKind::VarDecl { data_type, declarators, .. } => {
+            if let Some(rt) = lsdd_resolve_local_typedef(data_type, tds) {
+                *data_type = rt;
+            } else if let DataType::Struct(su) = data_type {
+                // A struct written INLINE in the declaration: its members
+                // may still name the module's typedefs.
+                lsdd_subst_struct_members(su, tds);
+            }
+            lsdd_data_type(data_type, env);
+            for d in declarators.iter_mut() {
+                for dim in d.dimensions.iter_mut() {
+                    match dim {
+                        UnpackedDimension::Range { left, right, .. } => {
+                            lsdd_expr(left, env);
+                            lsdd_expr(right, env);
+                        }
+                        UnpackedDimension::Expression { expr, .. } => lsdd_expr(expr, env),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // §6.18: a typedef declared inside a block sizes from the same scope.
+        StatementKind::Typedef(td) => {
+            if let Some(rt) = lsdd_resolve_local_typedef(&td.data_type, tds) {
+                td.data_type = rt;
+            } else if let DataType::Struct(su) = &mut td.data_type {
+                lsdd_subst_struct_members(su, tds);
+            }
+            lsdd_data_type(&mut td.data_type, env)
+        }
+        // A named block is a new scope; the loop/branch forms below are not.
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            lsdd_scope(stmts, env, tds)
+        }
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            lsdd_stmt(stmt, env, tds)
+        }
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            lsdd_stmt(then_stmt, env, tds);
+            if let Some(e) = else_stmt {
+                lsdd_stmt(e, env, tds);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body, .. } => lsdd_stmt(body, env, tds),
+        StatementKind::Case { items, .. } => {
+            for it in items.iter_mut() {
+                lsdd_stmt(&mut it.stmt, env, tds);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lsdd_data_type(dt: &mut DataType, env: &HashMap<String, Value>) {
+    // A packed struct/union sizes its MEMBERS from the same parameters, and a
+    // member left unresolved collapses the whole layout — the aggregate is
+    // then short and every member above the bad one reads x.
+    if let DataType::Struct(su) = dt {
+        for m in su.members.iter_mut() {
+            lsdd_data_type(&mut m.data_type, env);
+            for d in m.declarators.iter_mut() {
+                for dim in d.dimensions.iter_mut() {
+                    match dim {
+                        UnpackedDimension::Range { left, right, .. } => {
+                            lsdd_expr(left, env);
+                            lsdd_expr(right, env);
+                        }
+                        UnpackedDimension::Expression { expr, .. } => lsdd_expr(expr, env),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    // An enum's BASE type carries the width. Left unresolved it collapses to
+    // one bit, and the §6.19 member-width check then REJECTS the design —
+    // `enum logic [DW-1:0] {…}` in any submodule was unusable.
+    if let DataType::Enum(et) = dt {
+        if let Some(bt) = et.base_type.as_mut() {
+            lsdd_data_type(bt, env);
+        }
+    }
+    let dims = match dt {
+        DataType::IntegerVector { dimensions, .. }
+        | DataType::Implicit { dimensions, .. }
+        | DataType::TypeReference { dimensions, .. }
+        | DataType::Struct(StructUnionType { dimensions, .. })
+        | DataType::Enum(EnumType { dimensions, .. }) => dimensions,
+        _ => return,
+    };
+    for dim in dims.iter_mut() {
+        if let PackedDimension::Range { left, right, .. } = dim {
+            lsdd_expr(left, env);
+            lsdd_expr(right, env);
+        }
+    }
+}
+
+/// Replace one dimension endpoint with its constant value, when it is not
+/// already a literal and it const-evaluates in this scope.
+fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
+    if matches!(e.kind, ExprKind::Number(_)) {
+        return;
+    }
+    // Nothing to gain on a name-free expression.
+    let mut names: Vec<String> = Vec::new();
+    collect_ident_names(e, &mut names);
+    if names.is_empty() {
+        return;
+    }
+    let Some(v) = const_eval_i64_with_params(e, Some(env)) else { return };
+    e.kind = ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+        size: None,
+        signed: true,
+        base: crate::ast::expr::NumberBase::Decimal,
+        value: v.to_string(),
+        cached_val: std::cell::Cell::new(None),
+    });
 }
 
 /// Replace a single delay expression with its tick-count equivalent.
@@ -12268,11 +13076,10 @@ pub fn is_type_two_state_resolved(
     if let DataType::Enum(e) = resolved {
         return match e.base_type.as_deref() {
             Some(bt) => is_type_two_state_resolved(bt, typedef_types),
-            // No explicit base: preserve the existing behaviour of
-            // `is_type_two_state` (`unwrap_or(false)`). Whether a default-base
-            // enum should be 2-state like its implied `int` is a separate
-            // question the audit did not settle; not changing it here.
-            None => false,
+            // §6.19: with NO base type the default is `int`, which is
+            // 2-state. Match `is_type_two_state` (`unwrap_or(true)`): a bare
+            // `enum {A0,A1} k;` default-initializes to 0, not x.
+            None => true,
         };
     }
     is_type_two_state(resolved)
@@ -12975,6 +13782,16 @@ fn funcs_tls_add<'a>(
 // `with_typedefs(td, || const_eval_…)`; the table is restored on exit.
 thread_local! {
     static TYPEDEFS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
+        = const { std::cell::RefCell::new(None) };
+    /// §6.20.3 / §20.6.2 — the packed widths of the TYPE PARAMETERS of the
+    /// instance whose behavioral items are currently being materialized, so
+    /// `rewrite_expr_impl` can fold `$bits(T)` to a literal. The binding only
+    /// exists during inlining (the `saved_type_binds` rail restores the
+    /// bare typedef slot afterwards), so at run time `$bits(T)` found no `T`
+    /// and read 1 — wrong in every expression position (cont-assign,
+    /// procedural, loop bound) while a `localparam NB = $bits(T)` folded
+    /// correctly during elaboration. Same pattern as TYPEDEFS_TLS.
+    static TYPE_BIND_WIDTHS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
         = const { std::cell::RefCell::new(None) };
     /// LRM §20.7 — thread-local array-range table for const-eval of
     /// `$size`/`$left`/`$right`/`$high`/`$low`/`$dimensions` on an
@@ -13952,6 +14769,12 @@ pub fn packed_full_dims_of(
         // element selects degrade to bit-selects and element continuous
         // assigns cannot resolve to a slice.
         DataType::Implicit { dimensions, .. } => dimensions,
+        // §7.4.2 inline packed array of packed structs: the dims written after
+        // the body are the element dims (each element is one struct); the
+        // slot flatten only consumes leading dims, so these plug in directly.
+        // Absent this arm a two-index select on such a local had no shape,
+        // and the element read collapsed to one bit.
+        DataType::Struct(su) if !su.dimensions.is_empty() => &su.dimensions,
         _ => return None,
     };
     if dims.is_empty() {
@@ -14131,6 +14954,33 @@ pub fn packed_inner_elem_width(
         }
         return Some(total / outer);
     } else { dt };
+    // §7.4.2 packed array of packed STRUCTS written inline
+    // (`struct packed {…} [1:0] a`): the element is one struct; the outer
+    // dims after the body count elements. Absent this arm the element width
+    // fell to one bit — `a[1] = '{…}` stored a single bit and `a[0].m` read x —
+    // and a typedef'd form folded into this shape by the submodule-local
+    // typedef substitution broke the same way.
+    if let DataType::Struct(su) = resolved {
+        if su.dimensions.is_empty() {
+            return None;
+        }
+        let mut no_dims = su.clone();
+        no_dims.dimensions.clear();
+        let elem = resolve_type_width(&DataType::Struct(no_dims), Some(params), Some(typedefs));
+        if elem == 0 {
+            return None;
+        }
+        // Several outer dims: an element of the outermost is the remaining
+        // sub-array, same rule as the vector case below.
+        let mut inner = elem;
+        for d in su.dimensions.iter().skip(1) {
+            let PackedDimension::Range { left, right, .. } = d else { return None };
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            inner = inner.checked_mul(((l - r).abs() + 1) as u32)?;
+        }
+        return Some(inner);
+    }
     if let DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } =
         resolved
     {
@@ -15733,7 +16583,10 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 }
                 _ => 0,
             };
-            Value::from_u64(result, 32)
+            // §20.9: `$onehot`/`$onehot0`/`$isunknown` return `bit`; the
+            // count functions return `int`.
+            let w = if matches!(name.as_str(), "$onehot" | "$onehot0" | "$isunknown") { 1 } else { 32 };
+            Value::from_u64(result, w)
         }
         // LRM §20.7 array-introspection on an array-name ident: consults
         // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
@@ -15977,6 +16830,842 @@ fn register_nested_classes(
     }
 }
 
+/// Visit every expression reachable from a statement, in evaluation-agnostic
+/// order. Statement kinds with no expression payload are skipped.
+fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
+    use crate::ast::stmt::StatementKind as K;
+    match &stmt.kind {
+        K::Expr(e) => f(e),
+        K::BlockingAssign { lvalue, rvalue } => {
+            f(lvalue);
+            f(rvalue);
+        }
+        K::NonblockingAssign { lvalue, delay, rvalue } => {
+            f(lvalue);
+            if let Some(d) = delay {
+                f(d);
+            }
+            f(rvalue);
+        }
+        K::If { condition, then_stmt, else_stmt, .. } => {
+            f(condition);
+            for_each_stmt_expr(then_stmt, f);
+            if let Some(e) = else_stmt {
+                for_each_stmt_expr(e, f);
+            }
+        }
+        K::Case { expr, items, .. } => {
+            f(expr);
+            for it in items {
+                for p in &it.patterns {
+                    f(p);
+                }
+                if let Some(g) = &it.guard {
+                    f(g);
+                }
+                for_each_stmt_expr(&it.stmt, f);
+            }
+        }
+        K::For { init, condition, step, body } => {
+            for i in init {
+                match i {
+                    crate::ast::stmt::ForInit::VarDecl { init, .. } => f(init),
+                    crate::ast::stmt::ForInit::Assign { lvalue, rvalue } => {
+                        f(lvalue);
+                        f(rvalue);
+                    }
+                }
+            }
+            if let Some(c) = condition {
+                f(c);
+            }
+            for st in step {
+                f(st);
+            }
+            for_each_stmt_expr(body, f);
+        }
+        K::Foreach { array, body, .. } => {
+            f(array);
+            for_each_stmt_expr(body, f);
+        }
+        K::ForeachTail { body, .. }
+        | K::Forever { body }
+        | K::ForeverTail { body }
+        | K::RsAction { body } => for_each_stmt_expr(body, f),
+        K::While { condition, body } | K::DoWhile { body, condition } => {
+            f(condition);
+            for_each_stmt_expr(body, f);
+        }
+        K::Repeat { count, body } => {
+            f(count);
+            for_each_stmt_expr(body, f);
+        }
+        K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+            for st in stmts {
+                for_each_stmt_expr(st, f);
+            }
+        }
+        K::TimingControl { stmt, .. } => for_each_stmt_expr(stmt, f),
+        K::Wait { condition, stmt } => {
+            f(condition);
+            for_each_stmt_expr(stmt, f);
+        }
+        K::Return(Some(e)) => f(e),
+        K::VarDecl { declarators, .. } => {
+            for d in declarators {
+                if let Some(i) = &d.init {
+                    f(i);
+                }
+            }
+        }
+        K::RandCase { items } => {
+            for (w, st) in items {
+                f(w);
+                for_each_stmt_expr(st, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Leaf names of every `force` / `release` / procedural `assign` /
+/// `deassign` target in the design's procedural code: always, initial and
+/// final blocks, module tasks and functions, and class methods. A net that is
+/// ever overridden this way must keep storage of its own — the simulator's
+/// buffer-collapse pass aliases `assign y = x` onto `x`, and a later
+/// `force y = ...` would then reach the shared net. Leaf names (the last path
+/// segment) are an over-approximation on purpose: a target spelled without
+/// its instance prefix inside a task body must still exclude the prefixed net.
+pub fn collect_override_target_leaves(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
+    collect_write_targets(elab).0
+}
+
+/// Flat names of every variable written by a procedural assignment
+/// (blocking, nonblocking, `for` init, assignment expression, `++`/`--`) in
+/// the same procedural code. Names inside inlined instance bodies are
+/// already instance-prefixed by elaboration, so these are the exact spellings
+/// the signal table uses; a task-local spelling without its prefix is not
+/// recovered (tasks writing design nets are rare, and the buffer pass only
+/// needs this to keep the delta step between a procedurally written variable
+/// and a net that copies it).
+pub fn collect_procedural_write_names(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
+    collect_write_targets(elab).1
+}
+
+fn collect_write_targets(
+    elab: &ElaboratedModule,
+) -> (crate::hasher::HashSet<String>, crate::hasher::HashSet<String>) {
+    fn flat(e: &Expression, out: &mut crate::hasher::HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                out.insert(
+                    h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."),
+                );
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = crate::hasher::HashSet::default();
+                flat(expr, &mut base);
+                for b in base {
+                    out.insert(format!("{}.{}", b, member.name));
+                }
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => flat(expr, out),
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    flat(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn leaf(e: &Expression, out: &mut crate::hasher::HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if let Some(s) = h.path.last() {
+                    out.insert(s.name.name.clone());
+                }
+            }
+            ExprKind::MemberAccess { member, .. } => {
+                out.insert(member.name.clone());
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => leaf(expr, out),
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    leaf(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    struct Sets {
+        overrides: crate::hasher::HashSet<String>,
+        writes: crate::hasher::HashSet<String>,
+    }
+    fn write_expr(e: &Expression, out: &mut Sets) {
+        match &e.kind {
+            ExprKind::AssignExpr { lvalue, .. } => flat(lvalue, &mut out.writes),
+            ExprKind::Unary { operand, .. } => flat(operand, &mut out.writes),
+            _ => {}
+        }
+    }
+    fn walk(stmt: &Statement, out: &mut Sets) {
+        use crate::ast::stmt::ProceduralContinuous as PC;
+        use crate::ast::stmt::StatementKind as K;
+        match &stmt.kind {
+            K::ProceduralContinuous(pc) => match pc {
+                PC::Assign { lvalue, .. } | PC::Force { lvalue, .. } => {
+                    leaf(lvalue, &mut out.overrides)
+                }
+                PC::Deassign(e) | PC::Release(e) => leaf(e, &mut out.overrides),
+            },
+            K::BlockingAssign { lvalue, .. } | K::NonblockingAssign { lvalue, .. } => {
+                flat(lvalue, &mut out.writes)
+            }
+            K::Expr(e) => write_expr(e, out),
+            K::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    walk(e, out);
+                }
+            }
+            K::Case { items, .. } => {
+                for it in items {
+                    walk(&it.stmt, out);
+                }
+            }
+            K::For { init, step, body, .. } => {
+                for i in init {
+                    if let crate::ast::stmt::ForInit::Assign { lvalue, .. } = i {
+                        flat(lvalue, &mut out.writes);
+                    }
+                }
+                for st in step {
+                    write_expr(st, out);
+                }
+                walk(body, out);
+            }
+            K::Foreach { body, .. }
+            | K::ForeachTail { body, .. }
+            | K::Forever { body }
+            | K::ForeverTail { body }
+            | K::RsAction { body }
+            | K::While { body, .. }
+            | K::DoWhile { body, .. }
+            | K::Repeat { body, .. } => walk(body, out),
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+                for st in stmts {
+                    walk(st, out);
+                }
+            }
+            K::TimingControl { stmt, .. } | K::Wait { stmt, .. } => walk(stmt, out),
+            K::RandCase { items } => {
+                for (_, st) in items {
+                    walk(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    use crate::ast::decl::ClassMethodKind as CMK;
+    let mut out = Sets {
+        overrides: crate::hasher::HashSet::default(),
+        writes: crate::hasher::HashSet::default(),
+    };
+    for b in &elab.always_blocks {
+        walk(&b.stmt, &mut out);
+    }
+    for b in elab.initial_blocks.iter().chain(elab.final_blocks.iter()) {
+        walk(&b.stmt, &mut out);
+    }
+    for t in elab.tasks.values() {
+        for s in &t.items {
+            walk(s, &mut out);
+        }
+    }
+    for f in elab.functions.values() {
+        for s in &f.items {
+            walk(s, &mut out);
+        }
+    }
+    for c in elab.classes.values() {
+        for m in c.methods.values() {
+            match &m.kind {
+                CMK::Function(f) | CMK::Extern(f) | CMK::PureVirtual(f) => {
+                    for s in &f.items {
+                        walk(s, &mut out);
+                    }
+                }
+                CMK::Task(t) => {
+                    for s in &t.items {
+                        walk(s, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    (out.overrides, out.writes)
+}
+
+/// Visit every sub-expression (pre-order, `e` included).
+fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
+    f(e);
+    match &e.kind {
+        ExprKind::Unary { operand, .. } => for_each_sub_expr(operand, f),
+        ExprKind::Binary { left, right, .. } => {
+            for_each_sub_expr(left, f);
+            for_each_sub_expr(right, f);
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            for_each_sub_expr(condition, f);
+            for_each_sub_expr(then_expr, f);
+            for_each_sub_expr(else_expr, f);
+        }
+        ExprKind::Concatenation(xs) | ExprKind::StreamOp { exprs: xs, .. } => {
+            for x in xs {
+                for_each_sub_expr(x, f);
+            }
+        }
+        ExprKind::Replication { count, exprs } => {
+            for_each_sub_expr(count, f);
+            for x in exprs {
+                for_each_sub_expr(x, f);
+            }
+        }
+        ExprKind::AssignmentPattern(items) => {
+            for it in items {
+                for_each_sub_expr(it.expr(), f);
+            }
+        }
+        ExprKind::Call { func, args } => {
+            for_each_sub_expr(func, f);
+            for a in args {
+                for_each_sub_expr(a, f);
+            }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args {
+                for_each_sub_expr(a, f);
+            }
+        }
+        ExprKind::NamedArg { expr: Some(x), .. } => for_each_sub_expr(x, f),
+        ExprKind::Inside { expr, ranges } => {
+            for_each_sub_expr(expr, f);
+            for r in ranges {
+                for_each_sub_expr(r, f);
+            }
+        }
+        ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Specialization { base: expr, .. }
+        | ExprKind::Paren(expr)
+        | ExprKind::ShallowCopy { source: expr } => for_each_sub_expr(expr, f),
+        ExprKind::Index { expr, index } => {
+            for_each_sub_expr(expr, f);
+            for_each_sub_expr(index, f);
+        }
+        ExprKind::RangeSelect { expr, left, right, .. } => {
+            for_each_sub_expr(expr, f);
+            for_each_sub_expr(left, f);
+            for_each_sub_expr(right, f);
+        }
+        ExprKind::Range(a, b) | ExprKind::AssignExpr { lvalue: a, rvalue: b } => {
+            for_each_sub_expr(a, f);
+            for_each_sub_expr(b, f);
+        }
+        ExprKind::WithClause { expr, filter } => {
+            for_each_sub_expr(expr, f);
+            for_each_sub_expr(filter, f);
+        }
+        ExprKind::RandomizeWith { call, .. } => for_each_sub_expr(call, f),
+        ExprKind::SvaClocked { clock, body } => {
+            for_each_sub_expr(clock, f);
+            for_each_sub_expr(body, f);
+        }
+        _ => {}
+    }
+}
+
+/// Every name DECLARED anywhere in the design: ports, nets, variables,
+/// parameters, typedefs and their enum members, genvars, subroutines, class
+/// properties and methods, clocking/let/property/sequence/covergroup names —
+/// across modules, interfaces, programs, packages, classes, generate blocks.
+fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> HashSet<String> {
+    fn data_type_names(dt: &DataType, out: &mut HashSet<String>) {
+        if let DataType::Enum(e) = dt {
+            for m in &e.members {
+                out.insert(m.name.name.clone());
+            }
+        }
+    }
+    fn param(p: &ParameterDeclaration, out: &mut HashSet<String>) {
+        if let ParameterKind::Data { data_type, assignments } = &p.kind {
+            data_type_names(data_type, out);
+            for a in assignments {
+                out.insert(a.name.name.clone());
+            }
+        }
+    }
+    fn typedef(t: &crate::ast::decl::TypedefDeclaration, out: &mut HashSet<String>) {
+        out.insert(t.name.name.clone());
+        data_type_names(&t.data_type, out);
+    }
+    fn ports(pl: &PortList, out: &mut HashSet<String>) {
+        match pl {
+            PortList::Ansi(ps) => {
+                for p in ps {
+                    out.insert(p.name.name.clone());
+                }
+            }
+            PortList::NonAnsi(ids) => {
+                for id in ids {
+                    out.insert(id.name.clone());
+                }
+            }
+            PortList::Empty => {}
+        }
+    }
+    fn class_items(c: &crate::ast::decl::ClassDeclaration, out: &mut HashSet<String>) {
+        use crate::ast::decl::ClassItem as CI;
+        out.insert(c.name.name.clone());
+        for p in &c.params {
+            param(p, out);
+        }
+        for it in &c.items {
+            match it {
+                CI::Property(p) => {
+                    data_type_names(&p.data_type, out);
+                    for d in &p.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                CI::Method(m) => match &m.kind {
+                    crate::ast::decl::ClassMethodKind::Function(fd)
+                    | crate::ast::decl::ClassMethodKind::PureVirtual(fd) => {
+                        out.insert(fd.name.name.name.clone());
+                    }
+                    crate::ast::decl::ClassMethodKind::Task(td) => {
+                        out.insert(td.name.name.name.clone());
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {}
+                },
+                CI::Typedef(t) => typedef(t, out),
+                CI::Parameter(p) => param(p, out),
+                CI::Class(inner) => class_items(inner, out),
+                CI::Covergroup(cg) => {
+                    out.insert(cg.name.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    fn dpi_name(di: &crate::ast::decl::DPIImport) -> String {
+        match &di.proto {
+            crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
+            crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
+        }
+    }
+    fn module_items(items: &[ModuleItem], out: &mut HashSet<String>) {
+        for it in items {
+            match it {
+                ModuleItem::PortDeclaration(pd) => {
+                    data_type_names(&pd.data_type, out);
+                    for d in &pd.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::NetDeclaration(nd) => {
+                    data_type_names(&nd.data_type, out);
+                    for d in &nd.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::DataDeclaration(dd) => {
+                    data_type_names(&dd.data_type, out);
+                    for d in &dd.declarators {
+                        out.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                    param(p, out);
+                }
+                ModuleItem::TypedefDeclaration(t) => typedef(t, out),
+                ModuleItem::GenvarDeclaration(g) => {
+                    for n in &g.names {
+                        out.insert(n.name.clone());
+                    }
+                }
+                ModuleItem::FunctionDeclaration(fd) => {
+                    out.insert(fd.name.name.name.clone());
+                }
+                ModuleItem::TaskDeclaration(td) => {
+                    out.insert(td.name.name.name.clone());
+                }
+                ModuleItem::DPIImport(di) => {
+                    out.insert(dpi_name(di));
+                }
+                ModuleItem::ClassDeclaration(c) => class_items(c, out),
+                ModuleItem::ClockingDeclaration(c) => {
+                    out.insert(c.name.name.clone());
+                }
+                ModuleItem::LetDeclaration(l) => {
+                    out.insert(l.name.name.clone());
+                }
+                ModuleItem::PropertyDeclaration(p) => {
+                    out.insert(p.name.name.clone());
+                }
+                ModuleItem::SequenceDeclaration(sq) => {
+                    out.insert(sq.name.name.clone());
+                }
+                ModuleItem::CovergroupDeclaration(cg) => {
+                    out.insert(cg.name.name.clone());
+                }
+                ModuleItem::NettypeDeclaration(n) => {
+                    out.insert(n.name.name.clone());
+                }
+                ModuleItem::ModuleInstantiation(mi) => {
+                    for hi in &mi.instances {
+                        out.insert(hi.name.name.clone());
+                    }
+                }
+                ModuleItem::GenerateRegion(gr) => module_items(&gr.items, out),
+                ModuleItem::GenerateIf(gi) => {
+                    for (_, items) in &gi.branches {
+                        module_items(items, out);
+                    }
+                }
+                ModuleItem::GenerateFor(gf) => {
+                    out.insert(gf.var.clone());
+                    module_items(&gf.items, out);
+                }
+                ModuleItem::GenerateCase(gc) => {
+                    for arm in &gc.arms {
+                        module_items(&arm.items, out);
+                    }
+                }
+                ModuleItem::NestedModule(m) => {
+                    for p in &m.params {
+                        param(p, out);
+                    }
+                    ports(&m.ports, out);
+                    module_items(&m.items, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::default();
+    for def in definitions.values() {
+        out.insert(def.name().to_string());
+        for p in def.params() {
+            param(p, &mut out);
+        }
+        ports(def.ports(), &mut out);
+        match def {
+            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_) => {
+                module_items(def.items(), &mut out);
+            }
+            Definition::Package(p) => {
+                use crate::ast::decl::PackageItem as PI;
+                for it in &p.items {
+                    match it {
+                        PI::Parameter(pd) => param(pd, &mut out),
+                        PI::Typedef(t) => typedef(t, &mut out),
+                        PI::Function(fd) => {
+                            out.insert(fd.name.name.name.clone());
+                        }
+                        PI::Task(td) => {
+                            out.insert(td.name.name.name.clone());
+                        }
+                        PI::DPIImport(di) => {
+                            out.insert(dpi_name(di));
+                        }
+                        PI::Data(dd) => {
+                            data_type_names(&dd.data_type, &mut out);
+                            for d in &dd.declarators {
+                                out.insert(d.name.name.clone());
+                            }
+                        }
+                        PI::Class(c) => class_items(c, &mut out),
+                        PI::Let(l) => {
+                            out.insert(l.name.name.clone());
+                        }
+                        PI::Nettype(n) => {
+                            out.insert(n.name.name.clone());
+                        }
+                        PI::Property(pr) => {
+                            out.insert(pr.name.name.clone());
+                        }
+                        PI::Sequence(sq) => {
+                            out.insert(sq.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Definition::Class(c) => class_items(c, &mut out),
+            Definition::Typedef(t) => typedef(t, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Names a statement itself declares — block-local variables, for/foreach
+/// loop variables, named blocks. Flow-insensitive: a name declared anywhere
+/// in the body counts everywhere in it.
+fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
+    use crate::ast::stmt::StatementKind as K;
+    match &stmt.kind {
+        K::VarDecl { declarators, .. } => {
+            for d in declarators {
+                out.insert(d.name.name.clone());
+            }
+        }
+        K::For { init, body, .. } => {
+            for i in init {
+                if let crate::ast::stmt::ForInit::VarDecl { name, .. } = i {
+                    out.insert(name.name.clone());
+                }
+            }
+            collect_stmt_declared_names(body, out);
+        }
+        K::Foreach { vars, body, .. } => {
+            for v in vars.iter().flatten() {
+                out.insert(v.name.clone());
+            }
+            collect_stmt_declared_names(body, out);
+        }
+        K::ForeachTail { loop_var, body, keys, .. } => {
+            if let Some(v) = loop_var {
+                out.insert(v.clone());
+            }
+            for k in keys {
+                out.insert(k.clone());
+            }
+            collect_stmt_declared_names(body, out);
+        }
+        K::If { then_stmt, else_stmt, .. } => {
+            collect_stmt_declared_names(then_stmt, out);
+            if let Some(e) = else_stmt {
+                collect_stmt_declared_names(e, out);
+            }
+        }
+        K::Case { items, .. } => {
+            for it in items {
+                collect_stmt_declared_names(&it.stmt, out);
+            }
+        }
+        K::While { body, .. }
+        | K::DoWhile { body, .. }
+        | K::Repeat { body, .. }
+        | K::Forever { body }
+        | K::ForeverTail { body }
+        | K::RsAction { body } => collect_stmt_declared_names(body, out),
+        K::SeqBlock { name, stmts } | K::ParBlock { name, stmts, .. } => {
+            if let Some(n) = name {
+                out.insert(n.name.clone());
+            }
+            for st in stmts {
+                collect_stmt_declared_names(st, out);
+            }
+        }
+        K::TimingControl { stmt, .. } | K::Wait { stmt, .. } => {
+            collect_stmt_declared_names(stmt, out);
+        }
+        K::RandCase { items } => {
+            for (_, st) in items {
+                collect_stmt_declared_names(st, out);
+            }
+        }
+        K::Typedef(t) => {
+            out.insert(t.name.name.clone());
+            if let DataType::Enum(e) = &t.data_type {
+                for m in &e.members {
+                    out.insert(m.name.name.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An identifier or call in an inlined sub-instance body that NOTHING in the
+/// design declares is an error — the reference tooling rejects it at
+/// elaboration. The per-module validator only ever saw the TOP module's
+/// blocks; sub-instance bodies are inlined afterwards and were never checked,
+/// so `chk_always(...)` in an RTL module bound to a stale header that lacked
+/// it simply never ran (assertions silently vanished), and a typo'd signal in
+/// a child read x for the whole run.
+///
+/// The bar is deliberately "declared nowhere": a bare name is accepted if the
+/// instance's own module declares it (`local_names`, ports, interfaces), the
+/// body declares it, any elaborated table knows it under any scope, or any
+/// definition in the design declares it. Scope resolution is the runtime's
+/// job; this only catches names that cannot resolve anywhere.
+fn validate_inlined_bodies(
+    elab: &ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+) -> Result<(), String> {
+    if elab.pending_always.is_empty()
+        && elab.pending_initial.is_empty()
+        && elab.pending_cont_assign.is_empty()
+    {
+        return Ok(());
+    }
+    let mut known = collect_design_declared_names(definitions);
+    // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
+    let mut add_key = |k: &str| {
+        let leaf = k.rsplit('.').next().unwrap_or(k);
+        let base = leaf.split('[').next().unwrap_or(leaf);
+        known.insert(base.to_string());
+    };
+    for k in elab.signals.keys() {
+        add_key(k);
+    }
+    for k in elab.parameters.keys() {
+        add_key(k);
+    }
+    for k in elab.arrays.keys() {
+        add_key(k);
+    }
+    for k in elab.associative_arrays.keys() {
+        add_key(k);
+    }
+    for k in elab.arrays_2d.keys() {
+        add_key(k);
+    }
+    for k in elab.arrays_nd.keys() {
+        add_key(k);
+    }
+    for k in elab.dynamic_arrays.iter() {
+        add_key(k);
+    }
+    for k in elab.functions.keys() {
+        add_key(k);
+    }
+    for k in elab.tasks.keys() {
+        add_key(k);
+    }
+    for k in elab.dpi_imports.keys() {
+        add_key(k);
+    }
+    for k in elab.classes.keys() {
+        add_key(k);
+    }
+    for k in elab.typedefs.keys() {
+        add_key(k);
+    }
+    for k in elab.typedef_types.keys() {
+        add_key(k);
+    }
+    for k in elab.lets.keys() {
+        add_key(k);
+    }
+    for k in elab.sequences.iter() {
+        add_key(k);
+    }
+    for k in elab.clocking_blocks.keys() {
+        add_key(k);
+    }
+    for k in elab.interfaces.iter() {
+        add_key(k);
+    }
+    for ms in elab.enum_members.values() {
+        for (n, _) in ms {
+            add_key(n);
+        }
+    }
+    for m in elab.package_enum_members.values() {
+        for n in m.keys() {
+            add_key(n);
+        }
+    }
+    let known = known;
+
+    // One check per distinct source body: sibling instances share the Rc.
+    let mut seen: HashSet<usize> = HashSet::default();
+    let mut first: Option<(String, Span, String)> = None;
+    let mut check_body = |source_ptr: usize,
+                          ctx: &RewriteCtx,
+                          locals: &HashSet<String>,
+                          visit: &mut dyn FnMut(&mut dyn FnMut(&Expression))| {
+        if first.is_some() || !seen.insert(source_ptr) {
+            return;
+        }
+        let mut check_expr = |e: &Expression| {
+            for_each_sub_expr(e, &mut |x| {
+                if first.is_some() {
+                    return;
+                }
+                let h = match &x.kind {
+                    ExprKind::Ident(h) => h,
+                    ExprKind::Call { func, .. } => match &func.kind {
+                        ExprKind::Ident(h) => h,
+                        _ => return,
+                    },
+                    _ => return,
+                };
+                if h.root.is_some() || h.path.len() != 1 {
+                    return;
+                }
+                let raw = h.path[0].name.name.as_str();
+                let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+                if name.starts_with('$')
+                    || name.contains('.')
+                    || matches!(
+                        name,
+                        "new" | "super" | "this" | "randomize" | "std" | "process" | "null"
+                    )
+                    || (name.starts_with("genblk")
+                        && name.len() > 6
+                        && name[6..].chars().all(|c| c.is_ascii_digit()))
+                    || ctx.local_names.contains(name)
+                    || ctx.port_map.contains_key(name)
+                    || ctx.interface_map.contains_key(name)
+                    || ctx.type_binds.contains_key(name)
+                    || locals.contains(name)
+                    || known.contains(name)
+                {
+                    return;
+                }
+                first = Some((name.to_string(), x.span, ctx.owner.clone()));
+            });
+        };
+        visit(&mut check_expr);
+    };
+    for p in &elab.pending_always {
+        let mut locals = HashSet::default();
+        collect_stmt_declared_names(&p.source, &mut locals);
+        let src = &p.source;
+        check_body(std::rc::Rc::as_ptr(src) as usize, &p.ctx, &locals, &mut |f| {
+            for_each_stmt_expr(src, f)
+        });
+    }
+    for p in &elab.pending_initial {
+        let mut locals = HashSet::default();
+        collect_stmt_declared_names(&p.source, &mut locals);
+        let src = &p.source;
+        check_body(std::rc::Rc::as_ptr(src) as usize, &p.ctx, &locals, &mut |f| {
+            for_each_stmt_expr(src, f)
+        });
+    }
+    for p in &elab.pending_cont_assign {
+        let locals = HashSet::default();
+        let (l, r) = (&p.lhs_source, &p.rhs_source);
+        check_body(std::rc::Rc::as_ptr(r) as usize, &p.ctx, &locals, &mut |f| {
+            f(l);
+            f(r);
+        });
+    }
+    if let Some((name, span, owner)) = first {
+        let loc = span_location_of(elab, span, &owner)
+            .map(|l| format!(" at {}", l))
+            .unwrap_or_default();
+        return Err(format!("Undeclared identifier '{}'{}", name, loc));
+    }
+    Ok(())
+}
+
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
@@ -16073,6 +17762,22 @@ pub fn inline_instantiations(
                     }
                     let Some(members) = elab.enum_members.get(&td.name.name).cloned() else { continue };
                     let w = elab.typedefs.get(&td.name.name).copied().unwrap_or(32).max(1);
+                    // §6.19 wide base: the (u64, width) table truncates past
+                    // 64 bits, so ALSO park the full Value under the
+                    // qualified spelling in `parameters` — the runtime's
+                    // qualified lookup consults it first for wide members.
+                    if w > 64 {
+                        if let DataType::Enum(et) = &td.data_type {
+                            for (m, v) in wide_enum_value_map(et, w, &elab.parameters) {
+                                params_insert_traced(
+                                    &mut elab.parameters,
+                                    line!(),
+                                    format!("{}::{}", name, m),
+                                    v,
+                                );
+                            }
+                        }
+                    }
                     let slot = elab.package_enum_members.entry(name.clone()).or_default();
                     for (m, v) in members {
                         slot.insert(m, (v, w));
@@ -16082,10 +17787,12 @@ pub fn inline_instantiations(
                     match item {
                         crate::ast::decl::PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);
-                            elab.classes.insert(
-                        c.name.name.clone(),
-                        std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
-                    );
+                            let cls = std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters)));
+                            let pkg_scoped = format!("{}::{}", name, c.name.name);
+                            elab.classes.insert(pkg_scoped.clone(), cls.clone());
+                            elab.classes.insert(c.name.name.clone(), cls);
+                            register_nested_classes(c, &c.name.name, elab);
+                            register_nested_classes(c, &pkg_scoped, elab);
                         }
                         crate::ast::decl::PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
@@ -16383,6 +18090,7 @@ pub fn inline_instantiations(
         None => return Err(format!("Top module '{}' not found in module map", module_name)),
     };
     // Recursively inline starting from the top module's items
+    MODPORT_EXPR_TLS.with(|m| m.borrow_mut().clear());
     let top_params = elab.parameters.clone();
     // Snapshot the now-complete package/$unit parameters as the const-eval
     // fallback so sub-module header localparams (evaluated in the instance-merge
@@ -16457,6 +18165,8 @@ pub fn inline_instantiations(
         assign.lhs = rewrite_expr(&assign.lhs, prefix, &port_map, &local_names, &interface_map);
         assign.rhs = rewrite_expr(&assign.rhs, prefix, &port_map, &local_names, &interface_map);
     }
+
+    validate_inlined_bodies(elab, definitions)?;
 
     Ok(())
 }
@@ -17998,6 +19708,12 @@ fn prepare_module_items(
 
     let mut effective_items = collect_effective_items(source_def.items(), local_params);
 
+    // Bind this instance's parameters into statement-local declarations while
+    // they are still resolvable by their bare names — after elaboration only
+    // the instance-qualified keys survive, and a local sized `[DW-1:0]` would
+    // silently become 1 bit wide.
+    literalize_stmt_decl_dims(&mut effective_items, local_params);
+
     // §23.3.2: expand arrays of module instances into individual instances with
     // bit-sliced vector connections, before body_sources/driver derivation.
     if effective_items.iter().any(|it| {
@@ -18100,6 +19816,20 @@ fn prepare_module_items(
             }
             ModuleItem::TaskDeclaration(td) => {
                 local_names.insert(td.name.name.name.clone());
+            }
+            // §6.19: enum MEMBERS are named constants of this scope. Absent
+            // from this set, an inlined expression kept the bare member name
+            // and resolved through the flat first-wins slot, so a later
+            // differently-parameterized instance read the FIRST instance's
+            // member value (`OTHER = V + 1` stuck at the first V). The
+            // instance-scoped entries the rewrite will now point at are
+            // registered unconditionally at instance time.
+            ModuleItem::TypedefDeclaration(td) => {
+                if let DataType::Enum(et) = &td.data_type {
+                    for m in &et.members {
+                        local_names.insert(m.name.name.clone());
+                    }
+                }
             }
             ModuleItem::ModuleInstantiation(inst) => {
                 // §23.6: CHILD INSTANCE names are local names of this module —
@@ -18221,6 +19951,17 @@ fn prepare_module_items(
             ),
             ModuleItem::AlwaysConstruct(ac) => BodySource::Always(ac.kind, std::rc::Rc::new(ac.stmt.clone()), ac.gen_scope.clone()),
             ModuleItem::InitialConstruct(ic) => BodySource::Initial(std::rc::Rc::new(ic.stmt.clone()), ic.gen_scope.clone()),
+            // §16.5: a concurrent assertion in an INLINED instance (sub-module
+            // or interface) travels like the top-level hoist — one synthetic
+            // initial statement the runtime registers as a clocked site. It
+            // used to fall to `Other` and vanish: no site, no failure, ever.
+            ModuleItem::AssertionItem(a) => BodySource::Initial(
+                std::rc::Rc::new(crate::ast::stmt::Statement::new(
+                    crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                    a.span,
+                )),
+                String::new(),
+            ),
             _ => BodySource::Other,
         }
     }).collect();
@@ -18582,6 +20323,25 @@ fn defparam_path_segments(e: &Expression) -> Option<Vec<String>> {
     }
 }
 
+/// §6.18/§23.10: a submodule VARIABLE declared with one of the module's own
+/// typedefs records the INSTANCE-scoped typedef name as its `type_name`, so
+/// run-time reflection (`.name()`, `.num()`, `.first()`) keys the right
+/// member list — the bare name is unbound after inlining and collides across
+/// modules that reuse common typedef names like `state_e`.
+fn scope_local_type_name(
+    tn: Option<String>,
+    local_typedefs: &std::collections::HashSet<String>,
+    inst_prefix: &str,
+) -> Option<String> {
+    tn.map(|t| {
+        if local_typedefs.contains(&t) {
+            format!("{}{}", inst_prefix, t)
+        } else {
+            t
+        }
+    })
+}
+
 /// §6.18/§23.10: rename every bare `TypeReference` in `dt` that names one of
 /// `local_names` to its instance-scoped form `"<prefix><name>"`. A typedef
 /// stored under a scoped key still carried BARE member-type references, so a
@@ -18645,6 +20405,105 @@ fn qualify_sibling_conn(
     }
 }
 
+thread_local! {
+    /// §25.5.4 modport expression members, keyed `<interface instance>.<member>`
+    /// (instance name as it appears in signal names), valued by the member's
+    /// expression rewritten to that instance's signals. Filled per module by
+    /// `register_modport_expressions` before its sub-instances are inlined,
+    /// consulted by the interface-map arm of `rewrite_expr_impl`.
+    static MODPORT_EXPR_TLS: std::cell::RefCell<HashMap<String, Expression>> =
+        std::cell::RefCell::new(HashMap::default());
+    /// Set by the three substitution sites when they return a modport
+    /// expression, so the `Index` arm knows its base is a packed
+    /// part-select it may fold (an unpacked array SLICE keeps its original
+    /// indices, so the fold must never apply to arbitrary bases).
+    static MODPORT_SUBST_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Signal names an interface definition declares (ports, nets, variables),
+/// so a modport expression's identifiers can be prefixed with the instance.
+fn interface_signal_names(idef: &crate::ast::module::InterfaceDeclaration) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    match &idef.ports {
+        PortList::Ansi(ps) => {
+            for p in ps {
+                out.insert(p.name.name.clone());
+            }
+        }
+        PortList::NonAnsi(ids) => {
+            for id in ids {
+                out.insert(id.name.clone());
+            }
+        }
+        PortList::Empty => {}
+    }
+    for it in &idef.items {
+        match it {
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators {
+                    out.insert(d.name.name.clone());
+                }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators {
+                    out.insert(d.name.name.clone());
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    out.insert(d.name.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Register every modport EXPRESSION member of the interface instances a
+/// module declares (`ifc i();` with `modport lo8 (output .b(word[7:0]))`)
+/// under `<prefix><inst>.<member>`, each expression rewritten onto the
+/// instance's signals. Must run before the module's sub-instances are inlined
+/// so a child's `p.b` (through `ifc.lo8 p`) can substitute it.
+fn register_modport_expressions(
+    items: &[ModuleItem],
+    prefix: &str,
+    definitions: &HashMap<String, Definition>,
+) {
+    for it in items {
+        let ModuleItem::ModuleInstantiation(inst) = it else { continue };
+        let Some(Definition::Interface(idef)) = definitions.get(&inst.module_name.name) else {
+            continue;
+        };
+        let has_exprs = idef.items.iter().any(|item| {
+            matches!(item, ModuleItem::ModportDeclaration(md)
+                if md.items.iter().any(|mp| mp.ports.iter().any(|p| p.expr.is_some())))
+        });
+        if !has_exprs {
+            continue;
+        }
+        let names = interface_signal_names(idef);
+        let empty_pm: HashMap<String, Expression> = HashMap::default();
+        let empty_if: HashMap<String, String> = HashMap::default();
+        for hi in &inst.instances {
+            let inst_name = format!("{}{}", prefix, hi.name.name);
+            let inst_prefix = format!("{}.", inst_name);
+            for item in &idef.items {
+                let ModuleItem::ModportDeclaration(md) = item else { continue };
+                for mp in &md.items {
+                    for p in &mp.ports {
+                        let Some(e) = &p.expr else { continue };
+                        let rewritten = rewrite_expr(e, &inst_prefix, &empty_pm, &names, &empty_if);
+                        MODPORT_EXPR_TLS.with(|m| {
+                            m.borrow_mut().insert(format!("{}.{}", inst_name, p.name.name), rewritten);
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -18680,6 +20539,7 @@ fn inline_module_items(
     // rewrite leaves it unprefixed — the connection then bound the port to a
     // phantom top-level name and, e.g., a whole-struct write through it
     // silently vanished for every NON-top instantiation of the module.
+    register_modport_expressions(source_def.items(), prefix, definitions);
     let sibling_inst_names: std::collections::HashSet<String> = prepared_source
         .effective_items
         .iter()
@@ -18813,6 +20673,12 @@ fn inline_module_items(
                 let __th = std::time::Instant::now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                // Bare-name keys this instance adds to the design-wide
+                // geometry tables while its body is processed (see the
+                // DataDeclaration arm below); removed again when the
+                // instance is fully inlined, so they cannot be matched by
+                // an unrelated same-named declaration elsewhere.
+                let mut inst_bare_keys: Vec<(u8, String)> = Vec::new();
                 // §3.3/§23.3.2: one instance name per scope. Accepting a
                 // duplicate elaborated BOTH instances and applied the second
                 // #() override to each (the override map is name-keyed) —
@@ -18887,8 +20753,17 @@ fn inline_module_items(
                             continue;
                         }
                         let scoped = format!("{}{}", inst_prefix, name);
+                        // §6.10: the implicit net belongs to THIS instance, so
+                        // the existence test must be SCOPED. A bare
+                        // `signals.contains_key(name)` skipped creation
+                        // whenever anything ANYWHERE shared the bare spelling —
+                        // including an INSTANCE-NAME placeholder, since
+                        // instantiating `foo c (...)` registers a signal named
+                        // `c`. A gate library hits this constantly: a cell's
+                        // `buf IC (clk, dCK);` wants its own implicit `clk`,
+                        // every design has some other `clk`, and the cell's
+                        // flops were then never clocked and read x.
                         if elab.signals.contains_key(&scoped)
-                            || elab.signals.contains_key(&name)
                             || elab.parameters.contains_key(&name)
                             || elab.parameters.contains_key(&scoped)
                             || elab.nets.contains(&scoped)
@@ -19625,6 +21500,40 @@ fn inline_module_items(
                                 }
                             }
                         }
+                        // Enum typedef MEMBERS are elaboration constants of
+                        // this scope too (§6.19). They were never collected
+                        // here, so a member with a parameter-dependent value
+                        // (`MAGIC = V`) was absent from the instance's local
+                        // environment — the cont-assign const-folder then fell
+                        // back to the flat bare slot, which is first-wins
+                        // across instances, and every later instance folded
+                        // the FIRST instance's value in. Recomputed each
+                        // round like the localparams above, so a member
+                        // depending on a later-resolved name converges.
+                        for item in &effective_items {
+                            if let ModuleItem::TypedefDeclaration(td) = item {
+                                if let DataType::Enum(et) = &td.data_type {
+                                    let bw = et.base_type.as_ref()
+                                        .map(|bt| resolve_type_width(bt, Some(local_map), Some(&elab_ro.typedefs)))
+                                        .unwrap_or(32);
+                                    let mut next_val: u64 = 0;
+                                    for member in &et.members {
+                                        let val = if let Some(init) = &member.init {
+                                            eval_const_expr(init, local_map)
+                                        } else { next_val };
+                                        next_val = val.wrapping_add(1);
+                                        if frozen.contains(&member.name.name) { continue; }
+                                        let v = Value::from_u64(val, bw);
+                                        let stale = local_map.get(&member.name.name)
+                                            .is_none_or(|p| p.to_u64() != Some(val));
+                                        if stale {
+                                            local_map.insert(member.name.name.clone(), v);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if local_map.len() == before && !changed { break; }
                     }
                 };
@@ -20106,7 +22015,17 @@ fn inline_module_items(
                                 {
                                     elab.packed_signal_elem_widths.insert(sig_name.clone(), ew);
                                 }
+                                // A TYPEDEF'd element type with declared dims
+                                // (`u7_t [4:0][1:0] a`): chain the declared dims
+                                // with the typedef's like the top-level path does.
+                                // Resolving the typedef first kept only ITS
+                                // dimension, so `foreach (a[i, j])` on an inlined
+                                // instance (every top under `__xezim_multi_top`)
+                                // walked the 70 bits instead of the 10 elements.
                                 if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params)
+                                    .or_else(|| {
+                                        packed_full_dims_chained(dt, &sub_merged_params, &elab.typedef_types)
+                                    })
                                     .or_else(|| packed_full_dims_of(&resolved_dt, &sub_merged_params))
                                 {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
@@ -20225,7 +22144,7 @@ fn inline_module_items(
                                             width,
                                             port_is_real,
                                         ),
-                                        is_real: port_is_real, type_name: get_type_name(&pd.data_type),
+                                        is_real: port_is_real, type_name: scope_local_type_name(get_type_name(&pd.data_type), &sub_typedef_names_all, &inst_prefix),
                                     });
                                 }
                             }
@@ -20244,12 +22163,27 @@ fn inline_module_items(
                                 .map(|bt| resolve_type_width(bt, Some(&sub_merged_params), Some(&elab.typedefs)))
                                 .unwrap_or(32);
                             let mut next_val: u64 = 0;
+                            let wide_vals = (base_width > 64)
+                                .then(|| wide_enum_value_map(et, base_width, &sub_merged_params));
+                            // §6.19.6: the member LIST of this instance's enum,
+                            // for `.name()/.first()/.num()` on its variables.
+                            // Submodule enums never reach `process_typedef`, so
+                            // `enum_members` had no entry for them at all —
+                            // `.name()` then fell back to a design-wide
+                            // by-value scan (a sibling's `PB` for our `SB`),
+                            // and `.num()` read 0.
+                            let mut inst_members: Vec<(String, u64)> = Vec::new();
                             for member in &et.members {
                                 let val = if let Some(init) = &member.init {
                                     eval_const_expr(init, &sub_merged_params)
                                 } else { next_val };
                                 next_val = val.wrapping_add(1);
-                                let v = Value::from_u64(val, base_width);
+                                inst_members.push((member.name.name.clone(), val));
+                                let v = wide_vals
+                                    .as_ref()
+                                    .and_then(|m| m.get(&member.name.name))
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
                                 // Don't clobber an already-registered member
                                 // with a DIFFERENT value: xezim's parameter
                                 // namespace is flat, but per LRM §22.1.4 +
@@ -20282,8 +22216,44 @@ fn inline_module_items(
                                         is_real: false,
                                     });
                                 }
+                                // INSTANCE-scoped key, unconditionally: a
+                                // member whose value depends on this
+                                // instance's parameters (`MAGIC = V`) loses
+                                // the first-wins race above, and every later
+                                // instance then read the FIRST instance's
+                                // value. Statement identifiers already
+                                // resolve through the instance prefix (that
+                                // is how a plain parameter is per-instance),
+                                // so the scoped entry wins where it matters
+                                // and the bare slot stays the design-wide
+                                // §23.6 fallback.
+                                let sc = format!("{}{}", inst_prefix, member.name.name);
+                                let sv = wide_vals
+                                    .as_ref()
+                                    .and_then(|m| m.get(&member.name.name))
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
+                                params_insert_traced(&mut elab.parameters, line!(), sc.clone(), sv.clone());
+                                signals_insert_traced(&mut elab.signals, line!(), sc.clone(), Signal {
+                                    is_const: false,
+                                    name: sc,
+                                    width: base_width,
+                                    is_signed: false,
+                                    direction: None,
+                                    value: sv,
+                                    type_name: None,
+                                    is_real: false,
+                                });
                             }
-                            // Width-only restore — see the non-enum twin below.
+                            // Keyed by the INSTANCE-scoped typedef name (the
+                            // signal's `type_name` is scoped to match); the
+                            // bare key is a first-wins fallback only.
+                            elab.enum_members
+                                .insert(format!("{}{}", inst_prefix, td.name.name), inst_members.clone());
+                            elab.enum_members
+                                .entry(td.name.name.clone())
+                                .or_insert(inst_members);
+                            // Prior-or-keep restore — see the non-enum twin below.
                             saved_type_binds.push((
                                 td.name.name.clone(),
                                 elab.typedefs.get(&td.name.name).copied(),
@@ -20294,8 +22264,7 @@ fn inline_module_items(
                             ));
                             typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_enum", td.name.name.clone(), base_width);
                             elab.typedef_types
-                                .entry(td.name.name.clone())
-                                .or_insert_with(|| td.data_type.clone());
+                                .insert(td.name.name.clone(), td.data_type.clone());
                             // §6.18/§23.10: the INSTANCE-scoped key. The bare
                             // key is last-writer-wins across differently
                             // parameterized instances of the same module, so a
@@ -20324,12 +22293,21 @@ fn inline_module_items(
                             // instance inlined last (order-dependent 64 vs 16).
                             // Same save/restore rail the type-parameter
                             // overrides use.
-                            // Restore the WIDTH slot only: typedef_types is
-                            // first-wins-and-KEPT (the struct-member machinery
-                            // consults it AFTER inlining — reverting it broke
-                            // every struct-typed member in an instance), so
-                            // hand the restore loop the POST-state type and it
-                            // no-ops there while healing the width table.
+                            // The TYPE slot is prior-or-KEEP: the saved value
+                            // is what the slot held before this instance — or,
+                            // for the FIRST instance, this instance's own type
+                            // — so the restore hands post-inlining consumers
+                            // (the struct-member machinery reads the bare slot
+                            // AFTER inlining; removing it broke every
+                            // struct-typed member) the same first-declared
+                            // fallback as before, while the overwrite below
+                            // makes the slot context-correct DURING inlining.
+                            // With first-wins (`entry().or_insert`) here, a
+                            // second differently-parameterized instance
+                            // resolved its `#(.T(rec_t))` overrides and its
+                            // own member writes through the FIRST instance's
+                            // baked layout — 39-bit field offsets in a 68-bit
+                            // struct, order-dependent on instance order.
                             saved_type_binds.push((
                                 td.name.name.clone(),
                                 elab.typedefs.get(&td.name.name).copied(),
@@ -20366,11 +22344,12 @@ fn inline_module_items(
                             // layout. Only the width was recorded before, so
                             // `flatten_struct_fields` below found nothing and the
                             // member cont-assign was silently dropped (struct
-                            // stayed X). `entry().or_insert` = first-declared
-                            // wins, matching the enum-member shadowing rule.
+                            // stayed X). Plain insert: THIS instance's type,
+                            // for the duration of its inlining (see the rail
+                            // comment above); first-declared still wins the
+                            // post-inlining fallback via the restore.
                             elab.typedef_types
-                                .entry(td.name.name.clone())
-                                .or_insert_with(|| td.data_type.clone());
+                                .insert(td.name.name.clone(), td.data_type.clone());
                             elab.typedef_types
                                 .entry(format!("{}{}", inst_prefix, td.name.name))
                                 .or_insert_with(|| {
@@ -20416,7 +22395,13 @@ fn inline_module_items(
                                         .insert(sig_name.clone(), elem_w);
                                 }
                                 if let Some(fdims) =
-                                    packed_full_dims_of(&nd.data_type, &sub_merged_params)
+                                    packed_full_dims_of(&nd.data_type, &sub_merged_params).or_else(|| {
+                                        packed_full_dims_chained(
+                                            &nd.data_type,
+                                            &sub_merged_params,
+                                            &elab.typedef_types,
+                                        )
+                                    })
                                 {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
@@ -20474,7 +22459,7 @@ fn inline_module_items(
                                     // twin (§6.6.7).
                                     is_real: is_type_real_resolved(&nd.data_type, &elab.typedef_types),
                                     direction: None, value: init_value,
-                                    type_name: get_type_name(&nd.data_type),
+                                    type_name: scope_local_type_name(get_type_name(&nd.data_type), &sub_typedef_names_all, &inst_prefix),
                                 });                            }
                         }
                         ModuleItem::DataDeclaration(dd) => {
@@ -20544,7 +22529,9 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.string_signals.insert(bare);
+                                    if elab.string_signals.insert(bare.clone()) {
+                                        inst_bare_keys.push((2, bare));
+                                    }
                                     elab.string_signals.insert(scoped);
                                 }
                             }
@@ -20562,15 +22549,37 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_signal_elem_widths.entry(bare).or_insert(elem_w);
+                                    if !elab.packed_signal_elem_widths.contains_key(&bare) {
+                                        elab.packed_signal_elem_widths.insert(bare.clone(), elem_w);
+                                        inst_bare_keys.push((0, bare));
+                                    }
                                     elab.packed_signal_elem_widths.insert(scoped, elem_w);
                                 }
                             }
-                            if let Some(fdims) = packed_full_dims_of(&dd.data_type, &sub_merged_params) {
+                            // A TYPEDEF'd element type with declared dims
+                            // (`u7_t [4:0][1:0] a`) has no dims of its own for
+                            // `packed_full_dims_of`: chain the declared dims with
+                            // the typedef's, as the top-level declaration path
+                            // does. Without this the inlined signal had NO dims
+                            // entry, and `foreach (a[i, j])` in an instance —
+                            // every top under `__xezim_multi_top` — walked the
+                            // 70 bits instead of the 10 elements.
+                            if let Some(fdims) = packed_full_dims_of(&dd.data_type, &sub_merged_params)
+                                .or_else(|| {
+                                    packed_full_dims_chained(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedef_types,
+                                    )
+                                })
+                            {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_full_dims.entry(bare).or_insert_with(|| fdims.clone());
+                                    if !elab.packed_full_dims.contains_key(&bare) {
+                                        elab.packed_full_dims.insert(bare.clone(), fdims.clone());
+                                        inst_bare_keys.push((1, bare));
+                                    }
                                     elab.packed_full_dims.insert(scoped, fdims.clone());
                                 }
                             }
@@ -20611,9 +22620,10 @@ fn inline_module_items(
                                                 // First-wins on the bare key
                                                 // (see the packed-dim blocks
                                                 // above).
-                                                elab.packed_struct_fields
-                                                    .entry(bare.clone())
-                                                    .or_insert_with(|| fields.clone());
+                                                if !elab.packed_struct_fields.contains_key(&bare) {
+                                                    elab.packed_struct_fields.insert(bare.clone(), fields.clone());
+                                                    inst_bare_keys.push((3, bare.clone()));
+                                                }
                                                 elab.packed_struct_fields
                                                     .insert(scoped.clone(), fields.clone());
                                                 // Per-MEMBER packed-array element
@@ -20776,7 +22786,7 @@ fn inline_module_items(
                             existing.width = width;
                                         existing.is_signed = is_signed;
                                         existing.is_real = decl_is_real;
-                                        existing.type_name = get_type_name(&dd.data_type);
+                                        existing.type_name = scope_local_type_name(get_type_name(&dd.data_type), &sub_typedef_names_all, &inst_prefix);
                                         existing.value = default_port_value(
                                             existing.direction,
                                             Some(&dd.data_type),
@@ -20802,6 +22812,26 @@ fn inline_module_items(
                                 // SUBMODULE or interface decl must register
                                 // like a top-level one — `tif.q.push_back(x)`
                                 // read a phantom 64-slot fixed array before.
+                                // An instance variable with unpacked dims (queue, dynamic,
+                                // associative, fixed) whose ELEMENT is a packed struct: the
+                                // module path registers the element layout under the container
+                                // name so `q[i].field` resolves; the inlined copy never did, so
+                                // every element field read 0 and writes were lost inside an
+                                // instance while the same code worked at the top level.
+                                if !effective_decl_dims.is_empty()
+                                    && !elab.packed_struct_fields.contains_key(&sig_name)
+                                {
+                                    if let Some(fields) = packed_struct_field_layout(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                        }
+                                    }
+                                }
                                 match effective_decl_dims.first() {
                                     Some(UnpackedDimension::Unsized(_))
                                     | Some(UnpackedDimension::Queue { .. }) => {
@@ -20916,11 +22946,24 @@ fn inline_module_items(
                                         );
                                         elab.var_decl_types
                                             .insert(sig_name.clone(), dd.data_type.clone());
+                                        // §6.8: its initializer is deferred like every
+                                        // other instance declaration's (one whole-pattern
+                                        // assignment, rewritten into the instance scope).
+                                        if let Some(init_expr) = &decl.init {
+                                            deferred_decl_inits.push((sig_name.clone(), init_expr.clone()));
+                                        }
                                         continue;
                                     }
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    // §6.8: a fixed array's declaration initializer is
+                                    // deferred like every other instance declaration's
+                                    // (one whole-pattern assignment, rewritten into the
+                                    // instance scope); it used to be dropped here.
+                                    if let Some(init_expr) = &decl.init {
+                                        deferred_decl_inits.push((sig_name.clone(), init_expr.clone()));
+                                    }
                                     // The ELEMENT type of a child array — the
                                     // top-level path records one and every
                                     // type-directed operation needs it
@@ -21018,6 +23061,20 @@ fn inline_module_items(
                                         }
                                         _ => false,
                                     };
+                                    // §6.19.6: an ANONYMOUS enum variable keys
+                                    // its member list by the variable's own
+                                    // (scoped) name; the top-level path did
+                                    // this, the instance path did not, so
+                                    // `anon.name()` in a submodule fell to the
+                                    // by-value scan.
+                                    if matches!(dd.data_type, DataType::Enum(_)) {
+                                        if let Some(m) = anon_enum_members_ordered(
+                                            &dd.data_type,
+                                            &sub_merged_params,
+                                        ) {
+                                            elab.enum_members.insert(sig_name.clone(), m);
+                                        }
+                                    }
                                     if unpacked_struct_decl {
                                         register_unpacked_aggregate(elab, &sig_name, &dd.data_type);
                                         elab.var_decl_types
@@ -21040,7 +23097,7 @@ fn inline_module_items(
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
                                         is_real: is_type_real_resolved(&dd.data_type, &elab.typedef_types),
-                                        type_name: get_type_name(&dd.data_type),
+                                        type_name: scope_local_type_name(get_type_name(&dd.data_type), &sub_typedef_names_all, &inst_prefix),
                                     });
                                 }
                             }
@@ -21177,11 +23234,25 @@ fn inline_module_items(
                     let sub_expr = make_ident_expr(&sub_sig_name);
                     match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
-                            // §23.3.3: a NARROWER actual drives only the low
-                            // bits of the formal; the unconnected high bits
-                            // read z (measured: 4-bit actual on an 8-bit
-                            // input -> "zzzz1010"). A plain resize would
-                            // zero-extend, silently driving the top bits 0.
+                            // §23.3.3.6: a port connection is an implicit
+                            // continuous assignment, so a NARROWER actual on
+                            // an INPUT extends to the formal width like any
+                            // assignment (`.p(1'b0)` on a 4-bit port reads
+                            // 0000). One reference simulator instead leaves
+                            // the unconnected high bits z ("zzzz1010"
+                            // measured) and this code used to copy that; the
+                            // LRM reading — which the other reference
+                            // implements — was chosen after the z bits walked
+                            // through a production DUT's CDC and stalled its
+                            // write path as X.
+                            //
+                            // An INOUT keeps the z-fill: it is bidirectional,
+                            // and driving the unconnected high bits would
+                            // fight the sub-module's own driver.
+                            let is_inout = matches!(
+                                prepared_sub.port_directions.get(port_name),
+                                Some(PortDirection::Inout)
+                            );
                             let mut rhs = parent_expr.clone();
                             let fw = elab
                                 .signals
@@ -21193,7 +23264,7 @@ fn inline_module_items(
                                 .get(&sub_sig_name)
                                 .map(|s| s.is_real)
                                 .unwrap_or(false);
-                            if !is_real_port && fw > 0 {
+                            if is_inout && !is_real_port && fw > 0 {
                                 if let Some(aw) = port_conn_width(parent_expr, elab) {
                                     if aw > 0 && aw < fw {
                                         let span = parent_expr.span;
@@ -21276,6 +23347,43 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // §7.2.1/§23.3.3: a PACKED-STRUCT formal read member-wise
+                    // (`din.f0`) needs its own member layout. Substituting a
+                    // FLAT actual (a plain vector net, a concat, a select)
+                    // hands the body a name with no layout, so every member
+                    // read went x while the whole-port read stayed right —
+                    // the same conversion block worked when the parent net
+                    // happened to be struct-typed. Keep the formal's signal
+                    // unless the actual is a whole net carrying a layout.
+                    // Only for a PLAIN struct formal (an array-of-structs
+                    // formal carries element widths and takes the packed
+                    // element path, where substitution is right), and only
+                    // when the actual's ROOT net carries no layout at all —
+                    // an element/part select of a struct array keeps its
+                    // parent's layout through the select and substitutes
+                    // fine; a flat vector or a concat does not.
+                    let formal_key = format!("{}{}", inst_prefix, pname);
+                    if is_input
+                        && elab.packed_struct_fields.contains_key(&formal_key)
+                        && !elab.packed_signal_elem_widths.contains_key(&formal_key)
+                    {
+                        let mut root: &Expression = actual;
+                        loop {
+                            match &root.kind {
+                                ExprKind::Index { expr, .. }
+                                | ExprKind::RangeSelect { expr, .. } => root = expr,
+                                ExprKind::Paren(inner) => root = inner,
+                                _ => break,
+                            }
+                        }
+                        let root_has_layout = whole_net_ident_name(root).is_some_and(|n| {
+                            elab.packed_struct_fields.contains_key(&n)
+                                || elab.packed_signal_elem_widths.contains_key(&n)
+                        });
+                        if !root_has_layout {
+                            no_subst_ports.insert(pname.clone());
+                        }
+                    }
                     let Some(actual_w) = port_conn_width(actual, elab) else {
                         continue;
                     };
@@ -21349,12 +23457,23 @@ fn inline_module_items(
                         }
                     }
                 }
+                let pend_type_bind_widths: HashMap<String, u32> = pend_type_binds
+                    .iter()
+                    .map(|(n, dt)| {
+                        (
+                            n.clone(),
+                            resolve_type_width(dt, Some(&sub_merged_params), Some(&elab.typedefs)),
+                        )
+                    })
+                    .collect();
                 let pend_ctx = std::rc::Rc::new(RewriteCtx {
                     prefix: inst_prefix.clone(),
                     port_map: rewrite_port_map.clone(),
                     local_names: std::rc::Rc::clone(&prepared_sub.local_names),
                     interface_map: sub_interface_map.clone(),
                     type_binds: pend_type_binds,
+                    type_bind_widths: pend_type_bind_widths,
+                    owner: sub_mod.name().to_string(),
                 });
 
                 // §6.8: the deferred (non-constant) declaration initializers of
@@ -21453,6 +23572,10 @@ fn inline_module_items(
                 // Inline the sub-module's continuous assigns
                 iprof_add("ck6_before_fntask", __th.elapsed());
                 let __td = std::time::Instant::now();
+                // Function/task bodies are copied PER INSTANCE below through
+                // `rewrite_stmt`, so this instance's type-parameter widths
+                // must be live for `$bits(T)` to fold inside them too.
+                set_type_bind_widths_tls(&pend_ctx.type_bind_widths);
                 for (sub_item, body_src) in prepared_sub.effective_items.iter().zip(prepared_sub.body_sources.iter()) {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
@@ -21470,6 +23593,9 @@ fn inline_module_items(
                         let mut fn_locals = (*prepared_sub.local_names).clone();
                         for p in &fd.ports {
                             fn_locals.remove(&p.name.name);
+                        }
+                        for n in stmt_list_declared_names(&fd.items) {
+                            fn_locals.remove(n);
                         }
                         for p in &mut new_fd.ports {
                             bake_formal_type(p);
@@ -21503,6 +23629,9 @@ fn inline_module_items(
                         for p in &td.ports {
                             task_locals.remove(&p.name.name);
                         }
+                        for n in stmt_list_declared_names(&td.items) {
+                            task_locals.remove(n);
+                        }
                         for p in &mut new_td.ports {
                             bake_formal_type(p);
                             if let Some(def) = &p.default {
@@ -21524,10 +23653,9 @@ fn inline_module_items(
                         // re-registers the identical definition).
                         validate_class_constraints(cd, Some(definitions), Some(&elab.enum_members), Some(&elab))?;
                         register_class_enum_members(cd, elab);
-                        elab.classes.insert(
-                            cd.name.name.clone(),
-                            std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
-                        );
+                        let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
+                        ec.declaring_module = Some(sub_mod_name.clone());
+                        elab.classes.insert(cd.name.name.clone(), std::sync::Arc::new(ec));
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
                         // §14.3 interface-scoped clocking block: register it under
@@ -21699,7 +23827,7 @@ fn inline_module_items(
                             });
                         }
                     }
-                    if matches!(sub_item, ModuleItem::InitialConstruct(_)) {
+                    if matches!(sub_item, ModuleItem::InitialConstruct(_) | ModuleItem::AssertionItem(_)) {
                         if let BodySource::Initial(stmt_rc, gen_scope) = body_src {
                             if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                                 eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);
@@ -21730,6 +23858,7 @@ fn inline_module_items(
                         });
                     }
                 }
+                clear_type_bind_widths_tls();
 
                 // Record the instance before descending. Inlining is about to
                 // dissolve this module into the parent, so this is the only
@@ -21803,6 +23932,27 @@ fn inline_module_items(
                     match prev_dt {
                         Some(dt) => { elab.typedef_types.insert(tp_name, dt); }
                         None => { elab.typedef_types.remove(&tp_name); }
+                    }
+                }
+                // The instance is fully inlined: every name in its body now
+                // carries the instance prefix, so the bare geometry keys it
+                // registered are no longer needed — and leaving them made
+                // `inp.sram_renA[2]` on a struct member in another instance
+                // resolve against this instance's `[3:0][1:0] sram_renA`.
+                for (table, key) in inst_bare_keys.drain(..) {
+                    match table {
+                        0 => {
+                            elab.packed_signal_elem_widths.remove(&key);
+                        }
+                        1 => {
+                            elab.packed_full_dims.remove(&key);
+                        }
+                        2 => {
+                            elab.string_signals.remove(&key);
+                        }
+                        _ => {
+                            elab.packed_struct_fields.remove(&key);
+                        }
                     }
                 }
             }
@@ -23999,11 +26149,56 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             }
             let name = &hier.path[0].name.name;
             if let Some(if_prefix) = interface_map.get(name) {
+                // §25.5.4: a modport EXPRESSION member (`.b(word[7:0])`)
+                // stands for an expression over the interface instance's
+                // signals — substitute it (registered by
+                // `register_modport_expressions`), applying any selects the
+                // reference carried on the member.
+                if hier.path.len() == 2 && hier.path[0].selects.is_empty() {
+                    let key = format!("{}.{}", if_prefix, hier.path[1].name.name);
+                    let hit = MODPORT_EXPR_TLS.with(|m| m.borrow().get(&key).cloned());
+                    if let Some(mut e) = hit {
+                        for sel in &hier.path[1].selects {
+                            e = Expression::new(
+                                ExprKind::Index {
+                                    expr: Box::new(e),
+                                    index: Box::new(rewrite_expr_impl(sel, prefix, port_map, local_names, interface_map)),
+                                },
+                                expr.span,
+                            );
+                        }
+                        MODPORT_SUBST_FLAG.with(|f| f.set(true));
+                        return e;
+                    }
+                }
                 let mut new_hier = hier.clone();
                 new_hier.path[0].name.name = if_prefix.clone();
                 return Expression::new(ExprKind::Ident(new_hier), expr.span);
             }
             if let Some(mapped) = port_map.get(name) {
+                // §25.5.4: `p.b` through a modport-typed port whose actual is
+                // an interface instance — a modport EXPRESSION member
+                // substitutes its registered expression (see
+                // `register_modport_expressions`).
+                if hier.path.len() == 2 && hier.path[0].selects.is_empty() {
+                    if let Some(inst) = whole_net_ident_name(mapped) {
+                        let key = format!("{}.{}", inst, hier.path[1].name.name);
+                        let hit = MODPORT_EXPR_TLS.with(|m| m.borrow().get(&key).cloned());
+                        if let Some(mut e) = hit {
+                            for sel in &hier.path[1].selects {
+                                e = Expression::new(
+                                    ExprKind::Index {
+                                        expr: Box::new(e),
+                                        index: Box::new(rewrite_expr_impl(sel, prefix, port_map, local_names, interface_map)),
+                                    },
+                                    expr.span,
+                                );
+                            }
+                            MODPORT_SUBST_FLAG.with(|f| f.set(true));
+                            return e;
+                        }
+                    }
+                }
                 // Preserve any trailing path segments and first-segment selects:
                 // `a.b.c` parsed as one ident with path=[a,b,c] where `a` is the
                 // port-mapped name must become `<mapped>.b.c`, not just
@@ -24180,10 +26375,44 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             count: Box::new(rewrite_expr_impl(count, prefix, port_map, local_names, interface_map)),
             exprs: exprs.iter().map(|e| rewrite_expr_impl(e, prefix, port_map, local_names, interface_map)).collect(),
         },
-        ExprKind::Index { expr: base, index } => ExprKind::Index {
-            expr: Box::new(rewrite_expr_impl(base, prefix, port_map, local_names, interface_map)),
-            index: Box::new(rewrite_expr_impl(index, prefix, port_map, local_names, interface_map)),
-        },
+        ExprKind::Index { expr: base, index } => {
+            MODPORT_SUBST_FLAG.with(|f| f.set(false));
+            let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
+            let from_modport = MODPORT_SUBST_FLAG.with(|f| f.replace(false));
+            let ni = rewrite_expr_impl(index, prefix, port_map, local_names, interface_map);
+            // §11.5.1: a bit-select of a CONSTANT part-select (`word[7:0][k]`,
+            // which is what a modport-expression member `.b(word[7:0])`
+            // rewrites `p.b[k]` into) addresses bit `min(l,r) + k` of the
+            // base — fold it so the select stays a plain, assignable
+            // bit-select instead of an index over a part-select value.
+            if from_modport
+                && let ExprKind::RangeSelect { expr: inner, kind: RangeKind::Constant, left, right } = &nb.kind
+            {
+                let lit = |e: &Expression| match &e.kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.parse::<i64>().ok(),
+                    _ => None,
+                };
+                if let (Some(l), Some(r)) = (lit(left), lit(right)) {
+                    let lo = l.min(r);
+                    let idx = match lit(&ni) {
+                        Some(k) => make_i64_literal(lo + k, ni.span),
+                        None => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Add,
+                                left: Box::new(make_i64_literal(lo, ni.span)),
+                                right: Box::new(ni.clone()),
+                            },
+                            ni.span,
+                        ),
+                    };
+                    return Expression::new(
+                        ExprKind::Index { expr: inner.clone(), index: Box::new(idx) },
+                        expr.span,
+                    );
+                }
+            }
+            ExprKind::Index { expr: Box::new(nb), index: Box::new(ni) }
+        }
         ExprKind::RangeSelect { expr: base, kind, left, right } => {
             let nb = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             let nl = rewrite_expr_impl(left, prefix, port_map, local_names, interface_map);
@@ -24212,6 +26441,17 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
         ExprKind::MemberAccess { expr: base, member } => {
             let rewritten_base = rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             if let ExprKind::Ident(mut hier) = rewritten_base.kind {
+                // §25.5.4: `p.b` where `p` rewrote to an interface instance
+                // and `b` is a modport EXPRESSION member — substitute the
+                // registered expression (see `register_modport_expressions`).
+                if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                    let key = format!("{}.{}", hier.path[0].name.name, member.name);
+                    let hit = MODPORT_EXPR_TLS.with(|m| m.borrow().get(&key).cloned());
+                    if let Some(e) = hit {
+                        MODPORT_SUBST_FLAG.with(|f| f.set(true));
+                        return e;
+                    }
+                }
                 hier.path.push(HierPathSegment {
                     name: member.clone(),
                     selects: Vec::new(),
@@ -24229,10 +26469,17 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
             func: Box::new(rewrite_expr_impl(func, prefix, port_map, local_names, interface_map)),
             args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
         },
-        ExprKind::SystemCall { name, args } => ExprKind::SystemCall {
-            name: name.clone(),
-            args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
-        },
+        ExprKind::SystemCall { name, args } => {
+            // `$bits(T)` on a bound type parameter folds to its width here,
+            // before the ident could be prefixed into a nonexistent signal.
+            if let Some(w) = bits_of_bound_type_param(name, args) {
+                return make_i64_literal(w as i64, expr.span);
+            }
+            ExprKind::SystemCall {
+                name: name.clone(),
+                args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
+            }
+        }
         // LRM §16.5 SVA property body — substitute formal-arg
         // references in both the clock signal and the body. Without
         // this, a checker like
@@ -24309,6 +26556,33 @@ fn rewrite_pattern(
                 .collect(),
         ),
     }
+}
+
+fn set_type_bind_widths_tls(w: &HashMap<String, u32>) {
+    // Always assign — an instance WITHOUT type parameters must clear
+    // whatever an enclosing instance left, or its `$bits(T)` on a typedef
+    // named `T` would fold to the parent's parameter width.
+    TYPE_BIND_WIDTHS_TLS.with(|c| {
+        *c.borrow_mut() = if w.is_empty() { None } else { Some(w.clone()) };
+    });
+}
+
+fn clear_type_bind_widths_tls() {
+    TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
+}
+
+/// `$bits(T)` with `T` a type parameter of the instance being materialized:
+/// its width, or None when the call is anything else.
+fn bits_of_bound_type_param(name: &str, args: &[Expression]) -> Option<u32> {
+    if name != "$bits" || args.len() != 1 {
+        return None;
+    }
+    let ExprKind::Ident(h) = &args[0].kind else { return None };
+    if h.path.len() != 1 || !h.path[0].selects.is_empty() || h.root.is_some() {
+        return None;
+    }
+    let t = &h.path[0].name.name;
+    TYPE_BIND_WIDTHS_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(t).copied()))
 }
 
 /// Substitute an instance's TYPE-PARAMETER bindings into the declarations of
@@ -24396,6 +26670,24 @@ fn substitute_type_params_stmt(
         StatementKind::Wait { condition, stmt } => {
             StatementKind::Wait { condition, stmt: sub(stmt) }
         }
+        // Same missing-arm class as rewrite_stmt's Assertion gap: recurse
+        // into the remaining compound kinds so a VarDecl of a bound type
+        // param inside them still resolves.
+        StatementKind::Assertion(mut a) => {
+            a.action = a.action.map(sub);
+            a.else_action = a.else_action.map(sub);
+            StatementKind::Assertion(a)
+        }
+        StatementKind::RandCase { items } => StatementKind::RandCase {
+            items: items
+                .into_iter()
+                .map(|(w, st)| (w, substitute_type_params_stmt(st, binds)))
+                .collect(),
+        },
+        StatementKind::WaitOrder { events, pass, fail, armed, idx, span } => {
+            StatementKind::WaitOrder { events, pass: pass.map(sub), fail: fail.map(sub), armed, idx, span }
+        }
+        StatementKind::RsAction { body } => StatementKind::RsAction { body: sub(body) },
         other => other,
     };
     Statement { kind, span }
@@ -24452,16 +26744,24 @@ pub fn rename_process_shadowed_locals(
     let StatementKind::SeqBlock { name, stmts } = &stmt.kind else {
         return None;
     };
-    if name.is_some() {
-        return None;
-    }
+    // A LABELED block's locals are hierarchically addressable (`tb.p1.v`), so
+    // they are salted with the label itself (`p1.v`) rather than the opaque
+    // process salt: the stored name IS the hierarchical name, so references
+    // from other processes keep resolving, while two processes' same-named
+    // locals (or a local shadowing a module variable) no longer share one
+    // slot. Labeled blocks used to be skipped here entirely, which left
+    // exactly those collisions in place.
+    let label: Option<&str> = name.as_ref().map(|n| n.name.as_str());
     let mut map: HashMap<String, Expression> = HashMap::default();
     let mut renames: HashMap<String, String> = HashMap::default();
     for s in stmts.iter() {
         if let StatementKind::VarDecl { declarators, .. } = &s.kind {
             for d in declarators {
                 if module_names.contains(&d.name.name) && !renames.contains_key(&d.name.name) {
-                    let fresh = format!("{}__shadow_{}", d.name.name, salt);
+                    let fresh = match label {
+                        Some(l) => format!("{}.{}", l, d.name.name),
+                        None => format!("{}__shadow_{}", d.name.name, salt),
+                    };
                     let hier = crate::ast::expr::HierarchicalIdentifier {
                         root: None,
                         path: vec![crate::ast::expr::HierPathSegment {
@@ -24572,6 +26872,73 @@ pub fn rename_process_shadowed_locals(
     Some(out)
 }
 
+/// `local_names` minus the names a loop declares itself (a for-init
+/// `integer i`, foreach loop variables). A declared name that also exists at
+/// the child's module scope (`integer i, j;` next to `for (integer i = 0;
+/// ...)`) used to have its USES prefixed to the module variable while the
+/// declaration stayed bare, so the loop tested an x-valued `inst.i` and never
+/// ran. `None` when nothing collides (the common case). Block-local
+/// declarations (`begin integer k; ... end`) are deliberately NOT stripped:
+/// the runtime's process-context block locals are not yet consistent enough
+/// to stand on their own, and the prefixed form keeps today's behaviour.
+/// Names declared by the top-level `VarDecl` statements of a statement list
+/// (a subroutine body or a block). §6.21: such a declaration shadows the
+/// module's own names for the statements that follow it, so the inliner must
+/// not prefix its uses with the instance path — `begin int u; u = 5; end`
+/// clobbered the module-level `u`, a task-local `core` next to an instance
+/// `core` read `core.c` as x, and a block-local handle named like the
+/// enclosing instance read null.
+fn stmt_list_declared_names(stmts: &[Statement]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for st in stmts {
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            for d in declarators {
+                out.push(d.name.name.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite a statement list where each `VarDecl` shadows the module names
+/// for the statements AFTER it (its own initialiser still sees the outer
+/// set).
+fn rewrite_stmt_list_scoped(
+    stmts: &[Statement],
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<Statement> {
+    let mut cur: Option<std::collections::HashSet<String>> = None;
+    let mut out = Vec::with_capacity(stmts.len());
+    for st in stmts {
+        let names = cur.as_ref().unwrap_or(local_names);
+        out.push(rewrite_stmt(st, prefix, port_map, names, interface_map));
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let Some(reduced) =
+                without_declared(names, declarators.iter().map(|d| d.name.name.as_str()))
+            {
+                cur = Some(reduced);
+            }
+        }
+    }
+    out
+}
+
+fn without_declared<'a>(
+    local_names: &std::collections::HashSet<String>,
+    declared: impl Iterator<Item = &'a str>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut reduced: Option<std::collections::HashSet<String>> = None;
+    for n in declared {
+        if local_names.contains(n) {
+            reduced.get_or_insert_with(|| local_names.clone()).remove(n);
+        }
+    }
+    reduced
+}
+
 fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
@@ -24605,22 +26972,35 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
                 guard: item.guard.as_ref().map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
             }).collect(),
         },
-        StatementKind::For { init, condition, step, body } => StatementKind::For {
-            init: init.iter().map(|fi| match fi {
-                ForInit::VarDecl { data_type, name, init } => ForInit::VarDecl {
-                    data_type: data_type.clone(),
-                    name: name.clone(),
-                    init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
-                },
-                ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
-                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
-                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
-                },
-            }).collect(),
-            condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, local_names, interface_map)),
-            step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, local_names, interface_map)).collect(),
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
-        },
+        StatementKind::For { init, condition, step, body } => {
+            // The loop variables shadow same-named child-scope variables in
+            // the condition, step and body; the init expressions are
+            // evaluated before the declaration and keep the outer set.
+            let reduced = without_declared(
+                local_names,
+                init.iter().filter_map(|fi| match fi {
+                    ForInit::VarDecl { name, .. } => Some(name.name.as_str()),
+                    _ => None,
+                }),
+            );
+            let inner = reduced.as_ref().unwrap_or(local_names);
+            StatementKind::For {
+                init: init.iter().map(|fi| match fi {
+                    ForInit::VarDecl { data_type, name, init } => ForInit::VarDecl {
+                        data_type: data_type.clone(),
+                        name: name.clone(),
+                        init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
+                    },
+                    ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
+                        lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                        rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
+                    },
+                }).collect(),
+                condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, inner, interface_map)),
+                step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, inner, interface_map)).collect(),
+                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
+            }
+        }
         StatementKind::While { condition, body } => StatementKind::While {
             condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
@@ -24634,9 +27014,75 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         // reaches, so it returned x while the identical read outside the loop
         // was fine. The loop VARIABLES stay untouched: they are declared by the
         // foreach itself, not inherited from the child's scope.
-        StatementKind::Foreach { array, vars, body } => StatementKind::Foreach {
-            array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
-            vars: vars.clone(),
+        StatementKind::Foreach { array, vars, body } => {
+            let reduced = without_declared(
+                local_names,
+                vars.iter().flatten().map(|v| v.name.as_str()),
+            );
+            let inner = reduced.as_ref().unwrap_or(local_names);
+            StatementKind::Foreach {
+                array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
+                vars: vars.clone(),
+                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
+            }
+        }
+        // Sibling of the missing-Assertion-arm bug: these kinds also fell
+        // through `other => other.clone()` un-rewritten, so a dotted
+        // reference inside them stayed a raw MemberAccess (and, in prefix
+        // mode, skipped prefixing/port substitution). Observed live on
+        // `force tgt = host.sig;` in a bound module: the un-collapsed
+        // rvalue broke continuous-force tracking. The rest are the same
+        // class, fixed for uniformity.
+        StatementKind::DoWhile { body, condition } => StatementKind::DoWhile {
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
+            condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
+        },
+        StatementKind::Wait { condition, stmt } => StatementKind::Wait {
+            condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
+            stmt: Box::new(rewrite_stmt(stmt, prefix, port_map, local_names, interface_map)),
+        },
+        StatementKind::ProceduralContinuous(pc) => {
+            use crate::ast::stmt::ProceduralContinuous as PC;
+            StatementKind::ProceduralContinuous(match pc {
+                PC::Assign { lvalue, rvalue } => PC::Assign {
+                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
+                },
+                PC::Deassign(lv) => PC::Deassign(rewrite_expr(lv, prefix, port_map, local_names, interface_map)),
+                PC::Force { lvalue, rvalue } => PC::Force {
+                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
+                },
+                PC::Release(lv) => PC::Release(rewrite_expr(lv, prefix, port_map, local_names, interface_map)),
+            })
+        }
+        // Declared names and dimensions stay untouched (they are introduced
+        // by the declaration itself); only the initializer reads outer names.
+        StatementKind::VarDecl { data_type, lifetime, declarators } => StatementKind::VarDecl {
+            data_type: data_type.clone(),
+            lifetime: *lifetime,
+            declarators: declarators.iter().map(|d| crate::ast::stmt::VarDeclarator {
+                name: d.name.clone(),
+                dimensions: d.dimensions.clone(),
+                init: d.init.as_ref().map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+                span: d.span,
+            }).collect(),
+        },
+        StatementKind::RandCase { items } => StatementKind::RandCase {
+            items: items.iter().map(|(w, st)| (
+                rewrite_expr(w, prefix, port_map, local_names, interface_map),
+                rewrite_stmt(st, prefix, port_map, local_names, interface_map),
+            )).collect(),
+        },
+        StatementKind::WaitOrder { events, pass, fail, armed, idx, span } => StatementKind::WaitOrder {
+            events: events.clone(),
+            pass: pass.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            fail: fail.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            armed: *armed,
+            idx: *idx,
+            span: *span,
+        },
+        StatementKind::RsAction { body } => StatementKind::RsAction {
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
         },
         StatementKind::Repeat { count, body } => StatementKind::Repeat {
@@ -24646,6 +27092,23 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         StatementKind::Forever { body } => StatementKind::Forever {
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
         },
+        // §16.3/§16.4: an immediate assertion's condition and action blocks
+        // are ordinary procedural code. This arm was missing, so the whole
+        // statement fell through `other => other.clone()` un-rewritten: a
+        // dotted reference in the condition (`sub.sig`, parsed as
+        // MemberAccess) never collapsed to a hierarchical Ident, and the
+        // interpreter read it as a (nonexistent) object property — 0. An
+        // `assert (sub.sig >= lo) else $error(...)` in a bound checker
+        // module falsely fired while the same read in a plain `if` (which
+        // IS rewritten) resolved fine.
+        StatementKind::Assertion(a) => StatementKind::Assertion(crate::ast::stmt::AssertionStatement {
+            kind: a.kind,
+            expr: rewrite_expr(&a.expr, prefix, port_map, local_names, interface_map),
+            action: a.action.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            else_action: a.else_action.as_ref().map(|s| Box::new(rewrite_stmt(s, prefix, port_map, local_names, interface_map))),
+            is_property: a.is_property,
+            span: a.span,
+        }),
         StatementKind::TimingControl { control, stmt: body } => StatementKind::TimingControl {
             control: match control {
                 TimingControl::Delay(e) => TimingControl::Delay(rewrite_expr(e, prefix, port_map, local_names, interface_map)),
@@ -24655,7 +27118,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name: name.clone(),
-            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
         },
         StatementKind::EventTrigger { nonblocking, name, target, span } => StatementKind::EventTrigger {
             nonblocking: *nonblocking,
@@ -24674,7 +27137,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         },
         StatementKind::ParBlock { name, stmts, join_type } => StatementKind::ParBlock {
             name: name.clone(),
-            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
             join_type: *join_type,
         },
 
@@ -25207,13 +27670,22 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         .unwrap_or(32);
                                     let mut next_val: u64 = 0;
                                     let mut members_ordered: Vec<(String, u64)> = Vec::new();
+                                    let wide_vals = (base_width > 64).then(|| {
+                                        wide_enum_value_map(et, base_width, &elab.parameters)
+                                    });
                                     for member in &et.members {
                                         let (entries, nv) =
                                             expand_enum_member(member, next_val, &elab.parameters);
                                         next_val = nv;
                                         for (nm, val) in entries {
                                             if &nm == sym_name {
-                                                let v = Value::from_u64(val, base_width);
+                                                let v = wide_vals
+                                                    .as_ref()
+                                                    .and_then(|m| m.get(&nm))
+                                                    .cloned()
+                                                    .unwrap_or_else(|| {
+                                                        Value::from_u64(val, base_width)
+                                                    });
                                                 elab.note_decl_site(
                                                     &nm,
                                                     member.name.span,
@@ -25269,6 +27741,11 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::DPIImport(di)
                             if &dpi_proto_sv_name(&di.proto) == sym_name => {
                                 register_dpi_import(di, elab)?;
+                                found = true;
+                            }
+                        PackageItem::DPIExport(e)
+                            if &dpi_proto_sv_name(&e.proto) == sym_name => {
+                                register_dpi_export(e, elab);
                                 found = true;
                             }
                         PackageItem::Class(c)
@@ -25472,6 +27949,9 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         }
                         PackageItem::DPIImport(di) => {
                             register_dpi_import(di, elab)?;
+                        }
+                        PackageItem::DPIExport(e) => {
+                            register_dpi_export(e, elab);
                         }
                         PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);

@@ -780,6 +780,7 @@ impl Parser {
                                 direction: PortDirection::Input,
                                 name: cb_name,
                                 span: self.span_from(pstart),
+                                expr: None,
                             });
                         } else if self.at(TokenKind::KwImport) || self.at(TokenKind::KwExport) {
                             // §25.5 modport import/export of a task/function.
@@ -793,6 +794,7 @@ impl Parser {
                                     direction: PortDirection::Input,
                                     name,
                                     span: self.span_from(pstart),
+                                    expr: None,
                                 });
                             }
                             while !self.at(TokenKind::Comma)
@@ -803,8 +805,19 @@ impl Parser {
                             }
                         } else {
                             if let Some(d) = self.parse_optional_direction() { last_dir = d; }
-                            let port_name = self.parse_identifier();
-                            ports.push(ModportPort { direction: last_dir, name: port_name, span: self.span_from(pstart) });
+                            // §25.5.4 modport expression: `.b(word[7:0])` —
+                            // the member `b` stands for an expression over
+                            // the interface's signals.
+                            if self.eat(TokenKind::Dot).is_some() {
+                                let port_name = self.parse_identifier();
+                                self.expect(TokenKind::LParen);
+                                let e = self.parse_expression();
+                                self.expect(TokenKind::RParen);
+                                ports.push(ModportPort { direction: last_dir, name: port_name, span: self.span_from(pstart), expr: Some(e) });
+                            } else {
+                                let port_name = self.parse_identifier();
+                                ports.push(ModportPort { direction: last_dir, name: port_name, span: self.span_from(pstart), expr: None });
+                            }
                         }
                         if self.eat(TokenKind::Comma).is_none() { break; }
                     }
@@ -1092,6 +1105,25 @@ impl Parser {
                         },
                         self.span_from(bstart),
                     ))
+                } else if !self.at(TokenKind::KwEndsequence) {
+                    // Unclocked body (`sequence s; a ##1 b; endsequence`):
+                    // parse it speculatively so a named sequence used INSIDE
+                    // a property (`a |=> s`) has a body to expand. Any shape
+                    // the expression parser does not cover backtracks to the
+                    // token-skip path below, exactly as before.
+                    let save_pos = self.pos;
+                    let save_diag = self.diagnostics.len();
+                    self.in_sva_seq = true;
+                    let body = self.parse_expression();
+                    self.in_sva_seq = false;
+                    if self.diagnostics.len() == save_diag && self.at(TokenKind::Semicolon) {
+                        self.bump();
+                        Some(body)
+                    } else {
+                        self.diagnostics.truncate(save_diag);
+                        self.pos = save_pos;
+                        None
+                    }
                 } else { None };
                 while !self.at(TokenKind::KwEndsequence) && !self.at(TokenKind::Eof) { self.bump(); }
                 self.expect(TokenKind::KwEndsequence);
@@ -1798,6 +1830,112 @@ impl Parser {
         } else { (self.parse_module_item().into_iter().collect(), None) }
     }
 
+    /// Convert a `#(...)` parameter VALUE into a TYPE-ARG expression when it
+    /// is used as the specialization of a parameterized CLASS in a data-
+    /// declaration type (`param_obj #(int) x;`). `parse_param_value` returns
+    /// `ParamValue::Type(dt)` for a type keyword (`int`, `bit`) or a
+    /// typedef/class name; data declarations need those as identifier
+    /// expressions so the specialize's `type_args` list is non-empty and
+    /// downstream per-spec binding (type_bindings / current_spec / the
+    /// class registry's `type_name`) can reconstruct `param_obj#(int)`. A
+    /// position that drops them leaves the type_args empty and the variable
+    /// default-specializes (`param_obj#(bit)`), which is what broke UVM's
+    /// `type_id::type_name()` for parameterized-class fields/collections.
+    fn param_value_to_type_arg(&self, pv: &ParamValue) -> Option<crate::ast::expr::Expression> {
+        use crate::ast::expr::{ExprKind, Expression, HierarchicalIdentifier, HierPathSegment};
+        use crate::ast::Identifier as PIdent;
+        use crate::ast::types::DataType;
+        let (leaf, span) = match pv {
+            ParamValue::Expr(e) => return Some(e.clone()),
+            ParamValue::Type(dt) => match dt {
+                // A DIMENSIONED vector (`bit [7:0]`) or a signed atom is not a
+                // bare name: rendering just the keyword would alias
+                // `P#(bit[7:0])` with `P#(bit)`. Carry the whole type instead;
+                // the spec-fragment renderer knows how to print a
+                // `TypeLiteral`.
+                DataType::IntegerVector { dimensions, span, .. } if !dimensions.is_empty() => {
+                    return Some(Expression::new(
+                        ExprKind::TypeLiteral(Box::new(dt.clone())),
+                        *span,
+                    ));
+                }
+                DataType::TypeReference { name, .. } => (name.name.name.clone(), name.name.span),
+                DataType::IntegerAtom { kind, span, .. } => (
+                    match kind {
+                        crate::ast::types::IntegerAtomType::Byte => "byte",
+                        crate::ast::types::IntegerAtomType::ShortInt => "shortint",
+                        crate::ast::types::IntegerAtomType::Int => "int",
+                        crate::ast::types::IntegerAtomType::LongInt => "longint",
+                        crate::ast::types::IntegerAtomType::Integer => "integer",
+                        crate::ast::types::IntegerAtomType::Time => "time",
+                    }
+                    .to_string(),
+                    *span,
+                ),
+                DataType::IntegerVector { kind, span, .. } => (
+                    match kind {
+                        crate::ast::types::IntegerVectorType::Bit => "bit",
+                        crate::ast::types::IntegerVectorType::Logic => "logic",
+                        crate::ast::types::IntegerVectorType::Reg => "reg",
+                    }
+                    .to_string(),
+                    *span,
+                ),
+                DataType::Simple {
+                    kind: crate::ast::types::SimpleType::String,
+                    span,
+                } => ("string".to_string(), *span),
+                _ => return None,
+            },
+        };
+        let hier = HierarchicalIdentifier {
+            root: None,
+            path: vec![HierPathSegment {
+                name: PIdent { name: leaf, span },
+                selects: Vec::new(),
+            }],
+            span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        Some(Expression::new(ExprKind::Ident(hier), span))
+    }
+
+    /// The optional `#(...)` parameter value assignment of an instantiation
+    /// (`mod #(.P(v), 3) u (...)`), shared by module items and `bind`
+    /// directives. `None` when no `#` follows.
+    pub(super) fn parse_instantiation_params(&mut self) -> Option<Vec<ParamConnection>> {
+        if !self.at(TokenKind::Hash) {
+            return None;
+        }
+        self.bump();
+        if self.eat(TokenKind::LParen).is_some() {
+            let mut p = Vec::new();
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                if self.at(TokenKind::Dot) {
+                    self.bump(); let pn = self.parse_identifier(); self.expect(TokenKind::LParen);
+                    let pv = if !self.at(TokenKind::RParen) { Some(self.parse_param_value()) } else { None };
+                    self.expect(TokenKind::RParen); p.push(ParamConnection::Named { name: pn, value: pv });
+                } else { p.push(ParamConnection::Ordered(Some(self.parse_param_value()))); }
+
+                if self.eat(TokenKind::Comma).is_none() { break; }
+            }
+            self.expect(TokenKind::RParen); Some(p)
+        } else if matches!(
+            self.current_kind(),
+            TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
+        ) {
+            // §28.3 primitive delay without parens — `ubuf #2 u (o, i)`.
+            // Eating the `#` and returning None left the literal in the
+            // stream to trip the instance-name parse. A single NUMERIC
+            // literal becomes the one positional value, converging with
+            // `#(2)` downstream (the UDP elaborator reads a scalar delay
+            // out of `params`). Literals only: an identifier here would
+            // be ambiguous against too many neighbors.
+            Some(vec![ParamConnection::Ordered(Some(self.parse_param_value()))])
+        } else { None }
+    }
+
     fn parse_identifier_starting_item(&mut self) -> ModuleItem {
         let start = self.current().span.start;
         let first_name = self.parse_identifier();
@@ -1857,22 +1995,7 @@ impl Parser {
                 span: self.span_from(start),
             });
         }
-        let params = if self.at(TokenKind::Hash) {
-            self.bump();
-            if self.eat(TokenKind::LParen).is_some() {
-                let mut p = Vec::new();
-                while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-                    if self.at(TokenKind::Dot) {
-                        self.bump(); let pn = self.parse_identifier(); self.expect(TokenKind::LParen);
-                        let pv = if !self.at(TokenKind::RParen) { Some(self.parse_param_value()) } else { None };
-                        self.expect(TokenKind::RParen); p.push(ParamConnection::Named { name: pn, value: pv });
-                        } else { p.push(ParamConnection::Ordered(Some(self.parse_param_value()))); }
-
-                    if self.eat(TokenKind::Comma).is_none() { break; }
-                }
-                self.expect(TokenKind::RParen); Some(p)
-            } else { None }
-        } else { None };
+        let params = self.parse_instantiation_params();
 
         // Packed dimensions on a user-typedef base: `MyType [hi:lo] var_name;`
         // After the optional #(params), if we see `[`, treat the construct as a
@@ -1882,8 +2005,8 @@ impl Parser {
             let dimensions = self.parse_packed_dimensions();
             let type_args: Vec<crate::ast::expr::Expression> = match &params {
                 Some(ps) => ps.iter().filter_map(|pc| match pc {
-                    ParamConnection::Ordered(Some(ParamValue::Expr(e))) => Some(e.clone()),
-                    ParamConnection::Named { value: Some(ParamValue::Expr(e)), .. } => Some(e.clone()),
+                    ParamConnection::Ordered(Some(pv)) => self.param_value_to_type_arg(pv),
+                    ParamConnection::Named { value: Some(pv), .. } => self.param_value_to_type_arg(pv),
                     _ => None,
                 }).collect(),
                 None => Vec::new(),
@@ -1923,8 +2046,8 @@ impl Parser {
                 self.pos = initial_pos;
                 let type_args: Vec<crate::ast::expr::Expression> = match &params {
                     Some(ps) => ps.iter().filter_map(|pc| match pc {
-                        ParamConnection::Ordered(Some(ParamValue::Expr(e))) => Some(e.clone()),
-                        ParamConnection::Named { value: Some(ParamValue::Expr(e)), .. } => Some(e.clone()),
+                        ParamConnection::Ordered(Some(pv)) => self.param_value_to_type_arg(pv),
+                        ParamConnection::Named { value: Some(pv), .. } => self.param_value_to_type_arg(pv),
                         _ => None,
                     }).collect(),
                     None => Vec::new(),
@@ -2200,22 +2323,26 @@ impl Parser {
         let start = self.current().span.start;
         self.bump();
         let name = self.parse_identifier();
-        // Optional formal argument list: `covergroup cg (ref int x, ...) ...`
-        if self.at(TokenKind::LParen) {
-            self.skip_balanced_parens();
-        }
+        // §19.3 constructor formal list (`covergroup cg (int lo, int hi)`),
+        // parsed like function ports and bound at `new(...)`.
+        let ports = if self.at(TokenKind::LParen) {
+            self.parse_function_ports()
+        } else {
+            Vec::new()
+        };
         // Optional coverage event: either `@(event)` / `@@(block_event)` or a
         // `with function sample(tf_port_list)` clause (SV 19.4). The sample
         // function turns the covergroup into one sampled explicitly by call.
         let event = if self.at(TokenKind::At) {
             Some(self.parse_event_control())
         } else { None };
+        let mut sample_ports: Vec<FunctionPort> = Vec::new();
         if self.at(TokenKind::KwWith) {
             self.bump();
             self.expect(TokenKind::KwFunction);
             let _ = self.parse_identifier(); // `sample`
             if self.at(TokenKind::LParen) {
-                self.skip_balanced_parens();
+                sample_ports = self.parse_function_ports();
             }
         }
         self.expect(TokenKind::Semicolon);
@@ -2225,7 +2352,7 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndgroup);
         let endlabel = self.parse_end_label();
-        CovergroupDeclaration { name, event, items, endlabel, span: self.span_from(start) }
+        CovergroupDeclaration { name, ports, sample_ports, event, items, endlabel, span: self.span_from(start) }
     }
 
     fn parse_covergroup_item(&mut self) -> CovergroupItem {
@@ -2833,7 +2960,20 @@ impl Parser {
             DataType::TypeReference { dimensions, .. } if dimensions.is_empty() => {
                 DataType::Real { kind: RealType::Real, span }
             }
-            _ => dt,
+                        // The redundant explicit spelling (`wreal real x`) is harmless.
+            DataType::Real { kind: RealType::Real, .. } => dt,
+            // Issue #37: any OTHER explicit data type was silently accepted
+            // AS that type — `wreal logic [3:0] p` elaborated as a 4-bit
+            // vector, quietly reintroducing the integer-rounding corruption
+            // the packed-range rejection above exists to prevent. Same
+            // diagnostic, same recovery.
+            _ => {
+                self.error(
+                    "a 'wreal' net carries a real value and cannot take a data type \
+                     (Verilog-AMS 2.4 §3.8)",
+                );
+                DataType::Real { kind: RealType::Real, span }
+            }
         }
     }
 }

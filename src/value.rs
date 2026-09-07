@@ -803,6 +803,154 @@ impl Value {
         }
     }
 
+    /// The low 128 bits of both planes, masked to `width` (bits at or
+    /// above the width read zero).
+    #[inline]
+    pub fn bits128(&self) -> (u128, u128) {
+        let w = self.width.min(128);
+        let mask: u128 = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                ((*val_bits as u128) & mask, (*xz_bits as u128) & mask)
+            }
+            ValueStorage::Wide(bits) => {
+                let word = |p: &[u64], i: usize| p.get(i).copied().unwrap_or(0) as u128;
+                (
+                    (word(&bits.val, 0) | (word(&bits.val, 1) << 64)) & mask,
+                    (word(&bits.xz, 0) | (word(&bits.xz, 1) << 64)) & mask,
+                )
+            }
+        }
+    }
+
+    /// Replace this value with `nbits` copies of one bit (`v`/`x` are the
+    /// bit's planes, 0 or 1), REUSING the existing wide allocation when it
+    /// already has the right word count. `{N{sel}}` masks over wide buses
+    /// are the RTL idiom this serves: a c906 CoreMark iteration replicates
+    /// a single bit 6.6 million times for 1.48 billion copies in total, and
+    /// the per-copy splice was the last wide-value hot spot.
+    pub fn assign_replicated_bit(&mut self, v: u64, x: u64, nbits: u32) {
+        let (vw, xw) = (0u64.wrapping_sub(v & 1), 0u64.wrapping_sub(x & 1));
+        if nbits <= 64 {
+            let m = Self::mask(nbits);
+            self.storage = ValueStorage::Inline { val_bits: vw & m, xz_bits: xw & m };
+        } else {
+            let n = WidePlanes::nwords(nbits);
+            match &mut self.storage {
+                ValueStorage::Wide(p) if p.val.len() == n && p.xz.len() == n => {
+                    p.val.fill(vw);
+                    p.xz.fill(xw);
+                    p.nbits = nbits;
+                    p.mask_top();
+                }
+                storage => {
+                    let mut p = WidePlanes { val: vec![vw; n], xz: vec![xw; n], nbits };
+                    p.mask_top();
+                    *storage = ValueStorage::Wide(Box::new(p));
+                }
+            }
+        }
+        self.width = nbits;
+        self.is_signed = false;
+        self.is_real = false;
+        self.is_fill = false;
+    }
+
+    /// `{n{self}}`: `n` copies of this value, MSB-first like `concat_refs`.
+    /// A one-bit source is a fill; a source of at most 64 bits is laid down
+    /// a word at a time from its period; anything wider takes the general
+    /// concatenation.
+    pub fn replicate(&self, n: usize) -> Value {
+        let total = (self.width as u64).saturating_mul(n as u64);
+        let total = if total > u32::MAX as u64 { u32::MAX } else { total as u32 };
+        let total = Self::cap_width(total);
+        if n == 0 || self.width == 0 || total == 0 {
+            return Value::zero(0);
+        }
+        if self.is_fill || self.is_real || self.width > 64 {
+            return Value::concat_refs(std::iter::repeat_n(self, n));
+        }
+        if self.width == 1 {
+            let (v, x) = self.raw_bits();
+            let mut out = Value::zero(0);
+            out.assign_replicated_bit(v, x, total);
+            return out;
+        }
+        let w = self.width as usize;
+        let (sv, sx) = self.raw_bits();
+        let m = Self::mask(self.width);
+        let (sv, sx) = (sv & m, sx & m);
+        let nw = WidePlanes::nwords(total);
+        let (mut val, mut xz) = (vec![0u64; nw], vec![0u64; nw]);
+        // Each output word collects the copies overlapping it: copy k
+        // occupies bits [k*w, k*w+w).
+        for wi in 0..nw {
+            let base = wi * 64;
+            let end = (base + 64).min(total as usize);
+            let mut k = base / w;
+            let (mut ov, mut ox) = (0u64, 0u64);
+            while k * w < end {
+                let pos = k * w;
+                if pos >= base {
+                    let sh = pos - base;
+                    ov |= sv << sh;
+                    ox |= sx << sh;
+                } else {
+                    let sh = base - pos;
+                    ov |= sv >> sh;
+                    ox |= sx >> sh;
+                }
+                k += 1;
+            }
+            val[wi] = ov;
+            xz[wi] = ox;
+        }
+        if total <= 64 {
+            let m = Self::mask(total);
+            return Value {
+                storage: ValueStorage::Inline { val_bits: val[0] & m, xz_bits: xz[0] & m },
+                width: total, is_signed: false, is_real: false, is_fill: false,
+            };
+        }
+        let mut p = WidePlanes { val, xz, nbits: total };
+        p.mask_top();
+        Value {
+            storage: ValueStorage::Wide(Box::new(p)),
+            width: total, is_signed: false, is_real: false, is_fill: false,
+        }
+    }
+
+    /// Replace this value with a 65..=128-bit two-plane value given as
+    /// 128-bit words, REUSING the existing wide allocation when this value
+    /// already holds exactly two words. A bytecode register that receives
+    /// the same-shaped wide concatenation every evaluation then never
+    /// reallocates. Flags reset as for a freshly built concatenation.
+    #[inline]
+    pub fn assign_wide128(&mut self, v: u128, x: u128, nbits: u32) {
+        debug_assert!(nbits > 64 && nbits <= 128);
+        let (v0, v1, x0, x1) = (v as u64, (v >> 64) as u64, x as u64, (x >> 64) as u64);
+        match &mut self.storage {
+            ValueStorage::Wide(p) if p.val.len() == 2 && p.xz.len() == 2 => {
+                p.val[0] = v0;
+                p.val[1] = v1;
+                p.xz[0] = x0;
+                p.xz[1] = x1;
+                p.nbits = nbits;
+            }
+            storage => {
+                *storage = ValueStorage::Wide(Box::new(WidePlanes {
+                    val: vec![v0, v1],
+                    xz: vec![x0, x1],
+                    nbits,
+                }));
+            }
+        }
+        self.width = nbits;
+        self.is_signed = false;
+        self.is_real = false;
+        self.is_fill = false;
+    }
+
     /// Access the bits field (compatibility layer for existing code).
     /// Returns a temporary Vec for wide values, or constructs from inline.
     pub fn get_bits(&self) -> BitsRef<'_> {
@@ -946,7 +1094,9 @@ impl Value {
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
-            ValueStorage::Wide(bits) => bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)),
+            // A word scan of the xz plane; the per-bit iterator walk was
+            // 1.9 % of a c906 run (every wide two-state guard asks this).
+            ValueStorage::Wide(bits) => bits.xz.iter().any(|w| *w != 0),
         }
     }
 
@@ -1071,6 +1221,25 @@ impl Value {
         }
     }
 
+    /// Set the compact 4-state code of a one-bit value.
+    #[inline(always)]
+    pub fn set_scalar_code(&mut self, code: u8) -> bool {
+        debug_assert_eq!(self.width, 1);
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let new_val = (code & 1) as u64;
+                let new_xz = ((code >> 1) & 1) as u64;
+                if *val_bits == new_val && *xz_bits == new_xz {
+                    return false;
+                }
+                *val_bits = new_val;
+                *xz_bits = new_xz;
+                true
+            }
+            ValueStorage::Wide(_) => self.set_bit_code(0, code),
+        }
+    }
+
     /// Set bit at position i. Hot-path mirror of `get_bit`; same
     /// rationale for `#[inline(always)]`.
     #[inline(always)]
@@ -1132,25 +1301,66 @@ impl Value {
                 *dst_x = next_x;
                 changed
             }
+            // Word-wise for every wide combination: the former per-bit
+            // get/set walk was 2.4 % of a c906 run on its own (every wide
+            // comb-block store copies its result through here).
             (ValueStorage::Wide(dst), ValueStorage::Wide(src)) => {
                 let mut changed = false;
-                for off in 0..count {
-                    let b = src.get(src_start + off);
-                    if dst.get(dst_start + off) != b {
-                        dst.set(dst_start + off, b);
+                let mut off = 0usize;
+                while off < count {
+                    let n = (count - off).min(64);
+                    let (sv, sx) = src.extract64(src_start + off, n);
+                    let (dv, dx) = dst.extract64(dst_start + off, n);
+                    if sv != dv || sx != dx {
+                        dst.splice64(dst_start + off, sv, sx, n);
                         changed = true;
                     }
+                    off += n;
                 }
                 changed
             }
-            _ => {
+            (ValueStorage::Wide(dst), ValueStorage::Inline { val_bits, xz_bits }) => {
                 let mut changed = false;
-                for offset in 0..count {
-                    changed |= self.set_bit_code(
-                        dst_start + offset,
-                        source.get_bit_code(src_start + offset),
-                    );
+                let mut off = 0usize;
+                while off < count {
+                    let n = (count - off).min(64);
+                    let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+                    let pos = src_start + off;
+                    let (sv, sx) = if pos >= 64 {
+                        (0, 0)
+                    } else {
+                        ((*val_bits >> pos) & mask, (*xz_bits >> pos) & mask)
+                    };
+                    let (dv, dx) = dst.extract64(dst_start + off, n);
+                    if sv != dv || sx != dx {
+                        dst.splice64(dst_start + off, sv, sx, n);
+                        changed = true;
+                    }
+                    off += n;
                 }
+                changed
+            }
+            (
+                ValueStorage::Inline {
+                    val_bits: dst_v,
+                    xz_bits: dst_x,
+                },
+                ValueStorage::Wide(src),
+            ) => {
+                // The destination holds at most 64 live bits, so one
+                // extraction covers the whole copy.
+                let (sv, sx) = src.extract64(src_start, count);
+                let low_mask = if count >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << count) - 1
+                };
+                let mask = low_mask << dst_start;
+                let next_v = (*dst_v & !mask) | (sv << dst_start);
+                let next_x = (*dst_x & !mask) | (sx << dst_start);
+                let changed = next_v != *dst_v || next_x != *dst_x;
+                *dst_v = next_v;
+                *dst_x = next_x;
                 changed
             }
         }
@@ -1324,17 +1534,8 @@ impl Value {
                 };
                 result.is_signed = self.is_signed;
                 let copy_bits = self.width.min(target) as usize;
-                // `set_bit` ignores any index past `result.width` (which the
-                // unsigned branch's `Value::zero` may have capped below
-                // `target`), so clamping the copy to the destination buffer is
-                // the same work with the per-bit dispatch removed.
-                // Per-bit copy: `set_bit`/`get_bit` are word-indexed plane
-                // ops now, so the former byte-layout block copies no longer
-                // apply. This is the SLOW path; the plane-native fast paths
-                // above handle the common widths.
-                for i in 0..copy_bits {
-                    result.set_bit(i, self.get_bit(i));
-                }
+                // Word-wise through `copy_bits_from` (see there).
+                result.copy_bits_from(0, self, 0, copy_bits);
                 result
             }
         }
@@ -2621,6 +2822,26 @@ impl Value {
             };
         }
 
+        // Up to 128 bits: accumulate in two 128-bit words. A c906 run
+        // executes 3.5 M wide concatenations per CoreMark iteration, 83 % of
+        // them at most 128 bits wide and many-part, so the per-part
+        // `splice64` walk below was the dominant cost.
+        if total_width <= 128 {
+            let (mut out_v, mut out_x, mut offset) = (0u128, 0u128, 0u32);
+            for val in values.rev() {
+                if val.width == 0 {
+                    continue;
+                }
+                let (v, x) = val.bits128();
+                out_v |= v << offset;
+                out_x |= x << offset;
+                offset += val.width;
+            }
+            let mut out = Value::zero(0);
+            out.assign_wide128(out_v, out_x, total_width);
+            return out;
+        }
+
         // Wide result: build the two word planes directly. The former
         // byte-buffer construction (one byte per bit + raw-pointer stores)
         // served the byte-coded layout and is obsolete with planes; this is
@@ -2815,6 +3036,140 @@ impl fmt::Display for Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wide_helpers_word_paths_match_bit_semantics() {
+        use super::*;
+        // A 200-bit value with a known pattern and x/z bits in the top word.
+        let mut src = Value::zero(200);
+        for i in 0..200usize {
+            let b = match i % 7 {
+                0 => LogicBit::One,
+                3 => LogicBit::X,
+                5 => LogicBit::Z,
+                _ => LogicBit::Zero,
+            };
+            src.set_bit(i, b);
+        }
+        assert!(src.has_xz());
+        let mut clean = Value::zero(200);
+        for i in (0..200usize).step_by(2) {
+            clean.set_bit(i, LogicBit::One);
+        }
+        assert!(!clean.has_xz());
+
+        // Wide -> Wide copy at an unaligned offset, then bit-check.
+        let mut dst = Value::zero(300);
+        assert!(dst.copy_bits_from(37, &src, 5, 150));
+        for i in 0..150usize {
+            assert_eq!(dst.get_bit(37 + i), src.get_bit(5 + i), "bit {i}");
+        }
+        assert_eq!(dst.get_bit(36), LogicBit::Zero);
+        assert_eq!(dst.get_bit(187), LogicBit::Zero);
+        // Same copy again reports no change.
+        assert!(!dst.copy_bits_from(37, &src, 5, 150));
+
+        // Inline -> Wide and Wide -> Inline.
+        let small = Value::from_u64(0xDEAD_BEEF_0123_4567, 64);
+        let mut wide = Value::zero(130);
+        assert!(wide.copy_bits_from(70, &small, 4, 60));
+        for i in 0..60usize {
+            assert_eq!(wide.get_bit(70 + i), small.get_bit(4 + i), "iw bit {i}");
+        }
+        let mut narrow = Value::zero(64);
+        assert!(narrow.copy_bits_from(3, &src, 100, 40));
+        for i in 0..40usize {
+            assert_eq!(narrow.get_bit(3 + i), src.get_bit(100 + i), "wi bit {i}");
+        }
+        assert_eq!(narrow.get_bit(2), LogicBit::Zero);
+        assert_eq!(narrow.get_bit(43), LogicBit::Zero);
+
+        // Wide resize keeps the low bits, sign-extends a signed wide value.
+        let widened = src.resize(260);
+        for i in 0..200usize {
+            assert_eq!(widened.get_bit(i), src.get_bit(i), "rz bit {i}");
+        }
+        assert_eq!(widened.get_bit(259), LogicBit::Zero);
+        let mut neg = Value::zero(100);
+        neg.set_bit(99, LogicBit::One);
+        neg.is_signed = true;
+        let ext = neg.resize(140);
+        assert_eq!(ext.get_bit(139), LogicBit::One);
+        assert_eq!(ext.get_bit(99), LogicBit::One);
+        assert_eq!(ext.get_bit(98), LogicBit::Zero);
+        let truncated = src.resize(70);
+        for i in 0..70usize {
+            assert_eq!(truncated.get_bit(i), src.get_bit(i), "tr bit {i}");
+        }
+
+        // 65..=128-bit concatenation of mixed inline/wide parts equals the
+        // bit-by-bit definition, and an in-place assign reuses storage.
+        let a = Value::from_u64(0xF0F0_1234_5678_9ABC, 40);
+        let mut b = Value::zero(70);
+        for i in (1..70usize).step_by(3) {
+            b.set_bit(i, if i % 2 == 0 { LogicBit::X } else { LogicBit::One });
+        }
+        let c = Value::from_u64(0b101, 3);
+        let cat = Value::concat_refs([&a, &b, &c].into_iter());
+        assert_eq!(cat.width, 113);
+        for i in 0..3usize {
+            assert_eq!(cat.get_bit(i), c.get_bit(i), "c bit {i}");
+        }
+        for i in 0..70usize {
+            assert_eq!(cat.get_bit(3 + i), b.get_bit(i), "b bit {i}");
+        }
+        for i in 0..40usize {
+            assert_eq!(cat.get_bit(73 + i), a.get_bit(i), "a bit {i}");
+        }
+        assert!(cat.has_xz());
+        // Replication equals the concatenation definition for a 1-bit
+        // source (0/1/x/z), a 3-bit source, a 40-bit source, and reuses a
+        // register's storage in place.
+        for bit in [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z] {
+            let mut one = Value::zero(1);
+            one.set_bit(0, bit);
+            for n in [1usize, 7, 64, 65, 200, 257] {
+                let r = one.replicate(n);
+                let c = Value::concat_refs(std::iter::repeat_n(&one, n));
+                assert_eq!(r.width, c.width);
+                for i in 0..r.width as usize {
+                    assert_eq!(r.get_bit(i), c.get_bit(i), "1-bit {bit:?} n={n} bit {i}");
+                }
+            }
+        }
+        let mut three = Value::from_u64(0b101, 3);
+        three.set_bit(1, LogicBit::X);
+        for n in [1usize, 5, 21, 22, 43, 100] {
+            let r = three.replicate(n);
+            let c = Value::concat_refs(std::iter::repeat_n(&three, n));
+            assert_eq!(r.width, c.width);
+            for i in 0..r.width as usize {
+                assert_eq!(r.get_bit(i), c.get_bit(i), "3-bit n={n} bit {i}");
+            }
+        }
+        for n in [1usize, 2, 3, 9] {
+            let r = a.replicate(n);
+            let c = Value::concat_refs(std::iter::repeat_n(&a, n));
+            for i in 0..r.width as usize {
+                assert_eq!(r.get_bit(i), c.get_bit(i), "40-bit n={n} bit {i}");
+            }
+        }
+        let mut slot = Value::zero(200);
+        slot.assign_replicated_bit(1, 0, 200);
+        assert_eq!(slot.width, 200);
+        assert!(!slot.has_xz());
+        assert_eq!(slot.get_bit(199), LogicBit::One);
+        slot.assign_replicated_bit(0, 1, 150);
+        assert_eq!(slot.width, 150);
+        assert_eq!(slot.get_bit(149), LogicBit::X);
+        assert_eq!(slot.get_bit(0), LogicBit::X);
+
+        let mut reused = cat.clone();
+        let (v, x) = cat.bits128();
+        reused.assign_wide128(x, v, 100);
+        assert_eq!(reused.width, 100);
+        assert_eq!(reused.bits128(), (x & ((1u128 << 100) - 1), v & ((1u128 << 100) - 1)));
+    }
+
     use super::*;
 
     #[test]
@@ -3677,7 +4032,9 @@ impl Value {
     pub fn has_unknown(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
-            ValueStorage::Wide(bits) => bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)),
+            // A word scan of the xz plane; the per-bit iterator walk was
+            // 1.9 % of a c906 run (every wide two-state guard asks this).
+            ValueStorage::Wide(bits) => bits.xz.iter().any(|w| *w != 0),
         }
     }
 
@@ -3793,19 +4150,18 @@ impl Value {
     /// `len()`/`getc()` must observe.
     pub fn sv_string_bytes(&self) -> Vec<u8> {
         let num_bytes = self.width.div_ceil(8) as usize;
-        let mut out: Vec<u8> = Vec::new();
+        let mut out: Vec<u8> = Vec::with_capacity(num_bytes);
         let mut started = false;
+        // Whole bytes via the SWAR slice reader (word extraction) instead of
+        // eight get_bit calls per byte — string values are wide (one byte per
+        // char) and this ran per formatted UVM message.
         for bi in (0..num_bytes).rev() {
-            let mut byte = 0u8;
-            for b in 0..8usize {
-                let bit_idx = bi * 8 + b;
-                if bit_idx >= self.width as usize {
-                    break;
-                }
-                if self.get_bit(bit_idx) == LogicBit::One {
-                    byte |= 1u8 << b;
-                }
-            }
+            let lo = bi * 8;
+            let w = core::cmp::min(8, self.width as usize - lo);
+            let (v, xz) = self.slice_bits_swar(lo, w);
+            // get_bit == One only when val=1 AND xz=0 — an X bit (val=1,
+            // xz=1 in this encoding) must keep reading as 0 here.
+            let byte = ((v & !xz) & 0xff) as u8;
             if byte != 0 {
                 started = true;
             }
@@ -4374,5 +4730,20 @@ mod wide_probe_tests {
         assert_eq!(c.get_bit(1), LogicBit::Zero, "bit1");
         assert_eq!(c.get_bit(2), LogicBit::One, "bit2");
         assert_eq!(c.to_u128() & 0x7, 0b101);
+    }
+}
+
+#[cfg(test)]
+mod scalar_code_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_code_tracks_all_four_states() {
+        let mut value = Value::zero(1);
+        for code in [1, 2, 3, 0] {
+            assert!(value.set_scalar_code(code));
+            assert_eq!(value.get_bit_code(0), code);
+            assert!(!value.set_scalar_code(code));
+        }
     }
 }

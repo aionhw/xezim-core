@@ -9,10 +9,19 @@ use super::{Identifier, Span};
 pub struct Expression {
     pub kind: ExprKind,
     pub span: Span,
+    /// The self-determined width the simulator inferred for this node, when
+    /// that width is a static property of the node (signal widths, packed
+    /// layouts, literals, compositions of those). Filled lazily by
+    /// `infer_width`; never filled for shapes whose width depends on runtime
+    /// state (a local's current value, an evaluated fallback).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub cached_width: Cell<Option<u32>>,
 }
 
 impl Expression {
-    pub fn new(kind: ExprKind, span: Span) -> Self { Self { kind, span } }
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Self { kind, span, cached_width: Cell::new(None) }
+    }
 }
 
 #[derive(Debug, Clone)]
