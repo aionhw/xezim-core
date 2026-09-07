@@ -22675,6 +22675,26 @@ fn inline_module_items(
                                 // SUBMODULE or interface decl must register
                                 // like a top-level one — `tif.q.push_back(x)`
                                 // read a phantom 64-slot fixed array before.
+                                // An instance variable with unpacked dims (queue, dynamic,
+                                // associative, fixed) whose ELEMENT is a packed struct: the
+                                // module path registers the element layout under the container
+                                // name so `q[i].field` resolves; the inlined copy never did, so
+                                // every element field read 0 and writes were lost inside an
+                                // instance while the same code worked at the top level.
+                                if !effective_decl_dims.is_empty()
+                                    && !elab.packed_struct_fields.contains_key(&sig_name)
+                                {
+                                    if let Some(fields) = packed_struct_field_layout(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                        }
+                                    }
+                                }
                                 match effective_decl_dims.first() {
                                     Some(UnpackedDimension::Unsized(_))
                                     | Some(UnpackedDimension::Queue { .. }) => {
