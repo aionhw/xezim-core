@@ -1048,4 +1048,9 @@ pub enum PackageItem {
     /// import-declaration shape (package `*` spells the export-everything
     /// form). Appended last for bincode index stability.
     Export(ImportDeclaration),
+    /// `timeunit`/`timeprecision` inside a package (LRM §3.14.2.2): the
+    /// package's own time unit, overriding the file's `timescale for the
+    /// delays in its classes, tasks and functions. Appended last for bincode
+    /// index stability.
+    TimeunitsDecl(crate::ast::decl::TimeunitsDeclaration),
 }

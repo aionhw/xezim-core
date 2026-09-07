@@ -23437,6 +23437,9 @@ fn inline_module_items(
                         for p in &fd.ports {
                             fn_locals.remove(&p.name.name);
                         }
+                        for n in stmt_list_declared_names(&fd.items) {
+                            fn_locals.remove(n);
+                        }
                         for p in &mut new_fd.ports {
                             bake_formal_type(p);
                             if let Some(def) = &p.default {
@@ -23468,6 +23471,9 @@ fn inline_module_items(
                         let mut task_locals = (*prepared_sub.local_names).clone();
                         for p in &td.ports {
                             task_locals.remove(&p.name.name);
+                        }
+                        for n in stmt_list_declared_names(&td.items) {
+                            task_locals.remove(n);
                         }
                         for p in &mut new_td.ports {
                             bake_formal_type(p);
@@ -26708,6 +26714,51 @@ pub fn rename_process_shadowed_locals(
 /// declarations (`begin integer k; ... end`) are deliberately NOT stripped:
 /// the runtime's process-context block locals are not yet consistent enough
 /// to stand on their own, and the prefixed form keeps today's behaviour.
+/// Names declared by the top-level `VarDecl` statements of a statement list
+/// (a subroutine body or a block). §6.21: such a declaration shadows the
+/// module's own names for the statements that follow it, so the inliner must
+/// not prefix its uses with the instance path — `begin int u; u = 5; end`
+/// clobbered the module-level `u`, a task-local `core` next to an instance
+/// `core` read `core.c` as x, and a block-local handle named like the
+/// enclosing instance read null.
+fn stmt_list_declared_names(stmts: &[Statement]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for st in stmts {
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            for d in declarators {
+                out.push(d.name.name.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite a statement list where each `VarDecl` shadows the module names
+/// for the statements AFTER it (its own initialiser still sees the outer
+/// set).
+fn rewrite_stmt_list_scoped(
+    stmts: &[Statement],
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<Statement> {
+    let mut cur: Option<std::collections::HashSet<String>> = None;
+    let mut out = Vec::with_capacity(stmts.len());
+    for st in stmts {
+        let names = cur.as_ref().unwrap_or(local_names);
+        out.push(rewrite_stmt(st, prefix, port_map, names, interface_map));
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let Some(reduced) =
+                without_declared(names, declarators.iter().map(|d| d.name.name.as_str()))
+            {
+                cur = Some(reduced);
+            }
+        }
+    }
+    out
+}
+
 fn without_declared<'a>(
     local_names: &std::collections::HashSet<String>,
     declared: impl Iterator<Item = &'a str>,
@@ -26900,7 +26951,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name: name.clone(),
-            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
         },
         StatementKind::EventTrigger { nonblocking, name, target, span } => StatementKind::EventTrigger {
             nonblocking: *nonblocking,
@@ -26919,7 +26970,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         },
         StatementKind::ParBlock { name, stmts, join_type } => StatementKind::ParBlock {
             name: name.clone(),
-            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
             join_type: *join_type,
         },
 

@@ -832,6 +832,9 @@ impl Parser {
 
     pub(super) fn parse_package_item(&mut self) -> Option<PackageItem> {
         match self.current_kind() {
+            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
+                Some(PackageItem::TimeunitsDecl(self.parse_timeunits_declaration()))
+            }
             TokenKind::KwParameter => Some(PackageItem::Parameter(self.parse_parameter_decl_stmt())),
             TokenKind::KwLocalparam => Some(PackageItem::Parameter(self.parse_parameter_decl_stmt())),
             TokenKind::KwTypedef => Some(PackageItem::Typedef(self.parse_typedef_declaration())),

@@ -1246,8 +1246,13 @@ fn parse_and_elaborate(
                 elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
-            ast::Description::Program(p) => {
+            ast::Description::Program(mut p) => {
                 let name = p.name.name.clone();
+                // A program's delays scale like a module's; the pass never
+                // visited programs, so `#7` in one ran at zero time.
+                let (unit_s, prec_s) =
+                    eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
+                elaborate::rewrite_module_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
@@ -1289,11 +1294,23 @@ fn parse_and_elaborate(
                 // Packages are not in `eff_ts` (that walk covers instantiable
                 // elements); the preprocessor records the directive in effect
                 // at the package, else the compilation unit's first one.
-                let (unit_s, prec_s) = module_timescales
+                let (mut unit_s, mut prec_s) = module_timescales
                     .get(&name)
                     .or_else(|| module_timescales.get("$unit"))
                     .copied()
                     .unwrap_or((tick_s, tick_s));
+                // A `timeunit`/`timeprecision` declared IN the package wins
+                // over the directive (LRM §3.14.2.2).
+                for item in &p.items {
+                    if let ast::decl::PackageItem::TimeunitsDecl(td) = item {
+                        if let Some(u) = &td.unit {
+                            unit_s = elaborate::exp_to_secs(elaborate::time_literal_to_exp(u));
+                        }
+                        if let Some(pr) = &td.precision {
+                            prec_s = elaborate::exp_to_secs(elaborate::time_literal_to_exp(pr));
+                        }
+                    }
+                }
                 elaborate::rewrite_package_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 definitions.insert(name, SourceDefinition::Package(Rc::new(p)));
             }
