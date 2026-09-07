@@ -24448,8 +24448,19 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
                 && const_fn_expr_supported(else_expr)
         }
         ExprKind::Call { args, .. } => args.iter().all(const_fn_expr_supported),
+        // §6.24.1: `signed'(e)` / `unsigned'(e)` reach here lowered onto
+        // `$signed` / `$unsigned`. They only REINTERPRET signedness — no width
+        // is resolved and no type table is consulted — so `eval_const_expr_val`
+        // computes them faithfully with nothing more than `params`, which is
+        // the bar this list is guarding.
+        //
+        // `$__xz_type_cast` (`int'(e)`, `byte'(e)`, a user typedef) is
+        // deliberately NOT admitted: it resolves the target width through
+        // `TYPEDEFS_TLS`, and an unpopulated table silently yields width 1
+        // rather than failing, which is exactly the quiet-wrong-answer this
+        // list exists to prevent.
         ExprKind::SystemCall { name, args } => {
-            matches!(name.as_str(), "$clog2" | "$bits")
+            matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned")
                 && args.iter().all(const_fn_expr_supported)
         }
         _ => false,
