@@ -694,6 +694,33 @@ pub struct ElaboratedClass {
     /// `foo[i][j]` writes were dropped and `foreach (foo[i,j])` left `j` at X.
     #[serde(default)]
     pub array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)>,
+    /// §7.4.5: a fixed-size unpacked array whose ELEMENT is a COLLECTION
+    /// (`int q[3][$]`, `int d[3][]`, `int a[2][2][int]`). name -> (outer
+    /// fixed shape, element width, element collection kind).
+    ///
+    /// The trailing collection dimension used to be dropped on the floor.
+    /// `array_nd_properties` rejects the shape (a queue dimension has no
+    /// constant bounds), so classification fell back to
+    /// `effective_dims.first()` and the member became a plain fixed array of
+    /// SCALARS. That failed quietly in the worst way: `$size(q)` and
+    /// `foreach (q[i])` both answered correctly off the outer shape, while
+    /// every element's queue had no storage at all — `q[i].push_back(x)`
+    /// resolved to nothing and `q[i].size()` stayed 0 forever.
+    #[serde(default)]
+    pub array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)>,
+}
+
+/// The kind of COLLECTION that sits at the innermost dimension of an
+/// `array_of_coll_properties` member. Mirrors the three trailing unpacked
+/// dimensions that give an element its own independent store.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CollDimKind {
+    /// `m[$]` / `m[$:N]` — the option carries the bounded cap (max + 1).
+    Queue(Option<u32>),
+    /// `m[]` — dynamic array.
+    Dyn,
+    /// `m[KEY]` — associative; the flag is `true` for a `string` key.
+    Assoc { string_key: bool },
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -837,6 +864,8 @@ pub fn elaborate_class_with_params(
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
+    let mut array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)> =
+        HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut static_assoc_key_types: HashMap<String, String> = HashMap::default();
@@ -1070,6 +1099,82 @@ pub fn elaborate_class_with_params(
                     // only `effective_dims.first()`, silently dropping inner
                     // dimensions — `foo[i][j]` writes then miss and multi-var
                     // `foreach` never binds the inner index.
+                    // §7.4.5: FIXED outer dimensions with a COLLECTION as the
+                    // innermost one (`int q[3][$]`, `int d[3][]`,
+                    // `int a[2][2][int]`). Neither branch below can express
+                    // this: `nd_shape` needs constant bounds on every
+                    // dimension and a queue dimension has none, so it bails
+                    // and the fallback keeps only `effective_dims.first()` —
+                    // the member becomes a fixed array of SCALARS and the
+                    // element collections get no storage at all. Claim the
+                    // shape here, before either.
+                    let coll_elem_kind = match effective_dims.last() {
+                        Some(UnpackedDimension::Queue { max_size, .. }) if effective_dims.len() >= 2 => {
+                            Some(CollDimKind::Queue(
+                                max_size
+                                    .as_ref()
+                                    .and_then(|e| const_eval_i64_with_params(e, unpacked_params))
+                                    .map(|n| (n + 1).max(1) as u32),
+                            ))
+                        }
+                        Some(UnpackedDimension::Unsized(_)) if effective_dims.len() >= 2 => {
+                            Some(CollDimKind::Dyn)
+                        }
+                        Some(UnpackedDimension::Associative { data_type: kdt, .. })
+                            if effective_dims.len() >= 2 =>
+                        {
+                            Some(CollDimKind::Assoc {
+                                string_key: kdt.as_ref().is_some_and(|dt| {
+                                    matches!(
+                                        dt.as_ref(),
+                                        DataType::Simple { kind: SimpleType::String, .. }
+                                    )
+                                }),
+                            })
+                        }
+                        _ => None,
+                    };
+                    let outer_shape: Option<Vec<(i64, i64)>> = coll_elem_kind.as_ref().and_then(|_| {
+                        effective_dims[..effective_dims.len() - 1]
+                            .iter()
+                            .map(|dm| match dm {
+                                UnpackedDimension::Range { left, right, .. } => match (
+                                    const_eval_i64_with_params(left, unpacked_params),
+                                    const_eval_i64_with_params(right, unpacked_params),
+                                ) {
+                                    (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
+                                    _ => None,
+                                },
+                                UnpackedDimension::Expression { expr, .. } => {
+                                    match const_eval_i64_with_params(expr, unpacked_params) {
+                                        Some(n) if n > 0 => Some((0, n - 1)),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                    if let (Some(kind), Some(shape)) = (coll_elem_kind, outer_shape) {
+                        // The OUTER shape still goes into the ordinary fixed-
+                        // array maps: every existing consumer of a class
+                        // property's shape ($size, foreach, %p, the randomizer)
+                        // reads them, and the outer dimensions really are a
+                        // fixed array. `array_of_coll_properties` is additive —
+                        // it says what the ELEMENT is, which is the part that
+                        // had nowhere to live.
+                        if shape.len() == 1 {
+                            array_properties.insert(
+                                decl.name.name.clone(),
+                                (shape[0].0, shape[0].1, width.max(1)),
+                            );
+                        } else {
+                            array_nd_properties
+                                .insert(decl.name.name.clone(), (shape.clone(), width.max(1)));
+                        }
+                        array_of_coll_properties
+                            .insert(decl.name.name.clone(), (shape, width.max(1), kind));
+                    } else {
                     let nd_shape: Option<Vec<(i64, i64)>> = if effective_dims.len() >= 2 {
                         effective_dims
                             .iter()
@@ -1146,6 +1251,7 @@ pub fn elaborate_class_with_params(
                         _ => {}
                     }
                     } // end `else` (single-dim)
+                    } // end `else` (not an array-of-collections)
                     } // end `if !is_static`
                     // Remember scalar initializers so instantiation can re-eval
                     // them with the live parameter table (e.g. `= NUM_HARTS`).
@@ -1468,6 +1574,7 @@ pub fn elaborate_class_with_params(
         static_fixed_arrays,
         array_properties,
         array_nd_properties,
+        array_of_coll_properties,
     }
 }
 
