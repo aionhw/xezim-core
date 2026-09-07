@@ -15442,8 +15442,24 @@ fn register_array_param(
         if items.len() != n {
             return false;
         }
+        // §10.9.2: an ELEMENT of an unpacked array parameter may itself be
+        // an assignment pattern, and the element type supplies the layout.
+        // `eval_const_expr_val` has no type context for a bare `'{...}`, so a
+        // `localparam cfg_t A [3] = '{'{4,2},..}` used to evaluate every
+        // element to 0. The scalar form (`localparam cfg_t C = '{..}`) already
+        // went through these two packers; the array element path did not.
         for it in items {
-            vals.push(eval_init_for_width(it, params, elem_w));
+            let v = pack_struct_const_value(
+                data_type,
+                it,
+                params,
+                &elab.typedefs,
+                &elab.typedef_types,
+            )
+            .or_else(|| pack_packed_vector_pattern(data_type, it, params, &elab.typedef_types))
+            .map(|v| v.resize(elem_w))
+            .unwrap_or_else(|| eval_init_for_width(it, params, elem_w));
+            vals.push(v);
         }
     } else {
         return false;
