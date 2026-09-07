@@ -11853,6 +11853,46 @@ pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, prec_s: 
     rewrite_module_item_delays(items, unit_s, prec_s, tick_s);
 }
 
+/// Package-scope counterpart of `rewrite_module_delays_pub`: a package's
+/// classes, tasks and functions take the `timescale in effect at the
+/// package. Without this a `#200` in a package class method stayed 200 raw
+/// ticks (0.2 ns under a 1ps precision) while the same method in a module
+/// class was scaled correctly.
+/// Class-level entry for a compilation-unit (`$unit`) class declaration.
+pub fn rewrite_class_delays_pub(cd: &mut ClassDeclaration, unit_s: f64, prec_s: f64, tick_s: f64) {
+    rewrite_class_delays(cd, unit_s, prec_s, tick_s);
+}
+
+/// Statement-level entry for the compilation-unit (`$unit`) subroutines.
+pub fn rewrite_stmt_delays_pub(stmt: &mut Statement, unit_s: f64, prec_s: f64, tick_s: f64) {
+    rewrite_stmt_delays(stmt, unit_s, prec_s, tick_s);
+}
+
+pub fn rewrite_package_delays_pub(
+    items: &mut [crate::ast::decl::PackageItem],
+    unit_s: f64,
+    prec_s: f64,
+    tick_s: f64,
+) {
+    use crate::ast::decl::PackageItem;
+    for item in items.iter_mut() {
+        match item {
+            PackageItem::Class(cd) => rewrite_class_delays(cd, unit_s, prec_s, tick_s),
+            PackageItem::Task(td) => {
+                for st in td.items.iter_mut() {
+                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
+                }
+            }
+            PackageItem::Function(f) => {
+                for st in f.items.iter_mut() {
+                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Rewrite every delay expression inside a module's items so it is expressed in
 /// GLOBAL TICK units (`tick_s` seconds each), given the module's own timeunit
 /// `unit_s`. A *bare* delay `#5` is a count of `unit_s`, so it scales by

@@ -1255,6 +1255,13 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
                 }
+                // A compilation-unit class scales its method delays by the
+                // unit's `timescale, like a package's classes.
+                let (unit_s, prec_s) = module_timescales
+                    .get("$unit")
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
                 let name = c.name.name.clone();
                 definitions.insert(name, SourceDefinition::Class(Rc::new(c)));
             }
@@ -1276,6 +1283,18 @@ fn parse_and_elaborate(
                     }
                 }
                 let name = p.name.name.clone();
+                // Delays inside the package scale by ITS timescale, exactly
+                // as a module's items do above; without this a `#200` in a
+                // package class method stayed 200 raw ticks.
+                // Packages are not in `eff_ts` (that walk covers instantiable
+                // elements); the preprocessor records the directive in effect
+                // at the package, else the compilation unit's first one.
+                let (unit_s, prec_s) = module_timescales
+                    .get(&name)
+                    .or_else(|| module_timescales.get("$unit"))
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                elaborate::rewrite_package_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 definitions.insert(name, SourceDefinition::Package(Rc::new(p)));
             }
             ast::Description::TypedefDecl(t) => {
@@ -1316,11 +1335,27 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
                 }
+                // A `$unit` subroutine's delays scale by the compilation
+                // unit's `timescale (recorded as "$unit"), like a module's.
+                let (unit_s, prec_s) = module_timescales
+                    .get("$unit")
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                for st in f.items.iter_mut() {
+                    elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
+                }
                 top_level_functions.push(f);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Task(mut t)) => {
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
+                }
+                let (unit_s, prec_s) = module_timescales
+                    .get("$unit")
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                for st in t.items.iter_mut() {
+                    elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
                 }
                 top_level_tasks.push(t);
             }
