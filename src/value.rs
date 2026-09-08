@@ -1572,6 +1572,13 @@ impl Value {
     /// whenever `self.width == 0`, so the `width - 1` cannot underflow.
     #[inline]
     pub fn resize_for_assign(&self, target: u32) -> Value {
+        // Same width, ordinary value: the result is a copy of `self` (no
+        // extension, no truncation, no fill), so skip the sign/x/z probe
+        // and the resize branches — the most common non-blocking write
+        // shape on a CPU core.
+        if target == self.width && !self.is_fill && !self.is_real && target != 0 {
+            return self.clone();
+        }
         if !self.is_fill
             && (!self.is_signed
                 || target <= self.width
