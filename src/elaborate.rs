@@ -530,6 +530,13 @@ pub struct ElaboratedClass {
     /// enclosing class — its statics are visible to this class's methods.
     #[serde(default)]
     pub enclosing: Option<String>,
+    /// The MODULE this class is declared inside (`module wrapper; class
+    /// proxy_c; ... endclass ... endmodule`), if any. A method of such a
+    /// class resolves bare and sibling-instance names in that module's
+    /// scope (§23.6); the runtime needs the module to find the instance when
+    /// the object was not built inside it.
+    #[serde(default)]
+    pub declaring_module: Option<String>,
     /// Names listed in the `implements` clause.
     #[serde(default)]
     pub implements: Vec<String>,
@@ -1221,6 +1228,40 @@ pub fn elaborate_class_with_params(
                     }
                 }
             }
+            // §19.3: a covergroup declared in a class body implicitly declares
+            // a variable of that covergroup type with the same name, which
+            // the constructor's `cg = new` assigns. Without the property the
+            // assignment had no target: the handle stayed x and every
+            // `cg.sample()` was a silent no-op.
+            ClassItem::Covergroup(cg) => {
+                let cg_name = cg.name.name.clone();
+                if !properties.contains_key(&cg_name) {
+                    property_types.insert(
+                        cg_name.clone(),
+                        DataType::TypeReference {
+                            name: TypeName {
+                                scope: None,
+                                name: Identifier { name: cg_name.clone(), span: cg.name.span },
+                                span: cg.name.span,
+                            },
+                            dimensions: Vec::new(),
+                            type_args: Vec::new(),
+                            span: cg.name.span,
+                        },
+                    );
+                    properties.insert(cg_name.clone(), Signal {
+                        is_const: false,
+                        name: cg_name.clone(),
+                        width: 32,
+                        is_signed: false,
+                        is_real: false,
+                        direction: None,
+                        value: Value::new(32),
+                        type_name: Some(cg_name.clone()),
+                    });
+                    property_order.push(cg_name);
+                }
+            }
             ClassItem::Method(m) => {
                 let name = match &m.kind {
                     ClassMethodKind::Function(f) => f.name.name.name.clone(),
@@ -1391,6 +1432,7 @@ pub fn elaborate_class_with_params(
     ElaboratedClass {
         name: c.name.name.clone(),
         enclosing: None,
+        declaring_module: None,
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
         extends_args: c.extends.as_ref().map(|e| {
             e.args.iter().filter_map(|a| match a {
@@ -1577,6 +1619,11 @@ pub struct ElaboratedModule {
     /// passes back to identify which subroutine to run.
     #[cfg_attr(feature = "serde", serde(default))]
     pub dpi_exports: Vec<String>,
+    /// The C linkage name of each entry of `dpi_exports` (same index): the
+    /// alias of `export "DPI-C" c_name = task sv_name;` when given, else the
+    /// SV name. The alias used to be dropped, so the C side's `c_name` was an
+    /// undefined symbol in the loaded library.
+    pub dpi_export_c_names: Vec<String>,
     /// Clocking block definitions: name -> AST declaration.
     pub clocking_blocks: HashMap<String, ClockingDeclaration>,
     /// Let declarations visible in the elaborated scope.
@@ -1788,6 +1835,9 @@ pub struct ElaboratedModule {
     /// `$printtimescale` from it. Keyed by module name (= definition name).
     #[serde(default)]
     pub module_timescale_exp: HashMap<String, (i32, i32)>,
+    /// Module definitions that carried no `timescale (own, inherited, or
+    /// CLI) and therefore run on the 1ns/1ns tool default.
+    pub modules_without_timescale: Vec<String>,
     /// IEEE 1800-2017 §6.19: enum typedef members in declaration order.
     /// Keyed by typedef name; each entry is `(member_name, value)`.
     /// Used to resolve `.name()` / `.next()` / `.first()` etc.
@@ -2054,6 +2104,7 @@ impl ElaboratedModule {
             func_decl_scope: HashMap::default(),
             dpi_imports: HashMap::default(),
             dpi_exports: Vec::new(),
+            dpi_export_c_names: Vec::new(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
             modport_views: HashMap::default(),
@@ -2101,6 +2152,7 @@ impl ElaboratedModule {
             timeunit_exp: default_timeunit_exp(),
             timeprecision_exp: default_timeunit_exp(),
             module_timescale_exp: HashMap::default(),
+            modules_without_timescale: Vec::new(),
             enum_members: HashMap::default(),
             package_enum_members: HashMap::default(),
             decl_sites: HashMap::default(),
@@ -2305,6 +2357,35 @@ fn dpi_proto_sv_name(proto: &DPIProto) -> String {
         DPIProto::Function(fd) => fd.name.name.name.clone(),
         DPIProto::Task(td) => td.name.name.name.clone(),
     }
+}
+
+/// §19.3: a covergroup declared inside a class body is a type of that
+/// class. Register it under its bare name (the property's declared type,
+/// what `cg = new` resolves) and under `Class::cg` (what disambiguates two
+/// classes that both declare a `cg`). The bare key keeps the FIRST
+/// definition; the qualified key is exact.
+fn register_class_covergroups(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
+    for item in &c.items {
+        if let ClassItem::Covergroup(cg) = item {
+            elab.covergroups
+                .entry(cg.name.name.clone())
+                .or_insert_with(|| cg.clone());
+            elab.covergroups
+                .insert(format!("{}::{}", c.name.name, cg.name.name), cg.clone());
+        }
+    }
+}
+
+/// §35.5.4 `export "DPI-C" [c_name =] task|function sv_name;` — record the
+/// SV subroutine and the C linkage name the loaded library will call.
+fn register_dpi_export(e: &crate::ast::decl::DPIExport, elab: &mut ElaboratedModule) {
+    let name = dpi_proto_sv_name(&e.proto);
+    if elab.dpi_exports.contains(&name) {
+        return;
+    }
+    let c_name = e.c_name.clone().unwrap_or_else(|| name.clone());
+    elab.dpi_exports.push(name);
+    elab.dpi_export_c_names.push(c_name);
 }
 
 fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
@@ -3870,6 +3951,7 @@ pub fn elaborate_module_with_defs(
                 Definition::Class(c) => {
                     validate_class_constraints(c, Some(defs), Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
+                    register_class_covergroups(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -3925,6 +4007,7 @@ pub fn elaborate_module_with_defs(
                             // `pkg::Class::method`.
                             crate::ast::decl::PackageItem::Class(c) => {
                                 register_class_enum_members(c, &mut elab);
+                                register_class_covergroups(c, &mut elab);
                                 // Snapshot so the closure does not hold a borrow
                                 // of `elab` while `elab.classes` is borrowed.
                                 let params_snapshot = elab.parameters.clone();
@@ -4407,6 +4490,7 @@ pub fn elaborate_module_with_defs(
                 crate::ast::decl::PackageItem::Class(c) => {
                     validate_class_constraints(c, all_defs, Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
+                    register_class_covergroups(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -4417,6 +4501,9 @@ pub fn elaborate_module_with_defs(
                 }
                 crate::ast::decl::PackageItem::DPIImport(di) => {
                     register_dpi_import(di, &mut elab)?;
+                }
+                crate::ast::decl::PackageItem::DPIExport(e) => {
+                    register_dpi_export(e, &mut elab);
                 }
                 _ => {}
             }
@@ -5727,6 +5814,17 @@ pub fn elaborate_module_with_defs(
                             // with large memories). The width/signed/real
                             // attributes are uniform across elements so we
                             // don't need a per-element Signal struct.
+                            // §6.8/§10.9: apply the declaration initializer as one
+                            // whole-pattern assignment (the per-element lowering of the
+                            // 1-D path walks a single dimension; this shape's initializer
+                            // was silently dropped).
+                            if let Some(init_expr) = &decl.init {
+                                elab.initial_blocks.push(InitialBlock {
+                                    stmt: Statement::new(StatementKind::BlockingAssign {
+                                        lvalue: make_ident_expr(&decl.name.name),
+                                        rvalue: init_expr.clone(),
+                                    }, Span::dummy()), scope: String::new(), });
+                            }
                             let _ = (is_signed, width);
                             continue;
                         }
@@ -5769,6 +5867,17 @@ pub fn elaborate_module_with_defs(
                         // Per-element Signals synthesized by Simulator::new
                         // from arrays_nd — skip the per-element HashMap
                         // inserts here.
+                        // §6.8/§10.9: apply the declaration initializer as one
+                        // whole-pattern assignment (the per-element lowering of the
+                        // 1-D path walks a single dimension; this shape's initializer
+                        // was silently dropped).
+                        if let Some(init_expr) = &decl.init {
+                            elab.initial_blocks.push(InitialBlock {
+                                stmt: Statement::new(StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&decl.name.name),
+                                    rvalue: init_expr.clone(),
+                                }, Span::dummy()), scope: String::new(), });
+                        }
                         let _ = is_signed;
                         continue;
                     }
@@ -7218,7 +7327,10 @@ pub fn elaborate_module_with_defs(
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, &mut elab);
-                let cls = std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters)));
+                let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
+                // A module-scope class remembers its module (issue #155).
+                ec.declaring_module = Some(module.name().to_string());
+                let cls = std::sync::Arc::new(ec);
                 elab.classes.insert(cd.name.name.clone(), cls);
                 register_nested_classes(cd, &cd.name.name, &mut elab);
             }
@@ -7309,13 +7421,7 @@ pub fn elaborate_module_with_defs(
                 register_dpi_import(di, &mut elab)?;
             }
             ModuleItem::DPIExport(e) => {
-                let name = match &e.proto {
-                    crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
-                    crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
-                };
-                if !elab.dpi_exports.contains(&name) {
-                    elab.dpi_exports.push(name);
-                }
+                register_dpi_export(e, &mut elab);
             }
             ModuleItem::OutOfClassConstraint { class_name, constraint_name, items } => {
                 elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
@@ -7358,6 +7464,48 @@ pub fn elaborate_module_with_defs(
     }
 
     // §7.2.2: whole-struct continuous assigns expand member-wise.
+    // §35.5.4: an `export "DPI-C"` declared in a package this module never
+    // imports still names a GLOBAL C symbol. Register it under the
+    // package-qualified subroutine name (with its C alias) and bring the
+    // subroutine in under that key so the callback can reach it.
+    if let Some(defs) = all_defs {
+        let mut pkg_names: Vec<&String> = defs
+            .iter()
+            .filter(|(_, d)| matches!(d, Definition::Package(_)))
+            .map(|(n, _)| n)
+            .collect();
+        pkg_names.sort();
+        for pname in pkg_names {
+            let Some(Definition::Package(p)) = defs.get(pname) else { continue };
+            for item in &p.items {
+                let crate::ast::decl::PackageItem::DPIExport(e) = item else { continue };
+                let sv = dpi_proto_sv_name(&e.proto);
+                let q = format!("{}::{}", pname, sv);
+                if elab.dpi_exports.contains(&sv) || elab.dpi_exports.contains(&q) {
+                    continue;
+                }
+                let mut found = false;
+                for it in &p.items {
+                    match it {
+                        crate::ast::decl::PackageItem::Task(td) if td.name.name.name == sv => {
+                            elab.tasks.entry(q.clone()).or_insert_with(|| td.clone());
+                            found = true;
+                        }
+                        crate::ast::decl::PackageItem::Function(fd) if fd.name.name.name == sv => {
+                            elab.functions.entry(q.clone()).or_insert_with(|| fd.clone());
+                            found = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if found {
+                    elab.pkg_subr_owner.entry(sv.clone()).or_insert_with(|| pname.clone());
+                    elab.dpi_exports.push(q);
+                    elab.dpi_export_c_names.push(e.c_name.clone().unwrap_or(sv));
+                }
+            }
+        }
+    }
     expand_whole_struct_continuous_assigns(&mut elab);
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
@@ -9362,6 +9510,8 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                    !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
                    !elab.sequences.contains(name) &&
+                   // §19.7.1 `cg::type_option.f` scopes on the covergroup name.
+                   !elab.covergroups.contains_key(name) &&
                    !locals.contains(name) {
                    let loc = span_location(elab, expr.span)
                        .map(|l| format!(" at {}", l))
@@ -10444,6 +10594,28 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                 }
                             }
                         }
+                    }
+                    // A fixed MULTI-dimensional array declared in a generate
+                    // block (or any other elaborate_items-routed scope): register
+                    // its real shape — the 1-D path below kept only the first
+                    // dimension — and apply its initializer as one whole-pattern
+                    // assignment.
+                    if let Some(shape) = fixed_unpacked_shape(&decl.dimensions, &elab.parameters)
+                        .filter(|sh| sh.len() > 1)
+                    {
+                        let two_state = is_type_two_state_resolved(&dd.data_type, &elab.typedef_types);
+                        register_fixed_unpacked_array(elab, &decl.name.name, &shape, width, two_state);
+                        elab.var_decl_types
+                            .entry(decl.name.name.clone())
+                            .or_insert_with(|| dd.data_type.clone());
+                        if let Some(init_expr) = &decl.init {
+                            elab.initial_blocks.push(InitialBlock {
+                                stmt: Statement::new(StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&decl.name.name),
+                                    rvalue: init_expr.clone(),
+                                }, Span::dummy()), scope: String::new(), });
+                        }
+                        continue;
                     }
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
@@ -11702,6 +11874,46 @@ fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
 
 pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, prec_s: f64, tick_s: f64) {
     rewrite_module_item_delays(items, unit_s, prec_s, tick_s);
+}
+
+/// Package-scope counterpart of `rewrite_module_delays_pub`: a package's
+/// classes, tasks and functions take the `timescale in effect at the
+/// package. Without this a `#200` in a package class method stayed 200 raw
+/// ticks (0.2 ns under a 1ps precision) while the same method in a module
+/// class was scaled correctly.
+/// Class-level entry for a compilation-unit (`$unit`) class declaration.
+pub fn rewrite_class_delays_pub(cd: &mut ClassDeclaration, unit_s: f64, prec_s: f64, tick_s: f64) {
+    rewrite_class_delays(cd, unit_s, prec_s, tick_s);
+}
+
+/// Statement-level entry for the compilation-unit (`$unit`) subroutines.
+pub fn rewrite_stmt_delays_pub(stmt: &mut Statement, unit_s: f64, prec_s: f64, tick_s: f64) {
+    rewrite_stmt_delays(stmt, unit_s, prec_s, tick_s);
+}
+
+pub fn rewrite_package_delays_pub(
+    items: &mut [crate::ast::decl::PackageItem],
+    unit_s: f64,
+    prec_s: f64,
+    tick_s: f64,
+) {
+    use crate::ast::decl::PackageItem;
+    for item in items.iter_mut() {
+        match item {
+            PackageItem::Class(cd) => rewrite_class_delays(cd, unit_s, prec_s, tick_s),
+            PackageItem::Task(td) => {
+                for st in td.items.iter_mut() {
+                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
+                }
+            }
+            PackageItem::Function(f) => {
+                for st in f.items.iter_mut() {
+                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Rewrite every delay expression inside a module's items so it is expressed in
@@ -16257,7 +16469,10 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 }
                 _ => 0,
             };
-            Value::from_u64(result, 32)
+            // §20.9: `$onehot`/`$onehot0`/`$isunknown` return `bit`; the
+            // count functions return `int`.
+            let w = if matches!(name.as_str(), "$onehot" | "$onehot0" | "$isunknown") { 1 } else { 32 };
+            Value::from_u64(result, w)
         }
         // LRM §20.7 array-introspection on an array-name ident: consults
         // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
@@ -16607,6 +16822,184 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
         }
         _ => {}
     }
+}
+
+/// Leaf names of every `force` / `release` / procedural `assign` /
+/// `deassign` target in the design's procedural code: always, initial and
+/// final blocks, module tasks and functions, and class methods. A net that is
+/// ever overridden this way must keep storage of its own — the simulator's
+/// buffer-collapse pass aliases `assign y = x` onto `x`, and a later
+/// `force y = ...` would then reach the shared net. Leaf names (the last path
+/// segment) are an over-approximation on purpose: a target spelled without
+/// its instance prefix inside a task body must still exclude the prefixed net.
+pub fn collect_override_target_leaves(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
+    collect_write_targets(elab).0
+}
+
+/// Flat names of every variable written by a procedural assignment
+/// (blocking, nonblocking, `for` init, assignment expression, `++`/`--`) in
+/// the same procedural code. Names inside inlined instance bodies are
+/// already instance-prefixed by elaboration, so these are the exact spellings
+/// the signal table uses; a task-local spelling without its prefix is not
+/// recovered (tasks writing design nets are rare, and the buffer pass only
+/// needs this to keep the delta step between a procedurally written variable
+/// and a net that copies it).
+pub fn collect_procedural_write_names(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
+    collect_write_targets(elab).1
+}
+
+fn collect_write_targets(
+    elab: &ElaboratedModule,
+) -> (crate::hasher::HashSet<String>, crate::hasher::HashSet<String>) {
+    fn flat(e: &Expression, out: &mut crate::hasher::HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                out.insert(
+                    h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."),
+                );
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = crate::hasher::HashSet::default();
+                flat(expr, &mut base);
+                for b in base {
+                    out.insert(format!("{}.{}", b, member.name));
+                }
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => flat(expr, out),
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    flat(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn leaf(e: &Expression, out: &mut crate::hasher::HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if let Some(s) = h.path.last() {
+                    out.insert(s.name.name.clone());
+                }
+            }
+            ExprKind::MemberAccess { member, .. } => {
+                out.insert(member.name.clone());
+            }
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => leaf(expr, out),
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    leaf(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    struct Sets {
+        overrides: crate::hasher::HashSet<String>,
+        writes: crate::hasher::HashSet<String>,
+    }
+    fn write_expr(e: &Expression, out: &mut Sets) {
+        match &e.kind {
+            ExprKind::AssignExpr { lvalue, .. } => flat(lvalue, &mut out.writes),
+            ExprKind::Unary { operand, .. } => flat(operand, &mut out.writes),
+            _ => {}
+        }
+    }
+    fn walk(stmt: &Statement, out: &mut Sets) {
+        use crate::ast::stmt::ProceduralContinuous as PC;
+        use crate::ast::stmt::StatementKind as K;
+        match &stmt.kind {
+            K::ProceduralContinuous(pc) => match pc {
+                PC::Assign { lvalue, .. } | PC::Force { lvalue, .. } => {
+                    leaf(lvalue, &mut out.overrides)
+                }
+                PC::Deassign(e) | PC::Release(e) => leaf(e, &mut out.overrides),
+            },
+            K::BlockingAssign { lvalue, .. } | K::NonblockingAssign { lvalue, .. } => {
+                flat(lvalue, &mut out.writes)
+            }
+            K::Expr(e) => write_expr(e, out),
+            K::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    walk(e, out);
+                }
+            }
+            K::Case { items, .. } => {
+                for it in items {
+                    walk(&it.stmt, out);
+                }
+            }
+            K::For { init, step, body, .. } => {
+                for i in init {
+                    if let crate::ast::stmt::ForInit::Assign { lvalue, .. } = i {
+                        flat(lvalue, &mut out.writes);
+                    }
+                }
+                for st in step {
+                    write_expr(st, out);
+                }
+                walk(body, out);
+            }
+            K::Foreach { body, .. }
+            | K::ForeachTail { body, .. }
+            | K::Forever { body }
+            | K::ForeverTail { body }
+            | K::RsAction { body }
+            | K::While { body, .. }
+            | K::DoWhile { body, .. }
+            | K::Repeat { body, .. } => walk(body, out),
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+                for st in stmts {
+                    walk(st, out);
+                }
+            }
+            K::TimingControl { stmt, .. } | K::Wait { stmt, .. } => walk(stmt, out),
+            K::RandCase { items } => {
+                for (_, st) in items {
+                    walk(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    use crate::ast::decl::ClassMethodKind as CMK;
+    let mut out = Sets {
+        overrides: crate::hasher::HashSet::default(),
+        writes: crate::hasher::HashSet::default(),
+    };
+    for b in &elab.always_blocks {
+        walk(&b.stmt, &mut out);
+    }
+    for b in elab.initial_blocks.iter().chain(elab.final_blocks.iter()) {
+        walk(&b.stmt, &mut out);
+    }
+    for t in elab.tasks.values() {
+        for s in &t.items {
+            walk(s, &mut out);
+        }
+    }
+    for f in elab.functions.values() {
+        for s in &f.items {
+            walk(s, &mut out);
+        }
+    }
+    for c in elab.classes.values() {
+        for m in c.methods.values() {
+            match &m.kind {
+                CMK::Function(f) | CMK::Extern(f) | CMK::PureVirtual(f) => {
+                    for s in &f.items {
+                        walk(s, &mut out);
+                    }
+                }
+                CMK::Task(t) => {
+                    for s in &t.items {
+                        walk(s, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    (out.overrides, out.writes)
 }
 
 /// Visit every sub-expression (pre-order, `e` included).
@@ -19895,6 +20288,17 @@ fn prepare_module_items(
             ),
             ModuleItem::AlwaysConstruct(ac) => BodySource::Always(ac.kind, std::rc::Rc::new(ac.stmt.clone()), ac.gen_scope.clone()),
             ModuleItem::InitialConstruct(ic) => BodySource::Initial(std::rc::Rc::new(ic.stmt.clone()), ic.gen_scope.clone()),
+            // §16.5: a concurrent assertion in an INLINED instance (sub-module
+            // or interface) travels like the top-level hoist — one synthetic
+            // initial statement the runtime registers as a clocked site. It
+            // used to fall to `Other` and vanish: no site, no failure, ever.
+            ModuleItem::AssertionItem(a) => BodySource::Initial(
+                std::rc::Rc::new(crate::ast::stmt::Statement::new(
+                    crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                    a.span,
+                )),
+                String::new(),
+            ),
             _ => BodySource::Other,
         }
     }).collect();
@@ -20606,6 +21010,12 @@ fn inline_module_items(
                 let __th = std::time::Instant::now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                // Bare-name keys this instance adds to the design-wide
+                // geometry tables while its body is processed (see the
+                // DataDeclaration arm below); removed again when the
+                // instance is fully inlined, so they cannot be matched by
+                // an unrelated same-named declaration elsewhere.
+                let mut inst_bare_keys: Vec<(u8, String)> = Vec::new();
                 // §3.3/§23.3.2: one instance name per scope. Accepting a
                 // duplicate elaborated BOTH instances and applied the second
                 // #() override to each (the override map is name-keyed) —
@@ -21942,7 +22352,17 @@ fn inline_module_items(
                                 {
                                     elab.packed_signal_elem_widths.insert(sig_name.clone(), ew);
                                 }
+                                // A TYPEDEF'd element type with declared dims
+                                // (`u7_t [4:0][1:0] a`): chain the declared dims
+                                // with the typedef's like the top-level path does.
+                                // Resolving the typedef first kept only ITS
+                                // dimension, so `foreach (a[i, j])` on an inlined
+                                // instance (every top under `__xezim_multi_top`)
+                                // walked the 70 bits instead of the 10 elements.
                                 if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params)
+                                    .or_else(|| {
+                                        packed_full_dims_chained(dt, &sub_merged_params, &elab.typedef_types)
+                                    })
                                     .or_else(|| packed_full_dims_of(&resolved_dt, &sub_merged_params))
                                 {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
@@ -22312,7 +22732,13 @@ fn inline_module_items(
                                         .insert(sig_name.clone(), elem_w);
                                 }
                                 if let Some(fdims) =
-                                    packed_full_dims_of(&nd.data_type, &sub_merged_params)
+                                    packed_full_dims_of(&nd.data_type, &sub_merged_params).or_else(|| {
+                                        packed_full_dims_chained(
+                                            &nd.data_type,
+                                            &sub_merged_params,
+                                            &elab.typedef_types,
+                                        )
+                                    })
                                 {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
@@ -22440,7 +22866,9 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.string_signals.insert(bare);
+                                    if elab.string_signals.insert(bare.clone()) {
+                                        inst_bare_keys.push((2, bare));
+                                    }
                                     elab.string_signals.insert(scoped);
                                 }
                             }
@@ -22458,15 +22886,37 @@ fn inline_module_items(
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_signal_elem_widths.entry(bare).or_insert(elem_w);
+                                    if !elab.packed_signal_elem_widths.contains_key(&bare) {
+                                        elab.packed_signal_elem_widths.insert(bare.clone(), elem_w);
+                                        inst_bare_keys.push((0, bare));
+                                    }
                                     elab.packed_signal_elem_widths.insert(scoped, elem_w);
                                 }
                             }
-                            if let Some(fdims) = packed_full_dims_of(&dd.data_type, &sub_merged_params) {
+                            // A TYPEDEF'd element type with declared dims
+                            // (`u7_t [4:0][1:0] a`) has no dims of its own for
+                            // `packed_full_dims_of`: chain the declared dims with
+                            // the typedef's, as the top-level declaration path
+                            // does. Without this the inlined signal had NO dims
+                            // entry, and `foreach (a[i, j])` in an instance —
+                            // every top under `__xezim_multi_top` — walked the
+                            // 70 bits instead of the 10 elements.
+                            if let Some(fdims) = packed_full_dims_of(&dd.data_type, &sub_merged_params)
+                                .or_else(|| {
+                                    packed_full_dims_chained(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedef_types,
+                                    )
+                                })
+                            {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
                                     let scoped = format!("{}{}", inst_prefix, bare);
-                                    elab.packed_full_dims.entry(bare).or_insert_with(|| fdims.clone());
+                                    if !elab.packed_full_dims.contains_key(&bare) {
+                                        elab.packed_full_dims.insert(bare.clone(), fdims.clone());
+                                        inst_bare_keys.push((1, bare));
+                                    }
                                     elab.packed_full_dims.insert(scoped, fdims.clone());
                                 }
                             }
@@ -22507,9 +22957,10 @@ fn inline_module_items(
                                                 // First-wins on the bare key
                                                 // (see the packed-dim blocks
                                                 // above).
-                                                elab.packed_struct_fields
-                                                    .entry(bare.clone())
-                                                    .or_insert_with(|| fields.clone());
+                                                if !elab.packed_struct_fields.contains_key(&bare) {
+                                                    elab.packed_struct_fields.insert(bare.clone(), fields.clone());
+                                                    inst_bare_keys.push((3, bare.clone()));
+                                                }
                                                 elab.packed_struct_fields
                                                     .insert(scoped.clone(), fields.clone());
                                                 // Per-MEMBER packed-array element
@@ -22698,6 +23149,26 @@ fn inline_module_items(
                                 // SUBMODULE or interface decl must register
                                 // like a top-level one — `tif.q.push_back(x)`
                                 // read a phantom 64-slot fixed array before.
+                                // An instance variable with unpacked dims (queue, dynamic,
+                                // associative, fixed) whose ELEMENT is a packed struct: the
+                                // module path registers the element layout under the container
+                                // name so `q[i].field` resolves; the inlined copy never did, so
+                                // every element field read 0 and writes were lost inside an
+                                // instance while the same code worked at the top level.
+                                if !effective_decl_dims.is_empty()
+                                    && !elab.packed_struct_fields.contains_key(&sig_name)
+                                {
+                                    if let Some(fields) = packed_struct_field_layout(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                        }
+                                    }
+                                }
                                 match effective_decl_dims.first() {
                                     Some(UnpackedDimension::Unsized(_))
                                     | Some(UnpackedDimension::Queue { .. }) => {
@@ -22812,11 +23283,24 @@ fn inline_module_items(
                                         );
                                         elab.var_decl_types
                                             .insert(sig_name.clone(), dd.data_type.clone());
+                                        // §6.8: its initializer is deferred like every
+                                        // other instance declaration's (one whole-pattern
+                                        // assignment, rewritten into the instance scope).
+                                        if let Some(init_expr) = &decl.init {
+                                            deferred_decl_inits.push((sig_name.clone(), init_expr.clone()));
+                                        }
                                         continue;
                                     }
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    // §6.8: a fixed array's declaration initializer is
+                                    // deferred like every other instance declaration's
+                                    // (one whole-pattern assignment, rewritten into the
+                                    // instance scope); it used to be dropped here.
+                                    if let Some(init_expr) = &decl.init {
+                                        deferred_decl_inits.push((sig_name.clone(), init_expr.clone()));
+                                    }
                                     // The ELEMENT type of a child array — the
                                     // top-level path records one and every
                                     // type-directed operation needs it
@@ -23447,6 +23931,9 @@ fn inline_module_items(
                         for p in &fd.ports {
                             fn_locals.remove(&p.name.name);
                         }
+                        for n in stmt_list_declared_names(&fd.items) {
+                            fn_locals.remove(n);
+                        }
                         for p in &mut new_fd.ports {
                             bake_formal_type(p);
                             if let Some(def) = &p.default {
@@ -23479,6 +23966,9 @@ fn inline_module_items(
                         for p in &td.ports {
                             task_locals.remove(&p.name.name);
                         }
+                        for n in stmt_list_declared_names(&td.items) {
+                            task_locals.remove(n);
+                        }
                         for p in &mut new_td.ports {
                             bake_formal_type(p);
                             if let Some(def) = &p.default {
@@ -23500,10 +23990,9 @@ fn inline_module_items(
                         // re-registers the identical definition).
                         validate_class_constraints(cd, Some(definitions), Some(&elab.enum_members), Some(&elab))?;
                         register_class_enum_members(cd, elab);
-                        elab.classes.insert(
-                            cd.name.name.clone(),
-                            std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
-                        );
+                        let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
+                        ec.declaring_module = Some(sub_mod_name.clone());
+                        elab.classes.insert(cd.name.name.clone(), std::sync::Arc::new(ec));
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
                         // §14.3 interface-scoped clocking block: register it under
@@ -23675,7 +24164,7 @@ fn inline_module_items(
                             });
                         }
                     }
-                    if matches!(sub_item, ModuleItem::InitialConstruct(_)) {
+                    if matches!(sub_item, ModuleItem::InitialConstruct(_) | ModuleItem::AssertionItem(_)) {
                         if let BodySource::Initial(stmt_rc, gen_scope) = body_src {
                             if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                                 eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);
@@ -23780,6 +24269,27 @@ fn inline_module_items(
                     match prev_dt {
                         Some(dt) => { elab.typedef_types.insert(tp_name, dt); }
                         None => { elab.typedef_types.remove(&tp_name); }
+                    }
+                }
+                // The instance is fully inlined: every name in its body now
+                // carries the instance prefix, so the bare geometry keys it
+                // registered are no longer needed — and leaving them made
+                // `inp.sram_renA[2]` on a struct member in another instance
+                // resolve against this instance's `[3:0][1:0] sram_renA`.
+                for (table, key) in inst_bare_keys.drain(..) {
+                    match table {
+                        0 => {
+                            elab.packed_signal_elem_widths.remove(&key);
+                        }
+                        1 => {
+                            elab.packed_full_dims.remove(&key);
+                        }
+                        2 => {
+                            elab.string_signals.remove(&key);
+                        }
+                        _ => {
+                            elab.packed_struct_fields.remove(&key);
+                        }
                     }
                 }
             }
@@ -26689,6 +27199,73 @@ pub fn rename_process_shadowed_locals(
     Some(out)
 }
 
+/// `local_names` minus the names a loop declares itself (a for-init
+/// `integer i`, foreach loop variables). A declared name that also exists at
+/// the child's module scope (`integer i, j;` next to `for (integer i = 0;
+/// ...)`) used to have its USES prefixed to the module variable while the
+/// declaration stayed bare, so the loop tested an x-valued `inst.i` and never
+/// ran. `None` when nothing collides (the common case). Block-local
+/// declarations (`begin integer k; ... end`) are deliberately NOT stripped:
+/// the runtime's process-context block locals are not yet consistent enough
+/// to stand on their own, and the prefixed form keeps today's behaviour.
+/// Names declared by the top-level `VarDecl` statements of a statement list
+/// (a subroutine body or a block). §6.21: such a declaration shadows the
+/// module's own names for the statements that follow it, so the inliner must
+/// not prefix its uses with the instance path — `begin int u; u = 5; end`
+/// clobbered the module-level `u`, a task-local `core` next to an instance
+/// `core` read `core.c` as x, and a block-local handle named like the
+/// enclosing instance read null.
+fn stmt_list_declared_names(stmts: &[Statement]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for st in stmts {
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            for d in declarators {
+                out.push(d.name.name.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite a statement list where each `VarDecl` shadows the module names
+/// for the statements AFTER it (its own initialiser still sees the outer
+/// set).
+fn rewrite_stmt_list_scoped(
+    stmts: &[Statement],
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<Statement> {
+    let mut cur: Option<std::collections::HashSet<String>> = None;
+    let mut out = Vec::with_capacity(stmts.len());
+    for st in stmts {
+        let names = cur.as_ref().unwrap_or(local_names);
+        out.push(rewrite_stmt(st, prefix, port_map, names, interface_map));
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let Some(reduced) =
+                without_declared(names, declarators.iter().map(|d| d.name.name.as_str()))
+            {
+                cur = Some(reduced);
+            }
+        }
+    }
+    out
+}
+
+fn without_declared<'a>(
+    local_names: &std::collections::HashSet<String>,
+    declared: impl Iterator<Item = &'a str>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut reduced: Option<std::collections::HashSet<String>> = None;
+    for n in declared {
+        if local_names.contains(n) {
+            reduced.get_or_insert_with(|| local_names.clone()).remove(n);
+        }
+    }
+    reduced
+}
+
 fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
@@ -26722,22 +27299,35 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
                 guard: item.guard.as_ref().map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
             }).collect(),
         },
-        StatementKind::For { init, condition, step, body } => StatementKind::For {
-            init: init.iter().map(|fi| match fi {
-                ForInit::VarDecl { data_type, name, init } => ForInit::VarDecl {
-                    data_type: data_type.clone(),
-                    name: name.clone(),
-                    init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
-                },
-                ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
-                    lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
-                    rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
-                },
-            }).collect(),
-            condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, local_names, interface_map)),
-            step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, local_names, interface_map)).collect(),
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
-        },
+        StatementKind::For { init, condition, step, body } => {
+            // The loop variables shadow same-named child-scope variables in
+            // the condition, step and body; the init expressions are
+            // evaluated before the declaration and keep the outer set.
+            let reduced = without_declared(
+                local_names,
+                init.iter().filter_map(|fi| match fi {
+                    ForInit::VarDecl { name, .. } => Some(name.name.as_str()),
+                    _ => None,
+                }),
+            );
+            let inner = reduced.as_ref().unwrap_or(local_names);
+            StatementKind::For {
+                init: init.iter().map(|fi| match fi {
+                    ForInit::VarDecl { data_type, name, init } => ForInit::VarDecl {
+                        data_type: data_type.clone(),
+                        name: name.clone(),
+                        init: rewrite_expr(init, prefix, port_map, local_names, interface_map),
+                    },
+                    ForInit::Assign { lvalue, rvalue } => ForInit::Assign {
+                        lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
+                        rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
+                    },
+                }).collect(),
+                condition: condition.as_ref().map(|c| rewrite_expr(c, prefix, port_map, inner, interface_map)),
+                step: step.iter().map(|s| rewrite_expr(s, prefix, port_map, inner, interface_map)).collect(),
+                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
+            }
+        }
         StatementKind::While { condition, body } => StatementKind::While {
             condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
@@ -26751,11 +27341,18 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         // reaches, so it returned x while the identical read outside the loop
         // was fine. The loop VARIABLES stay untouched: they are declared by the
         // foreach itself, not inherited from the child's scope.
-        StatementKind::Foreach { array, vars, body } => StatementKind::Foreach {
-            array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
-            vars: vars.clone(),
-            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
-        },
+        StatementKind::Foreach { array, vars, body } => {
+            let reduced = without_declared(
+                local_names,
+                vars.iter().flatten().map(|v| v.name.as_str()),
+            );
+            let inner = reduced.as_ref().unwrap_or(local_names);
+            StatementKind::Foreach {
+                array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
+                vars: vars.clone(),
+                body: Box::new(rewrite_stmt(body, prefix, port_map, inner, interface_map)),
+            }
+        }
         // Sibling of the missing-Assertion-arm bug: these kinds also fell
         // through `other => other.clone()` un-rewritten, so a dotted
         // reference inside them stayed a raw MemberAccess (and, in prefix
@@ -26848,7 +27445,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name: name.clone(),
-            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
         },
         StatementKind::EventTrigger { nonblocking, name, target, span } => StatementKind::EventTrigger {
             nonblocking: *nonblocking,
@@ -26867,7 +27464,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
         },
         StatementKind::ParBlock { name, stmts, join_type } => StatementKind::ParBlock {
             name: name.clone(),
-            stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
             join_type: *join_type,
         },
 
@@ -27473,6 +28070,11 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 register_dpi_import(di, elab)?;
                                 found = true;
                             }
+                        PackageItem::DPIExport(e)
+                            if &dpi_proto_sv_name(&e.proto) == sym_name => {
+                                register_dpi_export(e, elab);
+                                found = true;
+                            }
                         PackageItem::Class(c)
                             if &c.name.name == sym_name => {
                                 register_class_enum_members(c, elab);
@@ -27674,6 +28276,9 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         }
                         PackageItem::DPIImport(di) => {
                             register_dpi_import(di, elab)?;
+                        }
+                        PackageItem::DPIExport(e) => {
+                            register_dpi_export(e, elab);
                         }
                         PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);

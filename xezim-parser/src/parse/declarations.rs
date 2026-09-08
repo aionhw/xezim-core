@@ -776,7 +776,12 @@ impl Parser {
                             depth -= 1;
                             if depth == 0 {
                                 next_after = self.peek_kind_n(k + 2);
-                                break;
+                                // `u7_t [R-1:0][C-1:0] name`: several packed
+                                // dimension groups precede the port name —
+                                // keep scanning through consecutive groups.
+                                if next_after != TokenKind::LBracket {
+                                    break;
+                                }
                             }
                         }
                         TokenKind::Eof => break,
@@ -827,6 +832,9 @@ impl Parser {
 
     pub(super) fn parse_package_item(&mut self) -> Option<PackageItem> {
         match self.current_kind() {
+            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
+                Some(PackageItem::TimeunitsDecl(self.parse_timeunits_declaration()))
+            }
             TokenKind::KwParameter => Some(PackageItem::Parameter(self.parse_parameter_decl_stmt())),
             TokenKind::KwLocalparam => Some(PackageItem::Parameter(self.parse_parameter_decl_stmt())),
             TokenKind::KwTypedef => Some(PackageItem::Typedef(self.parse_typedef_declaration())),

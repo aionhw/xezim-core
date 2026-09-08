@@ -1082,8 +1082,14 @@ fn parse_and_elaborate(
                 Some(ts)
             } else {
                 // No CLI: keep a cross-file-inherited directive (single-compilation-
-                // unit sticky behavior) when present; else no timescale.
-                directive
+                // unit sticky behavior) when present; else the tool default
+                // (§3.14.2.2 leaves it tool-defined): 1ns/1ns, the unit the
+                // reference simulator applies, so an untimed module's `#1` and
+                // `$realtime` both count nanoseconds. (1ps/1ps was tried on
+                // 2026-09-04: testbenches that mix bare `#10` clocks with
+                // absolute `3000ns` literals then ran 1000x more clock cycles,
+                // 10x slower, and no longer matched the reference.)
+                directive.or(Some((-9, -9)))
             };
             if let Some((u, p)) = eff_exp {
                 eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
@@ -1097,7 +1103,7 @@ fn parse_and_elaborate(
     if any_explicit_ts {
         for name in &modules_without_ts {
             eprintln!(
-                "[warn] module '{}' has no timescale directive; defaulting its reported timescale to 1s/1s",
+                "[warn] module '{}' has no timescale directive; defaulting its timescale to 1ns/1ns",
                 name
             );
         }
@@ -1152,6 +1158,14 @@ fn parse_and_elaborate(
     let mut top_level_functions: Vec<ast::decl::FunctionDeclaration> = Vec::new();
     let mut top_level_tasks: Vec<ast::decl::TaskDeclaration> = Vec::new();
     let mut top_level_nettypes: Vec<ast::decl::NettypeDeclaration> = Vec::new();
+    // §35.5.4: a compilation-unit `import "DPI-C"` is visible in every
+    // module of the unit, exactly like a $unit function — it was the one
+    // $unit declaration kind never injected, so `add(1, 2)` was undeclared.
+    let mut top_level_dpi_imports: Vec<ast::decl::DPIImport> = Vec::new();
+    // Likewise `export "DPI-C" function f;` at $unit: the exported
+    // subroutine is injected as a $unit function already; the export
+    // directive must follow it so the symbol is published.
+    let mut top_level_dpi_exports: Vec<ast::decl::DPIExport> = Vec::new();
     let mut top_level_params: Vec<ast::decl::ParameterDeclaration> = Vec::new();
     let mut top_level_vars: Vec<ast::decl::DataDeclaration> = Vec::new();
     let mut top_level_binds: Vec<ast::decl::BindDirective> = Vec::new();
@@ -1259,8 +1273,13 @@ fn parse_and_elaborate(
                 elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
-            ast::Description::Program(p) => {
+            ast::Description::Program(mut p) => {
                 let name = p.name.name.clone();
+                // A program's delays scale like a module's; the pass never
+                // visited programs, so `#7` in one ran at zero time.
+                let (unit_s, prec_s) =
+                    eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
+                elaborate::rewrite_module_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
@@ -1268,6 +1287,13 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
                 }
+                // A compilation-unit class scales its method delays by the
+                // unit's `timescale, like a package's classes.
+                let (unit_s, prec_s) = module_timescales
+                    .get("$unit")
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
                 let name = c.name.name.clone();
                 let rc = Rc::new(c);
                 // Always keep the class in its own registry so a same-named
@@ -1306,6 +1332,30 @@ fn parse_and_elaborate(
                     }
                 }
                 let name = p.name.name.clone();
+                // Delays inside the package scale by ITS timescale, exactly
+                // as a module's items do above; without this a `#200` in a
+                // package class method stayed 200 raw ticks.
+                // Packages are not in `eff_ts` (that walk covers instantiable
+                // elements); the preprocessor records the directive in effect
+                // at the package, else the compilation unit's first one.
+                let (mut unit_s, mut prec_s) = module_timescales
+                    .get(&name)
+                    .or_else(|| module_timescales.get("$unit"))
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                // A `timeunit`/`timeprecision` declared IN the package wins
+                // over the directive (LRM §3.14.2.2).
+                for item in &p.items {
+                    if let ast::decl::PackageItem::TimeunitsDecl(td) = item {
+                        if let Some(u) = &td.unit {
+                            unit_s = elaborate::exp_to_secs(elaborate::time_literal_to_exp(u));
+                        }
+                        if let Some(pr) = &td.precision {
+                            prec_s = elaborate::exp_to_secs(elaborate::time_literal_to_exp(pr));
+                        }
+                    }
+                }
+                elaborate::rewrite_package_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 definitions.insert(name, SourceDefinition::Package(Rc::new(p)));
             }
             ast::Description::TypedefDecl(t) => {
@@ -1368,16 +1418,44 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
                 }
+                // A `$unit` subroutine's delays scale by the compilation
+                // unit's `timescale (recorded as "$unit"), like a module's.
+                let (unit_s, prec_s) = module_timescales
+                    .get("$unit")
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                for st in f.items.iter_mut() {
+                    elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
+                }
                 top_level_functions.push(f);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Task(mut t)) => {
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
                 }
+                let (unit_s, prec_s) = module_timescales
+                    .get("$unit")
+                    .copied()
+                    .unwrap_or((tick_s, tick_s));
+                for st in t.items.iter_mut() {
+                    elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
+                }
                 top_level_tasks.push(t);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
                 top_level_nettypes.push(n);
+            }
+            ast::Description::PackageItem(ast::decl::PackageItem::DPIImport(di)) => {
+                top_level_dpi_imports.push(di);
+            }
+            ast::Description::DPIImport(di) => {
+                top_level_dpi_imports.push(di);
+            }
+            ast::Description::DPIExport(e) => {
+                top_level_dpi_exports.push(e);
+            }
+            ast::Description::PackageItem(ast::decl::PackageItem::DPIExport(e)) => {
+                top_level_dpi_exports.push(e);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Parameter(p)) => {
                 top_level_params.push(p);
@@ -1513,7 +1591,8 @@ fn parse_and_elaborate(
     }
     if !top_level_functions.is_empty() || !top_level_tasks.is_empty()
         || !top_level_nettypes.is_empty() || !top_level_params.is_empty()
-        || !top_level_vars.is_empty() {
+        || !top_level_vars.is_empty() || !top_level_dpi_imports.is_empty()
+        || !top_level_dpi_exports.is_empty() {
         for def in definitions.values_mut() {
             if let SourceDefinition::Module(m) = def {
                 let m = Rc::make_mut(m);
@@ -1585,6 +1664,25 @@ fn parse_and_elaborate(
                 }
                 for n in top_level_nettypes.iter().rev() {
                     m.items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+                }
+                for di in top_level_dpi_imports.iter().rev() {
+                    // A module's own import of the same name shadows the
+                    // $unit one (§3.12.1); do not inject a duplicate.
+                    let name = match &di.proto {
+                        ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
+                        ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
+                    };
+                    let own = m.items.iter().any(|it| matches!(it, ast::decl::ModuleItem::DPIImport(x)
+                        if match &x.proto {
+                            ast::decl::DPIProto::Function(fd) => fd.name.name.name == name,
+                            ast::decl::DPIProto::Task(td) => td.name.name.name == name,
+                        }));
+                    if !own {
+                        m.items.insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
+                    }
+                }
+                for e in top_level_dpi_exports.iter() {
+                    m.items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
                 }
                 // $unit-scope parameters become body localparams (constants):
                 // visible inside the module, not part of its override interface.
@@ -2040,6 +2138,7 @@ fn parse_and_elaborate(
     )?;
     elab.tick_s = tick_s;
     elab.module_timescale_exp = module_timescale_exp;
+    elab.modules_without_timescale = modules_without_ts;
     // The top module's own unit/precision drives the default $time scaling and
     // $printtimescale when no per-scope entry is found.
     if let Some(&(u, p)) = elab.module_timescale_exp.get(&elab.name) {

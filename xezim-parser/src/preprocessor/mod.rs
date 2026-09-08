@@ -1100,6 +1100,12 @@ impl Preprocessor {
                         self.module_timescales.entry(name).or_insert(ts);
                     }
                 }
+                // Compilation-unit ($unit) tasks and functions have no design
+                // element name; they take the first `timescale in effect
+                // before them, recorded once under the synthetic name "$unit".
+                if let Some(ts) = self.timescale {
+                    self.module_timescales.entry("$unit".to_string()).or_insert(ts);
+                }
                 output.push_str(&expanded);
                 output.push('\n');
             }
