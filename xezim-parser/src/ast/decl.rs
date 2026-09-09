@@ -647,7 +647,14 @@ pub struct FinalConstruct {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ContinuousAssign {
     pub strength: Option<String>,
+    /// `#d` / first of `#(rise, fall[, turnoff])` (§10.3.3).
     pub delay: Option<Expression>,
+    /// Second delay of the pair/triple form: applied to a transition to 0.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_fall: Option<Expression>,
+    /// Third delay: applied to a transition to z.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_off: Option<Expression>,
     pub assignments: Vec<(Expression, Expression)>,
     pub span: Span,
 }

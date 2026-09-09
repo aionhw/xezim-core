@@ -199,7 +199,15 @@ pub struct Signal {
 pub struct ContinuousAssignment {
     pub lhs: Expression,
     pub rhs: Expression,
+    /// Delay in ticks (rise delay of the `#(rise, fall[, turnoff])` form).
     pub delay: u64,
+    /// §10.3.3 fall delay (transition to 0) when it differs in form from
+    /// `delay`; `None` for the single-delay form.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_fall: Option<u64>,
+    /// §10.3.3 turn-off delay (transition to z).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_off: Option<u64>,
     /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
     /// inline time — its RHS names live in the PARENT scope by
     /// construction. The simulator must not apply the child scope hint to
@@ -365,6 +373,9 @@ pub struct PendingContAssign {
     /// (the old behavior) silently ran every inlined delayed assign with
     /// zero delay — a `#3` clock echo inside a DUT tracked undelayed.
     pub delay_source: Option<std::rc::Rc<Expression>>,
+    /// §10.3.3 fall / turn-off delays of the `#(rise, fall[, turnoff])` form.
+    pub delay_fall_source: Option<std::rc::Rc<Expression>>,
+    pub delay_off_source: Option<std::rc::Rc<Expression>>,
 }
 
 impl PendingAlways {
@@ -449,10 +460,8 @@ impl PendingContAssign {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        let delay = self
-            .delay_source
-            .as_ref()
-            .map(|d| {
+        let eval_delay = |src: &Option<std::rc::Rc<Expression>>| -> Option<u64> {
+            src.as_ref().map(|d| {
                 let d = rewrite_expr(
                     d,
                     &self.ctx.prefix,
@@ -462,8 +471,11 @@ impl PendingContAssign {
                 );
                 eval_const_expr(&d, params)
             })
-            .unwrap_or(0);
-        ContinuousAssignment { lhs, rhs, delay, rhs_parent_scoped: false }
+        };
+        let delay = eval_delay(&self.delay_source).unwrap_or(0);
+        let delay_fall = eval_delay(&self.delay_fall_source);
+        let delay_off = eval_delay(&self.delay_off_source);
+        ContinuousAssignment { lhs, rhs, delay, rhs_parent_scoped: false, delay_fall, delay_off }
     }
 }
 
@@ -4973,7 +4985,7 @@ pub fn elaborate_module_with_defs(
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: init_expr.clone(),
                                     delay: 0,
-                                 rhs_parent_scoped: false, });
+                                 rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                             }
                             continue;
                         }
@@ -5183,7 +5195,7 @@ pub fn elaborate_module_with_defs(
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: 0,
-                         rhs_parent_scoped: false, });
+                         rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                     }
                 }
             }
@@ -7165,6 +7177,8 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
+                let delay_fall = ca.delay_fall.as_ref().map(|d| eval_const_expr(d, &elab.parameters));
+                let delay_off = ca.delay_off.as_ref().map(|d| eval_const_expr(d, &elab.parameters));
                 for (lhs, rhs) in &ca.assignments {
                     // §10.3.1 / §21.2.1.5: record the drive strength pair on
                     // the target net so `%v` can report it (e.g. "Pu0").
@@ -7194,7 +7208,7 @@ pub fn elaborate_module_with_defs(
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false, delay_fall, delay_off });
                     }
                 }
             }
@@ -7368,7 +7382,7 @@ pub fn elaborate_module_with_defs(
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
-                     rhs_parent_scoped: false, });
+                     rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                 }
             }
             ModuleItem::ModuleInstantiation(inst) => {
@@ -10401,7 +10415,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: 0,
-                         rhs_parent_scoped: false, });
+                         rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                     }
                 }
             }
@@ -10796,6 +10810,8 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
+                let delay_fall = ca.delay_fall.as_ref().map(|d| eval_const_expr(d, &elab.parameters));
+                let delay_off = ca.delay_off.as_ref().map(|d| eval_const_expr(d, &elab.parameters));
                 for (lhs, rhs) in &ca.assignments {
                     // §10.3.1 / §21.2.1.5: record the drive strength pair on
                     // the target net so `%v` can report it (e.g. "Pu0").
@@ -10825,7 +10841,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     };
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false, delay_fall, delay_off });
                     }
                 }
             }
@@ -10988,7 +11004,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
-                     rhs_parent_scoped: false, });
+                     rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                 }
             }
             ModuleItem::FunctionDeclaration(fd) => {
@@ -11943,7 +11959,10 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
             // timeunits like any other delay; unscaled it ran as raw ticks
             // (5 ps in a 1ns/1ps module instead of 5 ns).
             ModuleItem::ContinuousAssign(ca) => {
-                if let Some(d) = ca.delay.as_mut() {
+                for d in [&mut ca.delay, &mut ca.delay_fall, &mut ca.delay_off]
+                    .into_iter()
+                    .flatten()
+                {
                     rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
             }
@@ -15528,7 +15547,7 @@ fn emit_struct_member_assigns(
             lhs: lhs_base.clone(),
             rhs: rhs.clone(),
             delay: ca.delay,
-            rhs_parent_scoped: ca.rhs_parent_scoped,
+            rhs_parent_scoped: ca.rhs_parent_scoped, delay_fall: ca.delay_fall, delay_off: ca.delay_off,
         });
         return;
     }
@@ -15572,7 +15591,7 @@ fn emit_struct_member_assigns(
                 lhs: mlhs,
                 rhs: mrhs,
                 delay: ca.delay,
-                rhs_parent_scoped: ca.rhs_parent_scoped,
+                rhs_parent_scoped: ca.rhs_parent_scoped, delay_fall: ca.delay_fall, delay_off: ca.delay_off,
             }),
         }
     }
@@ -20911,7 +20930,7 @@ fn inline_module_items(
                             lhs: clk_out_expr,
                             rhs: clk_in_expr,
                             delay: 0,
-                         rhs_parent_scoped: false, });
+                         rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                         continue;
                     }
                 }
@@ -23070,7 +23089,7 @@ fn inline_module_items(
                                         lhs: sub_expr,
                                         rhs: parent_elem,
                                         delay: 0,
-                                        rhs_parent_scoped: true,
+                                        rhs_parent_scoped: true, delay_fall: None, delay_off: None,
                                     });
                                 }
                                 Some(PortDirection::Output) => {
@@ -23078,7 +23097,7 @@ fn inline_module_items(
                                         lhs: parent_elem,
                                         rhs: sub_expr,
                                         delay: 0,
-                                        rhs_parent_scoped: false,
+                                        rhs_parent_scoped: false, delay_fall: None, delay_off: None,
                                     });
                                 }
                                 _ => {}
@@ -23152,17 +23171,17 @@ fn inline_module_items(
                             }
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs, delay: 0,
-                                rhs_parent_scoped: true,
+                                rhs_parent_scoped: true, delay_fall: None, delay_off: None,
                             });
                         }
                         Some(PortDirection::Output) => {                            elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: parent_expr.clone(), rhs: sub_expr, delay: 0,
-                             rhs_parent_scoped: false, });
+                             rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                         }
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
-                                rhs_parent_scoped: true,
+                                rhs_parent_scoped: true, delay_fall: None, delay_off: None,
                             });
                         }
                     }
@@ -23591,12 +23610,16 @@ fn inline_module_items(
                     if let ModuleItem::ContinuousAssign(ca_item) = sub_item {
                         // #7: Rc-share source ASTs across sibling instances.
                         let delay_rc = ca_item.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                        let delay_fall_rc = ca_item.delay_fall.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                        let delay_off_rc = ca_item.delay_off.as_ref().map(|d| std::rc::Rc::new(d.clone()));
                         if let BodySource::ContAssign(pairs) = body_src {                            for (lhs_rc, rhs_rc) in pairs {
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
                                     delay_source: delay_rc.clone(),
+                                    delay_fall_source: delay_fall_rc.clone(),
+                                    delay_off_source: delay_off_rc.clone(),
                                 });
                             }
                         }
@@ -23620,6 +23643,8 @@ fn inline_module_items(
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
                                     delay_source: None,
+                                    delay_fall_source: None,
+                                    delay_off_source: None,
                                 });
                             }
                         }
@@ -23634,6 +23659,8 @@ fn inline_module_items(
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
                                     delay_source: None,
+                                    delay_fall_source: None,
+                                    delay_off_source: None,
                                 });
                             }
                         }
@@ -23677,7 +23704,7 @@ fn inline_module_items(
                                 lhs,
                                 rhs,
                                 delay: 0,
-                             rhs_parent_scoped: false, });
+                             rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
                         }
                     }
                     if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {
@@ -24946,7 +24973,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                     ),
                     rhs,
                     delay: ca.delay,
-                    rhs_parent_scoped: ca.rhs_parent_scoped,
+                    rhs_parent_scoped: ca.rhs_parent_scoped, delay_fall: ca.delay_fall, delay_off: ca.delay_off,
                 });
             }
             changed = true;
@@ -25131,7 +25158,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             span,
                         ),
                         delay,
-                        rhs_parent_scoped: false,
+                        rhs_parent_scoped: false, delay_fall: None, delay_off: None,
                     });
                 }
             }
@@ -25139,7 +25166,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 lhs: make_ident_expr(lhs),
                 rhs,
                 delay,
-                rhs_parent_scoped: false,
+                rhs_parent_scoped: false, delay_fall: None, delay_off: None,
             }),
         }
     };
@@ -25380,7 +25407,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 (None, Some(wk)) => wk,
                 (None, None) => make_z_expr(span),
             };
-            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay, rhs_parent_scoped: false });
+            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay, rhs_parent_scoped: false, delay_fall: None, delay_off: None });
         }
     }
 }
@@ -25457,12 +25484,12 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
                 span,
             ),
             delay: 0,
-         rhs_parent_scoped: false, });
+         rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
         elab.continuous_assigns.push(ContinuousAssignment {
             lhs: term_b,
             rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
             delay: 0,
-         rhs_parent_scoped: false, });
+         rhs_parent_scoped: false, delay_fall: None, delay_off: None, });
     }
 }
 
@@ -25543,7 +25570,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
                 }
             }
         }
-        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay, rhs_parent_scoped: false });
+        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay, rhs_parent_scoped: false, delay_fall: None, delay_off: None });
     }
 }
 
@@ -25772,7 +25799,7 @@ pub fn whole_array_assign_parts(
                 lhs: make_index_expr(ln, llo + k),
                 rhs: make_index_expr(rn, rlo + k),
                 delay,
-             rhs_parent_scoped: false, })
+             rhs_parent_scoped: false, delay_fall: None, delay_off: None, })
             .collect(),
     )
 }
