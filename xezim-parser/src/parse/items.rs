@@ -614,9 +614,19 @@ impl Parser {
                     self.expect(TokenKind::RParen);
                     strength = Some(parts.join(","));
                 }
+                let mut delay_fall = None;
+                let mut delay_off = None;
                 let delay = if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
+                        // §10.3.3 `#(rise, fall[, turnoff])`: up to three
+                        // comma-separated delays.
                         let expr = self.parse_expression();
+                        if self.eat(TokenKind::Comma).is_some() {
+                            delay_fall = Some(self.parse_expression());
+                            if self.eat(TokenKind::Comma).is_some() {
+                                delay_off = Some(self.parse_expression());
+                            }
+                        }
                         self.expect(TokenKind::RParen);
                         Some(expr)
                     } else {
@@ -629,7 +639,7 @@ impl Parser {
                 loop { let l = self.parse_expression(); self.expect(TokenKind::Assign); let r = self.parse_expression();
                     asgns.push((l, r)); if self.eat(TokenKind::Comma).is_none() { break; } }
                 self.expect(TokenKind::Semicolon);
-                Some(ModuleItem::ContinuousAssign(ContinuousAssign { strength, delay, assignments: asgns, span: self.span_from(start) }))
+                Some(ModuleItem::ContinuousAssign(ContinuousAssign { strength, delay, delay_fall, delay_off, assignments: asgns, span: self.span_from(start) }))
             }
             TokenKind::KwGenerate => {
                 self.bump();
