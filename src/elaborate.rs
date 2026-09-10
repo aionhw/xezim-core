@@ -11995,6 +11995,103 @@ fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
 
 pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, prec_s: f64, tick_s: f64) {
     rewrite_module_item_delays(items, unit_s, prec_s, tick_s);
+    scope_time_decl_inits(items, secs_to_exp(unit_s), secs_to_exp(prec_s));
+}
+
+/// §5.8 for a VALUE-position time literal in a DECLARATION initialiser.
+///
+/// `rewrite_scope_time_semantics` already applies `scope_time_expr` to
+/// procedural code, so `#100ns`, `x = 100ns` and an automatic-variable
+/// initialiser were all scaled to the declaring scope's unit. Module ITEMS
+/// were never walked, so a declaration initialiser kept its
+/// `NumberLiteral::Time` and fell through to the fixed-1ns fallback in
+/// `eval_expr` (`secs * 1e9`) — scaling to nanoseconds regardless of the
+/// module's own unit. The two paths disagreed:
+///
+/// ```text
+///                        `timescale 1fs/1fs, both meaning 100 ns
+///   #100ns                            100000000   correct
+///   localparam realtime T = 100ns           100   1e6 short
+/// ```
+///
+/// The error is the ratio `1ns / unit`, so it was invisible at the default
+/// 1 ns timeunit and grew as the timescale got finer. Worse than a scale
+/// factor: a sub-nanosecond literal did not shrink, it VANISHED, because
+/// the folded value rounded to zero at the module's precision
+/// (`localparam realtime D = 300ps` under 1ps/1ps folded to 0.3, and the
+/// delay it fed measured 0.000 ps).
+///
+/// Note this walks INITIALISERS only. Delay-position expressions keep going
+/// through `rewrite_module_item_delays`, which converts to global ticks; the
+/// two passes touch disjoint expressions.
+pub fn scope_time_decl_inits(items: &mut [ModuleItem], unit_exp: i32, prec_exp: i32) {
+    for item in items.iter_mut() {
+        match item {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                scope_time_param_decl(pd, unit_exp, prec_exp);
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for d in dd.declarators.iter_mut() {
+                    if let Some(e) = d.init.as_mut() {
+                        scope_time_expr(e, unit_exp, prec_exp);
+                    }
+                }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                for d in nd.declarators.iter_mut() {
+                    if let Some(e) = d.init.as_mut() {
+                        scope_time_expr(e, unit_exp, prec_exp);
+                    }
+                }
+            }
+            // Generate scopes are the same module scope for timing purposes.
+            ModuleItem::GenerateFor(gf) => scope_time_decl_inits(&mut gf.items, unit_exp, prec_exp),
+            ModuleItem::GenerateIf(gi) => {
+                for (_c, items) in gi.branches.iter_mut() {
+                    scope_time_decl_inits(items, unit_exp, prec_exp);
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => {
+                scope_time_decl_inits(&mut gr.items, unit_exp, prec_exp)
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in gc.arms.iter_mut() {
+                    scope_time_decl_inits(&mut arm.items, unit_exp, prec_exp);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// §5.8 over a declaration's parameter PORT list, which is not part of
+/// `items` and so is not reached by `rewrite_module_delays_pub`.
+pub fn scope_time_param_ports_pub(
+    params: &mut [crate::ast::decl::ParameterDeclaration],
+    unit_s: f64,
+    prec_s: f64,
+) {
+    let (u, p) = (secs_to_exp(unit_s), secs_to_exp(prec_s));
+    for pd in params.iter_mut() {
+        scope_time_param_decl(pd, u, p);
+    }
+}
+
+/// Same §5.8 scaling for a parameter declaration, including a parameter PORT
+/// (`module m #(parameter realtime P = 100ns)`), which is not a `ModuleItem`
+/// and so is reached from the declaration's own `params` list.
+pub fn scope_time_param_decl(
+    pd: &mut crate::ast::decl::ParameterDeclaration,
+    unit_exp: i32,
+    prec_exp: i32,
+) {
+    if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &mut pd.kind {
+        for a in assignments.iter_mut() {
+            if let Some(e) = a.init.as_mut() {
+                scope_time_expr(e, unit_exp, prec_exp);
+            }
+        }
+    }
 }
 
 /// Package-scope counterpart of `rewrite_module_delays_pub`: a package's
