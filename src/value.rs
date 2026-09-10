@@ -1192,6 +1192,42 @@ impl Value {
 
     /// Set one bit from compact 4-state code. Returns true when the bit changed.
     #[inline(always)]
+    /// Replace the `n` (≤ 64) bits starting at `pos` with the planes
+    /// `(v, x)`; bits past the value's width are dropped, everything else
+    /// (X included) is untouched. Returns whether any bit changed. Word-level
+    /// on wide storage — the per-bit `set_bit` walk this replaces was the
+    /// cost of every two-state range store into a wide bus.
+    pub fn splice_bits64(&mut self, pos: usize, v: u64, x: u64, n: usize) -> bool {
+        let width = self.width as usize;
+        if n == 0 || pos >= width {
+            return false;
+        }
+        let n = n.min(64).min(width - pos);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let (v, x) = (v & mask, x & mask);
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let m = mask << pos;
+                let nv = (*val_bits & !m) | (v << pos);
+                let nx = (*xz_bits & !m) | (x << pos);
+                if nv == *val_bits && nx == *xz_bits {
+                    return false;
+                }
+                *val_bits = nv;
+                *xz_bits = nx;
+                true
+            }
+            ValueStorage::Wide(bits) => {
+                let (cv, cx) = bits.extract64(pos, n);
+                if cv == v && cx == x {
+                    return false;
+                }
+                bits.splice64(pos, v, x, n);
+                true
+            }
+        }
+    }
+
     pub fn set_bit_code(&mut self, i: usize, code: u8) -> bool {
         if i >= self.width as usize { return false; }
         match &mut self.storage {
