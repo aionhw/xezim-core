@@ -1196,6 +1196,27 @@ pub fn elaborate_class_with_params(
                             array_nd_properties
                                 .insert(decl.name.name.clone(), (shape.clone(), width.max(1)));
                         }
+                        // Element storage, mirroring the module-scope model
+                        // (`int q[3][$]` at module scope registers the flat
+                        // element keys `q[0]`..`q[2]`): every element gets its
+                        // own queue/dyn/assoc property under the flat name the
+                        // receiver resolver builds for `q[i][j].method()`, so
+                        // `push_back`, `new[n]`, `[key] =` and reads find a
+                        // store instead of silently doing nothing.
+                        for suffix in index_tuples(&shape) {
+                            let en = format!("{}{}", decl.name.name, suffix);
+                            match &kind {
+                                CollDimKind::Assoc { string_key } => {
+                                    assoc_properties.insert(en, *string_key);
+                                }
+                                CollDimKind::Queue(cap) => {
+                                    queue_properties.insert(en, (width.max(1), *cap));
+                                }
+                                CollDimKind::Dyn => {
+                                    queue_properties.insert(en, (width.max(1), None));
+                                }
+                            }
+                        }
                         array_of_coll_properties
                             .insert(decl.name.name.clone(), (shape, width.max(1), kind));
                     } else {
