@@ -12067,6 +12067,29 @@ pub fn scope_time_decl_inits(items: &mut [ModuleItem], unit_exp: i32, prec_exp: 
                     }
                 }
             }
+            // A parameter OVERRIDE at an instantiation (`m #(.P(50ns)) u();`)
+            // and a `defparam` are written in THIS module's unit, so they
+            // scale here too; otherwise a design that sets its timing
+            // parameters from the instantiation saw the default scaled and
+            // the override not.
+            ModuleItem::ModuleInstantiation(inst) => {
+                if let Some(params) = inst.params.as_mut() {
+                    for pc in params.iter_mut() {
+                        let value = match pc {
+                            crate::ast::decl::ParamConnection::Ordered(v) => v,
+                            crate::ast::decl::ParamConnection::Named { value, .. } => value,
+                        };
+                        if let Some(crate::ast::decl::ParamValue::Expr(e)) = value.as_mut() {
+                            scope_time_expr(e, unit_exp, prec_exp);
+                        }
+                    }
+                }
+            }
+            ModuleItem::Defparam(list) => {
+                for (_, e) in list.iter_mut() {
+                    scope_time_expr(e, unit_exp, prec_exp);
+                }
+            }
             // Generate scopes are the same module scope for timing purposes.
             ModuleItem::GenerateFor(gf) => scope_time_decl_inits(&mut gf.items, unit_exp, prec_exp),
             ModuleItem::GenerateIf(gi) => {
