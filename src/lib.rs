@@ -1124,6 +1124,27 @@ fn parse_and_elaborate(
         module_timescale_exp.insert(n.clone(), (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)));
     }
     let mut definitions: crate::hasher::HashMap<String, SourceDefinition> = crate::hasher::HashMap::default();
+    // §3.13/§23.2: a module and a CLASS may legally share a name — they live in
+    // different namespaces (hierarchy vs data type), as the reference
+    // simulator accepts (`class test` + `module test`). The single
+    // name-keyed `definitions` map cannot hold both, and the module (needed
+    // for top-module detection/instantiation) overwrites the class, silently
+    // dropping its factory/type registration. Keep every top-level (compilation
+    // unit scope) class in a separate registry keyed by its class name so it
+    // can always be re-registered into `elab.classes` regardless of a
+    // same-named module.
+    let mut class_defs: crate::hasher::HashMap<String, Rc<ast::decl::ClassDeclaration>> =
+        crate::hasher::HashMap::default();
+    // §3.13/§6.18: the same collision applies to TYPEDEFs — a typedef is a
+    // compilation-unit-scope DATA type and legally coexists with a same-named
+    // hierarchy kind (module/interface/program/package/UDP), but the single
+    // name-keyed `definitions` map gives the slot to the hierarchy kind.
+    // Keep every top-level typedef in its own registry so it can always be
+    // re-registered into `elab.typedef_types` regardless of a same-named
+    // hierarchy declaration (the reference resolves `typedef base shared;`
+    // + `module shared;` to the typedef for a `shared h;` handle value).
+    let mut typedef_defs: crate::hasher::HashMap<String, Rc<ast::decl::TypedefDeclaration>> =
+        crate::hasher::HashMap::default();
     let mut top_module = None;
     /// When the design has multiple uninstantiated top-level modules, this
     /// holds their names so that — after elaboration of the synthetic
@@ -1212,7 +1233,13 @@ fn parse_and_elaborate(
                     definitions.insert(nname, SourceDefinition::Module(Rc::new(n)));
                 }
                 let name = m.name.name.clone();
-                if definitions.contains_key(&name) {
+                // Only a same-kind collision (module overwriting module) is a
+                // genuine §3.3 redefinition worth warning about — and the module
+                // then legitimately wins. A module with the SAME name as an
+                // existing class/interface/package is legal (§3.13: hierarchy
+                // and data namespaces are separate); `class_defs` preserves the
+                // class, so no warning and no data loss.
+                if matches!(definitions.get(&name), Some(SourceDefinition::Module(_))) {
                     // The reference simulator ACCEPTS a redefinition with a
                     // warning and the LAST definition wins (measured:
                     // "Existing module 'm' ... will be overwritten", the
@@ -1272,7 +1299,24 @@ fn parse_and_elaborate(
                     .unwrap_or((tick_s, tick_s));
                 elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
                 let name = c.name.name.clone();
-                definitions.insert(name, SourceDefinition::Class(Rc::new(c)));
+                let rc = Rc::new(c);
+                // Always keep the class in its own registry so a same-named
+                // module cannot clobber it (see `class_defs`). Into
+                // `definitions` it goes ONLY when the name is free of a
+                // hierarchy kind (module/interface/program) — a class and a
+                // module may share a name (§3.13), and if the module came
+                // first we must not evict it from the name-keyed slot the
+                // top-module/instantiation walkers rely on. In that case the
+                // registration below restores the class into `elab.classes`.
+                class_defs.insert(name.clone(), rc.clone());
+                match definitions.get(&name) {
+                    Some(SourceDefinition::Module(_))
+                    | Some(SourceDefinition::Interface(_))
+                    | Some(SourceDefinition::Program(_)) => {}
+                    _ => {
+                        definitions.insert(name, SourceDefinition::Class(rc));
+                    }
+                }
             }
             ast::Description::Package(mut p) => {
                 if let Some((u, pr)) = cu_scope_ts {
@@ -1326,9 +1370,31 @@ fn parse_and_elaborate(
                 // Forward → insert only if absent; real → always (replaces a
                 // prior forward placeholder).
                 if t.forward {
+                    // A bare forward typedef (`typedef name;`) is a placeholder;
+                    // it must not displace a real definition of the same name —
+                    // `definitions.entry().or_insert` leaves a prior real entry
+                    // in place. A placeholder has no entity to preserve across a
+                    // hierarchy-name clash (only REAL typedefs do — they are
+                    // recorded in `typedef_defs` below).
                     definitions.entry(name).or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
                 } else {
-                    definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
+                    // Real typedef: keep it in the dedicated registry so a
+                    // same-named hierarchy kind (module/interface/program/
+                    // package/UDP) that later takes the `definitions` slot
+                    // can't erase it (see `typedef_defs`). Mirrors the class
+                    // guard: into the name-keyed `definitions` map it goes
+                    // ONLY when the name is free of a hierarchy-kind slot the
+                    // instantiation/type walkers rely on (§3.13 data vs
+                    // hierarchy namespaces are separate).
+                    typedef_defs.insert(name.clone(), Rc::new(t.clone()));
+                    match definitions.get(&name) {
+                        Some(SourceDefinition::Module(_))
+                        | Some(SourceDefinition::Interface(_))
+                        | Some(SourceDefinition::Program(_)) => {}
+                        _ => {
+                            definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
+                        }
+                    }
                 }
             }
             ast::Description::ImportDecl(id) => {
@@ -2086,6 +2152,42 @@ fn parse_and_elaborate(
     }
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
+    // Re-register any compilation-unit-scope CLASS whose name a module
+    // clobbered in `definitions`/`def_refs` (§3.13 class/module name-space
+    // coexistence). `inline_instantiations` could not see it because the
+    // module won the name-keyed slot; restore it into `elab.classes` under
+    // its real class name so factory/type creation still resolves. Same
+    // registration shape as the multi-top hoist below.
+    for (cname, cd) in class_defs.iter() {
+        if elab.classes.contains_key(cname) {
+            continue;
+        }
+        elaborate::register_class_enum_members(cd, &mut elab);
+        elab.classes.insert(
+            cname.clone(),
+            std::sync::Arc::new(elaborate::elaborate_class_with_params(
+                cd,
+                Some(&elab.parameters),
+            )),
+        );
+    }
+    // Re-register any compilation-unit-scope TYPEDEF whose name a hierarchy
+    // kind clobbered in `definitions`/`def_refs` (§3.13/§6.18 data namespace).
+    // `ordered_typedefs` never saw it because the module/interface/program/
+    // package/UDP won the name-keyed slot; run it through the same
+    // `process_typedef` path the normal elaboration uses so a `shared h;`
+    // (handle typed via a clobbered typedef) still resolves at runtime.
+    for (tname, td) in typedef_defs.iter() {
+        if elab.typedef_types.contains_key(tname)
+            && !matches!(
+                elab.typedef_types.get(tname),
+                Some(ast::types::DataType::Void(_))
+            )
+        {
+            continue;
+        }
+        elaborate::process_typedef(td, &mut elab);
+    }
     // §7.2/§23.3: port CONNECTIONS are emitted as continuous assigns during
     // inlining — after the in-module expansion pass — so an unpacked-struct
     // port connection (`assign s = u1.o;`) arrives here whole. Expand those
