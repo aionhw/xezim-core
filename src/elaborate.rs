@@ -9949,6 +9949,37 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             if is_declared_array(&prefixed) || is_declared_array(&name) {
                 continue;
             }
+            // §7.2 / §6.6.7(d): an UNPACKED STRUCT has no signal under its own
+            // name either — `register_unpacked_aggregate` registers the member
+            // LEAVES (`base.i`, `base.v`, ...) and nothing at `base`. That is
+            // how a user-defined nettype whose data type is an unpacked struct
+            // is stored, so a nettype net declared inside a SUB-MODULE looked
+            // undeclared here and got a 1-bit implicit net laid over its own
+            // base name. The scalar then absorbed the continuous assign: the
+            // member leaves were never written and every read of the net came
+            // back 0.0, silently, in a design that elaborated without error.
+            // The same declaration in the TOP module was correct, because that
+            // path never reaches this pass.
+            //
+            // `var_decl_types` is written for instance-scope declarations by
+            // the sub-module inlining path, which runs before this one, so the
+            // declared type is on file by now. Check the resolved type rather
+            // than the mere presence of a key: scalar child declarations are
+            // recorded there too, and those DO want an implicit net when the
+            // name is otherwise unknown.
+            let is_unpacked_aggregate = |n: &String| {
+                elab.var_decl_types.get(n).is_some_and(|dt| {
+                    matches!(
+                        resolve_typedef_chain(dt, &elab.typedef_types),
+                        DataType::Struct(su)
+                            if !su.packed
+                                && !(matches!(su.kind, StructUnionKind::Union) && !su.tagged)
+                    )
+                })
+            };
+            if is_unpacked_aggregate(&prefixed) || is_unpacked_aggregate(&name) {
+                continue;
+            }
             if !elab.signals.contains_key(&prefixed)
                 && !elab.parameters.contains_key(&prefixed)
                 && !elab.nets.contains(&prefixed)
@@ -25695,11 +25726,26 @@ pub fn duplicate_decl_error(
 /// Runs after `resolve_user_nettype_drivers`, which does its own member
 /// expansion for nettype nets (it has to — the resolver call only exists there);
 /// those emerge with a `MemberAccess` lhs and are left alone.
+/// The declared type NAME of a net or variable.
+///
+/// `signals[..].type_name` is the usual home, but a declaration inside an
+/// INSTANCE that resolves to an unpacked struct (§7.2) leaves no signal under
+/// its own name at all — `register_unpacked_aggregate` registers the member
+/// leaves and the sub-module path returns, recording the declared type in
+/// `var_decl_types` instead. A §6.6.7(d) nettype over an unpacked struct is
+/// stored that way too, so every lookup that goes only through `signals`
+/// silently misses those nets: their drivers are never gathered and their
+/// members never written, below the top level only.
+fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
+    if let Some(tn) = elab.signals.get(name).and_then(|sig| sig.type_name.clone()) {
+        return Some(tn);
+    }
+    elab.var_decl_types.get(name).and_then(get_type_name)
+}
+
 pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<String>> {
-        elab.signals
-            .get(name)
-            .and_then(|sig| sig.type_name.clone())
+        declared_type_name(elab, name)
             .and_then(|tn| elab.typedef_types.get(&tn).cloned())
             .and_then(|dt| match resolve_typedef_chain(&dt, &elab.typedef_types) {
                 // A PACKED struct keeps a contiguous bit layout that a
@@ -25788,6 +25834,34 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 net_resolver.insert(name.clone(), r.clone());
             }
         }
+    }
+    // §6.6.7(d) + §7.2: a nettype over an UNPACKED STRUCT has no signal under
+    // its own name inside an instance — the sub-module declaration path
+    // registers the member LEAVES and returns, because an unpacked struct is
+    // per-member storage. The scan above reads `signals[..].type_name`, so such
+    // a net was invisible here: its drivers were never gathered, the resolution
+    // function never ran, and every read came back with the members' defaults.
+    // Silently, and only below the top level — the same declaration in the root
+    // module resolved correctly, because that path does leave a base signal
+    // behind.
+    //
+    // `var_decl_types` is the record the instance path DOES write, so take the
+    // declared type from there for any name the signal scan missed.
+    let mut from_decls: Vec<(String, String)> = Vec::new();
+    for (name, dt) in &elab.var_decl_types {
+        if net_resolver.contains_key(name) {
+            continue;
+        }
+        if let Some(tn) = get_type_name(dt) {
+            if let Some(r) = elab.nettype_resolvers.get(&tn) {
+                from_decls.push((name.clone(), r.clone()));
+            }
+        }
+    }
+    // Deterministic: `var_decl_types` iteration order must not reach the output.
+    from_decls.sort();
+    for (name, resolver) in from_decls {
+        net_resolver.insert(name, resolver);
     }
     if net_resolver.is_empty() {
         return Ok(());
@@ -25903,9 +25977,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
 
     // Struct members of a nettype net, or None for a scalar one.
     let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<String>> {
-        elab.signals
-            .get(name)
-            .and_then(|sig| sig.type_name.clone())
+        declared_type_name(elab, name)
             .and_then(|tn| elab.typedef_types.get(&tn).cloned())
             .and_then(|dt| match resolve_typedef_chain(&dt, &elab.typedef_types) {
                 DataType::Struct(su) if !su.packed => {
@@ -25990,11 +26062,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // where the call is emitted; a bad one otherwise resolves to a
             // silently wrong value rather than a diagnostic. The nettype name
             // is recovered from the net's declared type for the message.
-            let nt_name = elab
-                .signals
-                .get(&root)
-                .and_then(|sig| sig.type_name.clone())
-                .unwrap_or_else(|| root.clone());
+            let nt_name =
+                declared_type_name(elab, &root).unwrap_or_else(|| root.clone());
             validate_resolver(elab, &nt_name, &resolver)?;
             // A nettype wrapping an unpacked struct is stored as ONE SIGNAL
             // PER MEMBER, which is why `emit` below expands the write side
