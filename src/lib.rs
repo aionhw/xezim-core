@@ -1208,6 +1208,7 @@ fn parse_and_elaborate(
                         eff_ts.get(&nname).copied().unwrap_or((tick_s, tick_s));
                     let mut n = n;
                     elaborate::rewrite_module_delays_pub(&mut n.items, unit_s, prec_s, tick_s);
+                    elaborate::scope_time_param_ports_pub(&mut n.params, unit_s, prec_s);
                     definitions.insert(nname, SourceDefinition::Module(Rc::new(n)));
                 }
                 let name = m.name.name.clone();
@@ -1232,6 +1233,7 @@ fn parse_and_elaborate(
                 let (unit_s, prec_s) =
                     eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
                 elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, prec_s, tick_s);
+                elaborate::scope_time_param_ports_pub(&mut m.params, unit_s, prec_s);
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
             }
@@ -1244,6 +1246,7 @@ fn parse_and_elaborate(
                     eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
                 let mut i = i;
                 elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
+                elaborate::scope_time_param_ports_pub(&mut i.params, unit_s, prec_s);
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
             ast::Description::Program(mut p) => {
@@ -1253,6 +1256,7 @@ fn parse_and_elaborate(
                 let (unit_s, prec_s) =
                     eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
                 elaborate::rewrite_module_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
+                elaborate::scope_time_param_ports_pub(&mut p.params, unit_s, prec_s);
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
@@ -1711,6 +1715,7 @@ fn parse_and_elaborate(
                 if let Some(SourceDefinition::Module(rc)) = definitions.get_mut(&name) {
                     let m = Rc::make_mut(rc);
                     elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, prec_s, tick_s);
+                    elaborate::scope_time_param_ports_pub(&mut m.params, unit_s, prec_s);
                     module_timescale_exp
                         .insert(name.clone(), (elaborate::secs_to_exp(unit_s), elaborate::secs_to_exp(elaborate::exp_to_secs(p))));
                 }
