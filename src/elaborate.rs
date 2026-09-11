@@ -15800,18 +15800,59 @@ fn emit_struct_member_assigns(
             flat.push((d.name.name.clone(), m.data_type.clone()));
         }
     }
-    // An ORDERED assignment pattern on the RHS (`'{1.5, 1'b1}`) maps
-    // position-wise onto the members, so take each item directly.
+    // An assignment pattern on the RHS is taken APART here, item by item.
     // Member-selecting the literal instead (`'{1.5, 1'b1}.f1`) has no
-    // evaluation path and yielded 0.
+    // evaluation path and yields 0 -- silently, which is why both forms below
+    // are handled explicitly rather than left to a fallback.
+    //
+    //   ORDERED  `'{1.5, 1'b1}`          maps position-wise onto the members.
+    //   NAMED    `'{f1: 1.5, f2: 1'b1}`  maps by member name, in any order.
+    //
+    // Named patterns used to fall through: the map returned None for a Named
+    // item, `collect::<Option<Vec<_>>>` short-circuits the whole pattern to
+    // None on the first one, and the literal was then member-selected -- the
+    // exact case the comment above warns about. `'{i: 3e-3, v: 1.8}` therefore
+    // wrote a struct of zeros, with no diagnostic. §10.9.2 gives both forms
+    // equal standing, and named is the form anyone writes for a struct whose
+    // members are not obviously ordered.
     let pat_items: Option<Vec<Expression>> = match &rhs.kind {
-        ExprKind::AssignmentPattern(items) if items.len() == flat.len() => items
-            .iter()
-            .map(|it| match it {
-                crate::ast::expr::AssignmentPatternItem::Ordered(e) => Some(e.clone()),
-                _ => None,
-            })
-            .collect(),
+        ExprKind::AssignmentPattern(items) if items.len() == flat.len() => {
+            use crate::ast::expr::AssignmentPatternItem as Item;
+            if items.iter().all(|it| matches!(it, Item::Ordered(_))) {
+                items
+                    .iter()
+                    .map(|it| match it {
+                        Item::Ordered(e) => Some(e.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                // By name. Every member must be named exactly once; anything
+                // else (a repeat, a miss, a `default:`) is left to the general
+                // path rather than half-applied.
+                let mut by_name: HashMap<String, Expression> = HashMap::default();
+                let mut usable = true;
+                for it in items {
+                    match it {
+                        Item::Named(key, val) => {
+                            if by_name.insert(key.name.clone(), val.clone()).is_some() {
+                                usable = false;
+                            }
+                        }
+                        _ => usable = false,
+                    }
+                }
+                if usable && flat.iter().all(|(m, _)| by_name.contains_key(m)) {
+                    Some(
+                        flat.iter()
+                            .map(|(m, _)| by_name.remove(m).expect("checked above"))
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            }
+        }
         _ => None,
     };
     for (i, (mname, mdt)) in flat.iter().enumerate() {
@@ -25458,9 +25499,54 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 .and_then(|sig| sig.type_name.clone())
                 .unwrap_or_else(|| root.clone());
             validate_resolver(elab, &nt_name, &resolver)?;
+            // A nettype wrapping an unpacked struct is stored as ONE SIGNAL
+            // PER MEMBER, which is why `emit` below expands the write side
+            // member-wise. The driver side needs the same treatment and did
+            // not get it: a driver that is already an assignment pattern
+            // (`assign n = '{i: x, v: y};`) is member-wise as written and
+            // survives, but a driver that names a struct VARIABLE or a
+            // struct-typed PORT (`assign n = t;`) has no whole-struct value
+            // to read -- the members are separate signals -- so the resolver
+            // received uninitialised memory: every member arrived as nan, or
+            // as zero once a later pass defaulted it.
+            //
+            // Both forms are legal. 10.3 gives `net_assignment ::=
+            // net_lvalue = expression`, and an expression may name a
+            // variable; the only restriction the clause places on a
+            // user-defined nettype is on the LEFT ("shall not contain any
+            // indexing or select"). So the fix is to expand, not to reject.
             let items: Vec<crate::ast::expr::AssignmentPatternItem> = drivers
                 .into_iter()
-                .map(crate::ast::expr::AssignmentPatternItem::Ordered)
+                .map(|d| {
+                    let d = match (&members, &d.kind) {
+                        // Already member-wise.
+                        (Some(_), ExprKind::AssignmentPattern(_)) => d,
+                        // Name it member by member instead: '{d.m0, d.m1, ..}
+                        (Some(ms), _) => {
+                            let span = d.span;
+                            let fields: Vec<crate::ast::expr::AssignmentPatternItem> = ms
+                                .iter()
+                                .map(|m| {
+                                    crate::ast::expr::AssignmentPatternItem::Ordered(
+                                        Expression::new(
+                                            ExprKind::MemberAccess {
+                                                expr: Box::new(d.clone()),
+                                                member: Identifier {
+                                                    name: m.clone(),
+                                                    span: Span::dummy(),
+                                                },
+                                            },
+                                            span,
+                                        ),
+                                    )
+                                })
+                                .collect();
+                            Expression::new(ExprKind::AssignmentPattern(fields), span)
+                        }
+                        _ => d,
+                    };
+                    crate::ast::expr::AssignmentPatternItem::Ordered(d)
+                })
                 .collect();
             Expression::new(
                 ExprKind::Call {
