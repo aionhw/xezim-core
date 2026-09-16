@@ -4397,8 +4397,8 @@ impl Value {
             // Wide value: parse digit-by-digit for radices that are powers of 2.
             let bits_per_digit = match radix { 2 => 1, 8 => 3, 16 => 4, _ => 0 };
             if bits_per_digit == 0 {
-                // Decimal wide number not supported here; fall back to zero.
-                return Self::zero(width);
+                // Decimal wide number: parse digit-by-digit using arbitrary precision.
+                return Self::from_decimal_str(&s, width);
             }
             let mut val = Self::zero(width);
             for (i, ch) in s.chars().rev().enumerate() {
@@ -4412,6 +4412,76 @@ impl Value {
                 }
             }
             val
+        }
+    }
+    
+/// Parse a decimal string into a Value of the given width.
+/// Uses u128 for widths <= 128, and a simple limb-based big integer for wider values.
+fn from_decimal_str(s: &str, width: u32) -> Value {
+    if width == 0 {
+        return Value::zero(0);
+    }
+    
+    // For widths up to 128 bits, use u128 accumulator with wrapping arithmetic
+    if width <= 128 {
+        let mut acc: u128 = 0;
+        for ch in s.chars() {
+            if let Some(digit) = ch.to_digit(10) {
+                acc = acc.wrapping_mul(10).wrapping_add(digit as u128);
+            }
+        }
+        // Truncate to the requested width
+        if width <= 64 {
+            return Value::from_u64(acc as u64, width);
+        } else {
+            return Value::from_u128(acc, width);
+        }
+    }
+    
+    // For widths > 128, use limb-based big integer (little-endian u64 limbs)
+    let mut limbs: Vec<u64> = vec![0];
+    for ch in s.chars() {
+        if let Some(digit) = ch.to_digit(10) {
+            // Multiply by 10
+            let mut carry: u128 = 0;
+            for limb in &mut limbs {
+                let prod = (*limb as u128) * 10 + carry;
+                *limb = prod as u64;
+                carry = prod >> 64;
+            }
+            while carry > 0 {
+                limbs.push(carry as u64);
+                carry >>= 64;
+            }
+            // Add digit
+            let mut carry: u128 = digit as u128;
+            for limb in &mut limbs {
+                let sum = (*limb as u128) + carry;
+                *limb = sum as u64;
+                carry = sum >> 64;
+            }
+            while carry > 0 {
+                limbs.push(carry as u64);
+                carry >>= 64;
+            }
+        }
+    }
+    
+    // Convert limbs to Value
+    let nwords = WidePlanes::nwords(width);
+    let mut val = vec![0u64; nwords];
+    let mut xz = vec![0u64; nwords];
+    for (i, &limb) in limbs.iter().take(nwords).enumerate() {
+        val[i] = limb;
+    }
+    let mut planes = WidePlanes { val, xz, nbits: width };
+    planes.mask_top();
+    Value {
+        storage: ValueStorage::Wide(Box::new(planes)),
+        width,
+        is_signed: false,
+        is_real: false,
+        is_fill: false,
         }
     }
 
