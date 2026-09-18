@@ -4500,11 +4500,20 @@ pub fn elaborate_module_with_defs(
                     is_real,
                     direction: port.direction,
                     value: init_val.unwrap_or_else(|| {
-                        default_port_value(port.direction, port.data_type.as_ref(), width, is_real)
+                        default_port_value(
+                            port.direction,
+                            port.data_type.as_ref(),
+                            width,
+                            is_real,
+                            port.net_type,
+                        )
                     }),
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
+                if let Some(net_type) = port.net_type {
+                    register_net_type(&mut elab, &port.name.name, net_type);
+                }
                 if port_shape.is_empty() {
                     signals_insert_traced(&mut elab.signals, line!(), port.name.name.clone(), sig);
                     // §7.2/§23.2.2: a port whose type is an UNPACKED STRUCT is
@@ -5052,6 +5061,7 @@ pub fn elaborate_module_with_defs(
                                     Some(&pd.data_type),
                                     width,
                                     is_real,
+                                    pd.net_type,
                                 );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
@@ -5059,6 +5069,9 @@ pub fn elaborate_module_with_defs(
                             }
                             if let Some(view) = &port_modport_view {
                                 elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                            }
+                            if let Some(net_type) = pd.net_type {
+                                register_net_type(&mut elab, &decl.name.name, net_type);
                             }
                             continue;
                         }
@@ -5075,6 +5088,7 @@ pub fn elaborate_module_with_defs(
                             Some(&pd.data_type),
                             width,
                             is_real,
+                            pd.net_type,
                         ),
                         type_name: get_type_name(&pd.data_type),
                     };
@@ -5082,6 +5096,9 @@ pub fn elaborate_module_with_defs(
                         elab.port_order.push(decl.name.name.clone());
                     }
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
+                    if let Some(net_type) = pd.net_type {
+                        register_net_type(&mut elab, &decl.name.name, net_type);
+                    }
                     if let Some(view) = &port_modport_view {
                         elab.modport_views.insert(decl.name.name.clone(), view.clone());
                     }
@@ -5111,17 +5128,8 @@ pub fn elaborate_module_with_defs(
                     // (i.e. a true duplicate user declaration).
                     if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_some() {
-                            existing.value = match nd.net_type {
-                                NetType::Supply0 => Value::zero(existing.width),
-                                NetType::Supply1 => Value::ones(existing.width),
-                                _ => {
-                                    if existing.is_real {
-                                        Value::from_f64(0.0)
-                                    } else {
-                                        Value::all_z(existing.width)
-                                    }
-                                }
-                            };
+                            existing.value =
+                                default_net_value(nd.net_type, existing.width, existing.is_real);
                             // §6.8: port and net signing MERGE — signed if
                             // EITHER declaration says signed (an explicit
                             // `unsigned` on one side does not downgrade the
@@ -5129,7 +5137,7 @@ pub fn elaborate_module_with_defs(
                             if is_signed {
                                 existing.is_signed = true;
                             }
-                            elab.nets.insert(decl.name.name.clone());
+                            register_net_type(&mut elab, &decl.name.name, nd.net_type);
                             // §10.3.1: the net declaration's initializer is a
                             // continuous assignment — it was dropped when the
                             // name was already declared as a port, leaving
@@ -5169,24 +5177,8 @@ pub fn elaborate_module_with_defs(
                     // §6.6.1: an undriven wire reads high-impedance — nets
                     // default to Z, not X (bits with drivers are overwritten
                     // at the first settle; bits nothing drives stay z).
-                    if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
-                        elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
-                    }
-                    if matches!(nd.net_type, NetType::Interconnect) {
-                        elab.interconnect_nets.insert(decl.name.name.clone());
-                    }
-                    let init_value = match nd.net_type {
-                        NetType::Supply0 => Value::zero(w),
-                        NetType::Supply1 => Value::ones(w),
-                        // §6.6.3: an UNDRIVEN tri0/tri1 reads its pull value,
-                        // not z. A driven one is resolved in the multi-driver
-                        // fold, which overwrites this at settle.
-                        NetType::Tri0 => Value::zero(w),
-                        NetType::Tri1 => Value::ones(w),
-                        // §6.6.4: a never-driven trireg reads x (no charge yet).
-                        NetType::TriReg => Value::all_x(w),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
-                    };
+                    register_net_type(&mut elab, &decl.name.name, nd.net_type);
+                    let init_value = default_net_value(nd.net_type, w, is_real);
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width: w,
@@ -5197,7 +5189,6 @@ pub fn elaborate_module_with_defs(
                         type_name: get_type_name(&nd.data_type),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
-                    elab.nets.insert(decl.name.name.clone());
                     // The declared type, same as the variable arm: the
                     // simulator's `register_struct_member_packed_dims` walks
                     // `packed_struct_fields` and needs the declaring type to
@@ -5530,6 +5521,7 @@ pub fn elaborate_module_with_defs(
                                     Some(&dd.data_type),
                                     width,
                                     decl_is_real,
+                                    None,
                                 )
                             };
                         }
@@ -5537,7 +5529,7 @@ pub fn elaborate_module_with_defs(
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                         // A reg/logic completion makes the port a variable, not a net.
-                        elab.nets.remove(&decl.name.name);
+                        unregister_net_type(&mut elab, &decl.name.name);
                         elab.var_decl_types
                             .insert(decl.name.name.clone(), dd.data_type.clone());
                         continue;
@@ -10704,6 +10696,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                     Some(&pd.data_type),
                                     width,
                                     is_real,
+                                    pd.net_type,
                                 );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
@@ -10711,6 +10704,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             }
                             if let Some(view) = &port_modport_view {
                                 elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                            }
+                            if let Some(net_type) = pd.net_type {
+                                register_net_type(elab, &decl.name.name, net_type);
                             }
                             continue;
                         }
@@ -10724,10 +10720,14 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             Some(&pd.data_type),
                             width,
                             is_real,
+                            pd.net_type,
                         ),
                         is_real, type_name: get_type_name(&pd.data_type),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
+                    if let Some(net_type) = pd.net_type {
+                        register_net_type(elab, &decl.name.name, net_type);
+                    }
                     elab.port_order.push(decl.name.name.clone());
                     if let Some(view) = &port_modport_view {
                         elab.modport_views.insert(decl.name.name.clone(), view.clone());
@@ -10739,24 +10739,8 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 let is_signed = is_type_signed(&nd.data_type);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
-                    if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
-                        elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
-                    }
-                    if matches!(nd.net_type, NetType::Interconnect) {
-                        elab.interconnect_nets.insert(decl.name.name.clone());
-                    }
-                    let init_value = match nd.net_type {
-                        NetType::Supply0 => Value::zero(width),
-                        NetType::Supply1 => Value::ones(width),
-                        // §6.6.3: an UNDRIVEN tri0/tri1 reads its pull value,
-                        // not z. A driven one is resolved in the multi-driver
-                        // fold, which overwrites this at settle.
-                        NetType::Tri0 => Value::zero(width),
-                        NetType::Tri1 => Value::ones(width),
-                        // §6.6.4: a never-driven trireg reads x (no charge yet).
-                        NetType::TriReg => Value::all_x(width),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(width) },
-                    };
+                    register_net_type(elab, &decl.name.name, nd.net_type);
+                    let init_value = default_net_value(nd.net_type, width, is_real);
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
                         direction: None, value: init_value,
@@ -13393,14 +13377,58 @@ fn default_value_for_type(dt: &DataType, width: u32) -> Value {
     if is_type_two_state(dt) { Value::zero(width) } else { Value::new(width) }
 }
 
+/// Record every semantic property carried by a built-in net type.  Keeping
+/// this in one helper prevents elaboration paths from setting an initial value
+/// while forgetting the metadata needed after a driver changes or releases.
+fn register_net_type(elab: &mut ElaboratedModule, name: &str, net_type: NetType) {
+    elab.nets.insert(name.to_string());
+    if let Some(kind) = ResolvedNetKind::from_net_type(net_type) {
+        elab.resolved_net_kinds.insert(name.to_string(), kind);
+    }
+    if matches!(net_type, NetType::Interconnect) {
+        elab.interconnect_nets.insert(name.to_string());
+    }
+}
+
+fn unregister_net_type(elab: &mut ElaboratedModule, name: &str) {
+    elab.nets.remove(name);
+    elab.resolved_net_kinds.remove(name);
+    elab.interconnect_nets.remove(name);
+}
+
+fn default_net_value(net_type: NetType, width: u32, is_real: bool) -> Value {
+    if is_real {
+        return Value::from_f64(0.0);
+    }
+    match net_type {
+        NetType::Supply0 | NetType::Tri0 => Value::zero(width),
+        NetType::Supply1 | NetType::Tri1 => Value::ones(width),
+        // §6.6.4: charge storage has no retained value until first driven.
+        NetType::TriReg => Value::all_x(width),
+        NetType::Wire
+        | NetType::Tri
+        | NetType::Wand
+        | NetType::Wor
+        | NetType::TriAnd
+        | NetType::TriOr
+        | NetType::Uwire
+        | NetType::Interconnect => Value::all_z(width),
+        NetType::Wreal => Value::from_f64(0.0),
+    }
+}
+
 fn default_port_value(
     direction: Option<PortDirection>,
     data_type: Option<&DataType>,
     width: u32,
     is_real: bool,
+    net_type: Option<NetType>,
 ) -> Value {
     if is_real {
         return Value::from_f64(0.0);
+    }
+    if let Some(net_type) = net_type {
+        return default_net_value(net_type, width, false);
     }
     if matches!(direction, Some(PortDirection::Input | PortDirection::Inout)) {
         if data_type.map(is_type_two_state).unwrap_or(false) {
@@ -22921,6 +22949,9 @@ fn inline_module_items(
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
                             }
+                            if let Some(net_type) = port.net_type {
+                                register_net_type(elab, &sig_name, net_type);
+                            }
                             if port_shape.is_empty() {
                                 // §7.2: unpacked-struct port of an INLINED
                                 // instance — register the member leaves too,
@@ -22944,12 +22975,16 @@ fn inline_module_items(
                                     _ => None,
                                 };
                                 signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
-                                    name: sig_name, width,
+                                    name: sig_name.clone(), width,
                                     is_signed: port.data_type.as_ref().map(is_type_signed).unwrap_or(false),
                                     is_real,
                                     direction: port.direction,
                                     value: init_val.unwrap_or_else(|| default_port_value(
-                                        port.direction, port.data_type.as_ref(), width, is_real,
+                                        port.direction,
+                                        port.data_type.as_ref(),
+                                        width,
+                                        is_real,
+                                        port.net_type,
                                     )),
                                     type_name: port.data_type.as_ref().and_then(get_type_name),
                                 });
@@ -23015,16 +23050,20 @@ fn inline_module_items(
                                     let port_is_real =
                                         is_type_real_resolved(&pd.data_type, &elab.typedef_types);
                                     signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
-                                        name: sig_name, width, is_signed,
+                                        name: sig_name.clone(), width, is_signed,
                                         direction: Some(pd.direction),
                                         value: default_port_value(
                                             Some(pd.direction),
                                             Some(&pd.data_type),
                                             width,
                                             port_is_real,
+                                            pd.net_type,
                                         ),
                                         is_real: port_is_real, type_name: scope_local_type_name(get_type_name(&pd.data_type), &sub_typedef_names_all, &inst_prefix),
                                     });
+                                    if let Some(net_type) = pd.net_type {
+                                        register_net_type(elab, &sig_name, net_type);
+                                    }
                                 }
                             }
                         }
@@ -23315,20 +23354,11 @@ fn inline_module_items(
                                     // Simulator::new from the array metadata.
                                     continue;
                                 }
-                                if matches!(nd.net_type, NetType::Interconnect) {
-                        elab.interconnect_nets.insert(decl.name.name.clone());
-                    }
-                    let init_value = match nd.net_type {
-                                    NetType::Supply0 => Value::zero(width),
-                                    NetType::Supply1 => Value::ones(width),
-                                    _ => {
-                                        if is_type_real(&nd.data_type) {
-                                            Value::from_f64(0.0)
-                                        } else {
-                                            Value::all_z(width)
-                                        }
-                                    }
-                                };
+                                let net_is_real =
+                                    is_type_real_resolved(&nd.data_type, &elab.typedef_types);
+                                register_net_type(elab, &sig_name, nd.net_type);
+                                let init_value =
+                                    default_net_value(nd.net_type, width, net_is_real);
                                 signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: is_type_signed(&nd.data_type),
@@ -23336,7 +23366,7 @@ fn inline_module_items(
                                     // NETTYPE net declared in a submodule
                                     // (`rnet n;`) is real like its top-level
                                     // twin (§6.6.7).
-                                    is_real: is_type_real_resolved(&nd.data_type, &elab.typedef_types),
+                                    is_real: net_is_real,
                                     direction: None, value: init_value,
                                     type_name: scope_local_type_name(get_type_name(&nd.data_type), &sub_typedef_names_all, &inst_prefix),
                                 });                            }
@@ -23671,12 +23701,13 @@ fn inline_module_items(
                                             Some(&dd.data_type),
                                             width,
                                             decl_is_real,
+                                            None,
                                         );
                                     }
                                     if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                                         elab.two_state_signals.insert(sig_name.clone());
                                     }
-                                    elab.nets.remove(&sig_name);
+                                    unregister_net_type(elab, &sig_name);
                                     elab.var_decl_types.insert(sig_name.clone(), dd.data_type.clone());
                                     continue;
                                 }
