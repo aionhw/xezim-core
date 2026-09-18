@@ -25,8 +25,8 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
 use super::value::{LogicBit, Value};
@@ -89,7 +89,9 @@ pub struct VcdSink {
 
 impl VcdSink {
     pub fn inline(w: DumpWriter) -> Self {
-        VcdSink { mode: Mode::Inline(BufWriter::new(w)) }
+        VcdSink {
+            mode: Mode::Inline(BufWriter::new(w)),
+        }
     }
 
     pub fn threaded(w: DumpWriter) -> Self {
@@ -100,7 +102,9 @@ impl VcdSink {
                 let mut bw = BufWriter::with_capacity(256 * 1024, w);
                 while let Ok(msg) = rx.recv() {
                     match msg {
-                        WorkerMsg::Chunk(bytes) => { let _ = bw.write_all(&bytes); }
+                        WorkerMsg::Chunk(bytes) => {
+                            let _ = bw.write_all(&bytes);
+                        }
                         WorkerMsg::VcdBatch(batch) => {
                             for ts in &batch {
                                 if let Some(t) = ts.time {
@@ -116,7 +120,9 @@ impl VcdSink {
                                 write_xtrace_timestep(&mut bw, ts);
                             }
                         }
-                        WorkerMsg::Flush => { let _ = bw.flush(); }
+                        WorkerMsg::Flush => {
+                            let _ = bw.flush();
+                        }
                         WorkerMsg::Shutdown => break,
                     }
                 }
@@ -146,7 +152,11 @@ impl VcdSink {
             Some(level) => Box::new(zstd::stream::Encoder::new(file, level)?.auto_finish()),
             None => Box::new(file),
         };
-        Ok(if threaded { Self::threaded(w) } else { Self::inline(w) })
+        Ok(if threaded {
+            Self::threaded(w)
+        } else {
+            Self::inline(w)
+        })
     }
 
     /// In threaded mode: push a timestep's value changes into the pending
@@ -162,7 +172,12 @@ impl VcdSink {
                     write_vcd_value(w, val, id);
                 }
             }
-            Mode::Threaded { buf, pending, tx: Some(tx), .. } => {
+            Mode::Threaded {
+                buf,
+                pending,
+                tx: Some(tx),
+                ..
+            } => {
                 if !buf.is_empty() {
                     let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
                     let _ = tx.send(WorkerMsg::Chunk(chunk));
@@ -188,7 +203,12 @@ impl VcdSink {
     pub fn post_xtrace_changes(&mut self, ts: XtraceTimestep) {
         match &mut self.mode {
             Mode::Inline(w) => write_xtrace_timestep(w, &ts),
-            Mode::Threaded { buf, pending_xt, tx: Some(tx), .. } => {
+            Mode::Threaded {
+                buf,
+                pending_xt,
+                tx: Some(tx),
+                ..
+            } => {
                 if !buf.is_empty() {
                     let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
                     let _ = tx.send(WorkerMsg::Chunk(chunk));
@@ -207,7 +227,14 @@ impl VcdSink {
     /// mode this is a no-op; `BufWriter` handles batching. Called at
     /// natural boundaries; `Drop` flushes whatever is left.
     pub fn commit(&mut self) {
-        if let Mode::Threaded { buf, pending, pending_xt, tx: Some(tx), .. } = &mut self.mode {
+        if let Mode::Threaded {
+            buf,
+            pending,
+            pending_xt,
+            tx: Some(tx),
+            ..
+        } = &mut self.mode
+        {
             if buf.len() >= COMMIT_THRESHOLD {
                 let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
                 let _ = tx.send(WorkerMsg::Chunk(chunk));
@@ -344,12 +371,22 @@ fn write_xtrace_timestep<W: Write>(w: &mut W, ts: &XtraceTimestep) {
     }
     if ts.changes.len() == 1 {
         let (id, val, is_real, is_string) = &ts.changes[0];
-        let _ = writeln!(w, "D,{},{}", id, xtrace_format_value(val, *is_real, *is_string));
+        let _ = writeln!(
+            w,
+            "D,{},{}",
+            id,
+            xtrace_format_value(val, *is_real, *is_string)
+        );
     } else if !ts.changes.is_empty() {
         for chunk in ts.changes.chunks(16) {
             let _ = write!(w, "P");
             for (id, val, is_real, is_string) in chunk {
-                let _ = write!(w, ",{}={}", id, xtrace_format_value(val, *is_real, *is_string));
+                let _ = write!(
+                    w,
+                    ",{}={}",
+                    id,
+                    xtrace_format_value(val, *is_real, *is_string)
+                );
             }
             let _ = writeln!(w);
         }
@@ -388,7 +425,13 @@ impl Write for VcdSink {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         match &mut self.mode {
             Mode::Inline(w) => w.write(data),
-            Mode::Threaded { buf, pending, pending_xt, tx: Some(tx), .. } => {
+            Mode::Threaded {
+                buf,
+                pending,
+                pending_xt,
+                tx: Some(tx),
+                ..
+            } => {
                 dispatch_batches(pending, pending_xt, tx);
                 buf.extend_from_slice(data);
                 Ok(data.len())
@@ -406,7 +449,13 @@ impl Write for VcdSink {
             // Unlike `commit()` (threshold-gated), a flush must force ALL
             // buffered work to the worker AND have the worker flush its own
             // BufWriter to disk — otherwise a crash loses the tail of the dump.
-            Mode::Threaded { buf, pending, pending_xt, tx: Some(tx), .. } => {
+            Mode::Threaded {
+                buf,
+                pending,
+                pending_xt,
+                tx: Some(tx),
+                ..
+            } => {
                 if !buf.is_empty() {
                     let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
                     let _ = tx.send(WorkerMsg::Chunk(chunk));
@@ -422,7 +471,14 @@ impl Write for VcdSink {
 
 impl Drop for VcdSink {
     fn drop(&mut self) {
-        if let Mode::Threaded { buf, pending, pending_xt, tx, handle } = &mut self.mode {
+        if let Mode::Threaded {
+            buf,
+            pending,
+            pending_xt,
+            tx,
+            handle,
+        } = &mut self.mode
+        {
             if let Some(tx_ref) = tx.as_ref() {
                 if !buf.is_empty() {
                     let chunk = std::mem::take(buf);

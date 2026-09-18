@@ -39,12 +39,12 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::ast::Description;
 use crate::ast::decl::{ModuleItem, PortConnection};
 use crate::ast::expr::ExprKind;
 use crate::ast::module::{ModuleDeclaration, PortList};
-use crate::ast::types::{DataType, SimpleType};
 use crate::ast::types::PortDirection;
-use crate::ast::Description;
+use crate::ast::types::{DataType, SimpleType};
 
 #[derive(Default)]
 struct Config {
@@ -56,17 +56,30 @@ static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 
 /// `--upf <file>` (repeatable).
 pub fn add_upf_file(path: String) {
-    CONFIG.lock().unwrap().get_or_insert_with(Config::default).files.push(path);
+    CONFIG
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Config::default)
+        .files
+        .push(path);
 }
 
 /// `--upf-top </path/to/instance>`: the design instance the UPF scope refers
 /// to (else the first instance of the `set_design_top` module is used).
 pub fn set_upf_top(path: String) {
-    CONFIG.lock().unwrap().get_or_insert_with(Config::default).top = Some(path);
+    CONFIG
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Config::default)
+        .top = Some(path);
 }
 
 pub fn upf_configured() -> bool {
-    CONFIG.lock().unwrap().as_ref().is_some_and(|c| !c.files.is_empty())
+    CONFIG
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|c| !c.files.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +238,11 @@ struct Args {
 }
 
 fn parse_args(words: &[String]) -> Args {
-    let mut a = Args { positional: Vec::new(), opts: HashMap::new(), flags: Vec::new() };
+    let mut a = Args {
+        positional: Vec::new(),
+        opts: HashMap::new(),
+        flags: Vec::new(),
+    };
     let mut i = 0;
     while i < words.len() {
         let w = &words[i];
@@ -342,8 +359,8 @@ fn parse_upf_file(
     if depth > 16 {
         return Err(format!("UPF: load_upf nesting too deep at '{}'", path));
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("UPF: cannot read '{}': {}", path, e))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("UPF: cannot read '{}': {}", path, e))?;
     let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
     let file_label = path.to_string();
     for words in read_commands(&text, vars) {
@@ -431,12 +448,18 @@ fn parse_upf_file(
                 }
             }
             "create_supply_port" => {
-                let dir = a.opts.get("direction").cloned().unwrap_or_else(|| "in".into());
+                let dir = a
+                    .opts
+                    .get("direction")
+                    .cloned()
+                    .unwrap_or_else(|| "in".into());
                 model.ports.push((model.scoped(&name), dir));
             }
             "connect_supply_net" => {
                 for p in lst("ports") {
-                    model.net_of_port.insert(model.scoped(&p), model.scoped(&name));
+                    model
+                        .net_of_port
+                        .insert(model.scoped(&p), model.scoped(&name));
                 }
             }
             "set_domain_supply_net" => {
@@ -448,15 +471,25 @@ fn parse_upf_file(
                         d.ground = gd;
                     }
                     None => model.warnings.push(format!(
-                        "set_domain_supply_net: unknown power domain '{}'", name
+                        "set_domain_supply_net: unknown power domain '{}'",
+                        name
                     )),
                 }
             }
-            "create_supply_set" | "associate_supply_set" | "add_power_state"
-            | "set_port_attributes" | "set_design_attributes" | "upf_version"
-            | "create_logic_net" | "create_logic_port" | "connect_logic_net"
-            | "set_partial_on_translation" | "set_simstate_behavior" => {
-                model.warnings.push(format!("'{}' parsed but not simulated", cmd));
+            "create_supply_set"
+            | "associate_supply_set"
+            | "add_power_state"
+            | "set_port_attributes"
+            | "set_design_attributes"
+            | "upf_version"
+            | "create_logic_net"
+            | "create_logic_port"
+            | "connect_logic_net"
+            | "set_partial_on_translation"
+            | "set_simstate_behavior" => {
+                model
+                    .warnings
+                    .push(format!("'{}' parsed but not simulated", cmd));
             }
             "create_power_switch" => {
                 let pair = |k: &str| -> (String, String) {
@@ -517,7 +550,9 @@ fn parse_upf_file(
                 let elements: Vec<String> =
                     lst("elements").iter().map(|e| model.scoped(e)).collect();
                 if a.flags.iter().any(|f| f == "no_isolation") {
-                    model.warnings.push(format!("set_isolation {}: -no_isolation, ignored", name));
+                    model
+                        .warnings
+                        .push(format!("set_isolation {}: -no_isolation, ignored", name));
                     continue;
                 }
                 if a.flags.iter().any(|f| f == "update") {
@@ -526,13 +561,27 @@ fn parse_upf_file(
                         .iter_mut()
                         .find(|st| st.name == name && (domain.is_empty() || st.domain == domain))
                     {
-                        if let Some(v) = a.opts.get("applies_to") { st.applies_to = Some(v.clone()); }
-                        if !elements.is_empty() { st.elements = elements; }
-                        if let Some(v) = a.opts.get("clamp_value") { st.clamp = v.clone(); }
-                        if let Some(v) = a.opts.get("isolation_signal") { st.signal = Some(v.clone()); }
-                        if let Some(v) = a.opts.get("isolation_sense") { st.sense = v.clone(); }
-                        if let Some(v) = a.opts.get("isolation_power_net") { st.power = Some(v.clone()); }
-                        if let Some(v) = a.opts.get("isolation_ground_net") { st.ground = Some(v.clone()); }
+                        if let Some(v) = a.opts.get("applies_to") {
+                            st.applies_to = Some(v.clone());
+                        }
+                        if !elements.is_empty() {
+                            st.elements = elements;
+                        }
+                        if let Some(v) = a.opts.get("clamp_value") {
+                            st.clamp = v.clone();
+                        }
+                        if let Some(v) = a.opts.get("isolation_signal") {
+                            st.signal = Some(v.clone());
+                        }
+                        if let Some(v) = a.opts.get("isolation_sense") {
+                            st.sense = v.clone();
+                        }
+                        if let Some(v) = a.opts.get("isolation_power_net") {
+                            st.power = Some(v.clone());
+                        }
+                        if let Some(v) = a.opts.get("isolation_ground_net") {
+                            st.ground = Some(v.clone());
+                        }
                         continue;
                     }
                 }
@@ -541,9 +590,17 @@ fn parse_upf_file(
                     domain,
                     applies_to: a.opts.get("applies_to").cloned(),
                     elements,
-                    clamp: a.opts.get("clamp_value").cloned().unwrap_or_else(|| "0".into()),
+                    clamp: a
+                        .opts
+                        .get("clamp_value")
+                        .cloned()
+                        .unwrap_or_else(|| "0".into()),
                     signal: a.opts.get("isolation_signal").cloned(),
-                    sense: a.opts.get("isolation_sense").cloned().unwrap_or_else(|| "high".into()),
+                    sense: a
+                        .opts
+                        .get("isolation_sense")
+                        .cloned()
+                        .unwrap_or_else(|| "high".into()),
                     power: a.opts.get("isolation_power_net").cloned(),
                     ground: a.opts.get("isolation_ground_net").cloned(),
                 });
@@ -564,7 +621,8 @@ fn parse_upf_file(
                         }
                     }
                     None => model.warnings.push(format!(
-                        "set_isolation_control: unknown isolation strategy '{}'", name
+                        "set_isolation_control: unknown isolation strategy '{}'",
+                        name
                     )),
                 }
             }
@@ -577,7 +635,10 @@ fn parse_upf_file(
             }
             "set_retention_control" => {}
             "set_level_shifter" => {
-                model.level_shifters.push((name.clone(), a.opts.get("domain").cloned().unwrap_or_default()));
+                model.level_shifters.push((
+                    name.clone(),
+                    a.opts.get("domain").cloned().unwrap_or_default(),
+                ));
             }
             "add_port_state" => {
                 let mut states = Vec::new();
@@ -608,12 +669,16 @@ fn parse_upf_file(
                 let st = lst("state");
                 match model.psts.iter_mut().find(|p| p.name == pst) {
                     Some(p) => p.states.push((name.clone(), st)),
-                    None => model.warnings.push(format!("add_pst_state: unknown PST '{}'", pst)),
+                    None => model
+                        .warnings
+                        .push(format!("add_pst_state: unknown PST '{}'", pst)),
                 }
             }
             other => {
                 if !other.starts_with("query_") {
-                    model.warnings.push(format!("unsupported UPF command '{}' ignored", other));
+                    model
+                        .warnings
+                        .push(format!("unsupported UPF command '{}' ignored", other));
                 }
             }
         }
@@ -630,7 +695,9 @@ struct Design<'a> {
 }
 
 impl<'a> Design<'a> {
-    fn instances(m: &'a ModuleDeclaration) -> Vec<(String, String, &'a crate::ast::decl::HierarchicalInstance)> {
+    fn instances(
+        m: &'a ModuleDeclaration,
+    ) -> Vec<(String, String, &'a crate::ast::decl::HierarchicalInstance)> {
         let mut out = Vec::new();
         fn walk<'b>(
             items: &'b [ModuleItem],
@@ -653,17 +720,28 @@ impl<'a> Design<'a> {
     }
 
     /// Module type of the instance at `path` (segments) below `from`.
-    fn module_at(&self, from: &'a ModuleDeclaration, path: &[String]) -> Option<&'a ModuleDeclaration> {
+    fn module_at(
+        &self,
+        from: &'a ModuleDeclaration,
+        path: &[String],
+    ) -> Option<&'a ModuleDeclaration> {
         let mut cur = from;
         for seg in path {
-            let (_, mname, _) = Self::instances(cur).into_iter().find(|(n, _, _)| n == seg)?;
+            let (_, mname, _) = Self::instances(cur)
+                .into_iter()
+                .find(|(n, _, _)| n == seg)?;
             cur = self.modules.get(&mname)?;
         }
         Some(cur)
     }
 
     /// First instance path (from `top`) whose module type is `target`.
-    fn find_by_type(&self, top: &'a ModuleDeclaration, target: &str, depth: usize) -> Option<Vec<String>> {
+    fn find_by_type(
+        &self,
+        top: &'a ModuleDeclaration,
+        target: &str,
+        depth: usize,
+    ) -> Option<Vec<String>> {
         if depth > 32 {
             return None;
         }
@@ -745,7 +823,14 @@ impl<'a> Design<'a> {
     /// power-down corrupts: scalar/vector variables, nets and outputs, and
     /// the same inside sub-instances. Inputs are the parent's nets and are
     /// left alone; arrays and non-integral types are skipped.
-    fn corruptible(&self, m: &'a ModuleDeclaration, prefix: &str, skip: &[String], out: &mut Vec<String>, depth: usize) {
+    fn corruptible(
+        &self,
+        m: &'a ModuleDeclaration,
+        prefix: &str,
+        skip: &[String],
+        out: &mut Vec<String>,
+        depth: usize,
+    ) {
         if depth > 32 || skip.iter().any(|s| s == prefix) {
             return;
         }
@@ -754,9 +839,18 @@ impl<'a> Design<'a> {
             !matches!(
                 dt,
                 DataType::Real { .. }
-                    | DataType::Simple { kind: SimpleType::String, .. }
-                    | DataType::Simple { kind: SimpleType::Event, .. }
-                    | DataType::Simple { kind: SimpleType::Chandle, .. }
+                    | DataType::Simple {
+                        kind: SimpleType::String,
+                        ..
+                    }
+                    | DataType::Simple {
+                        kind: SimpleType::Event,
+                        ..
+                    }
+                    | DataType::Simple {
+                        kind: SimpleType::Chandle,
+                        ..
+                    }
             )
         };
         let mut push = |name: &str, out: &mut Vec<String>| {
@@ -812,14 +906,26 @@ impl<'a> Design<'a> {
 
     /// Parent-side net an instance's output port drives, when the actual is
     /// a plain identifier.
-    fn output_actual(m: &ModuleDeclaration, hi: &crate::ast::decl::HierarchicalInstance, sub: &ModuleDeclaration, port: &str) -> Option<String> {
+    fn output_actual(
+        m: &ModuleDeclaration,
+        hi: &crate::ast::decl::HierarchicalInstance,
+        sub: &ModuleDeclaration,
+        port: &str,
+    ) -> Option<String> {
         let _ = m;
         let order = Self::port_order(sub);
-        let wildcard = hi.connections.iter().any(|c| matches!(c, PortConnection::Wildcard));
+        let wildcard = hi
+            .connections
+            .iter()
+            .any(|c| matches!(c, PortConnection::Wildcard));
         for (idx, c) in hi.connections.iter().enumerate() {
             let (pname, expr) = match c {
                 PortConnection::Wildcard => continue,
-                PortConnection::Named { name, expr, implicit } => {
+                PortConnection::Named {
+                    name,
+                    expr,
+                    implicit,
+                } => {
                     if name.name != port {
                         continue;
                     }
@@ -855,7 +961,9 @@ impl<'a> Design<'a> {
 // ---------------------------------------------------------------------------
 
 fn mangle(s: &str) -> String {
-    s.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 fn sv_str(s: &str) -> String {
@@ -882,7 +990,10 @@ fn bool_expr(expr: &str, ctrl: &HashMap<String, String>, warnings: &mut Vec<Stri
                     if word.chars().all(|c| c.is_ascii_digit()) {
                         out.push_str(&word);
                     } else {
-                        warnings.push(format!("power switch state uses unknown control port '{}'", word));
+                        warnings.push(format!(
+                            "power switch state uses unknown control port '{}'",
+                            word
+                        ));
                         out.push_str("1'bx");
                     }
                 }
@@ -902,11 +1013,22 @@ struct Glue {
     report: Vec<String>,
 }
 
-fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclaration, top_override: Option<&str>) -> Result<Glue, String> {
+fn generate(
+    model: &Model,
+    design: &Design,
+    top_name: &str,
+    top: &ModuleDeclaration,
+    top_override: Option<&str>,
+) -> Result<Glue, String> {
     let mut warnings: Vec<String> = model.warnings.clone();
     // Scope instance path (segments below the top module).
     let scope_path: Vec<String> = if let Some(p) = top_override {
-        let mut segs: Vec<String> = p.trim_start_matches('/').split(['/', '.']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let mut segs: Vec<String> = p
+            .trim_start_matches('/')
+            .split(['/', '.'])
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         if segs.first().map(|s| s.as_str()) == Some(top_name) {
             segs.remove(0);
         }
@@ -916,7 +1038,10 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
             Vec::new()
         } else {
             design.find_by_type(top, dt, 0).ok_or_else(|| {
-                format!("UPF: no instance of design top '{}' found below '{}'", dt, top_name)
+                format!(
+                    "UPF: no instance of design top '{}' found below '{}'",
+                    dt, top_name
+                )
             })?
         }
     } else {
@@ -925,11 +1050,19 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     let scope_mod = design
         .module_at(top, &scope_path)
         .ok_or_else(|| format!("UPF: scope path '{}' does not exist", scope_path.join(".")))?;
-    let scope_dot = if scope_path.is_empty() { String::new() } else { format!("{}.", scope_path.join(".")) };
+    let scope_dot = if scope_path.is_empty() {
+        String::new()
+    } else {
+        format!("{}.", scope_path.join("."))
+    };
     let hier = |rel: &str| -> String {
         // rel is scope-relative with '/' separators
         let r = rel.replace('/', ".");
-        if r.is_empty() { scope_dot.trim_end_matches('.').to_string() } else { format!("{}{}", scope_dot, r) }
+        if r.is_empty() {
+            scope_dot.trim_end_matches('.').to_string()
+        } else {
+            format!("{}{}", scope_dot, r)
+        }
     };
     let slash_path = |rel: &str| -> String {
         let mut p = format!("/{}", top_name);
@@ -947,7 +1080,11 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
 
     let mut nets: Vec<String> = model.nets.clone();
     for (p, _) in &model.ports {
-        let n = model.net_of_port.get(p).cloned().unwrap_or_else(|| p.clone());
+        let n = model
+            .net_of_port
+            .get(p)
+            .cloned()
+            .unwrap_or_else(|| p.clone());
         if !nets.contains(&n) {
             nets.push(n);
         }
@@ -965,7 +1102,11 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     let mut report = Vec::new();
     items.push_str("  // ---- IEEE 1801 power intent (generated by xezim from UPF) ----\n");
     for n in &nets {
-        items.push_str(&format!("  logic {} = 1'b0;\n  real {}_v = 0.0;\n", sup(n), sup(n)));
+        items.push_str(&format!(
+            "  logic {} = 1'b0;\n  real {}_v = 0.0;\n",
+            sup(n),
+            sup(n)
+        ));
         items.push_str(&format!(
             "  always @({s}) begin\n    if ({s} === 1'b1) $display(\"[UPF] Time: %0t, Supply net '{p}' toggled to '{{FULL_ON %0.2f V}}'\", $time, {s}_v);\n    else if ({s} === 1'b0) $display(\"[UPF] Time: %0t, Supply net '{p}' toggled to '{{OFF 0 V}}'\", $time);\n    else $display(\"[UPF] Time: %0t, Supply net '{p}' toggled to '{{UNDETERMINED}}'\", $time);\n  end\n",
             s = sup(n),
@@ -982,11 +1123,18 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
         let mut conds: Vec<String> = Vec::new();
         for (_, in_port, b) in &sw.on_states {
             if in_port != &sw.input.0 {
-                warnings.push(format!("power switch '{}': on_state uses input port '{}' (expected '{}')", sw.name, in_port, sw.input.0));
+                warnings.push(format!(
+                    "power switch '{}': on_state uses input port '{}' (expected '{}')",
+                    sw.name, in_port, sw.input.0
+                ));
             }
             conds.push(format!("({})", bool_expr(b, &ctrl, &mut warnings)));
         }
-        let cond = if conds.is_empty() { "1'b0".to_string() } else { conds.join(" || ") };
+        let cond = if conds.is_empty() {
+            "1'b0".to_string()
+        } else {
+            conds.join(" || ")
+        };
         let (i, o) = (sup(&sw.input.1), sup(&sw.output.1));
         items.push_str(&format!(
             "  assign {o} = ({c}) ? {i} : (({c}) === 1'b0 ? 1'b0 : 1'bx);\n  always @* {o}_v = ({c}) ? {i}_v : 0.0;\n",
@@ -1006,7 +1154,11 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
             sw.name,
             sw.input.1,
             sw.output.1,
-            sw.controls.iter().map(|(p, s)| format!("{}={}", p, s)).collect::<Vec<_>>().join(",")
+            sw.controls
+                .iter()
+                .map(|(p, s)| format!("{}={}", p, s))
+                .collect::<Vec<_>>()
+                .join(",")
         ));
     }
 
@@ -1014,7 +1166,11 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     let retained: Vec<String> = model
         .retentions
         .iter()
-        .flat_map(|r| r.elements.iter().map(|e| format!("{}{}", scope_dot, e.replace('/', "."))))
+        .flat_map(|r| {
+            r.elements
+                .iter()
+                .map(|e| format!("{}{}", scope_dot, e.replace('/', ".")))
+        })
         .collect();
 
     // Isolation: resolve ports to parent nets.
@@ -1033,22 +1189,35 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     iso_sorted.sort_by_key(|s| s.elements.is_empty());
     for iso in iso_sorted {
         let Some(sig) = &iso.signal else {
-            warnings.push(format!("isolation strategy '{}' has no -isolation_signal; not simulated", iso.name));
+            warnings.push(format!(
+                "isolation strategy '{}' has no -isolation_signal; not simulated",
+                iso.name
+            ));
             continue;
         };
         let sig_h = hier(sig);
-        let active = if iso.sense.eq_ignore_ascii_case("low") { "1'b0" } else { "1'b1" };
+        let active = if iso.sense.eq_ignore_ascii_case("low") {
+            "1'b0"
+        } else {
+            "1'b1"
+        };
         let clamp = match iso.clamp.to_ascii_lowercase().as_str() {
             "0" => "'0".to_string(),
             "1" => "'1".to_string(),
             "z" => "'z".to_string(),
             other => {
-                warnings.push(format!("isolation strategy '{}': clamp value '{}' not simulated", iso.name, other));
+                warnings.push(format!(
+                    "isolation strategy '{}': clamp value '{}' not simulated",
+                    iso.name, other
+                ));
                 continue;
             }
         };
         let Some(dom) = model.domains.iter().find(|d| d.name == iso.domain) else {
-            warnings.push(format!("isolation strategy '{}': unknown domain '{}'", iso.name, iso.domain));
+            warnings.push(format!(
+                "isolation strategy '{}': unknown domain '{}'",
+                iso.name, iso.domain
+            ));
             continue;
         };
         // (element instance path, port) pairs
@@ -1059,7 +1228,10 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
                     Some((inst, port)) => targets.push((inst.to_string(), port.to_string())),
                     None => {
                         // whole element: all its outputs
-                        if let Some(m) = design.module_at(scope_mod, &e.split('/').map(String::from).collect::<Vec<_>>()) {
+                        if let Some(m) = design.module_at(
+                            scope_mod,
+                            &e.split('/').map(String::from).collect::<Vec<_>>(),
+                        ) {
                             for p in Design::output_ports(m) {
                                 targets.push((e.clone(), p));
                             }
@@ -1070,11 +1242,17 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
         } else {
             let applies = iso.applies_to.clone().unwrap_or_else(|| "outputs".into());
             if applies != "outputs" && applies != "both" {
-                warnings.push(format!("isolation strategy '{}': -applies_to {} not simulated (outputs only)", iso.name, applies));
+                warnings.push(format!(
+                    "isolation strategy '{}': -applies_to {} not simulated (outputs only)",
+                    iso.name, applies
+                ));
                 continue;
             }
             for e in &dom.elements {
-                if let Some(m) = design.module_at(scope_mod, &e.split('/').map(String::from).collect::<Vec<_>>()) {
+                if let Some(m) = design.module_at(
+                    scope_mod,
+                    &e.split('/').map(String::from).collect::<Vec<_>>(),
+                ) {
                     for p in Design::output_ports(m) {
                         targets.push((e.clone(), p));
                     }
@@ -1087,15 +1265,30 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
                 continue;
             }
             let segs: Vec<String> = inst_rel.split('/').map(String::from).collect();
-            let Some((leaf, parent_segs)) = segs.split_last() else { continue };
-            let Some(parent_mod) = design.module_at(scope_mod, parent_segs) else { continue };
-            let Some(sub_mod) = design.module_at(scope_mod, &segs) else { continue };
-            let Some((_, _, hi)) = Design::instances(parent_mod).into_iter().find(|(n, _, _)| n == leaf) else { continue };
+            let Some((leaf, parent_segs)) = segs.split_last() else {
+                continue;
+            };
+            let Some(parent_mod) = design.module_at(scope_mod, parent_segs) else {
+                continue;
+            };
+            let Some(sub_mod) = design.module_at(scope_mod, &segs) else {
+                continue;
+            };
+            let Some((_, _, hi)) = Design::instances(parent_mod)
+                .into_iter()
+                .find(|(n, _, _)| n == leaf)
+            else {
+                continue;
+            };
             let Some(actual) = Design::output_actual(parent_mod, hi, sub_mod, &port) else {
                 warnings.push(format!("isolation strategy '{}': port '{}/{}' actual is not a plain net; not simulated", iso.name, inst_rel, port));
                 continue;
             };
-            let parent_rel = if parent_segs.is_empty() { actual.clone() } else { format!("{}/{}", parent_segs.join("/"), actual) };
+            let parent_rel = if parent_segs.is_empty() {
+                actual.clone()
+            } else {
+                format!("{}/{}", parent_segs.join("/"), actual)
+            };
             covered.push(key);
             iso_ports.push(IsoPort {
                 strategy: iso.name.clone(),
@@ -1114,13 +1307,18 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     // One process per control signal.
     let mut by_signal: Vec<(String, &'static str, Vec<&IsoPort>)> = Vec::new();
     for p in &iso_ports {
-        match by_signal.iter_mut().find(|(s, a, _)| *s == p.signal && *a == p.active) {
+        match by_signal
+            .iter_mut()
+            .find(|(s, a, _)| *s == p.signal && *a == p.active)
+        {
             Some((_, _, v)) => v.push(p),
             None => by_signal.push((p.signal.clone(), p.active, vec![p])),
         }
     }
     for (sig, active, ports) in &by_signal {
-        items.push_str(&format!("  always @({sig}) begin\n    if ({sig} === {active}) begin\n"));
+        items.push_str(&format!(
+            "  always @({sig}) begin\n    if ({sig} === {active}) begin\n"
+        ));
         for p in ports {
             items.push_str(&format!("      force {} = {};\n", p.parent, p.clamp));
             items.push_str(&format!(
@@ -1142,21 +1340,31 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     // Power domains: state, corruption, messages.
     for dom in &model.domains {
         let (Some(pw), Some(gd)) = (&dom.power, &dom.ground) else {
-            report.push(format!("power domain {}: no primary supplies (always on)", dom.name));
+            report.push(format!(
+                "power domain {}: no primary supplies (always on)",
+                dom.name
+            ));
             continue;
         };
         let pd = format!("upf_pd__{}", mangle(&dom.name));
         items.push_str(&format!("  wire {} = {} & {};\n", pd, sup(pw), sup(gd)));
         let mut targets: Vec<String> = Vec::new();
         for e in &dom.elements {
-            let segs: Vec<String> = e.split('/').filter(|s| !s.is_empty()).map(String::from).collect();
+            let segs: Vec<String> = e
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
             // `-elements {.}`: the scope instance itself.
             match design.module_at(scope_mod, &segs) {
                 Some(m) => {
                     let prefix = hier(e);
                     design.corruptible(m, &prefix, &retained, &mut targets, 0);
                 }
-                None => warnings.push(format!("power domain '{}': element '{}' not found", dom.name, e)),
+                None => warnings.push(format!(
+                    "power domain '{}': element '{}' not found",
+                    dom.name, e
+                )),
             }
         }
         let iso_checks: Vec<String> = iso_ports
@@ -1193,9 +1401,17 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
                     .retentions
                     .iter()
                     .filter(|r| r.domain == dom.name)
-                    .flat_map(|r| r.elements.iter().map(|e| format!("{}{}", scope_dot, e.replace('/', "."))))
+                    .flat_map(|r| {
+                        r.elements
+                            .iter()
+                            .map(|e| format!("{}{}", scope_dot, e.replace('/', ".")))
+                    })
                     .collect();
-                if mine.is_empty() { String::new() } else { format!(", retention exempt: {}", mine.join(",")) }
+                if mine.is_empty() {
+                    String::new()
+                } else {
+                    format!(", retention exempt: {}", mine.join(","))
+                }
             }
         ));
     }
@@ -1207,7 +1423,11 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
             "PST {} over [{}]: {}",
             p.name,
             p.supplies.join(", "),
-            p.states.iter().map(|(n, s)| format!("{}={{{}}}", n, s.join(" "))).collect::<Vec<_>>().join(" ")
+            p.states
+                .iter()
+                .map(|(n, s)| format!("{}={{{}}}", n, s.join(" ")))
+                .collect::<Vec<_>>()
+                .join(" ")
         ));
     }
     for w in &warnings {
@@ -1217,7 +1437,9 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     // UPF package: supply functions write the top module's state hierarchically.
     let mut pkg = String::new();
     pkg.push_str("package UPF;\n");
-    pkg.push_str("  function automatic int upf_apply(string path, bit on, real v);\n    case (path)\n");
+    pkg.push_str(
+        "  function automatic int upf_apply(string path, bit on, real v);\n    case (path)\n",
+    );
     for n in &nets {
         let s = sup(n);
         pkg.push_str(&format!(
@@ -1259,21 +1481,34 @@ fn generate(model: &Model, design: &Design, top_name: &str, top: &ModuleDeclarat
     pkg.push_str("      default: return 0.0;\n    endcase\n  endfunction\n");
     pkg.push_str("endpackage\n");
 
-    report.insert(0, format!(
-        "scope /{}{} ({}), {} supply nets: {}",
-        top_name,
-        scope_path.iter().map(|s| format!("/{}", s)).collect::<String>(),
-        scope_mod.name.name,
-        nets.len(),
-        nets.join(", ")
-    ));
-    Ok(Glue { package: pkg, items, report })
+    report.insert(
+        0,
+        format!(
+            "scope /{}{} ({}), {} supply nets: {}",
+            top_name,
+            scope_path
+                .iter()
+                .map(|s| format!("/{}", s))
+                .collect::<String>(),
+            scope_mod.name.name,
+            nets.len(),
+            nets.join(", ")
+        ),
+    );
+    Ok(Glue {
+        package: pkg,
+        items,
+        report,
+    })
 }
 
 /// Read the configured UPF files, generate the glue and splice it into the
 /// parsed design: the `UPF` package is prepended, the glue processes are
 /// appended to the top module. No-op when no `--upf` was given.
-pub fn inject(descriptions: &mut Vec<Description>, top_module_name: Option<&str>) -> Result<(), String> {
+pub fn inject(
+    descriptions: &mut Vec<Description>,
+    top_module_name: Option<&str>,
+) -> Result<(), String> {
     let (files, top_override) = {
         let g = CONFIG.lock().unwrap();
         match g.as_ref() {
@@ -1300,9 +1535,15 @@ pub fn inject(descriptions: &mut Vec<Description>, top_module_name: Option<&str>
         .ok_or_else(|| format!("UPF: top module '{}' not found", top_name))?;
     let glue = generate(&model, &design, top_name, top, top_override.as_deref())?;
     if std::env::var_os("XEZIM_UPF_DUMP").is_some() {
-        eprintln!("{}\nmodule __upf_glue;\n{}endmodule\n", glue.package, glue.items);
+        eprintln!(
+            "{}\nmodule __upf_glue;\n{}endmodule\n",
+            glue.package, glue.items
+        );
     }
-    let text = format!("{}\nmodule __upf_glue;\n{}endmodule\n", glue.package, glue.items);
+    let text = format!(
+        "{}\nmodule __upf_glue;\n{}endmodule\n",
+        glue.package, glue.items
+    );
     let parsed = crate::sv_parser::parse(&text);
     if !parsed.errors.is_empty() {
         let e = &parsed.errors[0];
@@ -1320,7 +1561,9 @@ pub fn inject(descriptions: &mut Vec<Description>, top_module_name: Option<&str>
             _ => {}
         }
     }
-    let Some(pkg) = pkg else { return Err("UPF: glue package missing".into()) };
+    let Some(pkg) = pkg else {
+        return Err("UPF: glue package missing".into());
+    };
     // Replace any user-provided UPF package (the standard's is a stub).
     descriptions.retain(|d| !matches!(d, Description::Package(p) if p.name.name == "UPF"));
     descriptions.insert(0, Description::Package(pkg));
