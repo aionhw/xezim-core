@@ -15778,7 +15778,7 @@ pub fn normalize_unpacked_dims(
         .collect()
 }
 
-/// Constant element indices of a declarator's (single) unpacked dimension.
+/// Constant element indices of the first unpacked dimension.
 /// Empty for a scalar; empty for dynamic/queue/associative (size unknown here).
 /// Element count of a declarator's FIXED unpacked dimensions (§7.4.2), for
 /// width computations. Dynamic / queue / associative dimensions have no static
@@ -16260,29 +16260,59 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
             let mbase = format!("{}.{}", base, mdecl.name.name);
             if mdecl.dimensions.is_empty() {
                 register_member_leaf(elab, &mbase, &member.data_type);
-            } else if let Some(idxs) = const_dim_indices(
-                &normalize_unpacked_dims(&mdecl.dimensions, &elab.parameters, &elab.typedef_types),
-                &elab.parameters,
-            ) {
-                // §7.4.2: the member is an ARRAY — record its bounds so
-                // `s.arr[i]` is an ELEMENT select. Only the per-element leaves
-                // were registered here; without the bounds the index degraded
-                // to a bit-select of a 1-bit unknown, so a struct with an array
-                // member read x for every element inside an instance (the
-                // top-level declaration got these bounds elsewhere).
-                if let (Some(&f), Some(&l)) = (idxs.first(), idxs.last()) {
+            } else {
+                let dims = normalize_unpacked_dims(
+                    &mdecl.dimensions,
+                    &elab.parameters,
+                    &elab.typedef_types,
+                );
+                let shape: Option<Vec<(i64, i64)>> = dims
+                    .iter()
+                    .map(|d| extract_array_range(std::slice::from_ref(d), &elab.parameters))
+                    .collect();
+                if let Some(shape) = shape.filter(|s| !s.is_empty()) {
+                    // IEEE 1800-2017 §7.4.2: every fixed unpacked dimension
+                    // belongs to the member's array shape. Recording only the
+                    // first one made the next subscript select a packed bit of
+                    // that element instead of selecting the next unpacked
+                    // dimension.
                     let ew = resolve_type_width(
                         &member.data_type,
                         Some(&elab.parameters),
                         Some(&elab.typedefs),
                     )
                     .max(1);
-                    elab.arrays
-                        .entry(mbase.clone())
-                        .or_insert((f.min(l), f.max(l), ew));
-                }
-                for i in idxs {
-                    register_member_leaf(elab, &format!("{}[{}]", mbase, i), &member.data_type);
+                    match shape.as_slice() {
+                        [one] => {
+                            elab.arrays
+                                .entry(mbase.clone())
+                                .or_insert((one.0, one.1, ew));
+                        }
+                        [one, two] => {
+                            elab.arrays_2d
+                                .entry(mbase.clone())
+                                .or_insert((*one, *two, ew));
+                        }
+                        _ => {
+                            elab.arrays_nd
+                                .entry(mbase.clone())
+                                .or_insert((shape.clone(), ew));
+                        }
+                    }
+                    if let Some(declared) =
+                        declared_unpacked_dims(&dims, &elab.parameters)
+                    {
+                        elab.unpacked_decl_dims.insert(mbase.clone(), declared);
+                    }
+                    elab.var_decl_types
+                        .insert(mbase.clone(), member.data_type.clone());
+                    for suffix in index_tuples(&shape) {
+                        register_member_leaf(
+                            elab,
+                            &format!("{}{}", mbase, suffix),
+                            &member.data_type,
+                        );
+                    }
                 }
             }
             // Dynamic / queue / associative members stay lazily created.
