@@ -16,14 +16,14 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-pub mod packed_value;
-pub mod value;
 pub mod bits2;
 pub mod elaborate;
+pub mod packed_value;
 pub mod sdf;
-pub mod upf;
-pub mod vcd_sink;
 pub mod stdout_sink;
+pub mod upf;
+pub mod value;
+pub mod vcd_sink;
 
 /// Deterministic hasher for `HashMap`/`HashSet` so iteration order is
 /// reproducible across runs. Both `crate::hasher::HashMap` (default `RandomState`)
@@ -57,9 +57,9 @@ pub mod hasher {
     pub type HashSet<T> = std::collections::HashSet<T, DeterministicState>;
 }
 
-pub use sv_parser::{self, parse, lexer, preprocessor, diagnostics, ParseResult, ast};
+pub use elaborate::{ElaboratedModule, elaborate_module};
+pub use sv_parser::{self, ParseResult, ast, diagnostics, lexer, parse, preprocessor};
 pub use value::Value;
-pub use elaborate::{elaborate_module, ElaboratedModule};
 
 /// Magic bytes identifying a xezim compiled artifact.
 /// Version byte: \x13 = \x12 + ExprKind::ShallowCopy, ForeachTail.key_type,
@@ -93,7 +93,7 @@ pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x18";
 /// default — strong compression at high throughput. Empirically shrinks
 /// the elaborated-bincode stream ~27×, which more than pays for the
 /// compute via reduced disk I/O.
-/// 
+///
 /// Can be overridden at runtime via `set_zstd_level()`. Default is 3.
 const XEZIM_ZSTD_LEVEL_DEFAULT: i32 = 3;
 
@@ -103,7 +103,8 @@ static ZSTD_LEVEL: std::sync::OnceLock<std::sync::RwLock<i32>> = std::sync::Once
 
 /// Flag to enable compression statistics output. When enabled, `write_compiled`
 /// and `read_compiled` will print statistics about compression ratios.
-static COMPRESSION_STATS: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+static COMPRESSION_STATS: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+    std::sync::OnceLock::new();
 
 /// Set the zstd compression level (1-22). Must be called before `write_compiled`.
 /// Higher levels = better compression but slower. Level 3 is the default.
@@ -177,7 +178,7 @@ fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
 /// Serialize a compiled ElaboratedModule to a file. Streams bincode through
 /// a zstd encoder into the file; never holds the full serialized blob in
 /// memory, and writes ~27× less to disk than the raw bincode stream.
-/// 
+///
 /// Uses the compression level set via `set_zstd_level()` (default: 3).
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the compression ratio after writing.
@@ -188,7 +189,8 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
     if artifact_uncompressed() {
         let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-        w.write_all(XEZIM_BYTECODE_MAGIC).map_err(|e| format!("write '{}': {}", path, e))?;
+        w.write_all(XEZIM_BYTECODE_MAGIC)
+            .map_err(|e| format!("write '{}': {}", path, e))?;
         xez_bincode_options()
             .serialize_into(&mut w, elab)
             .map_err(|e| format!("serialize: {}", e))?;
@@ -197,15 +199,15 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 
     let level = get_zstd_level();
     let stats_enabled = compression_stats_enabled();
-    
+
     let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-    w.write_all(XEZIM_BYTECODE_MAGIC).map_err(|e| format!("write '{}': {}", path, e))?;
-    
+    w.write_all(XEZIM_BYTECODE_MAGIC)
+        .map_err(|e| format!("write '{}': {}", path, e))?;
+
     // Create a wrapper to count bytes written
-    let mut enc = zstd::stream::Encoder::new(w, level)
-        .map_err(|e| format!("zstd init: {}", e))?;
-    
+    let mut enc = zstd::stream::Encoder::new(w, level).map_err(|e| format!("zstd init: {}", e))?;
+
     // We need to measure uncompressed size for statistics
     // Unfortunately zstd::Encoder doesn't expose this directly, so we'll
     // serialize to a separate buffer first to measure, then compress
@@ -216,29 +218,28 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
             .serialize_into(&mut uncompressed, elab)
             .map_err(|e| format!("serialize: {}", e))?;
         let uncompressed_size = uncompressed.len();
-        
+
         // Now compress and write
         let f2 = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
         let mut w2 = std::io::BufWriter::with_capacity(1 << 20, f2);
-        w2.write_all(XEZIM_BYTECODE_MAGIC).map_err(|e| format!("write '{}': {}", path, e))?;
-        let mut enc2 = zstd::stream::Encoder::new(w2, level)
-            .map_err(|e| format!("zstd init: {}", e))?;
+        w2.write_all(XEZIM_BYTECODE_MAGIC)
+            .map_err(|e| format!("write '{}': {}", path, e))?;
+        let mut enc2 =
+            zstd::stream::Encoder::new(w2, level).map_err(|e| format!("zstd init: {}", e))?;
         enc2.write_all(&uncompressed)
             .map_err(|e| format!("zstd write: {}", e))?;
         let mut w2 = enc2.finish().map_err(|e| format!("zstd finish: {}", e))?;
         w2.flush().map_err(|e| format!("flush '{}': {}", path, e))?;
-        
+
         // Get compressed size
-        let compressed_size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        
+        let compressed_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
         let ratio = if uncompressed_size > 0 {
             compressed_size as f64 / uncompressed_size as f64
         } else {
             1.0
         };
-        
+
         eprintln!(
             "[CACHE][COMPRESS] {}: {} bytes -> {} bytes ({:.2}× ratio, level {})",
             path,
@@ -247,7 +248,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
             1.0 / ratio,
             level
         );
-        
+
         Ok(())
     } else {
         // Standard path without statistics
@@ -262,25 +263,23 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 /// Read a compiled artifact from a file. Returns Ok(Some(elab)) if the file is
 /// a valid artifact, Ok(None) if it lacks the magic header, Err on I/O,
 /// version-mismatch, or deserialization failure.
-/// 
+///
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the file size and decompression info.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
     use bincode::Options;
     use std::io::Read;
-    
+
     let stats_enabled = compression_stats_enabled();
-    
+
     if stats_enabled {
-        let file_size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         eprintln!(
             "[CACHE][COMPRESS] reading {}: {} bytes (compressed)",
             path, file_size
         );
     }
-    
+
     let f = std::fs::File::open(path).map_err(|e| format!("read '{}': {}", path, e))?;
     let mut r = std::io::BufReader::with_capacity(1 << 20, f);
     let mut magic = [0u8; 8];
@@ -297,7 +296,9 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
     // first payload bytes are a bincode string length (low bytes small), so
     // the two cannot collide. Chain the peeked bytes back in front.
     let mut head = [0u8; 4];
-    let got = r.read(&mut head).map_err(|e| format!("read '{}': {}", path, e))?;
+    let got = r
+        .read(&mut head)
+        .map_err(|e| format!("read '{}': {}", path, e))?;
     let chained = std::io::Read::chain(std::io::Cursor::new(head[..got].to_vec()), r);
     let elab = if got == 4 && head == [0x28, 0xB5, 0x2F, 0xFD] {
         let dec = zstd::stream::Decoder::new(chained).map_err(|e| format!("zstd init: {}", e))?;
@@ -373,7 +374,10 @@ static LIBRARY_CLI: std::sync::OnceLock<std::sync::Mutex<LibraryCli>> = std::syn
 /// Whether `--primitive-verbose` is active — read by the simulator's UDP
 /// lowering to print per-terminal resolution detail.
 pub fn primitive_verbose() -> bool {
-    library_cli_cell().lock().map(|g| g.primitive_verbose).unwrap_or(false)
+    library_cli_cell()
+        .lock()
+        .map(|g| g.primitive_verbose)
+        .unwrap_or(false)
 }
 
 fn library_cli_cell() -> &'static std::sync::Mutex<LibraryCli> {
@@ -384,8 +388,7 @@ fn library_cli_cell() -> &'static std::sync::Mutex<LibraryCli> {
 /// Gate-level customer designs with thousands of vendor-cell pins can emit
 /// thousands of these; the flag silences the WARNING while keeping the
 /// implicit-net behavior itself (and the `default_nettype none error).
-static IMPLICIT_NET_WARN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static IMPLICIT_NET_WARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub fn set_implicit_net_warn(on: bool) {
     IMPLICIT_NET_WARN.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -625,8 +628,8 @@ static ADOPTED_LIB_PP_CONTEXT: std::sync::OnceLock<
     std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>>,
 > = std::sync::OnceLock::new();
 
-fn adopted_lib_pp_context_cell(
-) -> &'static std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>> {
+fn adopted_lib_pp_context_cell()
+-> &'static std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>> {
     ADOPTED_LIB_PP_CONTEXT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -683,7 +686,10 @@ pub fn set_module_timescale_cli(cli: ModuleTimescaleCli) {
 }
 
 fn module_timescale_cli() -> ModuleTimescaleCli {
-    module_timescale_cli_cell().lock().map(|g| g.clone()).unwrap_or_default()
+    module_timescale_cli_cell()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -716,8 +722,10 @@ impl SourceDefinition {
             SourceDefinition::Module(m) => &m.items,
             SourceDefinition::Interface(i) => &i.items,
             SourceDefinition::Program(p) => &p.items,
-            SourceDefinition::Class(_) | SourceDefinition::Package(_)
-            | SourceDefinition::Typedef(_) | SourceDefinition::Udp(_) => &[],
+            SourceDefinition::Class(_)
+            | SourceDefinition::Package(_)
+            | SourceDefinition::Typedef(_)
+            | SourceDefinition::Udp(_) => &[],
         }
     }
 }
@@ -781,7 +789,13 @@ pub fn parse_and_elaborate_multi(
     include_dirs: &[String],
     source_files: &[String],
     defines: &[(String, Option<String>)],
-) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
+) -> Result<
+    (
+        crate::hasher::HashMap<String, SourceDefinition>,
+        elaborate::ElaboratedModule,
+    ),
+    String,
+> {
     let mut all_descriptions = Vec::new();
     // Preprocessed text of each source, kept in parse order. Every AST
     // `Span` is a byte offset into ITS file's preprocessed text, so these
@@ -795,17 +809,26 @@ pub fn parse_and_elaborate_multi(
     let mut src_file_of_module: crate::hasher::HashMap<String, u32> =
         crate::hasher::HashMap::default();
     let mut pp = preprocessor::Preprocessor::new();
-    for dir in include_dirs { pp.add_include_dir(std::path::PathBuf::from(dir)); }
+    for dir in include_dirs {
+        pp.add_include_dir(std::path::PathBuf::from(dir));
+    }
     for (name, val) in defines {
-        pp.define(name.clone(), preprocessor::MacroDef {
-            name: name.clone(), params: None,
-            body: val.clone().unwrap_or_default(),
-        });
+        pp.define(
+            name.clone(),
+            preprocessor::MacroDef {
+                name: name.clone(),
+                params: None,
+                body: val.clone().unwrap_or_default(),
+            },
+        );
     }
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
-        let label = source_files.get(i).map(|s| s.as_str()).unwrap_or("<unnamed>");
+        let label = source_files
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("<unnamed>");
         if compile_verbose() {
             eprintln!("[compile] ({}/{}) parsing {}", i + 1, sources.len(), label);
         } else {
@@ -830,7 +853,10 @@ pub fn parse_and_elaborate_multi(
             progress_clear();
             return Err(format!(
                 "Preprocessing failed in '{}' (file {} of {}):\n{}",
-                label, i + 1, sources.len(), pp.errors().join("\n")
+                label,
+                i + 1,
+                sources.len(),
+                pp.errors().join("\n")
             ));
         }
 
@@ -839,13 +865,23 @@ pub fn parse_and_elaborate_multi(
         let source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
 
-        if diags.iter().any(|d| d.severity == diagnostics::Severity::Error) {
+        if diags
+            .iter()
+            .any(|d| d.severity == diagnostics::Severity::Error)
+        {
             progress_clear();
-            let errs: Vec<_> = diags.iter()
+            let errs: Vec<_> = diags
+                .iter()
                 .filter(|d| d.severity == diagnostics::Severity::Error)
-                .map(|d| d.to_string()).collect();
-            return Err(format!("Parse errors in '{}' (file {} of {}):\n{}",
-                label, i + 1, sources.len(), errs.join("\n")));
+                .map(|d| d.to_string())
+                .collect();
+            return Err(format!(
+                "Parse errors in '{}' (file {} of {}):\n{}",
+                label,
+                i + 1,
+                sources.len(),
+                errs.join("\n")
+            ));
         }
         if compile_verbose() {
             report_file_definitions(label, &source_ast.descriptions);
@@ -856,8 +892,13 @@ pub fn parse_and_elaborate_multi(
         let strict_viol = sv_parser::strict_check::strict_violations(&source_ast.descriptions);
         if !strict_viol.is_empty() {
             progress_clear();
-            return Err(format!("Strict check failed in '{}' (file {} of {}):\n{}",
-                label, i + 1, sources.len(), strict_viol.join("\n")));
+            return Err(format!(
+                "Strict check failed in '{}' (file {} of {}):\n{}",
+                label,
+                i + 1,
+                sources.len(),
+                strict_viol.join("\n")
+            ));
         }
         for d in &source_ast.descriptions {
             let name = match d {
@@ -901,8 +942,14 @@ pub fn parse_and_elaborate_multi(
             all_descriptions.len()
         ));
     }
-    let elaborated =
-        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file);
+    let elaborated = parse_and_elaborate(
+        all_descriptions,
+        top_module_name,
+        include_dirs,
+        &lib_defines,
+        &module_timescales,
+        &module_ts_own_file,
+    );
     progress_clear();
     let (texts, files) = elaborate::take_elab_sources();
     let (defs, mut elab) = elaborated?;
@@ -911,10 +958,7 @@ pub fn parse_and_elaborate_multi(
     elab.src_file_of_module = src_file_of_module;
     // Captured from the RAW sources — the only place the pre-preprocessing
     // line counts are still known.
-    elab.source_orig_lines = sources
-        .iter()
-        .map(|s| s.lines().count() as u32)
-        .collect();
+    elab.source_orig_lines = sources.iter().map(|s| s.lines().count() as u32).collect();
     Ok((defs, elab))
 }
 
@@ -971,7 +1015,13 @@ fn parse_and_elaborate(
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
     module_timescales: &std::collections::HashMap<String, (f64, f64)>,
     module_ts_own_file: &std::collections::HashSet<String>,
-) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
+) -> Result<
+    (
+        crate::hasher::HashMap<String, SourceDefinition>,
+        elaborate::ElaboratedModule,
+    ),
+    String,
+> {
     // Effective per-module timescale, unifying `\`timescale` directives (from
     // the preprocessor) with in-body `timeunit`/`timeprecision` declarations
     // (§3.14.2). A `timeunit` decl was previously ignored here, so its module's
@@ -982,7 +1032,8 @@ fn parse_and_elaborate(
     // 1 ns / 1 ns default. The command-line forms never override an explicit
     // source-level timescale (a local decl OR an active directive).
     let cli = module_timescale_cli();
-    let mut eff_ts: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new();
+    let mut eff_ts: std::collections::HashMap<String, (f64, f64)> =
+        std::collections::HashMap::new();
     let mut named_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
     // §3.14.2.2 — track modules that carry NO `timescale (no source-level
     // decl, no preceding directive, no CLI override) so a mixed design (some
@@ -1092,7 +1143,10 @@ fn parse_and_elaborate(
                 directive.or(Some((-9, -9)))
             };
             if let Some((u, p)) = eff_exp {
-                eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
+                eff_ts.insert(
+                    name.clone(),
+                    (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)),
+                );
             }
         }
     }
@@ -1121,9 +1175,13 @@ fn parse_and_elaborate(
     let mut module_timescale_exp: crate::hasher::HashMap<String, (i32, i32)> =
         crate::hasher::HashMap::default();
     for (n, &(u, p)) in &eff_ts {
-        module_timescale_exp.insert(n.clone(), (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)));
+        module_timescale_exp.insert(
+            n.clone(),
+            (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)),
+        );
     }
-    let mut definitions: crate::hasher::HashMap<String, SourceDefinition> = crate::hasher::HashMap::default();
+    let mut definitions: crate::hasher::HashMap<String, SourceDefinition> =
+        crate::hasher::HashMap::default();
     // §3.13/§23.2: a module and a CLASS may legally share a name — they live in
     // different namespaces (hierarchy vs data type), as the reference
     // simulator accepts (`class test` + `module test`). The single
@@ -1186,14 +1244,13 @@ fn parse_and_elaborate(
                 cu_ts_defs.1 = Some(elaborate::time_literal_to_exp(p));
             }
         }
-        let cu_scope_ts: Option<(i32, i32)> =
-            if cu_ts_defs.0.is_some() || cu_ts_defs.1.is_some() {
-                let u = cu_ts_defs.0.unwrap_or(-9);
-                let p = cu_ts_defs.1.unwrap_or(u);
-                Some((u, p))
-            } else {
-                None
-            };
+        let cu_scope_ts: Option<(i32, i32)> = if cu_ts_defs.0.is_some() || cu_ts_defs.1.is_some() {
+            let u = cu_ts_defs.0.unwrap_or(-9);
+            let p = cu_ts_defs.1.unwrap_or(u);
+            Some((u, p))
+        } else {
+            None
+        };
         match desc {
             ast::Description::Module(mut m) => {
                 // §23.4: hoist NESTED module declarations (recursively) into
@@ -1225,8 +1282,7 @@ fn parse_and_elaborate(
                             nname
                         ));
                     }
-                    let (unit_s, prec_s) =
-                        eff_ts.get(&nname).copied().unwrap_or((tick_s, tick_s));
+                    let (unit_s, prec_s) = eff_ts.get(&nname).copied().unwrap_or((tick_s, tick_s));
                     let mut n = n;
                     elaborate::rewrite_module_delays_pub(&mut n.items, unit_s, prec_s, tick_s);
                     elaborate::scope_time_param_ports_pub(&mut n.params, unit_s, prec_s);
@@ -1257,8 +1313,7 @@ fn parse_and_elaborate(
                 // consumes tick-denominated delays. A module with no effective
                 // timescale uses the tick unit, making the rewrite a numeric
                 // no-op but still converting the delay form.
-                let (unit_s, prec_s) =
-                    eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
+                let (unit_s, prec_s) = eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
                 elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut m.params, unit_s, prec_s);
                 top_module = Some(name.clone());
@@ -1269,8 +1324,7 @@ fn parse_and_elaborate(
                 // Interface items ARE `ModuleItem`s, so the module walker
                 // applies unchanged; the effective timescale now exists for
                 // interfaces too (see the ts_target walk above).
-                let (unit_s, prec_s) =
-                    eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
+                let (unit_s, prec_s) = eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
                 let mut i = i;
                 elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut i.params, unit_s, prec_s);
@@ -1280,8 +1334,7 @@ fn parse_and_elaborate(
                 let name = p.name.name.clone();
                 // A program's delays scale like a module's; the pass never
                 // visited programs, so `#7` in one ran at zero time.
-                let (unit_s, prec_s) =
-                    eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
+                let (unit_s, prec_s) = eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
                 elaborate::rewrite_module_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut p.params, unit_s, prec_s);
                 top_module = Some(name.clone());
@@ -1376,7 +1429,9 @@ fn parse_and_elaborate(
                     // in place. A placeholder has no entity to preserve across a
                     // hierarchy-name clash (only REAL typedefs do — they are
                     // recorded in `typedef_defs` below).
-                    definitions.entry(name).or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
+                    definitions
+                        .entry(name)
+                        .or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
                 } else {
                     // Real typedef: keep it in the dedicated registry so a
                     // same-named hierarchy kind (module/interface/program/
@@ -1470,7 +1525,11 @@ fn parse_and_elaborate(
             ast::Description::Bind(b) => {
                 top_level_binds.push(b);
             }
-            ast::Description::OutOfClassConstraint { class_name, constraint_name, items } => {
+            ast::Description::OutOfClassConstraint {
+                class_name,
+                constraint_name,
+                items,
+            } => {
                 top_level_ooc_constraints.push((class_name, constraint_name, items));
             }
             ast::Description::Udp(u) => {
@@ -1500,7 +1559,11 @@ fn parse_and_elaborate(
     let mut inmodule_binds: Vec<ast::decl::BindDirective> = Vec::new();
     for def in definitions.values_mut() {
         if let SourceDefinition::Module(m) = def {
-            if !m.items.iter().any(|it| matches!(it, ast::decl::ModuleItem::Bind(_))) {
+            if !m
+                .items
+                .iter()
+                .any(|it| matches!(it, ast::decl::ModuleItem::Bind(_)))
+            {
                 continue;
             }
             let m = Rc::make_mut(m);
@@ -1551,7 +1614,9 @@ fn parse_and_elaborate(
         };
         if let SourceDefinition::Module(m) = def {
             let m = Rc::make_mut(m);
-            m.items.push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
+            m.items.push(ast::decl::ModuleItem::ModuleInstantiation(
+                b.instantiation.clone(),
+            ));
         }
     }
     for b in &top_level_binds {
@@ -1593,36 +1658,38 @@ fn parse_and_elaborate(
             }
         }
     }
-    if !top_level_functions.is_empty() || !top_level_tasks.is_empty()
-        || !top_level_nettypes.is_empty() || !top_level_params.is_empty()
-        || !top_level_vars.is_empty() || !top_level_dpi_imports.is_empty()
-        || !top_level_dpi_exports.is_empty() {
+    if !top_level_functions.is_empty()
+        || !top_level_tasks.is_empty()
+        || !top_level_nettypes.is_empty()
+        || !top_level_params.is_empty()
+        || !top_level_vars.is_empty()
+        || !top_level_dpi_imports.is_empty()
+        || !top_level_dpi_exports.is_empty()
+    {
         for def in definitions.values_mut() {
             if let SourceDefinition::Module(m) = def {
                 let m = Rc::make_mut(m);
                 // What this module declares ITSELF, captured before anything is
                 // injected — a name in here shadows the $unit declaration of
                 // the same name (§3.12.1), see the variable injection below.
-                let local_decl_names: std::collections::HashSet<String> =
-                    module_declared_names(m);
+                let local_decl_names: std::collections::HashSet<String> = module_declared_names(m);
                 // §3.12.1: a $unit subroutine's body resolves its free names
                 // in $UNIT scope. When this module SHADOWS a $unit variable,
                 // the shadowed copy is injected under the reserved
                 // `$unit::<name>` (see the variable injection below) — rewrite
                 // the injected body to reference THAT, or the subroutine would
                 // silently read/write the module's shadow instead.
-                let shadowed_unit_vars: std::collections::HashMap<String, String> =
-                    top_level_vars
-                        .iter()
-                        .flat_map(|d| d.declarators.iter())
-                        .filter(|v| local_decl_names.contains(&v.name.name))
-                        .map(|v| {
-                            (
-                                v.name.name.clone(),
-                                sv_parser::unit_scope_name(&v.name.name),
-                            )
-                        })
-                        .collect();
+                let shadowed_unit_vars: std::collections::HashMap<String, String> = top_level_vars
+                    .iter()
+                    .flat_map(|d| d.declarators.iter())
+                    .filter(|v| local_decl_names.contains(&v.name.name))
+                    .map(|v| {
+                        (
+                            v.name.name.clone(),
+                            sv_parser::unit_scope_name(&v.name.name),
+                        )
+                    })
+                    .collect();
                 let subst_body = |items: &[ast::stmt::Statement],
                                   ports: &[ast::decl::FunctionPort]|
                  -> Option<Vec<ast::stmt::Statement>> {
@@ -1657,7 +1724,8 @@ fn parse_and_elaborate(
                     if let Some(items) = subst_body(&f.items, &f.ports) {
                         f.items = items;
                     }
-                    m.items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
+                    m.items
+                        .insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
                 }
                 for t in top_level_tasks.iter().rev() {
                     let mut t = t.clone();
@@ -1667,7 +1735,8 @@ fn parse_and_elaborate(
                     m.items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t));
                 }
                 for n in top_level_nettypes.iter().rev() {
-                    m.items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+                    m.items
+                        .insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
                 }
                 for di in top_level_dpi_imports.iter().rev() {
                     // A module's own import of the same name shadows the
@@ -1676,13 +1745,16 @@ fn parse_and_elaborate(
                         ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
                         ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
                     };
-                    let own = m.items.iter().any(|it| matches!(it, ast::decl::ModuleItem::DPIImport(x)
+                    let own = m.items.iter().any(|it| {
+                        matches!(it, ast::decl::ModuleItem::DPIImport(x)
                         if match &x.proto {
                             ast::decl::DPIProto::Function(fd) => fd.name.name.name == name,
                             ast::decl::DPIProto::Task(td) => td.name.name.name == name,
-                        }));
+                        })
+                    });
                     if !own {
-                        m.items.insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
+                        m.items
+                            .insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
                     }
                 }
                 for e in top_level_dpi_exports.iter() {
@@ -1701,9 +1773,12 @@ fn parse_and_elaborate(
                     let mut p = p.clone();
                     if let ast::decl::ParameterKind::Data { assignments, .. } = &mut p.kind {
                         assignments.retain(|a| !local_decl_names.contains(&a.name.name));
-                        if assignments.is_empty() { continue; }
+                        if assignments.is_empty() {
+                            continue;
+                        }
                     }
-                    m.items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p));
+                    m.items
+                        .insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p));
                 }
                 // $unit-scope variables (`string label = "X";`) become module
                 // signals so references — including from class methods
@@ -1718,8 +1793,13 @@ fn parse_and_elaborate(
                 // reference resolves to; the module's own `gv` keeps the bare
                 // name, so the two no longer share one storage slot.
                 for d in top_level_vars.iter().rev() {
-                    if !d.declarators.iter().any(|v| local_decl_names.contains(&v.name.name)) {
-                        m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(d.clone()));
+                    if !d
+                        .declarators
+                        .iter()
+                        .any(|v| local_decl_names.contains(&v.name.name))
+                    {
+                        m.items
+                            .insert(0, ast::decl::ModuleItem::DataDeclaration(d.clone()));
                         continue;
                     }
                     // `int a, b;` where only `b` is shadowed: split the
@@ -1735,12 +1815,14 @@ fn parse_and_elaborate(
                         for v in dd.declarators.iter_mut() {
                             v.name.name = sv_parser::unit_scope_name(&v.name.name);
                         }
-                        m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
+                        m.items
+                            .insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
                     }
                     if !plain.is_empty() {
                         let mut dd = d.clone();
                         dd.declarators = plain;
-                        m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
+                        m.items
+                            .insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
                     }
                 }
             }
@@ -1782,8 +1864,13 @@ fn parse_and_elaborate(
                     let m = Rc::make_mut(rc);
                     elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, prec_s, tick_s);
                     elaborate::scope_time_param_ports_pub(&mut m.params, unit_s, prec_s);
-                    module_timescale_exp
-                        .insert(name.clone(), (elaborate::secs_to_exp(unit_s), elaborate::secs_to_exp(elaborate::exp_to_secs(p))));
+                    module_timescale_exp.insert(
+                        name.clone(),
+                        (
+                            elaborate::secs_to_exp(unit_s),
+                            elaborate::secs_to_exp(elaborate::exp_to_secs(p)),
+                        ),
+                    );
                 }
             }
         }
@@ -1798,8 +1885,9 @@ fn parse_and_elaborate(
         let tname = b.target_module.name.clone();
         if let Some(SourceDefinition::Module(m)) = definitions.get_mut(&tname) {
             let m = Rc::make_mut(m);
-            m.items
-                .push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
+            m.items.push(ast::decl::ModuleItem::ModuleInstantiation(
+                b.instantiation.clone(),
+            ));
         } else {
             eprintln!(
                 "[elab] bind target module '{}' is not a module definition; bind ignored",
@@ -1823,12 +1911,18 @@ fn parse_and_elaborate(
     // that environment (e.g. `pkg::W`) is left untouched for the existing
     // late resolution.
     {
-        let mut unit_params: std::collections::HashMap<String, Value, crate::hasher::DeterministicState> = Default::default();
+        let mut unit_params: std::collections::HashMap<
+            String,
+            Value,
+            crate::hasher::DeterministicState,
+        > = Default::default();
         for pd in &top_level_params {
             if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
                 for a in assignments {
                     if let Some(init) = &a.init {
-                        if let Some(v) = elaborate::const_eval_i64_with_params(init, Some(&unit_params)) {
+                        if let Some(v) =
+                            elaborate::const_eval_i64_with_params(init, Some(&unit_params))
+                        {
                             let mut val = Value::from_u64(v as u64, 32);
                             val.is_signed = true;
                             unit_params.insert(a.name.name.clone(), val);
@@ -1838,7 +1932,8 @@ fn parse_and_elaborate(
             }
         }
         {
-            type PTable = std::collections::HashMap<String, Value, crate::hasher::DeterministicState>;
+            type PTable =
+                std::collections::HashMap<String, Value, crate::hasher::DeterministicState>;
             fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
                 if table.is_empty() || matches!(e.kind, ast::expr::ExprKind::Number(_)) {
                     return;
@@ -1875,12 +1970,17 @@ fn parse_and_elaborate(
                         fold_expr(left, table);
                         fold_expr(right, table);
                     }
-                    ast::types::UnpackedDimension::Expression { expr, .. } => fold_expr(expr, table),
+                    ast::types::UnpackedDimension::Expression { expr, .. } => {
+                        fold_expr(expr, table)
+                    }
                     // `[B]` with B a parameter parses as an ASSOCIATIVE dim
                     // keyed by "type B" — rewrite to a literal size in the
                     // declaring scope, exactly like normalize_unpacked_dims
                     // does later with the (wrong-scope) module table.
-                    ast::types::UnpackedDimension::Associative { data_type: Some(dt), span } => {
+                    ast::types::UnpackedDimension::Associative {
+                        data_type: Some(dt),
+                        span,
+                    } => {
                         if let ast::types::DataType::TypeReference { name, .. } = dt.as_ref() {
                             if let Some(v) = table.get(&name.name.name) {
                                 if let Some(n) = v.to_u64() {
@@ -1963,7 +2063,9 @@ fn parse_and_elaborate(
             }
             // $unit typedefs fold against the $unit params.
             for def in definitions.values_mut() {
-                let SourceDefinition::Typedef(t) = def else { continue };
+                let SourceDefinition::Typedef(t) = def else {
+                    continue;
+                };
                 let td = Rc::make_mut(t);
                 fold_dt(&mut td.data_type, &unit_params, 0);
                 for d in td.dimensions.iter_mut() {
@@ -1979,7 +2081,9 @@ fn parse_and_elaborate(
             // package's `A` currently occupies the slot — and a QUALIFIED
             // `P1::T` reference works without any import.
             for def in definitions.values_mut() {
-                let SourceDefinition::Package(pkg) = def else { continue };
+                let SourceDefinition::Package(pkg) = def else {
+                    continue;
+                };
                 let pkg = Rc::make_mut(pkg);
                 let mut table = unit_params.clone();
                 for item in pkg.items.iter_mut() {
@@ -2029,12 +2133,19 @@ fn parse_and_elaborate(
                     }
                 ));
             }
-            eprintln!("[xezim][warning] top module '{}' not found; auto-detecting the design root", name);
+            eprintln!(
+                "[xezim][warning] top module '{}' not found; auto-detecting the design root",
+                name
+            );
         }
         let mut instantiated: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for m in definitions.values() { collect_instantiated_modules(m.items(), &mut instantiated); }
-        let mut candidates: Vec<String> = definitions.keys()
-            .filter(|n| !instantiated.contains(n.as_str())
+        for m in definitions.values() {
+            collect_instantiated_modules(m.items(), &mut instantiated);
+        }
+        let mut candidates: Vec<String> = definitions
+            .keys()
+            .filter(|n| {
+                !instantiated.contains(n.as_str())
                 && explicit_def_names.contains(n.as_str())
                 // A top-level (`$unit`-scope) typedef is never a hierarchy
                 // root. Without this a file like `typedef enum {...} T;
@@ -2045,8 +2156,10 @@ fn parse_and_elaborate(
                 && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Typedef(_)))
                 // §29: a UDP is never a hierarchy root — exclude it so a
                 // trailing/unused primitive can't pin auto-top-detection.
-                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Udp(_))))
-            .cloned().collect();
+                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Udp(_)))
+            })
+            .cloned()
+            .collect();
         // Sort to make top-module selection deterministic when more than one
         // module is uninstantiated. Without this, ahash's random seed picks
         // arbitrarily between, e.g., openc910's `tb` and `top` testbenches —
@@ -2058,7 +2171,8 @@ fn parse_and_elaborate(
         // candidate (uninstantiated by anything else), prefer it over the
         // candidate-based heuristic. Otherwise fall through to the heuristic
         // and rely on `candidates.sort()` for determinism.
-        let parse_pick_valid = top_module.as_ref()
+        let parse_pick_valid = top_module
+            .as_ref()
             .is_some_and(|n| candidates.iter().any(|c| c == n));
         // IEEE 1800-2017 §23.3.3: every uninstantiated
         // module/interface/program is a top-level instance and its
@@ -2072,18 +2186,27 @@ fn parse_and_elaborate(
         // not hierarchy roots. This fixes multi-top testbenches (e.g. UVM's
         // 35objections/03basic/04module) where the previous heuristic ran only
         // one module's initial blocks.
-        let module_candidates: Vec<String> = candidates.iter()
-            .filter(|c| matches!(
-                definitions.get(c.as_str()),
-                Some(SourceDefinition::Module(_)) | Some(SourceDefinition::Interface(_)) | Some(SourceDefinition::Program(_))
-            ))
-            .cloned().collect();
+        let module_candidates: Vec<String> = candidates
+            .iter()
+            .filter(|c| {
+                matches!(
+                    definitions.get(c.as_str()),
+                    Some(SourceDefinition::Module(_))
+                        | Some(SourceDefinition::Interface(_))
+                        | Some(SourceDefinition::Program(_))
+                )
+            })
+            .cloned()
+            .collect();
         if module_candidates.len() > 1 {
             // Multi-top design: synthesize `__xezim_multi_top` instantiating
             // every top-level module and elaborate that as the root.
             let wrapper = make_multi_top_wrapper(&module_candidates);
             let wrapper_name = wrapper.name.name.clone();
-            definitions.insert(wrapper_name.clone(), SourceDefinition::Module(std::rc::Rc::new(wrapper)));
+            definitions.insert(
+                wrapper_name.clone(),
+                SourceDefinition::Module(std::rc::Rc::new(wrapper)),
+            );
             top_module = Some(wrapper_name);
             multi_top_modules = module_candidates.clone();
         } else if parse_pick_valid {
@@ -2092,8 +2215,15 @@ fn parse_and_elaborate(
             top_module = Some(candidates[0].clone());
         } else if candidates.len() > 1 {
             for c in &candidates {
-                if definitions.get(c).unwrap().items().iter().any(|item| matches!(item, ast::decl::ModuleItem::InitialConstruct(_))) {
-                    top_module = Some(c.clone()); break;
+                if definitions
+                    .get(c)
+                    .unwrap()
+                    .items()
+                    .iter()
+                    .any(|item| matches!(item, ast::decl::ModuleItem::InitialConstruct(_)))
+                {
+                    top_module = Some(c.clone());
+                    break;
                 }
             }
         }
@@ -2108,11 +2238,14 @@ fn parse_and_elaborate(
     }
 
     let top_name = top_module.ok_or("No module found")?;
-    let top_def = definitions.get(&top_name).ok_or_else(|| format!("Module '{}' not found", top_name))?;
+    let top_def = definitions
+        .get(&top_name)
+        .ok_or_else(|| format!("Module '{}' not found", top_name))?;
     let params = crate::hasher::HashMap::default();
 
-    let def_refs: crate::hasher::HashMap<String, elaborate::Definition> =
-        definitions.iter().filter_map(|(k, v)| {
+    let def_refs: crate::hasher::HashMap<String, elaborate::Definition> = definitions
+        .iter()
+        .filter_map(|(k, v)| {
             let def = match v {
                 SourceDefinition::Module(m) => elaborate::Definition::Module(m),
                 SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
@@ -2123,7 +2256,8 @@ fn parse_and_elaborate(
                 SourceDefinition::Udp(u) => elaborate::Definition::Udp(u),
             };
             Some((k.clone(), def))
-        }).collect();
+        })
+        .collect();
 
     let elab_def = match top_def {
         SourceDefinition::Module(m) => elaborate::Definition::Module(m),
@@ -2131,7 +2265,12 @@ fn parse_and_elaborate(
         SourceDefinition::Program(p) => elaborate::Definition::Program(p),
         SourceDefinition::Class(c) => elaborate::Definition::Class(c),
         SourceDefinition::Package(p) => elaborate::Definition::Package(p),
-        _ => return Err(format!("Top-level element '{}' is not a module or program", top_name)),
+        _ => {
+            return Err(format!(
+                "Top-level element '{}' is not a module or program",
+                top_name
+            ));
+        }
     };
     let mut elab = elaborate::elaborate_module_with_defs(
         elab_def,
@@ -2218,7 +2357,9 @@ fn parse_and_elaborate(
     // several tops.
     if !multi_top_modules.is_empty() {
         for mname in &multi_top_modules {
-            let Some(elaborate::Definition::Module(mdef)) = def_refs.get(mname) else { continue };
+            let Some(elaborate::Definition::Module(mdef)) = def_refs.get(mname) else {
+                continue;
+            };
             for item in &mdef.items {
                 match item {
                     ast::decl::ModuleItem::ClassDeclaration(cd) => {
@@ -2240,7 +2381,8 @@ fn parse_and_elaborate(
         }
     }
     if std::env::var("XEZIM_ELAB_STATS").is_ok() {
-        eprintln!("[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",
+        eprintln!(
+            "[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",
             elab.always_blocks.len(),
             elab.initial_blocks.len(),
             elab.continuous_assigns.len(),
@@ -2268,7 +2410,10 @@ fn parse_and_elaborate(
         };
         try_size("always_blocks    ", opts.serialize(&elab.always_blocks));
         try_size("initial_blocks   ", opts.serialize(&elab.initial_blocks));
-        try_size("continuous_assigns", opts.serialize(&elab.continuous_assigns));
+        try_size(
+            "continuous_assigns",
+            opts.serialize(&elab.continuous_assigns),
+        );
         try_size("signals          ", opts.serialize(&elab.signals));
         try_size("parameters       ", opts.serialize(&elab.parameters));
         try_size("arrays           ", opts.serialize(&elab.arrays));
@@ -2383,8 +2528,13 @@ fn apply_instance_bind(
     tclone.name.name = spec_of(&target_def);
     tclone
         .items
-        .push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
-    definitions.insert(tclone.name.name.clone(), SourceDefinition::Module(Rc::new(tclone)));
+        .push(ast::decl::ModuleItem::ModuleInstantiation(
+            b.instantiation.clone(),
+        ));
+    definitions.insert(
+        tclone.name.name.clone(),
+        SourceDefinition::Module(Rc::new(tclone)),
+    );
     // Rewrite parents bottom-up. Retargeting an instantiation that declares
     // several comma-listed instances must split the named one out, so the
     // siblings keep the original definition.
@@ -2442,12 +2592,19 @@ fn apply_instance_bind(
     true
 }
 
-fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::collections::HashSet<String>) {
+fn collect_instantiated_modules(
+    items: &[ast::decl::ModuleItem],
+    set: &mut std::collections::HashSet<String>,
+) {
     for item in items {
         match item {
-            ast::decl::ModuleItem::ModuleInstantiation(mi) => { set.insert(mi.module_name.name.clone()); }
+            ast::decl::ModuleItem::ModuleInstantiation(mi) => {
+                set.insert(mi.module_name.name.clone());
+            }
             ast::decl::ModuleItem::GenerateIf(gi) => {
-                for (_cond, items) in &gi.branches { collect_instantiated_modules(items, set); }
+                for (_cond, items) in &gi.branches {
+                    collect_instantiated_modules(items, set);
+                }
             }
             ast::decl::ModuleItem::GenerateFor(gf) => collect_instantiated_modules(&gf.items, set),
             // A stdcell netlist routinely instantiates cells inside generate
@@ -2459,7 +2616,9 @@ fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::
                 collect_instantiated_modules(&gr.items, set)
             }
             ast::decl::ModuleItem::GenerateCase(gc) => {
-                for arm in &gc.arms { collect_instantiated_modules(&arm.items, set); }
+                for arm in &gc.arms {
+                    collect_instantiated_modules(&arm.items, set);
+                }
             }
             _ => {}
         }
@@ -2474,24 +2633,36 @@ fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::
 /// reads `__xezim_multi_top.<module>`.
 fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration {
     use ast::decl::{HierarchicalInstance, ModuleInstantiation};
-    let items: Vec<ast::decl::ModuleItem> = modules.iter().map(|name| {
-        ast::decl::ModuleItem::ModuleInstantiation(ModuleInstantiation {
-            module_name: ast::Identifier { name: name.clone(), span: ast::Span::dummy() },
-            params: None,
-            instances: vec![HierarchicalInstance {
-                name: ast::Identifier { name: name.clone(), span: ast::Span::dummy() },
-                dimensions: vec![],
-                connections: vec![],
+    let items: Vec<ast::decl::ModuleItem> = modules
+        .iter()
+        .map(|name| {
+            ast::decl::ModuleItem::ModuleInstantiation(ModuleInstantiation {
+                module_name: ast::Identifier {
+                    name: name.clone(),
+                    span: ast::Span::dummy(),
+                },
+                params: None,
+                instances: vec![HierarchicalInstance {
+                    name: ast::Identifier {
+                        name: name.clone(),
+                        span: ast::Span::dummy(),
+                    },
+                    dimensions: vec![],
+                    connections: vec![],
+                    span: ast::Span::dummy(),
+                }],
                 span: ast::Span::dummy(),
-            }],
-            span: ast::Span::dummy(),
+            })
         })
-    }).collect();
+        .collect();
     ast::module::ModuleDeclaration {
         attrs: vec![],
         kind: ast::module::ModuleKind::Module,
         lifetime: None,
-        name: ast::Identifier { name: "__xezim_multi_top".to_string(), span: ast::Span::dummy() },
+        name: ast::Identifier {
+            name: "__xezim_multi_top".to_string(),
+            span: ast::Span::dummy(),
+        },
         params: vec![],
         ports: ast::module::PortList::Empty,
         items,
@@ -2514,8 +2685,8 @@ fn resolve_library_modules(
         exts: &[String],
         out: &mut Vec<std::path::PathBuf>,
     ) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| format!("read_dir '{}': {}", dir.display(), e))?;
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("read_dir '{}': {}", dir.display(), e))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("read_dir '{}': {}", dir.display(), e))?;
             let path = entry.path();
@@ -2523,7 +2694,9 @@ fn resolve_library_modules(
                 collect_sv_files(&path, exts, out)?;
                 continue;
             }
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if exts.iter().any(|e| e == ext) {
                 out.push(path);
             }
@@ -2597,7 +2770,11 @@ fn resolve_library_modules(
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Warning: library file '{}' unreadable: {}", path.display(), e);
+                eprintln!(
+                    "Warning: library file '{}' unreadable: {}",
+                    path.display(),
+                    e
+                );
                 return;
             }
         };
@@ -2687,7 +2864,10 @@ fn resolve_library_modules(
                     .take(16)
                 {
                     let (line, col) = line_col(diagnostic.span.start);
-                    let source_line = preprocessed.lines().nth(line.saturating_sub(1)).unwrap_or("");
+                    let source_line = preprocessed
+                        .lines()
+                        .nth(line.saturating_sub(1))
+                        .unwrap_or("");
                     eprintln!(
                         "  {}:{}:{}: {}: {}",
                         path.display(),
@@ -2791,9 +2971,16 @@ fn resolve_library_modules(
 
     for (path, explicit_v) in files {
         index_library_file(
-            path, explicit_v, include_dirs, lib_defines, lib_cli,
-            &mut lib, &mut lib_typedefs, &mut scanned_paths,
-            &mut parse_issue_files, &mut lib_origins,
+            path,
+            explicit_v,
+            include_dirs,
+            lib_defines,
+            lib_cli,
+            &mut lib,
+            &mut lib_typedefs,
+            &mut scanned_paths,
+            &mut parse_issue_files,
+            &mut lib_origins,
         );
     }
 
@@ -2824,7 +3011,10 @@ fn resolve_library_modules(
         let mut names = std::collections::HashSet::new();
         instantiations(def, &mut names);
         for n in &names {
-            referrers.entry(n.clone()).or_default().insert(def_name.clone());
+            referrers
+                .entry(n.clone())
+                .or_default()
+                .insert(def_name.clone());
         }
         seed.extend(names);
     }
@@ -2852,18 +3042,32 @@ fn resolve_library_modules(
             }
             for path in hit {
                 index_library_file(
-                    path, false, include_dirs, lib_defines, lib_cli,
-                    &mut lib, &mut lib_typedefs, &mut scanned_paths,
-                    &mut parse_issue_files, &mut lib_origins,
+                    path,
+                    false,
+                    include_dirs,
+                    lib_defines,
+                    lib_cli,
+                    &mut lib,
+                    &mut lib_typedefs,
+                    &mut scanned_paths,
+                    &mut parse_issue_files,
+                    &mut lib_origins,
                 );
             }
             if !lib.contains_key(&name) && !full_scan_done {
                 full_scan_done = true;
                 for path in std::mem::take(&mut pending) {
                     index_library_file(
-                        path, false, include_dirs, lib_defines, lib_cli,
-                        &mut lib, &mut lib_typedefs, &mut scanned_paths,
-                        &mut parse_issue_files, &mut lib_origins,
+                        path,
+                        false,
+                        include_dirs,
+                        lib_defines,
+                        lib_cli,
+                        &mut lib,
+                        &mut lib_typedefs,
+                        &mut scanned_paths,
+                        &mut parse_issue_files,
+                        &mut lib_origins,
                     );
                 }
             }
@@ -2900,7 +3104,10 @@ fn resolve_library_modules(
         }
     }
     if lib_cli.primitive_verbose && !lib_cli.lib_files.is_empty() {
-        let indexed_from_v = lib_origins.values().filter(|(_, from_v, _)| *from_v).count();
+        let indexed_from_v = lib_origins
+            .values()
+            .filter(|(_, from_v, _)| *from_v)
+            .count();
         eprintln!(
             "[primitive-verbose] -v resolution summary: files={} indexed_definitions={} adopted={} unresolved={}",
             lib_cli.lib_files.len(),
@@ -2990,13 +3197,22 @@ fn resolve_library_modules(
     // candidates exist, do the full scan now — old behavior, but only paid
     // when this actually matters.
     if !pending.is_empty()
-        && definitions.values().any(|d| matches!(d, SourceDefinition::Typedef(e) if e.forward))
+        && definitions
+            .values()
+            .any(|d| matches!(d, SourceDefinition::Typedef(e) if e.forward))
     {
         for path in std::mem::take(&mut pending) {
             index_library_file(
-                path, false, include_dirs, lib_defines, lib_cli,
-                &mut lib, &mut lib_typedefs, &mut scanned_paths,
-                &mut parse_issue_files, &mut lib_origins,
+                path,
+                false,
+                include_dirs,
+                lib_defines,
+                lib_cli,
+                &mut lib,
+                &mut lib_typedefs,
+                &mut scanned_paths,
+                &mut parse_issue_files,
+                &mut lib_origins,
             );
         }
     }
@@ -3013,5 +3229,9 @@ fn resolve_library_modules(
 }
 
 /// Set the log file for simulation output. Placeholder.
-pub fn log_println(s: &str) { println!("{}", s); }
-pub fn log_eprintln(s: &str) { eprintln!("{}", s); }
+pub fn log_println(s: &str) {
+    println!("{}", s);
+}
+pub fn log_eprintln(s: &str) {
+    eprintln!("{}", s);
+}

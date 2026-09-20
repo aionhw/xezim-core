@@ -18,8 +18,8 @@
 //! `Value` type. For now, it's a separate implementation that can be tested
 //! and benchmarked independently.
 
-use serde::{Serialize, Deserialize};
 use crate::value::LogicBit;
+use serde::{Deserialize, Serialize};
 
 /// Packed storage for wide 4-state logic values.
 ///
@@ -46,14 +46,17 @@ pub struct PackedBits {
 impl PackedBits {
     /// Create a new empty PackedBits.
     pub fn new() -> Self {
-        Self { data: Vec::new(), len: 0 }
+        Self {
+            data: Vec::new(),
+            len: 0,
+        }
     }
 
     /// Create PackedBits with given width, all bits initialized to X.
     pub fn new_x(width: u32) -> Self {
         let num_bytes = Self::bytes_needed(width);
         Self {
-            data: vec![0xAA; num_bytes],  // 0xAA = 10101010 = X X X X
+            data: vec![0xAA; num_bytes], // 0xAA = 10101010 = X X X X
             len: width,
         }
     }
@@ -70,7 +73,7 @@ impl PackedBits {
     /// Create PackedBits with given width, all bits initialized to specified value.
     pub fn new_fill(width: u32, bit: LogicBit) -> Self {
         let code = bit.to_code();
-        let fill_byte = code * 0x55;  // Replicate 2-bit code across byte
+        let fill_byte = code * 0x55; // Replicate 2-bit code across byte
         let num_bytes = Self::bytes_needed(width);
         Self {
             data: vec![fill_byte; num_bytes],
@@ -154,10 +157,13 @@ impl PackedBits {
         let num_bits = (64).min(self.len as usize);
         for i in 0..num_bits {
             match self.get(i) {
-                LogicBit::Zero => {},
+                LogicBit::Zero => {}
                 LogicBit::One => val_bits |= 1u64 << i,
                 LogicBit::X => xz_bits |= 1u64 << i,
-                LogicBit::Z => { val_bits |= 1u64 << i; xz_bits |= 1u64 << i; },
+                LogicBit::Z => {
+                    val_bits |= 1u64 << i;
+                    xz_bits |= 1u64 << i;
+                }
             }
         }
         (val_bits, xz_bits)
@@ -220,13 +226,11 @@ mod benchmarks {
 
     fn create_wide_value(width: usize) -> Vec<LogicBit> {
         (0..width)
-            .map(|i| {
-                match i % 4 {
-                    0 => LogicBit::Zero,
-                    1 => LogicBit::One,
-                    2 => LogicBit::X,
-                    _ => LogicBit::Z,
-                }
+            .map(|i| match i % 4 {
+                0 => LogicBit::Zero,
+                1 => LogicBit::One,
+                2 => LogicBit::X,
+                _ => LogicBit::Z,
             })
             .collect()
     }
@@ -247,30 +251,38 @@ mod benchmarks {
 
     #[test]
     fn test_packed_vs_wide_memory() {
-        let width = 10000;  // 10K bits
-        
+        let width = 10000; // 10K bits
+
         let wide = create_wide_value(width);
         let packed = create_packed_value(width);
-        
+
         // Vec<LogicBit> uses 1 byte per bit (enum with repr u8)
         let wide_size = wide.capacity() * std::mem::size_of::<LogicBit>();
         // PackedBits uses ~1 byte per 4 bits (2 bits per bit encoding)
         let packed_size = packed.memory_size();
-        
+
         println!("Width: {} bits", width);
-        println!("Vec<LogicBit> size: {} bytes ({:.2} KB)", wide_size, wide_size as f64 / 1024.0);
-        println!("PackedBits size: {} bytes ({:.2} KB)", packed_size, packed_size as f64 / 1024.0);
+        println!(
+            "Vec<LogicBit> size: {} bytes ({:.2} KB)",
+            wide_size,
+            wide_size as f64 / 1024.0
+        );
+        println!(
+            "PackedBits size: {} bytes ({:.2} KB)",
+            packed_size,
+            packed_size as f64 / 1024.0
+        );
         println!("Reduction: {:.1}x", wide_size as f64 / packed_size as f64);
-        
+
         // Should be ~4x reduction (1 byte/bit -> 0.25 bytes/bit)
-        assert!(wide_size > packed_size * 3);  // At least 3x reduction
+        assert!(wide_size > packed_size * 3); // At least 3x reduction
     }
 
     #[test]
     fn test_packed_access() {
         let width = 1000;
         let packed = create_packed_value(width);
-        
+
         // Test all access patterns
         for i in 0..width {
             let bit = packed.get(i);
@@ -289,13 +301,13 @@ mod benchmarks {
         use crate::value::LogicBit;
         let mut pb = PackedBits::new_zero(100);
         assert!(!pb.has_xz());
-        
+
         pb.set(10, LogicBit::X);
         assert!(pb.has_xz());
-        
+
         pb.set(10, LogicBit::Zero);
         assert!(!pb.has_xz());
-        
+
         pb.set(20, LogicBit::Z);
         assert!(pb.has_xz());
     }

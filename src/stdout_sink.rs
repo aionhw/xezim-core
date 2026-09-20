@@ -153,7 +153,9 @@ fn encode_sim_bytes(s: &str) -> std::borrow::Cow<'_, [u8]> {
 
 impl StdoutSink {
     pub fn inline() -> Self {
-        StdoutSink { mode: Mode::Inline(BufWriter::with_capacity(BUF_CAPACITY, io::stdout())) }
+        StdoutSink {
+            mode: Mode::Inline(BufWriter::with_capacity(BUF_CAPACITY, io::stdout())),
+        }
     }
 
     pub fn threaded() -> Self {
@@ -242,7 +244,14 @@ impl StdoutSink {
             Mode::Inline(w) => {
                 let _ = w.flush();
             }
-            Mode::Threaded { buf, tx: Some(tx), recycle, lines_since_check, last_dispatch, .. } => {
+            Mode::Threaded {
+                buf,
+                tx: Some(tx),
+                recycle,
+                lines_since_check,
+                last_dispatch,
+                ..
+            } => {
                 if buf.is_empty() {
                     return;
                 }
@@ -270,8 +279,17 @@ impl StdoutSink {
 
     fn write_bytes(&mut self, data: &[u8]) {
         match &mut self.mode {
-            Mode::Inline(w) => { let _ = w.write_all(data); }
-            Mode::Threaded { buf, tx: Some(tx), recycle, lines_since_check, last_dispatch, .. } => {
+            Mode::Inline(w) => {
+                let _ = w.write_all(data);
+            }
+            Mode::Threaded {
+                buf,
+                tx: Some(tx),
+                recycle,
+                lines_since_check,
+                last_dispatch,
+                ..
+            } => {
                 buf.extend_from_slice(data);
                 if buf.len() >= FLUSH_THRESHOLD {
                     let chunk = std::mem::replace(buf, Self::fresh_buf(recycle));
@@ -289,14 +307,22 @@ impl StdoutSink {
     /// time-bounded `line_flush` instead.
     pub fn flush(&mut self) {
         match &mut self.mode {
-            Mode::Inline(w) => { let _ = w.flush(); }
-            Mode::Threaded { buf, tx: Some(tx), recycle, lines_since_check, last_dispatch, .. }
-                if !buf.is_empty() => {
-                    let chunk = std::mem::replace(buf, Self::fresh_buf(recycle));
-                    let _ = tx.send(Msg::Chunk(chunk));
-                    *lines_since_check = 0;
-                    *last_dispatch = std::time::Instant::now();
-                }
+            Mode::Inline(w) => {
+                let _ = w.flush();
+            }
+            Mode::Threaded {
+                buf,
+                tx: Some(tx),
+                recycle,
+                lines_since_check,
+                last_dispatch,
+                ..
+            } if !buf.is_empty() => {
+                let chunk = std::mem::replace(buf, Self::fresh_buf(recycle));
+                let _ = tx.send(Msg::Chunk(chunk));
+                *lines_since_check = 0;
+                *last_dispatch = std::time::Instant::now();
+            }
             _ => {}
         }
     }
@@ -355,7 +381,10 @@ mod tests {
 
         // Both chunks are drained in one pass, then flushed once; the final
         // flush on loop exit is the second.
-        assert_eq!(*events.lock().unwrap(), ["write", "write", "flush", "flush"]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["write", "write", "flush", "flush"]
+        );
     }
 
     /// A chunk that arrives with nothing behind it is flushed immediately, so a

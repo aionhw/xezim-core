@@ -34,11 +34,7 @@ impl Bits2 {
     #[inline]
     fn top_mask(width: u32) -> u64 {
         let r = width % 64;
-        if r == 0 {
-            u64::MAX
-        } else {
-            (1u64 << r) - 1
-        }
+        if r == 0 { u64::MAX } else { (1u64 << r) - 1 }
     }
 
     #[inline]
@@ -169,7 +165,8 @@ impl Bits2 {
     }
     /// Two's-complement subtract: a - b = a + ~b + 1 (mod 2^width).
     pub fn sub(&self, o: &Bits2) -> Bits2 {
-        self.add(&o.not()).add(&Bits2::from_u64(1, self.width.max(o.width)))
+        self.add(&o.not())
+            .add(&Bits2::from_u64(1, self.width.max(o.width)))
     }
 
     // ---- shifts (logical) ----
@@ -468,8 +465,14 @@ mod tests {
 
     #[test]
     fn mul_narrow_and_wide() {
-        assert_eq!(Bits2::from_u64(12, 8).mul(&Bits2::from_u64(12, 8)).to_u64(), 144);
-        assert_eq!(Bits2::from_u64(200, 8).mul(&Bits2::from_u64(3, 8)).to_u64(), 600 & 0xFF);
+        assert_eq!(
+            Bits2::from_u64(12, 8).mul(&Bits2::from_u64(12, 8)).to_u64(),
+            144
+        );
+        assert_eq!(
+            Bits2::from_u64(200, 8).mul(&Bits2::from_u64(3, 8)).to_u64(),
+            600 & 0xFF
+        );
         // wide: (2^64) * 3 = 3<<64 → word1 == 3, word0 == 0 at width 128.
         let big = Bits2::from_u64(1, 128).shl(64); // == 2^64
         let r = big.mul(&Bits2::from_u64(3, 128));
@@ -500,11 +503,23 @@ mod tests {
 
     #[test]
     fn div_rem_narrow_and_wide() {
-        assert_eq!(Bits2::from_u64(100, 16).udiv(&Bits2::from_u64(7, 16)).to_u64(), 14);
-        assert_eq!(Bits2::from_u64(100, 16).urem(&Bits2::from_u64(7, 16)).to_u64(), 2);
+        assert_eq!(
+            Bits2::from_u64(100, 16)
+                .udiv(&Bits2::from_u64(7, 16))
+                .to_u64(),
+            14
+        );
+        assert_eq!(
+            Bits2::from_u64(100, 16)
+                .urem(&Bits2::from_u64(7, 16))
+                .to_u64(),
+            2
+        );
         assert_eq!(Bits2::from_u64(5, 8).udiv(&Bits2::zero(8)).to_u64(), 0); // /0 -> 0
         // wide: (2^96 + 12345) / 2^32  — quotient 2^64, remainder 12345
-        let num = Bits2::from_u64(1, 128).shl(96).add(&Bits2::from_u64(12345, 128));
+        let num = Bits2::from_u64(1, 128)
+            .shl(96)
+            .add(&Bits2::from_u64(12345, 128));
         let den = Bits2::from_u64(1, 128).shl(32); // 2^32
         let q = num.udiv(&den);
         let r = num.urem(&den);
