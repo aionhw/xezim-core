@@ -894,18 +894,16 @@ impl Value {
                 is_fill: false,
             }
         } else {
-            let mut bits = Vec::with_capacity(width as usize);
-            for &b in bytes.iter().rev() {
-                for i in 0..8 {
-                    bits.push(if (b >> i) & 1 == 1 {
-                        LogicBit::One
-                    } else {
-                        LogicBit::Zero
-                    });
-                }
+            // §6.16: the rightmost byte occupies the least-significant bits.
+            // Build the value plane directly without a temporary bit vector.
+            let mut planes = WidePlanes::zeroed(width);
+            for (word, chunk) in planes.val.iter_mut().zip(bytes.rchunks(8)) {
+                let mut packed = [0u8; 8];
+                packed[8 - chunk.len()..].copy_from_slice(chunk);
+                *word = u64::from_be_bytes(packed);
             }
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::from_bits(&bits))),
+                storage: ValueStorage::Wide(Box::new(planes)),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -6106,5 +6104,45 @@ mod scalar_code_tests {
             assert_eq!(value.get_bit_code(0), code);
             assert!(!value.set_scalar_code(code));
         }
+    }
+}
+
+#[cfg(test)]
+mod packed_string_tests {
+    use super::*;
+
+    /// §6.16: strings pack bytes from right to left across storage words.
+    #[test]
+    fn string_packing_preserves_every_byte_and_width() {
+        for len in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 65, 257] {
+            for latin1 in [false, true] {
+                let bytes: Vec<u8> = (0..len)
+                    .map(|i| ((i * 73 + 19) % if latin1 { 256 } else { 128 }) as u8)
+                    .collect();
+                let text: String = bytes.iter().map(|&b| b as char).collect();
+                let value = Value::from_string(&text);
+                assert_eq!(value.width, (len * 8) as u32);
+                assert!(!value.is_signed && !value.is_real && !value.is_fill);
+                for (i, byte) in bytes.iter().rev().enumerate() {
+                    for bit in 0..8 {
+                        let expected = if byte & (1 << bit) == 0 {
+                            LogicBit::Zero
+                        } else {
+                            LogicBit::One
+                        };
+                        assert_eq!(value.get_bit(i * 8 + bit), expected);
+                    }
+                }
+                assert_eq!(value.to_sv_string(), text);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_string_preserves_embedded_and_trailing_nuls() {
+        let text = "\0abcdefg\0\u{ff}hijklmn\0";
+        let value = Value::from_string(text);
+        assert_eq!(value.width, text.chars().count() as u32 * 8);
+        assert_eq!(value.to_sv_string(), text.trim_start_matches('\0'));
     }
 }
