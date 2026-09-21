@@ -29277,10 +29277,19 @@ fn eval_const_user_function(
         locals.insert(port.name.name.clone(), v);
     }
     // The implicit return variable (typed per the declared return type).
-    let ret_init = if is_type_real(&fd.return_type) {
+    let return_type = resolve_typedef_chain(&fd.return_type, &elab.typedef_types);
+    let return_width = resolve_type_width(return_type, Some(&locals), Some(&elab.typedefs));
+    let ret_init = if is_type_real(return_type) {
         Value::from_f64(0.0)
     } else {
-        Value::zero(32)
+        if return_width == 0 {
+            return None;
+        }
+        // §13.4.1: assignments and compound operators inside the function
+        // already operate on the declared return variable, not an unsigned int.
+        let mut value = Value::zero(return_width);
+        value.is_signed = is_type_signed(return_type);
+        value
     };
     locals.insert(fname.clone(), ret_init);
 
@@ -29656,7 +29665,7 @@ fn eval_const_user_function(
     let v = locals.remove(&fname)?;
     // A REAL return keeps its representation — resize() reinterprets the
     // IEEE-754 bits (f_id(5) came back 0.0).
-    if is_type_real(&fd.return_type) {
+    if is_type_real(return_type) {
         return Some(if v.is_real {
             v
         } else {
@@ -29666,16 +29675,12 @@ fn eval_const_user_function(
     // §13.4.1: the result takes the DECLARED return type — a
     // `function [3:0]` returning 20 yields 4, not 20. Unresolvable return
     // widths bail (deferral) rather than guessing.
-    let rw = resolve_type_width(
-        &fd.return_type,
-        Some(&elab.parameters),
-        Some(&elab.typedefs),
-    );
+    let rw = return_width;
     if rw == 0 {
         return None;
     }
     let mut v = v.resize(rw);
-    v.is_signed = is_type_signed(&fd.return_type);
+    v.is_signed = is_type_signed(return_type);
     Some(v)
 }
 
