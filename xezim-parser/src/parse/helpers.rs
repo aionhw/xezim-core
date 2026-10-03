@@ -236,74 +236,111 @@ impl Parser {
         label
     }
 
-    /// Check if the current identifier is followed by #(...) :: or just ::
-    /// which indicates a class scope (expression) rather than a type declaration.
+    /// Check if the current identifier begins a class-scope EXPRESSION
+    /// rather than a type declaration. Walks the full `::`-chained scope
+    /// prefix — `pkg::cls::member` (IEEE 1800-2017 §8.23) and
+    /// `cls#(N)::member` (§8.25.1) — then classifies by what follows the
+    /// chain: an identifier, directly or after balanced `[...]` groups or a
+    /// `#(...)` specialization, means a TYPE declaration
+    /// (`pkg::cls::TYPE var;`); anything else (`=`, `;`, `(`, `'`, `.`)
+    /// means a scoped expression (`pkg::cls::member = 1;`).
+    ///
+    /// The walk used to stop after ONE `::` link, so a legal
+    /// `pkg::cls::TYPE var;` statement looked like a scoped expression and
+    /// was routed to the expression parser, which died on the trailing
+    /// declarator.
     pub(super) fn peek_is_class_scope(&self) -> bool {
         if !self.at(TokenKind::Identifier) {
             return false;
         }
         let mut p = self.pos + 1;
-        if let Some(t) = self.tokens.get(p) {
-            if t.kind == TokenKind::DoubleColon {
-                p += 1;
-                // Peek after ::
-                if let Some(t2) = self.tokens.get(p) {
-                    if t2.kind == TokenKind::Identifier {
-                        p += 1;
-                        if let Some(t3) = self.tokens.get(p) {
-                            // `pkg::Type #(...)` — balance the override list and
-                            // look at what follows: an identifier means a
-                            // declaration (`pkg::Type #(...) var`), `::` means a
-                            // scoped access (`pkg::Cls#(...)::member`).
-                            if t3.kind == TokenKind::Hash
-                                && self
-                                    .tokens
-                                    .get(p + 1)
-                                    .is_some_and(|t| t.kind == TokenKind::LParen)
-                            {
-                                let mut q = p + 2;
-                                let mut depth = 1;
-                                while depth > 0 && q < self.tokens.len() {
-                                    match self.tokens[q].kind {
-                                        TokenKind::LParen => depth += 1,
-                                        TokenKind::RParen => depth -= 1,
-                                        _ => {}
-                                    }
-                                    q += 1;
-                                }
-                                if let Some(t4) = self.tokens.get(q) {
-                                    return t4.kind != TokenKind::Identifier;
-                                }
-                            }
-                            // If followed by another identifier, it's pkg::Type var (declaration)
-                            return t3.kind != TokenKind::Identifier;
-                        }
-                    }
-                }
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 512 {
                 return true;
             }
-            if t.kind == TokenKind::Hash {
-                p += 1;
-                if let Some(t2) = self.tokens.get(p) {
-                    if t2.kind == TokenKind::LParen {
-                        p += 1;
-                        let mut depth = 1;
-                        while depth > 0 && p < self.tokens.len() {
-                            if self.tokens[p].kind == TokenKind::LParen {
-                                depth += 1;
-                            } else if self.tokens[p].kind == TokenKind::RParen {
-                                depth -= 1;
-                            }
-                            p += 1;
-                        }
-                        if let Some(t3) = self.tokens.get(p) {
-                            // If it has :: after #(...) it's a class scope
-                            return t3.kind == TokenKind::DoubleColon;
-                        }
+            match self.tokens.get(p).map(|t| t.kind) {
+                // `x ::` — the chain continues with the next link (which
+                // may itself carry a `#(...)` before ITS `::`).
+                Some(TokenKind::DoubleColon) => {
+                    p += 1;
+                    match self.tokens.get(p).map(|t| t.kind) {
+                        Some(TokenKind::Identifier) => p += 1,
+                        // Malformed (`pkg::;`) — let the expression path
+                        // report it, as the old single-link walk did.
+                        _ => return true,
                     }
                 }
+                // `x #(...)` — a specialization of the link just consumed.
+                // `::` after it continues the chain (class scope,
+                // `cls#(N)::member`); an identifier means a declaration
+                // (`cls#(N) var;`); anything else is an expression.
+                Some(TokenKind::Hash)
+                    if self.tokens.get(p + 1).map(|t| t.kind) == Some(TokenKind::LParen) =>
+                {
+                    p = self.peek_past_balanced_parens(p + 1);
+                    match self.tokens.get(p).map(|t| t.kind) {
+                        Some(TokenKind::DoubleColon) => {}
+                        Some(TokenKind::Identifier) => return false,
+                        _ => return true,
+                    }
+                }
+                // `Type var` — a declaration.
+                Some(TokenKind::Identifier) => return false,
+                // `Type [dims] var` — a declaration with packed dimensions
+                // (§7.4.1: possibly several consecutive bracket groups).
+                // Balance them all, then decide.
+                Some(TokenKind::LBracket) => {
+                    let mut depth: i32 = 0;
+                    while p < self.tokens.len() {
+                        match self.tokens[p].kind {
+                            TokenKind::LBracket => depth += 1,
+                            TokenKind::RBracket => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    p += 1;
+                                    if self.tokens.get(p).map(|t| t.kind)
+                                        != Some(TokenKind::LBracket)
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                            TokenKind::Eof => break,
+                            _ => {}
+                        }
+                        p += 1;
+                    }
+                    return self.tokens.get(p).map(|t| t.kind) != Some(TokenKind::Identifier);
+                }
+                // `=`, `;`, `(`, `'`, `.`, … — a scoped expression.
+                _ => return true,
             }
         }
-        false
+    }
+
+    /// Index just past the `)` matching the `(` at `open_idx` (or the end
+    /// of the token stream if unbalanced). Pure lookahead helper.
+    fn peek_past_balanced_parens(&self, open_idx: usize) -> usize {
+        let mut p = open_idx;
+        // Start at 0 so the `(` at `open_idx` itself brings the depth to 1;
+        // starting at 1 double-counted it and the walk then overshot the
+        // matching `)` (to the next `)` or EOF), misclassifying
+        // `Alpha#(int) a;` as a scoped expression.
+        let mut depth = 0;
+        while p < self.tokens.len() {
+            match self.tokens[p].kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth -= 1,
+                _ => {}
+            }
+            p += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        p
     }
 }

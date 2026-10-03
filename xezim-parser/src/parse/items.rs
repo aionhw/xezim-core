@@ -3466,8 +3466,37 @@ impl Parser {
         let start = self.current().span.start;
         let first_name = self.parse_identifier();
         if self.at(TokenKind::DoubleColon) {
-            self.bump();
-            let second_name = self.parse_identifier();
+            // `::`-chained scoped type: `pkg::T`, `pkg::cls::T`,
+            // `pkg::cls::sub::T` (IEEE 1800-2017 §8.23) and `pkg::cls#(N)::T`
+            // (§8.25.1). Walk the WHOLE chain — the old two-name form
+            // collapsed `pkg::cls::T` to scope `pkg` + name `cls` and then
+            // died on the trailing `::T` when the declarator list parsed.
+            let mut scopes: Vec<crate::ast::types::TypeScope> = Vec::new();
+            let mut tn_name = first_name;
+            while self.at(TokenKind::DoubleColon) {
+                self.bump(); // ::
+                scopes.push(crate::ast::types::TypeScope {
+                    name: tn_name,
+                    type_args: Vec::new(),
+                });
+                tn_name = self.parse_identifier();
+                // `cls#(N)::t` — a per-link specialization, consumed only
+                // when a `::` follows (the leaf's own `#(...)` is parsed
+                // below, as before).
+                if self.at(TokenKind::Hash)
+                    && self.peek_kind() == TokenKind::LParen
+                    && self.peek_hash_paren_is_scope_link()
+                {
+                    let link_args = self.parse_type_args_hash(start);
+                    self.expect(TokenKind::DoubleColon);
+                    scopes.push(crate::ast::types::TypeScope {
+                        name: tn_name,
+                        type_args: link_args,
+                    });
+                    tn_name = self.parse_identifier();
+                }
+            }
+            let second_name = tn_name;
             // `pkg::cls #(.P(v)) var = new;` — scoped PARAMETERIZED class
             // as the declaration type (§8.25). The specialization was never
             // consumed here, so the declarator parser saw `#`.
@@ -3475,7 +3504,7 @@ impl Parser {
             let dimensions = self.parse_packed_dimensions();
             let dt = DataType::TypeReference {
                 name: TypeName {
-                    scope: Some(first_name),
+                    scopes,
                     name: second_name,
                     span: self.span_from(start),
                 },
@@ -3533,6 +3562,71 @@ impl Parser {
         }
         let params = self.parse_instantiation_params();
 
+        // §8.25.1: `Cls#(args)::td var;` — a parameterized class used as a
+        // scope prefix, spelled WITHOUT a package qualifier. The `#(...)`
+        // was just consumed as instantiation params; a following `::`
+        // means it was the class's SPECIALIZATION, so convert the
+        // connections to type args and walk the rest of the scope chain
+        // (further `::` links and per-link `#(...)::` specializations,
+        // §8.23).
+        if self.at(TokenKind::DoubleColon) {
+            let type_args: Vec<crate::ast::expr::Expression> = match &params {
+                Some(ps) => ps
+                    .iter()
+                    .filter_map(|pc| self.param_connection_to_type_arg(pc))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let mut scopes: Vec<crate::ast::types::TypeScope> =
+                vec![crate::ast::types::TypeScope {
+                    name: first_name,
+                    type_args,
+                }];
+            self.bump(); // ::
+            let mut tn_name = self.parse_identifier();
+            while self.at(TokenKind::DoubleColon) {
+                self.bump(); // ::
+                scopes.push(crate::ast::types::TypeScope {
+                    name: tn_name,
+                    type_args: Vec::new(),
+                });
+                tn_name = self.parse_identifier();
+                if self.at(TokenKind::Hash)
+                    && self.peek_kind() == TokenKind::LParen
+                    && self.peek_hash_paren_is_scope_link()
+                {
+                    let link_args = self.parse_type_args_hash(start);
+                    self.expect(TokenKind::DoubleColon);
+                    scopes.push(crate::ast::types::TypeScope {
+                        name: tn_name,
+                        type_args: link_args,
+                    });
+                    tn_name = self.parse_identifier();
+                }
+            }
+            let dimensions = self.parse_packed_dimensions();
+            let dt = DataType::TypeReference {
+                name: TypeName {
+                    scopes,
+                    name: tn_name,
+                    span: self.span_from(start),
+                },
+                dimensions,
+                type_args: Vec::new(),
+                span: self.span_from(start),
+            };
+            let decls = self.parse_var_declarator_list();
+            self.expect(TokenKind::Semicolon);
+            return ModuleItem::DataDeclaration(DataDeclaration {
+                const_kw: false,
+                var_kw: false,
+                lifetime: None,
+                data_type: dt,
+                declarators: decls,
+                span: self.span_from(start),
+            });
+        }
+
         // Packed dimensions on a user-typedef base: `MyType [hi:lo] var_name;`
         // After the optional #(params), if we see `[`, treat the construct as a
         // data declaration of `MyType` with packed dimensions, not a module
@@ -3548,7 +3642,7 @@ impl Parser {
             };
             let dt = DataType::TypeReference {
                 name: TypeName {
-                    scope: None,
+                    scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
                 },
@@ -3643,7 +3737,7 @@ impl Parser {
                 };
                 let dt = DataType::TypeReference {
                     name: TypeName {
-                        scope: None,
+                        scopes: Vec::new(),
                         name: first_name,
                         span: self.span_from(start),
                     },
@@ -3673,7 +3767,7 @@ impl Parser {
         } else {
             let dt = DataType::TypeReference {
                 name: TypeName {
-                    scope: None,
+                    scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
                 },

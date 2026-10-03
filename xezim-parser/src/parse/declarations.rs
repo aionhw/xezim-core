@@ -853,13 +853,16 @@ impl Parser {
                 self.parse_identifier()
             };
             TypeName {
-                scope: Some(first),
+                scopes: vec![crate::ast::types::TypeScope {
+                    name: first,
+                    type_args: Vec::new(),
+                }],
                 name: second,
                 span: self.span_from(start),
             }
         } else {
             TypeName {
-                scope: None,
+                scopes: Vec::new(),
                 name: first,
                 span: self.span_from(start),
             }
@@ -1089,7 +1092,7 @@ impl Parser {
                 let name = self.parse_identifier();
                 let data_type = DataType::TypeReference {
                     name: TypeName {
-                        scope: None,
+                        scopes: Vec::new(),
                         name: iface_name,
                         span: self.span_from(start),
                     },

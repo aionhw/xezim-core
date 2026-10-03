@@ -47,12 +47,82 @@ pub enum DataType {
     },
 }
 
+/// One `::`-chained scope link of a [`TypeName`] — `pkg` in `pkg::T`, the
+/// class `cls` (with its `#(...)` specialization args) in `cls#(N)::t`
+/// (IEEE 1800-2017 §8.23, §8.25.1).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeScope {
+    pub name: Identifier,
+    /// `#(...)` specialization args when this link names a parameterized
+    /// class (`cls#(N)::t`). Empty for package/plain-class links.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub type_args: Vec<expr::Expression>,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeName {
-    pub scope: Option<Identifier>,
+    /// `::`-chained scope prefix, outermost first: `pkg::cls::t` keeps
+    /// [`pkg`, `cls`]. Empty for an unqualified name. A chain longer than
+    /// one link is legal wherever a type may be named (§8.23 class scope,
+    /// §6.20.3 typedef, §13.5 ports) — the parser used to collapse it to a
+    /// single link and mis-parse the rest.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scopes: Vec<TypeScope>,
     pub name: Identifier,
     pub span: Span,
+}
+
+impl TypeName {
+    /// Whether any `::` scope prefix is present.
+    pub fn has_scope(&self) -> bool {
+        !self.scopes.is_empty()
+    }
+
+    /// The scope prefix when exactly one `::` link precedes the name —
+    /// `pkg::T` and an out-of-block method name `C::f`. `None` for
+    /// unqualified names and for longer chains.
+    pub fn single_scope(&self) -> Option<&Identifier> {
+        if self.scopes.len() == 1 {
+            Some(&self.scopes[0].name)
+        } else {
+            None
+        }
+    }
+
+    /// The fully-qualified `a::b::leaf` key, ignoring `#(...)` args — the
+    /// string the elaborator's typedef tables key scoped aliases under.
+    pub fn qualified(&self) -> String {
+        let mut s = String::new();
+        for link in &self.scopes {
+            s.push_str(&link.name.name);
+            s.push_str("::");
+        }
+        s.push_str(&self.name.name);
+        s
+    }
+
+    /// The `::`-joined scope prefix alone (`pkg::cls`), empty when
+    /// unqualified — the "owner" of a scoped type.
+    pub fn scope_prefix(&self) -> String {
+        let mut s = String::new();
+        for link in &self.scopes {
+            s.push_str(&link.name.name);
+            s.push_str("::");
+        }
+        if s.ends_with("::") {
+            s.truncate(s.len() - 2);
+        }
+        s
+    }
+
+    /// Whether any scope link carries a `#(...)` specialization
+    /// (`cls#(N)::t`, §8.25.1) — such references need the class walked and
+    /// its parameters bound, not just a table lookup.
+    pub fn has_specialized_scope(&self) -> bool {
+        self.scopes.iter().any(|s| !s.type_args.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

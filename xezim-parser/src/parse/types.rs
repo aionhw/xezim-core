@@ -199,7 +199,7 @@ impl Parser {
                     if let Some(cls) = crate::current_class_name() {
                         let span = self.span_from(start);
                         let name = TypeName {
-                            scope: None,
+                            scopes: Vec::new(),
                             name: crate::ast::Identifier { name: cls, span },
                             span,
                         };
@@ -238,7 +238,7 @@ impl Parser {
                 // the positional arguments as expressions; named (.NAME(expr))
                 // args are captured by value only (name discarded for now).
                 let type_args = self.parse_type_args_hash(start);
-                if name.scope.is_none() && self.at(TokenKind::Dot) {
+                if name.scopes.is_empty() && self.at(TokenKind::Dot) {
                     self.bump();
                     let modport = Some(self.parse_identifier());
                     let _dimensions = self.parse_packed_dimensions();
@@ -441,24 +441,80 @@ impl Parser {
         crate::ast::expr::Expression::new(crate::ast::expr::ExprKind::Ident(hier), sp)
     }
 
+    /// Parse a (possibly `::`-chained) type name: `T`, `pkg::T`,
+    /// `pkg::cls::T`, `pkg::cls::sub::T` (IEEE 1800-2017 §8.23) and
+    /// `cls#(N)::T` (§8.25.1 — a parameterized class as scope prefix).
+    ///
+    /// Each consumed `ident` becomes a scope link; a `#(...)` between a
+    /// link and its `::` (`cls#(N)::t`) is captured as that link's
+    /// specialization args. A TRAILING `#(...)` — the leaf's own
+    /// specialization, `cls#(N) var;` — is deliberately left unconsumed
+    /// for the caller: `parse_data_type` parses it via
+    /// `parse_type_args_hash`, exactly as it did before chains existed.
     pub(super) fn parse_type_name(&mut self) -> TypeName {
         let start = self.current().span.start;
-        let first = self.parse_identifier();
-        if self.at(TokenKind::DoubleColon) {
-            self.bump();
-            let second = self.parse_identifier();
-            TypeName {
-                scope: Some(first),
-                name: second,
-                span: self.span_from(start),
+        let mut scopes: Vec<crate::ast::types::TypeScope> = Vec::new();
+        let mut name = self.parse_identifier();
+        loop {
+            if self.at(TokenKind::DoubleColon) {
+                self.bump(); // ::
+                scopes.push(crate::ast::types::TypeScope {
+                    name,
+                    type_args: Vec::new(),
+                });
+                name = self.parse_identifier();
+                continue;
             }
-        } else {
-            TypeName {
-                scope: None,
-                name: first,
-                span: self.span_from(start),
+            // `x #(...) ::` — a parameterized class used as a scope link
+            // (§8.25.1). Peek past the balanced `#(...)` and only consume
+            // it when a `::` follows; otherwise it is the leaf's own
+            // specialization and belongs to the caller.
+            if self.at(TokenKind::Hash)
+                && self.peek_kind() == TokenKind::LParen
+                && self.peek_hash_paren_is_scope_link()
+            {
+                let args = self.parse_type_args_hash(start);
+                self.expect(TokenKind::DoubleColon);
+                scopes.push(crate::ast::types::TypeScope {
+                    name,
+                    type_args: args,
+                });
+                name = self.parse_identifier();
+                continue;
             }
+            break;
         }
+        TypeName {
+            scopes,
+            name,
+            span: self.span_from(start),
+        }
+    }
+
+    /// Whether the `#(` at the current position opens a SCOPE-link
+    /// specialization — i.e. the balanced `#(...)` is followed by `::`
+    /// (`cls#(N)::t`) rather than terminating the type name
+    /// (`cls#(N) var;`). Pure lookahead: consumes nothing.
+    pub(super) fn peek_hash_paren_is_scope_link(&self) -> bool {
+        let mut p = self.pos;
+        if self.tokens.get(p).map(|t| t.kind) != Some(TokenKind::Hash) {
+            return false;
+        }
+        p += 1;
+        if self.tokens.get(p).map(|t| t.kind) != Some(TokenKind::LParen) {
+            return false;
+        }
+        p += 1;
+        let mut depth = 1;
+        while depth > 0 && p < self.tokens.len() {
+            match self.tokens[p].kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth -= 1,
+                _ => {}
+            }
+            p += 1;
+        }
+        self.tokens.get(p).map(|t| t.kind) == Some(TokenKind::DoubleColon)
     }
 
     /// Skip an optional inline `(* attr_spec *)` attribute. Used at points

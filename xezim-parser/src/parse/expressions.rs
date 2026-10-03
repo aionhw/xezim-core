@@ -900,12 +900,7 @@ impl Parser {
                         },
                         self.span_from(start),
                     );
-                } else if matches!(&lhs.kind, ExprKind::Ident(h)
-                    if h.path.len() == 1 && h.path[0].selects.is_empty())
-                    || matches!(&lhs.kind, ExprKind::MemberAccess { expr, .. }
-                        if matches!(&expr.kind, ExprKind::Ident(h)
-                            if h.path.len() == 1 && h.path[0].selects.is_empty()))
-                {
+                } else if Self::scoped_name_expr(&lhs) {
                     // §6.24.1: `id'(v)` where `id` is a bare identifier is either
                     // a TYPE cast (id is a typedef) or a SIZE cast (id is a
                     // constant/parameter). The two are indistinguishable without
@@ -914,7 +909,11 @@ impl Parser {
                     // this dropped the cast entirely (`size1'(x)` kept x's width,
                     // `my_t'(x)` skipped the conversion). A package-scoped name
                     // (`pkg::my_t'(v)`, parsed as a member access) is carried the
-                    // same way; it was dropped too.
+                    // same way; it was dropped too. A `::`-CHAINED scope
+                    // (`pkg::cls::my_t'(v)`, §8.23) parses as nested member
+                    // accesses and is carried identically — it used to fall
+                    // through to the plain-paren branch below, silently
+                    // dropping the cast.
                     lhs = Expression::new(
                         ExprKind::SystemCall {
                             name: "$__xz_named_cast".to_string(),
@@ -932,6 +931,20 @@ impl Parser {
         }
 
         lhs
+    }
+
+    /// Whether `e` spells a bare scoped NAME — a plain identifier or a
+    /// `.`/`::` chain of member accesses rooted at one (`pkg`,
+    /// `pkg::cls`, `pkg::cls::type`), with no calls or selects. The shape
+    /// a named type cast (`pkg::cls::type'(v)`, IEEE 1800-2017 §6.24.1)
+    /// lowers onto so the simulator can resolve it against the typedef
+    /// tables.
+    fn scoped_name_expr(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].selects.is_empty(),
+            ExprKind::MemberAccess { expr, .. } => Self::scoped_name_expr(expr),
+            _ => false,
+        }
     }
 
     /// The `DataType` a cast keyword denotes (`int'(x)`, `byte'(x)`, …).
