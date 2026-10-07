@@ -8818,7 +8818,10 @@ pub fn elaborate_module_with_defs(
                 {
                     let mut width =
                         resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                    let mut signed = is_type_signed(data_type);
+                    // §6.20.2: resolve through typedefs — a parameter declared
+                    // with a typedef'd SIGNED type (`typedef logic signed [1:0]
+                    // T; localparam T C = …`) must read the typedef's sign.
+                    let mut signed = is_type_signed_resolved(data_type, &elab.typedef_types);
                     let is_real = is_type_real(data_type);
                     // A `string` parameter renders as text (`%p` quotes it).
                     if matches!(
@@ -14252,7 +14255,10 @@ fn elaborate_items_numbered(
                 {
                     let mut width =
                         resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                    let signed = is_type_signed(data_type);
+                    // §6.20.2: resolve through typedefs (see the module-scope
+                    // pre-pass above) — a typedef'd SIGNED declared type must
+                    // read the typedef's sign.
+                    let signed = is_type_signed_resolved(data_type, &elab.typedef_types);
                     if matches!(
                         data_type,
                         DataType::Simple {
@@ -29094,6 +29100,43 @@ fn inline_module_items(
                                                 }) {
                                                     val = pv;
                                                 }
+                                                // §6.20.2/§10.7/§23.10.2.2: the override
+                                                // value is converted to the FORMAL's
+                                                // declared type — wrap to its width and
+                                                // take its signedness. `#(.P(-1))` on
+                                                // `parameter [3:0] P` is 15; on
+                                                // `parameter signed [3:0] P` it is -1.
+                                                // Untyped formals keep the override's
+                                                // own value and signedness. An
+                                                // UNPACKED-ARRAY formal is skipped: its
+                                                // override is the CONCATENATION of all
+                                                // elements (N × element width), which
+                                                // the array machinery slices itself.
+                                                if !val.is_real
+                                                    && !is_string_data_type(data_type)
+                                                    && !matches!(
+                                                        data_type,
+                                                        DataType::Implicit { dimensions, .. }
+                                                            if dimensions.is_empty()
+                                                    )
+                                                    && assignments
+                                                        .iter()
+                                                        .find(|a| a.name.name == name.name)
+                                                        .is_none_or(|a| a.dimensions.is_empty())
+                                                {
+                                                    let w = resolve_type_width(
+                                                        data_type,
+                                                        Some(scoped_eval_params),
+                                                        Some(&elab.typedefs),
+                                                    );
+                                                    if w > 0 && (val.is_fill || val.width != w) {
+                                                        val = val.resize(w);
+                                                    }
+                                                    val.is_signed = is_type_signed_resolved(
+                                                        data_type,
+                                                        &elab.typedef_types,
+                                                    );
+                                                }
                                                 break;
                                             }
                                         }
@@ -29184,6 +29227,34 @@ fn inline_module_items(
                                             )
                                         }) {
                                             val = pv;
+                                        }
+                                        // §6.20.2/§10.7/§23.10.2.2: see the Named
+                                        // branch — convert the override to the
+                                        // FORMAL's declared type (width + sign).
+                                        // An UNPACKED-ARRAY formal is skipped: its
+                                        // override is the CONCATENATION of all
+                                        // elements, sliced by the array machinery.
+                                        if !val.is_real
+                                            && !is_string_data_type(data_type)
+                                            && !matches!(
+                                                data_type,
+                                                DataType::Implicit { dimensions, .. }
+                                                    if dimensions.is_empty()
+                                            )
+                                            && a.dimensions.is_empty()
+                                        {
+                                            let w = resolve_type_width(
+                                                data_type,
+                                                Some(scoped_eval_params),
+                                                Some(&elab.typedefs),
+                                            );
+                                            if w > 0 && (val.is_fill || val.width != w) {
+                                                val = val.resize(w);
+                                            }
+                                            val.is_signed = is_type_signed_resolved(
+                                                data_type,
+                                                &elab.typedef_types,
+                                            );
                                         }
                                         sub_params.insert(a.name.name.clone(), val);
                                     }
@@ -29305,7 +29376,9 @@ fn inline_module_items(
                     |items: &[ModuleItem],
                      local_map: &mut HashMap<String, Value>,
                      elab_ro: &ElaboratedModule,
-                     frozen: &HashSet<String>| {
+                     frozen: &HashSet<String>,
+                     tds: &HashMap<String, u32>,
+                     tts: &HashMap<String, DataType>| {
                         for _ in 0..64 {
                             let mut changed = false;
                             let before = local_map.len();
@@ -29391,14 +29464,48 @@ fn inline_module_items(
                                                         // `localparam [N-1:0] X='1`
                                                         // must fill N bits, not
                                                         // stay a 1-bit fill.
+                                                        // §6.20.2/§10.7: the declared
+                                                        // type is also the ASSIGNMENT
+                                                        // CONTEXT and the authority
+                                                        // for signedness. A bare range
+                                                        // `[1:0]` is UNSIGNED, but the
+                                                        // plain eval above left the
+                                                        // RHS's signedness on the
+                                                        // value, so `localparam [1:0] C
+                                                        // = 1 + P` read as -2 and
+                                                        // sign-extended at every use;
+                                                        // and a typedef'd SIGNED type
+                                                        // (`typedef logic signed [1:0]
+                                                        // T; localparam T C = …`) lost
+                                                        // its sign because the local
+                                                        // typedef was invisible to the
+                                                        // width/sign lookups.
                                                         let w = resolve_type_width(
                                                             data_type,
                                                             Some(local_map),
-                                                            Some(&elab_ro.typedefs),
+                                                            Some(tds),
                                                         );
-                                                        if w > 0 && (val.is_fill || val.width != w)
-                                                        {
-                                                            val = val.resize(w);
+                                                        if !assign.dimensions.is_empty() {
+                                                            // An UNPACKED-ARRAY localparam
+                                                            // keeps its legacy handling:
+                                                            // the packed concat is sliced
+                                                            // by the array machinery, not
+                                                            // wrapped to the element width.
+                                                            if w > 0
+                                                                && (val.is_fill
+                                                                    || val.width != w)
+                                                            {
+                                                                val = val.resize(w);
+                                                            }
+                                                        } else if w > 0 {
+                                                            val = eval_const_expr_val_ctx(
+                                                                init, local_map, w,
+                                                            )
+                                                            .resize_for_assign(w);
+                                                            val.is_signed =
+                                                                is_type_signed_resolved(
+                                                                    data_type, tts,
+                                                                );
                                                         }
                                                     }
                                                     if local_map.get(&assign.name.name)
@@ -29647,6 +29754,45 @@ fn inline_module_items(
                                         && val.is_real
                                     {
                                         val = Value::from_f64(val.to_f64());
+                                    } else if !val.is_real
+                                        && !is_string_data_type(data_type)
+                                        && assign.dimensions.is_empty()
+                                        && !matches!(
+                                            data_type,
+                                            DataType::Implicit { dimensions, .. }
+                                                if dimensions.is_empty()
+                                        )
+                                    {
+                                        // §6.20.2/§10.7: a header parameter with an
+                                        // explicit type/range takes its DEFAULT as
+                                        // an assignment to that type: evaluate in
+                                        // the declared width context, wrap to the
+                                        // declared width, and take the DECLARED
+                                        // signedness. `parameter [3:0] P = -1` is
+                                        // 15, `parameter signed [3:0] P = 15` is
+                                        // -1, `parameter [7:0] P = 256` is 0; an
+                                        // untyped parameter keeps its
+                                        // self-determined value (§6.20.2). An
+                                        // UNPACKED-ARRAY parameter is excluded —
+                                        // `register_array_param` above slices its
+                                        // packed initializer itself.
+                                        let w = resolve_type_width(
+                                            data_type,
+                                            Some(&sub_local_params),
+                                            Some(&elab.typedefs),
+                                        );
+                                        if w > 0 {
+                                            val = eval_const_expr_val_ctx(
+                                                init_eval,
+                                                &sub_local_params,
+                                                w,
+                                            )
+                                            .resize_for_assign(w);
+                                            val.is_signed = is_type_signed_resolved(
+                                                data_type,
+                                                &elab.typedef_types,
+                                            );
+                                        }
                                     }
                                     // Non-keyed assignment-pattern DEFAULT on a
                                     // multi-dim packed vector (`parameter bit
@@ -29746,6 +29892,24 @@ fn inline_module_items(
                         Vec::new()
                     };
                     let mut local_tds = elab.typedefs.as_map().clone();
+                    // §6.20.2: the same merge for the TYPE map — a body
+                    // localparam declared with a LOCAL typedef
+                    // (`typedef logic signed [1:0] T; localparam T C = …`)
+                    // must resolve T's width AND signedness, which the
+                    // global table alone cannot do. Only submodules that
+                    // declare local types pay for the merged copy.
+                    let sub_has_local_types = sub_mod
+                        .params()
+                        .iter()
+                        .any(|p| matches!(p.kind, ParameterKind::Type { .. }))
+                        || body_items
+                            .iter()
+                            .any(|c| matches!(**c, ModuleItem::TypedefDeclaration(_)));
+                    let mut local_tts = if sub_has_local_types {
+                        elab.typedef_types.clone()
+                    } else {
+                        HashMap::default()
+                    };
                     for p_decl in sub_mod.params() {
                         if let ParameterKind::Type { assignments } = &p_decl.kind {
                             for a in assignments {
@@ -29759,6 +29923,7 @@ fn inline_module_items(
                                         Some(&local_tds),
                                     );
                                     local_tds.insert(a.name.name.clone(), w);
+                                    local_tts.insert(a.name.name.clone(), def_dt.clone());
                                 }
                             }
                         }
@@ -29772,11 +29937,12 @@ fn inline_module_items(
                                     Some(&local_tds),
                                 );
                                 local_tds.insert(td.name.name.clone(), w);
+                                local_tts.insert(td.name.name.clone(), td.data_type.clone());
                             }
                         }
                     }
                     type_trace_tls_refresh("submodule_local", &local_tds);
-                    TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds));
+                    TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds.clone()));
                     TYPEDEFS_TLS_MIRROR.with(|m| m.set(None));
 
                     if !body_declares {
@@ -29789,6 +29955,12 @@ fn inline_module_items(
                         &mut sub_local_params,
                         elab,
                         &frozen_params,
+                        &local_tds,
+                        if sub_has_local_types {
+                            &local_tts
+                        } else {
+                            &elab.typedef_types
+                        },
                     );
                     if sub_local_params == snapshot {
                         break;
