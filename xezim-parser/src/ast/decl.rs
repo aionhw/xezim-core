@@ -1492,6 +1492,13 @@ pub enum ConstraintItem {
     Solve {
         before: Vec<Identifier>,
         after: Vec<Identifier>,
+        /// §18.5.10: each operand of `before` / `after` as written, a
+        /// member or element path (`a.b.c`, `arr[i].f`), parallel to
+        /// `before` / `after` (which keep the root identifier).
+        #[cfg_attr(feature = "serde", serde(default))]
+        before_paths: Vec<Expression>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        after_paths: Vec<Expression>,
         span: Span,
     },
     Soft(Box<ConstraintItem>),

@@ -5630,24 +5630,48 @@ impl Parser {
 
     /// Parse a single term of a `solve ... before ...` list. SV allows the
     /// solve/before operands to be member-select and index-select lvalues
-    /// (e.g. `mseccfg.mml`, `pmp_cfg[i].w`), not just bare identifiers. We
-    /// consume the whole postfix chain but only retain the root identifier,
-    /// which is all the elaborator's solve-ordering checks consult.
-    fn parse_solve_term(&mut self) -> Identifier {
+    /// (e.g. `mseccfg.mml`, `pmp_cfg[i].w`), not just bare identifiers.
+    /// Returns the root identifier, which the elaborator's solve-ordering
+    /// checks consult, and the whole operand as an identifier path (an
+    /// index select held on its segment), which the solver orders by.
+    fn parse_solve_term(&mut self) -> (Identifier, Expression) {
+        let start = self.current().span.start;
         let root = self.parse_identifier();
+        let mut path = vec![crate::ast::expr::HierPathSegment {
+            name: root.clone(),
+            selects: Vec::new(),
+        }];
         loop {
             if self.at(TokenKind::Dot) {
                 self.bump();
-                let _ = self.parse_identifier();
+                let id = self.parse_identifier();
+                path.push(crate::ast::expr::HierPathSegment {
+                    name: id,
+                    selects: Vec::new(),
+                });
             } else if self.at(TokenKind::LBracket) {
                 self.bump();
-                let _ = self.parse_expression();
+                let idx = self.parse_expression();
                 self.expect(TokenKind::RBracket);
+                if let Some(last) = path.last_mut() {
+                    last.selects.push(idx);
+                }
             } else {
                 break;
             }
         }
-        root
+        let span = self.span_from(start);
+        let e = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path,
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        );
+        (root, e)
     }
 
     pub(crate) fn parse_constraint_item(&mut self) -> ConstraintItem {
@@ -5656,8 +5680,11 @@ impl Parser {
             TokenKind::KwSolve => {
                 self.bump();
                 let mut before = Vec::new();
+                let mut before_paths = Vec::new();
                 loop {
-                    before.push(self.parse_solve_term());
+                    let (id, e) = self.parse_solve_term();
+                    before.push(id);
+                    before_paths.push(e);
                     if !self.at(TokenKind::Comma) {
                         break;
                     }
@@ -5665,8 +5692,11 @@ impl Parser {
                 }
                 self.expect(TokenKind::KwBefore);
                 let mut after = Vec::new();
+                let mut after_paths = Vec::new();
                 loop {
-                    after.push(self.parse_solve_term());
+                    let (id, e) = self.parse_solve_term();
+                    after.push(id);
+                    after_paths.push(e);
                     if !self.at(TokenKind::Comma) {
                         break;
                     }
@@ -5676,6 +5706,8 @@ impl Parser {
                 ConstraintItem::Solve {
                     before,
                     after,
+                    before_paths,
+                    after_paths,
                     span: self.span_from(start),
                 }
             }
