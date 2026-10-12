@@ -16368,6 +16368,18 @@ pub fn generate_for_start(gf: &GenerateFor, params: &HashMap<String, Value>) -> 
         .unwrap_or(gf.init_val)
 }
 
+/// §27.5: a generate-if/-case condition may be a user constant-function call
+/// (`if (has_neighbor(r, dir))`). `is_const_expr` rejects a Call and
+/// `eval_const_expr` reads one as 0, so fold the calls to literals first —
+/// the same substitution parameter initializers use. None leaves the
+/// expression as written (and its prior error).
+fn fold_const_fn_in_generate(expr: &Expression, elab: &ElaboratedModule) -> Option<Expression> {
+    if !expr_has_call(expr) {
+        return None;
+    }
+    substitute_const_fn_calls(expr, &elab.parameters, elab, 0).filter(|f| !expr_has_call(f))
+}
+
 /// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
 fn elaborate_generate_if(
     gi: &GenerateIf,
@@ -16403,6 +16415,8 @@ fn elaborate_generate_if(
     for (bi, (cond, items)) in gi.branches.iter().enumerate() {
         match cond {
             Some(c) => {
+                let folded = fold_const_fn_in_generate(c, elab);
+                let c = folded.as_ref().unwrap_or(c);
                 if !is_const_expr(c, &elab.parameters) {
                     return Err("Generate if condition must be a constant expression".to_string());
                 }
@@ -16426,16 +16440,20 @@ fn elaborate_generate_case(
     all_defs: Option<&HashMap<String, Definition>>,
     ordinal: u32,
 ) -> Result<(), String> {
-    if !is_const_expr(&gc.selector, &elab.parameters) {
+    let sel_folded = fold_const_fn_in_generate(&gc.selector, elab);
+    let selector = sel_folded.as_ref().unwrap_or(&gc.selector);
+    if !is_const_expr(selector, &elab.parameters) {
         return Err("Generate case selector must be a constant expression".to_string());
     }
-    let sel = eval_const_expr(&gc.selector, &elab.parameters);
+    let sel = eval_const_expr(selector, &elab.parameters);
     // First pass: try to match a non-default arm.
     for arm in &gc.arms {
         if arm.values.is_empty() {
             continue;
         } // skip default in this pass
         for v in &arm.values {
+            let v_folded = fold_const_fn_in_generate(v, elab);
+            let v = v_folded.as_ref().unwrap_or(v);
             if !is_const_expr(v, &elab.parameters) {
                 return Err("Generate case value must be a constant expression".to_string());
             }
@@ -18942,6 +18960,64 @@ fn const_unpacked_bounds(
     }
 }
 
+/// §13.4.3: interpret a user constant-function call against FUNCS_TLS and
+/// return its result at the function's DECLARED return type (width and
+/// signedness, or real). None when the call's shape, the function or any
+/// argument cannot be resolved — callers keep their prior fallback.
+fn const_eval_user_call(
+    expr: &Expression,
+    params: Option<&HashMap<String, Value>>,
+) -> Option<Value> {
+    let ExprKind::Call { func, args } = &expr.kind else {
+        return None;
+    };
+    // A SCOPED call (`p::LOG2(64)`) reaches here as either a 2-segment Ident
+    // or MemberAccess{Ident(p), LOG2} — resolve the qualified registration
+    // first so the right package's fn wins.
+    let (fname, scoped_key) = match &func.kind {
+        ExprKind::Ident(h) => {
+            let leaf = h.path.last().map(|s| s.name.name.clone())?;
+            let sk = (h.path.len() >= 2)
+                .then(|| format!("{}::{}", h.path[h.path.len() - 2].name.name, leaf));
+            (leaf, sk)
+        }
+        ExprKind::MemberAccess { expr: base, member } => {
+            let sk = match &base.kind {
+                ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                    Some(format!("{}::{}", bh.path[0].name.name, member.name))
+                }
+                _ => None,
+            };
+            (member.name.clone(), sk)
+        }
+        _ => return None,
+    };
+    let funcs = FUNCS_TLS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|m| {
+                scoped_key.as_deref().is_some_and(|k| m.contains_key(k)) || m.contains_key(&fname)
+            })
+            .cloned()
+    })?;
+    let fd = scoped_key
+        .as_deref()
+        .and_then(|k| funcs.get(k))
+        .or_else(|| funcs.get(&fname))
+        .cloned()?;
+    let mut argv = Vec::with_capacity(args.len());
+    for a in args {
+        let av = const_eval_i64_with_params(a, params)?;
+        argv.push(Value::from_u64(av as u64, 32));
+    }
+    let mut shell = ElaboratedModule::new(String::new());
+    if let Some(p) = params {
+        shell.parameters = p.clone();
+    }
+    shell.functions = FuncTable::from_map((*funcs).clone());
+    eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
+}
+
 pub fn const_eval_i64_with_params(
     expr: &Expression,
     params: Option<&HashMap<String, Value>>,
@@ -19620,57 +19696,14 @@ pub fn const_eval_i64_with_params(
         // fallback below only fires when the declaration isn't visible, and
         // silently assumes $clog2 semantics (wrong for floor-log2 variants).
         ExprKind::Call { func, args } => {
-            // A SCOPED call (`p::LOG2(64)`) reaches here as either a
-            // 2-segment Ident or MemberAccess{Ident(p), LOG2} — resolve the
-            // qualified registration first so the right package's fn wins.
-            let (fname, scoped_key) = match &func.kind {
-                ExprKind::Ident(h) => {
-                    let leaf = h.path.last().map(|s| s.name.name.clone())?;
-                    let sk = (h.path.len() >= 2)
-                        .then(|| format!("{}::{}", h.path[h.path.len() - 2].name.name, leaf));
-                    (leaf, sk)
-                }
-                ExprKind::MemberAccess { expr: base, member } => {
-                    let sk = match &base.kind {
-                        ExprKind::Ident(bh) if bh.path.len() == 1 => {
-                            Some(format!("{}::{}", bh.path[0].name.name, member.name))
-                        }
-                        _ => None,
-                    };
-                    (member.name.clone(), sk)
-                }
+            if let Some(v) = const_eval_user_call(expr, params) {
+                return v.to_i64();
+            }
+            let fname = match &func.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str())?,
+                ExprKind::MemberAccess { member, .. } => member.name.as_str(),
                 _ => return None,
             };
-            let fd_rc = FUNCS_TLS.with(|cell| {
-                cell.borrow()
-                    .as_ref()
-                    .filter(|m| {
-                        scoped_key.as_deref().is_some_and(|k| m.contains_key(k))
-                            || m.contains_key(&fname)
-                    })
-                    .cloned()
-            });
-            if let Some(funcs) = fd_rc {
-                let fd = scoped_key
-                    .as_deref()
-                    .and_then(|k| funcs.get(k))
-                    .or_else(|| funcs.get(&fname))
-                    .cloned()?;
-                let mut argv = Vec::with_capacity(args.len());
-                for a in args {
-                    let av = const_eval_i64_with_params(a, params)?;
-                    argv.push(Value::from_u64(av as u64, 32));
-                }
-                let mut shell = ElaboratedModule::new(String::new());
-                if let Some(p) = params {
-                    shell.parameters = p.clone();
-                }
-                shell.functions = FuncTable::from_map((*funcs).clone());
-                if let Some(v) = eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
-                {
-                    return v.to_i64();
-                }
-            }
             // Name-based ceil-log2 fallback (HardFloat `clog2` == $clog2).
             if fname == "clog2" {
                 let n = const_eval_i64_with_params(args.first()?, params)? as u64;
@@ -24445,6 +24478,13 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 Value::zero(((hi - lo + 1).max(1)) as u32)
             }
         }
+        // §13.4.3: a user constant-function call in a value context — e.g. a
+        // struct assignment-pattern field `'{x: x_bits_t'(router_x(r)), ...}`
+        // in a generate-for body, which otherwise packed as 0. The result
+        // keeps the function's declared return type.
+        ExprKind::Call { .. } => {
+            const_eval_user_call(expr, Some(params)).unwrap_or_else(|| Value::zero(32))
+        }
         _ => Value::zero(32),
     };
     // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
@@ -28884,6 +28924,21 @@ fn collect_effective_items_ref<'a>(
     out
 }
 
+/// §27.5: a generate-if condition or generate-case selector/value in an
+/// instantiated module, where `eval_const_expr` would read a user
+/// constant-function call as 0 and silently take the else/default branch
+/// (every `if (has_neighbor(r, dir))` became a boundary). Calls go through
+/// `const_eval_i64_with_params`, which interprets the function body; the
+/// result is compared as the same u64 `eval_const_expr` yields.
+fn eval_generate_const(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
+    if expr_has_call(expr) {
+        if let Some(v) = const_eval_i64_with_params(expr, Some(params)) {
+            return v as u64;
+        }
+    }
+    eval_const_expr(expr, params)
+}
+
 fn collect_effective_items_scoped(
     items: &[ModuleItem],
     params: &HashMap<String, Value>,
@@ -28906,7 +28961,7 @@ fn collect_effective_items_scoped(
                 let mut matched = false;
                 for (bi, (cond, branch_items)) in gi.branches.iter().enumerate() {
                     let take = match cond {
-                        Some(cond_expr) => eval_const_expr(cond_expr, params) != 0,
+                        Some(cond_expr) => eval_generate_const(cond_expr, params) != 0,
                         None => true, // unconditional else branch
                     };
                     if take {
@@ -28940,14 +28995,14 @@ fn collect_effective_items_scoped(
             }
             ModuleItem::GenerateCase(gc) => {
                 *gen_ordinal += 1;
-                let sel = eval_const_expr(&gc.selector, params);
+                let sel = eval_generate_const(&gc.selector, params);
                 let mut chosen: Option<&GenerateCaseArm> = None;
                 // First pass: try non-default arms.
                 for arm in &gc.arms {
                     if arm.values.is_empty() {
                         continue;
                     }
-                    if arm.values.iter().any(|v| eval_const_expr(v, params) == sel) {
+                    if arm.values.iter().any(|v| eval_generate_const(v, params) == sel) {
                         chosen = Some(arm);
                         break;
                     }
@@ -32515,6 +32570,28 @@ fn inline_module_items(
                                                                 val = val.resize(w);
                                                             }
                                                         }
+                                                    }
+                                                    // §10.9.2 / §27.4: a struct or multi-dim packed
+                                                    // pattern (`localparam id_t Id = '{x: f(r), ..}`
+                                                    // in a generate-for body) — the plain const-eval
+                                                    // above yields 0; pack it by the declared type
+                                                    // like the parameter-default path does.
+                                                    if let Some(pv) = pack_packed_vector_pattern(
+                                                        data_type,
+                                                        init,
+                                                        local_map,
+                                                        &elab_ro.typedef_types,
+                                                    )
+                                                    .or_else(|| {
+                                                        pack_struct_const_value(
+                                                            data_type,
+                                                            init,
+                                                            local_map,
+                                                            &elab_ro.typedefs,
+                                                            &elab_ro.typedef_types,
+                                                        )
+                                                    }) {
+                                                        val = pv;
                                                     }
                                                     if local_map.get(&assign.name.name)
                                                         != Some(&val)
