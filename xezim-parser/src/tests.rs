@@ -478,3 +478,94 @@ fn type_keyword_specialization_keeps_signing() {
         "{text}"
     );
 }
+
+/// The first expression statement of the first method in the first class.
+fn class_method_expr(result: &crate::ParseResult) -> &crate::ast::expr::Expression {
+    use crate::ast::decl::{ClassItem, ClassMethodKind};
+    let Some(Description::Class(class)) = result.source.descriptions.first() else {
+        panic!("not a class")
+    };
+    class
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ClassItem::Method(m) => match &m.kind {
+                ClassMethodKind::Function(f) => f.items.iter().find_map(|s| match &s.kind {
+                    crate::ast::stmt::StatementKind::Expr(e) => Some(e),
+                    _ => None,
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("no expression statement")
+}
+
+/// §18.8 `randomize_call`: the argument parentheses are optional, so
+/// `randomize with { ... }` is a complete inline-constraint clause.
+#[test]
+fn randomize_with_bare_constraint_block() {
+    use crate::ast::expr::ExprKind;
+    let result = parse(
+        "class c; rand int x; \
+         function void f(); this.randomize with { x > 0; }; endfunction endclass",
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let ExprKind::RandomizeWith { call, constraints } = &class_method_expr(&result).kind else {
+        panic!("{:?}", class_method_expr(&result))
+    };
+    assert!(
+        matches!(call.kind, ExprKind::MemberAccess { .. }),
+        "{call:?}"
+    );
+    assert_eq!(constraints.len(), 1);
+}
+
+/// §18.8: `[ ( [ identifier_list ] ) ] constraint_block` — the parenthesized
+/// identifier list may precede the block. The list names the variables to
+/// randomize; the AST keeps only the block, so this pins that it is consumed.
+#[test]
+fn randomize_with_identifier_list_and_block() {
+    use crate::ast::expr::ExprKind;
+    let result = parse(
+        "class c; rand int x, y; \
+         function void f(); this.randomize() with (x, y) { x > y; }; endfunction endclass",
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let text = format!("{:?}", result.source.descriptions);
+    assert!(text.contains("RandomizeWith"), "{text}");
+    let statement = class_method_expr(&result);
+    let ExprKind::RandomizeWith { constraints, .. } = &statement.kind else {
+        panic!("{statement:?}")
+    };
+    assert_eq!(constraints.len(), 1);
+}
+
+/// §18.8 requires the constraint block: the identifier list does not replace
+/// it, so `with (x)` alone is a syntax error.
+#[test]
+fn randomize_with_identifier_list_requires_block() {
+    let result = parse(
+        "class c; rand int x; \
+         function void f(); this.randomize with (x); endfunction endclass",
+    );
+    assert!(
+        !result.errors.is_empty(),
+        "{:?}",
+        result.source.descriptions
+    );
+}
+
+/// §18.8 vs. A.8.2: `with ( expression )` is the array-method filter, not a
+/// randomize clause, so a non-randomize receiver keeps `WithClause`.
+#[test]
+fn array_method_with_filter_is_not_randomize() {
+    let result = parse(
+        "module m; int arr[$]; int y; \
+         initial y = arr.sum with (item * 2); endmodule",
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let text = format!("{:?}", result.source.descriptions);
+    assert!(text.contains("WithClause"), "{text}");
+    assert!(!text.contains("RandomizeWith"), "{text}");
+}

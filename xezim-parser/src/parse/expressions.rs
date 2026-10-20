@@ -580,37 +580,41 @@ impl Parser {
                         self.span_from(start),
                     );
                     if self.eat(TokenKind::KwWith).is_some() {
-                        if self.at(TokenKind::LParen) {
-                            self.expect(TokenKind::LParen);
-                            let filter = self.parse_expression();
-                            self.expect(TokenKind::RParen);
-                            call_expr = Expression::new(
-                                ExprKind::WithClause {
-                                    expr: Box::new(call_expr),
-                                    filter: Box::new(filter),
-                                },
-                                self.span_from(start),
-                            );
-                        }
-                        // Inline constraint block `with { ... }`
-                        // (randomize-with). Parse it into ConstraintItems so
-                        // the simulator's `solve_forced` honours each. The
-                        // earlier brace-skip dropped these entirely — every
-                        // `obj.randomize() with { ... }` was silently
-                        // unconstrained.
-                        if self.eat(TokenKind::LBrace).is_some() {
-                            let mut constraints = Vec::new();
-                            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                                constraints.push(self.parse_constraint_item());
+                        if is_randomize_receiver(&call_expr) {
+                            call_expr = self.parse_randomize_with(call_expr, start);
+                        } else {
+                            if self.at(TokenKind::LParen) {
+                                self.expect(TokenKind::LParen);
+                                let filter = self.parse_expression();
+                                self.expect(TokenKind::RParen);
+                                call_expr = Expression::new(
+                                    ExprKind::WithClause {
+                                        expr: Box::new(call_expr),
+                                        filter: Box::new(filter),
+                                    },
+                                    self.span_from(start),
+                                );
                             }
-                            self.expect(TokenKind::RBrace);
-                            call_expr = Expression::new(
-                                ExprKind::RandomizeWith {
-                                    call: Box::new(call_expr),
-                                    constraints,
-                                },
-                                self.span_from(start),
-                            );
+                            // Inline constraint block `with { ... }` (randomize-with).
+                            // Parse it into ConstraintItems so the simulator's
+                            // `solve_forced` honours each. The earlier brace-skip
+                            // dropped these entirely — every
+                            // `obj.randomize() with { ... }` was silently
+                            // unconstrained.
+                            if self.eat(TokenKind::LBrace).is_some() {
+                                let mut constraints = Vec::new();
+                                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                                    constraints.push(self.parse_constraint_item());
+                                }
+                                self.expect(TokenKind::RBrace);
+                                call_expr = Expression::new(
+                                    ExprKind::RandomizeWith {
+                                        call: Box::new(call_expr),
+                                        constraints,
+                                    },
+                                    self.span_from(start),
+                                );
+                            }
                         }
                     }
                     lhs = call_expr;
@@ -876,16 +880,20 @@ impl Parser {
                 continue;
             }
             if self.eat(TokenKind::KwWith).is_some() {
-                self.expect(TokenKind::LParen);
-                let filter = self.parse_expression();
-                self.expect(TokenKind::RParen);
-                lhs = Expression::new(
-                    ExprKind::WithClause {
-                        expr: Box::new(lhs),
-                        filter: Box::new(filter),
-                    },
-                    self.span_from(start),
-                );
+                if is_randomize_receiver(&lhs) {
+                    lhs = self.parse_randomize_with(lhs, start);
+                } else {
+                    self.expect(TokenKind::LParen);
+                    let filter = self.parse_expression();
+                    self.expect(TokenKind::RParen);
+                    lhs = Expression::new(
+                        ExprKind::WithClause {
+                            expr: Box::new(lhs),
+                            filter: Box::new(filter),
+                        },
+                        self.span_from(start),
+                    );
+                }
                 continue;
             }
 
@@ -2301,6 +2309,36 @@ impl Parser {
         Expression::new(ExprKind::Concatenation(exprs), self.span_from(start))
     }
 
+    /// §18.8: the clause after `with` is
+    /// `[ ( [ identifier_list ] ) ] constraint_block`, so the block is
+    /// mandatory even when the parenthesized identifier list is omitted. The
+    /// list names the variables to randomize; the AST has no field for it, so
+    /// it is consumed and dropped (the way attribute instances are).
+    fn parse_randomize_with(&mut self, call: Expression, start: usize) -> Expression {
+        if self.eat(TokenKind::LParen).is_some() {
+            if !self.at(TokenKind::RParen) {
+                self.parse_identifier();
+                while self.eat(TokenKind::Comma).is_some() {
+                    self.parse_identifier();
+                }
+            }
+            self.expect(TokenKind::RParen);
+        }
+        self.expect(TokenKind::LBrace);
+        let mut constraints = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            constraints.push(self.parse_constraint_item());
+        }
+        self.expect(TokenKind::RBrace);
+        Expression::new(
+            ExprKind::RandomizeWith {
+                call: Box::new(call),
+                constraints,
+            },
+            self.span_from(start),
+        )
+    }
+
     pub(super) fn parse_call_args(&mut self) -> Vec<Expression> {
         self.parse_call_args_inner(false)
     }
@@ -3242,4 +3280,23 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
         }
     }
     out
+}
+
+/// §18.8: `randomize` is an ordinary identifier, so the receiver of an inline
+/// constraint is recognized by name — the last segment of a hierarchical name
+/// (`std::randomize`) or the member of an access (`obj.randomize`), possibly
+/// already wrapped in a call when the arguments were given.
+fn is_randomize_receiver(expr: &Expression) -> bool {
+    let target = match &expr.kind {
+        ExprKind::Call { func, .. } => func.as_ref(),
+        _ => expr,
+    };
+    match &target.kind {
+        ExprKind::Ident(id) => id
+            .path
+            .last()
+            .is_some_and(|segment| segment.name.name == "randomize"),
+        ExprKind::MemberAccess { member, .. } => member.name == "randomize",
+        _ => false,
+    }
 }
