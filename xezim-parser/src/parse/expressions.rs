@@ -1,6 +1,7 @@
 //! Expression parsing (IEEE 1800-2017 §A.8) with Pratt precedence climbing.
 
 use super::Parser;
+use super::items::ConstraintPos;
 use crate::ast::Identifier;
 use crate::ast::Span;
 use crate::ast::expr::*;
@@ -601,7 +602,8 @@ impl Parser {
                         if self.eat(TokenKind::LBrace).is_some() {
                             let mut constraints = Vec::new();
                             while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                                constraints.push(self.parse_constraint_item());
+                                constraints
+                                    .push(self.parse_constraint_item(ConstraintPos::BlockItem));
                             }
                             self.expect(TokenKind::RBrace);
                             call_expr = Expression::new(
@@ -713,7 +715,7 @@ impl Parser {
                     if self.eat(TokenKind::LBrace).is_some() {
                         let mut constraints = Vec::new();
                         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                            constraints.push(self.parse_constraint_item());
+                            constraints.push(self.parse_constraint_item(ConstraintPos::BlockItem));
                         }
                         self.expect(TokenKind::RBrace);
                         call_expr = Expression::new(
@@ -1650,7 +1652,7 @@ impl Parser {
                         self.bump(); // {
                         let mut constraints = Vec::new();
                         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                            constraints.push(self.parse_constraint_item());
+                            constraints.push(self.parse_constraint_item(ConstraintPos::BlockItem));
                         }
                         self.expect(TokenKind::RBrace);
                         Expression::new(

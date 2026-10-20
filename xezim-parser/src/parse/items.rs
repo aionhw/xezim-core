@@ -8,6 +8,26 @@ use crate::ast::module::*;
 use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
+/// Which constraint production the caller is inside, which is what decides
+/// whether a leading `{` can open a nested block at all (IEEE 1800-2023
+/// §18.5.2):
+///
+/// * `constraint_block ::= { { constraint_block_item } }` and
+///   `constraint_block_item ::= solve ... | constraint_expression` — a bare
+///   `{...}` block is not a block item, so here `{` can only begin an
+///   expression (a concatenation, §11.4.12).
+/// * `constraint_set ::= constraint_expression | { { constraint_expression } }`
+///   — after `if (...)`, `else`, `foreach (...)` and `->` both readings are
+///   legal, so that position needs a lookahead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConstraintPos {
+    /// Inside a `constraint_block`: `{` starts an expression only.
+    BlockItem,
+    /// A `constraint_set` position (`if`/`else`/`foreach`/`->`): `{` may open
+    /// a nested set or begin a concatenation expression.
+    ConstraintSet,
+}
+
 impl Parser {
     /// IEEE 1800-2023 §14.4 clocking skew value after the `#`: `1step`, a
     /// number or time literal, a parameter name, or a parenthesized
@@ -2081,7 +2101,7 @@ impl Parser {
                 if self.at(TokenKind::LBrace) {
                     self.bump();
                     while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                        items.push(self.parse_constraint_item());
+                        items.push(self.parse_constraint_item(ConstraintPos::BlockItem));
                     }
                     self.expect(TokenKind::RBrace);
                 } else if self.at(TokenKind::Semicolon) {
@@ -4923,7 +4943,7 @@ impl Parser {
                     self.bump();
                     let mut items = Vec::new();
                     while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                        items.push(self.parse_constraint_item());
+                        items.push(self.parse_constraint_item(ConstraintPos::BlockItem));
                     }
                     self.expect(TokenKind::RBrace);
                     (items, true)
@@ -5614,7 +5634,78 @@ impl Parser {
         (root, e)
     }
 
-    pub(crate) fn parse_constraint_item(&mut self) -> ConstraintItem {
+    /// Decide whether the `{` at the cursor opens a constraint block or a
+    /// concatenation expression (§11.4.12 / §18.5.2).
+    ///
+    /// Both readings start with a bare `LBrace`, and the grammar itself has
+    /// no fixed position for the choice, so it is settled by the token after
+    /// the matching `}`: an expression continues (an operator, `inside` /
+    /// `dist`, a select) or ends the item with `;`, while a block ends at
+    /// whatever terminates the enclosing item.
+    fn constraint_lbrace_is_block(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while let Some(tok) = self.tokens.get(i) {
+            match tok.kind {
+                TokenKind::LBrace | TokenKind::ApostropheLBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return !matches!(
+                            self.tokens.get(i + 1).map(|t| t.kind),
+                            Some(
+                                TokenKind::Semicolon
+                                    | TokenKind::KwInside
+                                    | TokenKind::KwDist
+                                    | TokenKind::LBracket
+                                    | TokenKind::Dot
+                                    | TokenKind::Increment
+                                    | TokenKind::Decrement
+                                    | TokenKind::Plus
+                                    | TokenKind::Minus
+                                    | TokenKind::Star
+                                    | TokenKind::Slash
+                                    | TokenKind::Percent
+                                    | TokenKind::DoubleStar
+                                    | TokenKind::Eq
+                                    | TokenKind::Neq
+                                    | TokenKind::CaseEq
+                                    | TokenKind::CaseNeq
+                                    | TokenKind::WildcardEq
+                                    | TokenKind::WildcardNeq
+                                    | TokenKind::Lt
+                                    | TokenKind::Gt
+                                    | TokenKind::Leq
+                                    | TokenKind::Geq
+                                    | TokenKind::ShiftLeft
+                                    | TokenKind::ShiftRight
+                                    | TokenKind::ArithShiftLeft
+                                    | TokenKind::ArithShiftRight
+                                    | TokenKind::LogAnd
+                                    | TokenKind::LogOr
+                                    | TokenKind::LogImplies
+                                    | TokenKind::BitAnd
+                                    | TokenKind::BitOr
+                                    | TokenKind::BitXor
+                                    | TokenKind::BitNand
+                                    | TokenKind::BitNor
+                                    | TokenKind::BitXnor
+                                    | TokenKind::Arrow
+                                    | TokenKind::Question
+                            )
+                        );
+                    }
+                }
+                TokenKind::Eof => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        // Unterminated: let the expression parser report the stray `{`.
+        false
+    }
+
+    pub(crate) fn parse_constraint_item(&mut self, pos: ConstraintPos) -> ConstraintItem {
         let start = self.current().span.start;
         match self.current_kind() {
             TokenKind::KwSolve => {
@@ -5656,10 +5747,12 @@ impl Parser {
                 self.expect(TokenKind::LParen);
                 let cond = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                let then_item = self.parse_constraint_item();
+                let then_item = self.parse_constraint_item(ConstraintPos::ConstraintSet);
                 let else_item = if self.at(TokenKind::KwElse) {
                     self.bump();
-                    Some(Box::new(self.parse_constraint_item()))
+                    Some(Box::new(
+                        self.parse_constraint_item(ConstraintPos::ConstraintSet),
+                    ))
                 } else {
                     None
                 };
@@ -5698,7 +5791,7 @@ impl Parser {
                 }
                 self.expect(TokenKind::RBracket);
                 self.expect(TokenKind::RParen);
-                let item = self.parse_constraint_item();
+                let item = self.parse_constraint_item(ConstraintPos::ConstraintSet);
                 ConstraintItem::Foreach {
                     array: array_expr,
                     vars,
@@ -5708,7 +5801,12 @@ impl Parser {
             }
             TokenKind::KwSoft => {
                 self.bump();
-                ConstraintItem::Soft(Box::new(self.parse_constraint_item()))
+                // `[ soft ] expression_or_dist ;` — only the first
+                // `constraint_expression` alternative takes `soft`, and that
+                // one is an expression, never a brace block.
+                ConstraintItem::Soft(Box::new(
+                    self.parse_constraint_item(ConstraintPos::BlockItem),
+                ))
             }
             TokenKind::KwDisable => {
                 // `disable soft <expr>;` — accept and treat as a no-op block.
@@ -5765,11 +5863,23 @@ impl Parser {
                     ConstraintItem::Block(items)
                 }
             }
-            TokenKind::LBrace => {
+            // A bare `{` is only ambiguous where the grammar allows a
+            // `constraint_set` (`if`/`else`/`foreach`/`->`). Inside a
+            // `constraint_block` a bare block is not a block item at all, so
+            // the `{` can only start an expression (a concatenation), which
+            // the `_` arm below parses with no lookahead.
+            //
+            // In `constraint_set` position both readings are legal:
+            //   if (c) { a == 1; }           -- a nested set
+            //   if (c) {a,b} inside {1,2};   -- a concatenation expression
+            // so tell them apart by what follows the matching `}`.
+            TokenKind::LBrace
+                if pos == ConstraintPos::ConstraintSet && self.constraint_lbrace_is_block() =>
+            {
                 self.bump();
                 let mut items = Vec::new();
                 while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                    items.push(self.parse_constraint_item());
+                    items.push(self.parse_constraint_item(ConstraintPos::BlockItem));
                 }
                 self.expect(TokenKind::RBrace);
                 ConstraintItem::Block(items)
@@ -5832,7 +5942,7 @@ impl Parser {
                     }
                 } else if self.at(TokenKind::Arrow) {
                     self.bump();
-                    let constraint = self.parse_constraint_item();
+                    let constraint = self.parse_constraint_item(ConstraintPos::ConstraintSet);
                     ConstraintItem::Implication {
                         condition: expr,
                         constraint: Box::new(constraint),

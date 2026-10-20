@@ -478,3 +478,62 @@ fn type_keyword_specialization_keeps_signing() {
         "{text}"
     );
 }
+
+fn class_constraint_items(result: &crate::ParseResult) -> Vec<crate::ast::decl::ConstraintItem> {
+    use crate::ast::decl::ClassItem;
+    let Some(Description::Class(class)) = result.source.descriptions.first() else {
+        panic!("not a class")
+    };
+    class
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ClassItem::Constraint(c) => Some(c.items.clone()),
+            _ => None,
+        })
+        .expect("no constraint")
+}
+
+/// §18.5.2: `constraint_block_item ::= solve ... | constraint_expression`, so a
+/// bare `{` at block-item level can only start an expression — here a
+/// concatenation, which must not be consumed as a nested block.
+#[test]
+fn constraint_block_item_lbrace_is_concatenation() {
+    use crate::ast::decl::ConstraintItem;
+    let result = parse("class c; rand int a,b; constraint k { {a,b} inside {1,2}; } endclass");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let items = class_constraint_items(&result);
+    // `inside` is an expression operator (§11.4.13), so the item is an
+    // `Expr`, not the dedicated `ConstraintItem::Inside` fast path.
+    let expr = match &items[0] {
+        ConstraintItem::Expr(e) => e,
+        ConstraintItem::Inside { expr, .. } => expr,
+        other => panic!("{other:?}"),
+    };
+    let inner = match &expr.kind {
+        crate::ast::expr::ExprKind::Inside { expr, .. } => expr,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        matches!(inner.kind, crate::ast::expr::ExprKind::Concatenation(_)),
+        "{inner:?}"
+    );
+}
+
+/// §18.5.2: after `if (...)` the position is a `constraint_set`, where `{`
+/// opens a nested block.
+#[test]
+fn constraint_set_lbrace_is_block() {
+    use crate::ast::decl::ConstraintItem;
+    let result =
+        parse("class c; rand int a,b; constraint k { if (a) { b == 1; b == 2; } } endclass");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let items = class_constraint_items(&result);
+    let ConstraintItem::IfElse { then_item, .. } = &items[0] else {
+        panic!("{:?}", items[0])
+    };
+    let ConstraintItem::Block(inner) = &**then_item else {
+        panic!("{then_item:?}")
+    };
+    assert_eq!(inner.len(), 2);
+}

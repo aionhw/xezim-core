@@ -12,6 +12,7 @@ use crate::ast::decl::{ModuleItem, PackageItem};
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::token::{Token, TokenKind};
+use items::ConstraintPos;
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -398,7 +399,7 @@ impl Parser {
                 if self.at(TokenKind::LBrace) {
                     self.bump();
                     while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                        items.push(self.parse_constraint_item());
+                        items.push(self.parse_constraint_item(ConstraintPos::BlockItem));
                     }
                     self.expect(TokenKind::RBrace);
                 }
