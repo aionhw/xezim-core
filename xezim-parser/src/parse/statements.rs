@@ -1196,6 +1196,40 @@ impl Parser {
     /// A.2.8); it adds no statement (in a fork it must not become a
     /// process), it is expanded where it is used.
     pub(super) fn parse_block_item(&mut self, stmts: &mut Vec<Statement>) {
+        // A compiler directive is not a statement: the statement grammar (A.6)
+        // has no directive production. Closing directives — `endprotect` and
+        // `endprotected` (legacy protected envelopes), `endcelldefine`
+        // (§22.10), `end_keywords` (§22.14) — delimit a region, so dispatching
+        // one to `parse_statement` consumed the block's own terminator and
+        // desynced the rest of the file (measured: one stray `endprotect`
+        // inside an if-block produced 15 cascade errors).
+        let mut skipped_directive = false;
+        while self.at(TokenKind::Directive) {
+            let bare = self.current().text.trim_start_matches('`');
+            if !CLOSING_DIRECTIVES.contains(&bare) {
+                break;
+            }
+            self.bump();
+            skipped_directive = true;
+        }
+        // The skip may have landed on the block's terminator, where there is
+        // no statement to collect. Return only for a token that also ends the
+        // caller's loop -- a function/task body loops on `endfunction`/
+        // `endtask`, not `end` (declarations.rs:519, :647) -- because returning
+        // with the cursor unmoved would make that loop re-enter forever.
+        if skipped_directive
+            && self.at_any(&[
+                TokenKind::KwEnd,
+                TokenKind::KwJoin,
+                TokenKind::KwJoin_any,
+                TokenKind::KwJoin_none,
+                TokenKind::KwEndfunction,
+                TokenKind::KwEndtask,
+                TokenKind::Eof,
+            ])
+        {
+            return;
+        }
         if self.at(TokenKind::KwLet) {
             self.parse_let_declaration();
             return;
@@ -2822,3 +2856,14 @@ fn expand_rs_ref(
         Statement::new(StatementKind::Null, span)
     }
 }
+
+/// Compiler directives that *close* a region rather than introduce a
+/// statement. They reach the parser unexpanded (the preprocessor knows them
+/// but never consumes them), so a statement-list loop that dispatches one to
+/// parse_statement desyncs on whatever terminator follows it.
+const CLOSING_DIRECTIVES: &[&str] = &[
+    "endprotect",
+    "endprotected",
+    "endcelldefine",
+    "end_keywords",
+];

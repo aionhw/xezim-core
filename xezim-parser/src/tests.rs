@@ -478,3 +478,31 @@ fn type_keyword_specialization_keeps_signing() {
         "{text}"
     );
 }
+
+/// A compiler directive is not a statement — the A.6 statement grammar has no
+/// directive production. A protected envelope inside a nested block ends just
+/// before the if-block's `end`; dispatching `` `endprotect `` to
+/// `parse_statement` consumed that `end` and desynced the rest of the file
+/// (one such envelope produced 15 cascade errors in the corpus).
+#[test]
+fn protected_envelope_in_block_keeps_the_blocks_end() {
+    let result =
+        parse("module m; initial begin if (1) begin `protect x = 1; `endprotect end end endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
+/// Same desync at a function body's terminator: that loop guards on
+/// `endfunction`, not `end`, so the skip must hand the token back untouched.
+#[test]
+fn protected_envelope_in_function_keeps_the_endfunction() {
+    let result =
+        parse("module m; function void f(); `protect x = 1; `endprotect endfunction endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
+/// And at a fork's `join`, which is the parallel block's terminator.
+#[test]
+fn protected_envelope_in_fork_keeps_the_join() {
+    let result = parse("module m; initial fork `protect x = 1; `endprotect join endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
