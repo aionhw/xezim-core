@@ -584,15 +584,88 @@ impl Parser {
                 self.bump();
                 dims.push(PackedDimension::Unsized(self.span_from(start)));
             } else {
+                // `packed_dimension ::= [ constant_range ] | unsized_dimension`
+                // (§A.2.5): the `[constant_expression]` form exists only for
+                // unpacked dimensions. Real code writes `bit [WIDTH] x;`
+                // meaning WIDTH bits, so name the defect once and recover as
+                // `[WIDTH-1:0]` instead of letting `expect(Colon)` cascade
+                // into "expected expression" on the same token.
+                //
+                // Only directly after a builtin integral type: at `$unit`
+                // scope a fragment such as `if_obj[0].data = v;` reaches this
+                // parser with `[` after an identifier, where `[N]` is a
+                // select, not a dimension.
+                let size_only_ok = self.pos >= 2
+                    && matches!(
+                        self.tokens[self.pos - 2].kind,
+                        TokenKind::KwBit
+                            | TokenKind::KwLogic
+                            | TokenKind::KwReg
+                            | TokenKind::KwByte
+                            | TokenKind::KwShortint
+                            | TokenKind::KwInt
+                            | TokenKind::KwLongint
+                            | TokenKind::KwInteger
+                            | TokenKind::KwTime
+                            | TokenKind::KwSigned
+                            | TokenKind::KwUnsigned
+                    );
                 let left = self.parse_expression();
-                self.expect(TokenKind::Colon);
-                let right = self.parse_expression();
-                self.expect(TokenKind::RBracket);
-                dims.push(PackedDimension::Range {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    span: self.span_from(start),
-                });
+                if self.eat(TokenKind::Colon).is_some() {
+                    let right = self.parse_expression();
+                    self.expect(TokenKind::RBracket);
+                    dims.push(PackedDimension::Range {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        span: self.span_from(start),
+                    });
+                } else if self.at(TokenKind::RBracket) && size_only_ok {
+                    self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                        "nonstandard packed dimension `[N]`: a packed dimension \
+                             must be a range `[N-1:0]`, not a size (IEEE 1800-2023 \
+                             A.2.5: the `[constant_expression]` form is \
+                             unpacked-only)",
+                        self.current().span,
+                    ));
+                    self.bump();
+                    let span = self.span_from(start);
+                    let num = |v: &str| {
+                        crate::ast::expr::Expression::new(
+                            crate::ast::expr::ExprKind::Number(
+                                crate::ast::expr::NumberLiteral::Integer {
+                                    size: None,
+                                    signed: false,
+                                    base: crate::ast::expr::NumberBase::Decimal,
+                                    value: v.to_string(),
+                                    cached_val: std::cell::Cell::new(None),
+                                },
+                            ),
+                            span,
+                        )
+                    };
+                    let msb = crate::ast::expr::Expression::new(
+                        crate::ast::expr::ExprKind::Binary {
+                            op: crate::ast::expr::BinaryOp::Sub,
+                            left: Box::new(left),
+                            right: Box::new(num("1")),
+                        },
+                        span,
+                    );
+                    dims.push(PackedDimension::Range {
+                        left: Box::new(msb),
+                        right: Box::new(num("0")),
+                        span,
+                    });
+                } else {
+                    self.expect(TokenKind::Colon);
+                    let right = self.parse_expression();
+                    self.expect(TokenKind::RBracket);
+                    dims.push(PackedDimension::Range {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        span: self.span_from(start),
+                    });
+                }
             }
         }
         dims

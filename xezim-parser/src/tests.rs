@@ -478,3 +478,47 @@ fn type_keyword_specialization_keeps_signing() {
         "{text}"
     );
 }
+
+/// §A.2.5: `packed_dimension ::= [ constant_range ] | unsized_dimension`, so
+/// `bit [8]` is not legal. It is named once and recovered as `[7:0]`, instead
+/// of the `expect(Colon)` cascade that also fails on the same `]`.
+#[test]
+fn packed_dimension_size_is_reported_once_and_recovered() {
+    use crate::ast::decl::ModuleItem;
+    use crate::ast::expr::{BinaryOp, ExprKind};
+    use crate::ast::types::PackedDimension;
+    let result = parse("module m; bit [8] x; endmodule");
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].message.contains("packed dimension"),
+        "{:?}",
+        result.errors
+    );
+    let Some(Description::Module(m)) = result.source.descriptions.first() else {
+        panic!("not a module")
+    };
+    let Some(ModuleItem::DataDeclaration(decl)) = m.items.first() else {
+        panic!("{:?}", m.items.first())
+    };
+    let crate::ast::types::DataType::IntegerVector { dimensions, .. } = &decl.data_type else {
+        panic!("{:?}", decl.data_type)
+    };
+    let PackedDimension::Range { left, right, .. } = &dimensions[0] else {
+        panic!("{:?}", dimensions[0])
+    };
+    let ExprKind::Binary {
+        op: BinaryOp::Sub, ..
+    } = &left.kind
+    else {
+        panic!("{left:?}")
+    };
+    assert!(matches!(right.kind, ExprKind::Number(_)), "{right:?}");
+}
+
+/// The same bracket is legal as an unpacked dimension (§A.2.5:
+/// `unpacked_dimension ::= [ constant_expression ]`), so it stays silent.
+#[test]
+fn unpacked_dimension_size_is_legal() {
+    let result = parse("module m; bit x [8]; endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
