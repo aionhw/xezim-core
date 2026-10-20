@@ -478,3 +478,85 @@ fn type_keyword_specialization_keeps_signing() {
         "{text}"
     );
 }
+
+fn class_constraint_items(result: &crate::ParseResult) -> Vec<crate::ast::decl::ConstraintItem> {
+    use crate::ast::decl::ClassItem;
+    let Some(Description::Class(class)) = result.source.descriptions.first() else {
+        panic!("not a class")
+    };
+    class
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ClassItem::Constraint(c) => Some(c.items.clone()),
+            _ => None,
+        })
+        .expect("no constraint")
+}
+
+/// §18.5.3: `constraint_expression ::= expression [ -> constraint_set ]`. The
+/// `->` is the constraint separator, not `LogImplies`, so its right side is a
+/// `constraint_set` — here a block with two items.
+#[test]
+fn constraint_implication_rhs_is_block() {
+    use crate::ast::decl::ConstraintItem;
+    let result = parse("class c; rand int a,b; constraint k { a -> { b == 1; b == 2; } } endclass");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let items = class_constraint_items(&result);
+    let ConstraintItem::Implication { constraint, .. } = &items[0] else {
+        panic!("{:?}", items[0])
+    };
+    let ConstraintItem::Block(inner) = &**constraint else {
+        panic!("{constraint:?}")
+    };
+    assert_eq!(inner.len(), 2);
+}
+
+/// `a -> b;` used to be swallowed by the expression parser as
+/// `BinaryOp::LogImplies`, so the solver never saw a constraint implication.
+#[test]
+fn constraint_implication_is_a_constraint_item() {
+    use crate::ast::decl::ConstraintItem;
+    use crate::ast::expr::ExprKind;
+    let result = parse("class c; rand int a,b; constraint k { a -> b; } endclass");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let items = class_constraint_items(&result);
+    let ConstraintItem::Implication {
+        condition,
+        constraint,
+        ..
+    } = &items[0]
+    else {
+        panic!("{:?}", items[0])
+    };
+    assert!(
+        matches!(condition.kind, ExprKind::Ident(_)),
+        "{condition:?}"
+    );
+    let ConstraintItem::Expr(expr) = &**constraint else {
+        panic!("{constraint:?}")
+    };
+    assert!(matches!(expr.kind, ExprKind::Ident(_)), "{expr:?}");
+}
+
+/// `->` is only a separator at the constraint-expression level: inside
+/// parentheses it is the ordinary `LogImplies` operator (§11.4.8). The
+/// `no_arrow` flag is scoped to one chain, not to the whole constraint.
+#[test]
+fn constraint_implication_inside_parens_is_logimplies() {
+    use crate::ast::decl::ConstraintItem;
+    use crate::ast::expr::{BinaryOp, ExprKind};
+    let result = parse("class c; rand int a,b; constraint k { (a -> b); } endclass");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let items = class_constraint_items(&result);
+    let ConstraintItem::Expr(expr) = &items[0] else {
+        panic!("{:?}", items[0])
+    };
+    let ExprKind::Paren(inner) = &expr.kind else {
+        panic!("{expr:?}")
+    };
+    let ExprKind::Binary { op, .. } = &inner.kind else {
+        panic!("{inner:?}")
+    };
+    assert_eq!(*op, BinaryOp::LogImplies);
+}

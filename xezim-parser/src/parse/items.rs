@@ -5779,7 +5779,10 @@ impl Parser {
                 // only in constraint context.
                 let saved_in_constraint = self.in_constraint;
                 self.in_constraint = true;
-                let expr = self.parse_expression();
+                // §18.5.3: a constraint expression is
+                // `expression [ -> constraint_set ]`. `->` is the constraint
+                // separator, not `LogImplies`, so the left side stops at it.
+                let expr = self.parse_constraint_left_expr();
                 self.in_constraint = saved_in_constraint;
                 // Nonstandard `-> ( expr dist {...} )`: the dist body was
                 // captured inside the parentheses; the LogImplies chain that

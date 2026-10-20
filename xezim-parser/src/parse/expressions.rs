@@ -214,6 +214,19 @@ impl Parser {
     }
 
     pub(super) fn parse_expr_bp(&mut self, min_bp: u8) -> Expression {
+        self.parse_expr_bp_ctx(min_bp, false)
+    }
+
+    /// Head of a §18.5.3 constraint expression: `expression -> constraint_set`.
+    /// `->` is not an operator at that position, so the top-level chain stops
+    /// before it and `parse_constraint_item` sees the token. Parentheses and
+    /// argument lists restart through `parse_expr_bp`, where `->` is an
+    /// ordinary operator again, so `a -> (b -> c)` still parses.
+    pub(super) fn parse_constraint_left_expr(&mut self) -> Expression {
+        self.parse_expr_bp_ctx(0, true)
+    }
+
+    fn parse_expr_bp_ctx(&mut self, min_bp: u8, no_arrow: bool) -> Expression {
         let start = self.current().span.start;
         let mut lhs = self.parse_prefix();
 
@@ -460,7 +473,7 @@ impl Parser {
             }
 
             // Binary/ternary operators
-            if let Some((op, l_bp, r_bp)) = self.infix_bp() {
+            if let Some((op, l_bp, r_bp)) = self.infix_bp(no_arrow) {
                 if l_bp < min_bp {
                     break;
                 }
@@ -2832,7 +2845,7 @@ impl Parser {
         )
     }
 
-    fn infix_bp(&self) -> Option<(BinaryOp, u8, u8)> {
+    fn infix_bp(&self, no_arrow: bool) -> Option<(BinaryOp, u8, u8)> {
         let kind = self.current_kind();
         match kind {
             TokenKind::OrMinusArrow => Some((BinaryOp::OrMinusArrow, 1, 1)),
@@ -2861,7 +2874,7 @@ impl Parser {
             // Logical implication / equivalence (IEEE 1800-2017 Table
             // 11-2): lowest-precedence binary ops, below `||`, above the
             // ternary. `->` is right-associative.
-            TokenKind::Arrow => Some((BinaryOp::LogImplies, 2, 1)),
+            TokenKind::Arrow if !no_arrow => Some((BinaryOp::LogImplies, 2, 1)),
             TokenKind::LogEquiv => Some((BinaryOp::LogEquiv, 1, 2)),
             TokenKind::LogOr => Some((BinaryOp::LogOr, 13, 14)),
             TokenKind::LogAnd => Some((BinaryOp::LogAnd, 15, 16)),
