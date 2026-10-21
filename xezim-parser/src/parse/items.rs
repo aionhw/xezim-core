@@ -5411,6 +5411,15 @@ impl Parser {
                                     // the terminating `;` (depth-aware).
                                     self.skip_bin_body_to_semicolon();
                                 }
+                                // LRM §19.5.1: optional `with (expr)` after the bin body.
+                                let with_expr = if self.eat(TokenKind::KwWith).is_some() {
+                                    self.expect(TokenKind::LParen);
+                                    let e = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(e)
+                                } else {
+                                    None
+                                };
                                 bins.push(crate::ast::decl::CoverBin {
                                     name: bin_name,
                                     kind: bin_kind,
@@ -5419,6 +5428,7 @@ impl Parser {
                                     array_size,
                                     is_wildcard,
                                     transitions,
+                                    with_expr,
                                     span: self.span_from(bin_start),
                                 });
                             } else {

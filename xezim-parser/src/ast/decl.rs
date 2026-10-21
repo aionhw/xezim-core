@@ -764,6 +764,9 @@ pub struct CoverBin {
     /// of its `=>` steps.
     #[cfg_attr(feature = "serde", serde(default))]
     pub transitions: Vec<Vec<TransStep>>,
+    /// LRM §19.5.1 `with (expr)` on a bin declaration.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub with_expr: Option<Expression>,
     pub span: Span,
 }
 
