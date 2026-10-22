@@ -33903,6 +33903,9 @@ fn inline_module_items(
                 // [63:0], parameter T P = …`) converts to that type; the
                 // global tables only hold overridden type parameters (bound
                 // above) and the parent's own names.
+                let prev_in_instance = CONST_FN_IN_INSTANCE.with(|c| c.replace(true));
+                let _in_instance =
+                    scopeguard_lite(move || CONST_FN_IN_INSTANCE.with(|c| c.set(prev_in_instance)));
                 let mut inst_types: HashMap<String, DataType> = HashMap::default();
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
@@ -38587,6 +38590,8 @@ fn eval_const_user_function(
         elab: &ElaboratedModule,
         depth: u32,
     ) -> Option<Value> {
+        let resolved = resolve_const_fn_cast_targets(e, elab);
+        let e = &resolved;
         if !const_fn_expr_supported(e) {
             return None;
         }
@@ -38711,16 +38716,233 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
         // computes them faithfully with nothing more than `params`, which is
         // the bar this list is guarding.
         //
-        // `$__xz_type_cast` (`int'(e)`, `byte'(e)`, a user typedef) is
-        // deliberately NOT admitted: it resolves the target width through
-        // `TYPEDEFS_TLS`, and an unpopulated table silently yields width 1
-        // rather than failing, which is exactly the quiet-wrong-answer this
-        // list exists to prevent.
+        //
+        // §6.24.1 casts. A size cast (`32'(e)`) takes its width from an
+        // expression this list already vets. A type cast (`int'(e)`,
+        // `logic [N-1:0]'(e)`, an enum) is admitted only when the target
+        // type alone fixes its width and signing: `eval_const_expr_val` then
+        // sizes it without the `TYPEDEFS_TLS` width table, where a missing
+        // entry silently yields width 1. A cast to a typedef reaches here
+        // already replaced by its declared type
+        // (`resolve_const_fn_cast_targets`); one that could not be resolved
+        // (`$__xz_named_cast`, a type reference) still bails.
+        ExprKind::SystemCall { name, args } if name == "$__xz_size_cast" => {
+            args.len() == 2 && args.iter().all(const_fn_expr_supported)
+        }
+        ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" => {
+            args.len() == 2
+                && matches!(&args[0].kind, ExprKind::TypeLiteral(dt) if const_fn_cast_type_static(dt))
+                && const_fn_expr_supported(&args[1])
+        }
         ExprKind::SystemCall { name, args } => {
             matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned")
                 && args.iter().all(const_fn_expr_supported)
         }
         _ => false,
+    }
+}
+
+/// §6.24.1: a cast target type whose width and signing follow from the type
+/// itself: an integer atom, or an integer vector or enum whose dimension
+/// bounds `const_fn_expr_supported` admits. Anything naming another type
+/// (a type reference, a struct member type) would need the width table.
+fn const_fn_cast_type_static(dt: &DataType) -> bool {
+    let dims_ok = |dims: &[PackedDimension]| {
+        dims.iter().all(|d| {
+            matches!(d, PackedDimension::Range { left, right, .. }
+                if const_fn_expr_supported(left) && const_fn_expr_supported(right))
+        })
+    };
+    match dt {
+        DataType::IntegerAtom { .. } => true,
+        DataType::IntegerVector { dimensions, .. } => dims_ok(dimensions),
+        DataType::Enum(e) => {
+            dims_ok(&e.dimensions) && e.base_type.as_deref().is_none_or(const_fn_cast_type_static)
+        }
+        _ => false,
+    }
+}
+
+thread_local! {
+    /// Set while an instantiated module is elaborated. Its own typedefs are
+    /// kept in a per-instance table, not in `elab.typedef_types`, so there a
+    /// bare typedef name could resolve to a same-named typedef of another
+    /// scope; `const_fn_cast_typedef` then accepts only package-qualified
+    /// names.
+    static CONST_FN_IN_INSTANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The package that declares the constant function being folded, if
+    /// any. Its body sees that package's typedefs (and what it imports), not
+    /// those of the scope that called it.
+    static CONST_FN_PACKAGE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The package that declares `fd`, found through its qualified registration
+/// (`pkg::f`), so a module function that happens to share a package
+/// function's name is not attributed to the package.
+fn const_fn_owner_package(
+    fname: &str,
+    scoped_key: Option<&str>,
+    fd: &FunctionDeclaration,
+    elab: &ElaboratedModule,
+) -> Option<String> {
+    let pkg = match scoped_key.and_then(|k| k.split_once("::")) {
+        Some((pkg, _)) => pkg.to_string(),
+        None => elab.pkg_subr_owner.get(fname)?.clone(),
+    };
+    let registered = elab.functions.get(&format!("{pkg}::{fname}"))?;
+    (registered.span == fd.span).then_some(pkg)
+}
+
+/// A typedef `leaf` as seen from package `pkg`: its own declaration, else the
+/// one package that declares that name (an imported typedef), else the bare
+/// entry, which no package declares and so is the `$unit` one. `None` when
+/// several packages declare it, rather than guess which one is imported.
+fn const_fn_package_typedef<'a>(
+    pkg: &str,
+    leaf: &str,
+    elab: &'a ElaboratedModule,
+) -> Option<&'a DataType> {
+    if let Some(dt) = elab.typedef_types.get(&format!("{pkg}::{leaf}")) {
+        return Some(dt);
+    }
+    let suffix = format!("::{leaf}");
+    let mut found = elab
+        .typedef_types
+        .iter()
+        .filter(|(k, _)| k.ends_with(&suffix) && k.matches("::").count() == 1);
+    match found.next() {
+        None => elab.typedef_types.get(leaf),
+        Some((_, dt)) => found.next().is_none().then_some(dt),
+    }
+}
+
+/// The declared type of the typedef a cast target names (`dir_e`, `p::dir_e`,
+/// or a type literal referring to one), followed through typedefs of
+/// typedefs. `None` when the target is not a typedef of `elab`, e.g. a
+/// parameter used as a size (`AW'(v)`). A bare name resolves in the package
+/// that declares the function being folded (`CONST_FN_PACKAGE`); outside a
+/// package function it is refused inside an instantiated module (see
+/// `CONST_FN_IN_INSTANCE`).
+fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option<DataType> {
+    let (leaf, scoped) = match &target.kind {
+        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => match h.path.len() {
+            1 => (h.path[0].name.name.clone(), None),
+            2 => (
+                h.path[1].name.name.clone(),
+                Some(format!("{}::{}", h.path[0].name.name, h.path[1].name.name)),
+            ),
+            _ => return None,
+        },
+        ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+            ExprKind::Ident(bh) if bh.path.len() == 1 && bh.path[0].selects.is_empty() => (
+                member.name.clone(),
+                Some(format!("{}::{}", bh.path[0].name.name, member.name)),
+            ),
+            _ => return None,
+        },
+        ExprKind::TypeLiteral(dt) => match dt.as_ref() {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } if dimensions.is_empty() => (
+                name.name.name.clone(),
+                (!name.scopes.is_empty()).then(|| name.qualified()),
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let pkg = CONST_FN_PACKAGE.with(|c| c.borrow().clone());
+    let mut dt = match (&scoped, &pkg) {
+        (Some(k), _) => elab.typedef_types.get(k)?,
+        (None, Some(pkg)) => const_fn_package_typedef(pkg, &leaf, elab)?,
+        (None, None) if CONST_FN_IN_INSTANCE.with(|c| c.get()) => return None,
+        (None, None) => elab.typedef_types.get(&leaf)?,
+    }
+    .clone();
+    for _ in 0..16 {
+        match &dt {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } if dimensions.is_empty() => {
+                dt = match &pkg {
+                    Some(pkg) if name.scopes.is_empty() => {
+                        const_fn_package_typedef(pkg, &name.name.name, elab)?.clone()
+                    }
+                    None if name.scopes.is_empty() && CONST_FN_IN_INSTANCE.with(|c| c.get()) => {
+                        return None;
+                    }
+                    _ => lookup_scoped_type(name, &elab.typedef_types)?.clone(),
+                };
+            }
+            DataType::TypeReference { .. } => return None,
+            _ => return Some(dt),
+        }
+    }
+    None
+}
+
+/// §6.24.1: inside a constant function, replace each cast to a typedef
+/// (`dir_e'(d)` lowers to `$__xz_named_cast`, `T'(e)` with a type operand to
+/// `$__xz_type_cast` of a type reference) with a `$__xz_type_cast` of the
+/// typedef's declared type, so `const_fn_expr_supported` can judge the cast
+/// from the type itself. Other expressions are rebuilt unchanged.
+fn resolve_const_fn_cast_targets(e: &Expression, elab: &ElaboratedModule) -> Expression {
+    let rec = |x: &Expression| resolve_const_fn_cast_targets(x, elab);
+    let rebuild = |k: ExprKind| Expression::new(k, e.span);
+    match &e.kind {
+        ExprKind::SystemCall { name, args }
+            if args.len() == 2 && (name == "$__xz_named_cast" || name == "$__xz_type_cast") =>
+        {
+            match const_fn_cast_typedef(&args[0], elab) {
+                Some(dt) => rebuild(ExprKind::SystemCall {
+                    name: "$__xz_type_cast".to_string(),
+                    args: vec![
+                        Expression::new(ExprKind::TypeLiteral(Box::new(dt)), args[0].span),
+                        rec(&args[1]),
+                    ],
+                }),
+                None => rebuild(ExprKind::SystemCall {
+                    name: name.clone(),
+                    args: vec![args[0].clone(), rec(&args[1])],
+                }),
+            }
+        }
+        ExprKind::SystemCall { name, args } => rebuild(ExprKind::SystemCall {
+            name: name.clone(),
+            args: args.iter().map(rec).collect(),
+        }),
+        ExprKind::Call { func, args } => rebuild(ExprKind::Call {
+            func: func.clone(),
+            args: args.iter().map(rec).collect(),
+        }),
+        ExprKind::Binary { op, left, right } => rebuild(ExprKind::Binary {
+            op: *op,
+            left: Box::new(rec(left)),
+            right: Box::new(rec(right)),
+        }),
+        ExprKind::Unary { op, operand } => rebuild(ExprKind::Unary {
+            op: *op,
+            operand: Box::new(rec(operand)),
+        }),
+        ExprKind::Paren(inner) => rebuild(ExprKind::Paren(Box::new(rec(inner)))),
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => rebuild(ExprKind::Conditional {
+            condition: Box::new(rec(condition)),
+            then_expr: Box::new(rec(then_expr)),
+            else_expr: Box::new(rec(else_expr)),
+        }),
+        ExprKind::Concatenation(items) => {
+            rebuild(ExprKind::Concatenation(items.iter().map(rec).collect()))
+        }
+        ExprKind::Replication { count, exprs } => rebuild(ExprKind::Replication {
+            count: Box::new(rec(count)),
+            exprs: exprs.iter().map(rec).collect(),
+        }),
+        _ => e.clone(),
     }
 }
 
@@ -38797,7 +39019,11 @@ fn substitute_const_fn_calls(
                     elab,
                 ));
             }
-            let v = eval_const_user_function(&fd, &argv, params, elab, depth)?;
+            let owner = const_fn_owner_package(&fname, scoped_key.as_deref(), &fd, elab);
+            let prev_owner = CONST_FN_PACKAGE.with(|c| c.replace(owner));
+            let v = eval_const_user_function(&fd, &argv, params, elab, depth);
+            CONST_FN_PACKAGE.with(|c| *c.borrow_mut() = prev_owner);
+            let v = v?;
             // §13.4.1: preserve the declared return width and signedness,
             // including wide and four-state results used by another call.
             const_value_literal(&v, expr.span)?
