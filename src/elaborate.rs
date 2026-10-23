@@ -33998,6 +33998,26 @@ fn inline_module_items(
                                     sub_local_params.insert(assign.name.name.clone(), val);
                                 }
                             } else if assign.dimensions.is_empty() {
+                                // §7.2.1: an OVERRIDDEN parameter skips the
+                                // default path above, which is where a
+                                // struct-typed header parameter registers its
+                                // field layout. Later header localparams
+                                // (`localparam int unsigned WIDTH =
+                                // Features.Width`) are folded in this same
+                                // loop, so the layout has to be in place here;
+                                // registered afterwards, the select reads a
+                                // 32-bit 0 and `[WIDTH-1:0]` elaborates to 2
+                                // bits.
+                                if let Some(fields) = flatten_struct_fields(
+                                    data_type,
+                                    &sub_local_params,
+                                    &elab.typedefs,
+                                    &elab.typedef_types,
+                                ) {
+                                    if !fields.is_empty() {
+                                        tls_register_struct_layout(&assign.name.name, &fields);
+                                    }
+                                }
                                 // §23.10.2: an override (`#(…)` or defparam) is
                                 // an assignment to the formal's declared type,
                                 // just as the default is: evaluated in its width
