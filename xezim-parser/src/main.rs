@@ -2,12 +2,16 @@
 //!
 //! Usage: sv-parse [OPTIONS] <files...>
 //!
+//! Files with a C++ extension (`.cpp`, `.cc`, `.h`, `.hpp`, …) go through
+//! the SystemC front end ([`sv_parser::systemc`]).
+//!
 //! Options:
 //!   --dump-tokens   Print token stream
 //!   --dump-ast      Print parsed AST (Rust Debug format)
 //!   --dump-json     Print parsed AST as JSON — one object per file
 //!                   (fields: file, source_text, ast, errors, warnings)
 //!   --check         Parse only, report errors (default)
+//!   --systemc       Parse every file as SystemC (C++), whatever its extension
 //!   -I <dir>        Add include directory
 //!   -D <name=val>   Define preprocessor macro
 //!   --help          Show this help
@@ -29,6 +33,8 @@ fn main() {
         eprintln!("  --dump-ast      Print parsed AST (Rust Debug format)");
         eprintln!("  --dump-json     Print parsed AST as JSON");
         eprintln!("  --check         Parse and report errors (default)");
+        eprintln!("  --systemc       Parse every file as SystemC (C++)");
+        eprintln!("                  (default for .cpp/.cc/.cxx/.h/.hpp/.hh files)");
         eprintln!("  -I <dir>        Add include directory");
         eprintln!("  -D <name=val>   Define preprocessor macro");
         eprintln!("  --help          Show this help");
@@ -41,6 +47,7 @@ fn main() {
     let mut dump_tokens = false;
     let mut dump_ast = false;
     let mut dump_json = false;
+    let mut force_systemc = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -49,6 +56,7 @@ fn main() {
             "--dump-ast" => dump_ast = true,
             "--dump-json" => dump_json = true,
             "--check" => {}
+            "--systemc" => force_systemc = true,
             "-I" => {
                 i += 1;
                 if i < args.len() {
@@ -98,6 +106,14 @@ fn main() {
     let mut total_modules = 0;
 
     for file in &files {
+        if force_systemc || systemc::is_systemc_path(file) {
+            let (errors, warnings, modules) =
+                run_systemc(file, &inc_refs, &def_refs, dump_tokens, dump_ast, dump_json);
+            total_errors += errors;
+            total_warnings += warnings;
+            total_modules += modules;
+            continue;
+        }
         if dump_tokens {
             let content = match std::fs::read_to_string(file) {
                 Ok(c) => c,
@@ -180,4 +196,69 @@ fn main() {
     if total_errors > 0 {
         process::exit(1);
     }
+}
+
+/// Parse one SystemC file; returns (errors, warnings, modules).
+fn run_systemc(
+    file: &str,
+    include_dirs: &[&str],
+    defines: &[(&str, &str)],
+    dump_tokens: bool,
+    dump_ast: bool,
+    dump_json: bool,
+) -> (usize, usize, usize) {
+    if dump_tokens {
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error: {}: {}", file, e);
+                return (1, 0, 0);
+            }
+        };
+        let mut pp = systemc::preprocess::Preprocessor::new(include_dirs, defines);
+        for tok in pp.run(file, content) {
+            println!(
+                "{:?} {:?} @ {}:{}..{}",
+                tok.kind, tok.text, tok.span.file, tok.span.start, tok.span.end
+            );
+        }
+        return (0, 0, 0);
+    }
+    let result = match systemc::parse_file(file, include_dirs, defines) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return (1, 0, 0);
+        }
+    };
+    for diag in result.errors.iter().chain(&result.warnings) {
+        eprintln!("{}", result.render(diag));
+    }
+    if dump_ast {
+        println!("{:#?}", result.unit);
+    }
+    #[cfg(feature = "json-cli")]
+    if dump_json {
+        let envelope = serde_json::json!({
+            "file": file,
+            "language": "systemc",
+            "ast": result.unit,
+            "errors": result.errors,
+            "warnings": result.warnings,
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&envelope).expect("ast serialization")
+        );
+    }
+    #[cfg(not(feature = "json-cli"))]
+    if dump_json {
+        eprintln!("--dump-json requires the `json-cli` cargo feature");
+        process::exit(2);
+    }
+    (
+        result.errors.len(),
+        result.warnings.len(),
+        result.unit.modules().len(),
+    )
 }

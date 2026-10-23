@@ -5,6 +5,9 @@
 //! Provides lexing, preprocessing, and parsing of SystemVerilog source into a
 //! typed AST. No simulation or elaboration — just parsing.
 //!
+//! The [`systemc`] module is a second front end for SystemC (C++) designs,
+//! RTL and TLM-2.0, with an AST of its own.
+//!
 //! ## Quick start
 //!
 //! ```rust
@@ -26,6 +29,7 @@ pub mod parse;
 pub mod preprocessor;
 pub mod source_map;
 pub mod strict_check;
+pub mod systemc;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

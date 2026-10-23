@@ -19,8 +19,8 @@ Two crates in one repo:
 - **`xezim-core`** (this crate, `src/`, lib name `xezim_core`) — elaboration,
   values, artifact serialization, deterministic hasher, SDF, VCD/stdout sinks.
 - **`sv-parser`** (subcrate at `xezim-parser/`, lib name `sv_parser`, bin
-  `sv-parse`) — lexer, preprocessor, parser, strict-checks. Parse-only; no
-  simulation or elaboration.
+  `sv-parse`) — lexer, preprocessor, parser, strict-checks, plus the SystemC
+  front end (`sv_parser::systemc`). Parse-only; no simulation or elaboration.
 
 `xezim` consumes this repo as a **git dependency pinned by `rev`** — each
 xezim revision names the exact core revision it was tested against, so bare
@@ -64,6 +64,9 @@ xezim-parser/src/parse/   Recursive-descent parser → AST (declarations, expres
 xezim-parser/src/ast/     Typed AST (decl, expr, module, stmt, types)
 xezim-parser/src/diagnostics/  Diagnostic type + rendering
 xezim-parser/src/strict_check.rs  Additive negative-case lint (gated by --strict)
+xezim-parser/src/systemc/ SystemC (C++, RTL + TLM-2.0) front end with its own AST:
+                          lexer, token-level preprocessor, parser/, ast.rs, classify.rs
+                          (ports/sockets/processes). Parse-only; not yet elaborated
 ```
 
 ## Build & test

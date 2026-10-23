@@ -26,6 +26,11 @@ src/
 │   └── types.rs    — data types, nets, packed/unpacked dimensions
 ├── serde/          — optional serialization support (see below)
 ├── diagnostics/    — diagnostics & error reporting
+├── systemc/        — SystemC (C++) front end with its own AST — see below
+│   ├── lexer.rs, token.rs, preprocess.rs  — C++ tokens and #include/#define/#if
+│   ├── parser/     — declarations, statements, expressions
+│   ├── ast.rs      — SystemC AST
+│   └── classify.rs — ports/channels/sockets/processes of a module
 ├── lib.rs          — crate root, public API
 ├── main.rs         — `sv-parse` binary (smoke-test runner)
 └── tests.rs
@@ -85,6 +90,44 @@ The `sv-parse` binary does a quick parse-only smoke test of a file:
 ```bash
 cargo run --bin sv-parse -- path/to/source.sv
 ```
+
+---
+
+## SystemC front end
+
+`sv_parser::systemc` parses SystemC designs — the RTL subset and TLM-2.0
+(IEEE 1666-2023) — into a separate SystemC AST. The input is C++: classes,
+templates, operator overloads, lambdas and the usual statements, with the
+SystemC macros (`SC_MODULE`, `SC_CTOR`, `SC_HAS_PROCESS`, `SC_METHOD` /
+`SC_THREAD` / `SC_CTHREAD`, `sensitive`, `dont_initialize`,
+`reset_signal_is`, `SC_NAMED`, `SC_FORK`/`SC_JOIN`, and the SystemC 3.0
+`SC_*_IMP` / `SC_INIT` / `SC_NAMED_WITH_INIT`) recognized as syntax. The
+SystemC/TLM library headers are not read (`#include <systemc>` is skipped);
+a design's own headers are included and macro-expanded normally.
+
+```rust
+use sv_parser::systemc;
+
+let r = systemc::parse_file("top.cpp", &["./include"], &[("NDEBUG", "1")]).unwrap();
+for d in &r.errors {
+    eprintln!("{}", r.render(d)); // file:line:col: error: … + source line + caret
+}
+for m in r.unit.modules() {
+    println!("{}: {} ports, {} processes", m.name_str().unwrap_or("?"),
+             m.ports().len(), r.unit.processes(m).len());
+}
+```
+
+`sv-parse` sends files with a C++ extension (`.cpp`, `.cc`, `.cxx`, `.h`,
+`.hpp`, `.hh`, …) through this front end; `--systemc` forces it for any file.
+`--dump-ast` / `--dump-json` print the SystemC AST.
+
+Not supported (diagnosed, never silently accepted): function-pointer and
+pointer-to-member declarators, template template parameters, `goto`,
+function-try-blocks. Names are not resolved: a `<` after an unknown name is a
+template argument list only when it parses as one in a type position (or
+before `(`/`::` in an expression), and library types are recognized by
+spelling (see `parser/mod.rs` for the built-in name tables).
 
 ---
 
