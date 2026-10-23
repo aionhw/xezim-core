@@ -75,6 +75,7 @@ mod body_type_params;
 pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;
+pub mod systemc;
 pub mod upf;
 pub mod value;
 pub mod vcd_sink;
@@ -1279,6 +1280,10 @@ pub fn parse_and_elaborate_multi_preprocessed(
         line_maps.push(line_map);
     }
 
+    // SystemC sources (IEEE 1666): lowered to SystemVerilog descriptions; the
+    // generated `sc_main` testbench is the top unless one was named.
+    let systemc_top = systemc::inject(&mut all_descriptions)?;
+    let top_module_name = top_module_name.or(systemc_top.as_deref());
     // IEEE 1801 power intent: splice the generated UPF package and glue
     // processes into the parsed design before elaboration.
     upf::inject(&mut all_descriptions, top_module_name)?;

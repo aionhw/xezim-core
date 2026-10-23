@@ -55,6 +55,10 @@ src/packed_value.rs       Separate packed-bit representation; current Value alre
 src/bits2.rs              2-state arbitrary-width value (Verilator-style, no X/Z mask);
                           the compute-core type for the cycle-based path
 src/sdf/                  SDF parser + annotator (IEEE 1497-2001): IOPATH/INTERCONNECT delays
+src/systemc/              SystemC (IEEE 1666) → SystemVerilog AST lowering, injected before
+                          elaboration like UPF: modules/processes (module.rs), bodies (lower.rs),
+                          types (types.rs), AST builders with synthetic spans (build.rs), and
+                          the `sc_rt` runtime package (runtime.sv: time, C-pointer memory, TLM)
 src/vcd_sink.rs           VCD waveform dump
 src/stdout_sink.rs        Locked stdout/stderr sink — feeds xezim's `-l` fd-level redirect
 xezim-parser/src/lexer/   Tokenizer (scanner.rs, token.rs)
@@ -66,7 +70,7 @@ xezim-parser/src/diagnostics/  Diagnostic type + rendering
 xezim-parser/src/strict_check.rs  Additive negative-case lint (gated by --strict)
 xezim-parser/src/systemc/ SystemC (C++, RTL + TLM-2.0) front end with its own AST:
                           lexer, token-level preprocessor, parser/, ast.rs, classify.rs
-                          (ports/sockets/processes). Parse-only; not yet elaborated
+                          (ports/sockets/processes). Parse-only; lowered by src/systemc/
 ```
 
 ## Build & test
@@ -105,6 +109,7 @@ Key types: `Value`/`LogicBit` (4-state), `Bits2` (2-state), `ElaboratedModule`,
 | Value arithmetic/representation, `$bits`, X/Z propagation | `src/value.rs`, `src/bits2.rs` |
 | `$display`/formatting output | `src/stdout_sink.rs` |
 | SDF annotation | `src/sdf/` |
+| SystemC result differs from the SystemC reference kernel | `src/systemc/` (lowering) — diff against `g++ … -lsystemc` |
 | VCD dumping | `src/vcd_sink.rs` |
 
 `src/lib.rs` re-exports the surface `xezim` relies on:
