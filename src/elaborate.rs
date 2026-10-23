@@ -20363,6 +20363,12 @@ pub fn const_eval_i64_with_params(
                             })
                         })
                     }
+                    // §7.2.2: `a[i].field.subfield` — the base is not a bare ident.
+                    ExprKind::MemberAccess { expr: base, member }
+                        if !matches!(base.kind, ExprKind::Ident(_)) =>
+                    {
+                        const_struct_field_in_base(base, &member.name).map(|(_, w)| w as i64)
+                    }
                     // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
                     // `::` lowers to the SAME `MemberAccess` node as a struct
                     // member select, so accept the leaf name and let the typedef
@@ -20376,19 +20382,8 @@ pub fn const_eval_i64_with_params(
                     ExprKind::MemberAccess { expr: base, member }
                         if matches!(base.kind, ExprKind::Ident(_)) =>
                     {
-                        let from_layout = if let ExprKind::Ident(h) = &base.kind {
-                            let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                            STRUCT_FIELDS_TLS.with(|c| {
-                                c.borrow().get(nm).and_then(|layout| {
-                                    layout
-                                        .iter()
-                                        .find(|(f, _, _)| f == &member.name)
-                                        .map(|&(_, _, w)| w as i64)
-                                })
-                            })
-                        } else {
-                            None
-                        };
+                        let from_layout =
+                            const_struct_field_in_base(base, &member.name).map(|(_, w)| w as i64);
                         // §26.3: `P::T` must reach THAT package's typedef —
                         // the bare name is one global slot a same-named typedef
                         // in another package can own.
@@ -20825,6 +20820,62 @@ fn tls_register_struct_layout(name: &str, fields: &[(String, u32, u32)]) {
     STRUCT_FIELDS_TLS.with(|c| {
         c.borrow_mut().insert(name.to_string(), fields.to_vec());
     });
+}
+
+/// Root parameter and dotted field path of a const select base.
+/// An index is the element (`OUTERS[0].rsp` keeps layout `OUTERS`, path `rsp`).
+fn const_struct_select_root(expr: &Expression) -> Option<(String, String)> {
+    match &expr.kind {
+        ExprKind::Paren(inner) => const_struct_select_root(inner),
+        ExprKind::Index { expr, .. } => const_struct_select_root(expr),
+        ExprKind::Ident(h) => {
+            let root = h.path.first()?.name.name.clone();
+            let prefix = h.path[1..]
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            Some((root, prefix))
+        }
+        ExprKind::MemberAccess { expr, member } => {
+            let (root, prefix) = const_struct_select_root(expr)?;
+            let path = if prefix.is_empty() {
+                member.name.clone()
+            } else {
+                format!("{prefix}.{}", member.name)
+            };
+            Some((root, path))
+        }
+        _ => None,
+    }
+}
+
+/// `(offset within the evaluated base, width)` of `member` (§7.2.2).
+/// Nested paths are stored on the root (`rsp.accept`); the offset is relative
+/// to the prefix already sliced into the base value.
+fn const_struct_field_in_base(base: &Expression, member: &str) -> Option<(u32, u32)> {
+    let (root, prefix) = const_struct_select_root(base)?;
+    let full = if prefix.is_empty() {
+        member.to_string()
+    } else {
+        format!("{prefix}.{member}")
+    };
+    STRUCT_FIELDS_TLS.with(|c| {
+        let map = c.borrow();
+        let layout = map.get(&root)?;
+        let (abs, w) = layout
+            .iter()
+            .find(|(f, _, _)| f == &full)
+            .map(|(_, o, w)| (*o, *w))?;
+        if prefix.is_empty() {
+            return Some((abs, w));
+        }
+        let poff = layout
+            .iter()
+            .find(|(f, _, _)| f == &prefix)
+            .map(|(_, o, _)| *o)?;
+        abs.checked_sub(poff).map(|rel| (rel, w))
+    })
 }
 
 /// Record a packed-array parameter's element width for const-eval index selects
@@ -24703,25 +24754,22 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                         .or_else(|| atom_keyword_width(n))
                         .unwrap_or(0)
                 }
+                // §7.2.2: `a[i].field.subfield` — the base is not a bare ident.
+                ExprKind::MemberAccess { expr: base, member }
+                    if !matches!(base.kind, ExprKind::Ident(_)) =>
+                {
+                    const_struct_field_in_base(base, &member.name)
+                        .map(|(_, w)| w)
+                        .unwrap_or(0)
+                }
                 // §26.3 package-/class-scoped type — see the matching arm in
                 // `const_eval_i64_with_params`. A struct MEMBER select
                 // (`$bits(CDEF.b)`) answers from the base's field layout.
                 ExprKind::MemberAccess { expr: base, member }
                     if matches!(base.kind, ExprKind::Ident(_)) =>
                 {
-                    let from_layout = if let ExprKind::Ident(h) = &base.kind {
-                        let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                        STRUCT_FIELDS_TLS.with(|c| {
-                            c.borrow().get(nm).and_then(|layout| {
-                                layout
-                                    .iter()
-                                    .find(|(f, _, _)| f == &member.name)
-                                    .map(|&(_, _, w)| w)
-                            })
-                        })
-                    } else {
-                        None
-                    };
+                    let from_layout =
+                        const_struct_field_in_base(base, &member.name).map(|(_, w)| w);
                     // §26.3: `P::T` must reach THAT package's typedef. Package
                     // typedefs also occupy one global bare-name table, so a
                     // same-named typedef in another package can own the bare
@@ -25289,6 +25337,14 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     if w > 0 && off + w <= base_val.width {
                         return base_val.range_select((off + w - 1) as usize, off as usize);
                     }
+                }
+            }
+            // §7.2.2: `array[i].field.subfield`. The base is itself a select,
+            // so the layout key is the root parameter (`rsp.accept` on
+            // `OUTERS`), and the offset is relative to that base value.
+            if let Some((off, w)) = const_struct_field_in_base(base, &member.name) {
+                if w > 0 && off + w <= base_val.width {
+                    return base_val.range_select((off + w - 1) as usize, off as usize);
                 }
             }
             Value::zero(32)

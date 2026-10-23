@@ -158,6 +158,20 @@ pub(super) fn register(
     };
     let width = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
     let full_name = format!("{prefix}{name}");
+    if let Some(fields) = super::packed_struct_field_layout(
+        data_type,
+        params,
+        &elab.typedefs,
+        &elab.typedef_types,
+    ) {
+        // §7.2.2: `array[i].field.subfield` slices the element Value. The
+        // layout has to be on the array name; a scalar struct parameter
+        // already records it, an unpacked array of that struct did not.
+        super::tls_register_struct_layout(&full_name, &fields);
+        elab.packed_struct_fields
+            .entry(full_name.clone())
+            .or_insert(fields);
+    }
     register_shape(elab, &full_name, &shape, width);
     // §6.20.2: aggregate parameter elements use whole Value storage.
     // An unpacked variable type would route their member reads to separate
