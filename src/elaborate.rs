@@ -35787,9 +35787,68 @@ fn inline_module_items(
                             };
                             let is_signed =
                                 is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
+                            // §7.4.1: packed dims that live on the TYPEDEF
+                            // (`typedef k_lane [4:0] k_plane; k_plane a;`) are
+                            // recorded for a top-level variable and for an
+                            // inlined port or net. This inlined VARIABLE arm
+                            // never did, so `a` was one 320-bit scalar with no
+                            // element stride. A continuous `a[1][0] = 1'b1`
+                            // then compiled as a bit-select of bit 0, and
+                            // `a[lane] = 64'h..` wrote that lane's LSB.
+                            // Procedural assigns stayed on the interpreter,
+                            // which still walked the typedef. One step of the
+                            // typedef, same as the top-level DataDecl arm —
+                            // `resolve_typedef_chain` would drop the
+                            // intermediate `[4:0]`.
+                            let dd_resolved: DataType = match &dd.data_type {
+                                DataType::TypeReference { name, .. } => lookup_scoped_type(
+                                    name,
+                                    &elab.typedef_types,
+                                )
+                                .cloned()
+                                .unwrap_or_else(|| dd.data_type.clone()),
+                                _ => dd.data_type.clone(),
+                            };
                             for decl in &dd.declarators {
                                 let base_name = decl.name.name.clone();
                                 let sig_name = cat2(&inst_prefix, &base_name);
+                                if !elab.packed_signal_elem_widths.contains_key(&sig_name) {
+                                    if let Some(elem_w) = packed_inner_elem_width(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                    )
+                                    .or_else(|| {
+                                        packed_inner_elem_width(
+                                            &dd_resolved,
+                                            &sub_merged_params,
+                                            &elab.typedefs,
+                                        )
+                                    }) {
+                                        elab.packed_signal_elem_widths
+                                            .insert(sig_name.clone(), elem_w);
+                                    }
+                                }
+                                if !elab.packed_full_dims.contains_key(&sig_name) {
+                                    if let Some(fdims) =
+                                        packed_full_dims_of(&dd.data_type, &sub_merged_params)
+                                            .or_else(|| {
+                                                packed_full_dims_of(
+                                                    &dd_resolved,
+                                                    &sub_merged_params,
+                                                )
+                                            })
+                                            .or_else(|| {
+                                                packed_full_dims_chained(
+                                                    &dd.data_type,
+                                                    &sub_merged_params,
+                                                    &elab.typedef_types,
+                                                )
+                                            })
+                                    {
+                                        elab.packed_full_dims.insert(sig_name.clone(), fdims);
+                                    }
+                                }
                                 // §6.18: unpacked dims may come from the
                                 // TYPEDEF (`typedef t_byte t_word [0:3];
                                 // t_word s;`), not the declarator — same gap
