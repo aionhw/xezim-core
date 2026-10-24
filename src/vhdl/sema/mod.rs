@@ -6,6 +6,7 @@
 //! analyses that package (and what it depends on) first, so the order of the
 //! source files does not matter.
 
+mod config;
 mod decl;
 mod expr;
 pub mod hir;
@@ -120,6 +121,14 @@ pub struct Design {
     pub entities: BTreeMap<(String, String), EntityInfo>,
     pub archs: Vec<Architecture>,
     pub components: Vec<ComponentInfo>,
+    /// Block configurations being applied (`config::BlockCfg`).
+    pub block_configs: Vec<config::BlockCfg>,
+    /// Configuration specifications by declarative region, with their
+    /// library and file.
+    cfg_specs: Vec<(RegionId, ast::ConfigSpec, String, FileId)>,
+    /// The block configuration of the architecture or block being
+    /// analysed.
+    cur_cfg: Option<usize>,
     /// The names alias declarations stand for.
     pub aliases: Vec<HExpr>,
     /// Labels of loops (by `Sym::Label` id) — names only, for diagnostics.
@@ -191,6 +200,9 @@ impl Design {
             entities: BTreeMap::new(),
             archs: Vec::new(),
             components: Vec::new(),
+            block_configs: Vec::new(),
+            cfg_specs: Vec::new(),
+            cur_cfg: None,
             aliases: Vec::new(),
             labels: Vec::new(),
             units: BTreeMap::new(),
@@ -787,7 +799,12 @@ impl Design {
 
     /// Analyse an entity with generic values (by name) in place of the
     /// defaults: its ports and declarations see them (§14.4.2.2).
-    fn entity_with(&mut self, lib: &str, name: &str, binding: &[(String, Value)]) -> Option<EntityInfo> {
+    fn entity_with(
+        &mut self,
+        lib: &str,
+        name: &str,
+        binding: &[(String, Value)],
+    ) -> Option<EntityInfo> {
         self.ensure_library(lib);
         let src = self.units.get(lib)?.get(name)?.clone();
         let du = self.unit_ast(&src)?.clone();
@@ -827,14 +844,14 @@ impl Design {
     /// The architecture of an instance whose generic map gives values
     /// other than the defaults: analysed again for those values, once per
     /// distinct binding (§14.5.2). Returns it and its entity's ports.
-    fn analyze_bound_arch(
+    pub(super) fn analyze_bound_arch(
         &mut self,
         inst: &Instance,
         binding: Vec<(String, Value)>,
     ) -> Option<(usize, Vec<ObjId>, Vec<ObjId>)> {
         let key = format!(
-            "{}.{}({:?}){:?}",
-            inst.library, inst.entity, inst.arch, binding
+            "{}.{}({:?}){:?}{:?}",
+            inst.library, inst.entity, inst.arch, binding, inst.config
         );
         if let Some(r) = self.bound_archs.get(&key) {
             return Some(r.clone());
@@ -853,6 +870,7 @@ impl Design {
             return None;
         };
         let lib = inst.library.clone();
+        let cfg = inst.config;
         let arch = self.in_unit(&lib, src.file, |d| {
             let ctx = d.context_region(&du.context);
             let r = d.new_region(Some(ent.region));
@@ -862,10 +880,17 @@ impl Design {
                     d.declare(r, &n, x);
                 }
             }
-            d.architecture(r, &ent, a)
+            let saved = std::mem::replace(&mut d.cur_cfg, cfg);
+            let arch = d.architecture(r, &ent, a);
+            d.cur_cfg = saved;
+            arch
         });
         self.archs.push(arch);
-        let res = (self.archs.len() - 1, ent.generics.clone(), ent.ports.clone());
+        let res = (
+            self.archs.len() - 1,
+            ent.generics.clone(),
+            ent.ports.clone(),
+        );
         self.bound_archs.insert(key, res.clone());
         Some(res)
     }
@@ -885,7 +910,11 @@ impl Design {
         // The default analysis (not one for a generic binding).
         let bound: Vec<usize> = self.bound_archs.values().map(|b| b.0).collect();
         if let Some(i) = self.archs.iter().enumerate().position(|(i, a)| {
-            a.library == lib && a.entity == entity && a.name == aname && !bound.contains(&i)
+            a.library == lib
+                && a.entity == entity
+                && a.name == aname
+                && !a.nested
+                && !bound.contains(&i)
         }) {
             return Some(i);
         }
@@ -902,7 +931,10 @@ impl Design {
                     d.declare(r, &n, x);
                 }
             }
-            d.architecture(r, &ent, a)
+            let saved = d.cur_cfg.take();
+            let arch = d.architecture(r, &ent, a);
+            d.cur_cfg = saved;
+            arch
         });
         self.archs.push(arch);
         Some(self.archs.len() - 1)
@@ -926,35 +958,69 @@ pub fn analyze(
     d.add_universal_types();
     d.ensure_library("std");
     d.analyze_package("std", "standard");
-    let mut user_entities = Vec::new();
+    // Entities and configurations of the user's files: (library, name,
+    // is a configuration).
+    let mut user_units = Vec::new();
+    let mut configured = Vec::new();
     for (lib, p) in files {
-        let file = d.files.len();
         if let Some(df) = &p.ast {
             for u in &df.units {
-                if let LibraryUnit::Entity(e) = &u.unit {
-                    user_entities.push((lib.clone(), e.name.name.clone(), file));
+                match &u.unit {
+                    LibraryUnit::Entity(e) => {
+                        user_units.push((lib.clone(), e.name.name.clone(), false));
+                    }
+                    LibraryUnit::Configuration(c) => {
+                        user_units.push((lib.clone(), c.name.name.clone(), true));
+                        configured.extend(last_ident(&c.entity).map(|i| i.name.clone()));
+                    }
+                    _ => {}
                 }
             }
         }
         d.add_file(&lib, p);
     }
-    // The top: named, or the last entity no architecture instantiates.
+    // The top: named, or the last entity no architecture instantiates and
+    // no configuration configures, or the last configuration (§14.2).
     let instantiated: Vec<String> = d.instantiated_entities();
-    let top_ent = match top {
-        Some(t) => user_entities
+    let top_unit = match top {
+        Some(t) => user_units
             .iter()
             .find(|(_, n, _)| n == &t.to_ascii_lowercase())
             .cloned(),
-        None => user_entities
+        None => user_units
             .iter()
             .rev()
-            .find(|(_, n, _)| !instantiated.contains(n))
+            .find(|(_, n, cfg)| !instantiated.contains(n) && (*cfg || !configured.contains(n)))
             .cloned(),
     };
-    let Some((lib, name, _)) = top_ent else {
+    let Some((lib, name, is_cfg)) = top_unit else {
         return Err(vec!["VHDL: no top-level entity found".to_string()]);
     };
-    let top = d.analyze_arch(&lib, &name, None);
+    let top = if is_cfg {
+        match d.config_by_name(&lib, &name) {
+            Some((elib, ename, arch, config)) => {
+                let inst = Instance {
+                    label: String::new(),
+                    library: elib,
+                    entity: ename,
+                    arch,
+                    arch_index: None,
+                    generic_map: Vec::new(),
+                    port_map: Vec::new(),
+                    port_conv: Vec::new(),
+                    config,
+                    loc: Loc {
+                        file: 0,
+                        span: 0..0,
+                    },
+                };
+                d.analyze_bound_arch(&inst, Vec::new()).map(|r| r.0)
+            }
+            None => None,
+        }
+    } else {
+        d.analyze_arch(&lib, &name, None)
+    };
     if !d.errors.is_empty() {
         return Err(d.render_errors());
     }
@@ -966,6 +1032,10 @@ pub fn analyze(
     while i < d.archs.len() {
         let insts = d.archs[i].instances.clone();
         for (j, inst) in insts.iter().enumerate() {
+            if inst.arch_index.is_some() {
+                // A block or generate iteration, analysed in place.
+                continue;
+            }
             // Generic values other than the defaults: a bound analysis.
             let mut binding = Vec::new();
             for (f, e) in &inst.generic_map {
@@ -976,10 +1046,12 @@ pub fn analyze(
                             binding.push((fo.name.clone(), v));
                         }
                     }
-                    None => d.errors.push((e.loc.clone(), "a generic actual must be static here".into())),
+                    None => d
+                        .errors
+                        .push((e.loc.clone(), "a generic actual must be static here".into())),
                 }
             }
-            if binding.is_empty() {
+            if binding.is_empty() && inst.config.is_none() {
                 let a = d.analyze_arch(&inst.library, &inst.entity, inst.arch.as_deref());
                 d.archs[i].instances[j].arch_index = a;
                 continue;
@@ -990,7 +1062,10 @@ pub fn analyze(
             if let Some((a, gens, ports)) = d.analyze_bound_arch(inst, binding) {
                 // The formals of the bound entity, by position.
                 let remap = |o: ObjId, from: &[ObjId], to: &[ObjId]| {
-                    from.iter().position(|x| *x == o).map(|p| to[p]).unwrap_or(o)
+                    from.iter()
+                        .position(|x| *x == o)
+                        .map(|p| to[p])
+                        .unwrap_or(o)
                 };
                 let ins = &mut d.archs[i].instances[j];
                 ins.arch_index = Some(a);
@@ -999,6 +1074,23 @@ pub fn analyze(
                 }
                 for (f, _) in ins.port_map.iter_mut() {
                     *f = remap(*f, &default.ports, &ports);
+                }
+                let objs = &d.objects;
+                for pc in ins.port_conv.iter_mut() {
+                    let to = remap(pc.formal, &default.ports, &ports);
+                    let side = if pc.mode == ast::Mode::In {
+                        &mut pc.target
+                    } else {
+                        &mut pc.value
+                    };
+                    *side = config::map_objs(side, &mut |o| {
+                        (o == pc.formal).then(|| HExpr {
+                            kind: HExprKind::Obj(to),
+                            ty: objs[to].ty,
+                            loc: objs[to].loc.clone(),
+                        })
+                    });
+                    pc.formal = to;
                 }
             }
         }
@@ -1088,6 +1180,10 @@ impl Design {
                     if let Some(e) = e {
                         calls_in_expr(e, &mut calls);
                     }
+                }
+                for pc in &i.port_conv {
+                    calls_in_expr(&pc.target, &mut calls);
+                    calls_in_expr(&pc.value, &mut calls);
                 }
             }
         }

@@ -94,10 +94,7 @@ impl<'a> Lw<'a> {
                 format!("{}vh_tio_write({}, {}, {}, {});\n", pad, l, s, just, field)
             }
             _ => {
-                self.err(
-                    loc,
-                    format!("'std.textio.{}' is not supported yet", name),
-                );
+                self.err(loc, format!("'std.textio.{}' is not supported yet", name));
                 String::new()
             }
         }

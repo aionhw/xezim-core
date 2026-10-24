@@ -107,6 +107,71 @@ pub struct PackageInst {
 pub struct ConfigDecl {
     pub name: Ident,
     pub entity: Name,
+    pub block: Option<BlockConfig>,
+    pub span: Span,
+}
+
+/// `for <block spec> <items> end for;` (§3.4.2).
+#[derive(Clone, Debug)]
+pub struct BlockConfig {
+    /// An architecture name, block label, or generate label with an
+    /// optional index, range or alternative label.
+    pub spec: Name,
+    pub items: Vec<ConfigItem>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConfigItem {
+    Block(BlockConfig),
+    Component(Box<ComponentConfig>),
+}
+
+/// `for <component spec> [binding;] [block configuration] end for;`
+/// (§3.4.3).
+#[derive(Clone, Debug)]
+pub struct ComponentConfig {
+    pub spec: ComponentSpec,
+    pub binding: Option<BindingInd>,
+    pub block: Option<BlockConfig>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum InstList {
+    Labels(Vec<Ident>),
+    Others,
+    All,
+}
+
+#[derive(Clone, Debug)]
+pub struct ComponentSpec {
+    pub insts: InstList,
+    pub comp: Name,
+}
+
+#[derive(Clone, Debug)]
+pub enum EntityAspect {
+    /// `entity lib.e(arch)`
+    Entity(Name, Option<Ident>),
+    Configuration(Name),
+    Open,
+}
+
+/// `use <entity aspect> generic map (…) port map (…)` (§7.3.2).
+#[derive(Clone, Debug)]
+pub struct BindingInd {
+    pub aspect: Option<EntityAspect>,
+    pub generic_map: Vec<Assoc>,
+    pub port_map: Vec<Assoc>,
+    pub span: Span,
+}
+
+/// `for <component spec> <binding>;` in a declarative part (§7.3.1).
+#[derive(Clone, Debug)]
+pub struct ConfigSpec {
+    pub spec: ComponentSpec,
+    pub binding: BindingInd,
     pub span: Span,
 }
 
@@ -409,6 +474,7 @@ pub enum Decl {
         span: Span,
     },
     Component(ComponentDecl),
+    ConfigSpec(ConfigSpec),
     Attribute {
         name: Ident,
         mark: Name,

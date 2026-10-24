@@ -7,6 +7,28 @@ use super::hir::*;
 use super::{Design, RegionId, Sym};
 use crate::vhdl::ast;
 
+/// A formal, its actual (`None`: open or unassociated) and whether it is
+/// associated explicitly.
+pub type Assoc = (ObjId, Option<HExpr>, bool);
+
+/// The source of a nested scope (block or generate iteration).
+struct Nested<'a> {
+    label: String,
+    /// The statement label, iteration value and alternative label, for
+    /// block configurations (§3.4.2).
+    cfg_label: &'a str,
+    index: Option<Value>,
+    alt: Option<&'a str>,
+    /// A for-generate parameter: name, type and value.
+    param: Option<(&'a ast::Ident, TypeId, Value)>,
+    generics: &'a [ast::InterfaceDecl],
+    generic_map: &'a [ast::Assoc],
+    ports: &'a [ast::InterfaceDecl],
+    port_map: &'a [ast::Assoc],
+    decls: &'a [ast::Decl],
+    stmts: &'a [ast::ConcStmt],
+}
+
 #[derive(Clone)]
 pub struct StmtCtx {
     /// In a process (wait and signal assignment allowed).
@@ -427,7 +449,7 @@ impl Design {
     }
 
     /// Whether a name is static (indices are static expressions).
-    fn static_name(&self, h: &HExpr) -> bool {
+    pub fn static_name(&self, h: &HExpr) -> bool {
         match &h.kind {
             HExprKind::Obj(_) => true,
             HExprKind::Index(b, i) => {
@@ -606,18 +628,276 @@ impl Design {
                 generic_map,
                 port_map,
             } => self.instance(r, &s.label, unit, generic_map, port_map, arch, loc),
-            ast::ConcKind::Block { .. } => {
-                self.error(s.span.clone(), "block statements are not supported yet")
+            ast::ConcKind::Block {
+                guard,
+                generics,
+                generic_map,
+                ports,
+                port_map,
+                decls,
+                stmts,
+            } => {
+                if let Some(g) = guard {
+                    self.error(g.span.clone(), "guarded blocks are not supported yet");
+                    return;
+                }
+                self.nested_scope(
+                    r,
+                    arch,
+                    loc,
+                    Nested {
+                        label: label.clone(),
+                        cfg_label: &label,
+                        index: None,
+                        alt: None,
+                        param: None,
+                        generics,
+                        generic_map,
+                        ports,
+                        port_map,
+                        decls,
+                        stmts,
+                    },
+                );
             }
-            ast::ConcKind::ForGenerate { .. }
-            | ast::ConcKind::IfGenerate(_)
-            | ast::ConcKind::CaseGenerate { .. } => {
-                self.error(s.span.clone(), "generate statements are not supported yet")
+            ast::ConcKind::ForGenerate {
+                param,
+                range,
+                decls,
+                stmts,
+            } => {
+                // §14.5.3: one block per value of the (static) range.
+                let Some((t, hr)) = self.discrete_range(r, range, None) else {
+                    return;
+                };
+                let vals = hr.static_val.as_ref().and_then(|sr| {
+                    let (l, rr) = (sr.left.as_i64()?, sr.right.as_i64()?);
+                    Some(match sr.dir {
+                        ast::Dir::To => (l..=rr).collect::<Vec<_>>(),
+                        ast::Dir::Downto => (rr..=l).rev().collect(),
+                    })
+                });
+                let Some(vals) = vals else {
+                    self.error(s.span.clone(), "the range of a for-generate must be static");
+                    return;
+                };
+                let is_enum = matches!(self.types[self.base(t)].kind, TypeKind::Enum(_));
+                for v in vals {
+                    let val = if is_enum {
+                        Value::Enum(v as u32)
+                    } else {
+                        Value::Int(v)
+                    };
+                    self.nested_scope(
+                        r,
+                        arch,
+                        loc.clone(),
+                        Nested {
+                            label: format!("{}({})", label, v),
+                            cfg_label: &label,
+                            index: Some(val.clone()),
+                            alt: None,
+                            param: Some((param, t, val)),
+                            generics: &[],
+                            generic_map: &[],
+                            ports: &[],
+                            port_map: &[],
+                            decls,
+                            stmts,
+                        },
+                    );
+                }
+            }
+            ast::ConcKind::IfGenerate(branches) => {
+                // §14.5.3: the first branch whose condition is true.
+                for b in branches {
+                    let take = match &b.cond {
+                        None => true,
+                        Some(c) => {
+                            let Some(h) = self.condition(r, c) else {
+                                return;
+                            };
+                            match self.eval(&h) {
+                                Some(v) => v == Value::Enum(1),
+                                None => {
+                                    self.error(
+                                        c.span.clone(),
+                                        "a generate condition must be static",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    if take {
+                        self.generate_branch(r, arch, loc, &label, b);
+                        return;
+                    }
+                }
+            }
+            ast::ConcKind::CaseGenerate { expr, branches } => {
+                let Some(x) = self.expr(r, expr, None) else {
+                    return;
+                };
+                let Some(v) = self.eval(&x) else {
+                    self.error(
+                        expr.span.clone(),
+                        "a case-generate expression must be static",
+                    );
+                    return;
+                };
+                for b in branches {
+                    let mut hit = false;
+                    for c in &b.choices {
+                        hit |= match c {
+                            ast::Choice::Others(_) => true,
+                            ast::Choice::Expr(e) => {
+                                let Some(h) = self.expr(r, e, Some(x.ty)) else {
+                                    return;
+                                };
+                                self.eval(&h).as_ref() == Some(&v)
+                            }
+                            ast::Choice::Range(dr) => {
+                                let Some((_, hr)) = self.discrete_range(r, dr, Some(x.ty)) else {
+                                    return;
+                                };
+                                match (hr.static_val, v.as_i64()) {
+                                    (Some(sr), Some(i)) => {
+                                        let (a, z) = (
+                                            sr.left.as_i64().unwrap_or(0),
+                                            sr.right.as_i64().unwrap_or(0),
+                                        );
+                                        match sr.dir {
+                                            ast::Dir::To => a <= i && i <= z,
+                                            ast::Dir::Downto => z <= i && i <= a,
+                                        }
+                                    }
+                                    _ => false,
+                                }
+                            }
+                        };
+                    }
+                    if hit {
+                        self.generate_branch(r, arch, loc, &label, b);
+                        return;
+                    }
+                }
             }
             ast::ConcKind::Unsupported(what) => {
                 self.error(s.span.clone(), format!("{} is not supported yet", what))
             }
         }
+    }
+
+    /// The chosen branch of an if- or case-generate.
+    fn generate_branch(
+        &mut self,
+        r: RegionId,
+        arch: &mut Architecture,
+        loc: Loc,
+        label: &str,
+        b: &ast::GenerateBranch,
+    ) {
+        let alt = b.alt_label.as_ref().map(|a| a.name.as_str());
+        self.nested_scope(
+            r,
+            arch,
+            loc,
+            Nested {
+                label: match alt {
+                    Some(a) => format!("{}({})", label, a),
+                    None => label.to_string(),
+                },
+                cfg_label: label,
+                index: None,
+                alt,
+                param: None,
+                generics: &[],
+                generic_map: &[],
+                ports: &[],
+                port_map: &[],
+                decls: &b.decls,
+                stmts: &b.stmts,
+            },
+        );
+    }
+
+    /// A block statement or generate iteration: a nested architecture
+    /// of its own, instantiated in place of the statement (§14.5.2,
+    /// §14.5.3). It sees the enclosing scope's objects.
+    fn nested_scope(&mut self, r: RegionId, parent: &mut Architecture, loc: Loc, b: Nested<'_>) {
+        let nr = self.new_region(Some(r));
+        let path = format!("{}.{}.{}", parent.library, parent.entity, b.label);
+        let mut constants = Vec::new();
+        if let Some((p, t, v)) = b.param {
+            let ploc = self.loc(p.span.clone());
+            let o = self.add_obj(ObjInfo {
+                name: p.name.clone(),
+                kind: ObjKind::Constant,
+                ty: t,
+                init: Some(super::decl::lit_expr(v.clone(), t, ploc.clone())),
+                loc: ploc,
+                static_val: Some(v),
+            });
+            self.declare(nr, &p.name, Sym::Obj(o));
+            constants.push(o);
+        }
+        let generics = self.interface_list(nr, b.generics, super::decl::IfaceKind::Generic, &path);
+        let generic_map = self.map_formals(r, &generics, b.generic_map, true, &loc);
+        // The generic values, for the block's declarations (§14.5.2).
+        for (g, a) in &generic_map {
+            if let Some(v) = a.as_ref().and_then(|a| self.eval(a)) {
+                let o = &mut self.objects[*g];
+                o.init = Some(super::decl::lit_expr(v.clone(), o.ty, o.loc.clone()));
+                o.static_val = Some(v);
+            }
+        }
+        let ports = self.interface_list(nr, b.ports, super::decl::IfaceKind::Port, &path);
+        let (port_map, port_conv) = self.map_ports(r, &ports, b.port_map, parent, &loc);
+        let mut objs = Vec::new();
+        let mut subs = Vec::new();
+        self.decls(nr, b.decls, &mut objs, &mut subs, &path);
+        let (signals, consts): (Vec<ObjId>, Vec<ObjId>) = objs
+            .into_iter()
+            .partition(|&o| self.objects[o].kind == ObjKind::Signal);
+        constants.extend(consts);
+        let mut arch = Architecture {
+            entity: parent.entity.clone(),
+            name: b.label.clone(),
+            library: parent.library.clone(),
+            generics,
+            ports,
+            signals,
+            constants,
+            processes: Vec::new(),
+            instances: Vec::new(),
+            nested: true,
+            loc: loc.clone(),
+        };
+        let sub = self
+            .cur_cfg
+            .and_then(|c| self.sub_block_cfg(c, b.cfg_label, b.index.as_ref(), b.alt));
+        let saved = std::mem::replace(&mut self.cur_cfg, sub);
+        for s in b.stmts {
+            self.conc_stmt(nr, s, &mut arch);
+        }
+        self.cur_cfg = saved;
+        self.archs.push(arch);
+        parent.instances.push(Instance {
+            label: b.label,
+            library: parent.library.clone(),
+            entity: parent.entity.clone(),
+            arch: None,
+            arch_index: Some(self.archs.len() - 1),
+            generic_map: generic_map
+                .into_iter()
+                .filter_map(|(f, a)| a.map(|a| (f, a)))
+                .collect(),
+            port_map: port_map.into_iter().map(|(f, a, _)| (f, a)).collect(),
+            port_conv,
+            config: None,
+            loc,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -632,48 +912,21 @@ impl Design {
         loc: Loc,
     ) {
         let label_s = label.as_ref().map(|l| l.name.clone()).unwrap_or_default();
-        // The entity: `entity lib.e(a)`, or a component of the same name as
-        // an entity of the work library (default binding, §7.3.3).
-        let (lib, ent, archn) = match unit {
+        let (lib, ent, archn, config) = match unit {
             ast::InstUnit::Entity(n, a) => {
-                let (lib, en) = match &n.kind {
-                    ast::NameKind::Selected(p, ast::Suffix::Ident(e)) => {
-                        match self.name_sym(r, p) {
-                            Some(Sym::Library(l)) => (l, e.name.clone()),
-                            _ => {
-                                self.error(
-                                    n.span.clone(),
-                                    "an entity name lib.entity was expected",
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    ast::NameKind::Simple(e) => (self.cur_lib.clone(), e.name.clone()),
-                    _ => {
-                        self.error(n.span.clone(), "an entity name was expected");
-                        return;
-                    }
-                };
-                (lib, en, a.as_ref().map(|a| a.name.clone()))
-            }
-            ast::InstUnit::Component(n) => match n.kind {
-                ast::NameKind::Simple(ref i) => (self.cur_lib.clone(), i.name.clone(), None),
-                _ => {
-                    self.error(
-                        n.span.clone(),
-                        "component instantiation of this form is not supported yet",
-                    );
+                let Some((lib, en)) = self.entity_name(r, n) else {
                     return;
-                }
-            },
-            ast::InstUnit::Configuration(n) => {
-                self.error(
-                    n.span.clone(),
-                    "configuration instantiation is not supported yet",
-                );
+                };
+                (lib, en, a.as_ref().map(|a| a.name.clone()), None)
+            }
+            ast::InstUnit::Component(n) => {
+                self.component_instance(r, &label_s, n, generic_map, port_map, arch, loc);
                 return;
             }
+            ast::InstUnit::Configuration(n) => match self.config_unit(r, n) {
+                Some(c) => c,
+                None => return,
+            },
         };
         let Some(info) = self.analyze_entity(&lib, &ent) else {
             self.error(
@@ -683,7 +936,7 @@ impl Design {
             return;
         };
         let generic_map = self.map_formals(r, &info.generics, generic_map, true, &loc);
-        let port_map = self.map_formals(r, &info.ports, port_map, false, &loc);
+        let (port_map, port_conv) = self.map_ports(r, &info.ports, port_map, arch, &loc);
         let generic_map: Vec<(ObjId, HExpr)> = generic_map
             .into_iter()
             .filter_map(|(f, a)| a.map(|a| (f, a)))
@@ -695,9 +948,250 @@ impl Design {
             arch: archn,
             arch_index: None,
             generic_map,
-            port_map,
+            port_map: port_map.into_iter().map(|(f, a, _)| (f, a)).collect(),
+            port_conv,
+            config,
             loc,
         });
+    }
+
+    /// Associate actuals with ports (§6.5.7.1): the plain associations
+    /// (formal, actual, explicitly associated) and those with a conversion
+    /// or a partial formal. A non-static actual expression of an `in` port
+    /// is assigned to an implicit signal by an implicit process in `arch`
+    /// (§6.5.6.3), which the port is associated with.
+    pub fn map_ports(
+        &mut self,
+        r: RegionId,
+        formals: &[ObjId],
+        assocs: &[ast::Assoc],
+        arch: &mut Architecture,
+        loc: &Loc,
+    ) -> (Vec<Assoc>, Vec<PortConv>) {
+        let mut out: Vec<(ObjId, Option<HExpr>, bool)> =
+            formals.iter().map(|f| (*f, None, false)).collect();
+        let mut convs = Vec::new();
+        // The formals are visible in formal parts.
+        let fr = self.new_region(Some(r));
+        for f in formals {
+            let n = self.objects[*f].name.clone();
+            self.declare(fr, &n, Sym::Obj(*f));
+        }
+        for (i, a) in assocs.iter().enumerate() {
+            let (idx, fpart) = match &a.formal {
+                None => (i, None),
+                Some(f) => match &f.kind {
+                    ast::NameKind::Simple(n) => {
+                        match formals.iter().position(|o| self.objects[*o].name == n.name) {
+                            Some(p) => (p, None),
+                            None => {
+                                self.error(f.span.clone(), format!("no port named '{}'", n.name));
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        let fe = ast::Expr {
+                            kind: ast::ExprKind::Name(f.clone()),
+                            span: f.span.clone(),
+                        };
+                        let Some(fh) = self.expr(fr, &fe, None) else {
+                            continue;
+                        };
+                        let Some(fo) = formal_root(&fh).filter(|o| formals.contains(o)) else {
+                            self.error(f.span.clone(), "a formal part names a port");
+                            continue;
+                        };
+                        let p = formals.iter().position(|o| *o == fo).unwrap();
+                        (p, Some(fh))
+                    }
+                },
+            };
+            let Some(&f) = formals.get(idx) else {
+                self.error(a.span.clone(), "too many associations");
+                continue;
+            };
+            out[idx].2 = true;
+            let ast::Actual::Expr(e) = &a.actual else {
+                if fpart.is_some() {
+                    self.error(
+                        a.span.clone(),
+                        "a partial or converted formal needs an actual",
+                    );
+                }
+                continue;
+            };
+            let mode = match self.objects[f].kind {
+                ObjKind::Port(m) => m,
+                _ => ast::Mode::In,
+            };
+            let ft = fpart.as_ref().map(|h| h.ty).unwrap_or(self.objects[f].ty);
+            let Some(ah) = self.expr(r, e, Some(ft)) else {
+                continue;
+            };
+            let formal_conv = fpart
+                .as_ref()
+                .is_some_and(|h| matches!(h.kind, HExprKind::Call(..) | HExprKind::Convert(_)));
+            match mode {
+                ast::Mode::In => {
+                    if formal_conv {
+                        self.error(
+                            a.span.clone(),
+                            "a port of mode in cannot have a formal conversion",
+                        );
+                        continue;
+                    }
+                    let ah = if self.is_signal_expr(&ah) && self.static_name(&ah) {
+                        ah
+                    } else if self.conversion_of_signal(&ah) || self.eval(&ah).is_some() {
+                        if fpart.is_none() && self.eval(&ah).is_some() {
+                            // A static value: the port's own signal with it.
+                            out[idx].1 = Some(ah);
+                            continue;
+                        }
+                        convs.push(PortConv {
+                            formal: f,
+                            mode,
+                            target: fpart.unwrap_or_else(|| obj_expr(self, f)),
+                            value: ah,
+                        });
+                        continue;
+                    } else {
+                        match self.implicit_signal(arch, ah, ft, loc) {
+                            Some(h) => h,
+                            None => continue,
+                        }
+                    };
+                    match fpart {
+                        None => out[idx].1 = Some(ah),
+                        Some(fh) => convs.push(PortConv {
+                            formal: f,
+                            mode,
+                            target: fh,
+                            value: ah,
+                        }),
+                    }
+                }
+                ast::Mode::Out | ast::Mode::Buffer => {
+                    if !(self.is_signal_expr(&ah) && self.static_name(&ah)) {
+                        self.error(
+                            e.span.clone(),
+                            "the actual of an out port must be a static signal name here",
+                        );
+                        continue;
+                    }
+                    match fpart {
+                        None => out[idx].1 = Some(ah),
+                        Some(fh) => convs.push(PortConv {
+                            formal: f,
+                            mode,
+                            target: ah,
+                            value: fh,
+                        }),
+                    }
+                }
+                _ => match fpart {
+                    None if self.is_signal_expr(&ah) && self.static_name(&ah) => {
+                        out[idx].1 = Some(ah)
+                    }
+                    None if self.eval(&ah).is_some() => out[idx].1 = Some(ah),
+                    _ => self.error(
+                        a.span.clone(),
+                        "conversions and partial association of inout ports are not supported yet",
+                    ),
+                },
+            }
+        }
+        (out, convs)
+    }
+
+    /// `f(s)` with `f` a function of one parameter, or `T(s)`, of a static
+    /// signal name `s`: a conversion of the actual (§6.5.7.1).
+    fn conversion_of_signal(&self, h: &HExpr) -> bool {
+        match &h.kind {
+            HExprKind::Call(f, args) => {
+                // A function name, not an operator (§6.5.7.1).
+                let sub = &self.subprograms[*f];
+                args.len() == 1
+                    && sub.params.len() == 1
+                    && !sub.name.starts_with('"')
+                    && !matches!(sub.builtin, Some(Builtin::Op(_)))
+                    && self.is_signal_expr(&args[0])
+                    && self.static_name(&args[0])
+            }
+            HExprKind::Convert(x) => self.is_signal_expr(x) && self.static_name(x),
+            _ => false,
+        }
+    }
+
+    /// The implicit signal of a non-static actual expression, assigned by
+    /// an implicit process (§6.5.6.3).
+    fn implicit_signal(
+        &mut self,
+        arch: &mut Architecture,
+        value: HExpr,
+        formal_ty: TypeId,
+        loc: &Loc,
+    ) -> Option<HExpr> {
+        let ty = if self.constrained(formal_ty) {
+            formal_ty
+        } else if self.constrained(value.ty) {
+            value.ty
+        } else {
+            self.errors.push((
+                value.loc.clone(),
+                "this actual needs a constrained port subtype here".into(),
+            ));
+            return None;
+        };
+        let o = self.add_obj(ObjInfo {
+            name: format!("implicit_{}", self.objects.len()),
+            kind: ObjKind::Signal,
+            ty,
+            init: None,
+            loc: value.loc.clone(),
+            static_val: None,
+        });
+        arch.signals.push(o);
+        let target = HExpr {
+            kind: HExprKind::Obj(o),
+            ty,
+            loc: value.loc.clone(),
+        };
+        let mut sens = Vec::new();
+        self.signals_read(&value, &mut sens);
+        arch.processes.push(Process {
+            label: String::new(),
+            postponed: false,
+            sens: Some(sens),
+            locals: Vec::new(),
+            stmts: vec![HStmt {
+                kind: HStmtKind::SignalAssign {
+                    target: target.clone(),
+                    delay: None,
+                    waves: vec![HWave {
+                        value: Some(value),
+                        after: None,
+                    }],
+                },
+                loc: loc.clone(),
+            }],
+            loc: loc.clone(),
+        });
+        Some(target)
+    }
+
+    /// Whether a subtype has every index range (a scalar always has).
+    pub fn constrained(&self, t: TypeId) -> bool {
+        match &self.types[t].kind {
+            TypeKind::Array { .. } => false,
+            TypeKind::Subtype {
+                constraint: Some(HConstraint::Index(v, _)),
+                ..
+            } => v.iter().all(|x| x.is_some()),
+            TypeKind::Subtype { base, .. } => self.constrained(*base),
+            _ => true,
+        }
     }
 
     /// Associate actuals with an entity's generics or ports (positional
@@ -708,9 +1202,25 @@ impl Design {
         formals: &[ObjId],
         assocs: &[ast::Assoc],
         generics: bool,
-        loc: &Loc,
+        _loc: &Loc,
     ) -> Vec<(ObjId, Option<HExpr>)> {
-        let mut out: Vec<(ObjId, Option<HExpr>)> = formals.iter().map(|f| (*f, None)).collect();
+        self.map_formals_ex(r, formals, assocs, generics)
+            .into_iter()
+            .map(|(f, a, _)| (f, a))
+            .collect()
+    }
+
+    /// `map_formals`, also telling which formals are associated
+    /// explicitly (an `open` actual included).
+    pub fn map_formals_ex(
+        &mut self,
+        r: RegionId,
+        formals: &[ObjId],
+        assocs: &[ast::Assoc],
+        generics: bool,
+    ) -> Vec<(ObjId, Option<HExpr>, bool)> {
+        let mut out: Vec<(ObjId, Option<HExpr>, bool)> =
+            formals.iter().map(|f| (*f, None, false)).collect();
         for (i, a) in assocs.iter().enumerate() {
             let idx = match &a.formal {
                 None => i,
@@ -743,6 +1253,7 @@ impl Design {
                 self.error(a.span.clone(), "too many associations");
                 continue;
             };
+            out[idx].2 = true;
             let ast::Actual::Expr(e) = &a.actual else {
                 continue;
             };
@@ -751,7 +1262,6 @@ impl Design {
                 out[idx].1 = Some(h);
             }
         }
-        let _ = loc;
         out
     }
 
@@ -816,6 +1326,26 @@ impl Design {
                 _ => {}
             }
         }
+    }
+}
+
+/// The object a formal part names: the formal of a partial association
+/// (`f(i)`, `f(a to b)`, `f.e`) or the argument of a conversion.
+fn formal_root(h: &HExpr) -> Option<ObjId> {
+    match &h.kind {
+        HExprKind::Obj(o) => Some(*o),
+        HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) => formal_root(b),
+        HExprKind::Call(_, a) if a.len() == 1 => formal_root(&a[0]),
+        HExprKind::Convert(x) => formal_root(x),
+        _ => None,
+    }
+}
+
+fn obj_expr(d: &Design, o: ObjId) -> HExpr {
+    HExpr {
+        kind: HExprKind::Obj(o),
+        ty: d.objects[o].ty,
+        loc: d.objects[o].loc.clone(),
     }
 }
 

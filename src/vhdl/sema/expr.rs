@@ -644,8 +644,9 @@ impl Design {
                                     .iter()
                                     .zip(&arg_sets)
                                     .all(|(p, set)| {
-                                        set.as_ref()
-                                            .is_none_or(|set| self.compatible(set, self.objects[*p].ty))
+                                        set.as_ref().is_none_or(|set| {
+                                            self.compatible(set, self.objects[*p].ty)
+                                        })
                                     })
                             {
                                 let b = self.base(rt);
@@ -830,10 +831,14 @@ impl Design {
                                 let TypeKind::Record(fields) =
                                     self.types[self.base(des)].kind.clone()
                                 else {
-                                    self.error(n.span.clone(), "this selected name is not supported");
+                                    self.error(
+                                        n.span.clone(),
+                                        "this selected name is not supported",
+                                    );
                                     return None;
                                 };
-                                let Some(idx) = fields.iter().position(|(f, _)| *f == i.name) else {
+                                let Some(idx) = fields.iter().position(|(f, _)| *f == i.name)
+                                else {
                                     self.error(
                                         i.span.clone(),
                                         format!("no element '{}' in the record", i.name),
@@ -1718,8 +1723,10 @@ impl Design {
         // are those of the designated array (§8.3).
         let px = self.name_expr(r, prefix, None)?;
         let px = if self.designated(px.ty).is_some_and(|d| self.is_array(d))
-            && matches!(name, "left" | "right" | "high" | "low" | "length" | "ascending")
-        {
+            && matches!(
+                name,
+                "left" | "right" | "high" | "low" | "length" | "ascending"
+            ) {
             self.implicit_deref(px)
         } else {
             px

@@ -94,12 +94,16 @@ struct Lw<'a> {
     sig_map: HashMap<(usize, ObjId), SigRef>,
     /// Instances, depth-first (0: the top).
     insts: Vec<InstInfo>,
+    /// Objects declared by each architecture's scope (`elab::owner_inst`).
+    arch_objs: Vec<std::collections::HashSet<ObjId>>,
     /// The instance being lowered.
     inst: usize,
     /// Processes in elaboration order: instance, architecture, index.
     procs: Vec<(usize, usize, usize)>,
     /// Drivers by (signal, process).
     drivers: BTreeMap<(usize, usize), Driver>,
+    /// Port associations through conversions or partial formals.
+    links: Vec<elab::Link>,
     /// Per process: its wait sites.
     sites: Vec<Vec<Site>>,
     /// Package objects (named without an instance).
@@ -148,9 +152,11 @@ pub fn lower(an: &Analysed) -> Result<Lowered, Vec<String>> {
         sigs: Vec::new(),
         sig_map: HashMap::new(),
         insts: Vec::new(),
+        arch_objs: Vec::new(),
         inst: 0,
         procs: Vec::new(),
         drivers: BTreeMap::new(),
+        links: Vec::new(),
         sites: Vec::new(),
         pkg_objs: BTreeSet::new(),
         read_last: false,
@@ -609,10 +615,13 @@ impl<'a> Lw<'a> {
         match info.kind {
             ObjKind::Signal | ObjKind::Port(_) => self.sig_read(o),
             ObjKind::Param(..) => format!("p{}_{}", o, sv_ident(&info.name)),
-            _ if self.inst == 0 || self.inst == GLOBAL || self.pkg_objs.contains(&o) => {
+            _ if self.inst == GLOBAL || self.pkg_objs.contains(&o) => {
                 format!("vh_o{}_{}", o, sv_ident(&info.name))
             }
-            _ => format!("vh_o{}_{}_i{}", o, sv_ident(&info.name), self.inst),
+            _ => match self.owner_inst(self.inst, o) {
+                0 => format!("vh_o{}_{}", o, sv_ident(&info.name)),
+                i => format!("vh_o{}_{}_i{}", o, sv_ident(&info.name), i),
+            },
         }
     }
 
@@ -1372,14 +1381,24 @@ impl<'a> Lw<'a> {
                 None => None,
             };
             let Some((l, r, dn)) = bounds else {
-                self.err(loc, "an aggregate with choices needs a constrained type here");
+                self.err(
+                    loc,
+                    "an aggregate with choices needs a constrained type here",
+                );
                 return "'{default:0}".into();
             };
             decls.push((format!("{}[]", setv), "bit".into()));
             let _ = writeln!(body, "{} = {}; {} = {}; {} = {};", lv, l, rv, r, dnv, dn);
             let _ = writeln!(body, "{} = new[vh_len({}, {}, {})];", tv, lv, rv, dnv);
             let _ = writeln!(body, "{} = new[{}.size()];", setv, tv);
-            let off = |i: &str| format!("({dn} ? {l} - ({i}) : ({i}) - {l})", dn = dnv, l = lv, i = i);
+            let off = |i: &str| {
+                format!(
+                    "({dn} ? {l} - ({i}) : ({i}) - {l})",
+                    dn = dnv,
+                    l = lv,
+                    i = i
+                )
+            };
             let mut pos = 0i64;
             for (choices, v) in items {
                 let x = elem(self, v);
@@ -1429,7 +1448,11 @@ impl<'a> Lw<'a> {
                 }
             }
         }
-        let _ = writeln!(body, "{} = {}_mk({}, {}, {}, {});", agg, name, lv, rv, dnv, tv);
+        let _ = writeln!(
+            body,
+            "{} = {}_mk({}, {}, {}, {});",
+            agg, name, lv, rv, dnv, tv
+        );
         // Declarations go to the enclosing scope; the statements run first.
         for (n, ty) in decls {
             let (n, dims) = match n.strip_suffix("[]") {
@@ -1800,7 +1823,9 @@ impl<'a> Lw<'a> {
                         pad, word
                     )
                 }
-                n if n.starts_with("textio.") => self.textio_call(&n["textio.".len()..], &info, args, ind, loc),
+                n if n.starts_with("textio.") => {
+                    self.textio_call(&n["textio.".len()..], &info, args, ind, loc)
+                }
                 _ => {
                     self.err(
                         loc,

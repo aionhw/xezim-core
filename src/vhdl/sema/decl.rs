@@ -173,7 +173,9 @@ impl Design {
                         // holding the converted value; of anything else, a
                         // conversion at each use (read-only).
                         let h = match alias_ty {
-                            Some(at) if self.is_array(at) && self.array_constraint(at).is_some() => {
+                            Some(at)
+                                if self.is_array(at) && self.array_constraint(at).is_some() =>
+                            {
                                 let conv = HExpr {
                                     kind: HExprKind::Convert(Box::new(h.clone())),
                                     ty: at,
@@ -226,6 +228,10 @@ impl Design {
                 });
                 let id = self.components.len() - 1;
                 self.declare(r, &c.name.name, Sym::Component(id));
+            }
+            ast::Decl::ConfigSpec(c) => {
+                let (lib, file) = (self.cur_lib.clone(), self.cur_file);
+                self.cfg_specs.push((r, c.clone(), lib, file));
             }
             ast::Decl::Attribute { name, mark, .. } => {
                 if let Some(t) = self.type_mark(r, mark) {
@@ -1234,6 +1240,7 @@ impl Design {
                 .collect(),
             processes: Vec::new(),
             instances: Vec::new(),
+            nested: false,
             loc: self.loc(a.name.span.clone()),
         };
         for s in &a.stmts {

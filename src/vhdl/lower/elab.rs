@@ -86,6 +86,9 @@ pub(super) struct InstInfo {
     pub arch: usize,
     /// Generic values given by the instance's generic map.
     pub generics: BTreeMap<ObjId, (HExpr, usize)>,
+    /// The enclosing instance of a block or generate iteration, whose
+    /// objects it sees.
+    pub parent: Option<usize>,
 }
 
 /// A wait site: the conditions (SV, kernel scope) of the events it is
@@ -105,15 +108,58 @@ enum Target {
 /// Package objects and top-level instance objects keep plain names.
 pub(super) const GLOBAL: usize = usize::MAX;
 
+/// Driver ids from here on are the drivers of port associations with a
+/// formal conversion or partial formal (`Link`), not processes.
+const PSEUDO: usize = 1 << 30;
+
+/// A port association through a conversion or a partial formal: a
+/// signal (part) computed from others without a delta (§14.7.3.4). Mode
+/// `in` writes the formal's effective value; mode `out` the driving value
+/// of the actual (a driver of it).
+#[derive(Clone, Debug)]
+pub(super) struct Link {
+    pub inn: bool,
+    pub target: SigRef,
+    /// The value and the instance context it is evaluated in.
+    pub value: HExpr,
+    pub ctx: usize,
+    /// The signals whose activity recomputes it.
+    pub sources: Vec<usize>,
+    /// Mode `out`: the driver of the actual.
+    pub drv: usize,
+}
+
 impl<'a> Lw<'a> {
     // ---- the instance tree ----------------------------------------------------------
 
     /// Elaborate the hierarchy below the top architecture: signals,
     /// port associations and processes in elaboration order.
     pub(super) fn elaborate(&mut self, top: usize) {
+        // The objects each architecture's scope declares (for the scopes
+        // of blocks and generate iterations).
+        self.arch_objs = self
+            .d
+            .archs
+            .iter()
+            .map(|a| {
+                let mut set: std::collections::HashSet<ObjId> = std::collections::HashSet::new();
+                set.extend(
+                    a.generics
+                        .iter()
+                        .chain(&a.ports)
+                        .chain(&a.signals)
+                        .chain(&a.constants),
+                );
+                for p in &a.processes {
+                    set.extend(p.locals.iter().copied());
+                }
+                set
+            })
+            .collect();
         self.insts.push(InstInfo {
             arch: top,
             generics: BTreeMap::new(),
+            parent: None,
         });
         // Signals declared in packages.
         let pkg_sigs: Vec<ObjId> = self
@@ -175,7 +221,10 @@ impl<'a> Lw<'a> {
             }
             let ins = self.d.archs[ai].instances[i].clone();
             let Some(child_arch) = ins.arch_index else {
-                self.err(&ins.loc, "the instantiated design entity has no architecture");
+                self.err(
+                    &ins.loc,
+                    "the instantiated design entity has no architecture",
+                );
                 continue;
             };
             let child = self.insts.len();
@@ -184,9 +233,11 @@ impl<'a> Lw<'a> {
                 .iter()
                 .map(|(f, e)| (*f, (e.clone(), inst)))
                 .collect();
+            let nested = self.d.archs[child_arch].nested;
             self.insts.push(InstInfo {
                 arch: child_arch,
                 generics,
+                parent: nested.then_some(inst),
             });
             let mut mapped = BTreeSet::new();
             for (formal, actual) in &ins.port_map {
@@ -217,6 +268,33 @@ impl<'a> Lw<'a> {
                 if !mapped.contains(&p) {
                     self.new_sig(child, p);
                 }
+            }
+            for pc in &ins.port_conv {
+                let inn = pc.mode == Mode::In;
+                let (tctx, vctx) = if inn { (child, inst) } else { (inst, child) };
+                let Some(target) = self.actual_ref(tctx, &pc.target) else {
+                    self.err(&pc.target.loc, "this port association is not supported yet");
+                    continue;
+                };
+                let mut sources = Vec::new();
+                self.sig_sources(vctx, &pc.value, &mut sources);
+                let drv = PSEUDO + self.links.len();
+                if !inn {
+                    let (cov, slots) = match target.part {
+                        Part::Whole => (Cov::All, false),
+                        Part::Elem(k) => (Cov::Set([k].into_iter().collect()), true),
+                        Part::Slice(k, n) => (Cov::Set((k..k + n).collect()), true),
+                    };
+                    self.add_driver(target.sig, drv, cov, slots);
+                }
+                self.links.push(Link {
+                    inn,
+                    target,
+                    value: pc.value.clone(),
+                    ctx: vctx,
+                    sources,
+                    drv,
+                });
             }
             self.elab_inst(child);
         }
@@ -268,11 +346,177 @@ impl<'a> Lw<'a> {
         self.d.eval(e).is_some()
     }
 
-    pub(super) fn lookup_sig(&self, inst: usize, o: ObjId) -> Option<SigRef> {
-        self.sig_map
-            .get(&(inst, o))
-            .or_else(|| self.sig_map.get(&(GLOBAL, o)))
-            .cloned()
+    /// The signals an expression reads, in the context of `inst`.
+    fn sig_sources(&self, inst: usize, h: &HExpr, out: &mut Vec<usize>) {
+        match &h.kind {
+            HExprKind::Obj(o) => {
+                if matches!(self.d.objects[*o].kind, ObjKind::Signal | ObjKind::Port(_))
+                    && let Some(r) = self.lookup_sig(inst, *o)
+                    && !out.contains(&r.sig)
+                {
+                    out.push(r.sig);
+                }
+            }
+            HExprKind::Call(_, a) | HExprKind::RecordAgg(a) => {
+                for x in a {
+                    self.sig_sources(inst, x, out);
+                }
+            }
+            HExprKind::Index(b, i) => {
+                self.sig_sources(inst, b, out);
+                for x in i {
+                    self.sig_sources(inst, x, out);
+                }
+            }
+            HExprKind::Slice(b, _)
+            | HExprKind::Field(b, _)
+            | HExprKind::Convert(b)
+            | HExprKind::Qualified(b) => self.sig_sources(inst, b, out),
+            _ => {}
+        }
+    }
+
+    /// The function applying link `n`: an `in` link recomputes the
+    /// formal's value (`init`: its initial value); an `out` link the
+    /// driving value it contributes to the actual.
+    fn link_sv(&mut self, n: usize) -> String {
+        let l = self.links[n].clone();
+        let s = l.target.sig;
+        let sig = self.sigs[s].clone();
+        let loc = self.d.objects[sig.obj].loc.clone();
+        let r = self.repr(sig.ty, &loc);
+        let saved = std::mem::replace(&mut self.inst, l.ctx);
+        self.temps.clear();
+        let dst = if l.inn {
+            "nv".to_string()
+        } else {
+            format!("vh_dv{}_{}", s, l.drv)
+        };
+        let assign = match l.target.part {
+            Part::Whole => {
+                let target = HExpr {
+                    kind: HExprKind::Obj(sig.obj),
+                    ty: sig.ty,
+                    loc: loc.clone(),
+                };
+                let v = self.store_value_init(&target, &l.value);
+                format!("    {} = {};\n", dst, v)
+            }
+            Part::Elem(k) => {
+                let v = self.ex(&l.value);
+                format!("    {}.d[{}] = {};\n", dst, k, v)
+            }
+            Part::Slice(k, len) => {
+                let v = self.ex(&l.value);
+                let (f, line, _) = self.file_line(&l.value.loc);
+                format!(
+                    "    vh_lv = {v};\n    if (vh_lv.d.size() != {len}) vh_fatal($sformatf(\"bound check failure at %s:%0d\", {f}, {line}));\n    else for (int j = 0; j < {len}; j++) {dst}.d[{k} + j] = vh_lv.d[j];\n",
+                    v = v,
+                    len = len,
+                    f = sv_string(&f),
+                    line = line,
+                    dst = dst,
+                    k = k
+                )
+            }
+        };
+        let pre = self.flush_pre(4);
+        let mut temps = String::new();
+        for (name, t) in std::mem::take(&mut self.temps) {
+            let _ = writeln!(temps, "    {} {};", t, name);
+        }
+        if let Part::Slice(..) = l.target.part {
+            let vt = self.repr(l.value.ty, &l.value.loc).sv();
+            let _ = writeln!(temps, "    {} vh_lv;", vt);
+        }
+        self.inst = saved;
+        let t = r.sv();
+        if l.inn {
+            let eq = self.eq_expr(&r, "nv", &format!("vh_s{}", s));
+            format!(
+                "  function automatic void vh_lnk{n}(bit init);\n    {t} nv;\n{temps}    nv = vh_s{s};\n{pre}{assign}    if (init) begin vh_s{s} = nv; vh_s{s}_last = nv; end\n    else begin\n      vh_s{s}_act = 1;\n      if (!{eq}) begin if (!vh_s{s}_ev) vh_s{s}_last = vh_s{s}; vh_s{s} = nv; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end\n    end\n  endfunction\n",
+                n = n,
+                t = t,
+                temps = temps,
+                s = s,
+                pre = pre,
+                assign = assign,
+                eq = eq
+            )
+        } else {
+            format!(
+                "  function automatic void vh_lnk{n}();\n{temps}{pre}{assign}    vh_s{s}_act = 1;\n  endfunction\n",
+                n = n,
+                temps = temps,
+                pre = pre,
+                assign = assign,
+                s = s
+            )
+        }
+    }
+
+    /// The order signals are updated in (§14.7.3): a link's target after
+    /// its sources, otherwise by elaboration order.
+    fn update_order(&self) -> Vec<usize> {
+        let n = self.sigs.len();
+        let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indeg = vec![0usize; n];
+        for l in &self.links {
+            for &src in &l.sources {
+                if src != l.target.sig {
+                    deps[src].push(l.target.sig);
+                    indeg[l.target.sig] += 1;
+                }
+            }
+        }
+        let mut ready: BTreeSet<usize> = (0..n).filter(|&s| indeg[s] == 0).collect();
+        let mut order = Vec::with_capacity(n);
+        while let Some(s) = ready.pop_first() {
+            order.push(s);
+            for &t in &deps[s] {
+                indeg[t] -= 1;
+                if indeg[t] == 0 {
+                    ready.insert(t);
+                }
+            }
+        }
+        // A cycle (not expected from port associations): the rest in order.
+        for s in 0..n {
+            if !order.contains(&s) {
+                order.push(s);
+            }
+        }
+        order
+    }
+
+    pub(super) fn lookup_sig(&self, mut inst: usize, o: ObjId) -> Option<SigRef> {
+        loop {
+            if let Some(r) = self.sig_map.get(&(inst, o)) {
+                return Some(r.clone());
+            }
+            match self.insts.get(inst).and_then(|i| i.parent) {
+                Some(p) => inst = p,
+                None => return self.sig_map.get(&(GLOBAL, o)).cloned(),
+            }
+        }
+    }
+
+    /// The instance whose scope declares object `o` as seen from `inst`:
+    /// `inst` itself or the block or generate iteration enclosing it.
+    pub(super) fn owner_inst(&self, inst: usize, o: ObjId) -> usize {
+        let mut i = inst;
+        loop {
+            let Some(info) = self.insts.get(i) else {
+                return inst;
+            };
+            let Some(p) = info.parent else {
+                return if i == inst { inst } else { i };
+            };
+            if self.arch_objs[info.arch].contains(&o) {
+                return i;
+            }
+            i = p;
+        }
     }
 
     /// The SV expression reading a signal object (current or last value).
@@ -538,7 +782,11 @@ impl<'a> Lw<'a> {
                 let n = format!("vh_len({}, {}, {})", left, right, dn);
                 let cov = match &rg.static_val {
                     Some(sr) => {
-                        match sr.left.as_i64().and_then(|lv| self.part_offset(&r, b.ty, lv)) {
+                        match sr
+                            .left
+                            .as_i64()
+                            .and_then(|lv| self.part_offset(&r, b.ty, lv))
+                        {
                             Some(k) => Cov::Set((k..k + sr.length()).collect()),
                             None => base_cov,
                         }
@@ -570,7 +818,10 @@ impl<'a> Lw<'a> {
             return String::new();
         };
         let Some(tg) = self.target(target) else {
-            self.err(&loc, "an assignment to this part of a signal is not supported yet");
+            self.err(
+                &loc,
+                "an assignment to this part of a signal is not supported yet",
+            );
             return String::new();
         };
         let (sig, call) = match &tg {
@@ -847,6 +1098,11 @@ impl<'a> Lw<'a> {
         // lowered with the subprograms).
         let drv = self.drivers_sv(&mut elab);
         let (upd, upd_sigs) = self.updates_sv();
+        let mut lnk = String::new();
+        for n in 0..self.links.len() {
+            let f = self.link_sv(n);
+            lnk.push_str(&f);
+        }
         // Subprograms the design calls (transitively).
         while let Some((s, inst)) = self.subs_todo.pop() {
             if self.subs_done.insert((s, inst)) {
@@ -904,6 +1160,7 @@ impl<'a> Lw<'a> {
         m.push_str(&drv);
         m.push_str(&upd);
         m.push_str(&self.sub_items);
+        m.push_str(&lnk);
         let _ = write!(
             m,
             "  function automatic void vh_elab();\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n{}  endfunction\n",
@@ -926,7 +1183,10 @@ impl<'a> Lw<'a> {
             let loc = self.d.objects[sig.obj].loc.clone();
             let r = self.repr(sig.ty, &loc);
             let t = r.sv();
-            if !dr.slots {
+            if *p >= PSEUDO {
+                // The driver of a port link: a value only.
+                let _ = writeln!(drv, "  {} vh_dv{}_{};", t, s, p);
+            } else if !dr.slots {
                 // Parallel queues of transaction times and values (a queue
                 // of structs holding a struct does not round-trip in the
                 // simulator).
@@ -941,7 +1201,10 @@ impl<'a> Lw<'a> {
                 );
             } else {
                 let Repr::Arr(name, er) = &r else {
-                    self.err(&loc, "an assignment to part of this signal is not supported yet");
+                    self.err(
+                        &loc,
+                        "an assignment to part of this signal is not supported yet",
+                    );
                     continue;
                 };
                 let et = er.sv();
@@ -1104,8 +1367,31 @@ impl<'a> Lw<'a> {
         let _ = writeln!(k, "  initial begin : vh_kernel");
         let _ = writeln!(k, "    longint vh_nxt;");
         let _ = writeln!(k, "    vh_elab();");
-        for s in upd_sigs {
-            let _ = writeln!(k, "    vh_upd{}(1);", s);
+        // Initial effective values (§14.7.5.2), in update order.
+        let order = self.update_order();
+        for &s in &order {
+            for (n, l) in self.links.iter().enumerate() {
+                if !l.inn && l.target.sig == s {
+                    let _ = writeln!(k, "    vh_lnk{}();", n);
+                }
+            }
+            if upd_sigs.contains(&s) {
+                let _ = writeln!(k, "    vh_upd{}(1);", s);
+            } else if let [(p, _)] = self.sig_drivers(s).as_slice()
+                && *p >= PSEUDO
+            {
+                let _ = writeln!(
+                    k,
+                    "    vh_s{s} = vh_dv{s}_{p}; vh_s{s}_last = vh_s{s};",
+                    s = s,
+                    p = p
+                );
+            }
+            for (n, l) in self.links.iter().enumerate() {
+                if l.inn && l.target.sig == s {
+                    let _ = writeln!(k, "    vh_lnk{}(1);", n);
+                }
+            }
         }
         let _ = writeln!(
             k,
@@ -1118,7 +1404,7 @@ impl<'a> Lw<'a> {
         );
         let _ = writeln!(k, "    forever begin");
         let _ = writeln!(k, "      vh_nxt = -64'sd1;");
-        for ((s, p), _) in &drivers {
+        for ((s, p), _) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
             let _ = writeln!(
                 k,
                 "      if (vh_dt{s}_{p}.size() > 0 && (vh_nxt < 0 || vh_dt{s}_{p}[0] < vh_nxt)) vh_nxt = vh_dt{s}_{p}[0];",
@@ -1137,7 +1423,7 @@ impl<'a> Lw<'a> {
         for s in 0..self.sigs.len() {
             let _ = writeln!(k, "      vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
         }
-        for ((s, p), dr) in &drivers {
+        for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
             if dr.slots {
                 let _ = writeln!(
                     k,
@@ -1154,13 +1440,40 @@ impl<'a> Lw<'a> {
                 );
             }
         }
-        for s in 0..self.sigs.len() {
+        for &s in &order {
+            // Links into this signal: the driving values from converted or
+            // partial out ports first, the in ports after its update.
+            let link_cond = |l: &Link| {
+                if l.sources.is_empty() {
+                    "0".to_string()
+                } else {
+                    l.sources
+                        .iter()
+                        .map(|x| format!("vh_s{}_act", x))
+                        .collect::<Vec<_>>()
+                        .join(" || ")
+                }
+            };
+            for (n, l) in self.links.iter().enumerate() {
+                if !l.inn && l.target.sig == s {
+                    let _ = writeln!(k, "      if ({}) vh_lnk{}();", link_cond(l), n);
+                }
+            }
+            let ins: Vec<String> = self
+                .links
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.inn && l.target.sig == s)
+                .map(|(n, l)| format!("      if ({}) vh_lnk{}(0);\n", link_cond(l), n))
+                .collect();
             let ds = self.sig_drivers(s);
             if ds.is_empty() {
+                k.push_str(&ins.concat());
                 continue;
             }
             if upd_sigs.contains(&s) {
                 let _ = writeln!(k, "      if (vh_s{s}_act) vh_upd{s}(0);", s = s);
+                k.push_str(&ins.concat());
                 continue;
             }
             let sig = self.sigs[s].clone();
@@ -1168,7 +1481,11 @@ impl<'a> Lw<'a> {
             let r = self.repr(sig.ty, &loc);
             let ne = format!(
                 "!({})",
-                self.eq_expr(&r, &format!("vh_dv{}_{}", s, ds[0].0), &format!("vh_s{}", s))
+                self.eq_expr(
+                    &r,
+                    &format!("vh_dv{}_{}", s, ds[0].0),
+                    &format!("vh_s{}", s)
+                )
             );
             let _ = writeln!(
                 k,
@@ -1177,6 +1494,7 @@ impl<'a> Lw<'a> {
                 p = ds[0].0,
                 ne = ne
             );
+            k.push_str(&ins.concat());
         }
         let _ = writeln!(k, "      // Resume (§14.7.5.3), in elaboration order.");
         for pi in 0..nprocs {
@@ -1223,7 +1541,10 @@ impl<'a> Lw<'a> {
                 format!("input longint {}_lev", name),
             ],
             ObjKind::Param(ObjClass::Signal, _) => {
-                self.err(loc, "signal parameters of mode out/inout are not supported yet");
+                self.err(
+                    loc,
+                    "signal parameters of mode out/inout are not supported yet",
+                );
                 vec![format!("input {} {}", r.sv(), name)]
             }
             // A composite `out` parameter has the actual's bounds (§4.2.2.2):

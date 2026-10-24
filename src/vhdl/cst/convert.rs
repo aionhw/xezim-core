@@ -230,9 +230,15 @@ impl Converter {
             }
             K::ConfigurationDeclaration => {
                 let pre = child(n, K::ConfigurationDeclarationPreamble)?;
+                if let Some(d) = child(n, K::ConfigurationDeclarativePart)
+                    && d.children().next().is_some()
+                {
+                    self.unsupported(&d, "a configuration declarative part");
+                }
                 LibraryUnit::Configuration(ConfigDecl {
                     name: first_ident(&pre)?,
                     entity: self.name(&child(&pre, K::Name)?)?,
+                    block: child(n, K::BlockConfiguration).and_then(|b| self.block_config(&b)),
                     span: span(n),
                 })
             }
@@ -913,8 +919,16 @@ impl Converter {
             K::GroupDeclaration | K::GroupTemplateDeclaration => {
                 Decl::Unsupported("groups".into(), span(n))
             }
-            K::SimpleConfigurationSpecification | K::CompoundConfigurationSpecification => {
-                Decl::Unsupported("configuration specifications".into(), span(n))
+            K::SimpleConfigurationSpecification => {
+                let pre = child(n, K::ComponentConfigurationPreamble)?;
+                Decl::ConfigSpec(ConfigSpec {
+                    spec: self.component_spec(&child(&pre, K::ComponentSpecification)?)?,
+                    binding: self.binding(&child(n, K::BindingIndication)?)?,
+                    span: span(n),
+                })
+            }
+            K::CompoundConfigurationSpecification => {
+                Decl::Unsupported("compound configuration specifications".into(), span(n))
             }
             _ => {
                 self.unsupported(n, "this declaration");
@@ -966,6 +980,133 @@ impl Converter {
     }
 
     // ---- associations -------------------------------------------------------
+
+    // ---- configurations ------------------------------------------------------------
+
+    fn block_config(&mut self, n: &N) -> Option<BlockConfig> {
+        let pre = child(n, K::BlockConfigurationPreamble)?;
+        let mut items = Vec::new();
+        for c in nodes(n) {
+            match c.kind() {
+                K::BlockConfigurationPreamble | K::BlockConfigurationEpilogue => {}
+                K::BlockConfigurationItem => {
+                    if let Some(b) = child(&c, K::BlockConfiguration) {
+                        items.extend(self.block_config(&b).map(ConfigItem::Block));
+                    } else if let Some(cc) = child(&c, K::ComponentConfiguration) {
+                        items.extend(
+                            self.component_config(&cc)
+                                .map(|c| ConfigItem::Component(Box::new(c))),
+                        );
+                    } else {
+                        self.unsupported(&c, "this configuration item");
+                    }
+                }
+                K::BlockConfiguration => {
+                    items.extend(self.block_config(&c).map(ConfigItem::Block));
+                }
+                K::ComponentConfiguration => {
+                    items.extend(
+                        self.component_config(&c)
+                            .map(|c| ConfigItem::Component(Box::new(c))),
+                    );
+                }
+                _ => self.unsupported(&c, "this configuration item"),
+            }
+        }
+        Some(BlockConfig {
+            spec: self.name(&child(&pre, K::Name)?)?,
+            items,
+            span: span(n),
+        })
+    }
+
+    fn component_config(&mut self, n: &N) -> Option<ComponentConfig> {
+        let pre = child(n, K::ComponentConfigurationPreamble)?;
+        let binding = match child(n, K::Binding).and_then(|b| child(&b, K::BindingIndication)) {
+            Some(b) => Some(self.binding(&b)?),
+            None => None,
+        };
+        Some(ComponentConfig {
+            spec: self.component_spec(&child(&pre, K::ComponentSpecification)?)?,
+            binding,
+            block: child(n, K::BlockConfiguration).and_then(|b| self.block_config(&b)),
+            span: span(n),
+        })
+    }
+
+    fn component_spec(&mut self, n: &N) -> Option<ComponentSpec> {
+        let insts = if child(n, K::InstantiationListAll).is_some() {
+            InstList::All
+        } else if child(n, K::InstantiationListOthers).is_some() {
+            InstList::Others
+        } else {
+            InstList::Labels(idents(&child(n, K::InstantiationListList)?))
+        };
+        Some(ComponentSpec {
+            insts,
+            comp: self.name(&child(n, K::Name)?)?,
+        })
+    }
+
+    fn binding(&mut self, n: &N) -> Option<BindingInd> {
+        let aspect = match child(n, K::BindingUseClause) {
+            None => None,
+            Some(u) => {
+                if let Some(e) = child(&u, K::EntityEntityAspect) {
+                    let (name, arch) = self.entity_arch_name(&child(&e, K::Name)?)?;
+                    Some(EntityAspect::Entity(name, arch))
+                } else if let Some(c) = child(&u, K::EntityConfigurationAspect) {
+                    Some(EntityAspect::Configuration(
+                        self.name(&child(&c, K::Name)?)?,
+                    ))
+                } else if child(&u, K::EntityOpenAspect).is_some() {
+                    Some(EntityAspect::Open)
+                } else {
+                    self.unexpected(&u);
+                    return None;
+                }
+            }
+        };
+        Some(BindingInd {
+            aspect,
+            generic_map: child(n, K::GenericMapAspect)
+                .map(|g| self.map_aspect(&g))
+                .unwrap_or_default(),
+            port_map: child(n, K::PortMapAspect)
+                .map(|g| self.map_aspect(&g))
+                .unwrap_or_default(),
+            span: span(n),
+        })
+    }
+
+    /// `lib.e(arch)`: the entity name and the architecture.
+    fn entity_arch_name(&mut self, n: &N) -> Option<(Name, Option<Ident>)> {
+        let full = self.name(n)?;
+        Some(match full.kind {
+            NameKind::Call(prefix, args) => {
+                let arch = match args.as_slice() {
+                    [
+                        Assoc {
+                            formal: None,
+                            actual:
+                                Actual::Expr(Expr {
+                                    kind:
+                                        ExprKind::Name(Name {
+                                            kind: NameKind::Simple(i),
+                                            ..
+                                        }),
+                                    ..
+                                }),
+                            ..
+                        },
+                    ] => Some(i.clone()),
+                    _ => None,
+                };
+                (*prefix, arch)
+            }
+            _ => (full, None),
+        })
+    }
 
     fn map_aspect(&mut self, n: &N) -> Vec<Assoc> {
         child(n, K::AssociationList)
@@ -1606,30 +1747,8 @@ impl Converter {
             }
             K::ComponentInstantiationStatement => {
                 let unit = if let Some(ie) = child(n, K::InstantiatedEntity) {
-                    let full = self.name(&child(&ie, K::Name)?)?;
-                    match full.kind {
-                        NameKind::Call(prefix, args) => {
-                            let arch = match args.as_slice() {
-                                [
-                                    Assoc {
-                                        actual:
-                                            Actual::Expr(Expr {
-                                                kind:
-                                                    ExprKind::Name(Name {
-                                                        kind: NameKind::Simple(i),
-                                                        ..
-                                                    }),
-                                                ..
-                                            }),
-                                        ..
-                                    },
-                                ] => Some(i.clone()),
-                                _ => None,
-                            };
-                            InstUnit::Entity(*prefix, arch)
-                        }
-                        _ => InstUnit::Entity(full, None),
-                    }
+                    let (name, arch) = self.entity_arch_name(&child(&ie, K::Name)?)?;
+                    InstUnit::Entity(name, arch)
                 } else if let Some(ic) = child(n, K::InstantiatedComponent) {
                     InstUnit::Component(self.name(&child(&ic, K::Name)?)?)
                 } else if let Some(ic) = child(n, K::InstantiatedConfiguration) {
@@ -1657,17 +1776,28 @@ impl Converter {
                 let (mut generics, mut generic_map, mut ports, mut port_map) =
                     (Vec::new(), Vec::new(), Vec::new(), Vec::new());
                 if let Some(h) = &header {
-                    if let Some(g) = child(h, K::GenericClause) {
-                        generics = self.interface_clause(&g);
+                    // BlockHeader → GenericPart (GenericClause, GenericMap →
+                    // GenericMapAspect) and PortPart (PortClause, PortMap →
+                    // PortMapAspect).
+                    if let Some(gp) = child(h, K::GenericPart) {
+                        if let Some(g) = child(&gp, K::GenericClause) {
+                            generics = self.interface_clause(&g);
+                        }
+                        if let Some(g) =
+                            child(&gp, K::GenericMap).and_then(|m| child(&m, K::GenericMapAspect))
+                        {
+                            generic_map = self.map_aspect(&g);
+                        }
                     }
-                    if let Some(g) = child(h, K::GenericMapAspect) {
-                        generic_map = self.map_aspect(&g);
-                    }
-                    if let Some(g) = child(h, K::PortClause) {
-                        ports = self.interface_clause(&g);
-                    }
-                    if let Some(g) = child(h, K::PortMapAspect) {
-                        port_map = self.map_aspect(&g);
+                    if let Some(pp) = child(h, K::PortPart) {
+                        if let Some(g) = child(&pp, K::PortClause) {
+                            ports = self.interface_clause(&g);
+                        }
+                        if let Some(g) =
+                            child(&pp, K::PortMap).and_then(|m| child(&m, K::PortMapAspect))
+                        {
+                            port_map = self.map_aspect(&g);
+                        }
                     }
                 }
                 ConcKind::Block {
@@ -1688,7 +1818,7 @@ impl Converter {
                 let pre = child(n, K::ForGeneratePreamble)?;
                 let ps = child(&pre, K::ParameterSpecification)?;
                 let range_n = nodes(&ps).into_iter().next()?;
-                let (decls, stmts) = self.generate_body(&child(n, K::GenerateStatementBody)?);
+                let (decls, stmts) = self.generate_body(child(n, K::GenerateStatementBody));
                 ConcKind::ForGenerate {
                     param: first_ident(&ps)?,
                     range: self.discrete_range(&range_n)?,
@@ -1709,7 +1839,7 @@ impl Converter {
                                 })
                                 .and_then(|e| self.expr(&e));
                             let (decls, stmts) =
-                                self.generate_body(&child(&b, K::GenerateStatementBody)?);
+                                self.generate_body(child(&b, K::GenerateStatementBody));
                             branches.push(GenerateBranch {
                                 alt_label,
                                 cond,
@@ -1730,7 +1860,7 @@ impl Converter {
                 let mut branches = Vec::new();
                 for b in childs(n, K::CaseGenerateAlternative) {
                     let choices = child(&b, K::Choices).and_then(|c| self.choices(&c))?;
-                    let (decls, stmts) = self.generate_body(&child(&b, K::GenerateStatementBody)?);
+                    let (decls, stmts) = self.generate_body(child(&b, K::GenerateStatementBody));
                     branches.push(GenerateBranch {
                         alt_label: self.label(&b),
                         cond: None,
@@ -1756,7 +1886,12 @@ impl Converter {
         })
     }
 
-    fn generate_body(&mut self, n: &N) -> (Vec<Decl>, Vec<ConcStmt>) {
+    /// A generate body; an empty one has no node.
+    fn generate_body(&mut self, n: Option<N>) -> (Vec<Decl>, Vec<ConcStmt>) {
+        let Some(n) = n else {
+            return (Vec::new(), Vec::new());
+        };
+        let n = &n;
         let decls = child(n, K::GenerateBodyDeclarations)
             .and_then(|d| child(&d, K::BlockDeclarativePart))
             .map(|d| self.decls(&d))

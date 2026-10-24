@@ -354,6 +354,9 @@ pub struct Architecture {
     pub constants: Vec<ObjId>,
     pub processes: Vec<Process>,
     pub instances: Vec<Instance>,
+    /// A block statement or generate iteration (§11.2, §11.8): a scope
+    /// nested in its parent's, instantiated in place.
+    pub nested: bool,
     pub loc: Loc,
 }
 
@@ -369,7 +372,27 @@ pub struct Instance {
     pub generic_map: Vec<(ObjId, HExpr)>,
     /// Port (of the instantiated entity) → actual (`None` for `open`).
     pub port_map: Vec<(ObjId, Option<HExpr>)>,
+    /// Port associations with a conversion or a partial formal (their
+    /// formals have `None` in `port_map` and a signal of their own).
+    pub port_conv: Vec<PortConv>,
+    /// The block configuration of the bound architecture (index into
+    /// `Design::block_configs`), from a configuration declaration.
+    pub config: Option<usize>,
     pub loc: Loc,
+}
+
+/// A port association with a conversion function, a type conversion or
+/// a partial formal (§6.5.7.1). Values pass without a delta (§14.7.3.4).
+#[derive(Clone, Debug)]
+pub struct PortConv {
+    pub formal: ObjId,
+    pub mode: Mode,
+    /// Mode `in`: the formal or a part of it (instance context).
+    /// Mode `out`/`buffer`: the actual signal name (enclosing context).
+    pub target: HExpr,
+    /// Mode `in`: the actual part (enclosing context); `out`/`buffer`:
+    /// the formal part (instance context).
+    pub value: HExpr,
 }
 
 /// An analysed package: its objects (constants, signals, shared variables)
