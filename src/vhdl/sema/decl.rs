@@ -69,11 +69,25 @@ impl Design {
                     objs.push(id);
                 }
             }
-            ast::Decl::Signal { obj, .. } => {
+            ast::Decl::Signal { obj, kind } => {
                 for id in self.object_decl(r, obj, ObjKind::Signal) {
                     objs.push(id);
+                    if let Some(k) = kind {
+                        // §6.4.2.3: a guarded signal is of a resolved subtype.
+                        if !self.is_resolved(self.objects[id].ty) {
+                            self.error(
+                                obj.span.clone(),
+                                "a guarded signal must be of a resolved subtype",
+                            );
+                        }
+                        self.sig_kinds.insert(id, *k);
+                        if let Some(m) = self.type_mark(r, &obj.ty.mark) {
+                            self.guarded_marks.insert(id, m);
+                        }
+                    }
                 }
             }
+            ast::Decl::Disconnect(ds) => self.disconnect_spec(r, ds, objs),
             ast::Decl::Variable { obj, shared } => {
                 let k = if *shared {
                     ObjKind::SharedVariable
@@ -272,6 +286,91 @@ impl Design {
             }
             ast::Decl::Unsupported(what, span) => {
                 self.error(span.clone(), format!("{} are not supported yet", what))
+            }
+        }
+    }
+
+    /// A disconnection specification (§7.4): the disconnection time of
+    /// the named guarded signals, or of the others or all of the type
+    /// declared in this declarative part.
+    fn disconnect_spec(&mut self, r: RegionId, ds: &ast::DisconnectSpec, objs: &[ObjId]) {
+        let Some(t) = self.type_mark(r, &ds.mark) else {
+            return;
+        };
+        let time = self.std.time;
+        let Some(after) = self.expr(r, &ds.after, Some(time)) else {
+            return;
+        };
+        if self.eval(&after).is_none() {
+            self.error(
+                ds.after.span.clone(),
+                "the disconnection time must be a static expression",
+            );
+            return;
+        }
+        let guarded = |d: &Self, o: ObjId| d.guarded_marks.get(&o) == Some(&t);
+        let targets: Vec<ObjId> = match &ds.signals {
+            ast::SignalList::Names(names) => {
+                let mut v = Vec::new();
+                for n in names {
+                    match objs.iter().rev().find(|&&o| self.objects[o].name == n.name) {
+                        Some(&o) if guarded(self, o) => v.push(o),
+                        Some(_) => self.error(
+                            n.span.clone(),
+                            format!(
+                                "'{}' is not a guarded signal of type '{}'",
+                                n.name,
+                                name_text(&ds.mark)
+                            ),
+                        ),
+                        None => self.error(
+                            n.span.clone(),
+                            format!(
+                                "no signal '{}' is declared in this declarative part",
+                                n.name
+                            ),
+                        ),
+                    }
+                }
+                v
+            }
+            ast::SignalList::Others => objs
+                .iter()
+                .copied()
+                .filter(|&o| guarded(self, o) && !self.disconnect.contains_key(&o))
+                .collect(),
+            ast::SignalList::All => objs.iter().copied().filter(|&o| guarded(self, o)).collect(),
+        };
+        for o in targets {
+            if self.disconnect.insert(o, after.clone()).is_some() {
+                self.error(
+                    ds.span.clone(),
+                    format!(
+                        "signal '{}' already has a disconnection specification",
+                        self.objects[o].name
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Whether a subtype has a resolution function (of its own or of its
+    /// elements, §6.3).
+    pub fn is_resolved(&self, t: TypeId) -> bool {
+        let mut cur = t;
+        loop {
+            match &self.types[cur].kind {
+                TypeKind::Subtype {
+                    resolution: Some(_),
+                    ..
+                } => return true,
+                TypeKind::Subtype { base, .. } => cur = *base,
+                TypeKind::Array { .. } => {
+                    return self
+                        .element_subtype(t)
+                        .is_some_and(|e| e != t && self.is_resolved(e));
+                }
+                _ => return false,
             }
         }
     }

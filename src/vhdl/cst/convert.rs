@@ -914,7 +914,30 @@ impl Converter {
                 Decl::PackageInst(Box::new(self.package_inst(n)?))
             }
             K::DisconnectionSpecification => {
-                Decl::Unsupported("disconnection specifications".into(), span(n))
+                let g = child(n, K::GuardedSignalSpecification)?;
+                let signals = if child(&g, K::SignalListAll).is_some() {
+                    SignalList::All
+                } else if child(&g, K::SignalListOthers).is_some() {
+                    SignalList::Others
+                } else {
+                    let mut v = Vec::new();
+                    for nm in childs(&child(&g, K::SignalListList)?, K::Name) {
+                        match self.name(&nm)?.kind {
+                            NameKind::Simple(i) => v.push(i),
+                            _ => {
+                                self.unexpected(&nm);
+                                return None;
+                            }
+                        }
+                    }
+                    SignalList::Names(v)
+                };
+                Decl::Disconnect(DisconnectSpec {
+                    signals,
+                    mark: self.name(&child(&g, K::Name)?)?,
+                    after: self.expr(nodes(n).get(1)?)?,
+                    span: span(n),
+                })
             }
             K::GroupDeclaration | K::GroupTemplateDeclaration => {
                 Decl::Unsupported("groups".into(), span(n))

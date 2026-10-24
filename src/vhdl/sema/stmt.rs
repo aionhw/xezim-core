@@ -27,6 +27,8 @@ struct Nested<'a> {
     port_map: &'a [ast::Assoc],
     decls: &'a [ast::Decl],
     stmts: &'a [ast::ConcStmt],
+    /// The guard expression of a guarded block (§11.2).
+    guard: Option<&'a ast::Expr>,
 }
 
 #[derive(Clone)]
@@ -130,6 +132,16 @@ impl Design {
                 let delay = self.delay(r, delay);
                 return self.assign_rhs(r, rhs, s.span.clone(), |d, w| {
                     let waves = d.waveform(r, w, t.ty)?;
+                    // §10.5.2.2: a null transaction needs a guarded target.
+                    if waves.iter().any(|w| w.value.is_none())
+                        && !d.sig_root(&t).is_some_and(|o| d.sig_kinds.contains_key(&o))
+                    {
+                        d.error(
+                            tn.span.clone(),
+                            "the target of a null waveform element must be a guarded signal",
+                        );
+                        return None;
+                    }
                     Some(HStmtKind::SignalAssign {
                         target: t.clone(),
                         delay: delay.clone(),
@@ -421,8 +433,17 @@ impl Design {
                     self.signals_read(x, out);
                 }
             }
+            HExprKind::Attr(name, p, _)
+                if matches!(
+                    name.as_str(),
+                    "stable" | "quiet" | "delayed" | "transaction"
+                ) && matches!(p.as_ref(), AttrPrefix::Expr(_)) =>
+            {
+                // An implicit signal (§16.2.4) is read itself.
+                out.push(h.clone());
+            }
             HExprKind::Attr(name, p, param) => {
-                // `s'event` etc. read the prefix signal; `'stable(t)` too.
+                // `s'event` etc. read the prefix signal.
                 if let AttrPrefix::Expr(x) = p.as_ref()
                     && !matches!(
                         name.as_str(),
@@ -522,13 +543,6 @@ impl Design {
                 delay,
                 rhs,
             } => {
-                if *guarded {
-                    self.error(
-                        s.span.clone(),
-                        "guarded signal assignments are not supported yet",
-                    );
-                    return;
-                }
                 // §11.6: the equivalent process.
                 let st = ast::SeqStmt {
                     label: None,
@@ -539,9 +553,15 @@ impl Design {
                     },
                     span: s.span.clone(),
                 };
-                let Some(h) = self.seq_stmt(r, &st, &pctx) else {
+                let Some(mut h) = self.seq_stmt(r, &st, &pctx) else {
                     return;
                 };
+                if *guarded {
+                    match self.guarded_assign(r, target, delay, h, &loc) {
+                        Some(g) => h = g,
+                        None => return,
+                    }
+                }
                 let mut sens = Vec::new();
                 self.stmts_signals_read(std::slice::from_ref(&h), &mut sens);
                 arch.processes.push(Process {
@@ -637,10 +657,6 @@ impl Design {
                 decls,
                 stmts,
             } => {
-                if let Some(g) = guard {
-                    self.error(g.span.clone(), "guarded blocks are not supported yet");
-                    return;
-                }
                 self.nested_scope(
                     r,
                     arch,
@@ -657,6 +673,7 @@ impl Design {
                         port_map,
                         decls,
                         stmts,
+                        guard: guard.as_ref(),
                     },
                 );
             }
@@ -704,6 +721,7 @@ impl Design {
                             port_map: &[],
                             decls,
                             stmts,
+                            guard: None,
                         },
                     );
                 }
@@ -818,6 +836,7 @@ impl Design {
                 port_map: &[],
                 decls: &b.decls,
                 stmts: &b.stmts,
+                guard: None,
             },
         );
     }
@@ -825,6 +844,73 @@ impl Design {
     /// A block statement or generate iteration: a nested architecture
     /// of its own, instantiated in place of the statement (§14.5.2,
     /// §14.5.3). It sees the enclosing scope's objects.
+    /// A guarded assignment (§11.6): `if GUARD then <assignment>`, and for
+    /// a guarded target `else <target> <= null after <disconnection time>`.
+    fn guarded_assign(
+        &mut self,
+        r: RegionId,
+        target: &ast::Target,
+        delay: &Option<ast::DelayMech>,
+        h: HStmt,
+        loc: &Loc,
+    ) -> Option<HStmt> {
+        let guard = match self.lookup(r, "guard").first() {
+            Some(Sym::Obj(o)) if self.objects[*o].kind == ObjKind::Signal => *o,
+            _ => {
+                self.error(
+                    loc.span.clone(),
+                    "a guarded assignment needs a GUARD signal (a guarded block)",
+                );
+                return None;
+            }
+        };
+        let cond = HExpr {
+            kind: HExprKind::Obj(guard),
+            ty: self.objects[guard].ty,
+            loc: loc.clone(),
+        };
+        let ast::Target::Name(tn) = target else {
+            self.error(target.span(), "aggregate targets are not supported yet");
+            return None;
+        };
+        let t = self.name_expr(r, tn, None)?;
+        let disconnect = match self.sig_root(&t) {
+            Some(o) if self.sig_kinds.contains_key(&o) => {
+                let after = match self.disconnect.get(&o) {
+                    Some(d) => d.clone(),
+                    None => super::decl::lit_expr(Value::Phys(0), self.std.time, loc.clone()),
+                };
+                Some(vec![HStmt {
+                    kind: HStmtKind::SignalAssign {
+                        target: t,
+                        delay: self.delay(r, delay),
+                        waves: vec![HWave {
+                            value: None,
+                            after: Some(after),
+                        }],
+                    },
+                    loc: loc.clone(),
+                }])
+            }
+            _ => None,
+        };
+        Some(HStmt {
+            kind: HStmtKind::If(vec![(cond, vec![h])], disconnect),
+            loc: loc.clone(),
+        })
+    }
+
+    /// The signal object a signal name is part of.
+    pub fn sig_root(&self, h: &HExpr) -> Option<ObjId> {
+        match &h.kind {
+            HExprKind::Obj(o) => Some(*o),
+            HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) => {
+                self.sig_root(b)
+            }
+            _ => None,
+        }
+    }
+
     fn nested_scope(&mut self, r: RegionId, parent: &mut Architecture, loc: Loc, b: Nested<'_>) {
         let nr = self.new_region(Some(r));
         let path = format!("{}.{}.{}", parent.library, parent.entity, b.label);
@@ -855,6 +941,23 @@ impl Design {
         let ports = self.interface_list(nr, b.ports, super::decl::IfaceKind::Port, &path);
         let (port_map, port_conv) = self.map_ports(r, &ports, b.port_map, parent, &loc);
         let mut objs = Vec::new();
+        // A guarded block declares the implicit signal GUARD (§11.2).
+        if let Some(g) = b.guard
+            && let Some(c) = self.condition(nr, g)
+        {
+            let gloc = self.loc(g.span.clone());
+            let o = self.add_obj(ObjInfo {
+                name: "guard".into(),
+                kind: ObjKind::Signal,
+                ty: self.std.boolean,
+                init: None,
+                loc: gloc,
+                static_val: None,
+            });
+            self.declare(nr, "guard", Sym::Obj(o));
+            self.guards.insert(o, c);
+            objs.push(o);
+        }
         let mut subs = Vec::new();
         self.decls(nr, b.decls, &mut objs, &mut subs, &path);
         let (signals, consts): (Vec<ObjId>, Vec<ObjId>) = objs

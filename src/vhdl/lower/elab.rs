@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::{Lw, Repr, sv_ident, sv_string};
-use crate::vhdl::ast::{Dir, Mode, ObjClass};
+use crate::vhdl::ast::{Dir, Mode, ObjClass, SignalKind};
 use crate::vhdl::sema::hir::*;
 
 /// A signal of the flattened design.
@@ -32,6 +32,47 @@ pub(super) struct Sig {
     pub inst: usize,
     /// An actual's value as the initial value (`port map (p => '0')`).
     pub init_expr: Option<(HExpr, usize)>,
+    /// An implicit signal (index into `Lw::imps`).
+    pub implicit: Option<usize>,
+}
+
+/// The kinds of implicit signals (§16.2.4, §11.2).
+#[derive(Clone, Debug)]
+pub(super) enum ImpKind {
+    Stable,
+    Quiet,
+    Delayed,
+    Transaction,
+    /// GUARD: the guard expression and the instance it is evaluated in.
+    Guard(HExpr, usize),
+}
+
+/// An implicit signal, updated by the kernel after the explicit signals
+/// of each simulation cycle (§14.7.5.3 b, c).
+#[derive(Clone, Debug)]
+pub(super) struct Imp {
+    pub kind: ImpKind,
+    pub sig: usize,
+    /// The prefix's event (`'stable`, `'delayed`) or activity (`'quiet`,
+    /// `'transaction`) in this cycle (SV).
+    pub trig: String,
+    /// `'delayed`: the prefix's value (SV).
+    pub value: String,
+    /// The time parameter T (SV).
+    pub delay: String,
+    /// Implicit signals (signal ids) it reads, updated before it.
+    pub deps: Vec<usize>,
+}
+
+/// A procedure lowered for one calling process and one binding of its
+/// signal parameters to the actual signals (§4.2.2.3): it may wait and
+/// drive signals for that process.
+#[derive(Clone, Debug)]
+pub(super) struct Spec {
+    pub sub: SubId,
+    pub inst: usize,
+    pub proc: usize,
+    pub binds: Vec<(ObjId, SigRef)>,
 }
 
 /// How an object names a signal: the whole signal or a static part.
@@ -188,6 +229,7 @@ impl<'a> Lw<'a> {
             ty: self.d.objects[o].ty,
             inst,
             init_expr: None,
+            implicit: None,
         });
         self.sig_map.insert(
             (inst, o),
@@ -524,10 +566,13 @@ impl<'a> Lw<'a> {
         let Some(r) = self.lookup_sig(self.inst, o) else {
             return format!("vh_s{}", o);
         };
-        let base = if self.read_last {
-            format!("vh_s{}_last", r.sig)
-        } else {
-            format!("vh_s{}", r.sig)
+        if self.sigs[r.sig].implicit.is_some() {
+            self.imp_refs.push(r.sig);
+        }
+        let base = match self.read_drv {
+            Some((s, p)) if s == r.sig => format!("vh_dv{}_{}", s, p),
+            _ if self.read_last => format!("vh_s{}_last", r.sig),
+            _ => format!("vh_s{}", r.sig),
         };
         match r.part {
             Part::Whole => base,
@@ -587,24 +632,43 @@ impl<'a> Lw<'a> {
     }
 
     /// A signal attribute of a signal name (`'event`, `'active`,
-    /// `'last_value`, `'last_event`, §16.2.4): of the whole signal, or for a
-    /// part, from the whole signal's flags and the part's values.
+    /// `'last_value`, `'last_event`, `'last_active`, §16.2.4): of the whole
+    /// signal, or for a part, from the whole signal's flags and the part's
+    /// values.
     pub(super) fn sig_attr(&mut self, x: &HExpr, name: &str) -> Option<String> {
+        // An implicit signal.
+        if let HExprKind::Attr(an, p, prm) = &x.kind
+            && is_implicit(an)
+            && let AttrPrefix::Expr(px) = p.as_ref()
+        {
+            let r = self.implicit_sig(an, px, prm.as_deref(), x.ty, &x.loc)?;
+            self.imp_refs.push(r);
+            return Some(self.whole_attr(r, name));
+        }
         // A signal parameter: the attributes passed with it.
         if let HExprKind::Obj(o) = &x.kind
             && matches!(self.d.objects[*o].kind, ObjKind::Param(ObjClass::Signal, _))
+            && self.lookup_sig(self.inst, *o).is_none()
         {
             let p = self.obj_name(*o);
             return Some(match name {
                 "event" => format!("{}_ev", p),
                 "active" => format!("{}_act", p),
                 "last_value" => format!("{}_last", p),
+                "last_active" => {
+                    self.err(
+                        &x.loc,
+                        "'last_active of a signal parameter is not supported yet",
+                    );
+                    "0".into()
+                }
                 _ => format!("(longint'($time) - {}_lev)", p),
             });
         }
         if let HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) = &x.kind
             && let HExprKind::Obj(o) = &b.kind
             && matches!(self.d.objects[*o].kind, ObjKind::Param(ObjClass::Signal, _))
+            && self.lookup_sig(self.inst, *o).is_none()
         {
             let p = self.obj_name(*o);
             let cur = self.ex(x);
@@ -614,27 +678,301 @@ impl<'a> Lw<'a> {
                 "event" => format!("({}_ev && !{})", p, self.eq_expr(&r, &cur, &last)),
                 "active" => format!("{}_act", p),
                 "last_value" => last,
+                "last_active" => {
+                    self.err(
+                        &x.loc,
+                        "'last_active of a signal parameter is not supported yet",
+                    );
+                    "0".into()
+                }
                 _ => format!("(longint'($time) - {}_lev)", p),
             });
         }
         let s = self.sig_of(x)?;
         if self.whole_sig(x).is_some() {
-            return Some(match name {
-                "event" => format!("vh_s{}_ev", s),
-                "active" => format!("vh_s{}_act", s),
-                "last_value" => format!("vh_s{}_last", s),
-                _ => format!("(longint'($time) - vh_s{}_lev)", s),
-            });
+            return Some(self.whole_attr(s, name));
         }
         let cur = self.ex(x);
         let last = self.ex_last(x);
         let r = self.repr(x.ty, &x.loc);
         Some(match name {
             "event" => format!("(vh_s{}_ev && !{})", s, self.eq_expr(&r, &cur, &last)),
-            "active" => format!("vh_s{}_act", s),
             "last_value" => last,
-            _ => format!("(longint'($time) - vh_s{}_lev)", s),
+            _ => self.whole_attr(s, name),
         })
+    }
+
+    /// A signal attribute of a whole signal.
+    fn whole_attr(&mut self, s: usize, name: &str) -> String {
+        match name {
+            "event" => format!("vh_s{}_ev", s),
+            "active" => format!("vh_s{}_act", s),
+            "last_value" => format!("vh_s{}_last", s),
+            "last_active" => {
+                self.need_lact.insert(s);
+                format!("(longint'($time) - vh_s{}_lact)", s)
+            }
+            _ => format!("(longint'($time) - vh_s{}_lev)", s),
+        }
+    }
+
+    /// The implicit signal `x'name(t)` (§16.2.4), created on first use;
+    /// `ty` is its type.
+    pub(super) fn implicit_sig(
+        &mut self,
+        name: &str,
+        x: &HExpr,
+        param: Option<&HExpr>,
+        ty: TypeId,
+        loc: &Loc,
+    ) -> Option<usize> {
+        let root = self.d.sig_root(x);
+        if let Some(o) = root
+            && matches!(self.d.objects[o].kind, ObjKind::Param(ObjClass::Signal, _))
+            && self.lookup_sig(self.inst, o).is_none()
+        {
+            self.err(
+                loc,
+                format!("'{} of a signal parameter is not supported yet", name),
+            );
+            return None;
+        }
+        let mark = self.imp_refs.len();
+        let px = self.ex(x);
+        let delay = match param {
+            Some(t) => self.ex(t),
+            None => "64'sd0".into(),
+        };
+        let key = format!("{}|{}|{}", name, px, delay);
+        if let Some(&r) = self.imp_keys.get(&key) {
+            self.imp_refs.truncate(mark);
+            return Some(r);
+        }
+        let trig = self.sig_attr(
+            x,
+            if matches!(name, "stable" | "delayed") {
+                "event"
+            } else {
+                "active"
+            },
+        );
+        let Some(trig) = trig else {
+            self.err(
+                loc,
+                format!("'{} of this signal is not supported yet", name),
+            );
+            return None;
+        };
+        let deps: Vec<usize> = self.imp_refs.drain(mark..).collect();
+        let kind = match name {
+            "stable" => ImpKind::Stable,
+            "quiet" => ImpKind::Quiet,
+            "delayed" => ImpKind::Delayed,
+            _ => ImpKind::Transaction,
+        };
+        let r = self.sigs.len();
+        self.sigs.push(Sig {
+            obj: root.unwrap_or(0),
+            ty,
+            inst: self.inst,
+            init_expr: None,
+            implicit: Some(self.imps.len()),
+        });
+        self.imps.push(Imp {
+            kind,
+            sig: r,
+            trig,
+            value: px,
+            delay,
+            deps,
+        });
+        self.imp_keys.insert(key, r);
+        Some(r)
+    }
+
+    /// `x'driving` / `x'driving_value` (§16.2.4): of the current process's
+    /// driver of the signal.
+    pub(super) fn driving(&mut self, name: &str, x: &HExpr, loc: &Loc) -> String {
+        let (Some(p), Some(s)) = (self.cur_proc, self.sig_of(x)) else {
+            self.err(loc, format!("'{} is only supported in a process", name));
+            return "0".into();
+        };
+        self.drv_checks.push((s, p, loc.clone()));
+        if name == "driving" {
+            return if self.sig_kind(s).is_some() {
+                format!("vh_don{}_{}", s, p)
+            } else {
+                "1'b1".into()
+            };
+        }
+        let saved = self.read_drv.replace((s, p));
+        let v = self.ex(x);
+        self.read_drv = saved;
+        v
+    }
+
+    /// The kind of a guarded signal (§6.4.2.3).
+    pub(super) fn sig_kind(&self, s: usize) -> Option<SignalKind> {
+        let sig = &self.sigs[s];
+        if sig.implicit.is_some() {
+            return None;
+        }
+        self.d.sig_kinds.get(&sig.obj).copied()
+    }
+
+    /// A call of a procedure lowered per process (`Spec`): its signal
+    /// parameters are bound to the actual signals, the other actuals are
+    /// passed.
+    pub(super) fn spec_call(
+        &mut self,
+        sub: SubId,
+        args: &[HExpr],
+        ind: usize,
+        loc: &Loc,
+    ) -> String {
+        let pad = " ".repeat(ind);
+        let info = self.d.subprograms[sub].clone();
+        let Some(p) = self.cur_proc else {
+            self.err(
+                loc,
+                format!(
+                    "procedure '{}' waits, assigns signals or has signal parameters; calls outside a process are not supported yet",
+                    info.name
+                ),
+            );
+            return String::new();
+        };
+        let inst = if self.in_package(sub) { 0 } else { self.inst };
+        let mut binds = Vec::new();
+        let mut a = Vec::new();
+        for (param, x) in info.params.iter().zip(args) {
+            if matches!(
+                self.d.objects[*param].kind,
+                ObjKind::Param(ObjClass::Signal, _)
+            ) {
+                match self.actual_ref(self.inst, x) {
+                    Some(r) => binds.push((*param, r)),
+                    None => {
+                        self.err(
+                            &x.loc,
+                            "the actual of a signal parameter must be a static signal name",
+                        );
+                        return String::new();
+                    }
+                }
+            } else {
+                a.extend(self.arg_values(*param, x));
+            }
+        }
+        let key = format!("{}|{}|{}|{:?}", sub, inst, p, binds);
+        let n = match self.spec_keys.get(&key) {
+            Some(n) => *n,
+            None => {
+                let n = self.specs.len();
+                self.specs.push(Spec {
+                    sub,
+                    inst,
+                    proc: p,
+                    binds,
+                });
+                self.spec_keys.insert(key, n);
+                self.spec_todo.push(n);
+                n
+            }
+        };
+        format!("{}{}({});\n", pad, self.spec_name(n), a.join(", "))
+    }
+
+    fn spec_name(&self, n: usize) -> String {
+        let s = self.specs[n].sub;
+        let clean: String = self.d.subprograms[s]
+            .name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        format!("vh_f{}_{}_x{}", s, clean, n)
+    }
+
+    /// Lower procedure specialization `n`: a task when it waits.
+    pub(super) fn spec_sv(&mut self, n: usize) {
+        let sp = self.specs[n].clone();
+        let info = self.d.subprograms[sp.sub].clone();
+        let Some(body) = info.body.clone() else {
+            return;
+        };
+        let loc = info.loc.clone().unwrap_or(Loc {
+            file: 0,
+            span: 0..0,
+        });
+        let saved_inst = std::mem::replace(&mut self.inst, sp.inst);
+        let saved_proc = self.cur_proc.replace(sp.proc);
+        let saved_temps = std::mem::take(&mut self.temps);
+        let mut saved_map = Vec::new();
+        for (o, r) in &sp.binds {
+            saved_map.push((*o, self.sig_map.insert((sp.inst, *o), r.clone())));
+        }
+        let mut params = Vec::new();
+        for p in &info.params {
+            if !matches!(self.d.objects[*p].kind, ObjKind::Param(ObjClass::Signal, _)) {
+                params.extend(self.param_decls(*p, &loc));
+            }
+        }
+        let mut locals = String::new();
+        let mut inits = String::new();
+        for l in &body.locals {
+            let o = self.d.objects[*l].clone();
+            let r = self.repr(o.ty, &o.loc);
+            let _ = writeln!(locals, "    {} {};", r.sv(), self.obj_name(*l));
+            let v = match &o.init {
+                Some(i) => {
+                    let target = HExpr {
+                        kind: HExprKind::Obj(*l),
+                        ty: o.ty,
+                        loc: o.loc.clone(),
+                    };
+                    self.store_value_init(&target, i)
+                }
+                None => self.default_value(o.ty, &o.loc),
+            };
+            let flushed = self.flush_pre(4);
+            inits.push_str(&flushed);
+            let _ = writeln!(inits, "    {} = {};", self.obj_name(*l), v);
+        }
+        let stmts = self.stmts(&body.stmts, 4);
+        let mut temps = String::new();
+        for (n, t) in std::mem::take(&mut self.temps) {
+            let _ = writeln!(temps, "    {} {};", t, n);
+        }
+        let (open, close) = if self.sub_waits(sp.sub) {
+            ("task automatic", "endtask")
+        } else {
+            ("function automatic void", "endfunction")
+        };
+        let _ = write!(
+            self.sub_items,
+            "  {} {}({});\n{}{}{}{}  {}\n",
+            open,
+            self.spec_name(n),
+            params.join(", "),
+            locals,
+            temps,
+            inits,
+            stmts,
+            close
+        );
+        for (o, old) in saved_map {
+            match old {
+                Some(r) => {
+                    self.sig_map.insert((sp.inst, o), r);
+                }
+                None => {
+                    self.sig_map.remove(&(sp.inst, o));
+                }
+            }
+        }
+        self.temps = saved_temps;
+        self.cur_proc = saved_proc;
+        self.inst = saved_inst;
     }
 
     /// `x` with the signals it names read at their last values.
@@ -846,11 +1184,20 @@ impl<'a> Lw<'a> {
                 Some(a) => self.ex(a),
                 None => "64'sd0".into(),
             };
-            let Some(v) = &w.value else {
-                self.err(&loc, "null transactions are not supported yet");
-                continue;
+            let guarded = self.sig_kind(sig).is_some();
+            let (val, nl) = match &w.value {
+                Some(v) => (self.store_value(target, v), ", 0"),
+                // A null transaction (§10.5.2.2): turns the driver off.
+                None if call.is_none() => (format!("vh_dv{}_{}", sig, p), ", 1"),
+                None => {
+                    self.err(
+                        &loc,
+                        "null transactions to part of a signal are not supported yet",
+                    );
+                    continue;
+                }
             };
-            let val = self.store_value(target, v);
+            let nl = if guarded { nl } else { "" };
             // The first element of an inertial assignment rejects pulses
             // shorter than the reject limit (default: its delay).
             let (mode, rej) = if i == 0 && !transport {
@@ -862,8 +1209,8 @@ impl<'a> Lw<'a> {
                 None => {
                     let _ = writeln!(
                         out,
-                        "{}vh_drv_{}_{}({}, {}, {}, {});",
-                        pad, sig, p, val, t, rej, mode
+                        "{}vh_drv_{}_{}({}, {}, {}, {}{});",
+                        pad, sig, p, val, t, rej, mode, nl
                     );
                 }
                 Some((off, None)) => {
@@ -944,6 +1291,20 @@ impl<'a> Lw<'a> {
     pub(super) fn module(&mut self, top: usize) -> String {
         let d = self.d;
         self.elaborate(top);
+        // GUARD signals of guarded blocks (§11.2): implicit signals.
+        for si in 0..self.sigs.len() {
+            if let Some(e) = d.guards.get(&self.sigs[si].obj) {
+                self.sigs[si].implicit = Some(self.imps.len());
+                self.imps.push(Imp {
+                    kind: ImpKind::Guard(e.clone(), self.sigs[si].inst),
+                    sig: si,
+                    trig: String::new(),
+                    value: String::new(),
+                    delay: String::new(),
+                    deps: Vec::new(),
+                });
+            }
+        }
         let nprocs = self.procs.len();
         let np = nprocs.max(1);
         self.sites = (0..nprocs).map(|_| Vec::new()).collect();
@@ -1017,7 +1378,7 @@ impl<'a> Lw<'a> {
             let r = self.repr(s.ty, &info.loc);
             let _ = writeln!(
                 decls,
-                "  {t} vh_s{s};\n  bit vh_s{s}_ev, vh_s{s}_act; {t} vh_s{s}_last; longint vh_s{s}_lev;",
+                "  {t} vh_s{s};\n  bit vh_s{s}_ev, vh_s{s}_act; {t} vh_s{s}_last; longint vh_s{s}_lev, vh_s{s}_lact;",
                 s = si,
                 t = r.sv()
             );
@@ -1043,7 +1404,7 @@ impl<'a> Lw<'a> {
             elab.push_str(&flushed);
             let _ = writeln!(
                 elab,
-                "    vh_s{s} = {v};\n    vh_s{s}_last = vh_s{s}; vh_s{s}_lev = -64'sd9223372036854775807;",
+                "    vh_s{s} = {v};\n    vh_s{s}_last = vh_s{s}; vh_s{s}_lev = -64'sd9223372036854775807; vh_s{s}_lact = vh_s{s}_lev;",
                 s = si,
                 v = v
             );
@@ -1094,21 +1455,40 @@ impl<'a> Lw<'a> {
         }
         self.cur_proc = None;
         self.inst = 0;
-        // Drivers and signal updates (their resolution functions are
-        // lowered with the subprograms).
-        let drv = self.drivers_sv(&mut elab);
-        let (upd, upd_sigs) = self.updates_sv();
         let mut lnk = String::new();
         for n in 0..self.links.len() {
             let f = self.link_sv(n);
             lnk.push_str(&f);
         }
-        // Subprograms the design calls (transitively).
-        while let Some((s, inst)) = self.subs_todo.pop() {
-            if self.subs_done.insert((s, inst)) {
-                let saved = std::mem::replace(&mut self.inst, inst);
-                self.subprogram(s);
-                self.inst = saved;
+        let mut imp_fns = String::new();
+        for n in 0..self.imps.len() {
+            if matches!(self.imps[n].kind, ImpKind::Guard(..)) {
+                let f = self.guard_sv(n);
+                imp_fns.push_str(&f);
+            }
+        }
+        // Subprograms the design calls (transitively), and the procedures
+        // lowered per process.
+        self.lower_subprograms();
+        // Drivers and signal updates (their resolution functions are
+        // lowered with the subprograms).
+        let drv = self.drivers_sv(&mut elab);
+        let (upd, upd_sigs) = self.updates_sv();
+        self.lower_subprograms();
+        for n in 0..self.imps.len() {
+            if !matches!(self.imps[n].kind, ImpKind::Guard(..)) {
+                let f = self.imp_sv(n, &mut decls);
+                imp_fns.push_str(&f);
+            }
+        }
+        // 'driving and 'driving_value need a driver of the process.
+        for (s, p, loc) in std::mem::take(&mut self.drv_checks) {
+            if !self.drivers.contains_key(&(s, p)) {
+                let name = self.d.objects[self.sigs[s].obj].name.clone();
+                self.err(
+                    &loc,
+                    format!("the process has no driver of signal '{}'", name),
+                );
             }
         }
         let k = self.kernel(&upd_sigs);
@@ -1150,7 +1530,7 @@ impl<'a> Lw<'a> {
         );
         let _ = writeln!(
             m,
-            "  bit vh_go [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop;",
+            "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop;",
             n = np
         );
         m.push_str(&decls);
@@ -1161,6 +1541,7 @@ impl<'a> Lw<'a> {
         m.push_str(&upd);
         m.push_str(&self.sub_items);
         m.push_str(&lnk);
+        m.push_str(&imp_fns);
         let _ = write!(
             m,
             "  function automatic void vh_elab();\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n{}  endfunction\n",
@@ -1170,6 +1551,150 @@ impl<'a> Lw<'a> {
         m.push_str(&k);
         m.push_str("endmodule\n");
         m
+    }
+
+    fn lower_subprograms(&mut self) {
+        loop {
+            if let Some(n) = self.spec_todo.pop() {
+                self.spec_sv(n);
+                continue;
+            }
+            let Some((s, inst)) = self.subs_todo.pop() else {
+                break;
+            };
+            if self.subs_done.insert((s, inst)) {
+                let saved = std::mem::replace(&mut self.inst, inst);
+                self.subprogram(s);
+                self.inst = saved;
+            }
+        }
+    }
+
+    /// The update function of GUARD (implicit signal `n`, §11.2): the
+    /// guard expression, recomputed in every cycle.
+    fn guard_sv(&mut self, n: usize) -> String {
+        let ImpKind::Guard(e, inst) = self.imps[n].kind.clone() else {
+            return String::new();
+        };
+        let r = self.imps[n].sig;
+        let saved = std::mem::replace(&mut self.inst, inst);
+        let saved_proc = self.cur_proc.take();
+        self.temps.clear();
+        let mark = self.imp_refs.len();
+        let v = self.ex(&e);
+        let deps: Vec<usize> = self.imp_refs.drain(mark..).filter(|&x| x != r).collect();
+        self.imps[n].deps = deps;
+        let pre = self.flush_pre(4);
+        let mut temps = String::new();
+        for (name, t) in std::mem::take(&mut self.temps) {
+            let _ = writeln!(temps, "    {} {};", t, name);
+        }
+        self.inst = saved;
+        self.cur_proc = saved_proc;
+        let t = self.repr(e.ty, &e.loc).sv();
+        format!(
+            "  function automatic void vh_imp{n}(bit init);\n    {t} nv;\n{temps}{pre}    nv = {v};\n    if (init) begin vh_s{r} = nv; vh_s{r}_last = nv; end\n    else if (nv != vh_s{r}) begin vh_s{r}_last = vh_s{r}; vh_s{r} = nv; vh_s{r}_ev = 1; vh_s{r}_act = 1; vh_s{r}_lev = $time; end\n  endfunction\n",
+            n = n,
+            t = t,
+            temps = temps,
+            pre = pre,
+            v = v,
+            r = r
+        )
+    }
+
+    /// The declarations (into `decls`) and the update function of
+    /// implicit signal `n` (§16.2.4): `'stable(T)`/`'quiet(T)` turn FALSE
+    /// in the cycle of an event/activity of the prefix and TRUE T later;
+    /// `'delayed(T)` follows the prefix's events T later (transport);
+    /// `'transaction` toggles in each cycle the prefix is active.
+    fn imp_sv(&mut self, n: usize, decls: &mut String) -> String {
+        let im = self.imps[n].clone();
+        let r = im.sig;
+        let sig = self.sigs[r].clone();
+        let loc = self.d.objects[sig.obj].loc.clone();
+        let rp = self.repr(sig.ty, &loc);
+        let t = rp.sv();
+        let _ = writeln!(
+            decls,
+            "  {t} vh_s{r};\n  bit vh_s{r}_ev, vh_s{r}_act; {t} vh_s{r}_last; longint vh_s{r}_lev, vh_s{r}_lact;",
+            t = t,
+            r = r
+        );
+        let init_common = format!(
+            "vh_s{r}_last = vh_s{r}; vh_s{r}_lev = -64'sd9223372036854775807; vh_s{r}_lact = vh_s{r}_lev;",
+            r = r
+        );
+        let ev = format!(
+            "    if (!{}) begin vh_s{r}_last = o; vh_s{r}_ev = 1; vh_s{r}_lev = $time; end\n",
+            self.eq_expr(&rp, &format!("vh_s{}", r), "o"),
+            r = r
+        );
+        match im.kind {
+            ImpKind::Stable | ImpKind::Quiet => {
+                let _ = writeln!(decls, "  longint vh_s{}_due;", r);
+                format!(
+                    "  function automatic void vh_imp{n}(bit init);\n    {t} o;\n    if (init) begin vh_s{r} = 1; vh_s{r}_due = -64'sd1; {ic} return; end\n    o = vh_s{r};\n    if (vh_s{r}_due >= 0 && vh_s{r}_due <= $time) begin vh_s{r}_due = -64'sd1; vh_s{r} = 1; vh_s{r}_act = 1; end\n    if ({trig}) begin vh_s{r} = 0; vh_s{r}_act = 1; vh_s{r}_due = vh_deadline({d}); end\n{ev}  endfunction\n",
+                    n = n,
+                    t = t,
+                    r = r,
+                    ic = init_common,
+                    trig = im.trig,
+                    d = im.delay,
+                    ev = ev
+                )
+            }
+            ImpKind::Delayed => {
+                let _ = writeln!(
+                    decls,
+                    "  longint vh_s{r}_qt[$];\n  {t} vh_s{r}_qv[$];",
+                    r = r,
+                    t = t
+                );
+                format!(
+                    "  function automatic void vh_imp{n}(bit init);\n    {t} o;\n    longint tt;\n    longint qt[$];\n    {t} qv[$];\n    if (init) begin vh_s{r} = {v}; {ic} return; end\n    o = vh_s{r};\n    qt = vh_s{r}_qt;\n    qv = vh_s{r}_qv;\n    if (qt.size() > 0 && qt[0] <= $time) begin void'(qt.pop_front()); vh_s{r} = qv.pop_front(); vh_s{r}_act = 1; end\n    if ({trig}) begin\n      tt = vh_deadline({d});\n      if (tt >= 0) begin\n        while (qt.size() > 0 && qt[qt.size()-1] >= tt) begin void'(qt.pop_back()); void'(qv.pop_back()); end\n        qt.push_back(tt);\n        qv.push_back({v});\n      end\n    end\n    vh_s{r}_qt = qt;\n    vh_s{r}_qv = qv;\n{ev}  endfunction\n",
+                    n = n,
+                    t = t,
+                    r = r,
+                    v = im.value,
+                    ic = init_common,
+                    trig = im.trig,
+                    d = im.delay,
+                    ev = ev
+                )
+            }
+            ImpKind::Transaction => format!(
+                "  function automatic void vh_imp{n}(bit init);\n    if (init) begin vh_s{r} = 1; {ic} return; end\n    if ({trig}) begin vh_s{r}_last = vh_s{r}; vh_s{r} = 1 - vh_s{r}; vh_s{r}_ev = 1; vh_s{r}_act = 1; vh_s{r}_lev = $time; end\n  endfunction\n",
+                n = n,
+                r = r,
+                ic = init_common,
+                trig = im.trig
+            ),
+            ImpKind::Guard(..) => String::new(),
+        }
+    }
+
+    /// Implicit signals in update order: each after those it reads.
+    fn imp_order(&self) -> Vec<usize> {
+        let mut order = Vec::new();
+        let mut state = vec![0u8; self.imps.len()];
+        fn visit(lw: &Lw, n: usize, state: &mut [u8], order: &mut Vec<usize>) {
+            if state[n] != 0 {
+                return;
+            }
+            state[n] = 1;
+            for &d in &lw.imps[n].deps {
+                if let Some(m) = lw.sigs[d].implicit {
+                    visit(lw, m, state, order);
+                }
+            }
+            state[n] = 2;
+            order.push(n);
+        }
+        for n in 0..self.imps.len() {
+            visit(self, n, &mut state, &mut order);
+        }
+        order
     }
 
     /// The drivers: transaction queues and the procedures updating their
@@ -1183,21 +1708,62 @@ impl<'a> Lw<'a> {
             let loc = self.d.objects[sig.obj].loc.clone();
             let r = self.repr(sig.ty, &loc);
             let t = r.sv();
+            let guarded = self.sig_kind(*s).is_some();
+            if guarded {
+                // Whether the driver is on (§14.7.3.2): a null transaction
+                // turns it off.
+                let _ = writeln!(drv, "  bit vh_don{}_{};", s, p);
+                let _ = writeln!(elab, "    vh_don{}_{} = 1;", s, p);
+            }
             if *p >= PSEUDO {
                 // The driver of a port link: a value only.
                 let _ = writeln!(drv, "  {} vh_dv{}_{};", t, s, p);
             } else if !dr.slots {
                 // Parallel queues of transaction times and values (a queue
                 // of structs holding a struct does not round-trip in the
-                // simulator).
+                // simulator); for a guarded signal also null flags.
                 let eq = self.eq_expr(&r, "qv[k]", "v");
+                let (g_decl, g_param, g_local, g_get, g_pop, g_eq, g_del, g_push, g_put) =
+                    if guarded {
+                        (
+                            format!("  bit vh_dn{s}_{p}[$];\n", s = s, p = p),
+                            ", bit nl",
+                            "    bit qn[$];\n",
+                            format!("    qn = vh_dn{s}_{p};\n", s = s, p = p),
+                            " void'(qn.pop_back());",
+                            format!("qn[k] == nl && (nl || {})", eq),
+                            " qn.delete(k);",
+                            "    qn.push_back(nl);\n",
+                            format!("    vh_dn{s}_{p} = qn;\n", s = s, p = p),
+                        )
+                    } else {
+                        (
+                            String::new(),
+                            "",
+                            "",
+                            String::new(),
+                            "",
+                            eq.clone(),
+                            "",
+                            "",
+                            String::new(),
+                        )
+                    };
                 let _ = write!(
                     drv,
-                    "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  // Update the projected output waveform (§10.5.2.2): mode 0 transport,\n  // 1 inertial first element (reject limit), 2 later elements.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    longint tt;\n    longint qt[$];\n    {t} qv[$];\n    int k;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qv = vh_dq{s}_{p};\n    while (qt.size() > 0 && qt[qt.size()-1] >= tt) begin void'(qt.pop_back()); void'(qv.pop_back()); end\n    if (mode == 1) begin\n      // Pulse rejection: of the old transactions in [tt - rej, tt), keep\n      // the run immediately before the new one that has its value.\n      k = qt.size() - 1;\n      while (k >= 0 && qt[k] >= tt - rej && ({eq})) k--;\n      while (k >= 0 && qt[k] >= tt - rej) begin qt.delete(k); qv.delete(k); k--; end\n    end\n    qt.push_back(tt);\n    qv.push_back(v);\n    vh_dt{s}_{p} = qt;\n    vh_dq{s}_{p} = qv;\n  endfunction\n",
+                    "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n{g_decl}  {t} vh_dv{s}_{p};\n  // Update the projected output waveform (§10.5.2.2): mode 0 transport,\n  // 1 inertial first element (reject limit), 2 later elements.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode{g_param});\n    longint tt;\n    longint qt[$];\n    {t} qv[$];\n{g_local}    int k;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qv = vh_dq{s}_{p};\n{g_get}    while (qt.size() > 0 && qt[qt.size()-1] >= tt) begin void'(qt.pop_back()); void'(qv.pop_back());{g_pop} end\n    if (mode == 1) begin\n      // Pulse rejection: of the old transactions in [tt - rej, tt), keep\n      // the run immediately before the new one that has its value.\n      k = qt.size() - 1;\n      while (k >= 0 && qt[k] >= tt - rej && ({g_eq})) k--;\n      while (k >= 0 && qt[k] >= tt - rej) begin qt.delete(k); qv.delete(k);{g_del} k--; end\n    end\n    qt.push_back(tt);\n    qv.push_back(v);\n{g_push}    vh_dt{s}_{p} = qt;\n    vh_dq{s}_{p} = qv;\n{g_put}  endfunction\n",
                     t = t,
                     s = s,
                     p = p,
-                    eq = eq
+                    g_decl = g_decl,
+                    g_param = g_param,
+                    g_local = g_local,
+                    g_get = g_get,
+                    g_pop = g_pop,
+                    g_eq = g_eq,
+                    g_del = g_del,
+                    g_push = g_push,
+                    g_put = g_put
                 );
             } else {
                 let Repr::Arr(name, er) = &r else {
@@ -1209,14 +1775,24 @@ impl<'a> Lw<'a> {
                 };
                 let et = er.sv();
                 let eq = self.eq_expr(er, "qv[i]", "v");
+                let (g_param, g_null) = if guarded {
+                    (
+                        ", bit nl",
+                        "    if (nl) begin vh_fatal(\"a null transaction to a signal also assigned by parts is not supported\"); return; end\n",
+                    )
+                } else {
+                    ("", "")
+                };
                 let _ = write!(
                     drv,
-                    "  longint vh_dt{s}_{p}[$];\n  longint vh_dk{s}_{p}[$];\n  {et} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  // The projected waveform of element k (§10.5.2.2), transactions kept in\n  // time order.\n  function automatic void vh_drs_{s}_{p}(longint k, {et} v, longint after, longint rej, int mode);\n    longint tt;\n    longint qt[$];\n    longint qk[$];\n    {et} qv[$];\n    int i, pos;\n    bit keep;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qk = vh_dk{s}_{p};\n    qv = vh_dq{s}_{p};\n    for (i = qt.size() - 1; i >= 0; i--) if (qk[i] == k && qt[i] >= tt) begin qt.delete(i); qk.delete(i); qv.delete(i); end\n    if (mode == 1) begin\n      keep = 1;\n      for (i = qt.size() - 1; i >= 0; i--) begin\n        if (qk[i] != k) continue;\n        if (qt[i] < tt - rej) break;\n        if (keep && ({eq})) continue;\n        keep = 0;\n        qt.delete(i); qk.delete(i); qv.delete(i);\n      end\n    end\n    pos = qt.size();\n    for (i = 0; i < qt.size(); i++) if (qt[i] > tt) begin pos = i; break; end\n    if (pos == qt.size()) begin\n      qt.push_back(tt); qk.push_back(k); qv.push_back(v);\n    end else begin\n      qt.insert(pos, tt); qk.insert(pos, k); qv.insert(pos, v);\n    end\n    vh_dt{s}_{p} = qt;\n    vh_dk{s}_{p} = qk;\n    vh_dq{s}_{p} = qv;\n  endfunction\n  // A slice: its elements from offset `off`.\n  function automatic void vh_drsl_{s}_{p}(longint off, longint n, {t} v, longint after, longint rej, int mode, string file, int line);\n    if (v.d.size() != n) begin\n      vh_fatal($sformatf(\"bound check failure at %s:%0d\", file, line));\n      return;\n    end\n    for (int j = 0; j < n; j++) vh_drs_{s}_{p}(off + j, v.d[j], after, rej, mode);\n  endfunction\n  // The whole signal: every element.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    for (int j = 0; j < v.d.size(); j++) vh_drs_{s}_{p}(j, v.d[j], after, rej, mode);\n  endfunction\n",
+                    "  longint vh_dt{s}_{p}[$];\n  longint vh_dk{s}_{p}[$];\n  {et} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  // The projected waveform of element k (§10.5.2.2), transactions kept in\n  // time order.\n  function automatic void vh_drs_{s}_{p}(longint k, {et} v, longint after, longint rej, int mode);\n    longint tt;\n    longint qt[$];\n    longint qk[$];\n    {et} qv[$];\n    int i, pos;\n    bit keep;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qk = vh_dk{s}_{p};\n    qv = vh_dq{s}_{p};\n    for (i = qt.size() - 1; i >= 0; i--) if (qk[i] == k && qt[i] >= tt) begin qt.delete(i); qk.delete(i); qv.delete(i); end\n    if (mode == 1) begin\n      keep = 1;\n      for (i = qt.size() - 1; i >= 0; i--) begin\n        if (qk[i] != k) continue;\n        if (qt[i] < tt - rej) break;\n        if (keep && ({eq})) continue;\n        keep = 0;\n        qt.delete(i); qk.delete(i); qv.delete(i);\n      end\n    end\n    pos = qt.size();\n    for (i = 0; i < qt.size(); i++) if (qt[i] > tt) begin pos = i; break; end\n    if (pos == qt.size()) begin\n      qt.push_back(tt); qk.push_back(k); qv.push_back(v);\n    end else begin\n      qt.insert(pos, tt); qk.insert(pos, k); qv.insert(pos, v);\n    end\n    vh_dt{s}_{p} = qt;\n    vh_dk{s}_{p} = qk;\n    vh_dq{s}_{p} = qv;\n  endfunction\n  // A slice: its elements from offset `off`.\n  function automatic void vh_drsl_{s}_{p}(longint off, longint n, {t} v, longint after, longint rej, int mode, string file, int line);\n    if (v.d.size() != n) begin\n      vh_fatal($sformatf(\"bound check failure at %s:%0d\", file, line));\n      return;\n    end\n    for (int j = 0; j < n; j++) vh_drs_{s}_{p}(off + j, v.d[j], after, rej, mode);\n  endfunction\n  // The whole signal: every element.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode{g_param});\n{g_null}    for (int j = 0; j < v.d.size(); j++) vh_drs_{s}_{p}(j, v.d[j], after, rej, mode);\n  endfunction\n",
                     et = et,
                     t = t,
                     s = s,
                     p = p,
-                    eq = eq
+                    eq = eq,
+                    g_param = g_param,
+                    g_null = g_null
                 );
                 let _ = name;
             }
@@ -1256,6 +1832,7 @@ impl<'a> Lw<'a> {
             let info = self.d.objects[sig.obj].clone();
             let r = self.repr(sig.ty, &info.loc);
             let res = self.resolution(sig.ty);
+            let kind = self.sig_kind(s);
             let tsv = r.sv();
             let mut body = String::new();
             match (&r, res) {
@@ -1269,16 +1846,45 @@ impl<'a> Lw<'a> {
                     self.need_sub(f);
                     let _ = writeln!(body, "    {} rv[];\n    {} nv;", per, tsv);
                     let _ = writeln!(body, "    rv = new[{}];", ds.len());
-                    for (i, (p, _)) in ds.iter().enumerate() {
-                        let _ = writeln!(body, "    rv[{}] = vh_dv{}_{};", i, s, p);
+                    match kind {
+                        None => {
+                            for (i, (p, _)) in ds.iter().enumerate() {
+                                let _ = writeln!(body, "    rv[{}] = vh_dv{}_{};", i, s, p);
+                            }
+                            let _ = writeln!(
+                                body,
+                                "    nv = {}({}_mk(0, {}, 0, rv));",
+                                self.sub_name(f),
+                                pname,
+                                ds.len() as i64 - 1
+                            );
+                        }
+                        Some(k) => {
+                            // A guarded signal: the drivers that are on;
+                            // with none, a register keeps its value
+                            // (§14.7.3.2).
+                            let _ = writeln!(body, "    {} ra[];\n    int c;\n    c = 0;", per);
+                            for (p, _) in &ds {
+                                let _ = writeln!(
+                                    body,
+                                    "    if (vh_don{s}_{p}) begin rv[c] = vh_dv{s}_{p}; c++; end",
+                                    s = s,
+                                    p = p
+                                );
+                            }
+                            let _ = writeln!(
+                                body,
+                                "    ra = new[c];\n    for (int j = 0; j < c; j++) ra[j] = rv[j];"
+                            );
+                            let call =
+                                format!("{}({}_mk(0, c - 1, 0, ra))", self.sub_name(f), pname);
+                            if k == SignalKind::Register {
+                                let _ = writeln!(body, "    nv = c == 0 ? vh_s{} : {};", s, call);
+                            } else {
+                                let _ = writeln!(body, "    nv = {};", call);
+                            }
+                        }
                     }
-                    let _ = writeln!(
-                        body,
-                        "    nv = {}({}_mk(0, {}, 0, rv));",
-                        self.sub_name(f),
-                        pname,
-                        ds.len() as i64 - 1
-                    );
                 }
                 (Repr::Arr(_, er), res) => {
                     // Element by element: the drivers covering it.
@@ -1305,19 +1911,36 @@ impl<'a> Lw<'a> {
                             }
                         }
                     }
-                    let _ = writeln!(body, "    {} nv;\n    {} rv[];\n    int c;", tsv, et);
+                    let _ = writeln!(body, "    {} nv;\n    {} rv[];\n    int c, cc;", tsv, et);
                     let _ = writeln!(body, "    nv = vh_s{};", s);
                     let _ = writeln!(body, "    rv = new[{}];", ds.len());
                     let _ = writeln!(body, "    for (int k = 0; k < nv.d.size(); k++) begin");
-                    let _ = writeln!(body, "      c = 0;");
+                    let _ = writeln!(body, "      c = 0; cc = 0;");
                     for (p, dr) in &ds {
                         let cond = cov_cond(&dr.cov);
-                        let _ = writeln!(
-                            body,
-                            "      if ({}) begin rv[c] = vh_dv{}_{}.d[k]; c++; end",
-                            cond, s, p
-                        );
+                        if kind.is_some() {
+                            let _ = writeln!(
+                                body,
+                                "      if ({c}) begin cc++; if (vh_don{s}_{p}) begin rv[c] = vh_dv{s}_{p}.d[k]; c++; end end",
+                                c = cond,
+                                s = s,
+                                p = p
+                            );
+                        } else {
+                            let _ = writeln!(
+                                body,
+                                "      if ({}) begin rv[c] = vh_dv{}_{}.d[k]; c++; end",
+                                cond, s, p
+                            );
+                        }
                     }
+                    // An element of a guarded bus with every driver off is
+                    // resolved from none.
+                    let any = if kind == Some(SignalKind::Bus) {
+                        "cc"
+                    } else {
+                        "c"
+                    };
                     match res {
                         Some((f, _)) => {
                             let pt = self.d.objects[self.d.subprograms[f].params[0]].ty;
@@ -1325,10 +1948,11 @@ impl<'a> Lw<'a> {
                             self.need_sub(f);
                             let _ = writeln!(
                                 body,
-                                "      if (c > 0) begin\n        {et} ra[];\n        ra = new[c];\n        for (int j = 0; j < c; j++) ra[j] = rv[j];\n        nv.d[k] = {}({}_mk(0, c - 1, 0, ra));\n      end",
+                                "      if ({any} > 0) begin\n        {et} ra[];\n        ra = new[c];\n        for (int j = 0; j < c; j++) ra[j] = rv[j];\n        nv.d[k] = {}({}_mk(0, c - 1, 0, ra));\n      end",
                                 self.sub_name(f),
                                 pname,
-                                et = et
+                                et = et,
+                                any = any
                             );
                         }
                         None => {
@@ -1363,9 +1987,55 @@ impl<'a> Lw<'a> {
         let nprocs = self.procs.len();
         let drivers: Vec<((usize, usize), Driver)> =
             self.drivers.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let post: Vec<usize> = (0..nprocs)
+            .filter(|&p| {
+                let (_, ai, pi) = self.procs[p];
+                self.d.archs[ai].processes[pi].postponed
+            })
+            .collect();
+        let imp_order = self.imp_order();
         let mut k = String::new();
+        // The time of the next simulation cycle (§14.7.5.3 g).
+        let _ = writeln!(
+            k,
+            "  function automatic longint vh_next();\n    longint n;\n    n = -64'sd1;"
+        );
+        for ((s, p), _) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
+            let _ = writeln!(
+                k,
+                "    if (vh_dt{s}_{p}.size() > 0 && (n < 0 || vh_dt{s}_{p}[0] < n)) n = vh_dt{s}_{p}[0];",
+                s = s,
+                p = p
+            );
+        }
+        let _ = writeln!(
+            k,
+            "    for (int p = 0; p < {}; p++) if (vh_tmo[p] >= 0 && (n < 0 || vh_tmo[p] < n)) n = vh_tmo[p];",
+            nprocs
+        );
+        for im in &self.imps {
+            match im.kind {
+                ImpKind::Stable | ImpKind::Quiet => {
+                    let _ = writeln!(
+                        k,
+                        "    if (vh_s{r}_due >= 0 && (n < 0 || vh_s{r}_due < n)) n = vh_s{r}_due;",
+                        r = im.sig
+                    );
+                }
+                ImpKind::Delayed => {
+                    let _ = writeln!(
+                        k,
+                        "    if (vh_s{r}_qt.size() > 0 && (n < 0 || vh_s{r}_qt[0] < n)) n = vh_s{r}_qt[0];",
+                        r = im.sig
+                    );
+                }
+                _ => {}
+            }
+        }
+        let _ = writeln!(k, "    return n;\n  endfunction");
         let _ = writeln!(k, "  initial begin : vh_kernel");
         let _ = writeln!(k, "    longint vh_nxt;");
+        let _ = writeln!(k, "    bit vh_any;");
         let _ = writeln!(k, "    vh_elab();");
         // Initial effective values (§14.7.5.2), in update order.
         let order = self.update_order();
@@ -1393,30 +2063,41 @@ impl<'a> Lw<'a> {
                 }
             }
         }
-        let _ = writeln!(
-            k,
-            "    // Initialization (§14.7.5.2): every process runs until it suspends."
-        );
-        let _ = writeln!(
-            k,
-            "    for (int p = 0; p < {}; p++) begin vh_go[p] = 1; wait (vh_go[p] == 0); end",
-            nprocs
-        );
-        let _ = writeln!(k, "    forever begin");
-        let _ = writeln!(k, "      vh_nxt = -64'sd1;");
-        for ((s, p), _) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
-            let _ = writeln!(
-                k,
-                "      if (vh_dt{s}_{p}.size() > 0 && (vh_nxt < 0 || vh_dt{s}_{p}[0] < vh_nxt)) vh_nxt = vh_dt{s}_{p}[0];",
-                s = s,
-                p = p
-            );
+        // Implicit signals: their initial values (after those they read).
+        for &n in &imp_order {
+            let _ = writeln!(k, "    vh_imp{}(1);", n);
         }
         let _ = writeln!(
             k,
-            "      for (int p = 0; p < {}; p++) if (vh_tmo[p] >= 0 && (vh_nxt < 0 || vh_tmo[p] < vh_nxt)) vh_nxt = vh_tmo[p];",
-            nprocs
+            "    // Initialization (§14.7.5.2): every process runs until it suspends,\n    // the postponed ones last."
         );
+        if post.is_empty() {
+            let _ = writeln!(
+                k,
+                "    for (int p = 0; p < {}; p++) begin vh_go[p] = 1; wait (vh_go[p] == 0); end",
+                nprocs
+            );
+        } else {
+            for p in &post {
+                let _ = writeln!(k, "    vh_post[{}] = 1;", p);
+            }
+            let _ = writeln!(
+                k,
+                "    for (int p = 0; p < {n}; p++) if (!vh_post[p]) begin vh_go[p] = 1; wait (vh_go[p] == 0); end\n    for (int p = 0; p < {n}; p++) if (vh_post[p]) begin vh_go[p] = 1; wait (vh_go[p] == 0); end",
+                n = nprocs
+            );
+        }
+        let _ = writeln!(k, "    forever begin");
+        let _ = writeln!(k, "      vh_nxt = vh_next();");
+        if !post.is_empty() {
+            // §14.7.5.3 h: at the last cycle of a time step the resumed
+            // postponed processes run; they must not cause a delta cycle.
+            let _ = writeln!(
+                k,
+                "      if (vh_nxt != $time) begin\n        vh_any = 0;\n        for (int p = 0; p < {n}; p++) if (vh_pres[p]) begin vh_pres[p] = 0; vh_go[p] = 1; wait (vh_go[p] == 0); vh_any = 1; end\n        if (vh_any) begin\n          vh_nxt = vh_next();\n          if (vh_nxt == $time) begin vh_fatal(\"postponed process causes a delta cycle\"); break; end\n        end\n      end",
+                n = nprocs
+            );
+        }
         let _ = writeln!(k, "      if (vh_nxt < 0 || vh_stop) break;");
         let _ = writeln!(k, "      if (vh_nxt > $time) #(vh_nxt - $time);");
         let _ = writeln!(k, "      // Signal update (§14.7.3).");
@@ -1432,11 +2113,17 @@ impl<'a> Lw<'a> {
                     p = p
                 );
             } else {
+                let on = if self.sig_kind(*s).is_some() {
+                    format!(" vh_don{s}_{p} = !vh_dn{s}_{p}.pop_front();", s = s, p = p)
+                } else {
+                    String::new()
+                };
                 let _ = writeln!(
                     k,
-                    "      if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
+                    "      if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
                     s = s,
-                    p = p
+                    p = p,
+                    on = on
                 );
             }
         }
@@ -1496,6 +2183,13 @@ impl<'a> Lw<'a> {
             );
             k.push_str(&ins.concat());
         }
+        // Implicit signals (§14.7.5.3 c).
+        for &n in &imp_order {
+            let _ = writeln!(k, "      vh_imp{}(0);", n);
+        }
+        for s in self.need_lact.clone() {
+            let _ = writeln!(k, "      if (vh_s{s}_act) vh_s{s}_lact = $time;", s = s);
+        }
         let _ = writeln!(k, "      // Resume (§14.7.5.3), in elaboration order.");
         for pi in 0..nprocs {
             let mut conds = vec![format!(
@@ -1512,6 +2206,18 @@ impl<'a> Lw<'a> {
                     si,
                     site.conds.join(" || ")
                 ));
+            }
+            if post.contains(&pi) {
+                // A postponed process resumes now and runs at the end of
+                // the time step, where its wait condition is evaluated
+                // (§10.2, §14.7.5.3 h).
+                let _ = writeln!(
+                    k,
+                    "      if (!vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
+                    p = pi,
+                    c = conds.join(" || ")
+                );
+                continue;
             }
             let _ = writeln!(
                 k,
@@ -1585,6 +2291,11 @@ impl<'a> Lw<'a> {
         }
         out
     }
+}
+
+/// Attributes denoting implicit signals (§16.2.4).
+pub(super) fn is_implicit(name: &str) -> bool {
+    matches!(name, "stable" | "quiet" | "delayed" | "transaction")
 }
 
 /// An SV condition on `k` for a driver's coverage.

@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use elab::{Driver, GLOBAL, InstInfo, Sig, SigRef, Site};
 use std::fmt::Write as _;
 
-use super::ast::Dir;
+use super::ast::{Dir, ObjClass};
 use super::sema::hir::*;
 use super::sema::{Analysed, Design};
 
@@ -117,9 +117,23 @@ struct Lw<'a> {
     sub_items: String,
     /// Process being lowered (for waits and drivers).
     cur_proc: Option<usize>,
-    /// Lowering a subprogram that waits: the process id is the `vh_pid`
-    /// argument.
-    in_task: bool,
+    /// Implicit signals, and their signals by attribute name and prefix.
+    imps: Vec<elab::Imp>,
+    imp_keys: HashMap<String, usize>,
+    /// Implicit signals read while lowering (dependencies of an implicit
+    /// signal's own update).
+    imp_refs: Vec<usize>,
+    /// Signals whose time of last activity is kept (`'last_active`).
+    need_lact: BTreeSet<usize>,
+    /// `'driving`/`'driving_value` uses: signal, process, location (the
+    /// process must have a driver of the signal).
+    drv_checks: Vec<(usize, usize, Loc)>,
+    /// Lowering `'driving_value`: this signal reads this process's driver.
+    read_drv: Option<(usize, usize)>,
+    /// Procedures lowered per calling process and signal actuals.
+    specs: Vec<elab::Spec>,
+    spec_keys: HashMap<String, usize>,
+    spec_todo: Vec<usize>,
     tmp: usize,
     /// Enclosing loops: (label id, exit flag, next flag) for exits of outer
     /// loops.
@@ -164,7 +178,15 @@ pub fn lower(an: &Analysed) -> Result<Lowered, Vec<String>> {
         subs_todo: Vec::new(),
         sub_items: String::new(),
         cur_proc: None,
-        in_task: false,
+        imps: Vec::new(),
+        imp_keys: HashMap::new(),
+        imp_refs: Vec::new(),
+        need_lact: BTreeSet::new(),
+        drv_checks: Vec::new(),
+        read_drv: None,
+        specs: Vec::new(),
+        spec_keys: HashMap::new(),
+        spec_todo: Vec::new(),
         tmp: 0,
         loops: Vec::new(),
         loop_flags: BTreeSet::new(),
@@ -614,6 +636,11 @@ impl<'a> Lw<'a> {
         let info = &self.d.objects[o];
         match info.kind {
             ObjKind::Signal | ObjKind::Port(_) => self.sig_read(o),
+            // A signal parameter of a procedure lowered per call: the
+            // actual signal.
+            ObjKind::Param(ObjClass::Signal, _) if self.lookup_sig(self.inst, o).is_some() => {
+                self.sig_read(o)
+            }
             ObjKind::Param(..) => format!("p{}_{}", o, sv_ident(&info.name)),
             _ if self.inst == GLOBAL || self.pkg_objs.contains(&o) => {
                 format!("vh_o{}_{}", o, sv_ident(&info.name))
@@ -1201,11 +1228,27 @@ impl<'a> Lw<'a> {
                 }
             },
             AttrPrefix::Expr(x) => {
-                if matches!(name, "event" | "active" | "last_value" | "last_event")
-                    && self.d.is_signal_expr(x)
+                if matches!(
+                    name,
+                    "event" | "active" | "last_value" | "last_event" | "last_active"
+                ) && self.d.is_signal_expr(x)
                     && let Some(v) = self.sig_attr(x, name)
                 {
                     return v;
+                }
+                if elab::is_implicit(name) && self.d.is_signal_expr(x) {
+                    let Some(r) = self.implicit_sig(name, x, param, h.ty, &h.loc) else {
+                        return "0".into();
+                    };
+                    self.imp_refs.push(r);
+                    return if self.read_last {
+                        format!("vh_s{}_last", r)
+                    } else {
+                        format!("vh_s{}", r)
+                    };
+                }
+                if matches!(name, "driving" | "driving_value") && self.d.is_signal_expr(x) {
+                    return self.driving(name, x, &h.loc);
                 }
                 let b = self.ex(x);
                 match name {
@@ -1469,15 +1512,6 @@ impl<'a> Lw<'a> {
 // ---- statements, subprograms, processes, kernel ----------------------------------
 
 impl<'a> Lw<'a> {
-    /// The process id expression in the current context.
-    fn pid(&self) -> String {
-        if self.in_task {
-            "vh_pid".into()
-        } else {
-            self.cur_proc.unwrap_or(0).to_string()
-        }
-    }
-
     /// Lower a statement list, indented.
     fn stmts(&mut self, stmts: &[HStmt], ind: usize) -> String {
         let mut out = String::new();
@@ -1855,38 +1889,76 @@ impl<'a> Lw<'a> {
                 );
                 String::new()
             }
+            None if self.needs_spec(sub) => self.spec_call(sub, args, ind, loc),
             None => {
                 self.need_sub(sub);
                 let mut a = Vec::new();
                 for (p, x) in info.params.iter().zip(args) {
                     a.extend(self.arg_values(*p, x));
                 }
-                if self.sub_waits(sub) {
-                    a.insert(0, self.pid());
-                }
                 format!("{}{}({});\n", pad, self.sub_name(sub), a.join(", "))
             }
         }
     }
 
-    /// Whether a procedure (transitively) waits: lowered as a task with the
-    /// calling process's id.
-    fn sub_waits(&self, s: SubId) -> bool {
-        fn has_wait(stmts: &[HStmt]) -> bool {
-            stmts.iter().any(|s| match &s.kind {
-                HStmtKind::Wait { .. } => true,
-                HStmtKind::If(b, e) => {
-                    b.iter().any(|(_, x)| has_wait(x)) || e.as_ref().is_some_and(|x| has_wait(x))
+    /// Whether a procedure (transitively) waits, and whether it
+    /// (transitively) assigns signals.
+    fn sub_effects(&self, s: SubId) -> (bool, bool) {
+        fn walk(d: &Design, stmts: &[HStmt], seen: &mut BTreeSet<SubId>, fx: &mut (bool, bool)) {
+            for s in stmts {
+                match &s.kind {
+                    HStmtKind::Wait { .. } => fx.0 = true,
+                    HStmtKind::SignalAssign { .. } => fx.1 = true,
+                    HStmtKind::If(b, e) => {
+                        for (_, x) in b {
+                            walk(d, x, seen, fx);
+                        }
+                        if let Some(x) = e {
+                            walk(d, x, seen, fx);
+                        }
+                    }
+                    HStmtKind::Case { alts, .. } => {
+                        for (_, x) in alts {
+                            walk(d, x, seen, fx);
+                        }
+                    }
+                    HStmtKind::Loop { body, .. } => walk(d, body, seen, fx),
+                    HStmtKind::Call(c, _) => {
+                        if seen.insert(*c)
+                            && let Some(b) = &d.subprograms[*c].body
+                        {
+                            walk(d, &b.stmts, seen, fx);
+                        }
+                    }
+                    _ => {}
                 }
-                HStmtKind::Case { alts, .. } => alts.iter().any(|(_, x)| has_wait(x)),
-                HStmtKind::Loop { body, .. } => has_wait(body),
-                _ => false,
-            })
+            }
         }
-        self.d.subprograms[s]
-            .body
-            .as_ref()
-            .is_some_and(|b| has_wait(&b.stmts))
+        let mut fx = (false, false);
+        let mut seen = BTreeSet::from([s]);
+        if let Some(b) = &self.d.subprograms[s].body {
+            walk(self.d, &b.stmts, &mut seen, &mut fx);
+        }
+        fx
+    }
+
+    fn sub_waits(&self, s: SubId) -> bool {
+        self.sub_effects(s).0
+    }
+
+    /// Whether a procedure is lowered per calling process (`elab::Spec`):
+    /// it waits, assigns signals or has signal parameters.
+    fn needs_spec(&self, s: SubId) -> bool {
+        let info = &self.d.subprograms[s];
+        if info.is_function || info.body.is_none() {
+            return false;
+        }
+        let (w, a) = self.sub_effects(s);
+        w || a
+            || info
+                .params
+                .iter()
+                .any(|p| matches!(self.d.objects[*p].kind, ObjKind::Param(ObjClass::Signal, _)))
     }
 
     fn subprogram(&mut self, s: SubId) {

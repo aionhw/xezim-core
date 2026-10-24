@@ -167,6 +167,23 @@ pub struct BindingInd {
     pub span: Span,
 }
 
+/// The signals of a disconnection specification (§7.4).
+#[derive(Clone, Debug)]
+pub enum SignalList {
+    Names(Vec<Ident>),
+    Others,
+    All,
+}
+
+/// `disconnect <signals> : <type mark> after <time>;` (§7.4).
+#[derive(Clone, Debug)]
+pub struct DisconnectSpec {
+    pub signals: SignalList,
+    pub mark: Name,
+    pub after: Expr,
+    pub span: Span,
+}
+
 /// `for <component spec> <binding>;` in a declarative part (§7.3.1).
 #[derive(Clone, Debug)]
 pub struct ConfigSpec {
@@ -475,6 +492,7 @@ pub enum Decl {
     },
     Component(ComponentDecl),
     ConfigSpec(ConfigSpec),
+    Disconnect(DisconnectSpec),
     Attribute {
         name: Ident,
         mark: Name,

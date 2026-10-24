@@ -129,6 +129,15 @@ pub struct Design {
     /// The block configuration of the architecture or block being
     /// analysed.
     cur_cfg: Option<usize>,
+    /// Guarded signals (§6.4.2.3): the signal kind.
+    pub sig_kinds: BTreeMap<ObjId, ast::SignalKind>,
+    /// Disconnection time of a guarded signal (§7.4); 0 ns when absent.
+    pub disconnect: BTreeMap<ObjId, HExpr>,
+    /// The type mark of each guarded signal's subtype indication.
+    guarded_marks: HashMap<ObjId, TypeId>,
+    /// The implicit GUARD signal of a guarded block → its guard
+    /// expression (§11.2).
+    pub guards: BTreeMap<ObjId, HExpr>,
     /// The names alias declarations stand for.
     pub aliases: Vec<HExpr>,
     /// Labels of loops (by `Sym::Label` id) — names only, for diagnostics.
@@ -202,6 +211,10 @@ impl Design {
             components: Vec::new(),
             block_configs: Vec::new(),
             cfg_specs: Vec::new(),
+            sig_kinds: BTreeMap::new(),
+            disconnect: BTreeMap::new(),
+            guarded_marks: HashMap::new(),
+            guards: BTreeMap::new(),
             cur_cfg: None,
             aliases: Vec::new(),
             labels: Vec::new(),

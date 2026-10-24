@@ -1778,6 +1778,10 @@ impl Design {
                 Some(mk(self, pt, pe, px))
             }
             "driving" if is_signal => Some(mk(self, boolean, None, px)),
+            "transaction" if is_signal => {
+                let bit = self.std.bit;
+                Some(mk(self, bit, None, px))
+            }
             "image" => {
                 // VHDL-2019 object'image; GHDL accepts it in 2008 mode too.
                 let _ = expect;
