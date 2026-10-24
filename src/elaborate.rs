@@ -33336,21 +33336,33 @@ fn inline_module_items(
                                                 // pattern `.CFG('{tag: ..})`) needs the
                                                 // formal's type to pack; the plain
                                                 // const-eval above yields 0 for it.
-                                                if let Some(pv) = pack_packed_vector_pattern(
-                                                    data_type,
-                                                    v,
-                                                    scoped_eval_params,
-                                                    &elab.typedef_types,
-                                                )
-                                                .or_else(|| {
-                                                    pack_struct_const_value(
+                                                // An unpacked array formal keeps the
+                                                // pattern: its elements are built from
+                                                // it, not from one packed element.
+                                                let unpacked = assignments.iter().any(|a| {
+                                                    a.name.name == name.name
+                                                        && !a.dimensions.is_empty()
+                                                });
+                                                let packed = if unpacked {
+                                                    None
+                                                } else {
+                                                    pack_packed_vector_pattern(
                                                         data_type,
                                                         v,
                                                         scoped_eval_params,
-                                                        &elab.typedefs,
                                                         &elab.typedef_types,
                                                     )
-                                                }) {
+                                                    .or_else(|| {
+                                                        pack_struct_const_value(
+                                                            data_type,
+                                                            v,
+                                                            scoped_eval_params,
+                                                            &elab.typedefs,
+                                                            &elab.typedef_types,
+                                                        )
+                                                    })
+                                                };
+                                                if let Some(pv) = packed {
                                                     val = pv;
                                                     packed_pattern = true;
                                                 }
@@ -33430,22 +33442,29 @@ fn inline_module_items(
                                             val = Value::from_f64(val.to_f64());
                                         }
                                         // See the Named branch: a pattern
-                                        // override needs the formal's type.
-                                        if let Some(pv) = pack_packed_vector_pattern(
-                                            data_type,
-                                            v,
-                                            scoped_eval_params,
-                                            &elab.typedef_types,
-                                        )
-                                        .or_else(|| {
-                                            pack_struct_const_value(
-                                                data_type,
-                                                v,
-                                                scoped_eval_params,
-                                                &elab.typedefs,
-                                                &elab.typedef_types,
-                                            )
-                                        }) {
+                                        // override needs the formal's type,
+                                        // and an unpacked array formal keeps it.
+                                        let packed =
+                                            if !a.dimensions.is_empty() {
+                                                None
+                                            } else {
+                                                pack_packed_vector_pattern(
+                                                    data_type,
+                                                    v,
+                                                    scoped_eval_params,
+                                                    &elab.typedef_types,
+                                                )
+                                                .or_else(|| {
+                                                    pack_struct_const_value(
+                                                        data_type,
+                                                        v,
+                                                        scoped_eval_params,
+                                                        &elab.typedefs,
+                                                        &elab.typedef_types,
+                                                    )
+                                                })
+                                            };
+                                        if let Some(pv) = packed {
                                             val = pv;
                                         } else {
                                             ovr_exprs.insert(a.name.name.clone(), v.clone());
@@ -33963,6 +33982,7 @@ fn inline_module_items(
                             // gets a value and `A[i]` reads 0.
                             if !assign.dimensions.is_empty() {
                                 let mut ov = sub_local_params.get(&assign.name.name).cloned();
+                                let mut pattern_init = None;
                                 // §23.10.2 / §10.9.1: an assignment-pattern
                                 // override (`.A('{-1, 18})`) assigns each item
                                 // to an element: pack the converted items,
@@ -33971,6 +33991,12 @@ fn inline_module_items(
                                 if let Some(ExprKind::AssignmentPattern(items)) =
                                     ovr_exprs.get(&assign.name.name).map(|e| &e.kind)
                                 {
+                                    // Any other pattern (replication, keyed,
+                                    // `default:`, nested rows, struct elements)
+                                    // is built element by element from the
+                                    // override itself, as a declared initializer is.
+                                    pattern_init = ovr_exprs.get(&assign.name.name);
+                                    ov = None;
                                     let elem_t = param_integral_target(
                                         data_type,
                                         &inst_types,
@@ -33981,9 +34007,12 @@ fn inline_module_items(
                                     if let Some(t) = elem_t.filter(|_| {
                                         assign.dimensions.len() == 1
                                             && items.iter().all(|it| {
-                                                matches!(it, AssignmentPatternItem::Ordered(_))
+                                                matches!(it, AssignmentPatternItem::Ordered(e)
+                                                    if !matches!(e.kind, ExprKind::Replication { .. }
+                                                        | ExprKind::AssignmentPattern(_)))
                                             })
                                     }) {
+                                        pattern_init = None;
                                         let elems: Vec<Value> = items
                                             .iter()
                                             .map(|it| {
@@ -34002,7 +34031,21 @@ fn inline_module_items(
                                     }
                                 }
                                 let snapshot = sub_local_params.clone();
-                                if register_array_param(
+                                if let Some(init) = pattern_init {
+                                    if array_params::register(
+                                        elab,
+                                        &inst_prefix,
+                                        &assign.name.name,
+                                        &assign.dimensions,
+                                        Some(init),
+                                        None,
+                                        data_type,
+                                        &snapshot,
+                                        scoped_eval_params,
+                                    ) {
+                                        continue;
+                                    }
+                                } else if register_array_param(
                                     elab,
                                     &inst_prefix,
                                     &assign.name.name,

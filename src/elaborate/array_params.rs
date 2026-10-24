@@ -62,11 +62,7 @@ pub(super) fn elements(
     if outer.is_empty() {
         return None;
     }
-    let items: Option<Vec<&Expression>> = init.and_then(|e| match &e.kind {
-        ExprKind::Concatenation(v) => Some(v.iter().collect()),
-        ExprKind::AssignmentPattern(v) => Some(v.iter().map(|v| v.expr()).collect()),
-        _ => None,
-    });
+    let items = init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, init_params));
     let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
     let row_count = dims[1..].iter().try_fold(1usize, |n, d| {
         n.checked_mul(const_dim_indices(std::slice::from_ref(d), params)?.len())
@@ -82,7 +78,7 @@ pub(super) fn elements(
     let mut out = Vec::new();
     for (position, index) in outer.iter().enumerate() {
         let key = format!("{name}[{index}]");
-        let item = items.as_ref().and_then(|v| v.get(position)).copied();
+        let item = items.as_ref().and_then(|v| v.get(position));
         let packed = override_val.map(|v| {
             let low = (outer.len() - 1 - position) * row_w;
             v.range_select(low + row_w - 1, low)
@@ -126,6 +122,85 @@ pub(super) fn elements(
         out.push((key, value));
     }
     Some(out)
+}
+
+/// One initializer per index of `outer` (declared order), from pattern `e`.
+///
+/// §10.9.1: `'{n{a, b}}` replicates pattern elements, `'{k: v}` places `v`
+/// at index `k` (not at position `k`), and `default:` fills every index left
+/// unset. For a nested array a non-pattern `default:` reaches every leaf, so
+/// each missing row becomes `'{default: v}` (`int a [2][3] = '{default: 5}`).
+fn pattern_items(
+    e: &Expression,
+    outer: &[i64],
+    nested: bool,
+    params: &HashMap<String, Value>,
+) -> Option<Vec<Expression>> {
+    let items = match &e.kind {
+        ExprKind::Concatenation(v) => return Some(v.clone()),
+        ExprKind::AssignmentPattern(items) => items,
+        _ => return None,
+    };
+    if items
+        .iter()
+        .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
+    {
+        if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
+            && let ExprKind::Replication { count, exprs } = &only.kind
+        {
+            let reps = usize::try_from(const_eval_i64_with_params(count, Some(params))?).ok()?;
+            if reps.checked_mul(exprs.len())? > outer.len() {
+                return None;
+            }
+            return Some(
+                exprs
+                    .iter()
+                    .cycle()
+                    .take(reps * exprs.len())
+                    .cloned()
+                    .collect(),
+            );
+        }
+        return Some(items.iter().map(|it| it.expr().clone()).collect());
+    }
+    let mut slots: Vec<Option<&Expression>> = vec![None; outer.len()];
+    let mut default = None;
+    for it in items {
+        match it {
+            AssignmentPatternItem::Keyed(key, v) => {
+                let index = const_eval_i64_with_params(key, Some(params))?;
+                *slots.get_mut(outer.iter().position(|&i| i == index)?)? = Some(v);
+            }
+            // A bare identifier key (`'{K: v}`) parses as a member name; in
+            // an array pattern it is a constant index.
+            AssignmentPatternItem::Named(key, v) => {
+                let index = const_eval_i64_with_params(&make_ident_expr(&key.name), Some(params))?;
+                *slots.get_mut(outer.iter().position(|&i| i == index)?)? = Some(v);
+            }
+            AssignmentPatternItem::Default(v) => default = Some(v),
+            _ => return None,
+        }
+    }
+    slots
+        .into_iter()
+        .map(|slot| match (slot, default) {
+            (Some(v), _) => Some(v.clone()),
+            (None, Some(d))
+                if nested
+                    && !matches!(
+                        d.kind,
+                        ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+                    ) =>
+            {
+                Some(Expression::new(
+                    ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(d.clone())]),
+                    d.span,
+                ))
+            }
+            (None, Some(d)) => Some(d.clone()),
+            (None, None) => None,
+        })
+        .collect()
 }
 
 pub(super) fn register(
