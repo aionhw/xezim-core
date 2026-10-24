@@ -36133,6 +36133,21 @@ fn inline_module_items(
                                             width,
                                             is_type_two_state(&dd.data_type),
                                         );
+                                        // Same §7.6 order as the 1-D instance path.
+                                        // `register_fixed_unpacked_array` records the
+                                        // normalized (lo, hi) shape; overwrite it with
+                                        // the declared bounds so a descending range
+                                        // still pairs left to right.
+                                        if let Some(declared) = declared_unpacked_dims(
+                                            &effective_decl_dims,
+                                            &sub_merged_params,
+                                        ) {
+                                            if declared.first().is_some_and(|(l, r)| l > r) {
+                                                elab.descending_arrays.insert(sig_name.clone());
+                                            }
+                                            elab.unpacked_decl_dims
+                                                .insert(sig_name.clone(), declared);
+                                        }
                                         elab.var_decl_types
                                             .insert(sig_name.clone(), dd.data_type.clone());
                                         // §6.8: its initializer is deferred like every
@@ -36161,6 +36176,25 @@ fn inline_module_items(
                                         }
                                     }
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    // §7.6: a 1-D variable in an INSTANCE keeps its
+                                    // declared left-to-right order, same as the
+                                    // top-level path. `arrays` stores (lo, hi);
+                                    // without `unpacked_decl_dims` /
+                                    // `descending_arrays` a `[N-1:0]` actual was
+                                    // paired with a descending port as if it were
+                                    // `[0:N-1]`, so element 0 of the port received
+                                    // the parent's highest index (and the output
+                                    // port reversed it back, hiding the swap from
+                                    // the parent).
+                                    if let Some(declared) = declared_unpacked_dims(
+                                        &effective_decl_dims,
+                                        &sub_merged_params,
+                                    ) {
+                                        if declared.first().is_some_and(|(l, r)| l > r) {
+                                            elab.descending_arrays.insert(sig_name.clone());
+                                        }
+                                        elab.unpacked_decl_dims.insert(sig_name.clone(), declared);
+                                    }
                                     // §6.8: a fixed array's declaration initializer is
                                     // deferred like every other instance declaration's
                                     // (one whole-pattern assignment, rewritten into the
