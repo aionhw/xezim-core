@@ -152,13 +152,13 @@ impl Design {
         if s.aggregate && self.is_composite(b) || s.null && self.is_access(b) {
             return true;
         }
-        if let Some(chars) = &s.string_lit
+        // §9.3.2: a string literal fits any one-dimensional array of a
+        // character type; its characters are checked once the type is known.
+        if s.string_lit.is_some()
             && let Some(e) = self.array1d_elem(b)
             && let Some(lits) = self.enum_lits(e)
         {
-            return chars
-                .iter()
-                .all(|c| lits.iter().any(|l| is_char_lit(l, *c)));
+            return lits.iter().any(|l| l.starts_with('\''));
         }
         // A universal type is compatible with its family.
         match &self.types[b].kind {
@@ -249,6 +249,21 @@ impl Design {
                 let el = self.base(el);
                 if !tys.contains(&el) {
                     tys.push(el);
+                }
+            }
+        }
+        // String literal operands: every one-dimensional array type of a
+        // character type is a candidate (overload resolution, §12.5).
+        if sets.iter().any(|s| s.string_lit.is_some()) {
+            for (id, ti) in self.types.iter().enumerate() {
+                if let TypeKind::Array { index, elem } = &ti.kind
+                    && index.len() == 1
+                    && self
+                        .enum_lits(*elem)
+                        .is_some_and(|l| l.iter().any(|x| x.starts_with('\'')))
+                    && !tys.contains(&id)
+                {
+                    tys.push(id);
                 }
             }
         }

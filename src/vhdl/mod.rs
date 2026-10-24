@@ -14,7 +14,10 @@
 pub mod ast;
 mod cst;
 pub mod libraries;
+mod lower;
 pub mod sema;
+
+pub use lower::real_image;
 
 use std::sync::Mutex;
 
@@ -69,7 +72,7 @@ pub fn cache_digest() -> Option<u64> {
 
 /// Parse the configured VHDL sources and add the lowered design to
 /// `descriptions`. Returns the top module to use when none was named.
-pub fn inject(_descriptions: &mut Vec<Description>) -> Result<Option<String>, String> {
+pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, String> {
     let Some(cfg) = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return Ok(None);
     };
@@ -105,8 +108,46 @@ pub fn inject(_descriptions: &mut Vec<Description>) -> Result<Option<String>, St
         .collect();
     let analysed = sema::analyze(files, None)
         .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
-    let _ = analysed;
-    Err("VHDL: simulating VHDL designs is not supported yet".to_string())
+    let lowered = lower::lower(&analysed)
+        .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
+    if std::env::var_os("XEZIM_VHDL_DUMP").is_some() {
+        eprintln!("{}", lowered.sv);
+    }
+    descriptions.extend(parse_generated(&lowered.sv)?);
+    Ok(Some(lowered.top))
+}
+
+/// Base of the spans of generated SystemVerilog, far above any source
+/// file's, so span-keyed simulator caches never collide with them.
+const GENERATED_SPAN_BASE: usize = 1 << 41;
+
+/// Parse the lowered design's SystemVerilog text.
+fn parse_generated(text: &str) -> Result<Vec<Description>, String> {
+    let mut tokens = crate::sv_parser::lexer::Lexer::new(text).tokenize();
+    for t in &mut tokens {
+        t.span.start += GENERATED_SPAN_BASE;
+        t.span.end += GENERATED_SPAN_BASE;
+    }
+    let mut parser = crate::sv_parser::parse::Parser::new(tokens);
+    let source = parser.parse_source_text();
+    let errors: Vec<String> = parser
+        .diagnostics()
+        .iter()
+        .filter(|d| matches!(d.severity, crate::sv_parser::diagnostics::Severity::Error))
+        .take(5)
+        .map(|e| {
+            let at = e.span.start.saturating_sub(GENERATED_SPAN_BASE);
+            let line = text[..at.min(text.len())].matches('\n').count() + 1;
+            format!("line {}: {}", line, e.message)
+        })
+        .collect();
+    if !errors.is_empty() {
+        return Err(format!(
+            "VHDL: internal error: the lowered SystemVerilog does not parse (XEZIM_VHDL_DUMP=1 shows it):\n{}",
+            errors.join("\n")
+        ));
+    }
+    Ok(source.descriptions)
 }
 
 /// Analyse VHDL sources (a test hook): the rendered errors.

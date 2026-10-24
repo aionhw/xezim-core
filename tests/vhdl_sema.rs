@@ -158,3 +158,20 @@ fn external_corpus_analyses() {
     }
     println!("analysed ok={} failed={}", ok, bad);
 }
+
+/// `"abc" < "abd"`: both STRING and BIT_VECTOR fit — ambiguous, as GHDL
+/// reports (§12.5).
+#[test]
+fn ambiguous_string_literal_operator() {
+    let errs = vhdl::check_design(&[(
+        "work",
+        "amb.vhd",
+        b"entity t is end entity;\narchitecture a of t is\nbegin\n  process begin\n    report boolean'image(\"abc\" < \"abd\");\n    wait;\n  end process;\nend architecture;\n",
+    )]);
+    let all = errs.join("\n");
+    assert!(
+        all.contains("amb.vhd:5:26: error: VHDL: ambiguous call of \"<\""),
+        "{}",
+        all
+    );
+}
