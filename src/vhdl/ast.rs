@@ -1,0 +1,853 @@
+//! xezim's own VHDL syntax tree, built from the parser's concrete syntax tree
+//! by `cst`. Everything after parsing works on this tree, so the parser crate
+//! stays an implementation detail of `cst`.
+//!
+//! Identifiers are folded to lower case (VHDL is case-insensitive, IEEE
+//! 1076-2008 §15.4.2); extended identifiers (`\Foo\`) keep their text,
+//! backslashes included. Names are unclassified here: `f(x)` is a call, an
+//! index, a slice or a type conversion — semantic analysis decides.
+
+use std::ops::Range;
+
+/// A byte range of the source file the node came from.
+pub type Span = Range<usize>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ident {
+    pub name: String,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct DesignFile {
+    pub units: Vec<DesignUnit>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DesignUnit {
+    pub context: Vec<ContextItem>,
+    pub unit: LibraryUnit,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum ContextItem {
+    Library(Vec<Ident>),
+    Use(Vec<Name>),
+    Context(Vec<Name>),
+}
+
+#[derive(Clone, Debug)]
+pub enum LibraryUnit {
+    Entity(EntityDecl),
+    Architecture(ArchBody),
+    Package(PackageDecl),
+    PackageBody(PackageBody),
+    PackageInst(PackageInst),
+    Configuration(ConfigDecl),
+    Context(ContextDecl),
+}
+
+impl LibraryUnit {
+    pub fn name(&self) -> &Ident {
+        match self {
+            LibraryUnit::Entity(u) => &u.name,
+            LibraryUnit::Architecture(u) => &u.name,
+            LibraryUnit::Package(u) => &u.name,
+            LibraryUnit::PackageBody(u) => &u.name,
+            LibraryUnit::PackageInst(u) => &u.name,
+            LibraryUnit::Configuration(u) => &u.name,
+            LibraryUnit::Context(u) => &u.name,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EntityDecl {
+    pub name: Ident,
+    pub generics: Vec<InterfaceDecl>,
+    pub ports: Vec<InterfaceDecl>,
+    pub decls: Vec<Decl>,
+    pub stmts: Vec<ConcStmt>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArchBody {
+    pub name: Ident,
+    pub entity: Ident,
+    pub decls: Vec<Decl>,
+    pub stmts: Vec<ConcStmt>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageDecl {
+    pub name: Ident,
+    pub generics: Vec<InterfaceDecl>,
+    pub generic_map: Option<Vec<Assoc>>,
+    pub decls: Vec<Decl>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageBody {
+    pub name: Ident,
+    pub decls: Vec<Decl>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageInst {
+    pub name: Ident,
+    pub package: Name,
+    pub generic_map: Vec<Assoc>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigDecl {
+    pub name: Ident,
+    pub entity: Name,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextDecl {
+    pub name: Ident,
+    pub items: Vec<ContextItem>,
+}
+
+// ---- interfaces -----------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjClass {
+    Constant,
+    Signal,
+    Variable,
+    File,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    In,
+    Out,
+    InOut,
+    Buffer,
+    Linkage,
+}
+
+#[derive(Clone, Debug)]
+pub enum InterfaceDecl {
+    Object(InterfaceObject),
+    Type(Ident),
+    Subprogram {
+        spec: SubprogramSpec,
+        default: Option<SubprogramDefault>,
+    },
+    Package {
+        name: Ident,
+        package: Name,
+        generic_map: Option<Vec<Assoc>>,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct InterfaceObject {
+    pub class: Option<ObjClass>,
+    pub names: Vec<Ident>,
+    pub mode: Option<Mode>,
+    pub ty: SubtypeInd,
+    pub bus: bool,
+    pub default: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum SubprogramDefault {
+    Box,
+    Name(Name),
+}
+
+// ---- types ----------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dir {
+    To,
+    Downto,
+}
+
+/// `left to right`, `left downto right`, or a range attribute name
+/// (`x'range`, `t'reverse_range`).
+#[derive(Clone, Debug)]
+pub enum RangeExpr {
+    Explicit {
+        left: Box<Expr>,
+        dir: Dir,
+        right: Box<Expr>,
+        span: Span,
+    },
+    Attr(Name),
+}
+
+impl RangeExpr {
+    pub fn span(&self) -> Span {
+        match self {
+            RangeExpr::Explicit { span, .. } => span.clone(),
+            RangeExpr::Attr(n) => n.span.clone(),
+        }
+    }
+}
+
+/// A discrete range: an explicit range, a range attribute, or a subtype
+/// indication (`natural`, `integer range 0 to 3`).
+#[derive(Clone, Debug)]
+pub enum DiscreteRange {
+    Range(RangeExpr),
+    Subtype(SubtypeInd),
+}
+
+impl DiscreteRange {
+    pub fn span(&self) -> Span {
+        match self {
+            DiscreteRange::Range(r) => r.span(),
+            DiscreteRange::Subtype(s) => s.span.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Constraint {
+    Range(RangeExpr),
+    /// Parenthesized constraints in order: an index constraint, then element
+    /// constraints (`(open)(7 downto 0)`), or a record constraint
+    /// (`(a(3 downto 0))`). The parser cannot tell them apart; semantic
+    /// analysis interprets each list against the type (§5.3.2.1, §5.3.3).
+    Paren(Vec<Vec<Assoc>>),
+}
+
+#[derive(Clone, Debug)]
+pub enum Resolution {
+    Function(Name),
+    /// `(f)` element resolution of an array.
+    Element(Box<Resolution>),
+    Record(Vec<(Ident, Resolution)>),
+}
+
+#[derive(Clone, Debug)]
+pub struct SubtypeInd {
+    pub resolution: Option<Resolution>,
+    pub mark: Name,
+    pub constraint: Option<Constraint>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum EnumLit {
+    Ident(Ident),
+    Char(u8, Span),
+}
+
+#[derive(Clone, Debug)]
+pub enum ArrayIndex {
+    /// `array (natural range <>) of …`: the index subtype marks.
+    Unbounded(Vec<Name>),
+    Constrained(Vec<DiscreteRange>),
+}
+
+#[derive(Clone, Debug)]
+pub enum TypeDef {
+    Enum(Vec<EnumLit>),
+    /// Integer or floating type: decided by the bounds.
+    Range(RangeExpr),
+    Physical {
+        range: RangeExpr,
+        primary: Ident,
+        secondary: Vec<(Ident, Expr)>,
+    },
+    Array {
+        index: ArrayIndex,
+        elem: SubtypeInd,
+    },
+    Record(Vec<(Vec<Ident>, SubtypeInd)>),
+    Access(SubtypeInd),
+    File(Name),
+    Protected(Vec<Decl>),
+    ProtectedBody(Vec<Decl>),
+    /// `type t is range implementation_defined` (std.standard only).
+    ImplementationDefined,
+}
+
+#[derive(Clone, Debug)]
+pub struct TypeDecl {
+    pub name: Ident,
+    /// `None` for an incomplete type declaration (`type t;`).
+    pub def: Option<TypeDef>,
+    pub span: Span,
+}
+
+// ---- declarations -----------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalKind {
+    Register,
+    Bus,
+}
+
+#[derive(Clone, Debug)]
+pub enum Designator {
+    Ident(Ident),
+    /// An operator symbol, e.g. `"+"`, folded to lower case (`"and"`).
+    Op(String, Span),
+}
+
+impl Designator {
+    pub fn text(&self) -> &str {
+        match self {
+            Designator::Ident(i) => &i.name,
+            Designator::Op(s, _) => s,
+        }
+    }
+    pub fn span(&self) -> Span {
+        match self {
+            Designator::Ident(i) => i.span.clone(),
+            Designator::Op(_, s) => s.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum SubprogramKind {
+    Function { pure: bool, ret: Name },
+    Procedure,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubprogramSpec {
+    pub kind: SubprogramKind,
+    pub designator: Designator,
+    pub generics: Vec<InterfaceDecl>,
+    pub params: Vec<InterfaceDecl>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubprogramBody {
+    pub spec: SubprogramSpec,
+    pub decls: Vec<Decl>,
+    pub stmts: Vec<SeqStmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjectDecl {
+    pub names: Vec<Ident>,
+    pub ty: SubtypeInd,
+    pub value: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileOpen {
+    pub kind: Option<Expr>,
+    pub name: Expr,
+}
+
+#[derive(Clone, Debug)]
+pub struct ComponentDecl {
+    pub name: Ident,
+    pub generics: Vec<InterfaceDecl>,
+    pub ports: Vec<InterfaceDecl>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttributeSpec {
+    pub attr: Ident,
+    /// The named entities (`others`/`all` as an empty list with the flag).
+    pub entities: Vec<Ident>,
+    pub all_or_others: bool,
+    pub class: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum Decl {
+    Type(TypeDecl),
+    Subtype {
+        name: Ident,
+        ind: SubtypeInd,
+        span: Span,
+    },
+    Constant(ObjectDecl),
+    Signal {
+        obj: ObjectDecl,
+        kind: Option<SignalKind>,
+    },
+    Variable {
+        obj: ObjectDecl,
+        shared: bool,
+    },
+    File {
+        names: Vec<Ident>,
+        ty: SubtypeInd,
+        open: Option<FileOpen>,
+        span: Span,
+    },
+    Alias {
+        name: Designator,
+        ty: Option<SubtypeInd>,
+        target: Name,
+        span: Span,
+    },
+    Component(ComponentDecl),
+    Attribute {
+        name: Ident,
+        mark: Name,
+        span: Span,
+    },
+    AttributeSpec(AttributeSpec),
+    SubprogramDecl(SubprogramSpec),
+    SubprogramBody(SubprogramBody),
+    SubprogramInst {
+        spec_kind: SubprogramKind,
+        name: Ident,
+        uninst: Name,
+        generic_map: Vec<Assoc>,
+        span: Span,
+    },
+    Use(Vec<Name>),
+    Package(Box<PackageDecl>),
+    PackageBody(Box<PackageBody>),
+    PackageInst(Box<PackageInst>),
+    /// A declaration xezim does not model yet, with its kind for the error.
+    Unsupported(String, Span),
+}
+
+// ---- concurrent statements -------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub enum Sensitivity {
+    All,
+    List(Vec<Name>),
+}
+
+#[derive(Clone, Debug)]
+pub enum InstUnit {
+    Component(Name),
+    Entity(Name, Option<Ident>),
+    Configuration(Name),
+}
+
+#[derive(Clone, Debug)]
+pub struct GenerateBranch {
+    pub alt_label: Option<Ident>,
+    /// The condition (if-generate) or choices (case-generate); `None` for
+    /// the `else` branch.
+    pub cond: Option<Expr>,
+    pub choices: Vec<Choice>,
+    pub decls: Vec<Decl>,
+    pub stmts: Vec<ConcStmt>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConcKind {
+    Process {
+        postponed: bool,
+        sens: Option<Sensitivity>,
+        decls: Vec<Decl>,
+        stmts: Vec<SeqStmt>,
+    },
+    SignalAssign {
+        postponed: bool,
+        guarded: bool,
+        target: Target,
+        delay: Option<DelayMech>,
+        rhs: AssignRhs<Waveform>,
+    },
+    Assert {
+        postponed: bool,
+        cond: Expr,
+        report: Option<Expr>,
+        severity: Option<Expr>,
+    },
+    ProcCall {
+        postponed: bool,
+        call: Name,
+    },
+    Instance {
+        unit: InstUnit,
+        generic_map: Vec<Assoc>,
+        port_map: Vec<Assoc>,
+    },
+    Block {
+        guard: Option<Expr>,
+        generics: Vec<InterfaceDecl>,
+        generic_map: Vec<Assoc>,
+        ports: Vec<InterfaceDecl>,
+        port_map: Vec<Assoc>,
+        decls: Vec<Decl>,
+        stmts: Vec<ConcStmt>,
+    },
+    ForGenerate {
+        param: Ident,
+        range: DiscreteRange,
+        decls: Vec<Decl>,
+        stmts: Vec<ConcStmt>,
+    },
+    IfGenerate(Vec<GenerateBranch>),
+    CaseGenerate {
+        expr: Expr,
+        branches: Vec<GenerateBranch>,
+    },
+    Unsupported(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ConcStmt {
+    pub label: Option<Ident>,
+    pub kind: ConcKind,
+    pub span: Span,
+}
+
+// ---- sequential statements ---------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub enum Target {
+    Name(Name),
+    Aggregate(Vec<ElemAssoc>, Span),
+}
+
+impl Target {
+    pub fn span(&self) -> Span {
+        match self {
+            Target::Name(n) => n.span.clone(),
+            Target::Aggregate(_, s) => s.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum DelayMech {
+    Transport,
+    /// `inertial` or `reject t inertial`.
+    Inertial(Option<Expr>),
+}
+
+#[derive(Clone, Debug)]
+pub struct WaveElem {
+    /// `None` for a null transaction (`null after t`).
+    pub value: Option<Expr>,
+    pub after: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum Waveform {
+    Elems(Vec<WaveElem>),
+    Unaffected(Span),
+}
+
+#[derive(Clone, Debug)]
+pub enum AssignRhs<T> {
+    Simple(T),
+    /// `a when c1 else b when c2 else d`: the final `else` has no condition.
+    Cond(Vec<(T, Option<Expr>)>),
+    Select {
+        expr: Expr,
+        matching: bool,
+        items: Vec<(T, Vec<Choice>)>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum LoopScheme {
+    Plain,
+    While(Expr),
+    For(Ident, DiscreteRange),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForceMode {
+    In,
+    Out,
+}
+
+#[derive(Clone, Debug)]
+pub enum SeqKind {
+    Wait {
+        on: Vec<Name>,
+        until: Option<Expr>,
+        timeout: Option<Expr>,
+    },
+    Assert {
+        cond: Expr,
+        report: Option<Expr>,
+        severity: Option<Expr>,
+    },
+    Report {
+        msg: Expr,
+        severity: Option<Expr>,
+    },
+    SignalAssign {
+        target: Target,
+        delay: Option<DelayMech>,
+        rhs: AssignRhs<Waveform>,
+    },
+    Force {
+        target: Target,
+        mode: Option<ForceMode>,
+        rhs: AssignRhs<Expr>,
+    },
+    Release {
+        target: Target,
+        mode: Option<ForceMode>,
+    },
+    VarAssign {
+        target: Target,
+        rhs: AssignRhs<Expr>,
+    },
+    ProcCall(Name),
+    If {
+        branches: Vec<(Expr, Vec<SeqStmt>)>,
+        else_branch: Option<Vec<SeqStmt>>,
+    },
+    Case {
+        matching: bool,
+        expr: Expr,
+        alts: Vec<(Vec<Choice>, Vec<SeqStmt>)>,
+    },
+    Loop {
+        scheme: LoopScheme,
+        body: Vec<SeqStmt>,
+    },
+    Next {
+        label: Option<Ident>,
+        cond: Option<Expr>,
+    },
+    Exit {
+        label: Option<Ident>,
+        cond: Option<Expr>,
+    },
+    Return(Option<Expr>),
+    Null,
+    Unsupported(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct SeqStmt {
+    pub label: Option<Ident>,
+    pub kind: SeqKind,
+    pub span: Span,
+}
+
+// ---- expressions and names -------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    And,
+    Or,
+    Nand,
+    Nor,
+    Xor,
+    Xnor,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    MatchEq,
+    MatchNe,
+    MatchLt,
+    MatchLe,
+    MatchGt,
+    MatchGe,
+    Sll,
+    Srl,
+    Sla,
+    Sra,
+    Rol,
+    Ror,
+    Add,
+    Sub,
+    Concat,
+    Mul,
+    Div,
+    Mod,
+    Rem,
+    Pow,
+}
+
+impl BinOp {
+    /// The operator's designator (`"+"`, `"and"`), as overloads name it.
+    pub fn symbol(self) -> &'static str {
+        use BinOp::*;
+        match self {
+            And => "and",
+            Or => "or",
+            Nand => "nand",
+            Nor => "nor",
+            Xor => "xor",
+            Xnor => "xnor",
+            Eq => "=",
+            Ne => "/=",
+            Lt => "<",
+            Le => "<=",
+            Gt => ">",
+            Ge => ">=",
+            MatchEq => "?=",
+            MatchNe => "?/=",
+            MatchLt => "?<",
+            MatchLe => "?<=",
+            MatchGt => "?>",
+            MatchGe => "?>=",
+            Sll => "sll",
+            Srl => "srl",
+            Sla => "sla",
+            Sra => "sra",
+            Rol => "rol",
+            Ror => "ror",
+            Add => "+",
+            Sub => "-",
+            Concat => "&",
+            Mul => "*",
+            Div => "/",
+            Mod => "mod",
+            Rem => "rem",
+            Pow => "**",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Plus,
+    Minus,
+    Abs,
+    Not,
+    /// Reduction operators (VHDL-2008 §9.2.2): `and x`, `or x`, …
+    And,
+    Or,
+    Nand,
+    Nor,
+    Xor,
+    Xnor,
+    /// Condition operator `??` (§9.2.9).
+    Cond,
+}
+
+impl UnOp {
+    pub fn symbol(self) -> &'static str {
+        use UnOp::*;
+        match self {
+            Plus => "+",
+            Minus => "-",
+            Abs => "abs",
+            Not => "not",
+            And => "and",
+            Or => "or",
+            Nand => "nand",
+            Nor => "nor",
+            Xor => "xor",
+            Xnor => "xnor",
+            Cond => "??",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Literal {
+    /// Integer literal (decimal or based), value as written.
+    Int(i128),
+    Real(f64),
+    /// A physical literal: abstract literal (default 1) and unit name.
+    Physical(Box<Literal>, Name),
+    Char(u8),
+    /// String literal, characters as Latin-1 codes.
+    Str(Vec<u8>),
+    /// Bit string literal expanded to its string of characters (§15.8).
+    BitStr(Vec<u8>),
+    Null,
+}
+
+#[derive(Clone, Debug)]
+pub enum Choice {
+    Expr(Expr),
+    Range(DiscreteRange),
+    Others(Span),
+}
+
+#[derive(Clone, Debug)]
+pub struct ElemAssoc {
+    pub choices: Vec<Choice>,
+    pub value: Expr,
+}
+
+#[derive(Clone, Debug)]
+pub enum Actual {
+    Expr(Expr),
+    Open(Span),
+}
+
+#[derive(Clone, Debug)]
+pub struct Assoc {
+    pub formal: Option<Name>,
+    pub actual: Actual,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum Suffix {
+    Ident(Ident),
+    Char(u8, Span),
+    Op(String, Span),
+    All(Span),
+}
+
+#[derive(Clone, Debug)]
+pub enum NameKind {
+    Simple(Ident),
+    /// An operator symbol used as a name (`"+"(a, b)`).
+    Op(String),
+    /// A character literal used as a name (an enumeration literal).
+    Char(u8),
+    Selected(Box<Name>, Suffix),
+    /// `prefix(assoc, …)`: call, index, slice or conversion.
+    Call(Box<Name>, Vec<Assoc>),
+    /// `prefix'attr` or `prefix'attr(expr)`, with an optional signature.
+    Attribute(Box<Name>, Ident, Option<Box<Expr>>),
+    External {
+        class: ObjClass,
+        path: String,
+        ty: Box<SubtypeInd>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct Name {
+    pub kind: NameKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum ExprKind {
+    Name(Name),
+    Lit(Literal),
+    Aggregate(Vec<ElemAssoc>),
+    Qualified(Name, Box<Expr>),
+    New(Box<Expr>),
+    /// `new t` with a subtype indication.
+    NewSubtype(Box<SubtypeInd>),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    Unary(UnOp, Box<Expr>),
+    Paren(Box<Expr>),
+    /// A range where an expression was parsed (slice index, choice).
+    Range(Box<RangeExpr>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}

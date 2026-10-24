@@ -15,6 +15,9 @@ ahash = { version = "0.8", features = ["serde"] }
 mimalloc = { version = "0.1.52", optional = true }
 rand = "0.8"
 sv-parser = { path = "xezim-parser" }
+# VHDL parser (lossless syntax tree). Pinned: the 0.x API changes between
+# releases; only src/vhdl/cst.rs uses it.
+vhdl_syntax = "=0.2.0"
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1.3"
 zstd = "0.13"

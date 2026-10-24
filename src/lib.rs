@@ -77,6 +77,7 @@ pub mod sdf;
 pub mod stdout_sink;
 pub mod upf;
 pub mod value;
+pub mod vhdl;
 pub mod vcd_sink;
 
 /// Deterministic hasher for `HashMap`/`HashSet` so iteration order is
@@ -1281,6 +1282,9 @@ pub fn parse_and_elaborate_multi_preprocessed(
 
     // IEEE 1801 power intent: splice the generated UPF package and glue
     // processes into the parsed design before elaboration.
+    // VHDL (IEEE 1076): the lowered VHDL design joins the SV descriptions.
+    let vhdl_top = vhdl::inject(&mut all_descriptions)?;
+    let top_module_name = top_module_name.or(vhdl_top.as_deref());
     upf::inject(&mut all_descriptions, top_module_name)?;
     let (lib_defines, module_timescales, module_ts_own_file) = match pre {
         Some(p) => (p.macro_defines, p.module_timescales, p.module_ts_own_file),

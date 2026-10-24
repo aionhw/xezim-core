@@ -55,6 +55,9 @@ src/packed_value.rs       Separate packed-bit representation; current Value alre
 src/bits2.rs              2-state arbitrary-width value (Verilator-style, no X/Z mask);
                           the compute-core type for the cycle-based path
 src/sdf/                  SDF parser + annotator (IEEE 1497-2001): IOPATH/INTERCONNECT delays
+src/vhdl/                 VHDL (IEEE 1076-2008) front end, in development: parsing through the
+                          `vhdl_syntax` crate (only cst.rs uses it), located syntax errors;
+                          vendored IEEE P1076 `std`/`ieee` package sources (libraries/, Apache-2.0)
 src/vcd_sink.rs           VCD waveform dump
 src/stdout_sink.rs        Locked stdout/stderr sink — feeds xezim's `-l` fd-level redirect
 xezim-parser/src/lexer/   Tokenizer (scanner.rs, token.rs)
@@ -102,6 +105,7 @@ Key types: `Value`/`LogicBit` (4-state), `Bits2` (2-state), `ElaboratedModule`,
 | Value arithmetic/representation, `$bits`, X/Z propagation | `src/value.rs`, `src/bits2.rs` |
 | `$display`/formatting output | `src/stdout_sink.rs` |
 | SDF annotation | `src/sdf/` |
+| VHDL parse error / VHDL result differs from GHDL | `src/vhdl/` — diff against `ghdl -a/-e/-r --std=08` |
 | VCD dumping | `src/vcd_sink.rs` |
 
 `src/lib.rs` re-exports the surface `xezim` relies on:
