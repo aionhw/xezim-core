@@ -586,6 +586,9 @@ pub struct ClockingDeclaration {
     /// §14.4 `default output #d` skew expression, if declared.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_output_skew: Option<super::expr::Expression>,
+    /// §14.3 edge of a `default output negedge` skew, if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_output_edge: Option<super::stmt::Edge>,
     /// LRM §14.11: true when declared `default clocking ...` — the block
     /// that procedural cycle delays (`##N`) synchronize to.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -609,6 +612,9 @@ pub struct ClockingSignal {
     /// §14.4 per-signal skew (`output #0 sig;`). None = use the block default.
     #[cfg_attr(feature = "serde", serde(default))]
     pub skew: Option<super::expr::Expression>,
+    /// §14.3 edge of a per-signal skew (`output negedge sig;`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub skew_edge: Option<super::stmt::Edge>,
     /// §14.3 signal RENAMING: `input alias = actual_expr;` binds the clocking
     /// name to a different signal. None = the clocking name IS the signal.
     #[cfg_attr(feature = "serde", serde(default))]
