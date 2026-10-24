@@ -60,3 +60,47 @@ endmodule
     assert_eq!(p("CHAIN_CAST"), Some(2));
     assert_eq!(p("VEC_CAST"), Some(7));
 }
+
+#[test]
+fn constant_function_casts_to_instance_types() {
+    let design = xezim_core::parse_and_elaborate_multi(
+        &[r#"
+package pk;
+  typedef logic [3:0] n_t;
+endpackage
+typedef logic [7:0] w_t;
+module child #(parameter int W = 5, parameter type T = logic [3:0]) ();
+  import pk::*;
+  typedef logic [W-1:0] w_t;
+  typedef w_t v_t;
+  function automatic int fw(int x); return w_t'(x); endfunction
+  function automatic int fv(int x); return v_t'(x); endfunction
+  function automatic int ft(int x); return T'(x); endfunction
+  function automatic int fn(int x); return n_t'(x); endfunction
+  localparam int CW = fw(37);
+  localparam int CV = fv(37);
+  localparam int CT = ft(45);
+  localparam int CN = fn(37);
+endmodule
+module top;
+  child c5 ();
+  child #(.W(6), .T(logic [2:0])) c6 ();
+endmodule
+"#
+        .to_string()],
+        Some("top"),
+        &[],
+        &["top.sv".to_string()],
+        &[],
+    )
+    .expect("elaborate")
+    .1;
+    let get = |k: &str| design.parameters[k].to_i64();
+    // The child's own 5-bit `w_t`, not the 8-bit `$unit` one.
+    assert_eq!(get("c5.CW"), Some(5));
+    assert_eq!(get("c5.CV"), Some(5));
+    assert_eq!(get("c5.CT"), Some(13));
+    assert_eq!(get("c5.CN"), Some(5));
+    assert_eq!(get("c6.CW"), Some(37));
+    assert_eq!(get("c6.CT"), Some(5));
+}

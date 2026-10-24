@@ -34419,6 +34419,11 @@ fn inline_module_items(
                     }
                     // 2. Parameters from module items
                     let snapshot = sub_local_params.clone();
+                    // A constant function of this instance casts to its own
+                    // typedefs and type parameters (`w_t'(x)`, `T'(x)`).
+                    let mut fn_types = local_types.clone();
+                    fn_types.extend(type_overrides.iter().cloned());
+                    let prev_fn_types = CONST_FN_LOCAL_TYPES.with(|c| c.replace(Some(fn_types)));
                     add_params_from_items(
                         sub_mod.items(),
                         &mut sub_local_params,
@@ -34426,6 +34431,7 @@ fn inline_module_items(
                         &frozen_params,
                         &local_types,
                     );
+                    CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = prev_fn_types);
                     if sub_local_params == snapshot {
                         break;
                     }
@@ -38767,9 +38773,14 @@ thread_local! {
     /// Set while an instantiated module is elaborated. Its own typedefs are
     /// kept in a per-instance table, not in `elab.typedef_types`, so there a
     /// bare typedef name could resolve to a same-named typedef of another
-    /// scope; `const_fn_cast_typedef` then accepts only package-qualified
-    /// names.
+    /// scope; `const_fn_cast_typedef` resolves it through
+    /// `CONST_FN_LOCAL_TYPES` instead.
     static CONST_FN_IN_INSTANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The instance's own typedefs and type parameters while its body
+    /// localparams are folded, so a bare cast target inside an instantiated
+    /// module resolves in that instance and nowhere else.
+    static CONST_FN_LOCAL_TYPES: std::cell::RefCell<Option<HashMap<String, DataType>>> =
+        const { std::cell::RefCell::new(None) };
     /// The package that declares the constant function being folded, if
     /// any. Its body sees that package's typedefs (and what it imports), not
     /// those of the scope that called it.
@@ -38806,6 +38817,13 @@ fn const_fn_package_typedef<'a>(
     if let Some(dt) = elab.typedef_types.get(&format!("{pkg}::{leaf}")) {
         return Some(dt);
     }
+    const_fn_imported_typedef(leaf, elab)
+}
+
+/// A typedef `leaf` that the current scope does not declare: the one package
+/// that declares it (an imported typedef), else the bare `$unit` entry.
+/// `None` when several packages declare it.
+fn const_fn_imported_typedef<'a>(leaf: &str, elab: &'a ElaboratedModule) -> Option<&'a DataType> {
     let suffix = format!("::{leaf}");
     let mut found = elab
         .typedef_types
@@ -38815,6 +38833,22 @@ fn const_fn_package_typedef<'a>(
         None => elab.typedef_types.get(leaf),
         Some((_, dt)) => found.next().is_none().then_some(dt),
     }
+}
+
+/// A bare type name inside an instantiated module: the instance's own typedef
+/// or type parameter (`CONST_FN_LOCAL_TYPES`), else a package typedef it
+/// imports or a `$unit` one. `None` outside the instance's body localparams,
+/// where its own typedefs are not known: the cast then defers rather than pick
+/// a same-named type of another scope.
+fn const_fn_local_typedef(name: &str, elab: &ElaboratedModule) -> Option<DataType> {
+    CONST_FN_LOCAL_TYPES.with(|c| {
+        let local = c.borrow();
+        let local = local.as_ref()?;
+        local
+            .get(name)
+            .or_else(|| const_fn_imported_typedef(name, elab))
+            .cloned()
+    })
 }
 
 /// The declared type of the typedef a cast target names (`dir_e`, `p::dir_e`,
@@ -38854,12 +38888,13 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
     };
     let pkg = CONST_FN_PACKAGE.with(|c| c.borrow().clone());
     let mut dt = match (&scoped, &pkg) {
-        (Some(k), _) => elab.typedef_types.get(k)?,
-        (None, Some(pkg)) => const_fn_package_typedef(pkg, &leaf, elab)?,
-        (None, None) if CONST_FN_IN_INSTANCE.with(|c| c.get()) => return None,
-        (None, None) => elab.typedef_types.get(&leaf)?,
-    }
-    .clone();
+        (Some(k), _) => elab.typedef_types.get(k)?.clone(),
+        (None, Some(pkg)) => const_fn_package_typedef(pkg, &leaf, elab)?.clone(),
+        (None, None) if CONST_FN_IN_INSTANCE.with(|c| c.get()) => {
+            const_fn_local_typedef(&leaf, elab)?
+        }
+        (None, None) => elab.typedef_types.get(&leaf)?.clone(),
+    };
     for _ in 0..16 {
         match &dt {
             DataType::TypeReference {
@@ -38870,7 +38905,7 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
                         const_fn_package_typedef(pkg, &name.name.name, elab)?.clone()
                     }
                     None if name.scopes.is_empty() && CONST_FN_IN_INSTANCE.with(|c| c.get()) => {
-                        return None;
+                        const_fn_local_typedef(&name.name.name, elab)?
                     }
                     _ => lookup_scoped_type(name, &elab.typedef_types)?.clone(),
                 };
