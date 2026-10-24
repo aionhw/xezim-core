@@ -78,6 +78,17 @@ fn integer(size: Option<u32>, signed: bool, value: String) -> Expression {
     }))
 }
 
+/// A sized unsigned literal in base 2 or 16 (`digits` may hold x/z).
+pub fn based_lit(width: u32, base: NumberBase, digits: String) -> Expression {
+    ex(ExprKind::Number(NumberLiteral::Integer {
+        size: Some(width),
+        signed: false,
+        base,
+        value: digits,
+        cached_val: Cell::new(None),
+    }))
+}
+
 /// A signed 32-bit decimal literal (negative values as unary minus).
 pub fn int(v: i64) -> Expression {
     if v < 0 {

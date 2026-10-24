@@ -205,110 +205,30 @@ fn scan_class(c: &ClassDecl, out: &mut BTreeSet<String>) {
 fn scan_fn(f: &FunctionDecl, out: &mut BTreeSet<String>) {
     if let Some(b) = &f.body {
         for s in &b.stmts {
-            scan_stmt(s, out);
+            visit_stmt(s, &mut |e| scan_expr(e, out));
         }
     }
 }
 
-fn scan_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
-    match s {
-        Stmt::Block(b) => b.stmts.iter().for_each(|s| scan_stmt(s, out)),
-        Stmt::Decl(v) => {
-            for d in &v.declarators {
-                if let Some(Initializer::Assign(e)) = &d.init {
-                    scan_expr(e, out);
-                }
-                if let Some(Initializer::Paren(a) | Initializer::Brace(a)) = &d.init {
-                    a.iter().for_each(|e| scan_expr(e, out));
-                }
-            }
-        }
-        Stmt::Expr(e) => scan_expr(e, out),
-        Stmt::If {
-            init,
-            cond,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            if let Some(i) = init {
-                scan_stmt(i, out);
-            }
-            if let Condition::Expr(e) = cond.as_ref() {
-                scan_expr(e, out);
-            }
-            scan_stmt(then_branch, out);
-            if let Some(e) = else_branch {
-                scan_stmt(e, out);
-            }
-        }
-        Stmt::Switch { arms, cond, .. } => {
-            if let Condition::Expr(e) = cond.as_ref() {
-                scan_expr(e, out);
-            }
-            for a in arms {
-                a.body.iter().for_each(|s| scan_stmt(s, out));
-            }
-        }
-        Stmt::For {
-            init,
-            cond,
-            step,
-            body,
-            ..
-        } => {
-            if let Some(i) = init {
-                scan_stmt(i, out);
-            }
-            if let Some(c) = cond
-                && let Condition::Expr(e) = c.as_ref()
-            {
-                scan_expr(e, out);
-            }
-            if let Some(s) = step {
-                scan_expr(s, out);
-            }
-            scan_stmt(body, out);
-        }
-        Stmt::RangeFor { range, body, .. } => {
-            scan_expr(range, out);
-            scan_stmt(body, out);
-        }
-        Stmt::While { cond, body, .. } => {
-            if let Condition::Expr(e) = cond.as_ref() {
-                scan_expr(e, out);
-            }
-            scan_stmt(body, out);
-        }
-        Stmt::DoWhile { body, cond, .. } => {
-            scan_stmt(body, out);
-            scan_expr(cond, out);
-        }
-        Stmt::Return(Some(e), _) => scan_expr(e, out),
-        _ => {}
-    }
-}
-
+/// Names whose address an expression takes (not recursive: `visit_*` calls
+/// this on every subexpression).
 fn scan_expr(e: &Expr, out: &mut BTreeSet<String>) {
     use ExprKind as K;
     match &e.kind {
         K::Unary {
             op: UnaryOp::AddrOf,
             operand,
-        } => {
-            match &operand.kind {
-                K::Name(q) if q.segments.len() == 1 => {
+        } => match &operand.kind {
+            K::Name(q) if q.segments.len() == 1 => {
+                out.insert(q.last_name().to_string());
+            }
+            K::Index { base, .. } => {
+                if let Some(q) = base.as_name() {
                     out.insert(q.last_name().to_string());
                 }
-                K::Index { base, .. } => {
-                    if let Some(q) = base.as_name() {
-                        out.insert(q.last_name().to_string());
-                    }
-                }
-                _ => {}
             }
-            scan_expr(operand, out);
-        }
+            _ => {}
+        },
         K::Call { callee, args } => {
             // Arrays passed to the C memory functions decay to pointers.
             if let Some(q) = callee.as_name()
@@ -320,29 +240,133 @@ fn scan_expr(e: &Expr, out: &mut BTreeSet<String>) {
                     }
                 }
             }
-            scan_expr(callee, out);
-            args.iter().for_each(|a| scan_expr(a, out));
+        }
+        _ => {}
+    }
+}
+
+/// Whether the statements call any of `names` (unqualified).
+pub fn calls_any(stmts: &[Stmt], names: &[&str]) -> bool {
+    let mut found = false;
+    for s in stmts {
+        visit_stmt(s, &mut |e| {
+            if let ExprKind::Call { callee, .. } = &e.kind
+                && let Some(q) = callee.as_name()
+                && names.contains(&q.last_name())
+            {
+                found = true;
+            }
+        });
+    }
+    found
+}
+
+/// Calls `f` on every expression of a statement, subexpressions included.
+fn visit_stmt(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+    let cond = |c: &Condition, f: &mut dyn FnMut(&Expr)| {
+        if let Condition::Expr(e) = c {
+            visit_expr(e, f);
+        }
+    };
+    match s {
+        Stmt::Block(b) => b.stmts.iter().for_each(|s| visit_stmt(s, f)),
+        Stmt::Decl(v) => {
+            for d in &v.declarators {
+                match &d.init {
+                    Some(Initializer::Assign(e)) => visit_expr(e, f),
+                    Some(Initializer::Paren(a) | Initializer::Brace(a)) => {
+                        a.iter().for_each(|e| visit_expr(e, f))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Stmt::Expr(e) => visit_expr(e, f),
+        Stmt::If {
+            init,
+            cond: c,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            if let Some(i) = init {
+                visit_stmt(i, f);
+            }
+            cond(c, f);
+            visit_stmt(then_branch, f);
+            if let Some(e) = else_branch {
+                visit_stmt(e, f);
+            }
+        }
+        Stmt::Switch { arms, cond: c, .. } => {
+            cond(c, f);
+            for a in arms {
+                a.body.iter().for_each(|s| visit_stmt(s, f));
+            }
+        }
+        Stmt::For {
+            init,
+            cond: c,
+            step,
+            body,
+            ..
+        } => {
+            if let Some(i) = init {
+                visit_stmt(i, f);
+            }
+            if let Some(c) = c {
+                cond(c, f);
+            }
+            if let Some(s) = step {
+                visit_expr(s, f);
+            }
+            visit_stmt(body, f);
+        }
+        Stmt::RangeFor { range, body, .. } => {
+            visit_expr(range, f);
+            visit_stmt(body, f);
+        }
+        Stmt::While { cond: c, body, .. } => {
+            cond(c, f);
+            visit_stmt(body, f);
+        }
+        Stmt::DoWhile { body, cond, .. } => {
+            visit_stmt(body, f);
+            visit_expr(cond, f);
+        }
+        Stmt::Return(Some(e), _) => visit_expr(e, f),
+        _ => {}
+    }
+}
+
+fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    use ExprKind as K;
+    f(e);
+    match &e.kind {
+        K::Call { callee, args } => {
+            visit_expr(callee, f);
+            args.iter().for_each(|a| visit_expr(a, f));
         }
         K::Binary { lhs, rhs, .. } | K::Assign { lhs, rhs, .. } => {
-            scan_expr(lhs, out);
-            scan_expr(rhs, out);
+            visit_expr(lhs, f);
+            visit_expr(rhs, f);
         }
-        K::Unary { operand, .. } | K::Postfix { operand, .. } => scan_expr(operand, out),
+        K::Unary { operand, .. } | K::Postfix { operand, .. } => visit_expr(operand, f),
         K::Conditional {
             cond,
             then_expr,
             else_expr,
         } => {
-            scan_expr(cond, out);
-            scan_expr(then_expr, out);
-            scan_expr(else_expr, out);
+            visit_expr(cond, f);
+            visit_expr(then_expr, f);
+            visit_expr(else_expr, f);
         }
         K::Index { base, index } => {
-            scan_expr(base, out);
-            scan_expr(index, out);
+            visit_expr(base, f);
+            visit_expr(index, f);
         }
-        K::Member { base, .. } => scan_expr(base, out),
-        K::Cast { expr, .. } | K::Paren(expr) => scan_expr(expr, out),
+        K::Member { base, .. } => visit_expr(base, f),
+        K::Cast { expr, .. } | K::Paren(expr) => visit_expr(expr, f),
         _ => {}
     }
 }

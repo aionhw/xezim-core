@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::build::*;
 use super::program::Program;
 use super::types::*;
-use crate::ast::expr::{BinaryOp, ExprKind, Expression, UnaryOp};
+use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, UnaryOp};
 use crate::ast::stmt::{CaseItem, CaseKind, Edge, EventExpr, JoinType, Statement, StatementKind};
 use crate::sv_parser::systemc::ast as sc;
 use crate::sv_parser::systemc::token::ScSpan;
@@ -113,6 +113,9 @@ pub struct ModCtx {
     pub pending: Vec<(String, String, bool)>,
     /// Extra module items the bodies needed (temporaries, flags).
     pub extra_items: Vec<crate::ast::decl::ModuleItem>,
+    /// `sc_buffer` channels (SV names): each write also bumps their
+    /// `buffer_counter`.
+    pub buffers: BTreeSet<String>,
 }
 
 /// Per-function lowering state.
@@ -204,6 +207,16 @@ fn sv_binop(op: sc::BinaryOp) -> Option<BinaryOp> {
         B::LogOr => BinaryOp::LogOr,
         _ => return None,
     })
+}
+
+/// C++ `>>` of a signed value shifts in the sign bit (an arithmetic shift).
+fn signed_shift(op: BinaryOp, lhs: &Ty) -> BinaryOp {
+    match (op, lhs) {
+        (BinaryOp::ShiftRight, Ty::Vec2 { signed: true, .. } | Ty::Int { signed: true, .. }) => {
+            BinaryOp::ArithShiftRight
+        }
+        _ => op,
+    }
 }
 
 fn sv_assignop(op: sc::AssignOp) -> Option<BinaryOp> {
@@ -905,6 +918,7 @@ impl<'a> Lw<'a> {
         let Some(sv) = sv_binop(op) else {
             return self.err(span, "this operator is not supported");
         };
+        let sv = signed_shift(sv, &lt);
         let ty = match op {
             sc::BinaryOp::Lt
             | sc::BinaryOp::Gt
@@ -922,6 +936,45 @@ impl<'a> Lw<'a> {
         // Integer division of two reals stays real; mixed SystemC arithmetic
         // is 64-bit in C++ (sc_uint promotes to uint64).
         Ok((bin(sv, l, r), ty))
+    }
+
+    /// `e` as a value of type `target`: a string literal assigned to an
+    /// `sc_bv`/`sc_lv`/`sc_uint` is a bit string (IEEE 1666-2023 §7.9.8,
+    /// `"01XZ"`, `"0b…"`, `"0x…"`), zero-extended to the width.
+    pub fn expr_for(&mut self, e: &sc::Expr, target: &Ty) -> R<Expression> {
+        let (sc::ExprKind::StringLit { value, .. }, Ty::Vec2 { w, .. } | Ty::Vec4 { w }) =
+            (&e.kind, target)
+        else {
+            return Ok(self.expr(e)?.0);
+        };
+        let Some(n) = w.n else {
+            return self.err(e.span, "a bit-string literal needs a constant width");
+        };
+        let four = matches!(target, Ty::Vec4 { .. });
+        let (base, digits, per) = match value.get(..2) {
+            Some("0x" | "0X") => (NumberBase::Hex, &value[2..], 4),
+            Some("0b" | "0B") => (NumberBase::Binary, &value[2..], 1),
+            _ => (NumberBase::Binary, value.as_str(), 1),
+        };
+        let ok = |c: char| match base {
+            NumberBase::Hex => c.is_ascii_hexdigit(),
+            _ => matches!(c, '0' | '1') || (four && matches!(c, 'x' | 'X' | 'z' | 'Z')),
+        };
+        if digits.is_empty() || !digits.chars().all(ok) {
+            return self.err(
+                e.span,
+                format!("\"{}\" is not a bit string for this type", value),
+            );
+        }
+        let mut d = digits.to_ascii_lowercase();
+        let need = (n as usize).div_ceil(per);
+        if d.len() > need {
+            d = d[d.len() - need..].to_string();
+        }
+        while d.len() < need {
+            d.insert(0, '0');
+        }
+        Ok(based_lit(n, base, d))
     }
 
     fn index_expr(&mut self, base: &sc::Expr, i: &sc::Expr, span: ScSpan) -> R<(Expression, Ty)> {
@@ -1022,6 +1075,10 @@ impl<'a> Lw<'a> {
     ) -> R<(Expression, Ty)> {
         use sc::ExprKind as K;
         match &callee.kind {
+            K::Name(q) if matches!(q.last_name(), "sc_spawn" | "sc_spawn_options") => self.err(
+                span,
+                "dynamic processes (sc_spawn) are not supported in simulation",
+            ),
             K::Name(q) => self.call_name(q, args, span),
             K::Member { base, name, .. } => {
                 self.call_method(base, &name.ident.name, name, args, span)
@@ -1519,8 +1576,21 @@ impl<'a> Lw<'a> {
             Ty::Class(c) => {
                 let sv_m = if m == "release" { "release_" } else { m };
                 let ret = self.prog.class_method_ret(c, m);
+                let mut xs = Vec::new();
+                for (e, x) in args.iter().zip(&a) {
+                    // A data pointer argument may be an array (it decays).
+                    let decays = matches!(m, "set_data_ptr" | "set_byte_enable_ptr")
+                        && e.as_name()
+                            .and_then(|q| self.lookup(q.last_name()))
+                            .is_some_and(|sym| sym.kind == SymKind::BoxedArr);
+                    xs.push(if decays {
+                        self.ptr_arg(e, x)?
+                    } else {
+                        x.0.clone()
+                    });
+                }
                 match ret {
-                    Some(r) => Ok((method(b, sv_m, a.into_iter().map(|x| x.0).collect()), r)),
+                    Some(r) => Ok((method(b, sv_m, xs), r)),
                     None => self.err(span, format!("unknown method '{}'", m)),
                 }
             }
@@ -1983,14 +2053,14 @@ impl<'a> Lw<'a> {
                         }
                         continue;
                     }
-                    let (x, _) = self.expr(e)?;
+                    let x = self.expr_for(e, &ty)?;
                     out.push(assign(target, x));
                 }
                 Some(sc::Initializer::Paren(args)) | Some(sc::Initializer::Brace(args)) => {
                     match args.as_slice() {
                         [] => {}
                         [a] => {
-                            let (x, _) = self.expr(a)?;
+                            let x = self.expr_for(a, &ty)?;
                             out.push(assign(target, x));
                         }
                         [v_, u] if matches!(ty, Ty::Time) => {
@@ -2091,14 +2161,15 @@ impl<'a> Lw<'a> {
             }
             return self.err(span, "'new' of this type is not supported");
         }
-        let (mut r, _) = if let K::InitList(_) = &rhs.kind {
-            self.expr(rhs)?
+        let (mut r, _) = if let K::StringLit { .. } = &rhs.kind {
+            let (_, lt) = self.expr(lhs)?;
+            (self.expr_for(rhs, &lt)?, lt)
         } else {
             self.expr(rhs)?
         };
         if let Some(b) = sv_assignop(op) {
-            let (cur, _) = self.expr(lhs)?;
-            r = bin(b, cur, paren(r));
+            let (cur, ct) = self.expr(lhs)?;
+            r = bin(signed_shift(b, &ct), cur, paren(r));
         }
         self.store(lhs, r, span)
     }
@@ -2233,7 +2304,17 @@ impl<'a> Lw<'a> {
                         )),
                     ]));
                 }
-                Ok(nba(target(ident(&sym.sv)), value))
+                let w = nba(target(ident(&sym.sv)), value);
+                if self.m.buffers.contains(&sym.sv) {
+                    // §6.9: an sc_buffer notifies on every write, changed or
+                    // not; its write counter changes in the same update.
+                    let n = buffer_counter(&sym.sv);
+                    return Ok(block(vec![
+                        w,
+                        nba(ident(&n), bin(BinaryOp::Add, ident(&n), int(1))),
+                    ]));
+                }
+                Ok(w)
             }
             SymKind::InPort => self.err(span, "an input port cannot be written"),
             SymKind::Boxed => Ok(assign(target(member(ident(&sym.sv), "v")), value)),
@@ -2372,7 +2453,11 @@ impl<'a> Lw<'a> {
                 let [v] = args else {
                     return self.err(span, "write(value) expected");
                 };
-                let (x, _) = self.expr(v)?;
+                let elem_ty = match (&sym.ty, &base.kind) {
+                    (Ty::Array(e, _), K::Index { .. }) => (**e).clone(),
+                    (t, _) => t.clone(),
+                };
+                let x = self.expr_for(v, &elem_ty)?;
                 let elem = match &base.kind {
                     K::Index { index: i, .. } => Some(self.expr(i)?.0),
                     _ => None,
@@ -2590,15 +2675,31 @@ impl<'a> Lw<'a> {
                         "value_changed_event" | "default_event" | "value_changed" => None,
                         other => return self.err(e.span, format!("'{}' is not an event", other)),
                     };
+                    if edge.is_none()
+                        && let Some(ev) = self.buffer_counter_of(base)
+                    {
+                        return Ok(vec![event_expr(None, ident(&ev))]);
+                    }
                     return Ok(vec![event_expr(edge, x)]);
                 }
                 self.err(e.span, "expected an event")
             }
             _ => {
+                if let Some(ev) = self.buffer_counter_of(e) {
+                    return Ok(vec![event_expr(None, ident(&ev))]);
+                }
                 let (x, _) = self.expr(e)?;
                 Ok(vec![event_expr(None, x)])
             }
         }
+    }
+
+    /// The write counter of the `sc_buffer` `e` names.
+    pub fn buffer_counter_of(&self, e: &sc::Expr) -> Option<String> {
+        let q = e.as_name()?;
+        let sym = self.lookup(q.last_name())?;
+        (sym.kind == SymKind::Signal && self.m.buffers.contains(&sym.sv))
+            .then(|| buffer_counter(&sym.sv))
     }
 
     /// `sc_start(...)` in sc_main (see mod.rs: the testbench pauses 1 ps
@@ -2789,6 +2890,12 @@ fn math1(f: &str) -> Option<&'static str> {
         "log10" => "$log10",
         _ => return None,
     })
+}
+
+/// The write counter of an `sc_buffer`: it changes on every write, so a
+/// process sensitive to it wakes like one sensitive to a changed signal.
+pub fn buffer_counter(buffer: &str) -> String {
+    format!("__sc_wr_{}", buffer)
 }
 
 /// After a process's sc_stop(): let the processes of the current delta

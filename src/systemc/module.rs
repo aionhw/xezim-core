@@ -32,6 +32,8 @@ pub struct ModIface {
     /// constructor parameters.
     pub template_params: Vec<String>,
     pub ctor_params: Vec<String>,
+    /// Members that are `sc_buffer`s.
+    pub buffers: BTreeSet<String>,
 }
 
 /// A registered process before lowering.
@@ -84,6 +86,9 @@ pub struct ModuleLowering<'l, 'a> {
     clock_init: BTreeMap<String, u64>,
     /// FIFO channel → its capacity.
     fifo_size: BTreeMap<String, Expression>,
+    /// sc_main: the testbench statements from this index on follow the
+    /// last, unbounded `sc_start()` and run in a `final` block.
+    tb_tail: Option<usize>,
 }
 
 impl<'l, 'a> ModuleLowering<'l, 'a> {
@@ -97,6 +102,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             async_resets: Vec::new(),
             clock_init: BTreeMap::new(),
             fifo_size: BTreeMap::new(),
+            tb_tail: None,
         }
     }
 }
@@ -210,6 +216,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             for d in &v.declarators {
                 let sym = self.member_sym(v, d)?;
                 if let Some(sym) = sym {
+                    if matches!(ScObjectKind::of(&v.ty), ScObjectKind::Buffer) {
+                        iface.buffers.insert(sym.sv.clone());
+                    }
                     if port_dir(&sym.kind).is_some() {
                         iface.ports.push((d.name.name.clone(), sym.kind.clone()));
                     }
@@ -358,6 +367,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             syms: iface.members.clone(),
             ..Default::default()
         };
+        for b in &iface.buffers {
+            self.add_buffer(b);
+        }
         let ctor = find_ctor(self.lw, class, name);
         let mut s = Structure::default();
         let mut params = Vec::new();
@@ -552,7 +564,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 }
             }
             SymKind::Fifo => {
-                if let Some(size) = mi.args.get(1) {
+                if let Some(size) = fifo_size_arg(&mi.args) {
                     let (x, _) = self.lw.expr(size)?;
                     self.fifo_size.insert(sym.sv.clone(), x);
                 }
@@ -732,8 +744,16 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                         .err(e.span, format!("'{}' is not a sensitivity", other));
                 }
             };
+            if edge.is_none()
+                && let Some(ev) = self.lw.buffer_counter_of(base)
+            {
+                return Ok((None, ident(&ev), base_name(base)));
+            }
             let (x, _) = self.lw.expr(base)?;
             return Ok((edge, x, base_name(base)));
+        }
+        if let Some(ev) = self.lw.buffer_counter_of(e) {
+            return Ok((None, ident(&ev), base_name(e)));
         }
         let (x, _) = self.lw.expr(e)?;
         Ok((None, x, base_name(e)))
@@ -788,6 +808,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     let Some((p, _)) = ports.get(i) else {
                         return self.lw.err(e.span, "too many positional port bindings");
                     };
+                    self.check_not_buffer(a)?;
                     let (x, _) = self.lw.expr(a)?;
                     self.connect(s, &sym.sv, p, x);
                 }
@@ -883,6 +904,31 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         }
     }
 
+    /// Register an `sc_buffer` of the module being lowered and declare its
+    /// write counter.
+    fn add_buffer(&mut self, sv: &str) {
+        if self.lw.m.buffers.insert(sv.to_string()) {
+            self.lw.m.extra_items.push(data_decl(
+                atom_t(crate::ast::types::IntegerAtomType::Int, false),
+                &buffer_counter(sv),
+                Vec::new(),
+                None,
+            ));
+        }
+    }
+
+    /// A port sees its channel's value changes only, so an sc_buffer's
+    /// per-write events would be lost through it.
+    fn check_not_buffer(&mut self, a: &sc::Expr) -> R<()> {
+        if self.lw.buffer_counter_of(a).is_some() {
+            return self.lw.err(
+                a.span,
+                "binding an sc_buffer to a port is not supported in simulation",
+            );
+        }
+        Ok(())
+    }
+
     fn connect(&mut self, s: &mut Structure, inst: &str, port: &str, x: Expression) {
         if let Some(i) = s.insts.iter_mut().find(|i| i.sv == inst) {
             i.conns.retain(|(p, _)| p != port);
@@ -906,6 +952,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             .map(|m| m.kind.clone());
         match kind {
             Some(SymKind::InPort | SymKind::OutPort | SymKind::InOutPort) => {
+                self.check_not_buffer(a)?;
                 let (x, _) = self.lw.expr(a)?;
                 self.connect(s, inst, port, x);
                 Ok(())
@@ -1526,7 +1573,14 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         defs.remove(0);
         self.register_sigs(&defs)?;
         if let Some(b) = &f.body {
-            self.walk(&b.stmts, &mut s);
+            match unbounded_start_tail(&b.stmts) {
+                Some(i) => {
+                    self.walk(&b.stmts[..i], &mut s);
+                    self.tb_tail = Some(s.elab.len());
+                    self.walk(&b.stmts[i..], &mut s);
+                }
+                None => self.walk(&b.stmts, &mut s),
+            }
         }
         let decls = std::mem::take(&mut self.lw.f.decls);
         let stmts = std::mem::take(&mut s.elab);
@@ -1574,12 +1628,15 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     match sym.kind {
                         SymKind::Clock => s.clocks.push((d.name.name.clone(), args, d.span)),
                         SymKind::Fifo => {
-                            if let Some(n) = args.get(1) {
+                            if let Some(n) = fifo_size_arg(&args) {
                                 let (x, _) = self.lw.expr(n)?;
                                 self.fifo_size.insert(d.name.name.clone(), x);
                             }
                         }
                         _ => {}
+                    }
+                    if matches!(kind, ScObjectKind::Buffer) {
+                        self.add_buffer(&sym.sv);
                     }
                     self.lw.m.syms.insert(d.name.name.clone(), sym);
                 }
@@ -1666,7 +1723,15 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     method(ident(slot), "size", vec![]),
                 )),
                 step: vec![unary(UnaryOp::PostIncr, ident("k"))],
-                body: Box::new(assign(target, index(ident(slot), ident("k")))),
+                body: Box::new(if self.lw.m.buffers.contains(sig) {
+                    let n = buffer_counter(sig);
+                    block(vec![
+                        assign(target, index(ident(slot), ident("k"))),
+                        assign(ident(&n), bin(BinaryOp::Add, ident(&n), int(1))),
+                    ])
+                } else {
+                    assign(target, index(ident(slot), ident("k")))
+                }),
             }));
             apply.push(expr_stmt(method(ident(slot), "delete", vec![])));
             apply.push(expr_stmt(method(ident(&idx), "delete", vec![])));
@@ -1678,11 +1743,53 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             apply,
         )));
         items.append(&mut self.lw.m.extra_items);
-        let (decls, stmts) = tb.unwrap_or_default();
-        let mut body = decls;
+        let (decls, mut stmts) = tb.unwrap_or_default();
+        let Some(at) = self.tb_tail.take() else {
+            let mut body = decls;
+            body.extend(stmts);
+            body.push(expr_stmt(sys("$finish", vec![])));
+            items.push(initial(block(body)));
+            return items;
+        };
+        // An unbounded sc_start() also returns when no events are left
+        // (IEEE 1666-2023 §4.5.7), where SystemVerilog simulation simply
+        // ends; the statements after it run in a `final` block, which
+        // both ends reach. sc_main's locals move to the module so the
+        // final block sees them.
+        let mut tail = vec![assign(ident("scrt_tb_now"), sys("$time", vec![]))];
+        tail.extend(stmts.split_off(at));
+        let mut body = Vec::new();
+        for d in decls {
+            let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = d.kind
+            else {
+                body.push(d);
+                continue;
+            };
+            for v in declarators {
+                items.push(data_decl(
+                    data_type.clone(),
+                    &v.name.name,
+                    v.dimensions,
+                    None,
+                ));
+                if let Some(init) = v.init {
+                    body.push(assign(ident(&v.name.name), init));
+                }
+            }
+        }
         body.extend(stmts);
         body.push(expr_stmt(sys("$finish", vec![])));
         items.push(initial(block(body)));
+        items.push(ModuleItem::FinalConstruct(
+            crate::ast::decl::FinalConstruct {
+                stmt: block(tail),
+                span: sp(),
+            },
+        ));
         items
     }
 
@@ -2134,4 +2241,24 @@ fn blocking_functions(lw: &Lw, defs: &[(usize, &sc::FunctionDecl)]) -> BTreeSet<
         }
     }
     out
+}
+
+/// The depth argument of `sc_fifo(size)` / `sc_fifo(name, size)` (§6.23.3).
+fn fifo_size_arg(args: &[sc::Expr]) -> Option<&sc::Expr> {
+    match args {
+        [a] if !matches!(a.kind, sc::ExprKind::StringLit { .. }) => Some(a),
+        [_, size, ..] => Some(size),
+        _ => None,
+    }
+}
+
+/// The index after sc_main's last top-level unbounded `sc_start()`, when the
+/// statements after it need no simulation time.
+fn unbounded_start_tail(stmts: &[sc::Stmt]) -> Option<usize> {
+    let i = stmts.iter().rposition(|s| {
+        matches!(s, sc::Stmt::Expr(sc::Expr { kind: sc::ExprKind::Call { callee, args }, .. })
+            if args.is_empty() && callee.as_name().is_some_and(|q| q.last_name() == "sc_start"))
+    })?;
+    let tail = &stmts[i + 1..];
+    (!tail.is_empty() && !super::program::calls_any(tail, &["sc_start", "wait"])).then_some(i + 1)
 }
