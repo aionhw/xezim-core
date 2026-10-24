@@ -315,6 +315,13 @@ impl Designator {
     }
 }
 
+/// `[t1, t2 return r]`: selects one overload (§4.5.3).
+#[derive(Clone, Debug)]
+pub struct Signature {
+    pub params: Vec<Name>,
+    pub ret: Option<Name>,
+}
+
 #[derive(Clone, Debug)]
 pub enum SubprogramKind {
     Function { pure: bool, ret: Name },
@@ -398,6 +405,7 @@ pub enum Decl {
         name: Designator,
         ty: Option<SubtypeInd>,
         target: Name,
+        signature: Option<Signature>,
         span: Span,
     },
     Component(ComponentDecl),

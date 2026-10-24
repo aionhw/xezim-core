@@ -14,6 +14,7 @@
 pub mod ast;
 mod cst;
 pub mod libraries;
+pub mod sema;
 
 use std::sync::Mutex;
 
@@ -96,7 +97,32 @@ pub fn inject(_descriptions: &mut Vec<Description>) -> Result<Option<String>, St
             }
         }
     }
+    let files = cfg
+        .files
+        .iter()
+        .map(|f| f.library.clone())
+        .zip(parsed)
+        .collect();
+    let analysed = sema::analyze(files, None)
+        .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
+    let _ = analysed;
     Err("VHDL: simulating VHDL designs is not supported yet".to_string())
+}
+
+/// Analyse VHDL sources (a test hook): the rendered errors.
+pub fn check_design(sources: &[(&str, &str, &[u8])]) -> Vec<String> {
+    let mut files = Vec::new();
+    for (lib, path, text) in sources {
+        let p = cst::parse(cst::SourceFile::new(path.to_string(), text.to_vec()));
+        if !p.errors.is_empty() {
+            return p.errors.iter().map(|d| p.file.render(d)).collect();
+        }
+        files.push((lib.to_string(), p));
+    }
+    match sema::analyze(files, None) {
+        Ok(_) => Vec::new(),
+        Err(e) => e,
+    }
 }
 
 /// Parse a VHDL source (a test hook): the syntax errors, rendered.

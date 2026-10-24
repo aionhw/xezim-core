@@ -108,11 +108,9 @@ fn idents(n: &N) -> Vec<Ident> {
 
 /// Latin-1 bytes of a token's text.
 fn bytes(t: &Tk) -> Vec<u8> {
-    t.text()
-        .to_string()
-        .chars()
-        .map(|c| c as u32 as u8)
-        .collect()
+    // Raw bytes: the parser's text display maps some Latin-1 characters
+    // (e.g. the soft hyphen) to others.
+    t.text().as_bytes().to_vec()
 }
 
 /// `"ab""c"` → `ab"c`.
@@ -764,10 +762,28 @@ impl Converter {
                     Some(a) => Some(self.subtype_ind(&child(&a, K::SubtypeIndication)?)?),
                     None => None,
                 };
+                let signature = match child(n, K::Signature) {
+                    Some(sg) => {
+                        let params = child(&sg, K::TypeMarkList)
+                            .map(|l| {
+                                childs(&l, K::Name)
+                                    .iter()
+                                    .filter_map(|x| self.name(x))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let ret = child(&sg, K::ReturnType)
+                            .and_then(|r| child(&r, K::Name))
+                            .and_then(|x| self.name(&x));
+                        Some(Signature { params, ret })
+                    }
+                    None => None,
+                };
                 Decl::Alias {
                     name,
                     ty,
                     target: self.name(&child(n, K::Name)?)?,
+                    signature,
                     span: span(n),
                 }
             }
@@ -1021,8 +1037,14 @@ impl Converter {
                     let kind = match t.kind() {
                         T::Identifier => NameKind::Simple(ident(&t)),
                         T::CharacterLiteral => NameKind::Char(bytes(&t)[1]),
+                        // An operator symbol, or a string literal (`f("01")`):
+                        // kept as written; `expr` turns a bare one into a
+                        // string literal.
                         T::StringLiteral => NameKind::Op(
-                            String::from_utf8_lossy(&string_value(&bytes(&t))).to_ascii_lowercase(),
+                            string_value(&bytes(&t))
+                                .iter()
+                                .map(|&b| b as char)
+                                .collect(),
                         ),
                         _ => {
                             self.unexpected(p);
@@ -1245,7 +1267,20 @@ impl Converter {
                 };
                 ExprKind::Unary(uop, Box::new(self.expr(&operand)?))
             }
-            K::NameExpression => ExprKind::Name(self.name(&child(n, K::Name)?)?),
+            K::NameExpression => {
+                let nm = self.name(&child(n, K::Name)?)?;
+                match nm.kind {
+                    // A bare operator symbol in an expression is a string
+                    // literal (the grammar cannot tell them apart).
+                    NameKind::Op(s) => {
+                        ExprKind::Lit(Literal::Str(s.chars().map(|c| c as u32 as u8).collect()))
+                    }
+                    k => ExprKind::Name(Name {
+                        kind: k,
+                        span: nm.span,
+                    }),
+                }
+            }
             K::Name => ExprKind::Name(self.name(n)?),
             K::LiteralExpression => {
                 let t = toks(n).into_iter().next()?;
