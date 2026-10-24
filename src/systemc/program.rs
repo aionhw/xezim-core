@@ -25,6 +25,9 @@ pub struct Program<'a> {
     address_taken: BTreeSet<(usize, String)>,
     /// Lowered member types of each module (for `inst.member` references).
     pub module_members: RefCell<BTreeMap<String, BTreeMap<String, Ty>>>,
+    /// Classes deriving from `sc_foreign_module`: declarations of modules
+    /// written in SystemVerilog, by C++ class → SV module name.
+    pub foreign: BTreeMap<String, String>,
 }
 
 impl<'a> Program<'a> {
@@ -40,6 +43,7 @@ impl<'a> Program<'a> {
             global_consts: BTreeMap::new(),
             address_taken: BTreeSet::new(),
             module_members: RefCell::new(BTreeMap::new()),
+            foreign: BTreeMap::new(),
         };
         for (tu, r) in results.iter().enumerate() {
             p.collect(tu, &r.unit.items, &[]);
@@ -51,7 +55,68 @@ impl<'a> Program<'a> {
                 p.address_taken.insert((tu, n));
             }
         }
+        let foreign: Vec<(String, String)> = p
+            .classes
+            .iter()
+            .filter(|(_, (_, c, _))| {
+                c.bases
+                    .iter()
+                    .any(|b| b.name.last_name() == "sc_foreign_module")
+            })
+            .map(|(n, (_, c, _))| (n.clone(), p.hdl_name(n, c)))
+            .collect();
+        p.foreign.extend(foreign);
         p
+    }
+
+    /// The SV module a foreign-module class stands for: the name given to
+    /// `sc_foreign_module(nm, "name", …)` or returned by `hdl_name()`, else
+    /// the class name.
+    fn hdl_name(&self, class: &str, c: &ClassDecl) -> String {
+        let lit = |e: &Expr| match &e.kind {
+            ExprKind::StringLit { value, .. } => Some(value.clone()),
+            _ => None,
+        };
+        let ctors = c
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                Member::Constructor(f) => Some(f),
+                _ => None,
+            })
+            .chain(
+                self.out_of_class
+                    .get(class)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, f)| *f)
+                    .filter(|f| f.base_name() == class),
+            );
+        for f in ctors {
+            for mi in &f.initializers {
+                if mi.name.last_name() == "sc_foreign_module"
+                    && let Some(n) = mi.args.get(1).and_then(lit)
+                {
+                    return n;
+                }
+            }
+        }
+        for m in &c.members {
+            if let Member::Method(f) = m
+                && f.base_name() == "hdl_name"
+                && let Some(b) = &f.body
+                && let [Stmt::Return(Some(e), _)] = b.stmts.as_slice()
+                && let Some(n) = lit(e)
+            {
+                return n;
+            }
+        }
+        class.to_string()
+    }
+
+    /// The SV module an instance of class `module` instantiates.
+    pub fn sv_module_name<'s>(&'s self, module: &'s str) -> &'s str {
+        self.foreign.get(module).map_or(module, |s| s.as_str())
     }
 
     fn collect(&mut self, tu: usize, items: &'a [Item], tparams: &[TemplateParam]) {
@@ -112,6 +177,7 @@ impl<'a> Program<'a> {
 
     pub fn is_module(&self, name: &str) -> bool {
         self.classes.get(name).is_some_and(|(_, c, _)| c.sc_module)
+            || self.foreign.contains_key(name)
     }
 
     pub fn address_taken(&self, name: &str, tu: usize) -> bool {

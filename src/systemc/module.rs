@@ -904,6 +904,16 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         }
     }
 
+    /// A process or clock first waits for sc_main's first `sc_start`; with
+    /// no sc_main (a SystemVerilog top), it starts at time 0.
+    fn start_wait(&self) -> Vec<Statement> {
+        if self.lw.prog.sc_main.is_some() {
+            vec![wait(ident("scrt_started"))]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Register an `sc_buffer` of the module being lowered and declare its
     /// write counter.
     fn add_buffer(&mut self, sv: &str) {
@@ -1421,7 +1431,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         // Children.
         for inst in &s.insts {
             items.push(instance(
-                &inst.module,
+                self.lw.prog.sv_module_name(&inst.module),
                 &inst.sv,
                 inst.params.clone(),
                 inst.conns.clone(),
@@ -1873,7 +1883,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         self.clock_init.insert(clk.to_string(), 1 - first);
         // Toggles are deferred with #0 so that writes sc_main makes at the
         // same time instant are applied first (SystemC's update phase).
-        let mut body = vec![wait(ident("scrt_started"))];
+        let mut body = self.start_wait();
         if start > 0 {
             body.push(delay(u64_lit(start), null_stmt()));
         }
@@ -1938,7 +1948,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             .iter()
             .map(|s| assign(ident(&edge_flag_name(p.index, s)), sized(1, 0)))
             .collect();
-        let mut body = vec![wait(ident("scrt_started"))];
+        let mut body = self.start_wait();
         match p.kind {
             sc::ProcessKind::Method => {
                 if !dont_init {

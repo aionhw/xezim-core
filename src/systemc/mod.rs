@@ -8,7 +8,9 @@
 //!
 //! Scheduling (IEEE 1666-2023 §4.2) is mapped onto the SV event regions:
 //!
-//! - Processes start at the first `sc_start` (`scrt_started`); a method
+//! - Processes start at the first `sc_start` (`scrt_started`), or at time
+//!   0 when the design has no `sc_main` (a SystemVerilog top instantiates
+//!   the SystemC modules); a method
 //!   runs once at initialization unless `dont_initialize()`; a clocked
 //!   thread first runs at its first clock edge.
 //! - Signal writes from processes are nonblocking assignments (SystemC's
@@ -171,7 +173,7 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
     )> = prog
         .classes
         .iter()
-        .filter(|(_, (_, c, _))| c.sc_module)
+        .filter(|(n, (_, c, _))| c.sc_module || prog.foreign.contains_key(*n))
         .map(|(n, (tu, c, tp))| (n.clone(), *tu, *c, tp.clone()))
         .collect();
     let mut ifaces = BTreeMap::new();
@@ -199,6 +201,10 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
         let Some(iface) = ifaces.get(name) else {
             continue;
         };
+        // A foreign module's body is the SystemVerilog module it names.
+        if prog.foreign.contains_key(name) {
+            continue;
+        }
         lw.tu = *tu;
         lw.env.tparams.clear();
         for tp in tps {
