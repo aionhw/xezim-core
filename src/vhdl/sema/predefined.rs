@@ -111,8 +111,18 @@ impl Design {
     pub fn is_numeric(&self, t: TypeId) -> bool {
         self.is_integer(t) || self.is_real(t) || self.is_physical(t)
     }
+    pub fn is_array(&self, t: TypeId) -> bool {
+        matches!(self.types[self.base(t)].kind, TypeKind::Array { .. })
+    }
     pub fn is_access(&self, t: TypeId) -> bool {
         matches!(self.types[self.base(t)].kind, TypeKind::Access(_))
+    }
+    /// The designated subtype of an access type.
+    pub fn designated(&self, t: TypeId) -> Option<TypeId> {
+        match self.types[self.base(t)].kind {
+            TypeKind::Access(d) => Some(d),
+            _ => None,
+        }
     }
     pub fn is_composite(&self, t: TypeId) -> bool {
         matches!(
@@ -496,6 +506,16 @@ impl Design {
                     if self.is_scalar(t) || chars {
                         out.push(self.pre_sub(name, &[t], Some(string), Builtin::ToString));
                     }
+                }
+                ("deallocate", 1) if self.is_access(t) => {
+                    let id = self.pre_sub(name, &[t], None, Builtin::Deallocate);
+                    let p = self.subprograms[id].params[0];
+                    self.objects[p].kind = ObjKind::Param(
+                        crate::vhdl::ast::ObjClass::Variable,
+                        crate::vhdl::ast::Mode::InOut,
+                    );
+                    self.subprograms[id].is_function = false;
+                    out.push(id);
                 }
                 ("rising_edge" | "falling_edge", 1) if self.is_bit_or_bool(t) => {
                     let b = if name == "rising_edge" {

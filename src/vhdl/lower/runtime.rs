@@ -86,6 +86,17 @@ pub const COMMON: &str = r#"
     if (r >= 0.0) return longint'($floor(r + 0.5));
     return -longint'($floor(-r + 0.5));
   endfunction
+  // The length of the range l..r.
+  function automatic longint vh_len(longint l, longint r, bit dn);
+    longint n;
+    n = dn ? l - r + 1 : r - l + 1;
+    return n < 0 ? 0 : n;
+  endfunction
+  // A designated object: the access value must not be null.
+  function automatic longint vh_nn(longint p, string file, int line);
+    if (p == 0) vh_fatal($sformatf("NULL access dereferenced at %s:%0d", file, line));
+    return p;
+  endfunction
   // An array index → storage offset (0-based from 'left), checked.
   function automatic longint vh_ix(longint i, longint l, longint r, bit dn, string file, int line);
     if (dn ? (i > l || i < r) : (i < l || i > r)) begin
@@ -93,6 +104,69 @@ pub const COMMON: &str = r#"
       return 0;
     end
     return dn ? l - i : i - l;
+  endfunction
+"#;
+
+/// The matching operators (§9.2.3) on STD_ULOGIC codes (`U X 0 1 Z W L H -`
+/// = 0..8) and on BIT, after the array types.
+pub const MATCHING: &str = r#"
+  // To X01: 0/L → '0', 1/H → '1', else 'X'.
+  function automatic byte unsigned vh_ul_x01(byte unsigned a);
+    case (a)
+      2, 6: return 2;
+      3, 7: return 3;
+      default: return 1;
+    endcase
+  endfunction
+  function automatic byte unsigned vh_ul_not(byte unsigned a);
+    case (a)
+      0: return 0;
+      2, 6: return 3;
+      3, 7: return 2;
+      default: return 1;
+    endcase
+  endfunction
+  function automatic byte unsigned vh_ul_and(byte unsigned a, byte unsigned b);
+    if (vh_ul_x01(a) == 2 || vh_ul_x01(b) == 2) return 2;
+    if (a == 0 || b == 0) return 0;
+    if (vh_ul_x01(a) == 1 || vh_ul_x01(b) == 1) return 1;
+    return 3;
+  endfunction
+  function automatic byte unsigned vh_ul_meq(byte unsigned a, byte unsigned b);
+    if (a == 8 || b == 8) return 3;
+    if (a == 0 || b == 0) return 0;
+    a = vh_ul_x01(a);
+    b = vh_ul_x01(b);
+    if (a == 1 || b == 1) return 1;
+    return a == b ? 3 : 2;
+  endfunction
+  function automatic byte unsigned vh_ul_mlt(byte unsigned a, byte unsigned b);
+    if (a == 8 || b == 8) begin
+      $display("ghdl:error: STD_LOGIC_1164: '-' operand for matching ordering operator");
+      return 1;
+    end
+    if (a == 0 || b == 0) return 0;
+    a = vh_ul_x01(a);
+    b = vh_ul_x01(b);
+    if (a == 1 || b == 1) return 1;
+    return a < b ? 3 : 2;
+  endfunction
+  function automatic byte unsigned vh_ul_meq_arr(vh_a_u8 x, vh_a_u8 y, string file, int line);
+    byte unsigned r;
+    if (x.d.size() != y.d.size()) begin
+      vh_fatal($sformatf("length mismatch at %s:%0d", file, line));
+      return 1;
+    end
+    r = 3;
+    for (int i = 0; i < x.d.size(); i++) r = vh_ul_and(r, vh_ul_meq(x.d[i], y.d[i]));
+    return r;
+  endfunction
+  function automatic byte unsigned vh_bit_meq_arr(vh_a_u8 x, vh_a_u8 y, string file, int line);
+    if (x.d.size() != y.d.size()) begin
+      vh_fatal($sformatf("length mismatch at %s:%0d", file, line));
+      return 0;
+    end
+    return vh_a_u8_eq(x, y);
   endfunction
 "#;
 
@@ -118,6 +192,51 @@ pub const ARRAY_TEMPLATE: &str = r#"
     a.r = dn ? l - t.size() + 1 : l + t.size() - 1;
     a.d = t;
     return a;
+  endfunction
+  // An array with explicit bounds (also a null range's).
+  function automatic ARR ARR_mk(longint l, longint r, bit dn, ELEM t[]);
+    ARR a;
+    a.l = l;
+    a.r = r;
+    a.dn = dn;
+    a.d = t;
+    return a;
+  endfunction
+  // The value of a subtype l..r: every element e (§14.4.2.5 defaults).
+  function automatic ARR ARR_fill(longint l, longint r, bit dn, ELEM e);
+    ELEM t[];
+    longint n;
+    n = dn ? l - r + 1 : r - l + 1;
+    if (n < 0) n = 0;
+    t = new[n];
+    foreach (t[i]) t[i] = e;
+    return ARR_mk(l, r, dn, t);
+  endfunction
+  // v with the bounds l..r of a constrained subtype (conversion, initial
+  // value): the lengths must match.
+  function automatic ARR ARR_rb(ARR v, longint l, longint r, bit dn, string file, int line);
+    ELEM t[];
+    longint n;
+    n = dn ? l - r + 1 : r - l + 1;
+    if (n < 0) n = 0;
+    if (n != v.d.size()) begin
+      vh_fatal($sformatf("bound check failure at %s:%0d", file, line));
+      return v;
+    end
+    t = v.d;
+    return ARR_mk(l, r, dn, t);
+  endfunction
+  // n elements of x from offset off, with bounds l..r (a port associated
+  // with a slice).
+  function automatic ARR ARR_sub(ARR x, longint off, longint n, longint l, longint r, bit dn);
+    ELEM t[];
+    t = new[n];
+    for (longint i = 0; i < n; i++) t[i] = x.d[off + i];
+    return ARR_mk(l, r, dn, t);
+  endfunction
+  // Element i, checked (reads of an indexed call result).
+  function automatic ELEM ARR_at(ARR x, longint i, string file, int line);
+    return x.d[vh_ix(i, x.l, x.r, x.dn, file, line)];
   endfunction
   // `x & y` (§9.2.5): the left operand's bounds and direction, unless it is
   // a null array; `il`/`idn` are the index subtype's left bound and
@@ -170,8 +289,8 @@ pub const ARRAY_TEMPLATE: &str = r#"
     int n;
     n = x.d.size() < y.d.size() ? x.d.size() : y.d.size();
     for (int i = 0; i < n; i++) begin
-      if (x.d[i] < y.d[i]) return 1;
-      if (x.d[i] > y.d[i]) return 0;
+      if (LT(x.d[i], y.d[i])) return 1;
+      if (GT(x.d[i], y.d[i])) return 0;
     end
     return x.d.size() < y.d.size();
   endfunction

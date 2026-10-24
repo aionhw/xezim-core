@@ -106,10 +106,10 @@ impl Design {
             }
             ast::Decl::Alias {
                 name,
+                ty: decl_ty,
                 target,
                 signature,
                 span,
-                ..
             } => {
                 let key = match name {
                     ast::Designator::Ident(i) => i.name.clone(),
@@ -161,8 +161,52 @@ impl Design {
                     kind: ast::ExprKind::Name(target.clone()),
                     span: target.span.clone(),
                 };
+                let alias_ty = match decl_ty {
+                    Some(ind) => self.subtype_ind(r, ind),
+                    None => None,
+                };
                 match self.expr(r, &e, None) {
                     Some(h) => {
+                        // With a subtype indication, the alias views the
+                        // object with the subtype's bounds (§6.6.2). An alias
+                        // of a constant or `in` parameter is a constant
+                        // holding the converted value; of anything else, a
+                        // conversion at each use (read-only).
+                        let h = match alias_ty {
+                            Some(at) if self.is_array(at) && self.array_constraint(at).is_some() => {
+                                let conv = HExpr {
+                                    kind: HExprKind::Convert(Box::new(h.clone())),
+                                    ty: at,
+                                    loc: h.loc.clone(),
+                                };
+                                let readonly = root_obj(&h).is_some_and(|o| {
+                                    matches!(
+                                        self.objects[o].kind,
+                                        ObjKind::Constant
+                                            | ObjKind::Generic
+                                            | ObjKind::Param(
+                                                ast::ObjClass::Constant | ast::ObjClass::Variable,
+                                                ast::Mode::In
+                                            )
+                                    )
+                                });
+                                if readonly {
+                                    let id = self.add_obj(ObjInfo {
+                                        name: key.clone(),
+                                        kind: ObjKind::Constant,
+                                        ty: at,
+                                        init: Some(conv),
+                                        loc: self.loc(span.clone()),
+                                        static_val: None,
+                                    });
+                                    self.declare(r, &key, Sym::Obj(id));
+                                    objs.push(id);
+                                    return;
+                                }
+                                conv
+                            }
+                            _ => h,
+                        };
                         self.aliases.push(h);
                         let id = self.aliases.len() - 1;
                         self.declare(r, &key, Sym::Alias(id));
@@ -1251,6 +1295,15 @@ pub fn name_text(n: &ast::Name) -> String {
         ast::NameKind::Call(p, _) => name_text(p),
         ast::NameKind::Attribute(p, a, _) => format!("{}'{}", name_text(p), a.name),
         ast::NameKind::External { path, .. } => path.clone(),
+    }
+}
+
+/// The object a name denotes, through indexing, slicing and selection.
+pub fn root_obj(h: &HExpr) -> Option<ObjId> {
+    match &h.kind {
+        HExprKind::Obj(o) => Some(*o),
+        HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) => root_obj(b),
+        _ => None,
     }
 }
 

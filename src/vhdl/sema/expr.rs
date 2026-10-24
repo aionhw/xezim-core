@@ -106,9 +106,33 @@ impl Design {
                 );
                 None
             }
-            ast::ExprKind::New(_) | ast::ExprKind::NewSubtype(_) => {
-                self.error(e.span.clone(), "allocators are not supported yet");
-                None
+            // Allocators (§9.3.7): the context gives the access type.
+            ast::ExprKind::New(x) => {
+                let loc = self.loc(e.span.clone());
+                let Some(at) = expect.filter(|t| self.is_access(*t)) else {
+                    self.error(e.span.clone(), "an allocator needs an access type context");
+                    return None;
+                };
+                let des = self.designated(at)?;
+                let v = self.expr(r, x, Some(des))?;
+                Some(HExpr {
+                    kind: HExprKind::New(Some(Box::new(v))),
+                    ty: at,
+                    loc,
+                })
+            }
+            ast::ExprKind::NewSubtype(ind) => {
+                let loc = self.loc(e.span.clone());
+                let Some(at) = expect.filter(|t| self.is_access(*t)) else {
+                    self.error(e.span.clone(), "an allocator needs an access type context");
+                    return None;
+                };
+                let st = self.subtype_ind(r, ind)?;
+                Some(HExpr {
+                    kind: HExprKind::NewOf(st),
+                    ty: at,
+                    loc,
+                })
             }
         }
     }
@@ -602,10 +626,27 @@ impl Design {
             NameKind::Call(prefix, args) => {
                 match self.denote(r, prefix) {
                     Some(Denot::Syms(syms)) if syms.iter().any(|s| matches!(s, Sym::Sub(_))) => {
+                        // Positional arguments must fit the parameters.
+                        let arg_sets: Vec<Option<TypeSet>> = args
+                            .iter()
+                            .map(|a| match (&a.formal, &a.actual) {
+                                (None, ast::Actual::Expr(e)) => Some(self.possible_types(r, e)),
+                                _ => None,
+                            })
+                            .collect();
                         for s in syms {
                             if let Sym::Sub(id) = s
                                 && let Some(rt) = self.subprograms[id].ret
                                 && self.arity_ok(id, args)
+                                && self.subprograms[id]
+                                    .params
+                                    .clone()
+                                    .iter()
+                                    .zip(&arg_sets)
+                                    .all(|(p, set)| {
+                                        set.as_ref()
+                                            .is_none_or(|set| self.compatible(set, self.objects[*p].ty))
+                                    })
                             {
                                 let b = self.base(rt);
                                 out.add(b);
@@ -640,6 +681,8 @@ impl Design {
                                 Some(Sym::Alias(a)) => self.aliases[*a].ty,
                                 _ => unreachable!(),
                             };
+                            // Through an access value (§8.3).
+                            let ty = self.designated(ty).unwrap_or(ty);
                             let b = self.base(ty);
                             let is_slice = args.len() == 1 && self.is_range_actual(r, &args[0]);
                             match &self.types[b].kind {
@@ -654,7 +697,7 @@ impl Design {
                     },
                     Some(Denot::Expr(h)) => {
                         // Index (element type) or slice (same type).
-                        let b = self.base(h.ty);
+                        let b = self.base(self.designated(h.ty).unwrap_or(h.ty));
                         let is_slice = args.len() == 1 && self.is_range_actual(r, &args[0]);
                         match &self.types[b].kind {
                             TypeKind::Array { elem, .. } if !is_slice => {
@@ -772,9 +815,42 @@ impl Design {
                             loc,
                         }))
                     }
-                    (TypeKind::Access(_), _) => {
-                        self.error(n.span.clone(), "access types are not supported yet");
-                        None
+                    (TypeKind::Access(des), suffix) => {
+                        let des = *des;
+                        let loc = self.loc(n.span.clone());
+                        let d = HExpr {
+                            kind: HExprKind::Deref(Box::new(p)),
+                            ty: des,
+                            loc: loc.clone(),
+                        };
+                        match suffix {
+                            ast::Suffix::All(_) => Some(Denot::Expr(d)),
+                            // A record element through the access value.
+                            ast::Suffix::Ident(i) => {
+                                let TypeKind::Record(fields) =
+                                    self.types[self.base(des)].kind.clone()
+                                else {
+                                    self.error(n.span.clone(), "this selected name is not supported");
+                                    return None;
+                                };
+                                let Some(idx) = fields.iter().position(|(f, _)| *f == i.name) else {
+                                    self.error(
+                                        i.span.clone(),
+                                        format!("no element '{}' in the record", i.name),
+                                    );
+                                    return None;
+                                };
+                                Some(Denot::Expr(HExpr {
+                                    kind: HExprKind::Field(Box::new(d), idx),
+                                    ty: fields[idx].1,
+                                    loc,
+                                }))
+                            }
+                            _ => {
+                                self.error(n.span.clone(), "this selected name is not supported");
+                                None
+                            }
+                        }
                     }
                     _ => {
                         self.error(n.span.clone(), "this selected name is not supported");
@@ -1219,6 +1295,20 @@ impl Design {
                 .collect(),
             _ => Vec::new(),
         };
+        // Predefined procedures (DEALLOCATE, §5.4.3).
+        let mut cands = cands;
+        if let NameKind::Simple(i) = &prefix.kind
+            && i.name == "deallocate"
+        {
+            let sets: Vec<TypeSet> = args
+                .iter()
+                .filter_map(|a| match &a.actual {
+                    ast::Actual::Expr(e) => Some(self.possible_types(r, e)),
+                    _ => None,
+                })
+                .collect();
+            cands.extend(self.predefined_funcs("deallocate", &sets));
+        }
         if cands.is_empty() {
             self.error(
                 n.span.clone(),
@@ -1309,6 +1399,7 @@ impl Design {
         n: &ast::Name,
     ) -> Option<HExpr> {
         let loc = self.loc(n.span.clone());
+        let base = self.implicit_deref(base);
         let b = self.base(base.ty);
         let TypeKind::Array { index, elem } = self.types[b].kind.clone() else {
             self.error(n.span.clone(), "only arrays can be indexed or sliced");
@@ -1490,6 +1581,7 @@ impl Design {
             }
             _ => {
                 let h = self.name_expr(r, prefix, None)?;
+                let h = self.implicit_deref(h);
                 let t = h.ty;
                 (Some(h), t)
             }
@@ -1622,8 +1714,16 @@ impl Design {
                 }
             };
         }
-        // Object (or expression) prefix.
+        // Object (or expression) prefix; an access value's array attributes
+        // are those of the designated array (§8.3).
         let px = self.name_expr(r, prefix, None)?;
+        let px = if self.designated(px.ty).is_some_and(|d| self.is_array(d))
+            && matches!(name, "left" | "right" | "high" | "low" | "length" | "ascending")
+        {
+            self.implicit_deref(px)
+        } else {
+            px
+        };
         let pt = px.ty;
         let mk = |d: &mut Self, ty: TypeId, param: Option<HExpr>, px: HExpr| -> HExpr {
             let h = HExpr {
@@ -1692,6 +1792,18 @@ impl Design {
         match &self.types[self.base(t)].kind {
             TypeKind::Array { index, .. } => index.get(dim.unwrap_or(0)).copied(),
             _ => None,
+        }
+    }
+
+    /// An access value used as the object it designates (§8.3).
+    pub fn implicit_deref(&self, h: HExpr) -> HExpr {
+        match self.designated(h.ty) {
+            Some(des) => HExpr {
+                loc: h.loc.clone(),
+                kind: HExprKind::Deref(Box::new(h)),
+                ty: des,
+            },
+            None => h,
         }
     }
 
@@ -1966,6 +2078,6 @@ fn reverse_range(mut hr: HRange) -> HRange {
 fn is_predefined_func(n: &str) -> bool {
     matches!(
         n,
-        "rising_edge" | "falling_edge" | "to_string" | "minimum" | "maximum"
+        "rising_edge" | "falling_edge" | "to_string" | "minimum" | "maximum" | "deallocate"
     )
 }

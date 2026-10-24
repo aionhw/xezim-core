@@ -11,12 +11,16 @@
 //! time, in elaboration order, waiting until each suspends again. VHDL
 //! delta cycles therefore never depend on the SV scheduler's ordering.
 
+mod elab;
 mod runtime;
+mod textio;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use elab::{Driver, GLOBAL, InstInfo, Sig, SigRef, Site};
 use std::fmt::Write as _;
 
-use super::ast::{Dir, Mode, ObjClass};
+use super::ast::Dir;
 use super::sema::hir::*;
 use super::sema::{Analysed, Design};
 
@@ -66,28 +70,46 @@ pub struct Lowered {
     pub top: String,
 }
 
-/// A wait site: the signals it is sensitive to.
-struct Site {
-    sigs: Vec<ObjId>,
-}
-
 struct Lw<'a> {
     d: &'a Design,
-    items: String,
-    arr_types: BTreeMap<String, (Repr, bool)>,
+    /// Type definitions (records, array structs and their helpers), in
+    /// creation order: a type's parts are defined before it.
+    type_defs: String,
+    arr_types: BTreeSet<String>,
+    /// Heaps of designated types (by representation key), after the types.
+    heaps: BTreeSet<String>,
+    heap_defs: String,
+    /// TEXTIO support code, when used.
+    textio: bool,
+    /// Array types of BIT/BOOLEAN elements (logical operators).
+    logic_arrs: BTreeSet<String>,
     rec_types: BTreeMap<TypeId, String>,
     lits: HashMap<String, String>,
     lit_items: String,
     dflt: HashMap<TypeId, String>,
     errors: Vec<String>,
     /// Signals of the flattened design.
-    signals: Vec<ObjId>,
-    /// Drivers (signal, process).
-    drivers: BTreeSet<(ObjId, usize)>,
+    sigs: Vec<Sig>,
+    /// The signal (part) each signal object of an instance names.
+    sig_map: HashMap<(usize, ObjId), SigRef>,
+    /// Instances, depth-first (0: the top).
+    insts: Vec<InstInfo>,
+    /// The instance being lowered.
+    inst: usize,
+    /// Processes in elaboration order: instance, architecture, index.
+    procs: Vec<(usize, usize, usize)>,
+    /// Drivers by (signal, process).
+    drivers: BTreeMap<(usize, usize), Driver>,
     /// Per process: its wait sites.
     sites: Vec<Vec<Site>>,
-    subs_done: BTreeSet<SubId>,
-    subs_todo: Vec<SubId>,
+    /// Package objects (named without an instance).
+    pkg_objs: BTreeSet<ObjId>,
+    /// Lowering signal names as their last values (`'last_value`).
+    read_last: bool,
+    /// Subprograms by (subprogram, instance): one per instance when it is
+    /// declared in an architecture.
+    subs_done: BTreeSet<(SubId, usize)>,
+    subs_todo: Vec<(SubId, usize)>,
     sub_items: String,
     /// Process being lowered (for waits and drivers).
     cur_proc: Option<usize>,
@@ -112,16 +134,26 @@ pub fn lower(an: &Analysed) -> Result<Lowered, Vec<String>> {
     let arch = &d.archs[an.top];
     let mut lw = Lw {
         d,
-        items: String::new(),
-        arr_types: BTreeMap::new(),
+        type_defs: String::new(),
+        arr_types: BTreeSet::new(),
+        heaps: BTreeSet::new(),
+        heap_defs: String::new(),
+        textio: false,
+        logic_arrs: BTreeSet::new(),
         rec_types: BTreeMap::new(),
         lits: HashMap::new(),
         lit_items: String::new(),
         dflt: HashMap::new(),
         errors: Vec::new(),
-        signals: Vec::new(),
-        drivers: BTreeSet::new(),
+        sigs: Vec::new(),
+        sig_map: HashMap::new(),
+        insts: Vec::new(),
+        inst: 0,
+        procs: Vec::new(),
+        drivers: BTreeMap::new(),
         sites: Vec::new(),
+        pkg_objs: BTreeSet::new(),
+        read_last: false,
         subs_done: BTreeSet::new(),
         subs_todo: Vec::new(),
         sub_items: String::new(),
@@ -133,14 +165,9 @@ pub fn lower(an: &Analysed) -> Result<Lowered, Vec<String>> {
         pre_stmts: Vec::new(),
         temps: Vec::new(),
     };
-    if !arch.instances.is_empty() {
-        let (f, l, c) = d.file_line(&arch.instances[0].loc);
-        return Err(vec![format!(
-            "{}:{}:{}: error: VHDL: component and entity instantiation are not supported yet",
-            f, l, c
-        )]);
-    }
-    let sv = lw.module(arch);
+    // STRING (messages) first.
+    lw.arr_type(&Repr::U8);
+    let sv = lw.module(an.top);
     if !lw.errors.is_empty() {
         lw.errors.dedup();
         return Err(lw.errors);
@@ -217,20 +244,23 @@ impl<'a> Lw<'a> {
             TypeKind::UniversalInteger | TypeKind::Physical(_) => Repr::I64,
             TypeKind::Real | TypeKind::UniversalReal => Repr::Real,
             TypeKind::Array { index, elem } => {
-                if index.len() != 1 {
-                    self.err(loc, "multi-dimensional arrays are not supported yet");
-                    return Repr::I32;
-                }
+                // A multi-dimensional array is an array (first dimension)
+                // of arrays of the remaining dimensions.
                 let er = self.repr(*elem, loc);
-                let name = format!("vh_a_{}", er.key());
                 let logic = self.d.is_bit_or_bool(*elem);
-                let e = self
-                    .arr_types
-                    .entry(name.clone())
-                    .or_insert((er.clone(), false));
-                e.1 |= logic;
-                Repr::Arr(name, Box::new(er))
+                let mut r = er;
+                for k in (0..index.len()).rev() {
+                    let name = self.arr_type(&r);
+                    if k == index.len() - 1 && logic {
+                        self.logic_arrs.insert(name.clone());
+                    }
+                    r = Repr::Arr(name, Box::new(r));
+                }
+                r
             }
+            // An access value: a handle into the designated type's heap (0:
+            // null, §5.4).
+            TypeKind::Access(_) => Repr::I64,
             TypeKind::Record(fields) => {
                 if let Some(n) = self.rec_types.get(&b) {
                     return Repr::Rec(n.clone());
@@ -256,7 +286,7 @@ impl<'a> Lw<'a> {
                     },
                     n = name
                 );
-                self.items.push_str(&s);
+                self.type_defs.push_str(&s);
                 Repr::Rec(name)
             }
             _ => {
@@ -272,11 +302,121 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// The heap of an access type's designated type (its key).
+    fn heap(&mut self, acc: TypeId, loc: &Loc) -> String {
+        let des = self.d.designated(acc).unwrap_or(acc);
+        let r = self.repr(des, loc);
+        let key = r.key();
+        if self.heaps.insert(key.clone()) {
+            let _ = write!(
+                self.heap_defs,
+                "  {t} vh_heap_{k}[longint];\n  longint vh_heap_{k}_n;\n  function automatic longint vh_new_{k}({t} v);\n    vh_heap_{k}_n++;\n    vh_heap_{k}[vh_heap_{k}_n] = v;\n    return vh_heap_{k}_n;\n  endfunction\n",
+                t = r.sv(),
+                k = key
+            );
+        }
+        key
+    }
+
+    /// The array struct for elements represented as `er`, defined with its
+    /// helpers on first use.
+    fn arr_type(&mut self, er: &Repr) -> String {
+        let name = format!("vh_a_{}", er.key());
+        if self.arr_types.insert(name.clone()) {
+            let eq = self.eq_expr(er, "x.d[i]", "y.d[i]");
+            let scalar = !matches!(er, Repr::Arr(..) | Repr::Rec(_));
+            let t = runtime::ARRAY_TEMPLATE
+                .replace("EQ(x.d[i], y.d[i])", &eq)
+                .replace(
+                    "LT(x.d[i], y.d[i])",
+                    if scalar { "x.d[i] < y.d[i]" } else { "0" },
+                )
+                .replace(
+                    "GT(x.d[i], y.d[i])",
+                    if scalar { "x.d[i] > y.d[i]" } else { "0" },
+                )
+                .replace("ARR", &name)
+                .replace("ELEM", &er.sv());
+            self.type_defs.push_str(&t);
+        }
+        name
+    }
+
     /// The (left, dir, right) of a constrained array subtype, if static.
     fn static_bounds(&self, t: TypeId) -> Option<(i64, Dir, i64)> {
         let r = self.d.array_index_ranges(t)?;
         let sr = r.first()?.clone()?;
         Some((sr.left.as_i64()?, sr.dir, sr.right.as_i64()?))
+    }
+
+    /// The number of dimensions of an array type (0: not an array).
+    fn ndims(&self, t: TypeId) -> usize {
+        match &self.d.types[self.base(t)].kind {
+            TypeKind::Array { index, .. } => index.len(),
+            _ => 0,
+        }
+    }
+
+    /// The static range of dimension `k` of a constrained array subtype.
+    fn static_dim(&self, t: TypeId, k: usize) -> Option<StaticRange> {
+        self.d.array_index_ranges(t)?.get(k)?.clone()
+    }
+
+    /// The bounds (left, right, dn) of dimension `k` of a constrained array
+    /// subtype as SV expressions: static, or computed where the subtype is
+    /// elaborated (§14.4.2.1).
+    fn dim_bounds(&mut self, t: TypeId, k: usize) -> Option<(String, String, String)> {
+        let cons = self.d.array_constraint(t)?;
+        let hr = cons.get(k)?.clone()?;
+        if let Some(sr) = &hr.static_val {
+            return Some((
+                self.scalar_lit(&sr.left, &Repr::I64),
+                self.scalar_lit(&sr.right, &Repr::I64),
+                ((sr.dir == Dir::Downto) as u8).to_string(),
+            ));
+        }
+        Some(self.range_parts(&hr))
+    }
+
+    /// The array struct of each dimension (outermost first) of an array
+    /// type, and the element representation.
+    fn arr_levels(&mut self, t: TypeId, loc: &Loc) -> (Vec<String>, Repr) {
+        let mut r = self.repr(t, loc);
+        let mut levels = Vec::new();
+        for _ in 0..self.ndims(t) {
+            match r {
+                Repr::Arr(n, e) => {
+                    levels.push(n);
+                    r = *e;
+                }
+                _ => break,
+            }
+        }
+        (levels, r)
+    }
+
+    /// The left bound and direction of dimension `k`'s index subtype.
+    fn index_left_dir_k(&self, arr: TypeId, k: usize) -> (i64, bool) {
+        if let TypeKind::Array { index, .. } = &self.d.types[self.base(arr)].kind
+            && let Some(it) = index.get(k)
+            && let Some(sr) = self.d.scalar_range(*it)
+        {
+            return (sr.left.as_i64().unwrap_or(0), sr.dir == Dir::Downto);
+        }
+        (0, false)
+    }
+
+    /// An SV expression usable as a function argument: an assignment
+    /// pattern goes through a temporary.
+    fn as_arg(&mut self, x: String, sv_ty: &str) -> String {
+        if !x.starts_with("'{") {
+            return x;
+        }
+        self.tmp += 1;
+        let n = format!("vh_e{}", self.tmp);
+        self.pre_stmts
+            .push((n.clone(), sv_ty.to_string(), format!("{} = {};", n, x)));
+        n
     }
 
     /// The index subtype's left bound and direction (for concatenation
@@ -322,37 +462,7 @@ impl<'a> Lw<'a> {
     fn value(&mut self, v: &Value, t: TypeId, loc: &Loc) -> String {
         let r = self.repr(t, loc);
         match (v, &r) {
-            (Value::Array(av), Repr::Arr(name, er)) => {
-                let key = format!("{}:{:?}", name, av);
-                if let Some(f) = self.lits.get(&key) {
-                    return format!("{}()", f);
-                }
-                let f = format!("vh_lit{}", self.lits.len());
-                let elem_t = self.d.element_subtype(t).unwrap_or(t);
-                let mut body = String::new();
-                let _ = writeln!(
-                    body,
-                    "  function automatic {} {}();\n    {} t[];\n    t = new[{}];",
-                    name,
-                    f,
-                    er.sv(),
-                    av.elems.len()
-                );
-                for (i, e) in av.elems.iter().enumerate() {
-                    let ev = self.value(e, elem_t, loc);
-                    let _ = writeln!(body, "    t[{}] = {};", i, ev);
-                }
-                let _ = writeln!(
-                    body,
-                    "    return {}_from({}, {}, t);\n  endfunction",
-                    name,
-                    self.scalar_lit(&Value::Int(av.left), &Repr::I64),
-                    (av.dir == Dir::Downto) as u8
-                );
-                self.lit_items.push_str(&body);
-                self.lits.insert(key, f.clone());
-                format!("{}()", f)
-            }
+            (Value::Array(av), Repr::Arr(..)) => self.value_arr(av, t, 0, loc),
             (Value::Record(vals), Repr::Rec(_)) => {
                 let TypeKind::Record(fields) = self.d.types[self.base(t)].kind.clone() else {
                     return "'{default:0}".into();
@@ -368,39 +478,90 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// A static array value for dimension `k` of array type `t` (rows of a
+    /// multi-dimensional array take the type's bounds of their dimension).
+    fn value_arr(&mut self, av: &ArrayValue, t: TypeId, k: usize, loc: &Loc) -> String {
+        let (levels, er) = self.arr_levels(t, loc);
+        let n = levels.len();
+        let (left, dir) = match self.static_dim(t, k) {
+            Some(sr) if k > 0 => (sr.left.as_i64().unwrap_or(av.left), sr.dir),
+            _ => (av.left, av.dir),
+        };
+        let name = levels[k].clone();
+        let key = format!("{}:{}:{:?}:{:?}", name, left, dir, av.elems);
+        if let Some(f) = self.lits.get(&key) {
+            return format!("{}()", f);
+        }
+        let f = format!("vh_lit{}", self.lits.len());
+        self.lits.insert(key, f.clone());
+        let elem_sv = if k + 1 < n {
+            levels[k + 1].clone()
+        } else {
+            er.sv()
+        };
+        let elem_t = self.d.element_subtype(t).unwrap_or(t);
+        let mut body = String::new();
+        let _ = writeln!(
+            body,
+            "  function automatic {} {}();\n    {} t[];\n    t = new[{}];",
+            name,
+            f,
+            elem_sv,
+            av.elems.len()
+        );
+        for (i, e) in av.elems.iter().enumerate() {
+            let ev = match e {
+                Value::Array(sub) if k + 1 < n => self.value_arr(sub, t, k + 1, loc),
+                _ => self.value(e, elem_t, loc),
+            };
+            let _ = writeln!(body, "    t[{}] = {};", i, ev);
+        }
+        let cnt = av.elems.len() as i64;
+        let right = match dir {
+            Dir::To => left + cnt - 1,
+            Dir::Downto => left - cnt + 1,
+        };
+        let right = if cnt == 0 { av.right } else { right };
+        let _ = writeln!(
+            body,
+            "    return {}_mk({}, {}, {}, t);\n  endfunction",
+            name,
+            self.scalar_lit(&Value::Int(left), &Repr::I64),
+            self.scalar_lit(&Value::Int(right), &Repr::I64),
+            (dir == Dir::Downto) as u8
+        );
+        self.lit_items.push_str(&body);
+        format!("{}()", f)
+    }
+
     /// The default (initial) value of type `t` (§14.4.2.5: T'LEFT, element
     /// by element).
     fn default_value(&mut self, t: TypeId, loc: &Loc) -> String {
         let r = self.repr(t, loc);
         match &r {
             Repr::Arr(name, _) => {
+                let n = self.ndims(t);
+                if !(0..n).all(|k| self.static_dim(t, k).is_some()) {
+                    // Bounds computed where the object is elaborated.
+                    return self.default_arr(t, 0, loc);
+                }
                 if let Some(f) = self.dflt.get(&t) {
                     return format!("{}()", f);
                 }
                 let f = format!("vh_dflt{}", t);
                 self.dflt.insert(t, f.clone());
-                let elem_t = self.d.element_subtype(t).unwrap_or(t);
-                let ev = self.default_value(elem_t, loc);
-                let er = match &r {
-                    Repr::Arr(_, e) => e.sv(),
-                    _ => unreachable!(),
-                };
-                let (l, dir, rr) = self.static_bounds(t).unwrap_or((0, Dir::To, -1));
-                let n = match dir {
-                    Dir::To => (rr - l + 1).max(0),
-                    Dir::Downto => (l - rr + 1).max(0),
-                };
+                let saved = std::mem::take(&mut self.pre_stmts);
+                let v = self.default_arr(t, 0, loc);
+                let mut decls = String::new();
+                let mut stmts = String::new();
+                for (tn, tt, st) in std::mem::replace(&mut self.pre_stmts, saved) {
+                    let _ = writeln!(decls, "    {} {};", tt, tn);
+                    let _ = writeln!(stmts, "    {}", st);
+                }
                 let _ = write!(
                     self.lit_items,
-                    "  function automatic {} {}();\n    {} t[];\n    t = new[{}];\n    foreach (t[i]) t[i] = {};\n    return {}_from({}, {}, t);\n  endfunction\n",
-                    name,
-                    f,
-                    er,
-                    n,
-                    ev,
-                    name,
-                    self.scalar_lit(&Value::Int(l), &Repr::I64),
-                    (dir == Dir::Downto) as u8
+                    "  function automatic {} {}();\n{}{}    return {};\n  endfunction\n",
+                    name, f, decls, stmts, v
                 );
                 format!("{}()", f)
             }
@@ -424,14 +585,48 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// The default value of dimension `k` onwards of array type `t`.
+    fn default_arr(&mut self, t: TypeId, k: usize, loc: &Loc) -> String {
+        let (levels, er) = self.arr_levels(t, loc);
+        let n = levels.len();
+        let (e, e_sv) = if k + 1 < n {
+            (self.default_arr(t, k + 1, loc), levels[k + 1].clone())
+        } else {
+            let elem_t = self.d.element_subtype(t).unwrap_or(t);
+            (self.default_value(elem_t, loc), er.sv())
+        };
+        let e = self.as_arg(e, &e_sv);
+        let (l, r, dn) = self
+            .dim_bounds(t, k)
+            .unwrap_or_else(|| ("64'sd0".into(), "(-64'sd1)".into(), "0".into()));
+        format!("{}_fill({}, {}, {}, {})", levels[k], l, r, dn, e)
+    }
+
     // ---- names -----------------------------------------------------------------------
 
-    fn obj_name(&self, o: ObjId) -> String {
+    fn obj_name(&mut self, o: ObjId) -> String {
         let info = &self.d.objects[o];
         match info.kind {
-            ObjKind::Signal | ObjKind::Port(_) => format!("vh_s{}", o),
+            ObjKind::Signal | ObjKind::Port(_) => self.sig_read(o),
             ObjKind::Param(..) => format!("p{}_{}", o, sv_ident(&info.name)),
-            _ => format!("vh_o{}_{}", o, sv_ident(&info.name)),
+            _ if self.inst == 0 || self.inst == GLOBAL || self.pkg_objs.contains(&o) => {
+                format!("vh_o{}_{}", o, sv_ident(&info.name))
+            }
+            _ => format!("vh_o{}_{}_i{}", o, sv_ident(&info.name), self.inst),
+        }
+    }
+
+    /// Whether a subprogram is declared in a package (lowered once) rather
+    /// than in an architecture or process (lowered per instance).
+    fn in_package(&self, s: SubId) -> bool {
+        let path = &self.d.subprograms[s].path;
+        let mut it = path.split('.');
+        match (it.next(), it.next()) {
+            (Some(l), Some(p)) => self
+                .d
+                .packages
+                .contains_key(&(l.to_string(), p.to_string())),
+            _ => false,
         }
     }
 
@@ -441,7 +636,11 @@ impl<'a> Lw<'a> {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
-        format!("vh_f{}_{}", s, clean)
+        if self.inst == 0 || self.in_package(s) {
+            format!("vh_f{}_{}", s, clean)
+        } else {
+            format!("vh_f{}_{}_i{}", s, clean, self.inst)
+        }
     }
 
     // ---- expressions -----------------------------------------------------------------
@@ -461,19 +660,33 @@ impl<'a> Lw<'a> {
             HExprKind::Convert(x) => self.convert(x, h.ty, &h.loc),
             HExprKind::Call(s, args) => self.call(*s, args, h),
             HExprKind::Index(b, idx) => {
-                let base = self.ex(b);
+                let (levels, _) = self.arr_levels(b.ty, &h.loc);
+                let mut cur = self.ex(b);
                 let (f, l, _) = self.file_line(&h.loc);
-                let i = self.ex(&idx[0]);
-                format!(
-                    "{}.d[vh_ix({}, {}.l, {}.r, {}.dn, {}, {})]",
-                    base,
-                    i,
-                    base,
-                    base,
-                    base,
-                    sv_string(&f),
-                    l
-                )
+                // A call result is evaluated once, through `_at`.
+                let call = cur.contains('(');
+                for (k, ix) in idx.iter().enumerate() {
+                    let i = self.ex(ix);
+                    cur = if call {
+                        format!(
+                            "{}_at({}, {}, {}, {})",
+                            levels.get(k).cloned().unwrap_or_default(),
+                            cur,
+                            i,
+                            sv_string(&f),
+                            l
+                        )
+                    } else {
+                        format!(
+                            "{c}.d[vh_ix({i}, {c}.l, {c}.r, {c}.dn, {f}, {l})]",
+                            c = cur,
+                            i = i,
+                            f = sv_string(&f),
+                            l = l
+                        )
+                    };
+                }
+                cur
             }
             HExprKind::Slice(b, r) => {
                 let base = self.ex(b);
@@ -501,9 +714,36 @@ impl<'a> Lw<'a> {
                 format!("'{{{}}}", parts.join(", "))
             }
             HExprKind::Attr(name, prefix, param) => self.attr(name, prefix, param.as_deref(), h),
-            HExprKind::Deref(_) | HExprKind::New(_) => {
-                self.err(&h.loc, "access types are not supported yet");
-                "0".into()
+            HExprKind::Deref(p) => {
+                let key = self.heap(p.ty, &h.loc);
+                let pv = self.ex(p);
+                let (f, l, _) = self.file_line(&h.loc);
+                format!("vh_heap_{}[vh_nn({}, {}, {})]", key, pv, sv_string(&f), l)
+            }
+            HExprKind::New(v) => {
+                let key = self.heap(h.ty, &h.loc);
+                let des = self.d.designated(h.ty).unwrap_or(h.ty);
+                let x = match v {
+                    Some(v) => {
+                        let target = HExpr {
+                            kind: HExprKind::Lit(Value::Null),
+                            ty: des,
+                            loc: v.loc.clone(),
+                        };
+                        self.store_value_init(&target, v)
+                    }
+                    None => self.default_value(des, &h.loc),
+                };
+                let r = self.repr(des, &h.loc);
+                let x = self.as_arg(x, &r.sv());
+                format!("vh_new_{}({})", key, x)
+            }
+            HExprKind::NewOf(st) => {
+                let key = self.heap(h.ty, &h.loc);
+                let x = self.default_value(*st, &h.loc);
+                let r = self.repr(*st, &h.loc);
+                let x = self.as_arg(x, &r.sv());
+                format!("vh_new_{}({})", key, x)
             }
         }
     }
@@ -535,8 +775,24 @@ impl<'a> Lw<'a> {
         if self.d.is_integer(tb) && self.d.is_integer(fb) {
             return self.checked_int(v, to, loc);
         }
-        // Closely related arrays: same representation, the value as is
-        // (bounds kept, §9.3.6).
+        // Closely related arrays (§9.3.6): to a constrained subtype, its
+        // bounds (lengths must match); else the operand's.
+        if self.ndims(tb) == 1
+            && let Some((l, r, dn)) = self.dim_bounds(to, 0)
+        {
+            let name = self.arr_name(to, loc);
+            let (f, line, _) = self.file_line(loc);
+            return format!(
+                "{}_rb({}, {}, {}, {}, {}, {})",
+                name,
+                v,
+                l,
+                r,
+                dn,
+                sv_string(&f),
+                line
+            );
+        }
         v
     }
 
@@ -594,17 +850,20 @@ impl<'a> Lw<'a> {
             Some(Builtin::ToString) => self.image(&args[0], args[0].ty, false),
             Some(Builtin::RisingEdge) | Some(Builtin::FallingEdge) => {
                 let a = &args[0];
-                let HExprKind::Obj(o) = a.kind else {
-                    self.err(
-                        &h.loc,
-                        "rising_edge/falling_edge of this signal is not supported yet",
-                    );
+                let one = matches!(info.builtin, Some(Builtin::RisingEdge));
+                let Some(ev) = self.sig_attr(a, "event") else {
+                    self.err(&h.loc, "rising_edge/falling_edge needs a signal");
                     return "0".into();
                 };
-                let one = matches!(info.builtin, Some(Builtin::RisingEdge));
-                format!("(vh_s{}_ev && vh_s{} == {})", o, o, one as u8)
+                let v = self.ex(a);
+                format!("({} && {} == {})", ev, v, one as u8)
             }
             Some(Builtin::Now) => "longint'($time)".into(),
+            Some(Builtin::Native(n)) if n == "textio.justify" => {
+                self.textio = true;
+                let a: Vec<String> = args.iter().map(|x| self.ex(x)).collect();
+                format!("vh_tio_justify({}, {}, {})", a[0], a[1], a[2])
+            }
             Some(Builtin::Native(n)) => {
                 self.err(&h.loc, format!("'{}' is not supported yet", n));
                 "0".into()
@@ -615,9 +874,10 @@ impl<'a> Lw<'a> {
             }
             None => {
                 self.need_sub(s);
+                let params = self.d.subprograms[s].params.clone();
                 let mut a = Vec::new();
-                for x in args {
-                    a.push(self.ex(x));
+                for (p, x) in params.iter().zip(args) {
+                    a.extend(self.arg_values(*p, x));
                 }
                 format!("{}({})", self.sub_name(s), a.join(", "))
             }
@@ -625,8 +885,9 @@ impl<'a> Lw<'a> {
     }
 
     fn need_sub(&mut self, s: SubId) {
-        if !self.subs_done.contains(&s) && !self.subs_todo.contains(&s) {
-            self.subs_todo.push(s);
+        let k = (s, if self.in_package(s) { 0 } else { self.inst });
+        if !self.subs_done.contains(&k) && !self.subs_todo.contains(&k) {
+            self.subs_todo.push(k);
         }
     }
 
@@ -663,6 +924,9 @@ impl<'a> Lw<'a> {
             };
         }
         let (x, y) = (&a[0], &a[1]);
+        if op.starts_with('?') {
+            return self.matching_op(op, pt[0], x, y, &loc);
+        }
         let real = self.d.is_real(self.base(pt[0])) || self.d.is_real(self.base(pt[1]));
         match op {
             "=" | "/=" => {
@@ -698,11 +962,13 @@ impl<'a> Lw<'a> {
                     l
                 )
             }
-            "and" => format!("(({}) & ({}))", x, y),
-            "or" => format!("(({}) | ({}))", x, y),
+            // BIT/BOOLEAN `and`, `or`, `nand`, `nor` evaluate the right
+            // operand only when needed (§9.2.2).
+            "and" => format!("(({}) && ({}))", x, y),
+            "or" => format!("(({}) || ({}))", x, y),
             "xor" => format!("(({}) ^ ({}))", x, y),
-            "nand" => format!("!(({}) & ({}))", x, y),
-            "nor" => format!("!(({}) | ({}))", x, y),
+            "nand" => format!("!(({}) && ({}))", x, y),
+            "nor" => format!("!(({}) || ({}))", x, y),
             "xnor" => format!("!(({}) ^ ({}))", x, y),
             "&" => {
                 let n = self.arr_name(ty, &loc);
@@ -743,6 +1009,53 @@ impl<'a> Lw<'a> {
                 "0".into()
             }
         }
+    }
+
+    /// The matching relational operators (§9.2.3) on BIT, STD_ULOGIC and
+    /// their one-dimensional arrays (`?=`, `?/=` only).
+    fn matching_op(&mut self, op: &str, t: TypeId, x: &str, y: &str, loc: &Loc) -> String {
+        let ul = self.d.std.std_ulogic;
+        let is_arr = self.ndims(t) == 1;
+        let et = if is_arr {
+            self.d.element_subtype(t).unwrap_or(t)
+        } else {
+            t
+        };
+        let std_ul = ul.is_some_and(|u| self.base(et) == u);
+        let (f, l, _) = self.file_line(loc);
+        if is_arr {
+            let n = self.arr_name(t, loc);
+            let eq = if std_ul {
+                format!("vh_ul_meq_arr({}, {}, {}, {})", x, y, sv_string(&f), l)
+            } else {
+                format!("vh_bit_meq_arr({}, {}, {}, {})", x, y, sv_string(&f), l)
+            };
+            let _ = n;
+            return match (op, std_ul) {
+                ("?=", _) => eq,
+                (_, true) => format!("vh_ul_not({})", eq),
+                _ => format!("!{}", eq),
+            };
+        }
+        if std_ul {
+            return match op {
+                "?=" => format!("vh_ul_meq({}, {})", x, y),
+                "?/=" => format!("vh_ul_not(vh_ul_meq({}, {}))", x, y),
+                "?<" => format!("vh_ul_mlt({}, {})", x, y),
+                "?<=" => format!("vh_ul_not(vh_ul_mlt({}, {}))", y, x),
+                "?>" => format!("vh_ul_mlt({}, {})", y, x),
+                _ => format!("vh_ul_not(vh_ul_mlt({}, {}))", x, y),
+            };
+        }
+        let cmp = match op {
+            "?=" => "==",
+            "?/=" => "!=",
+            "?<" => "<",
+            "?<=" => "<=",
+            "?>" => ">",
+            _ => ">=",
+        };
+        format!("(({}) {} ({}))", x, cmp, y)
     }
 
     /// Integer arithmetic checked against the result type's base range
@@ -800,7 +1113,34 @@ impl<'a> Lw<'a> {
                 }
                 format!("vh_str({}({}))", f, v)
             }
-            TypeKind::Array { .. } => v,
+            TypeKind::Array { elem, .. } => {
+                // TO_STRING of an array of a character enumeration type
+                // (§5.7): its elements' characters.
+                let eb = self.base(elem);
+                if eb == self.d.std.character {
+                    return v;
+                }
+                let TypeKind::Enum(lits) = self.d.types[eb].kind.clone() else {
+                    self.err(&x.loc, "TO_STRING of this array type is not supported yet");
+                    return "vh_str(\"\")".into();
+                };
+                let name = self.arr_name(t, &x.loc);
+                let f = format!("vh_tostr{}", eb);
+                if !self.lits.contains_key(&f) {
+                    let mut s = format!(
+                        "  function automatic vh_a_u8 {}({} a);\n    byte unsigned t[];\n    t = new[a.d.size()];\n    foreach (t[i])\n      case (a.d[i])\n",
+                        f, name
+                    );
+                    for (i, l) in lits.iter().enumerate() {
+                        let c = l.as_bytes().get(1).copied().unwrap_or(b'?');
+                        let _ = writeln!(s, "        {}: t[i] = {};", i, c);
+                    }
+                    s.push_str("        default: t[i] = 0;\n      endcase\n    return vh_a_u8_from(1, 0, t);\n  endfunction\n");
+                    self.lit_items.push_str(&s);
+                    self.lits.insert(f.clone(), f.clone());
+                }
+                format!("{}({})", f, v)
+            }
             _ => {
                 self.err(&x.loc, "'image of this type is not supported yet");
                 "vh_str(\"\")".into()
@@ -852,16 +1192,11 @@ impl<'a> Lw<'a> {
                 }
             },
             AttrPrefix::Expr(x) => {
-                if let HExprKind::Obj(o) = &x.kind
+                if matches!(name, "event" | "active" | "last_value" | "last_event")
                     && self.d.is_signal_expr(x)
+                    && let Some(v) = self.sig_attr(x, name)
                 {
-                    match name {
-                        "event" => return format!("vh_s{}_ev", o),
-                        "active" => return format!("vh_s{}_act", o),
-                        "last_value" => return format!("vh_s{}_last", o),
-                        "last_event" => return format!("(longint'($time) - vh_s{}_lev)", o),
-                        _ => {}
-                    }
+                    return v;
                 }
                 let b = self.ex(x);
                 match name {
@@ -885,62 +1220,169 @@ impl<'a> Lw<'a> {
     /// choices and `others`. Built by statements run before the statement
     /// using it, into temporaries declared in the enclosing scope.
     fn array_agg(&mut self, items: &[(Vec<HChoice>, HExpr)], h: &HExpr) -> String {
-        let t = h.ty;
-        let name = self.arr_name(t, &h.loc);
-        let er = match self.repr(t, &h.loc) {
-            Repr::Arr(_, e) => e.sv(),
-            _ => "int".into(),
+        self.array_agg_at(items, h.ty, 0, &h.loc)
+    }
+
+    /// The aggregate of dimension `k` of array type `t` (`k > 0`: a
+    /// sub-aggregate of a multi-dimensional aggregate, §9.3.3.3).
+    fn array_agg_at(
+        &mut self,
+        items: &[(Vec<HChoice>, HExpr)],
+        t: TypeId,
+        k: usize,
+        loc: &Loc,
+    ) -> String {
+        let (levels, er) = self.arr_levels(t, loc);
+        let n = levels.len();
+        if k >= n {
+            return "'{default:0}".into();
+        }
+        let name = levels[k].clone();
+        let elem_sv = if k + 1 < n {
+            levels[k + 1].clone()
+        } else {
+            er.sv()
         };
+        let (f, line, _) = self.file_line(loc);
         self.tmp += 1;
         let agg = format!("vh_agg{}", self.tmp);
         let tv = format!("{}_t", agg);
         let setv = format!("{}_set", agg);
+        let (lv, rv, dnv) = (
+            format!("{}_l", agg),
+            format!("{}_r", agg),
+            format!("{}_dn", agg),
+        );
         let positional = items.iter().all(|(c, _)| c.is_empty());
+        let bounds = self.dim_bounds(t, k);
         let mut body = String::new();
         let mut decls = vec![
-            (agg.clone(), name.clone()),
-            (format!("{}[]", tv), er.clone()),
+            (format!("{}[]", tv), elem_sv.clone()),
+            (lv.clone(), "longint".to_string()),
+            (rv.clone(), "longint".to_string()),
+            (dnv.clone(), "bit".to_string()),
         ];
+        // An element: a sub-aggregate of the next dimension, or a value.
+        let elem = |lw: &mut Self, v: &HExpr| -> String {
+            if k + 1 < n {
+                if let HExprKind::ArrayAgg(sub) = &v.kind {
+                    return lw.array_agg_at(sub, t, k + 1, &v.loc);
+                }
+                let x = lw.ex(v);
+                if let Some((l, r, dn)) = lw.dim_bounds(t, k + 1) {
+                    return format!(
+                        "{}_rb({}, {}, {}, {}, {}, {})",
+                        levels[k + 1],
+                        x,
+                        l,
+                        r,
+                        dn,
+                        sv_string(&f),
+                        line
+                    );
+                }
+                return x;
+            }
+            lw.ex(v)
+        };
         if positional {
-            let (il, idn) = match self.static_bounds(t) {
-                Some((l, d, _)) => (l, d == Dir::Downto),
-                None => self.index_left_dir(t),
+            // The context's bounds when constrained, else from the index
+            // subtype's left bound and direction (§9.3.3.3).
+            let (l, dn) = match &bounds {
+                Some((l, _, dn)) => (l.clone(), dn.clone()),
+                None => {
+                    let (il, idn) = self.index_left_dir_k(t, k);
+                    (
+                        self.scalar_lit(&Value::Int(il), &Repr::I64),
+                        (idn as u8).to_string(),
+                    )
+                }
             };
             let _ = writeln!(body, "{} = new[{}];", tv, items.len());
             for (i, (_, v)) in items.iter().enumerate() {
-                let x = self.ex(v);
+                let x = elem(self, v);
                 let _ = writeln!(body, "{}[{}] = {};", tv, i, x);
             }
             let _ = writeln!(
                 body,
-                "{} = {}_from({}, {}, {});",
-                agg,
-                name,
-                self.scalar_lit(&Value::Int(il), &Repr::I64),
-                idn as u8,
-                tv
+                "{} = {}; {} = {}; {} = {} ? {} - {} : {} + {};",
+                lv,
+                l,
+                dnv,
+                dn,
+                rv,
+                dnv,
+                lv,
+                items.len() as i64 - 1,
+                lv,
+                items.len() as i64 - 1
             );
         } else {
-            // Named/others: the bounds come from the subtype.
-            let Some((l, dir, r)) = self.static_bounds(t) else {
-                self.err(
-                    &h.loc,
-                    "an aggregate with choices needs a constrained type here",
-                );
+            // Named/others: the bounds come from the subtype; without one,
+            // from the smallest and largest choices in the index subtype's
+            // direction (§9.3.3.3).
+            let has_others = items
+                .iter()
+                .any(|(c, _)| c.iter().any(|x| matches!(x, HChoice::Others)));
+            let bounds = match bounds {
+                Some(b) => Some(b),
+                None if !has_others && items.iter().all(|(c, _)| !c.is_empty()) => {
+                    let (lo, hi) = (format!("{}_lo", agg), format!("{}_hi", agg));
+                    decls.push((lo.clone(), "longint".into()));
+                    decls.push((hi.clone(), "longint".into()));
+                    let mut first = true;
+                    for (choices, _) in items {
+                        for c in choices {
+                            let (a, b) = match c {
+                                HChoice::Expr(e) => {
+                                    let x = self.ex(e);
+                                    (x.clone(), x)
+                                }
+                                HChoice::Range(hr) => {
+                                    let (a, b, dn) = self.range_parts(hr);
+                                    (
+                                        format!("(({dn}) ? ({b}) : ({a}))", dn = dn, a = a, b = b),
+                                        format!("(({dn}) ? ({a}) : ({b}))", dn = dn, a = a, b = b),
+                                    )
+                                }
+                                HChoice::Others => continue,
+                            };
+                            if first {
+                                let _ = writeln!(body, "{} = {}; {} = {};", lo, a, hi, b);
+                                first = false;
+                            } else {
+                                let _ = writeln!(
+                                    body,
+                                    "if ({a} < {lo}) {lo} = {a}; if ({b} > {hi}) {hi} = {b};",
+                                    a = a,
+                                    b = b,
+                                    lo = lo,
+                                    hi = hi
+                                );
+                            }
+                        }
+                    }
+                    let (_, idn) = self.index_left_dir_k(t, k);
+                    Some(if idn {
+                        (hi, lo, "1".to_string())
+                    } else {
+                        (lo, hi, "0".to_string())
+                    })
+                }
+                None => None,
+            };
+            let Some((l, r, dn)) = bounds else {
+                self.err(loc, "an aggregate with choices needs a constrained type here");
                 return "'{default:0}".into();
             };
-            let n = match dir {
-                Dir::To => (r - l + 1).max(0),
-                Dir::Downto => (l - r + 1).max(0),
-            };
-            let dn = (dir == Dir::Downto) as u8;
-            let ll = self.scalar_lit(&Value::Int(l), &Repr::I64);
             decls.push((format!("{}[]", setv), "bit".into()));
-            let _ = writeln!(body, "{} = new[{}];", tv, n);
-            let _ = writeln!(body, "{} = new[{}];", setv, n);
+            let _ = writeln!(body, "{} = {}; {} = {}; {} = {};", lv, l, rv, r, dnv, dn);
+            let _ = writeln!(body, "{} = new[vh_len({}, {}, {})];", tv, lv, rv, dnv);
+            let _ = writeln!(body, "{} = new[{}.size()];", setv, tv);
+            let off = |i: &str| format!("({dn} ? {l} - ({i}) : ({i}) - {l})", dn = dnv, l = lv, i = i);
             let mut pos = 0i64;
             for (choices, v) in items {
-                let x = self.ex(v);
+                let x = elem(self, v);
                 if choices.is_empty() {
                     let _ = writeln!(body, "{}[{}] = {}; {}[{}] = 1;", tv, pos, x, setv, pos);
                     pos += 1;
@@ -959,12 +1401,7 @@ impl<'a> Lw<'a> {
                         }
                         HChoice::Expr(e) => {
                             let i = self.ex(e);
-                            let o = format!(
-                                "({dn} ? {l} - ({i}) : ({i}) - {l})",
-                                dn = dn,
-                                l = ll,
-                                i = i
-                            );
+                            let o = off(&i);
                             let _ = writeln!(
                                 body,
                                 "{t}[{o}] = {x}; {s}[{o}] = 1;",
@@ -976,7 +1413,7 @@ impl<'a> Lw<'a> {
                         }
                         HChoice::Range(hr) => {
                             let (a, b, _) = self.range_parts(hr);
-                            let o = format!("({dn} ? {l} - k : k - {l})", dn = dn, l = ll);
+                            let o = off("k");
                             let _ = writeln!(
                                 body,
                                 "for (longint k = (({a}) < ({b}) ? ({a}) : ({b})); k <= (({a}) < ({b}) ? ({b}) : ({a})); k++) begin {t}[{o}] = {x}; {s}[{o}] = 1; end",
@@ -991,10 +1428,10 @@ impl<'a> Lw<'a> {
                     }
                 }
             }
-            let _ = writeln!(body, "{} = {}_from({}, {}, {});", agg, name, ll, dn, tv);
         }
+        let _ = writeln!(body, "{} = {}_mk({}, {}, {}, {});", agg, name, lv, rv, dnv, tv);
         // Declarations go to the enclosing scope; the statements run first.
-        for (n, ty) in decls.into_iter().skip(1) {
+        for (n, ty) in decls {
             let (n, dims) = match n.strip_suffix("[]") {
                 Some(b) => (b.to_string(), "[]"),
                 None => (n, ""),
@@ -1041,17 +1478,18 @@ impl<'a> Lw<'a> {
         let (f, l, _) = self.file_line(&loc);
         match &target.kind {
             HExprKind::Index(b, idx) => {
-                let base = self.ex(b);
-                let i = self.ex(&idx[0]);
-                format!(
-                    "{pad}{base}.d[vh_ix({i}, {base}.l, {base}.r, {base}.dn, {f}, {l})] = {value};\n",
-                    pad = pad,
-                    base = base,
-                    i = i,
-                    f = sv_string(&f),
-                    l = l,
-                    value = value
-                )
+                let mut cur = self.ex(b);
+                for ix in idx {
+                    let i = self.ex(ix);
+                    cur = format!(
+                        "{c}.d[vh_ix({i}, {c}.l, {c}.r, {c}.dn, {f}, {l})]",
+                        c = cur,
+                        i = i,
+                        f = sv_string(&f),
+                        l = l
+                    );
+                }
+                format!("{}{} = {};\n", pad, cur, value)
             }
             HExprKind::Slice(b, r) => {
                 let base = self.ex(b);
@@ -1346,143 +1784,10 @@ impl<'a> Lw<'a> {
         out
     }
 
-    /// `wait on S until C for T` (§10.2): suspend at a site sensitive to S
-    /// with an optional deadline; resumed by the kernel on an event of S
-    /// (then C must hold) or at the deadline.
-    fn wait(
-        &mut self,
-        on: &[HExpr],
-        until: Option<&HExpr>,
-        timeout: Option<&HExpr>,
-        ind: usize,
-        loc: &Loc,
-    ) -> String {
-        let pad = " ".repeat(ind);
-        let Some(p) = self.cur_proc else {
-            self.err(loc, "wait statements in subprograms are not supported yet");
-            return String::new();
-        };
-        let mut sigs = Vec::new();
-        for s in on {
-            match self.signal_obj(s) {
-                Some(o) => {
-                    if !sigs.contains(&o) {
-                        sigs.push(o);
-                    }
-                }
-                None => self.err(&s.loc, "this sensitivity is not supported yet"),
-            }
-        }
-        let site = self.sites[p].len();
-        self.sites[p].push(Site { sigs });
-        let pid = self.pid();
-        let deadline = match timeout {
-            Some(t) => {
-                let tv = self.ex(t);
-                format!("vh_deadline({})", tv)
-            }
-            None => "-64'sd1".into(),
-        };
-        let cond = match until {
-            Some(c) => self.ex(c),
-            None => "1".into(),
-        };
-        let _ = pid;
-        let mut out = String::new();
-        let _ = writeln!(out, "{}vh_dl[{}] = {};", pad, p, deadline);
-        let _ = writeln!(out, "{}forever begin", pad);
-        let _ = writeln!(
-            out,
-            "{}  vh_site[{p}] = {site}; vh_tmo[{p}] = vh_dl[{p}]; vh_go[{p}] = 0; wait (vh_go[{p}]);",
-            pad,
-            p = p,
-            site = site
-        );
-        let _ = writeln!(out, "{}  if (vh_tmoh[{}] || ({})) break;", pad, p, cond);
-        let _ = writeln!(out, "{}end", pad);
-        out
-    }
-
-    /// The signal object a sensitivity or target names (whole signals).
-    fn signal_obj(&self, h: &HExpr) -> Option<ObjId> {
-        match &h.kind {
-            HExprKind::Obj(o)
-                if matches!(self.d.objects[*o].kind, ObjKind::Signal | ObjKind::Port(_)) =>
-            {
-                Some(*o)
-            }
-            HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) => {
-                self.signal_obj(b)
-            }
-            _ => None,
-        }
-    }
-
-    /// `s <= [delay] w1 after t1, w2 after t2, …` (§10.5.2): update the
-    /// projected waveform of this process's driver of s.
-    fn signal_assign(
-        &mut self,
-        target: &HExpr,
-        delay: Option<&HDelay>,
-        waves: &[HWave],
-        ind: usize,
-    ) -> String {
-        let pad = " ".repeat(ind);
-        let loc = target.loc.clone();
-        let Some(p) = self.cur_proc else {
-            self.err(
-                &loc,
-                "signal assignments in subprograms are not supported yet",
-            );
-            return String::new();
-        };
-        let HExprKind::Obj(sig) = target.kind else {
-            self.err(
-                &loc,
-                "assignments to parts of a signal are not supported yet",
-            );
-            return String::new();
-        };
-        self.drivers.insert((sig, p));
-        let mut out = String::new();
-        let transport = matches!(delay, Some(HDelay::Transport));
-        let reject = match delay {
-            Some(HDelay::Inertial(Some(r))) => Some(self.ex(r)),
-            _ => None,
-        };
-        for (i, w) in waves.iter().enumerate() {
-            let t = match &w.after {
-                Some(a) => self.ex(a),
-                None => "64'sd0".into(),
-            };
-            let Some(v) = &w.value else {
-                self.err(&loc, "null transactions are not supported yet");
-                continue;
-            };
-            let val = self.store_value(target, v);
-            // The first element of an inertial assignment rejects pulses
-            // shorter than the reject limit (default: its delay).
-            let (mode, rej) = if i == 0 && !transport {
-                (1, reject.clone().unwrap_or_else(|| t.clone()))
-            } else {
-                (if i == 0 { 0 } else { 2 }, "64'sd0".into())
-            };
-            let _ = writeln!(
-                out,
-                "{}vh_drv_{}_{}({}, {}, {}, {});",
-                pad, sig, p, val, t, rej, mode
-            );
-        }
-        if waves.is_empty() {
-            // `unaffected`
-        }
-        out
-    }
-
     fn proc_call(&mut self, sub: SubId, args: &[HExpr], ind: usize, loc: &Loc) -> String {
         let pad = " ".repeat(ind);
         let info = self.d.subprograms[sub].clone();
-        match info.builtin {
+        match info.builtin.clone() {
             Some(Builtin::Native(n)) => match n.as_str() {
                 "env.finish" | "env.stop" => {
                     let word = if n == "env.finish" {
@@ -1495,6 +1800,7 @@ impl<'a> Lw<'a> {
                         pad, word
                     )
                 }
+                n if n.starts_with("textio.") => self.textio_call(&n["textio.".len()..], &info, args, ind, loc),
                 _ => {
                     self.err(
                         loc,
@@ -1507,6 +1813,16 @@ impl<'a> Lw<'a> {
                     String::new()
                 }
             },
+            Some(Builtin::Deallocate) => {
+                let key = self.heap(args[0].ty, loc);
+                let p = self.ex(&args[0]);
+                format!(
+                    "{pad}begin if ({p} != 0) vh_heap_{k}.delete({p}); {p} = 0; end\n",
+                    pad = pad,
+                    p = p,
+                    k = key
+                )
+            }
             Some(_) => {
                 self.err(
                     loc,
@@ -1517,8 +1833,8 @@ impl<'a> Lw<'a> {
             None => {
                 self.need_sub(sub);
                 let mut a = Vec::new();
-                for x in args {
-                    a.push(self.ex(x));
+                for (p, x) in info.params.iter().zip(args) {
+                    a.extend(self.arg_values(*p, x));
                 }
                 if self.sub_waits(sub) {
                     a.insert(0, self.pid());
@@ -1573,18 +1889,7 @@ impl<'a> Lw<'a> {
         let saved_proc = self.cur_proc.take();
         let mut params = Vec::new();
         for p in &info.params {
-            let o = &self.d.objects[*p];
-            let dir = match o.kind {
-                ObjKind::Param(ObjClass::Signal, _) => {
-                    self.err(&loc, "signal parameters are not supported yet");
-                    "input"
-                }
-                ObjKind::Param(_, Mode::Out) => "output",
-                ObjKind::Param(_, Mode::InOut) => "inout",
-                _ => "input",
-            };
-            let r = self.repr(o.ty, &loc);
-            params.push(format!("{} {} {}", dir, r.sv(), self.obj_name(*p)));
+            params.extend(self.param_decls(*p, &loc));
         }
         let mut locals = String::new();
         let mut inits = String::new();
@@ -1635,6 +1940,23 @@ impl<'a> Lw<'a> {
         // An object's initial value: an array takes its declared bounds when
         // the subtype is constrained, else the value's own.
         if let Repr::Arr(name, _) = self.repr(target.ty, &target.loc)
+            && self.ndims(target.ty) == 1
+            && let Some((bl, br, bdn)) = self.dim_bounds(target.ty, 0)
+        {
+            let x = self.ex(v);
+            let (f, l, _) = self.file_line(&v.loc);
+            return format!(
+                "{}_rb({}, {}, {}, {}, {}, {})",
+                name,
+                x,
+                bl,
+                br,
+                bdn,
+                sv_string(&f),
+                l
+            );
+        }
+        if let Repr::Arr(name, _) = self.repr(target.ty, &target.loc)
             && self.static_bounds(target.ty).is_some()
         {
             let x = self.ex(v);
@@ -1660,315 +1982,16 @@ impl<'a> Lw<'a> {
         out
     }
 
-    // ---- the module ----------------------------------------------------------------
-
-    fn module(&mut self, arch: &Architecture) -> String {
-        let d = self.d;
-        let np = arch.processes.len().max(1);
-        self.sites = (0..arch.processes.len()).map(|_| Vec::new()).collect();
-        // Signals: ports of the top entity and the architecture's signals.
-        let mut sigs: Vec<ObjId> = arch.ports.clone();
-        sigs.extend(arch.signals.iter().copied());
-        self.signals = sigs.clone();
-        // Elaboration: package objects (analysis order), generics,
-        // constants and signals of the architecture, process variables.
-        let mut elab = String::new();
-        let mut decls = String::new();
-        let mut pkg_objs: Vec<ObjId> = Vec::new();
-        for (p, _) in d.packages.values() {
-            pkg_objs.extend(p.objects.iter().copied());
+    /// The SV element type of an array struct (from its name).
+    fn arr_elem_sv(&self, name: &str) -> String {
+        match &name["vh_a_".len()..] {
+            "u8" => "byte unsigned".into(),
+            "u32" => "int unsigned".into(),
+            "i32" => "int".into(),
+            "i64" => "longint".into(),
+            "r" => "real".into(),
+            other => other.to_string(),
         }
-        pkg_objs.sort();
-        // A deferred constant is listed by its package and its body.
-        pkg_objs.dedup();
-        let mut objs: Vec<ObjId> = pkg_objs;
-        objs.extend(arch.generics.iter().copied());
-        objs.extend(arch.constants.iter().copied());
-        let mut proc_vars: Vec<ObjId> = Vec::new();
-        for p in &arch.processes {
-            proc_vars.extend(p.locals.iter().copied());
-        }
-        self.temps.clear();
-        for o in objs.iter().chain(&proc_vars).chain(&sigs) {
-            let info = d.objects[*o].clone();
-            if matches!(info.kind, ObjKind::File) {
-                continue;
-            }
-            let r = self.repr(info.ty, &info.loc);
-            let name = self.obj_name(*o);
-            let _ = writeln!(decls, "  {} {};", r.sv(), name);
-            let v = match &info.init {
-                Some(i) => {
-                    let target = HExpr {
-                        kind: HExprKind::Obj(*o),
-                        ty: info.ty,
-                        loc: info.loc.clone(),
-                    };
-                    self.store_value_init(&target, i)
-                }
-                None => self.default_value(info.ty, &info.loc),
-            };
-            let flushed = self.flush_pre(4);
-            elab.push_str(&flushed);
-            let _ = writeln!(elab, "    {} = {};", name, v);
-        }
-        // Temporaries of the initial values, declared in vh_elab.
-        let mut elab_temps = String::new();
-        for (n, t) in std::mem::take(&mut self.temps) {
-            let _ = writeln!(elab_temps, "    {} {};", t, n);
-        }
-        // Signal bookkeeping.
-        for s in &sigs {
-            let info = d.objects[*s].clone();
-            let r = self.repr(info.ty, &info.loc);
-            let _ = writeln!(
-                decls,
-                "  bit vh_s{s}_ev, vh_s{s}_act; {t} vh_s{s}_last; longint vh_s{s}_lev;",
-                s = s,
-                t = r.sv()
-            );
-            let _ = writeln!(
-                elab,
-                "    vh_s{s}_last = vh_s{s}; vh_s{s}_lev = -64'sd9223372036854775807;",
-                s = s
-            );
-        }
-        // Processes.
-        let mut procs = String::new();
-        for (pi, p) in arch.processes.iter().enumerate() {
-            self.cur_proc = Some(pi);
-            self.temps.clear();
-            let body = self.stmts(&p.stmts, 6);
-            let mut implicit = String::new();
-            if let Some(sens) = &p.sens {
-                let mut ss = Vec::new();
-                for x in sens {
-                    match self.signal_obj(x) {
-                        Some(o) => {
-                            if !ss.contains(&o) {
-                                ss.push(o);
-                            }
-                        }
-                        None => self.err(&x.loc, "this sensitivity is not supported yet"),
-                    }
-                }
-                let site = self.sites[pi].len();
-                self.sites[pi].push(Site { sigs: ss });
-                let _ = writeln!(
-                    implicit,
-                    "      vh_site[{p}] = {site}; vh_tmo[{p}] = -64'sd1; vh_go[{p}] = 0; wait (vh_go[{p}]);",
-                    p = pi,
-                    site = site
-                );
-            }
-            let mut temps = String::new();
-            for (n, t) in std::mem::take(&mut self.temps) {
-                let _ = writeln!(temps, "    {} {};", t, n);
-            }
-            let label = if p.label.is_empty() {
-                format!("p{}", pi)
-            } else {
-                sv_ident(&p.label)
-            };
-            let _ = write!(
-                procs,
-                "  // process {label}\n  initial begin : vh_p{pi}_{label}\n{temps}    wait (vh_go[{pi}]);\n    forever begin\n{body}{implicit}    end\n  end\n",
-                label = label,
-                pi = pi,
-                temps = temps,
-                body = body,
-                implicit = implicit
-            );
-        }
-        self.cur_proc = None;
-        // Subprograms the design calls (transitively).
-        while let Some(s) = self.subs_todo.pop() {
-            if self.subs_done.insert(s) {
-                self.subprogram(s);
-            }
-        }
-        // Drivers.
-        let mut drv = String::new();
-        let drivers: Vec<(ObjId, usize)> = self.drivers.iter().copied().collect();
-        for (s, p) in &drivers {
-            let info = d.objects[*s].clone();
-            let r = self.repr(info.ty, &info.loc);
-            let t = r.sv();
-            // Parallel queues of transaction times and values (a queue of
-            // structs holding a struct does not round-trip in the simulator).
-            let eq = self.eq_expr(&r, "qv[k]", "v");
-            let _ = write!(
-                drv,
-                "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  // Update the projected output waveform (§10.5.2.2): mode 0 transport,\n  // 1 inertial first element (reject limit), 2 later elements.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    longint tt;\n    longint qt[$];\n    {t} qv[$];\n    int k;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qv = vh_dq{s}_{p};\n    while (qt.size() > 0 && qt[qt.size()-1] >= tt) begin void'(qt.pop_back()); void'(qv.pop_back()); end\n    if (mode == 1) begin\n      // Pulse rejection: of the old transactions in [tt - rej, tt), keep\n      // the run immediately before the new one that has its value.\n      k = qt.size() - 1;\n      while (k >= 0 && qt[k] >= tt - rej && ({eq})) k--;\n      while (k >= 0 && qt[k] >= tt - rej) begin qt.delete(k); qv.delete(k); k--; end\n    end\n    qt.push_back(tt);\n    qv.push_back(v);\n    vh_dt{s}_{p} = qt;\n    vh_dq{s}_{p} = qv;\n  endfunction\n",
-                t = t,
-                s = s,
-                p = p,
-                eq = eq
-            );
-            let _ = writeln!(elab, "    vh_dv{s}_{p} = vh_s{s};", s = s, p = p);
-        }
-        // Kernel.
-        let mut k = String::new();
-        let _ = writeln!(k, "  initial begin : vh_kernel");
-        let _ = writeln!(k, "    longint vh_nxt;");
-        let _ = writeln!(k, "    vh_elab();");
-        let _ = writeln!(
-            k,
-            "    // Initialization (§14.7.5.2): every process runs until it suspends."
-        );
-        let _ = writeln!(
-            k,
-            "    for (int p = 0; p < {}; p++) begin vh_go[p] = 1; wait (vh_go[p] == 0); end",
-            arch.processes.len()
-        );
-        let _ = writeln!(k, "    forever begin");
-        let _ = writeln!(k, "      vh_nxt = -64'sd1;");
-        for (s, p) in &drivers {
-            let _ = writeln!(
-                k,
-                "      if (vh_dt{s}_{p}.size() > 0 && (vh_nxt < 0 || vh_dt{s}_{p}[0] < vh_nxt)) vh_nxt = vh_dt{s}_{p}[0];",
-                s = s,
-                p = p
-            );
-        }
-        let _ = writeln!(
-            k,
-            "      for (int p = 0; p < {}; p++) if (vh_tmo[p] >= 0 && (vh_nxt < 0 || vh_tmo[p] < vh_nxt)) vh_nxt = vh_tmo[p];",
-            arch.processes.len()
-        );
-        let _ = writeln!(k, "      if (vh_nxt < 0 || vh_stop) break;");
-        let _ = writeln!(k, "      if (vh_nxt > $time) #(vh_nxt - $time);");
-        let _ = writeln!(k, "      // Signal update (§14.7.3).");
-        for s in &sigs {
-            let _ = writeln!(k, "      vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
-        }
-        for (s, p) in &drivers {
-            let _ = writeln!(
-                k,
-                "      if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
-                s = s,
-                p = p
-            );
-        }
-        for s in &sigs {
-            let ds: Vec<usize> = drivers
-                .iter()
-                .filter(|(x, _)| x == s)
-                .map(|(_, p)| *p)
-                .collect();
-            if ds.is_empty() {
-                continue;
-            }
-            if ds.len() > 1 {
-                let info = &d.objects[*s];
-                let loc = info.loc.clone();
-                self.err(
-                    &loc,
-                    format!(
-                        "signal '{}' has several drivers (resolved signals are not supported yet)",
-                        info.name
-                    ),
-                );
-                continue;
-            }
-            let info = d.objects[*s].clone();
-            let r = self.repr(info.ty, &info.loc);
-            let ne = format!(
-                "!({})",
-                self.eq_expr(&r, &format!("vh_dv{}_{}", s, ds[0]), &format!("vh_s{}", s))
-            );
-            let _ = writeln!(
-                k,
-                "      if (vh_s{s}_act && {ne}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end",
-                s = s,
-                p = ds[0],
-                ne = ne
-            );
-        }
-        let _ = writeln!(k, "      // Resume (§14.7.5.3), in elaboration order.");
-        for pi in 0..arch.processes.len() {
-            let mut conds = vec![format!(
-                "(vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time)",
-                p = pi
-            )];
-            for (si, site) in self.sites[pi].iter().enumerate() {
-                if site.sigs.is_empty() {
-                    continue;
-                }
-                let evs: Vec<String> = site.sigs.iter().map(|s| format!("vh_s{}_ev", s)).collect();
-                conds.push(format!(
-                    "(vh_site[{}] == {} && ({}))",
-                    pi,
-                    si,
-                    evs.join(" || ")
-                ));
-            }
-            let _ = writeln!(
-                k,
-                "      if (!vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_go[{p}] = 1; wait (vh_go[{p}] == 0); end",
-                p = pi,
-                c = conds.join(" || ")
-            );
-        }
-        let _ = writeln!(k, "    end");
-        let _ = writeln!(k, "    $finish;");
-        let _ = writeln!(k, "  end");
-
-        // Assemble.
-        let mut m = String::new();
-        let _ = writeln!(m, "module {};", sv_ident(&arch.entity));
-        let _ = writeln!(m, "  timeunit 1fs; timeprecision 1fs;");
-        let mut arr_defs = String::new();
-        for (name, (er, logic)) in self.arr_types.clone() {
-            let eq = self.eq_expr(&er, "A", "B");
-            let mut t = runtime::ARRAY_TEMPLATE
-                .replace("ARR", &name)
-                .replace("ELEM", &er.sv());
-            t = t.replace(
-                "EQ(x.d[i], y.d[i])",
-                &eq.replace("A", "x.d[i]").replace("B", "y.d[i]"),
-            );
-            arr_defs.push_str(&t);
-            if logic {
-                arr_defs.push_str(
-                    &runtime::LOGIC_TEMPLATE
-                        .replace("ARR", &name)
-                        .replace("ELEM", &er.sv()),
-                );
-            }
-        }
-        // STRING helpers (always: messages are strings).
-        if !self.arr_types.contains_key("vh_a_u8") {
-            let t = runtime::ARRAY_TEMPLATE
-                .replace("ARR", "vh_a_u8")
-                .replace("ELEM", "byte unsigned")
-                .replace("EQ(x.d[i], y.d[i])", "x.d[i] == y.d[i]");
-            arr_defs.push_str(&t);
-        }
-        m.push_str(runtime::COMMON);
-        m.push_str(&self.items);
-        m.push_str(&arr_defs);
-        m.push_str(
-            "  function automatic vh_a_u8 vh_str(string s);\n    byte unsigned t[];\n    t = new[s.len()];\n    for (int i = 0; i < s.len(); i++) t[i] = s.getc(i);\n    return vh_a_u8_from(1, 0, t);\n  endfunction\n  function automatic string vh_sv(vh_a_u8 a);\n    string s;\n    s = \"\";\n    for (int i = 0; i < a.d.size(); i++) s = {s, string'(a.d[i])};\n    return s;\n  endfunction\n  function automatic longint vh_deadline(longint t);\n    if (t < 0) return -64'sd1;\n    if (t > 64'sd9223372036854775807 - longint'($time)) return -64'sd1;\n    return longint'($time) + t;\n  endfunction\n",
-        );
-        let _ = writeln!(
-            m,
-            "  bit vh_go [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop;",
-            n = np
-        );
-        m.push_str(&decls);
-        m.push_str(&self.lit_items);
-        m.push_str(&drv);
-        m.push_str(&self.sub_items);
-        let _ = write!(
-            m,
-            "  function automatic void vh_elab();\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n{}  endfunction\n",
-            elab_temps, np, elab
-        );
-        m.push_str(&procs);
-        m.push_str(&k);
-        m.push_str("endmodule\n");
-        m
     }
 
     /// Equality of two values of a representation (SV expression).

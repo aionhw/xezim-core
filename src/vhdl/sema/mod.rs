@@ -130,6 +130,8 @@ pub struct Design {
     arch_srcs: BTreeMap<(String, String), Vec<(String, UnitSrc)>>,
     state: HashMap<(String, String, u8), State>,
     pub std: StdTypes,
+    /// Architectures analysed for generic bindings: (arch, generics, ports).
+    bound_archs: HashMap<String, (usize, Vec<ObjId>, Vec<ObjId>)>,
     /// Predefined operation instances by name and profile.
     pre_cache: HashMap<String, SubId>,
     /// Library subprogram bodies not analysed yet.
@@ -196,6 +198,7 @@ impl Design {
             arch_srcs: BTreeMap::new(),
             state: HashMap::new(),
             std: StdTypes::default(),
+            bound_archs: HashMap::new(),
             pre_cache: HashMap::new(),
             lazy_bodies: HashMap::new(),
             errors: Vec::new(),
@@ -777,6 +780,14 @@ impl Design {
         if let Some(e) = self.entities.get(&k) {
             return Some(e.clone());
         }
+        let info = self.entity_with(lib, name, &[])?;
+        self.entities.insert(k, info.clone());
+        Some(info)
+    }
+
+    /// Analyse an entity with generic values (by name) in place of the
+    /// defaults: its ports and declarations see them (§14.4.2.2).
+    fn entity_with(&mut self, lib: &str, name: &str, binding: &[(String, Value)]) -> Option<EntityInfo> {
         self.ensure_library(lib);
         let src = self.units.get(lib)?.get(name)?.clone();
         let du = self.unit_ast(&src)?.clone();
@@ -788,6 +799,14 @@ impl Design {
             let r = d.new_region(Some(ctx));
             let path = format!("{}.{}", lib, name);
             let generics = d.interface_list(r, &e.generics, decl::IfaceKind::Generic, &path);
+            for g in &generics {
+                let gname = d.objects[*g].name.clone();
+                if let Some((_, v)) = binding.iter().find(|(n, _)| *n == gname) {
+                    let o = &mut d.objects[*g];
+                    o.static_val = Some(v.clone());
+                    o.init = Some(decl::lit_expr(v.clone(), o.ty, o.loc.clone()));
+                }
+            }
             let ports = d.interface_list(r, &e.ports, decl::IfaceKind::Port, &path);
             let mut objs = Vec::new();
             let mut subs = Vec::new();
@@ -802,8 +821,53 @@ impl Design {
                 stmts_src: (src.file, src.index),
             }
         });
-        self.entities.insert(k, info.clone());
         Some(info)
+    }
+
+    /// The architecture of an instance whose generic map gives values
+    /// other than the defaults: analysed again for those values, once per
+    /// distinct binding (§14.5.2). Returns it and its entity's ports.
+    fn analyze_bound_arch(
+        &mut self,
+        inst: &Instance,
+        binding: Vec<(String, Value)>,
+    ) -> Option<(usize, Vec<ObjId>, Vec<ObjId>)> {
+        let key = format!(
+            "{}.{}({:?}){:?}",
+            inst.library, inst.entity, inst.arch, binding
+        );
+        if let Some(r) = self.bound_archs.get(&key) {
+            return Some(r.clone());
+        }
+        let ent = self.entity_with(&inst.library, &inst.entity, &binding)?;
+        let list = self
+            .arch_srcs
+            .get(&(inst.library.clone(), inst.entity.clone()))?
+            .clone();
+        let (_, src) = match &inst.arch {
+            Some(a) => list.iter().rev().find(|(n, _)| n == a)?.clone(),
+            None => list.last()?.clone(),
+        };
+        let du = self.unit_ast(&src)?.clone();
+        let LibraryUnit::Architecture(a) = &du.unit else {
+            return None;
+        };
+        let lib = inst.library.clone();
+        let arch = self.in_unit(&lib, src.file, |d| {
+            let ctx = d.context_region(&du.context);
+            let r = d.new_region(Some(ent.region));
+            d.regions[r].uses = d.regions[ctx].uses.clone();
+            for (n, s) in d.regions[ctx].syms.clone() {
+                for x in s {
+                    d.declare(r, &n, x);
+                }
+            }
+            d.architecture(r, &ent, a)
+        });
+        self.archs.push(arch);
+        let res = (self.archs.len() - 1, ent.generics.clone(), ent.ports.clone());
+        self.bound_archs.insert(key, res.clone());
+        Some(res)
     }
 
     /// Analyse the architecture of an entity: `arch` or the most recently
@@ -818,11 +882,11 @@ impl Design {
             Some(a) => list.iter().rev().find(|(n, _)| n == a)?.clone(),
             None => list.last()?.clone(),
         };
-        if let Some(i) = self
-            .archs
-            .iter()
-            .position(|a| a.library == lib && a.entity == entity && a.name == aname)
-        {
+        // The default analysis (not one for a generic binding).
+        let bound: Vec<usize> = self.bound_archs.values().map(|b| b.0).collect();
+        if let Some(i) = self.archs.iter().enumerate().position(|(i, a)| {
+            a.library == lib && a.entity == entity && a.name == aname && !bound.contains(&i)
+        }) {
             return Some(i);
         }
         let du = self.unit_ast(&src)?.clone();
@@ -901,8 +965,42 @@ pub fn analyze(
     let mut i = 0;
     while i < d.archs.len() {
         let insts = d.archs[i].instances.clone();
-        for inst in insts {
-            d.analyze_arch(&inst.library, &inst.entity, inst.arch.as_deref());
+        for (j, inst) in insts.iter().enumerate() {
+            // Generic values other than the defaults: a bound analysis.
+            let mut binding = Vec::new();
+            for (f, e) in &inst.generic_map {
+                let fo = &d.objects[*f];
+                match d.eval(e) {
+                    Some(v) => {
+                        if fo.static_val.as_ref() != Some(&v) {
+                            binding.push((fo.name.clone(), v));
+                        }
+                    }
+                    None => d.errors.push((e.loc.clone(), "a generic actual must be static here".into())),
+                }
+            }
+            if binding.is_empty() {
+                let a = d.analyze_arch(&inst.library, &inst.entity, inst.arch.as_deref());
+                d.archs[i].instances[j].arch_index = a;
+                continue;
+            }
+            let Some(default) = d.analyze_entity(&inst.library, &inst.entity) else {
+                continue;
+            };
+            if let Some((a, gens, ports)) = d.analyze_bound_arch(inst, binding) {
+                // The formals of the bound entity, by position.
+                let remap = |o: ObjId, from: &[ObjId], to: &[ObjId]| {
+                    from.iter().position(|x| *x == o).map(|p| to[p]).unwrap_or(o)
+                };
+                let ins = &mut d.archs[i].instances[j];
+                ins.arch_index = Some(a);
+                for (f, _) in ins.generic_map.iter_mut() {
+                    *f = remap(*f, &default.generics, &gens);
+                }
+                for (f, _) in ins.port_map.iter_mut() {
+                    *f = remap(*f, &default.ports, &ports);
+                }
+            }
         }
         i += 1;
     }

@@ -693,6 +693,7 @@ impl Design {
             library: lib,
             entity: ent,
             arch: archn,
+            arch_index: None,
             generic_map,
             port_map,
             loc,

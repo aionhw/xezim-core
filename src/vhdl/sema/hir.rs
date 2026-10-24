@@ -235,8 +235,12 @@ pub enum HExprKind {
     Qualified(Box<HExpr>),
     /// Predefined attribute of a type or object.
     Attr(String, Box<AttrPrefix>, Option<Box<HExpr>>),
+    /// `p.all` (explicit or implicit, §8.3).
     Deref(Box<HExpr>),
+    /// `new T'(v)`: the initial value.
     New(Option<Box<HExpr>>),
+    /// `new T`: an object of subtype T with its default value.
+    NewOf(TypeId),
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +363,9 @@ pub struct Instance {
     pub library: String,
     pub entity: String,
     pub arch: Option<String>,
+    /// The bound architecture (index into `Design::archs`), set once the
+    /// design is analysed.
+    pub arch_index: Option<usize>,
     pub generic_map: Vec<(ObjId, HExpr)>,
     /// Port (of the instantiated entity) → actual (`None` for `open`).
     pub port_map: Vec<(ObjId, Option<HExpr>)>,
