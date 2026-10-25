@@ -401,10 +401,7 @@ impl Converter {
                 K::InterfacePackageDeclaration => {
                     let pre = child(&c, K::InterfacePackageDeclarationPreamble);
                     let name = pre.as_ref().and_then(first_ident);
-                    let package = pre
-                        .as_ref()
-                        .and_then(|p| child(p, K::Name))
-                        .and_then(|p| self.name(&p));
+                    let package = child(&c, K::Name).and_then(|p| self.name(&p));
                     if let (Some(name), Some(package)) = (name, package) {
                         out.push(InterfaceDecl::Package {
                             name,

@@ -120,6 +120,9 @@ pub(super) struct Driver {
     pub cov: Cov,
     /// Assigned through elements or slices: per-element transactions.
     pub slots: bool,
+    /// Assigned through a port with a default value, and the instance:
+    /// the driver's initial value (§14.7.2).
+    pub init: Option<(ObjId, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +133,10 @@ pub(super) struct InstInfo {
     /// The enclosing instance of a block or generate iteration, whose
     /// objects it sees.
     pub parent: Option<usize>,
+    /// The instance containing this one, and its label there (the top:
+    /// its entity name), for external names (§8.7).
+    pub container: Option<usize>,
+    pub label: String,
 }
 
 /// A wait site: the conditions (SV, kernel scope) of the events it is
@@ -201,6 +208,8 @@ impl<'a> Lw<'a> {
             arch: top,
             generics: BTreeMap::new(),
             parent: None,
+            container: None,
+            label: self.d.archs[top].entity.clone(),
         });
         // Signals declared in packages.
         let pkg_sigs: Vec<ObjId> = self
@@ -280,6 +289,8 @@ impl<'a> Lw<'a> {
                 arch: child_arch,
                 generics,
                 parent: nested.then_some(inst),
+                container: Some(inst),
+                label: ins.label.to_ascii_lowercase(),
             });
             let mut mapped = BTreeSet::new();
             for (formal, actual) in &ins.port_map {
@@ -532,6 +543,10 @@ impl<'a> Lw<'a> {
     }
 
     pub(super) fn lookup_sig(&self, mut inst: usize, o: ObjId) -> Option<SigRef> {
+        if self.d.externals.contains_key(&o) {
+            let (i, x) = self.resolve_external(inst, o)?;
+            return self.lookup_sig(i, x);
+        }
         loop {
             if let Some(r) = self.sig_map.get(&(inst, o)) {
                 return Some(r.clone());
@@ -541,6 +556,43 @@ impl<'a> Lw<'a> {
                 None => return self.sig_map.get(&(GLOBAL, o)).cloned(),
             }
         }
+    }
+
+    /// The object an external name denotes (§8.7), seen from instance
+    /// `inst`: the instance declaring it and the object. An absolute
+    /// path starts at the top entity, a relative one at `inst`; `^` goes
+    /// up one level.
+    pub(super) fn resolve_external(&self, inst: usize, o: ObjId) -> Option<(usize, ObjId)> {
+        let path = self.d.externals.get(&o)?;
+        let (mut cur, rest) = match path.strip_prefix('.') {
+            Some(p) => {
+                let mut parts = p.split('.');
+                if parts.next()? != self.insts[0].label {
+                    return None;
+                }
+                (0, parts.collect::<Vec<_>>())
+            }
+            None => (inst, path.split('.').collect::<Vec<_>>()),
+        };
+        let (last, labels) = rest.split_last()?;
+        for l in labels {
+            cur = if *l == "^" {
+                self.insts[cur].container?
+            } else {
+                (0..self.insts.len())
+                    .find(|&c| self.insts[c].container == Some(cur) && self.insts[c].label == *l)?
+            };
+        }
+        let a = &self.d.archs[self.insts[cur].arch];
+        let x = a
+            .signals
+            .iter()
+            .chain(&a.ports)
+            .chain(&a.constants)
+            .chain(&a.generics)
+            .copied()
+            .find(|x| self.d.objects[*x].name == *last)?;
+        Some((cur, x))
     }
 
     /// The instance whose scope declares object `o` as seen from `inst`:
@@ -564,6 +616,13 @@ impl<'a> Lw<'a> {
     /// The SV expression reading a signal object (current or last value).
     pub(super) fn sig_read(&mut self, o: ObjId) -> String {
         let Some(r) = self.lookup_sig(self.inst, o) else {
+            if self.d.externals.contains_key(&o) {
+                let loc = self.d.objects[o].loc.clone();
+                self.err(
+                    &loc,
+                    format!("no signal at external path '{}'", self.d.objects[o].name),
+                );
+            }
             return format!("vh_s{}", o);
         };
         if self.sigs[r.sig].implicit.is_some() {
@@ -1172,6 +1231,15 @@ impl<'a> Lw<'a> {
                 (*s, Some((off.clone(), n.clone())))
             }
         };
+        // A driver of an out port starts with the port's default value
+        // (§6.5.2, §14.7.2).
+        if let HExprKind::Obj(o) = &target.kind
+            && matches!(self.d.objects[*o].kind, ObjKind::Port(_))
+            && self.d.objects[*o].init.is_some()
+            && let Some(dr) = self.drivers.get_mut(&(sig, p))
+        {
+            dr.init.get_or_insert((*o, self.inst));
+        }
         let (f, line, _) = self.file_line(&loc);
         let mut out = String::new();
         let transport = matches!(delay, Some(HDelay::Transport));
@@ -1242,6 +1310,36 @@ impl<'a> Lw<'a> {
         out
     }
 
+    /// `s <= force v` / `s <= release` (§10.5.2.1): a request applied in
+    /// the next simulation cycle (§14.7.3.1); a forced signal keeps the
+    /// forced value whatever its drivers do, a released one takes their
+    /// value again. A port shares its actual's signal, so the force modes
+    /// `in` and `out` act alike.
+    pub(super) fn force(&mut self, target: &HExpr, value: Option<&HExpr>, ind: usize) -> String {
+        let pad = " ".repeat(ind);
+        let Some(s) = self.whole_sig(target) else {
+            self.err(&target.loc, "forcing part of a signal is not supported yet");
+            return String::new();
+        };
+        self.forced.insert(s);
+        match value {
+            Some(v) => {
+                let x = self.store_value(target, v);
+                format!(
+                    "{pad}vh_s{s}_fnv = {x}; vh_s{s}_freq = 1; vh_s{s}_rreq = 0; vh_fpend = 1;\n",
+                    pad = pad,
+                    s = s,
+                    x = x
+                )
+            }
+            None => format!(
+                "{pad}vh_s{s}_rreq = 1; vh_s{s}_freq = 0; vh_fpend = 1;\n",
+                pad = pad,
+                s = s
+            ),
+        }
+    }
+
     fn add_driver(&mut self, s: usize, p: usize, cov: Cov, slots: bool) {
         match self.drivers.get_mut(&(s, p)) {
             Some(d) => {
@@ -1249,7 +1347,14 @@ impl<'a> Lw<'a> {
                 d.slots |= slots;
             }
             None => {
-                self.drivers.insert((s, p), Driver { cov, slots });
+                self.drivers.insert(
+                    (s, p),
+                    Driver {
+                        cov,
+                        slots,
+                        init: None,
+                    },
+                );
             }
         }
     }
@@ -1472,7 +1577,12 @@ impl<'a> Lw<'a> {
         self.lower_subprograms();
         // Drivers and signal updates (their resolution functions are
         // lowered with the subprograms).
+        self.temps.clear();
         let drv = self.drivers_sv(&mut elab);
+        // Temporaries of drivers' initial values (port defaults).
+        for (n, t) in std::mem::take(&mut self.temps) {
+            let _ = writeln!(elab_temps, "    {} {};", t, n);
+        }
         let (upd, upd_sigs) = self.updates_sv();
         self.lower_subprograms();
         for n in 0..self.imps.len() {
@@ -1490,6 +1600,18 @@ impl<'a> Lw<'a> {
                     format!("the process has no driver of signal '{}'", name),
                 );
             }
+        }
+        // Forced signals: the force state and pending requests.
+        for s in self.forced.clone() {
+            let sig = self.sigs[s].clone();
+            let loc = self.d.objects[sig.obj].loc.clone();
+            let t = self.repr(sig.ty, &loc).sv();
+            let _ = writeln!(
+                decls,
+                "  bit vh_s{s}_frc, vh_s{s}_freq, vh_s{s}_rreq; {t} vh_s{s}_fnv;",
+                s = s,
+                t = t
+            );
         }
         let k = self.kernel(&upd_sigs);
 
@@ -1530,7 +1652,7 @@ impl<'a> Lw<'a> {
         );
         let _ = writeln!(
             m,
-            "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop;",
+            "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop, vh_fpend;",
             n = np
         );
         m.push_str(&decls);
@@ -1796,7 +1918,25 @@ impl<'a> Lw<'a> {
                 );
                 let _ = name;
             }
-            let _ = writeln!(elab, "    vh_dv{s}_{p} = vh_s{s};", s = s, p = p);
+            match dr.init {
+                Some((o, inst)) => {
+                    let info = self.d.objects[o].clone();
+                    let target = HExpr {
+                        kind: HExprKind::Obj(o),
+                        ty: info.ty,
+                        loc: info.loc.clone(),
+                    };
+                    let saved = std::mem::replace(&mut self.inst, inst);
+                    let v = self.store_value_init(&target, info.init.as_ref().unwrap());
+                    self.inst = saved;
+                    let pre = self.flush_pre(4);
+                    elab.push_str(&pre);
+                    let _ = writeln!(elab, "    vh_dv{s}_{p} = {v};", s = s, p = p, v = v);
+                }
+                None => {
+                    let _ = writeln!(elab, "    vh_dv{s}_{p} = vh_s{s};", s = s, p = p);
+                }
+            }
         }
         drv
     }
@@ -2032,7 +2172,11 @@ impl<'a> Lw<'a> {
                 _ => {}
             }
         }
-        let _ = writeln!(k, "    return n;\n  endfunction");
+        // Force and release requests take effect in the next cycle.
+        let _ = writeln!(
+            k,
+            "    if (vh_fpend && (n < 0 || $time < n)) n = $time;\n    return n;\n  endfunction"
+        );
         let _ = writeln!(k, "  initial begin : vh_kernel");
         let _ = writeln!(k, "    longint vh_nxt;");
         let _ = writeln!(k, "    bit vh_any;");
@@ -2047,8 +2191,8 @@ impl<'a> Lw<'a> {
             }
             if upd_sigs.contains(&s) {
                 let _ = writeln!(k, "    vh_upd{}(1);", s);
-            } else if let [(p, _)] = self.sig_drivers(s).as_slice()
-                && *p >= PSEUDO
+            } else if let [(p, dr)] = self.sig_drivers(s).as_slice()
+                && (*p >= PSEUDO || dr.init.is_some())
             {
                 let _ = writeln!(
                     k,
@@ -2104,6 +2248,7 @@ impl<'a> Lw<'a> {
         for s in 0..self.sigs.len() {
             let _ = writeln!(k, "      vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
         }
+        let _ = writeln!(k, "      vh_fpend = 0;");
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
             if dr.slots {
                 let _ = writeln!(
@@ -2154,12 +2299,33 @@ impl<'a> Lw<'a> {
                 .map(|(n, l)| format!("      if ({}) vh_lnk{}(0);\n", link_cond(l), n))
                 .collect();
             let ds = self.sig_drivers(s);
+            // A forced signal keeps its forced value (§14.7.3.1).
+            let unforced = if self.forced.contains(&s) {
+                let sig = self.sigs[s].clone();
+                let loc = self.d.objects[sig.obj].loc.clone();
+                let r = self.repr(sig.ty, &loc);
+                let eq = self.eq_expr(&r, &format!("vh_s{}_fnv", s), &format!("vh_s{}", s));
+                let _ = writeln!(
+                    k,
+                    "      if (vh_s{s}_freq) begin vh_s{s}_freq = 0; vh_s{s}_frc = 1; vh_s{s}_act = 1; if (!{eq}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end end\n      if (vh_s{s}_rreq) begin vh_s{s}_rreq = 0; vh_s{s}_frc = 0; vh_s{s}_act = 1; end",
+                    s = s,
+                    eq = eq
+                );
+                format!(" && !vh_s{}_frc", s)
+            } else {
+                String::new()
+            };
             if ds.is_empty() {
                 k.push_str(&ins.concat());
                 continue;
             }
             if upd_sigs.contains(&s) {
-                let _ = writeln!(k, "      if (vh_s{s}_act) vh_upd{s}(0);", s = s);
+                let _ = writeln!(
+                    k,
+                    "      if (vh_s{s}_act{u}) vh_upd{s}(0);",
+                    s = s,
+                    u = unforced
+                );
                 k.push_str(&ins.concat());
                 continue;
             }
@@ -2176,10 +2342,11 @@ impl<'a> Lw<'a> {
             );
             let _ = writeln!(
                 k,
-                "      if (vh_s{s}_act && {ne}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end",
+                "      if (vh_s{s}_act{u} && {ne}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end",
                 s = s,
                 p = ds[0].0,
-                ne = ne
+                ne = ne,
+                u = unforced
             );
             k.push_str(&ins.concat());
         }

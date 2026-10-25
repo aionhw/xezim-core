@@ -163,10 +163,20 @@ impl Design {
                     })
                 });
             }
-            ast::SeqKind::Force { target, .. } | ast::SeqKind::Release { target, .. } => {
-                self.error(target.span(), "force and release are not supported yet");
-                return None;
+            ast::SeqKind::Force { target, rhs, .. } => {
+                let t = self.force_target(r, target)?;
+                return self.assign_rhs(r, rhs, s.span.clone(), |d, e| {
+                    let v = d.expr(r, e, Some(t.ty))?;
+                    Some(HStmtKind::Force {
+                        target: t.clone(),
+                        value: Some(v),
+                    })
+                });
             }
+            ast::SeqKind::Release { target, .. } => HStmtKind::Force {
+                target: self.force_target(r, target)?,
+                value: None,
+            },
             ast::SeqKind::ProcCall(n) => {
                 let (id, actuals) = self.procedure_call(r, n)?;
                 HStmtKind::Call(id, actuals)
@@ -189,25 +199,47 @@ impl Design {
                 alts,
             } => {
                 if *matching {
-                    self.error(s.span.clone(), "case? is not supported yet");
-                    return None;
-                }
-                let x = self.expr(r, expr, None)?;
-                let mut hs = Vec::new();
-                for (choices, body) in alts {
-                    let mut cs = Vec::new();
-                    for c in choices {
-                        cs.push(match c {
-                            ast::Choice::Others(_) => HChoice::Others,
-                            ast::Choice::Expr(e) => HChoice::Expr(self.expr(r, e, Some(x.ty))?),
-                            ast::Choice::Range(dr) => {
-                                HChoice::Range(self.discrete_range(r, dr, Some(x.ty))?.1)
-                            }
-                        });
+                    // §10.9: the first alternative with a choice matching
+                    // (`?=`) the expression.
+                    let mut branches = Vec::new();
+                    let mut else_b = None;
+                    for (choices, body) in alts {
+                        let body = self.seq_stmts(r, body, ctx);
+                        match self.matching_cond(r, expr, choices)? {
+                            Some(c) => branches.push((c, body)),
+                            None => else_b = Some(body),
+                        }
                     }
-                    hs.push((cs, self.seq_stmts(r, body, ctx)));
+                    if branches.is_empty() {
+                        // Only `others`.
+                        let t = super::decl::lit_expr(
+                            Value::Enum(1),
+                            self.std.boolean,
+                            self.loc(s.span.clone()),
+                        );
+                        branches.push((t, else_b.take().unwrap_or_default()));
+                    }
+                    HStmtKind::If(branches, else_b)
+                } else {
+                    let x = self.expr(r, expr, None)?;
+                    let mut hs = Vec::new();
+                    for (choices, body) in alts {
+                        let mut cs = Vec::new();
+                        for c in choices {
+                            cs.push(match c {
+                                ast::Choice::Others(_) => HChoice::Others,
+                                ast::Choice::Expr(e) => {
+                                    HChoice::Expr(self.expr(r, e, Some(x.ty))?)
+                                }
+                                ast::Choice::Range(dr) => {
+                                    HChoice::Range(self.discrete_range(r, dr, Some(x.ty))?.1)
+                                }
+                            });
+                        }
+                        hs.push((cs, self.seq_stmts(r, body, ctx)));
+                    }
+                    HStmtKind::Case { expr: x, alts: hs }
                 }
-                HStmtKind::Case { expr: x, alts: hs }
             }
             ast::SeqKind::Loop { scheme, body } => {
                 let lr = self.new_region(Some(r));
@@ -363,8 +395,23 @@ impl Design {
                 items,
             } => {
                 if *matching {
-                    self.error(span, "select? is not supported yet");
-                    return None;
+                    // §10.5.4: as a matching case statement.
+                    let mut branches = Vec::new();
+                    let mut else_b = None;
+                    for (v, choices) in items {
+                        let st = vec![HStmt {
+                            kind: one(self, v)?,
+                            loc: loc.clone(),
+                        }];
+                        match self.matching_cond(r, expr, choices)? {
+                            Some(c) => branches.push((c, st)),
+                            None => else_b = Some(st),
+                        }
+                    }
+                    return Some(HStmt {
+                        kind: HStmtKind::If(branches, else_b),
+                        loc,
+                    });
                 }
                 let x = self.expr(r, expr, None)?;
                 let mut alts = Vec::new();
@@ -391,6 +438,65 @@ impl Design {
             }
         };
         Some(HStmt { kind, loc })
+    }
+
+    /// The signal a force or release assignment names (§10.5.2.1).
+    fn force_target(&mut self, r: RegionId, target: &ast::Target) -> Option<HExpr> {
+        let ast::Target::Name(tn) = target else {
+            self.error(target.span(), "aggregate targets are not supported yet");
+            return None;
+        };
+        let t = self.name_expr(r, tn, None)?;
+        if !self.is_signal_expr(&t) {
+            self.error(
+                tn.span.clone(),
+                format!("'{}' is not a signal", name_text(tn)),
+            );
+            return None;
+        }
+        Some(t)
+    }
+
+    /// The condition selecting an alternative of a matching case (§10.9):
+    /// the expression matches (`?=`) one of the choices; `None` for
+    /// `others`.
+    fn matching_cond(
+        &mut self,
+        r: RegionId,
+        expr: &ast::Expr,
+        choices: &[ast::Choice],
+    ) -> Option<Option<HExpr>> {
+        let mut cond: Option<ast::Expr> = None;
+        for c in choices {
+            let e = match c {
+                ast::Choice::Others(_) => return Some(None),
+                ast::Choice::Expr(e) => e,
+                ast::Choice::Range(dr) => {
+                    self.error(
+                        dr.span(),
+                        "ranges in the choices of a matching case are not supported yet",
+                    );
+                    return None;
+                }
+            };
+            let m = ast::Expr {
+                kind: ast::ExprKind::Binary(
+                    ast::BinOp::MatchEq,
+                    Box::new(expr.clone()),
+                    Box::new(e.clone()),
+                ),
+                span: e.span.clone(),
+            };
+            cond = Some(match cond {
+                None => m,
+                Some(prev) => ast::Expr {
+                    span: prev.span.start..m.span.end,
+                    kind: ast::ExprKind::Binary(ast::BinOp::Or, Box::new(prev), Box::new(m)),
+                },
+            });
+        }
+        let c = cond?;
+        Some(Some(self.condition(r, &c)?))
     }
 
     /// The signals an expression reads (for the sensitivity of concurrent
@@ -998,9 +1104,57 @@ impl Design {
                 .collect(),
             port_map: port_map.into_iter().map(|(f, a, _)| (f, a)).collect(),
             port_conv,
+            generic_types: Vec::new(),
             config: None,
             loc,
         });
+    }
+
+    /// The actual types of an entity's generic types in a generic map,
+    /// and the associations of its other generics (§6.5.7.2).
+    fn type_actuals(
+        &mut self,
+        r: RegionId,
+        info: &super::EntityInfo,
+        gmap: &[ast::Assoc],
+    ) -> (Vec<(String, TypeId)>, Vec<ast::Assoc>) {
+        let mut types = Vec::new();
+        let mut rest = Vec::new();
+        if !info.generic_names.iter().any(|(_, t)| *t) {
+            return (types, gmap.to_vec());
+        }
+        for (i, a) in gmap.iter().enumerate() {
+            let formal = match &a.formal {
+                None => info.generic_names.get(i).cloned(),
+                Some(n) => match &n.kind {
+                    ast::NameKind::Simple(id) => info
+                        .generic_names
+                        .iter()
+                        .find(|(g, _)| *g == id.name)
+                        .cloned(),
+                    _ => None,
+                },
+            };
+            match (formal, &a.actual) {
+                (
+                    Some((g, true)),
+                    ast::Actual::Expr(ast::Expr {
+                        kind: ast::ExprKind::Name(nm),
+                        ..
+                    }),
+                ) => {
+                    if let Some(t) = self.type_mark(r, nm) {
+                        types.push((g, t));
+                    }
+                }
+                (Some((g, true)), _) => self.error(
+                    a.span.clone(),
+                    format!("the actual of generic type '{}' must be a subtype", g),
+                ),
+                _ => rest.push(a.clone()),
+            }
+        }
+        (types, rest)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1031,14 +1185,23 @@ impl Design {
                 None => return,
             },
         };
-        let Some(info) = self.analyze_entity(&lib, &ent) else {
+        let Some(mut info) = self.analyze_entity(&lib, &ent) else {
             self.error(
                 loc.span.clone(),
                 format!("no entity '{}' in library '{}'", ent, lib),
             );
             return;
         };
-        let generic_map = self.map_formals(r, &info.generics, generic_map, true, &loc);
+        // Generic types (§6.5.3): their actuals, and the entity's
+        // interface with them.
+        let (generic_types, generic_map) = self.type_actuals(r, &info, generic_map);
+        if !generic_types.is_empty() {
+            match self.entity_with(&lib, &ent, &[], &generic_types) {
+                Some(i) => info = i,
+                None => return,
+            }
+        }
+        let generic_map = self.map_formals(r, &info.generics, &generic_map, true, &loc);
         let (port_map, port_conv) = self.map_ports(r, &info.ports, port_map, arch, &loc);
         let generic_map: Vec<(ObjId, HExpr)> = generic_map
             .into_iter()
@@ -1053,6 +1216,7 @@ impl Design {
             generic_map,
             port_map: port_map.into_iter().map(|(f, a, _)| (f, a)).collect(),
             port_conv,
+            generic_types,
             config,
             loc,
         });
@@ -1393,7 +1557,10 @@ impl Design {
                         }
                     }
                 }
-                HStmtKind::VarAssign { value, .. } => self.signals_read(value, out),
+                HStmtKind::VarAssign { value, .. }
+                | HStmtKind::Force {
+                    value: Some(value), ..
+                } => self.signals_read(value, out),
                 HStmtKind::Call(_, a) => {
                     for x in a {
                         self.signals_read(x, out);

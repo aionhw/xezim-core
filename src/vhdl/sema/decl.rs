@@ -254,6 +254,12 @@ impl Design {
             }
             // User-defined attribute values: not used by the simulation.
             ast::Decl::AttributeSpec(_) => {}
+            ast::Decl::SubprogramDecl(spec) if !spec.generics.is_empty() => {
+                self.declare_generic_sub(r, spec, None)
+            }
+            ast::Decl::SubprogramBody(b) if !b.spec.generics.is_empty() => {
+                self.declare_generic_sub(r, &b.spec, Some(b))
+            }
             ast::Decl::SubprogramDecl(spec) => {
                 if let Some(id) = self.subprogram_spec(r, spec, path) {
                     subs.push(id);
@@ -266,10 +272,19 @@ impl Design {
                     subs.push(id);
                 }
             }
-            ast::Decl::SubprogramInst { span, .. } => self.error(
-                span.clone(),
-                "subprogram instantiation is not supported yet",
-            ),
+            ast::Decl::SubprogramInst {
+                name,
+                uninst,
+                generic_map,
+                span,
+                ..
+            } => {
+                if let Some(id) =
+                    self.instantiate_sub(r, name, uninst, generic_map, span.clone(), path)
+                {
+                    subs.push(id);
+                }
+            }
             ast::Decl::Use(names) => {
                 for n in names {
                     self.use_clause(r, n);
@@ -282,7 +297,20 @@ impl Design {
                 self.error(p.span.clone(), "nested packages are not supported yet")
             }
             ast::Decl::PackageInst(p) => {
-                self.error(p.span.clone(), "package instantiation is not supported yet")
+                // A package instance declared in this region (§4.9).
+                self.local_insts += 1;
+                let key = (
+                    self.cur_lib.clone(),
+                    format!("{}_inst{}", p.name.name, self.local_insts),
+                );
+                let actx = super::generics::ActualCtx {
+                    region: r,
+                    lib: self.cur_lib.clone(),
+                    file: self.cur_file,
+                };
+                if self.instantiate_package(&actx, p, key.clone()).is_some() {
+                    self.declare(r, &p.name.name, Sym::Package(key));
+                }
             }
             ast::Decl::Unsupported(what, span) => {
                 self.error(span.clone(), format!("{} are not supported yet", what))
@@ -904,9 +932,8 @@ impl Design {
             ast::Constraint::Paren(groups) => {
                 let (index, elem) = match &self.types[base].kind {
                     TypeKind::Array { index, elem } => (index.clone(), *elem),
-                    TypeKind::Record(_) => {
-                        self.error(span, "record constraints are not supported yet");
-                        return None;
+                    TypeKind::Record(fields) => {
+                        return self.record_constraint(r, &fields.clone(), groups, span);
                     }
                     _ => {
                         self.error(span, "an index constraint needs an array type");
@@ -946,6 +973,96 @@ impl Design {
                     ))
                 };
                 Some(HConstraint::Index(ranges, elem_t))
+            }
+        }
+    }
+
+    /// A record constraint (§5.3.3): element names with constraints of
+    /// their (unconstrained) subtypes, `rec(a(3 downto 0), s(1 to 3))`.
+    fn record_constraint(
+        &mut self,
+        r: RegionId,
+        fields: &[(String, TypeId)],
+        groups: &[Vec<ast::Assoc>],
+        span: ast::Span,
+    ) -> Option<HConstraint> {
+        let [group] = groups else {
+            self.error(
+                span,
+                "a record constraint is one list of element constraints",
+            );
+            return None;
+        };
+        let mut out = Vec::new();
+        for a in group {
+            let ast::Actual::Expr(ast::Expr {
+                kind: ast::ExprKind::Name(n),
+                ..
+            }) = &a.actual
+            else {
+                self.error(a.span.clone(), "an element constraint was expected");
+                return None;
+            };
+            // `e(c)` or `e(c)(c2)`: the element name and its constraints.
+            let mut lists = Vec::new();
+            let mut cur = n;
+            while let ast::NameKind::Call(p, args) = &cur.kind {
+                lists.push(args.clone());
+                cur = p;
+            }
+            lists.reverse();
+            let ast::NameKind::Simple(id) = &cur.kind else {
+                self.error(a.span.clone(), "an element constraint was expected");
+                return None;
+            };
+            let Some(k) = fields.iter().position(|(f, _)| *f == id.name) else {
+                self.error(id.span.clone(), format!("no record element '{}'", id.name));
+                return None;
+            };
+            let ft = fields[k].1;
+            let c = self.constraint(r, ft, &ast::Constraint::Paren(lists), a.span.clone())?;
+            let st = self.add_type(
+                "",
+                TypeKind::Subtype {
+                    base: ft,
+                    constraint: Some(c),
+                    resolution: None,
+                },
+                None,
+                None,
+            );
+            out.push((k, st));
+        }
+        Some(HConstraint::Record(out))
+    }
+
+    /// The elements of a record (sub)type with their subtypes: those of
+    /// record constraints in place of the declared ones (§5.3.3).
+    pub fn record_fields(&self, t: TypeId) -> Vec<(String, TypeId)> {
+        let mut cur = t;
+        let mut cons: Vec<(usize, TypeId)> = Vec::new();
+        loop {
+            match &self.types[cur].kind {
+                TypeKind::Subtype {
+                    base, constraint, ..
+                } => {
+                    if let Some(HConstraint::Record(c)) = constraint {
+                        for (k, st) in c {
+                            if !cons.iter().any(|(j, _)| j == k) {
+                                cons.push((*k, *st));
+                            }
+                        }
+                    }
+                    cur = *base;
+                }
+                TypeKind::Record(fields) => {
+                    let mut f = fields.clone();
+                    for (k, st) in cons {
+                        f[k].1 = st;
+                    }
+                    return f;
+                }
+                _ => return Vec::new(),
             }
         }
     }
@@ -1124,7 +1241,18 @@ impl Design {
                     }
                 }
                 ast::InterfaceDecl::Type(i) => {
-                    self.error(i.span.clone(), "generic types are not supported yet");
+                    // A generic type (§6.5.3): the instance's actual type, or
+                    // an incomplete type while there is none.
+                    let t = match self.type_binding.iter().find(|(n, _)| *n == i.name) {
+                        Some((_, t)) => *t,
+                        None => self.add_type(
+                            &i.name,
+                            TypeKind::Incomplete,
+                            None,
+                            Some(self.loc(i.span.clone())),
+                        ),
+                    };
+                    self.declare(r, &i.name, Sym::Type(t));
                 }
                 ast::InterfaceDecl::Subprogram { spec, .. } => {
                     self.error(
@@ -1213,7 +1341,7 @@ impl Design {
 
     /// Whether two subprograms have the same parameter and result type
     /// profile (§4.5.1).
-    fn same_profile(&self, a: SubId, b: SubId) -> bool {
+    pub(super) fn same_profile(&self, a: SubId, b: SubId) -> bool {
         let (sa, sb) = (&self.subprograms[a], &self.subprograms[b]);
         sa.is_function == sb.is_function
             && sa.params.len() == sb.params.len()
@@ -1225,7 +1353,7 @@ impl Design {
                 .all(|(x, y)| self.base(self.objects[*x].ty) == self.base(self.objects[*y].ty))
     }
 
-    fn subprogram_body(
+    pub(super) fn subprogram_body(
         &mut self,
         r: RegionId,
         b: &ast::SubprogramBody,

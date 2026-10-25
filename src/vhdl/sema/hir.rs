@@ -298,6 +298,11 @@ pub enum HStmtKind {
         target: HExpr,
         value: HExpr,
     },
+    /// `target <= force value` / `target <= release` (`None`, §10.5.2.1).
+    Force {
+        target: HExpr,
+        value: Option<HExpr>,
+    },
     Call(SubId, Vec<HExpr>),
     If(Vec<(HExpr, Vec<HStmt>)>, Option<Vec<HStmt>>),
     Case {
@@ -370,6 +375,8 @@ pub struct Instance {
     /// design is analysed.
     pub arch_index: Option<usize>,
     pub generic_map: Vec<(ObjId, HExpr)>,
+    /// Generic types (§6.5.3) → the actual types.
+    pub generic_types: Vec<(String, TypeId)>,
     /// Port (of the instantiated entity) → actual (`None` for `open`).
     pub port_map: Vec<(ObjId, Option<HExpr>)>,
     /// Port associations with a conversion or a partial formal (their

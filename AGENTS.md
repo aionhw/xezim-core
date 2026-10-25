@@ -57,8 +57,10 @@ src/bits2.rs              2-state arbitrary-width value (Verilator-style, no X/Z
 src/sdf/                  SDF parser + annotator (IEEE 1497-2001): IOPATH/INTERCONNECT delays
 src/vhdl/                 VHDL (IEEE 1076-2008), in development: cst/ parses through the
                           `vhdl_syntax` crate (the only user of it); sema/ analyses to a typed
-                          HIR (config.rs: component binding and configurations; blocks and
-                          generate iterations become nested architectures); lower/
+                          HIR (config.rs: component binding and configurations; generics.rs:
+                          generic packages/subprograms instantiated by re-analysis with
+                          bound generics; blocks and generate iterations become nested
+                          architectures); lower/
                           elaborates the hierarchy and emits SV with a generated VHDL
                           kernel (elab.rs: signals, drivers and null transactions,
                           resolution, port conversion links, implicit signals, procedures

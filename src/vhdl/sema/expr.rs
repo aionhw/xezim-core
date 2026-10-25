@@ -808,7 +808,13 @@ impl Design {
                             );
                             return None;
                         };
-                        let ft = fields[idx].1;
+                        // The element subtype of a record constraint, if any
+                        // (§5.3.3).
+                        let ft = self
+                            .record_fields(p.ty)
+                            .get(idx)
+                            .map(|f| f.1)
+                            .unwrap_or(fields[idx].1);
                         let loc = self.loc(n.span.clone());
                         Some(Denot::Expr(HExpr {
                             kind: HExprKind::Field(Box::new(p), idx),
@@ -933,9 +939,42 @@ impl Design {
             NameKind::Attribute(prefix, attr, param) => {
                 self.attribute(r, prefix, attr, param.as_deref(), expect, loc)
             }
-            NameKind::External { .. } => {
-                self.error(n.span.clone(), "external names are not supported yet");
-                None
+            NameKind::External { class, path, ty } => {
+                // §8.7: resolved against the design hierarchy when it is
+                // elaborated; here an object of the given class and subtype.
+                let t = self.subtype_ind(r, ty)?;
+                let kind = match class {
+                    ast::ObjClass::Signal => ObjKind::Signal,
+                    ast::ObjClass::Constant => ObjKind::Constant,
+                    _ => {
+                        self.error(
+                            n.span.clone(),
+                            "external variable names are not supported yet",
+                        );
+                        return None;
+                    }
+                };
+                if path.starts_with('@') {
+                    self.error(
+                        n.span.clone(),
+                        "package paths in external names are not supported yet",
+                    );
+                    return None;
+                }
+                let o = self.add_obj(ObjInfo {
+                    name: path.clone(),
+                    kind,
+                    ty: t,
+                    init: None,
+                    loc: loc.clone(),
+                    static_val: None,
+                });
+                self.externals.insert(o, path.clone());
+                Some(HExpr {
+                    kind: HExprKind::Obj(o),
+                    ty: t,
+                    loc,
+                })
             }
         }
     }
@@ -1719,6 +1758,26 @@ impl Design {
                 }
             };
         }
+        // A package prefix of 'simple_name/'path_name/'instance_name
+        // (§16.2.5).
+        if matches!(name, "simple_name" | "path_name" | "instance_name")
+            && let Some(Denot::Syms(syms)) = self.denote(r, prefix)
+            && let Some(Sym::Package((lib, pkg))) = syms.first().cloned()
+        {
+            let pname = self.inst_name_of(&(lib.clone(), pkg.clone()));
+            let text = match name {
+                "simple_name" => pname,
+                _ => format!(":{}:{}:", lib, pname),
+            };
+            let elems: Vec<Value> = text.bytes().map(|b| Value::Enum(b as u32)).collect();
+            let v = Value::Array(Box::new(ArrayValue {
+                left: 1,
+                dir: ast::Dir::To,
+                right: elems.len() as i64,
+                elems,
+            }));
+            return Some(lit_expr(v, string, loc));
+        }
         // Object (or expression) prefix; an access value's array attributes
         // are those of the designated array (§8.3).
         let px = self.name_expr(r, prefix, None)?;
@@ -1842,6 +1901,11 @@ impl Design {
                 _ => None,
             },
             HExprKind::Qualified(x) => self.eval(x),
+            HExprKind::RecordAgg(vals) => Some(Value::Record(
+                vals.iter()
+                    .map(|v| self.eval(v))
+                    .collect::<Option<Vec<_>>>()?,
+            )),
             HExprKind::Convert(x) => {
                 let v = self.eval(x)?;
                 let t = self.base(h.ty);

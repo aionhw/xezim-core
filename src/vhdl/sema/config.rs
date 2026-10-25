@@ -490,6 +490,7 @@ impl Design {
             generic_map: gmap,
             port_map: pmap,
             port_conv,
+            generic_types: Vec::new(),
             config: cfg,
             loc,
         });

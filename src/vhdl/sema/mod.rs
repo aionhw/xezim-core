@@ -9,6 +9,7 @@
 mod config;
 mod decl;
 mod expr;
+mod generics;
 pub mod hir;
 mod predefined;
 mod stmt;
@@ -38,6 +39,9 @@ pub enum Sym {
     /// An alias of an object name (index into `Design::aliases`).
     Alias(usize),
     Attribute(TypeId),
+    /// An uninstantiated generic subprogram (index into
+    /// `Design::generic_subs`).
+    GenericSub(usize),
 }
 
 impl Sym {
@@ -138,6 +142,19 @@ pub struct Design {
     /// The implicit GUARD signal of a guarded block → its guard
     /// expression (§11.2).
     pub guards: BTreeMap<ObjId, HExpr>,
+    /// Package instances → the generic package they instantiate.
+    inst_of: HashMap<PkgKey, PkgKey>,
+    /// Generic packages (analysed only through their instances).
+    generic_pkgs: std::collections::HashSet<PkgKey>,
+    /// Counter naming package instances declared in other units.
+    local_insts: usize,
+    /// The actual types of generic types while an entity is analysed for
+    /// an instance (`decl::interface_list`).
+    type_binding: Vec<(String, TypeId)>,
+    /// Generic subprograms (§4.2.1): analysed in each instantiation.
+    generic_subs: Vec<generics::GenericSub>,
+    /// External names (§8.7): the object standing for each, and its path.
+    pub externals: BTreeMap<ObjId, String>,
     /// The names alias declarations stand for.
     pub aliases: Vec<HExpr>,
     /// Labels of loops (by `Sym::Label` id) — names only, for diagnostics.
@@ -175,6 +192,8 @@ pub struct EntityInfo {
     pub library: String,
     pub name: String,
     pub generics: Vec<ObjId>,
+    /// The generic names in order, and whether each is a generic type.
+    pub generic_names: Vec<(String, bool)>,
     pub ports: Vec<ObjId>,
     pub region: RegionId,
     pub loc: Loc,
@@ -214,6 +233,12 @@ impl Design {
             sig_kinds: BTreeMap::new(),
             disconnect: BTreeMap::new(),
             guarded_marks: HashMap::new(),
+            inst_of: HashMap::new(),
+            generic_pkgs: Default::default(),
+            local_insts: 0,
+            type_binding: Vec::new(),
+            externals: BTreeMap::new(),
+            generic_subs: Vec::new(),
             guards: BTreeMap::new(),
             cur_cfg: None,
             aliases: Vec::new(),
@@ -677,7 +702,13 @@ impl Design {
                 d.package_decl(lib, p, ctx);
             }
             LibraryUnit::PackageInst(p) => {
-                d.error(p.span.clone(), "package instantiation is not supported yet");
+                let ctx = d.context_region(&du.context);
+                let actx = generics::ActualCtx {
+                    region: ctx,
+                    lib: lib.to_string(),
+                    file: src.file,
+                };
+                d.instantiate_package(&actx, p, (lib.to_string(), name.to_string()));
             }
             _ => {}
         });
@@ -692,7 +723,17 @@ impl Design {
         }
         self.state.insert(key.clone(), State::Analyzing);
         let pkg = (lib.to_string(), name.to_string());
-        let Some(src) = self.bodies.get(&pkg).cloned() else {
+        if self.generic_pkgs.contains(&pkg) {
+            self.state.insert(key, State::Done);
+            return;
+        }
+        // An instance takes the body of its generic package (§4.9).
+        let of = self
+            .inst_of
+            .get(&pkg)
+            .cloned()
+            .unwrap_or_else(|| pkg.clone());
+        let Some(src) = self.bodies.get(&of).cloned() else {
             self.state.insert(key, State::Done);
             return;
         };
@@ -702,7 +743,7 @@ impl Design {
         let Some(pkg_region) = self.package_region(&pkg) else {
             return;
         };
-        self.in_unit(lib, src.file, |d| {
+        self.in_unit(&of.0, src.file, |d| {
             if let LibraryUnit::PackageBody(b) = &du.unit {
                 let ctx = d.context_region(&du.context);
                 let r = d.new_region(Some(pkg_region));
@@ -731,14 +772,14 @@ impl Design {
     }
 
     fn package_decl(&mut self, lib: &str, p: &ast::PackageDecl, ctx: RegionId) {
-        if !p.generics.is_empty() {
-            self.error(
-                p.name.span.clone(),
-                "generic packages are not supported yet",
-            );
-        }
         let r = self.new_region(Some(ctx));
         let key = (lib.to_string(), p.name.name.clone());
+        if !p.generics.is_empty() {
+            // Analysed in each instance (`generics::instantiate_package`).
+            self.pkg_regions.insert(key.clone(), r);
+            self.generic_pkgs.insert(key);
+            return;
+        }
         self.pkg_regions.insert(key.clone(), r);
         let mut objs = Vec::new();
         let mut subs = Vec::new();
@@ -805,7 +846,7 @@ impl Design {
         if let Some(e) = self.entities.get(&k) {
             return Some(e.clone());
         }
-        let info = self.entity_with(lib, name, &[])?;
+        let info = self.entity_with(lib, name, &[], &[])?;
         self.entities.insert(k, info.clone());
         Some(info)
     }
@@ -817,6 +858,7 @@ impl Design {
         lib: &str,
         name: &str,
         binding: &[(String, Value)],
+        types: &[(String, TypeId)],
     ) -> Option<EntityInfo> {
         self.ensure_library(lib);
         let src = self.units.get(lib)?.get(name)?.clone();
@@ -828,7 +870,24 @@ impl Design {
             let ctx = d.context_region(&du.context);
             let r = d.new_region(Some(ctx));
             let path = format!("{}.{}", lib, name);
+            let saved = std::mem::replace(&mut d.type_binding, types.to_vec());
             let generics = d.interface_list(r, &e.generics, decl::IfaceKind::Generic, &path);
+            d.type_binding = saved;
+            let mut generic_names = Vec::new();
+            for g in &e.generics {
+                match g {
+                    ast::InterfaceDecl::Object(o) => {
+                        generic_names.extend(o.names.iter().map(|n| (n.name.clone(), false)))
+                    }
+                    ast::InterfaceDecl::Type(i) => generic_names.push((i.name.clone(), true)),
+                    ast::InterfaceDecl::Subprogram { spec, .. } => {
+                        generic_names.push((Design::designator_key(&spec.designator), false))
+                    }
+                    ast::InterfaceDecl::Package { name, .. } => {
+                        generic_names.push((name.name.clone(), false))
+                    }
+                }
+            }
             for g in &generics {
                 let gname = d.objects[*g].name.clone();
                 if let Some((_, v)) = binding.iter().find(|(n, _)| *n == gname) {
@@ -845,6 +904,7 @@ impl Design {
                 library: lib.to_string(),
                 name: name.to_string(),
                 generics,
+                generic_names,
                 ports,
                 region: r,
                 loc: d.loc(e.name.span.clone()),
@@ -863,13 +923,13 @@ impl Design {
         binding: Vec<(String, Value)>,
     ) -> Option<(usize, Vec<ObjId>, Vec<ObjId>)> {
         let key = format!(
-            "{}.{}({:?}){:?}{:?}",
-            inst.library, inst.entity, inst.arch, binding, inst.config
+            "{}.{}({:?}){:?}{:?}{:?}",
+            inst.library, inst.entity, inst.arch, binding, inst.config, inst.generic_types
         );
         if let Some(r) = self.bound_archs.get(&key) {
             return Some(r.clone());
         }
-        let ent = self.entity_with(&inst.library, &inst.entity, &binding)?;
+        let ent = self.entity_with(&inst.library, &inst.entity, &binding, &inst.generic_types)?;
         let list = self
             .arch_srcs
             .get(&(inst.library.clone(), inst.entity.clone()))?
@@ -1021,6 +1081,7 @@ pub fn analyze(
                     generic_map: Vec::new(),
                     port_map: Vec::new(),
                     port_conv: Vec::new(),
+                    generic_types: Vec::new(),
                     config,
                     loc: Loc {
                         file: 0,
@@ -1064,33 +1125,30 @@ pub fn analyze(
                         .push((e.loc.clone(), "a generic actual must be static here".into())),
                 }
             }
-            if binding.is_empty() && inst.config.is_none() {
+            if binding.is_empty() && inst.config.is_none() && inst.generic_types.is_empty() {
                 let a = d.analyze_arch(&inst.library, &inst.entity, inst.arch.as_deref());
                 d.archs[i].instances[j].arch_index = a;
                 continue;
             }
-            let Some(default) = d.analyze_entity(&inst.library, &inst.entity) else {
-                continue;
-            };
             if let Some((a, gens, ports)) = d.analyze_bound_arch(inst, binding) {
-                // The formals of the bound entity, by position.
-                let remap = |o: ObjId, from: &[ObjId], to: &[ObjId]| {
-                    from.iter()
-                        .position(|x| *x == o)
-                        .map(|p| to[p])
+                // The formals of the bound entity, by name.
+                let objs = &d.objects;
+                let remap = |o: ObjId, to: &[ObjId]| {
+                    to.iter()
+                        .copied()
+                        .find(|x| objs[*x].name == objs[o].name)
                         .unwrap_or(o)
                 };
-                let ins = &mut d.archs[i].instances[j];
+                let mut ins = d.archs[i].instances[j].clone();
                 ins.arch_index = Some(a);
                 for (f, _) in ins.generic_map.iter_mut() {
-                    *f = remap(*f, &default.generics, &gens);
+                    *f = remap(*f, &gens);
                 }
                 for (f, _) in ins.port_map.iter_mut() {
-                    *f = remap(*f, &default.ports, &ports);
+                    *f = remap(*f, &ports);
                 }
-                let objs = &d.objects;
                 for pc in ins.port_conv.iter_mut() {
-                    let to = remap(pc.formal, &default.ports, &ports);
+                    let to = remap(pc.formal, &ports);
                     let side = if pc.mode == ast::Mode::In {
                         &mut pc.target
                     } else {
@@ -1105,15 +1163,29 @@ pub fn analyze(
                     });
                     pc.formal = to;
                 }
+                d.archs[i].instances[j] = ins;
             }
         }
         i += 1;
     }
     // Package bodies of every package used, then the library subprogram
     // bodies the design reaches.
-    let pkgs: Vec<PkgKey> = d.packages.keys().cloned().collect();
-    for (lib, name) in pkgs {
-        d.analyze_package_body(&lib, &name);
+    // A body's context may use further packages.
+    let mut done: std::collections::BTreeSet<PkgKey> = Default::default();
+    loop {
+        let pkgs: Vec<PkgKey> = d
+            .packages
+            .keys()
+            .filter(|k| !done.contains(*k))
+            .cloned()
+            .collect();
+        if pkgs.is_empty() {
+            break;
+        }
+        for (lib, name) in pkgs {
+            d.analyze_package_body(&lib, &name);
+            done.insert((lib, name));
+        }
     }
     d.analyze_reachable_bodies();
     if !d.errors.is_empty() {
@@ -1345,6 +1417,12 @@ pub fn calls_in_stmts(stmts: &[HStmt], out: &mut Vec<SubId>) {
             HStmtKind::VarAssign { target, value } => {
                 calls_in_expr(target, out);
                 calls_in_expr(value, out);
+            }
+            HStmtKind::Force { target, value } => {
+                calls_in_expr(target, out);
+                if let Some(v) = value {
+                    calls_in_expr(v, out);
+                }
             }
             HStmtKind::Call(f, a) => {
                 out.push(*f);

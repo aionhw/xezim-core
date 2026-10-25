@@ -130,6 +130,8 @@ struct Lw<'a> {
     drv_checks: Vec<(usize, usize, Loc)>,
     /// Lowering `'driving_value`: this signal reads this process's driver.
     read_drv: Option<(usize, usize)>,
+    /// Signals forced or released (`elab::force`).
+    forced: BTreeSet<usize>,
     /// Procedures lowered per calling process and signal actuals.
     specs: Vec<elab::Spec>,
     spec_keys: HashMap<String, usize>,
@@ -184,6 +186,7 @@ pub fn lower(an: &Analysed) -> Result<Lowered, Vec<String>> {
         need_lact: BTreeSet::new(),
         drv_checks: Vec::new(),
         read_drv: None,
+        forced: BTreeSet::new(),
         specs: Vec::new(),
         spec_keys: HashMap::new(),
         spec_todo: Vec::new(),
@@ -594,9 +597,10 @@ impl<'a> Lw<'a> {
                 format!("{}()", f)
             }
             Repr::Rec(_) => {
-                let TypeKind::Record(fields) = self.d.types[self.base(t)].kind.clone() else {
+                let fields = self.d.record_fields(t);
+                if fields.is_empty() {
                     return "'{default:0}".into();
-                };
+                }
                 let parts: Vec<String> = fields
                     .iter()
                     .map(|(_, ft)| self.default_value(*ft, loc))
@@ -633,6 +637,21 @@ impl<'a> Lw<'a> {
     // ---- names -----------------------------------------------------------------------
 
     fn obj_name(&mut self, o: ObjId) -> String {
+        // An external name (§8.7): the object it denotes.
+        if self.d.externals.contains_key(&o) && self.d.objects[o].kind == ObjKind::Constant {
+            let Some((i, x)) = self.resolve_external(self.inst, o) else {
+                let loc = self.d.objects[o].loc.clone();
+                self.err(
+                    &loc,
+                    format!("no object at external path '{}'", self.d.objects[o].name),
+                );
+                return "0".into();
+            };
+            let saved = std::mem::replace(&mut self.inst, i);
+            let n = self.obj_name(x);
+            self.inst = saved;
+            return n;
+        }
         let info = &self.d.objects[o];
         match info.kind {
             ObjKind::Signal | ObjKind::Port(_) => self.sig_read(o),
@@ -746,8 +765,19 @@ impl<'a> Lw<'a> {
             HExprKind::Field(b, i) => format!("{}.f{}", self.ex(b), i),
             HExprKind::ArrayAgg(items) => self.array_agg(items, h),
             HExprKind::RecordAgg(vals) => {
+                // Built field by field into a temporary (a pattern of
+                // struct-valued members is not copied reliably by the
+                // simulator).
                 let parts: Vec<String> = vals.iter().map(|v| self.ex(v)).collect();
-                format!("'{{{}}}", parts.join(", "))
+                let t = self.repr(h.ty, &h.loc).sv();
+                self.tmp += 1;
+                let agg = format!("vh_rag{}", self.tmp);
+                let mut body = String::new();
+                for (i, p) in parts.iter().enumerate() {
+                    let _ = writeln!(body, "{}.f{} = {};", agg, i, p);
+                }
+                self.pre_stmts.push((agg.clone(), t, body));
+                agg
             }
             HExprKind::Attr(name, prefix, param) => self.attr(name, prefix, param.as_deref(), h),
             HExprKind::Deref(p) => {
@@ -1585,8 +1615,52 @@ impl<'a> Lw<'a> {
                 format!("{}_conv({}, {}, {}, {})", name, tv, x, sv_string(&f), l)
             }
             Repr::I32 | Repr::I64 if self.d.is_integer(t) => self.checked_int(x, t, &v.loc),
+            Repr::Rec(_) => self.rec_conv(t, x, &v.loc),
             _ => x,
         }
+    }
+
+    /// A record value converted to record subtype `t` (§14.7.3.1): each
+    /// array element takes the bounds of its constrained element subtype.
+    fn rec_conv(&mut self, t: TypeId, x: String, loc: &Loc) -> String {
+        let fields = self.d.record_fields(t);
+        let mut body = String::new();
+        let mut name = String::new();
+        let (f, l, _) = self.file_line(loc);
+        for (k, (_, ft)) in fields.iter().enumerate() {
+            let Repr::Arr(an, _) = self.repr(*ft, loc) else {
+                continue;
+            };
+            if self.ndims(*ft) != 1 {
+                continue;
+            }
+            let Some((bl, br, bdn)) = self.dim_bounds(*ft, 0) else {
+                continue;
+            };
+            if name.is_empty() {
+                self.tmp += 1;
+                name = format!("vh_rcv{}", self.tmp);
+                let _ = writeln!(body, "{} = {};", name, x);
+            }
+            let _ = writeln!(
+                body,
+                "{n}.f{k} = {an}_rb({n}.f{k}, {bl}, {br}, {bdn}, {f}, {l});",
+                n = name,
+                k = k,
+                an = an,
+                bl = bl,
+                br = br,
+                bdn = bdn,
+                f = sv_string(&f),
+                l = l
+            );
+        }
+        if name.is_empty() {
+            return x;
+        }
+        let ts = self.repr(t, loc).sv();
+        self.pre_stmts.push((name.clone(), ts, body));
+        name
     }
 
     fn stmt(&mut self, s: &HStmt, ind: usize) -> String {
@@ -1597,6 +1671,7 @@ impl<'a> Lw<'a> {
                 let v = self.store_value(target, value);
                 self.assign_to(target, v, ind)
             }
+            HStmtKind::Force { target, value } => self.force(target, value.as_ref(), ind),
             HStmtKind::Assert {
                 cond,
                 report,
@@ -2064,6 +2139,9 @@ impl<'a> Lw<'a> {
         let x = self.ex(v);
         if self.d.is_integer(target.ty) {
             return self.checked_int(x, target.ty, &v.loc);
+        }
+        if let Repr::Rec(_) = self.repr(target.ty, &target.loc) {
+            return self.rec_conv(target.ty, x, &v.loc);
         }
         x
     }
