@@ -12,6 +12,7 @@
 //! delta cycles therefore never depend on the SV scheduler's ordering.
 
 mod elab;
+mod files;
 mod runtime;
 mod textio;
 
@@ -20,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use elab::{Driver, GLOBAL, InstInfo, Sig, SigRef, Site};
 use std::fmt::Write as _;
 
-use super::ast::{Dir, ObjClass};
+use super::ast::{Dir, Mode, ObjClass};
 use super::sema::hir::*;
 use super::sema::{Analysed, Design};
 
@@ -81,6 +82,14 @@ struct Lw<'a> {
     heap_defs: String,
     /// TEXTIO support code, when used.
     textio: bool,
+    /// The design has file objects (support code in files.rs).
+    files: bool,
+    /// Protected types whose objects are made (`prot_new`), and their
+    /// variables and constructors.
+    prots: BTreeSet<TypeId>,
+    prot_defs: String,
+    /// In a method of a protected type: the SV name of its object.
+    cur_self: Option<String>,
     /// Array types of BIT/BOOLEAN elements (logical operators).
     logic_arrs: BTreeSet<String>,
     rec_types: BTreeMap<TypeId, String>,
@@ -159,6 +168,10 @@ pub fn lower(an: &Analysed) -> Result<Lowered, Vec<String>> {
         heaps: BTreeSet::new(),
         heap_defs: String::new(),
         textio: false,
+        files: false,
+        prots: BTreeSet::new(),
+        prot_defs: String::new(),
+        cur_self: None,
         logic_arrs: BTreeSet::new(),
         rec_types: BTreeMap::new(),
         lits: HashMap::new(),
@@ -292,6 +305,10 @@ impl<'a> Lw<'a> {
             // An access value: a handle into the designated type's heap (0:
             // null, §5.4).
             TypeKind::Access(_) => Repr::I64,
+            // A file object: its handle (files.rs).
+            TypeKind::File(_) => Repr::I32,
+            // An object of a protected type: a handle (see `prot_new`).
+            TypeKind::Protected => Repr::I64,
             TypeKind::Record(fields) => {
                 if let Some(n) = self.rec_types.get(&b) {
                     return Repr::Rec(n.clone());
@@ -568,6 +585,9 @@ impl<'a> Lw<'a> {
     /// The default (initial) value of type `t` (§14.4.2.5: T'LEFT, element
     /// by element).
     fn default_value(&mut self, t: TypeId, loc: &Loc) -> String {
+        if matches!(self.d.types[self.base(t)].kind, TypeKind::Protected) {
+            return self.prot_new(self.base(t), loc);
+        }
         let r = self.repr(t, loc);
         match &r {
             Repr::Arr(name, _) => {
@@ -651,6 +671,11 @@ impl<'a> Lw<'a> {
             let n = self.obj_name(x);
             self.inst = saved;
             return n;
+        }
+        // A variable of a protected type's body: the current object's.
+        if self.d.prot_vars.contains_key(&o) {
+            let me = self.cur_self.clone().unwrap_or_else(|| "0".into());
+            return format!("vh_pv{}[{}]", o, me);
         }
         let info = &self.d.objects[o];
         match info.kind {
@@ -914,6 +939,10 @@ impl<'a> Lw<'a> {
                 }
             }
             Some(Builtin::ToString) => self.image(&args[0], args[0].ty, false),
+            Some(Builtin::BitString(w)) => {
+                let x = self.ex(&args[0]);
+                format!("vh_bvstr({}, {})", x, w)
+            }
             Some(Builtin::RisingEdge) | Some(Builtin::FallingEdge) => {
                 let a = &args[0];
                 let one = matches!(info.builtin, Some(Builtin::RisingEdge));
@@ -925,6 +954,7 @@ impl<'a> Lw<'a> {
                 format!("({} && {} == {})", ev, v, one as u8)
             }
             Some(Builtin::Now) => "longint'($time)".into(),
+            Some(Builtin::EndFile) => self.endfile(&args[0]),
             Some(Builtin::Native(n)) if n == "textio.justify" => {
                 self.textio = true;
                 let a: Vec<String> = args.iter().map(|x| self.ex(x)).collect();
@@ -1152,7 +1182,9 @@ impl<'a> Lw<'a> {
     }
 
     /// `t'image(x)` (or TO_STRING): a STRING value (§16.2.2).
-    fn image(&mut self, x: &HExpr, t: TypeId, _quote_unused: bool) -> String {
+    /// The text of a scalar value: as 'IMAGE (`quote`), or as TO_STRING,
+    /// which gives a character literal without its quotes (§5.7).
+    fn image(&mut self, x: &HExpr, t: TypeId, quote: bool) -> String {
         let v = self.ex(x);
         let b = self.base(t);
         match self.d.types[b].kind.clone() {
@@ -1164,13 +1196,18 @@ impl<'a> Lw<'a> {
                 format!("vh_str($sformatf(\"%0d {}\", {}))", units[0].0, v)
             }
             TypeKind::Enum(lits) => {
-                let f = format!("vh_img{}", b);
+                let unquote = !quote && lits.iter().any(|l| l.starts_with('\''));
+                let f = format!("vh_img{}{}", if unquote { "s" } else { "" }, b);
                 if !self.lits.contains_key(&f) {
                     let mut s = format!(
                         "  function automatic string {}(int unsigned p);\n    case (p)\n",
                         f
                     );
                     for (i, l) in lits.iter().enumerate() {
+                        let l = match l.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+                            Some(c) if unquote => c,
+                            _ => l.as_str(),
+                        };
                         let _ = writeln!(s, "      {}: return {};", i, sv_string(l));
                     }
                     s.push_str("      default: return \"\";\n    endcase\n  endfunction\n");
@@ -1947,6 +1984,13 @@ impl<'a> Lw<'a> {
                     String::new()
                 }
             },
+            Some(
+                b @ (Builtin::FileOpen
+                | Builtin::FileClose
+                | Builtin::Read
+                | Builtin::Write
+                | Builtin::Flush),
+            ) => self.file_call(&b, args, ind, loc),
             Some(Builtin::Deallocate) => {
                 let key = self.heap(args[0].ty, loc);
                 let p = self.ex(&args[0]);
@@ -1968,10 +2012,36 @@ impl<'a> Lw<'a> {
             None => {
                 self.need_sub(sub);
                 let mut a = Vec::new();
+                let (mut before, mut after) = (String::new(), String::new());
                 for (p, x) in info.params.iter().zip(args) {
-                    a.extend(self.arg_values(*p, x));
+                    let writes = matches!(
+                        self.d.objects[*p].kind,
+                        ObjKind::Param(ObjClass::Variable, Mode::Out | Mode::InOut)
+                    );
+                    if writes && matches!(x.kind, HExprKind::Slice(..)) {
+                        // A slice actual of an out/inout parameter: through
+                        // a temporary stored back into the slice after the
+                        // call (§4.2.2.2).
+                        let r = self.repr(x.ty, loc).sv();
+                        self.tmp += 1;
+                        let t = format!("vh_sa{}", self.tmp);
+                        self.temps.push((t.clone(), r));
+                        let v = self.ex(x);
+                        let _ = writeln!(before, "{}{} = {};", pad, t, v);
+                        after.push_str(&self.assign_to(x, t.clone(), ind));
+                        a.push(t);
+                    } else {
+                        a.extend(self.arg_values(*p, x));
+                    }
                 }
-                format!("{}{}({});\n", pad, self.sub_name(sub), a.join(", "))
+                format!(
+                    "{}{}{}({});\n{}",
+                    before,
+                    pad,
+                    self.sub_name(sub),
+                    a.join(", "),
+                    after
+                )
             }
         }
     }
@@ -2059,6 +2129,13 @@ impl<'a> Lw<'a> {
         }
         let saved_temps = std::mem::take(&mut self.temps);
         let saved_proc = self.cur_proc.take();
+        // A method: its object is the first parameter.
+        let me = if self.d.method_of.contains_key(&s) {
+            Some(self.obj_name(info.params[0]))
+        } else {
+            None
+        };
+        let saved_self = std::mem::replace(&mut self.cur_self, me);
         let mut params = Vec::new();
         for p in &info.params {
             params.extend(self.param_decls(*p, &loc));
@@ -2083,6 +2160,10 @@ impl<'a> Lw<'a> {
             let flushed = self.flush_pre(4);
             inits.push_str(&flushed);
             let _ = writeln!(inits, "    {} = {};", self.obj_name(*l), v);
+            if matches!(o.kind, ObjKind::File) {
+                let open = self.file_decl_open(*l, 4);
+                inits.push_str(&open);
+            }
         }
         let stmts = self.stmts(&body.stmts, 4);
         let mut temps = String::new();
@@ -2106,6 +2187,67 @@ impl<'a> Lw<'a> {
         );
         self.temps = saved_temps;
         self.cur_proc = saved_proc;
+        self.cur_self = saved_self;
+    }
+
+    /// A new object of protected type `t` (§5.6.2): the next handle, with
+    /// the body's variables at their initial values. Returns the call.
+    fn prot_new(&mut self, t: TypeId, loc: &Loc) -> String {
+        let f = format!("vh_pnew{}", t);
+        if self.prots.contains(&t) {
+            return format!("{}()", f);
+        }
+        self.prots.insert(t);
+        let Some(info) = self.d.protected.get(&t).cloned() else {
+            return "0".into();
+        };
+        if !info.has_body {
+            self.err(
+                loc,
+                format!("protected type '{}' has no body", self.d.types[t].name),
+            );
+        }
+        let saved_temps = std::mem::take(&mut self.temps);
+        let saved_pre = std::mem::take(&mut self.pre_stmts);
+        let saved_self = self.cur_self.replace("vh_pself".into());
+        let mut decls = String::new();
+        let mut inits = String::new();
+        for v in &info.vars {
+            let o = self.d.objects[*v].clone();
+            let r = self.repr(o.ty, &o.loc);
+            let _ = writeln!(decls, "  {} vh_pv{}[longint];", r.sv(), v);
+            let val = match &o.init {
+                Some(i) => {
+                    let target = HExpr {
+                        kind: HExprKind::Obj(*v),
+                        ty: o.ty,
+                        loc: o.loc.clone(),
+                    };
+                    self.store_value_init(&target, i)
+                }
+                None => self.default_value(o.ty, &o.loc),
+            };
+            let pre = self.flush_pre(4);
+            inits.push_str(&pre);
+            let _ = writeln!(inits, "    vh_pv{}[vh_pself] = {};", v, val);
+        }
+        let mut temps = String::new();
+        for (n, ty) in std::mem::take(&mut self.temps) {
+            let _ = writeln!(temps, "    {} {};", ty, n);
+        }
+        self.temps = saved_temps;
+        self.pre_stmts = saved_pre;
+        self.cur_self = saved_self;
+        let _ = write!(
+            self.prot_defs,
+            "  longint vh_pt{t}_n;\n{decls}  function automatic longint {f}();\n    longint vh_pself;\n{temps}    vh_pt{t}_n++;\n    vh_pself = vh_pt{t}_n;\n{inits}    return vh_pself;\n  endfunction\n",
+            t = t,
+            decls = decls,
+            f = f,
+            temps = temps,
+            inits = inits
+        );
+        format!("{}()", f)
     }
 
     fn store_value_init(&mut self, target: &HExpr, v: &HExpr) -> String {

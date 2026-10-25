@@ -182,6 +182,8 @@ pub enum Builtin {
     Op(String),
     MinMax(bool),
     ToString,
+    /// TO_BSTRING / TO_OSTRING / TO_HSTRING of a BIT_VECTOR: bits per digit.
+    BitString(u8),
     RisingEdge,
     FallingEdge,
     Now,

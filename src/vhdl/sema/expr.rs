@@ -586,6 +586,9 @@ impl Design {
     }
 
     fn name_possible_types(&mut self, r: RegionId, n: &ast::Name, out: &mut TypeSet) {
+        if let Some(m) = self.method_call(r, n) {
+            return self.name_possible_types(r, &m, out);
+        }
         match &n.kind {
             NameKind::Simple(_) | NameKind::Selected(..) | NameKind::Op(_) | NameKind::Char(_) => {
                 match self.denote(r, n) {
@@ -873,6 +876,93 @@ impl Design {
         }
     }
 
+    /// A call of a method of a protected type (§4.2.2.4, §5.6.2), as the
+    /// call of the type's methods with the object as first argument:
+    /// `obj.m(args)`, or `m(args)` in the type's body (the enclosing
+    /// method's object).
+    fn method_call(&mut self, r: RegionId, n: &ast::Name) -> Option<ast::Name> {
+        if self.method_keys.is_empty() {
+            return None;
+        }
+        let (prefix, args): (&ast::Name, &[ast::Assoc]) = match &n.kind {
+            NameKind::Call(p, a) => (p, a),
+            _ => (n, &[]),
+        };
+        let (t, m, obj) = match &prefix.kind {
+            NameKind::Selected(p, ast::Suffix::Ident(m)) => {
+                if self.static_prefix(r, p).is_some() {
+                    return None;
+                }
+                let t = match &p.kind {
+                    NameKind::Simple(i) => match self.lookup(r, &i.name).first() {
+                        Some(Sym::Obj(o)) => self.objects[*o].ty,
+                        _ => return None,
+                    },
+                    _ => self.name_expr(r, p, None)?.ty,
+                };
+                (self.base(t), m, (**p).clone())
+            }
+            NameKind::Simple(m) if !m.name.starts_with('<') => {
+                let Some(Sym::Obj(o)) = self.lookup(r, "self_").first().cloned() else {
+                    return None;
+                };
+                let t = self.objects[o].ty;
+                let is_method = self
+                    .lookup(r, &m.name)
+                    .iter()
+                    .any(|s| matches!(s, Sym::Sub(id) if self.method_of.get(id) == Some(&t)));
+                if !is_method {
+                    return None;
+                }
+                let me = ast::Name {
+                    kind: NameKind::Simple(ast::Ident {
+                        name: "self_".into(),
+                        span: m.span.clone(),
+                    }),
+                    span: m.span.clone(),
+                };
+                (t, m, me)
+            }
+            _ => return None,
+        };
+        if !matches!(self.types[t].kind, TypeKind::Protected) {
+            return None;
+        }
+        let key = format!("<m{}:{}>", t, m.name);
+        if !self.method_keys.contains_key(&key) {
+            self.error(
+                m.span.clone(),
+                format!(
+                    "no method '{}' in protected type '{}'",
+                    m.name, self.types[t].name
+                ),
+            );
+            return None;
+        }
+        let mut all = vec![ast::Assoc {
+            formal: None,
+            actual: ast::Actual::Expr(ast::Expr {
+                kind: ast::ExprKind::Name(obj.clone()),
+                span: obj.span.clone(),
+            }),
+            span: obj.span.clone(),
+        }];
+        all.extend(args.iter().cloned());
+        Some(ast::Name {
+            kind: NameKind::Call(
+                Box::new(ast::Name {
+                    kind: NameKind::Simple(ast::Ident {
+                        name: key,
+                        span: m.span.clone(),
+                    }),
+                    span: prefix.span.clone(),
+                }),
+                all,
+            ),
+            span: n.span.clone(),
+        })
+    }
+
     /// A prefix that denotes a library or package (not an object).
     fn static_prefix(&mut self, r: RegionId, n: &ast::Name) -> Option<Sym> {
         match &n.kind {
@@ -898,6 +988,9 @@ impl Design {
         n: &ast::Name,
         expect: Option<TypeId>,
     ) -> Option<HExpr> {
+        if let Some(m) = self.method_call(r, n) {
+            return self.name_expr(r, &m, expect);
+        }
         let loc = self.loc(n.span.clone());
         match &n.kind {
             NameKind::Simple(_) | NameKind::Selected(..) | NameKind::Op(_) | NameKind::Char(_) => {
@@ -1325,6 +1418,9 @@ impl Design {
 
     /// A procedure call statement's procedure and actuals.
     pub fn procedure_call(&mut self, r: RegionId, n: &ast::Name) -> Option<(SubId, Vec<HExpr>)> {
+        if let Some(m) = self.method_call(r, n) {
+            return self.procedure_call(r, &m);
+        }
         let (prefix, args): (&ast::Name, &[ast::Assoc]) = match &n.kind {
             NameKind::Call(p, a) => (p, a),
             _ => (n, &[]),
@@ -2153,6 +2249,17 @@ fn reverse_range(mut hr: HRange) -> HRange {
 fn is_predefined_func(n: &str) -> bool {
     matches!(
         n,
-        "rising_edge" | "falling_edge" | "to_string" | "minimum" | "maximum" | "deallocate"
+        "rising_edge"
+            | "falling_edge"
+            | "to_string"
+            | "minimum"
+            | "maximum"
+            | "deallocate"
+            | "to_bstring"
+            | "to_binary_string"
+            | "to_ostring"
+            | "to_octal_string"
+            | "to_hstring"
+            | "to_hex_string"
     )
 }

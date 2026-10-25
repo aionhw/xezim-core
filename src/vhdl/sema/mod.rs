@@ -109,6 +109,8 @@ pub struct StdTypes {
     /// IEEE.STD_LOGIC_1164.STD_ULOGIC, once that package is analysed (the
     /// matching operators are predefined for it, §9.2.3).
     pub std_ulogic: Option<TypeId>,
+    /// STD.TEXTIO.TEXT, once that package is analysed: its files are text.
+    pub text: Option<TypeId>,
 }
 
 /// The whole analysed design.
@@ -155,6 +157,21 @@ pub struct Design {
     generic_subs: Vec<generics::GenericSub>,
     /// External names (§8.7): the object standing for each, and its path.
     pub externals: BTreeMap<ObjId, String>,
+    /// File objects declared with file open information (§6.4.2.5): the
+    /// external name and the open kind.
+    pub file_opens: BTreeMap<ObjId, (HExpr, HExpr)>,
+    /// Protected types (§5.6): their declarations' regions and the
+    /// variables of their bodies.
+    pub protected: BTreeMap<TypeId, ProtInfo>,
+    /// The subprograms of protected types (methods), each with the object
+    /// as a hidden first parameter `self_`.
+    pub method_of: BTreeMap<SubId, TypeId>,
+    /// Variables of protected type bodies: one per object of the type.
+    pub prot_vars: BTreeMap<ObjId, TypeId>,
+    /// Methods by `<m{type}:{name}>`, the name method calls are resolved by.
+    method_keys: HashMap<String, Vec<SubId>>,
+    /// The protected type whose declaration or body is being analysed.
+    cur_prot: Option<TypeId>,
     /// The names alias declarations stand for.
     pub aliases: Vec<HExpr>,
     /// Labels of loops (by `Sym::Label` id) — names only, for diagnostics.
@@ -175,6 +192,16 @@ pub struct Design {
     /// The library of the unit being analysed (for `work`).
     cur_lib: String,
     cur_file: FileId,
+}
+
+/// A protected type (§5.6).
+#[derive(Clone, Debug)]
+pub struct ProtInfo {
+    /// The region of its declaration (the methods).
+    pub decl_region: RegionId,
+    /// The variables of its body, in order.
+    pub vars: Vec<ObjId>,
+    pub has_body: bool,
 }
 
 /// A library subprogram body kept for analysis on first use.
@@ -238,6 +265,12 @@ impl Design {
             local_insts: 0,
             type_binding: Vec::new(),
             externals: BTreeMap::new(),
+            file_opens: BTreeMap::new(),
+            protected: BTreeMap::new(),
+            method_of: BTreeMap::new(),
+            prot_vars: BTreeMap::new(),
+            method_keys: HashMap::new(),
+            cur_prot: None,
             generic_subs: Vec::new(),
             guards: BTreeMap::new(),
             cur_cfg: None,
@@ -315,10 +348,15 @@ impl Design {
     pub fn file_line(&self, loc: &Loc) -> (String, usize, usize) {
         let f = &self.files[loc.file];
         let (l, c) = f.line_col(loc.span.start);
-        let name = std::path::Path::new(&f.path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| f.path.clone());
+        // A built-in library source keeps GHDL's path.
+        let name = if f.path.starts_with("../../src/") {
+            f.path.clone()
+        } else {
+            std::path::Path::new(&f.path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| f.path.clone())
+        };
         (name, l, c)
     }
 
@@ -372,6 +410,14 @@ impl Design {
     /// directly visible declarations, inner hiding outer, then the names use
     /// clauses make potentially visible. Overloadable names accumulate.
     pub fn lookup(&mut self, region: RegionId, name: &str) -> Vec<Sym> {
+        // The methods of a protected type, as method calls name them.
+        if name.starts_with("<m") {
+            return self
+                .method_keys
+                .get(name)
+                .map(|v| v.iter().map(|s| Sym::Sub(*s)).collect())
+                .unwrap_or_default();
+        }
         let mut out: Vec<Sym> = Vec::new();
         let mut r = Some(region);
         while let Some(id) = r {
@@ -507,8 +553,14 @@ impl Design {
             .iter()
             .filter(|s| s.library == lib)
         {
+            // Named as GHDL names its copies of these sources in messages.
+            let dir = if lib == "std" {
+                "../../src/std/v08"
+            } else {
+                "../../src/ieee2008"
+            };
             let p = cst::parse(SourceFile::new(
-                format!("{}/{}", lib, s.file),
+                format!("{}/{}", dir, s.file),
                 s.text.to_vec(),
             ));
             self.add_file(lib, p);
@@ -801,6 +853,12 @@ impl Design {
                 .and_then(|v| v.first())
         {
             self.std.std_ulogic = Some(*t);
+        }
+        if lib == "std"
+            && p.name.name == "textio"
+            && let Some(Sym::Type(t)) = self.regions[r].syms.get("text").and_then(|v| v.first())
+        {
+            self.std.text = Some(*t);
         }
         self.packages.insert(
             key.clone(),

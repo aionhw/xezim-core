@@ -507,6 +507,20 @@ impl Design {
                         out.push(self.pre_sub(name, &[t], Some(string), Builtin::ToString));
                     }
                 }
+                // §5.3.2.4: the string of a BIT_VECTOR in binary, octal or
+                // hexadecimal digits.
+                (
+                    "to_bstring" | "to_binary_string" | "to_ostring" | "to_octal_string"
+                    | "to_hstring" | "to_hex_string",
+                    1,
+                ) if t == self.std.bit_vector => {
+                    let w = match name {
+                        "to_ostring" | "to_octal_string" => 3,
+                        "to_hstring" | "to_hex_string" => 4,
+                        _ => 1,
+                    };
+                    out.push(self.pre_sub(name, &[t], Some(string), Builtin::BitString(w)));
+                }
                 ("deallocate", 1) if self.is_access(t) => {
                     let id = self.pre_sub(name, &[t], None, Builtin::Deallocate);
                     let p = self.subprograms[id].params[0];

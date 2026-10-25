@@ -41,7 +41,7 @@ impl Design {
         path: &str,
     ) {
         match d {
-            ast::Decl::Type(t) => self.type_decl(r, t),
+            ast::Decl::Type(t) => self.type_decl(r, t, path),
             ast::Decl::Subtype { name, ind, .. } => {
                 if let Some(t) = self.subtype_ind(r, ind) {
                     // A subtype declaration names a subtype: give an anonymous
@@ -99,11 +99,30 @@ impl Design {
                 }
             }
             ast::Decl::File {
-                names, ty, span, ..
+                names, ty, open, ..
             } => {
-                let _ = span;
                 let Some(t) = self.subtype_ind(r, ty) else {
                     return;
+                };
+                // The open information: the name, and the kind (READ_MODE
+                // by default).
+                let open = match open {
+                    Some(fo) => {
+                        let string = self.std.string;
+                        let fok = self.std.file_open_kind;
+                        let Some(name) = self.expr(r, &fo.name, Some(string)) else {
+                            return;
+                        };
+                        let kind = match &fo.kind {
+                            Some(k) => match self.expr(r, k, Some(fok)) {
+                                Some(k) => k,
+                                None => return,
+                            },
+                            None => lit_expr(Value::Enum(0), fok, name.loc.clone()),
+                        };
+                        Some((name, kind))
+                    }
+                    None => None,
                 };
                 for n in names {
                     let id = self.add_obj(ObjInfo {
@@ -115,6 +134,9 @@ impl Design {
                         static_val: None,
                     });
                     self.declare(r, &n.name, Sym::Obj(id));
+                    if let Some(o) = &open {
+                        self.file_opens.insert(id, o.clone());
+                    }
                     objs.push(id);
                 }
             }
@@ -557,9 +579,20 @@ impl Design {
         t
     }
 
-    fn type_decl(&mut self, r: RegionId, td: &ast::TypeDecl) {
+    fn type_decl(&mut self, r: RegionId, td: &ast::TypeDecl, path: &str) {
         let name = td.name.name.clone();
         let loc = Some(self.loc(td.name.span.clone()));
+        match &td.def {
+            Some(ast::TypeDef::Protected(decls)) => {
+                self.protected_decl(r, &name, decls, loc, path);
+                return;
+            }
+            Some(ast::TypeDef::ProtectedBody(decls)) => {
+                self.protected_body(r, td, decls, path);
+                return;
+            }
+            _ => {}
+        }
         let Some(def) = &td.def else {
             let t = self.add_type(&name, TypeKind::Incomplete, None, loc);
             self.declare(r, &name, Sym::Type(t));
@@ -784,10 +817,7 @@ impl Design {
                 };
                 self.add_type(&name, TypeKind::File(ft), None, loc)
             }
-            ast::TypeDef::Protected(_) | ast::TypeDef::ProtectedBody(_) => {
-                self.error(td.span.clone(), "protected types are not supported yet");
-                return;
-            }
+            ast::TypeDef::Protected(_) | ast::TypeDef::ProtectedBody(_) => return,
         };
         // Completing an incomplete type declaration: reuse its id.
         if let Some(Sym::Type(prev)) = self.regions[r]
@@ -801,6 +831,186 @@ impl Design {
             return;
         }
         self.declare(r, &name, Sym::Type(t));
+        if let TypeKind::File(elem) = self.types[t].kind {
+            self.file_ops(r, t, elem);
+        }
+    }
+
+    /// A protected type declaration (§5.6.2): its methods, declared in a
+    /// region of their own.
+    fn protected_decl(
+        &mut self,
+        r: RegionId,
+        name: &str,
+        decls: &[ast::Decl],
+        loc: Option<Loc>,
+        path: &str,
+    ) {
+        let t = self.add_type(name, TypeKind::Protected, None, loc);
+        self.declare(r, name, Sym::Type(t));
+        let pr = self.new_region(Some(r));
+        self.protected.insert(
+            t,
+            super::ProtInfo {
+                decl_region: pr,
+                vars: Vec::new(),
+                has_body: false,
+            },
+        );
+        let saved = self.cur_prot.replace(t);
+        let mut objs = Vec::new();
+        let mut subs = Vec::new();
+        self.decls(
+            pr,
+            decls,
+            &mut objs,
+            &mut subs,
+            &format!("{}.{}", path, name),
+        );
+        self.cur_prot = saved;
+    }
+
+    /// A protected type body (§5.6.3): the variables each object of the
+    /// type has, and the bodies of its methods (and private subprograms).
+    fn protected_body(&mut self, r: RegionId, td: &ast::TypeDecl, decls: &[ast::Decl], path: &str) {
+        let name = td.name.name.clone();
+        let t = match self.lookup(r, &name).first() {
+            Some(Sym::Type(t)) if matches!(self.types[*t].kind, TypeKind::Protected) => *t,
+            _ => {
+                self.error(
+                    td.name.span.clone(),
+                    format!("no protected type declaration '{}' for this body", name),
+                );
+                return;
+            }
+        };
+        let Some(info) = self.protected.get(&t).cloned() else {
+            return;
+        };
+        // The body sees its own context and the declaration's methods.
+        let br = self.new_region(Some(r));
+        let methods: Vec<(String, Vec<Sym>)> = self.regions[info.decl_region]
+            .syms
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, v) in methods {
+            for sym in v {
+                self.declare(br, &k, sym);
+            }
+        }
+        let saved = self.cur_prot.replace(t);
+        let mut objs = Vec::new();
+        let mut subs = Vec::new();
+        self.decls(
+            br,
+            decls,
+            &mut objs,
+            &mut subs,
+            &format!("{}.{}", path, name),
+        );
+        self.cur_prot = saved;
+        let vars: Vec<ObjId> = objs
+            .into_iter()
+            .filter(|o| matches!(self.objects[*o].kind, ObjKind::Variable))
+            .collect();
+        for v in &vars {
+            self.prot_vars.insert(*v, t);
+        }
+        if let Some(p) = self.protected.get_mut(&t) {
+            p.vars = vars;
+            p.has_body = true;
+        }
+    }
+
+    /// The operations a file type declaration implicitly declares (§5.5.2):
+    /// FILE_OPEN (with and without a status), FILE_CLOSE, READ (with a
+    /// LENGTH for an unconstrained array), WRITE, FLUSH and ENDFILE.
+    fn file_ops(&mut self, r: RegionId, ft: TypeId, elem: TypeId) {
+        let std = self.std.clone();
+        let loc = Loc {
+            file: 0,
+            span: 0..0,
+        };
+        let read_mode = lit_expr(Value::Enum(0), std.file_open_kind, loc.clone());
+        let f = ("f", ObjClass::File, Mode::In, ft, None);
+        let name = (
+            "external_name",
+            ObjClass::Constant,
+            Mode::In,
+            std.string,
+            None,
+        );
+        let kind = (
+            "open_kind",
+            ObjClass::Constant,
+            Mode::In,
+            std.file_open_kind,
+            Some(read_mode),
+        );
+        let status = (
+            "status",
+            ObjClass::Variable,
+            Mode::Out,
+            std.file_open_status,
+            None,
+        );
+        let value_out = ("value", ObjClass::Variable, Mode::Out, elem, None);
+        let value_in = ("value", ObjClass::Constant, Mode::In, elem, None);
+        let length = ("length", ObjClass::Variable, Mode::Out, std.natural, None);
+        let mut subs = vec![
+            (
+                "file_open",
+                vec![f.clone(), name.clone(), kind.clone()],
+                None,
+                Builtin::FileOpen,
+            ),
+            (
+                "file_open",
+                vec![status, f.clone(), name, kind],
+                None,
+                Builtin::FileOpen,
+            ),
+            ("file_close", vec![f.clone()], None, Builtin::FileClose),
+            ("write", vec![f.clone(), value_in], None, Builtin::Write),
+            ("flush", vec![f.clone()], None, Builtin::Flush),
+            (
+                "endfile",
+                vec![f.clone()],
+                Some(std.boolean),
+                Builtin::EndFile,
+            ),
+        ];
+        if self.constrained(elem) {
+            subs.push(("read", vec![f, value_out], None, Builtin::Read));
+        } else {
+            subs.push(("read", vec![f, value_out, length], None, Builtin::Read));
+        }
+        for (sub, params, ret, builtin) in subs {
+            let mut pids = Vec::new();
+            for (pn, class, mode, ty, init) in params {
+                pids.push(self.add_obj(ObjInfo {
+                    name: pn.to_string(),
+                    kind: ObjKind::Param(class, mode),
+                    ty,
+                    init,
+                    loc: loc.clone(),
+                    static_val: None,
+                }));
+            }
+            let id = self.add_sub(SubInfo {
+                name: sub.to_string(),
+                is_function: ret.is_some(),
+                pure: false,
+                params: pids,
+                ret,
+                builtin: Some(builtin),
+                body: None,
+                loc: None,
+                path: format!("<file>.{}", sub),
+            });
+            self.declare(r, sub, Sym::Sub(id));
+        }
     }
 
     /// A subtype indication (§6.3): a type mark with an optional constraint
@@ -1310,7 +1520,7 @@ impl Design {
             }
             ast::SubprogramKind::Procedure => (false, true, None),
         };
-        let params = self.interface_list(
+        let mut params = self.interface_list(
             pr,
             &spec.params,
             IfaceKind::Param {
@@ -1319,6 +1529,21 @@ impl Design {
             path,
         );
         let name = Self::designator_key(&spec.designator);
+        // A method of a protected type: the object is a hidden first
+        // parameter (a VHDL name cannot end with '_').
+        let method = self.cur_prot;
+        if let Some(t) = method {
+            let o = self.add_obj(ObjInfo {
+                name: "self_".into(),
+                kind: ObjKind::Param(ObjClass::Variable, Mode::In),
+                ty: t,
+                init: None,
+                loc: self.loc(spec.designator.span()),
+                static_val: None,
+            });
+            self.declare(pr, "self_", Sym::Obj(o));
+            params.insert(0, o);
+        }
         let id = self.add_sub(SubInfo {
             name: name.clone(),
             is_function,
@@ -1334,6 +1559,13 @@ impl Design {
         // are native.
         if path.starts_with("std.") {
             self.subprograms[id].builtin = super::predefined::native_builtin(path, &name);
+        }
+        if let Some(t) = method {
+            self.method_of.insert(id, t);
+            self.method_keys
+                .entry(format!("<m{}:{}>", t, name))
+                .or_default()
+                .push(id);
         }
         self.declare(r, &name, Sym::Sub(id));
         Some((id, pr))
@@ -1397,6 +1629,11 @@ impl Design {
             if let Some(v) = self.regions[r].syms.get_mut(&key) {
                 v.retain(|s| *s != Sym::Sub(new_id));
             }
+            if let Some(t) = self.method_of.remove(&new_id)
+                && let Some(v) = self.method_keys.get_mut(&format!("<m{}:{}>", t, key))
+            {
+                v.retain(|s| *s != new_id);
+            }
             target = prev;
         }
         let sub_path = format!("{}.{}", path, key);
@@ -1431,7 +1668,10 @@ impl Design {
         let body_r = self.new_region(Some(pr));
         let mut locals = Vec::new();
         let mut subs = Vec::new();
+        // Subprograms declared in a method's body are not methods.
+        let saved = self.cur_prot.take();
         self.decls(body_r, &b.decls, &mut locals, &mut subs, sub_path);
+        self.cur_prot = saved;
         let ret = self.subprograms[target].ret;
         let stmts = self.seq_stmts(body_r, &b.stmts, &stmt_ctx_fn(ret));
         self.subprograms[target].body = Some(Body { locals, stmts });

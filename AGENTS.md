@@ -65,7 +65,10 @@ src/vhdl/                 VHDL (IEEE 1076-2008), in development: cst/ parses thr
                           kernel (elab.rs: signals, drivers and null transactions,
                           resolution, port conversion links, implicit signals, procedures
                           lowered per calling process, postponed processes, kernel;
-                          textio.rs; runtime.rs: SV support code); vendored
+                          textio.rs: TEXTIO as GHDL reads and writes; files.rs: file
+                          objects in GHDL's binary format; runtime.rs: SV support
+                          code; protected types are handles with per-type variable
+                          arrays); vendored
                           IEEE P1076 `std`/`ieee` package sources (libraries/, Apache-2.0)
 src/vcd_sink.rs           VCD waveform dump
 src/stdout_sink.rs        Locked stdout/stderr sink — feeds xezim's `-l` fd-level redirect

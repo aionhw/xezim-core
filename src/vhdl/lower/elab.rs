@@ -1442,9 +1442,6 @@ impl<'a> Lw<'a> {
         }
         for (inst, o) in objs {
             let info = d.objects[o].clone();
-            if matches!(info.kind, ObjKind::File) {
-                continue;
-            }
             self.inst = if inst == GLOBAL { 0 } else { inst };
             let r = self.repr(info.ty, &info.loc);
             let name = self.obj_name(o);
@@ -1474,6 +1471,10 @@ impl<'a> Lw<'a> {
             let flushed = self.flush_pre(4);
             elab.push_str(&flushed);
             let _ = writeln!(elab, "    {} = {};", name, v);
+            if matches!(info.kind, ObjKind::File) {
+                let open = self.file_decl_open(o, 4);
+                elab.push_str(&open);
+            }
         }
         // Signals.
         let sigs = self.sigs.clone();
@@ -1645,16 +1646,19 @@ impl<'a> Lw<'a> {
         }
         m.push_str(&self.type_defs);
         m.push_str(&self.heap_defs);
+        m.push_str(&self.prot_defs);
         m.push_str(&logic_defs);
         m.push_str(super::runtime::MATCHING);
         m.push_str(
-            "  function automatic vh_a_u8 vh_str(string s);\n    byte unsigned t[];\n    t = new[s.len()];\n    for (int i = 0; i < s.len(); i++) t[i] = s.getc(i);\n    return vh_a_u8_from(1, 0, t);\n  endfunction\n  function automatic string vh_sv(vh_a_u8 a);\n    string s;\n    s = \"\";\n    for (int i = 0; i < a.d.size(); i++) s = {s, string'(a.d[i])};\n    return s;\n  endfunction\n  function automatic longint vh_deadline(longint t);\n    if (t < 0) return -64'sd1;\n    if (t > 64'sd9223372036854775807 - longint'($time)) return -64'sd1;\n    return longint'($time) + t;\n  endfunction\n",
+            "  function automatic vh_a_u8 vh_str(string s);\n    byte unsigned t[];\n    t = new[s.len()];\n    for (int i = 0; i < s.len(); i++) t[i] = s.getc(i);\n    return vh_a_u8_from(1, 0, t);\n  endfunction\n  function automatic string vh_sv(vh_a_u8 a);\n    string s;\n    s = \"\";\n    for (int i = 0; i < a.d.size(); i++) s = {s, string'(a.d[i])};\n    return s;\n  endfunction\n  // A BIT_VECTOR in digits of w bits (§5.3.2.4), padded with zeros on the left.\n  function automatic vh_a_u8 vh_bvstr(vh_a_u8 v, int w);\n    byte unsigned t[];\n    longint n, nd, x, k;\n    n = v.d.size();\n    nd = (n + w - 1) / w;\n    t = new[nd];\n    for (longint i = 0; i < nd; i++) begin\n      x = 0;\n      for (int j = 0; j < w; j++) begin\n        k = i * w + j - (nd * w - n);\n        x = x * 2 + (k >= 0 ? v.d[k] : 0);\n      end\n      t[i] = x < 10 ? 48 + x : 55 + x;\n    end\n    return vh_a_u8_from(1, 0, t);\n  endfunction\n  function automatic longint vh_deadline(longint t);\n    if (t < 0) return -64'sd1;\n    if (t > 64'sd9223372036854775807 - longint'($time)) return -64'sd1;\n    return longint'($time) + t;\n  endfunction\n",
         );
         let _ = writeln!(
             m,
             "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop, vh_fpend;",
             n = np
         );
+        let files = self.files_sv();
+        m.push_str(&files);
         m.push_str(&decls);
         m.push_str(&self.lit_items);
         let tio = self.textio_sv();
@@ -2425,6 +2429,8 @@ impl<'a> Lw<'a> {
             ObjKind::Param(_, Mode::Out) if matches!(r, Repr::Arr(..) | Repr::Rec(_)) => {
                 vec![format!("inout {} {}", r.sv(), name)]
             }
+            // A file parameter: the handle, which FILE_OPEN/FILE_CLOSE change.
+            ObjKind::Param(ObjClass::File, _) => vec![format!("inout int {}", name)],
             ObjKind::Param(_, Mode::Out) => vec![format!("output {} {}", r.sv(), name)],
             ObjKind::Param(_, Mode::InOut) => vec![format!("inout {} {}", r.sv(), name)],
             _ => vec![format!("input {} {}", r.sv(), name)],
