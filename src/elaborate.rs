@@ -18374,6 +18374,13 @@ fn literalize_stmt_decl_dims(items: &mut [ModuleItem], params: &HashMap<String, 
     let mut tds: HashMap<String, DataType> = HashMap::default();
     for item in items.iter() {
         if let ModuleItem::TypedefDeclaration(td) = item {
+            // §6.18/§7.4: an unpacked-array typedef (`typedef logic [31:0]
+            // arr_t [2:4];`) keeps its name: its dimensions live on the
+            // declaration, not in `data_type`, so substituting the element
+            // type turned `arr_t v;` into a scalar.
+            if !td.dimensions.is_empty() {
+                continue;
+            }
             let mut dt = td.data_type.clone();
             lsdd_data_type(&mut dt, params);
             tds.insert(td.name.name.clone(), dt);
@@ -33528,6 +33535,9 @@ fn inline_module_items(
                 // recursion into ITS sub-instances, so `.T(type_t)` chains
                 // resolve). Prior same-named entries saved for restore.
                 let mut saved_type_binds: Vec<(String, Option<u32>, Option<DataType>)> = Vec::new();
+                // Bare-key unpacked dimensions of this instance's local
+                // typedefs, restored with the type binds.
+                let mut saved_type_dims: Vec<(String, Option<Vec<UnpackedDimension>>)> = Vec::new();
                 for (tp_name, tp_dt) in &type_overrides {
                     let resolved_dt = resolve_typedef_chain(tp_dt, &elab.typedef_types).clone();
                     let w = resolve_type_width(
@@ -35332,6 +35342,46 @@ fn inline_module_items(
                                         &inst_prefix,
                                     )
                                 });
+                        }
+                        // §6.18/§7.4: the typedef's UNPACKED dimensions
+                        // (`typedef int arr_t [0:2];`), as `process_typedef`
+                        // records them for a top-level or $unit typedef — an
+                        // alias of a dimensioned typedef carries the base's
+                        // dimensions after its own. Only the width and type
+                        // were recorded here, so `arr_t v;` in a child module
+                        // (a variable, a block local, a function return)
+                        // became a 32-bit scalar. Bare key for this
+                        // instance's inlining (restored below), scoped key
+                        // for the prefixed names in the inlined body.
+                        let base_dims = match &td.data_type {
+                            DataType::TypeReference {
+                                name, dimensions, ..
+                            } if dimensions.is_empty() && name.qualified() != td.name.name => {
+                                lookup_scoped_type(name, &elab.typedef_unpacked_dims).cloned()
+                            }
+                            _ => None,
+                        };
+                        let dims = match base_dims {
+                            Some(bd) => {
+                                let mut d = td.dimensions.clone();
+                                d.extend(bd);
+                                Some(d)
+                            }
+                            None => (!td.dimensions.is_empty()).then(|| td.dimensions.clone()),
+                        };
+                        saved_type_dims.push((
+                            td.name.name.clone(),
+                            elab.typedef_unpacked_dims.get(&td.name.name).cloned(),
+                        ));
+                        match dims {
+                            Some(d) => {
+                                elab.typedef_unpacked_dims
+                                    .insert(cat2(&inst_prefix, &td.name.name), d.clone());
+                                elab.typedef_unpacked_dims.insert(td.name.name.clone(), d);
+                            }
+                            None => {
+                                elab.typedef_unpacked_dims.remove(&td.name.name);
+                            }
                         }
                     }
                 }
@@ -37654,6 +37704,18 @@ fn inline_module_items(
                 )?;
                 iprof_since("recursion", __te);
 
+                // Restore the bare-key unpacked dimensions this instance's
+                // local typedefs shadowed.
+                for (td_name, prev) in saved_type_dims.into_iter().rev() {
+                    match prev {
+                        Some(d) => {
+                            elab.typedef_unpacked_dims.insert(td_name, d);
+                        }
+                        None => {
+                            elab.typedef_unpacked_dims.remove(&td_name);
+                        }
+                    }
+                }
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.
                 for (tp_name, prev_w, prev_dt) in saved_type_binds {
