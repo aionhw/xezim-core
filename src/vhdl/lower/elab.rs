@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use super::leaves::{DSel, Sel};
 use super::{Lw, Repr, sv_ident, sv_string};
 use crate::vhdl::ast::{Dir, Mode, ObjClass, SignalKind};
 use crate::vhdl::sema::hir::*;
@@ -79,11 +80,9 @@ pub(super) struct Spec {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Part {
     Whole,
-    Elem(i64),
-    /// Offset and length; the bounds are the formal's.
-    Slice(i64, i64),
-    /// An element of a record signal: the field indices from the record.
-    Field(Vec<usize>),
+    /// Record elements, elements and a trailing slice (offsets from the
+    /// left; a slice keeps the formal's bounds).
+    Path(Vec<Sel>),
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +99,18 @@ pub(super) enum Cov {
 }
 
 impl Cov {
+    /// Whether two coverages share a leaf in `base..base + count`.
+    pub(super) fn overlaps(&self, other: &Cov, base: i64, count: i64) -> bool {
+        match (self, other) {
+            (Cov::All, Cov::All) => count > 0,
+            (Cov::All, Cov::Set(x)) | (Cov::Set(x), Cov::All) => {
+                x.range(base..base + count).next().is_some()
+            }
+            (Cov::Set(a), Cov::Set(b)) => a
+                .range(base..base + count)
+                .any(|k| b.contains(k)),
+        }
+    }
     fn add(&mut self, other: Cov) {
         match (std::mem::replace(self, Cov::All), other) {
             (Cov::Set(mut a), Cov::Set(b)) => {
@@ -107,12 +118,6 @@ impl Cov {
                 *self = Cov::Set(a);
             }
             _ => *self = Cov::All,
-        }
-    }
-    pub(super) fn covers(&self, k: i64) -> bool {
-        match self {
-            Cov::All => true,
-            Cov::Set(s) => s.contains(&k),
         }
     }
 }
@@ -150,11 +155,8 @@ pub(super) struct Site {
 /// The target of a signal assignment.
 enum Target {
     Whole(usize),
-    /// Signal, offset of the first element (SV), number of elements
-    /// (`None`: one element), coverage.
-    Slots(usize, String, Option<String>, Cov),
-    /// An element of a record signal: signal, element path, leaves covered.
-    Field(usize, Vec<usize>, Cov),
+    /// A part: signal, path, scalar leaves covered.
+    Path(usize, Vec<DSel>, Cov),
 }
 
 /// Package objects and top-level instance objects keep plain names.
@@ -340,10 +342,11 @@ impl<'a> Lw<'a> {
                 let drv = PSEUDO + self.links.len();
                 if !inn {
                     let (cov, slots) = match &target.part {
-                        Part::Field(path) => (self.path_cov(self.sigs[target.sig].ty, path), true),
                         Part::Whole => (Cov::All, false),
-                        Part::Elem(k) => (Cov::Set([*k].into_iter().collect()), true),
-                        Part::Slice(k, n) => (Cov::Set((*k..*k + *n).collect()), true),
+                        Part::Path(p) => (
+                            self.path_cov(self.sigs[target.sig].ty, &dsels(p)),
+                            true,
+                        ),
                     };
                     self.add_driver(target.sig, drv, cov, slots);
                 }
@@ -368,56 +371,68 @@ impl<'a> Lw<'a> {
 
     /// The signal (part) an actual names in the context of `inst`.
     pub(super) fn actual_ref(&self, inst: usize, e: &HExpr) -> Option<SigRef> {
-        match &e.kind {
-            HExprKind::Obj(o) => self.lookup_sig(inst, *o),
-            HExprKind::Index(b, idx) if idx.len() == 1 => {
+        let (base, sel) = match &e.kind {
+            HExprKind::Obj(o) => return self.lookup_sig(inst, *o),
+            HExprKind::Field(b, i) => (self.actual_ref(inst, b)?, vec![Sel::Field(*i)]),
+            HExprKind::Index(b, idx) => {
                 let base = self.actual_ref(inst, b)?;
-                let i = self.d.eval(&idx[0])?.as_i64()?;
-                let off = self.part_offset(&base, b.ty, i)?;
-                Some(SigRef {
-                    sig: base.sig,
-                    part: Part::Elem(off),
-                })
+                let mut sels = Vec::new();
+                for (k, x) in idx.iter().enumerate() {
+                    let i = self.d.eval(x)?.as_i64()?;
+                    let (l, dir, _) = if k == 0 {
+                        self.static_bounds(b.ty)?
+                    } else {
+                        let sr = self.d.array_index_ranges(b.ty)?.get(k)?.clone()?;
+                        (sr.left.as_i64()?, sr.dir, 0)
+                    };
+                    sels.push(Sel::Elem(match dir {
+                        Dir::To => i - l,
+                        Dir::Downto => l - i,
+                    }));
+                }
+                (base, sels)
             }
             HExprKind::Slice(b, r) => {
                 let base = self.actual_ref(inst, b)?;
-                let sr = r.static_val.clone()?;
-                let off = self.part_offset(&base, b.ty, sr.left.as_i64()?)?;
-                Some(SigRef {
-                    sig: base.sig,
-                    part: Part::Slice(off, sr.length()),
-                })
-            }
-            HExprKind::Field(b, i) => {
-                let base = self.actual_ref(inst, b)?;
-                let mut path = match base.part {
-                    Part::Whole => Vec::new(),
-                    Part::Field(p) => p,
-                    _ => return None,
+                let (l, dir, _) = self.static_bounds(b.ty)?;
+                let (left, len) = match &r.static_val {
+                    Some(sr) => (sr.left.as_i64()?, sr.length()),
+                    None => {
+                        let a = self.d.eval(&r.left)?.as_i64()?;
+                        let z = self.d.eval(&r.right)?.as_i64()?;
+                        (a, if r.dir == Dir::To { z - a + 1 } else { a - z + 1 })
+                    }
                 };
-                path.push(*i);
-                Some(SigRef {
-                    sig: base.sig,
-                    part: Part::Field(path),
-                })
+                let off = match dir {
+                    Dir::To => left - l,
+                    Dir::Downto => l - left,
+                };
+                (base, vec![Sel::Slice(off, len.max(0))])
             }
-            _ => None,
+            _ => return None,
+        };
+        let mut path = match base.part {
+            Part::Whole => Vec::new(),
+            Part::Path(p) => p,
+        };
+        for s in sel {
+            // An element or slice of a slice: offsets from the slice's start.
+            match (path.last().cloned(), s) {
+                (Some(Sel::Slice(o, _)), Sel::Elem(k)) => {
+                    path.pop();
+                    path.push(Sel::Elem(o + k));
+                }
+                (Some(Sel::Slice(o, _)), Sel::Slice(k, n)) => {
+                    path.pop();
+                    path.push(Sel::Slice(o + k, n));
+                }
+                (Some(Sel::Slice(..)), Sel::Field(_)) => return None,
+                (_, s) => path.push(s),
+            }
         }
-    }
-
-    /// The storage offset of index `i` of a (whole or sliced) signal.
-    fn part_offset(&self, base: &SigRef, ty: TypeId, i: i64) -> Option<i64> {
-        let (l, dir, _) = match base.part {
-            Part::Whole | Part::Slice(..) => self.static_bounds(ty)?,
-            Part::Elem(_) | Part::Field(_) => return None,
-        };
-        let rel = match dir {
-            Dir::To => i - l,
-            Dir::Downto => l - i,
-        };
-        Some(match base.part {
-            Part::Slice(off, _) => off + rel,
-            _ => rel,
+        Some(SigRef {
+            sig: base.sig,
+            part: Part::Path(path),
         })
     }
 
@@ -472,30 +487,9 @@ impl<'a> Lw<'a> {
             format!("vh_dv{}_{}", s, l.drv)
         };
         let assign = match (l.target.part.clone(), l.foreign) {
-            (Part::Field(path), f) => {
-                let v = match f {
-                    Some(k) => self.foreign_value(k),
-                    None => self.ex(&l.value),
-                };
-                format!("    {}{} = {};\n", dst, Self::path_sv(&path), v)
-            }
             (Part::Whole, Some(k)) => {
                 let v = self.foreign_value(k);
                 format!("    {} = {};\n", dst, v)
-            }
-            (Part::Elem(e), Some(k)) => {
-                let v = self.foreign_value(k);
-                format!("    {}.d[{}] = {};\n", dst, e, v)
-            }
-            (Part::Slice(e, len), Some(k)) => {
-                let v = self.foreign_value(k);
-                format!(
-                    "    vh_lv = {v};\n    for (int j = 0; j < {len}; j++) {dst}.d[{e} + j] = vh_lv.d[j];\n",
-                    v = v,
-                    len = len,
-                    dst = dst,
-                    e = e
-                )
             }
             (Part::Whole, None) => {
                 let target = HExpr {
@@ -506,22 +500,28 @@ impl<'a> Lw<'a> {
                 let v = self.store_value_init(&target, &l.value);
                 format!("    {} = {};\n", dst, v)
             }
-            (Part::Elem(k), None) => {
-                let v = self.ex(&l.value);
-                format!("    {}.d[{}] = {};\n", dst, k, v)
-            }
-            (Part::Slice(k, len), None) => {
-                let v = self.ex(&l.value);
-                let (f, line, _) = self.file_line(&l.value.loc);
-                format!(
-                    "    vh_lv = {v};\n    if (vh_lv.d.size() != {len}) vh_fatal($sformatf(\"bound check failure at %s:%0d\", {f}, {line}));\n    else for (int j = 0; j < {len}; j++) {dst}.d[{k} + j] = vh_lv.d[j];\n",
-                    v = v,
-                    len = len,
-                    f = sv_string(&f),
-                    line = line,
-                    dst = dst,
-                    k = k
-                )
+            (Part::Path(path), f) => {
+                let v = match f {
+                    Some(k) => self.foreign_value(k),
+                    None => self.ex(&l.value),
+                };
+                let (sel, slice) = Self::static_path_sv(&path);
+                match slice {
+                    None => format!("    {}{} = {};\n", dst, sel, v),
+                    Some((k, len)) => {
+                        let (f, line, _) = self.file_line(&l.value.loc);
+                        format!(
+                            "    vh_lv = {v};\n    if (vh_lv.d.size() != {len}) vh_fatal($sformatf(\"bound check failure at %s:%0d\", {f}, {line}));\n    else for (int j = 0; j < {len}; j++) {dst}{sel}.d[{k} + j] = vh_lv.d[j];\n",
+                            v = v,
+                            len = len,
+                            f = sv_string(&f),
+                            line = line,
+                            dst = dst,
+                            sel = sel,
+                            k = k
+                        )
+                    }
+                }
             }
         };
         let pre = self.flush_pre(4);
@@ -529,7 +529,9 @@ impl<'a> Lw<'a> {
         for (name, t) in std::mem::take(&mut self.temps) {
             let _ = writeln!(temps, "    {} {};", t, name);
         }
-        if let Part::Slice(..) = l.target.part {
+        if let Part::Path(p) = &l.target.part
+            && matches!(p.last(), Some(Sel::Slice(..)))
+        {
             let vt = match l.foreign {
                 Some(k) => {
                     let ft = self.fins[k].ty;
@@ -692,33 +694,10 @@ impl<'a> Lw<'a> {
         };
         match r.part {
             Part::Whole => base,
-            Part::Field(path) => format!("{}{}", base, Self::path_sv(&path)),
-            Part::Elem(off) => format!("{}.d[{}]", base, off),
-            Part::Slice(off, len) => {
+            Part::Path(path) => {
                 let ty = self.d.objects[o].ty;
                 let loc = self.d.objects[o].loc.clone();
-                let name = self.arr_name(ty, &loc);
-                // The formal's bounds, else the actual's.
-                let (l, r, dn) = match self.dim_bounds(ty, 0) {
-                    Some(b) => b,
-                    None => {
-                        let st = self.sigs[r.sig].ty;
-                        let (al, adir, _) = self.static_bounds(st).unwrap_or((0, Dir::To, 0));
-                        let (l, rr) = match adir {
-                            Dir::To => (al + off, al + off + len - 1),
-                            Dir::Downto => (al - off, al - off - len + 1),
-                        };
-                        (
-                            self.scalar_lit(&Value::Int(l), &Repr::I64),
-                            self.scalar_lit(&Value::Int(rr), &Repr::I64),
-                            ((adir == Dir::Downto) as u8).to_string(),
-                        )
-                    }
-                };
-                format!(
-                    "{}_sub({}, {}, {}, {}, {}, {})",
-                    name, base, off, len, l, r, dn
-                )
+                self.path_read(&base, &path, r.sig, ty, &loc)
             }
         }
     }
@@ -1165,108 +1144,14 @@ impl<'a> Lw<'a> {
 
     /// The driver an assignment target updates.
     fn target(&mut self, t: &HExpr) -> Option<Target> {
-        let (f, l, _) = self.file_line(&t.loc);
-        match &t.kind {
-            HExprKind::Field(..) => {
-                let r = self.actual_ref(self.inst, t)?;
-                let Part::Field(path) = r.part else {
-                    return None;
-                };
-                let cov = self.path_cov(self.sigs[r.sig].ty, &path);
-                Some(Target::Field(r.sig, path, cov))
-            }
-            HExprKind::Obj(o) => {
-                let r = self.lookup_sig(self.inst, *o)?;
-                Some(match r.part {
-                    Part::Field(path) => {
-                        let cov = self.path_cov(self.sigs[r.sig].ty, &path);
-                        Target::Field(r.sig, path, cov)
-                    }
-                    Part::Whole => Target::Whole(r.sig),
-                    Part::Elem(off) => Target::Slots(
-                        r.sig,
-                        off.to_string(),
-                        None,
-                        Cov::Set([off].into_iter().collect()),
-                    ),
-                    Part::Slice(off, len) => Target::Slots(
-                        r.sig,
-                        off.to_string(),
-                        Some(len.to_string()),
-                        Cov::Set((off..off + len).collect()),
-                    ),
-                })
-            }
-            HExprKind::Index(b, idx) if idx.len() == 1 => {
-                let HExprKind::Obj(o) = &b.kind else {
-                    return None;
-                };
-                let r = self.lookup_sig(self.inst, *o)?;
-                let (base_off, base_cov) = match r.part {
-                    Part::Whole => (0, Cov::All),
-                    Part::Slice(off, len) => (off, Cov::Set((off..off + len).collect())),
-                    Part::Elem(_) | Part::Field(_) => return None,
-                };
-                let bv = self.ex(b);
-                let i = self.ex(&idx[0]);
-                let off = format!(
-                    "({} + vh_ix({}, {b}.l, {b}.r, {b}.dn, {}, {}))",
-                    base_off,
-                    i,
-                    sv_string(&f),
-                    l,
-                    b = bv
-                );
-                let cov = match self.d.eval(&idx[0]).and_then(|v| v.as_i64()) {
-                    Some(iv) => match self.part_offset(&r, b.ty, iv) {
-                        Some(k) => Cov::Set([k].into_iter().collect()),
-                        None => base_cov,
-                    },
-                    None => base_cov,
-                };
-                Some(Target::Slots(r.sig, off, None, cov))
-            }
-            HExprKind::Slice(b, rg) => {
-                let HExprKind::Obj(o) = &b.kind else {
-                    return None;
-                };
-                let r = self.lookup_sig(self.inst, *o)?;
-                let (base_off, base_cov) = match r.part {
-                    Part::Whole => (0, Cov::All),
-                    Part::Slice(off, len) => (off, Cov::Set((off..off + len).collect())),
-                    Part::Elem(_) | Part::Field(_) => return None,
-                };
-                let bv = self.ex(b);
-                let (left, right, dn) = self.range_parts(rg);
-                let off = format!(
-                    "({} + vh_ix({}, {b}.l, {b}.r, {b}.dn, {}, {}))",
-                    base_off,
-                    left,
-                    sv_string(&f),
-                    l,
-                    b = bv
-                );
-                let n = format!("vh_len({}, {}, {})", left, right, dn);
-                let cov = match &rg.static_val {
-                    Some(sr) => {
-                        match sr
-                            .left
-                            .as_i64()
-                            .and_then(|lv| self.part_offset(&r, b.ty, lv))
-                        {
-                            Some(k) => Cov::Set((k..k + sr.length()).collect()),
-                            None => base_cov,
-                        }
-                    }
-                    None => base_cov,
-                };
-                Some(Target::Slots(r.sig, off, Some(n), cov))
-            }
-            _ => None,
+        let (sig, path) = self.target_path(t)?;
+        if path.is_empty() {
+            return Some(Target::Whole(sig));
         }
+        let cov = self.path_cov(self.sigs[sig].ty, &path);
+        Some(Target::Path(sig, path, cov))
     }
 
-    /// `s <= [delay] w1 after t1, w2 after t2, …` (§10.5.2): update the
     /// projected waveform of this process's driver of s.
     pub(super) fn signal_assign(
         &mut self,
@@ -1291,22 +1176,14 @@ impl<'a> Lw<'a> {
             );
             return String::new();
         };
-        let (sig, call) = match &tg {
+        let (sig, path) = match tg {
             Target::Whole(s) => {
-                self.add_driver(*s, p, Cov::All, false);
-                (*s, None)
+                self.add_driver(s, p, Cov::All, false);
+                (s, None)
             }
-            Target::Slots(s, off, n, cov) => {
-                self.add_driver(*s, p, cov.clone(), true);
-                (*s, Some((off.clone(), n.clone())))
-            }
-            Target::Field(s, path, cov) => {
-                self.add_driver(*s, p, cov.clone(), true);
-                if self.sig_kind(*s).is_some() {
-                    self.err(&loc, "an assignment to an element of a guarded signal is not supported yet");
-                    return String::new();
-                }
-                return self.field_assign(*s, p, path, target, delay, waves, ind);
+            Target::Path(s, path, cov) => {
+                self.add_driver(s, p, cov, true);
+                (s, Some(path))
             }
         };
         // A driver of an out port starts with the port's default value
@@ -1318,23 +1195,22 @@ impl<'a> Lw<'a> {
         {
             dr.init.get_or_insert((*o, self.inst));
         }
-        let (f, line, _) = self.file_line(&loc);
         let mut out = String::new();
         let transport = matches!(delay, Some(HDelay::Transport));
         let reject = match delay {
             Some(HDelay::Inertial(Some(r))) => Some(self.ex(r)),
             _ => None,
         };
+        let guarded = self.sig_kind(sig).is_some();
         for (i, w) in waves.iter().enumerate() {
             let t = match &w.after {
                 Some(a) => self.ex(a),
                 None => "64'sd0".into(),
             };
-            let guarded = self.sig_kind(sig).is_some();
             let (val, nl) = match &w.value {
                 Some(v) => (self.store_value(target, v), ", 0"),
                 // A null transaction (§10.5.2.2): turns the driver off.
-                None if call.is_none() => (format!("vh_dv{}_{}", sig, p), ", 1"),
+                None if path.is_none() => (format!("vh_dv{}_{}", sig, p), ", 1"),
                 None => {
                     self.err(
                         &loc,
@@ -1351,7 +1227,7 @@ impl<'a> Lw<'a> {
             } else {
                 (if i == 0 { 0 } else { 2 }, "64'sd0".into())
             };
-            match &call {
+            match &path {
                 None => {
                     let _ = writeln!(
                         out,
@@ -1359,97 +1235,30 @@ impl<'a> Lw<'a> {
                         pad, sig, p, val, t, rej, mode, nl
                     );
                 }
-                Some((off, None)) => {
-                    let _ = writeln!(
-                        out,
-                        "{}vh_drs_{}_{}({}, {}, {}, {}, {});",
-                        pad, sig, p, off, val, t, rej, mode
-                    );
+                Some(path) => {
+                    // The value once, then a transaction per scalar leaf.
+                    let vt = self.repr(target.ty, &loc).sv();
+                    let tmp = format!("vh_tv{}", self.tmp);
+                    self.tmp += 1;
+                    self.temps.push((tmp.clone(), vt));
+                    let _ = writeln!(out, "{}{} = {};", pad, tmp, val);
+                    if let Some(DSel::Slice(_, n, _)) = path.last() {
+                        let (f, line, _) = self.file_line(&loc);
+                        let _ = writeln!(
+                            out,
+                            "{}if ({}.d.size() != {}) vh_fatal($sformatf(\"bound check failure at %s:%0d\", {}, {}));",
+                            pad,
+                            tmp,
+                            n,
+                            sv_string(&f),
+                            line
+                        );
+                    }
+                    let m = mode.to_string();
+                    let code = self.drive_path(sig, p, path, target.ty, &tmp, (&t, &rej, mode), ind);
+                    let _ = m;
+                    out.push_str(&code);
                 }
-                Some((off, Some(n))) => {
-                    let _ = writeln!(
-                        out,
-                        "{}vh_drsl_{}_{}({}, {}, {}, {}, {}, {}, {}, {});",
-                        pad,
-                        sig,
-                        p,
-                        off,
-                        n,
-                        val,
-                        t,
-                        rej,
-                        mode,
-                        sv_string(&f),
-                        line
-                    );
-                }
-            }
-        }
-        out
-    }
-
-    /// A signal assignment to element `path` of record signal `s`: each
-    /// leaf it covers gets a transaction on its own waveform.
-    #[allow(clippy::too_many_arguments)]
-    fn field_assign(
-        &mut self,
-        s: usize,
-        p: usize,
-        path: &[usize],
-        target: &HExpr,
-        delay: Option<&HDelay>,
-        waves: &[HWave],
-        ind: usize,
-    ) -> String {
-        let pad = " ".repeat(ind);
-        let loc = target.loc.clone();
-        let leaves: Vec<(usize, Vec<usize>)> = self
-            .rec_leaves(self.sigs[s].ty)
-            .into_iter()
-            .enumerate()
-            .filter(|(_, (lp, _))| lp.starts_with(path))
-            .map(|(j, (lp, _))| (j, lp[path.len()..].to_vec()))
-            .collect();
-        let transport = matches!(delay, Some(HDelay::Transport));
-        let reject = match delay {
-            Some(HDelay::Inertial(Some(r))) => Some(self.ex(r)),
-            _ => None,
-        };
-        let mut out = String::new();
-        let vt = self.repr(target.ty, &loc).sv();
-        for (i, w) in waves.iter().enumerate() {
-            let t = match &w.after {
-                Some(a) => self.ex(a),
-                None => "64'sd0".into(),
-            };
-            let Some(v) = &w.value else {
-                self.err(&loc, "null transactions to part of a signal are not supported yet");
-                continue;
-            };
-            let val = self.store_value(target, v);
-            let (mode, rej) = if i == 0 && !transport {
-                (1, reject.clone().unwrap_or_else(|| t.clone()))
-            } else {
-                (if i == 0 { 0 } else { 2 }, "64'sd0".into())
-            };
-            let tmp = format!("vh_rf{}", self.tmp);
-            self.tmp += 1;
-            self.temps.push((tmp.clone(), vt.clone()));
-            let _ = writeln!(out, "{}{} = {};", pad, tmp, val);
-            for (j, sub) in &leaves {
-                let _ = writeln!(
-                    out,
-                    "{}vh_drl_{}_{}_{}({}{}, {}, {}, {});",
-                    pad,
-                    s,
-                    p,
-                    j,
-                    tmp,
-                    Self::path_sv(sub),
-                    t,
-                    rej,
-                    mode
-                );
             }
         }
         out
@@ -1812,6 +1621,11 @@ impl<'a> Lw<'a> {
             }
         }
         let _ = writeln!(m, "  timeunit 1fs; timeprecision 1fs;");
+        let _ = writeln!(
+            m,
+            "  localparam int VH_STOP_LEVEL = {};\n  localparam int VH_IEEE_ASSERTS = {};",
+            self.opts.assert_level, self.opts.ieee_asserts
+        );
         m.push_str(super::runtime::COMMON);
         // The STRING heap (TEXTIO lines).
         if self.textio {
@@ -1839,6 +1653,7 @@ impl<'a> Lw<'a> {
             "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop, vh_fpend;",
             n = np
         );
+        m.push_str(&self.tx_defs);
         let files = self.files_sv();
         m.push_str(&files);
         let bnd = self.boundary_sv();
@@ -2060,6 +1875,17 @@ impl<'a> Lw<'a> {
                             String::new(),
                         )
                     };
+                if !guarded {
+                    let tx = self.whole_tx(&r);
+                    let _ = write!(
+                        drv,
+                        "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, v, after, rej, mode);\n  endfunction\n",
+                        s = s,
+                        p = p,
+                        t = t,
+                        tx = tx
+                    );
+                } else {
                 let _ = write!(
                     drv,
                     "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n{g_decl}  {t} vh_dv{s}_{p};\n  // Update the projected output waveform (§10.5.2.2): mode 0 transport,\n  // 1 inertial first element (reject limit), 2 later elements.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode{g_param});\n    longint tt;\n    longint qt[$];\n    {t} qv[$];\n{g_local}    int k;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qv = vh_dq{s}_{p};\n{g_get}    while (qt.size() > 0 && qt[qt.size()-1] >= tt) begin void'(qt.pop_back()); void'(qv.pop_back());{g_pop} end\n    if (mode == 1) begin\n      // Pulse rejection: of the old transactions in [tt - rej, tt), keep\n      // the run immediately before the new one that has its value.\n      k = qt.size() - 1;\n      while (k >= 0 && qt[k] >= tt - rej && ({g_eq})) k--;\n      while (k >= 0 && qt[k] >= tt - rej) begin qt.delete(k); qv.delete(k);{g_del} k--; end\n    end\n    qt.push_back(tt);\n    qv.push_back(v);\n{g_push}    vh_dt{s}_{p} = qt;\n    vh_dq{s}_{p} = qv;\n{g_put}  endfunction\n",
@@ -2076,39 +1902,18 @@ impl<'a> Lw<'a> {
                     g_push = g_push,
                     g_put = g_put
                 );
-            } else if let Repr::Rec(_) = &r {
-                let d = self.record_driver_sv(*s, *p, &t, &loc);
-                drv.push_str(&d);
+                }
             } else {
-                let Repr::Arr(name, er) = &r else {
-                    self.err(
-                        &loc,
-                        "an assignment to part of this signal is not supported yet",
-                    );
-                    continue;
-                };
-                let et = er.sv();
-                let eq = self.eq_expr(er, "qv[i]", "v");
-                let (g_param, g_null) = if guarded {
-                    (
-                        ", bit nl",
-                        "    if (nl) begin vh_fatal(\"a null transaction to a signal also assigned by parts is not supported\"); return; end\n",
-                    )
-                } else {
-                    ("", "")
-                };
-                let _ = write!(
-                    drv,
-                    "  longint vh_dt{s}_{p}[$];\n  longint vh_dk{s}_{p}[$];\n  {et} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  // The projected waveform of element k (§10.5.2.2), transactions kept in\n  // time order.\n  function automatic void vh_drs_{s}_{p}(longint k, {et} v, longint after, longint rej, int mode);\n    longint tt;\n    longint qt[$];\n    longint qk[$];\n    {et} qv[$];\n    int i, pos;\n    bit keep;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qk = vh_dk{s}_{p};\n    qv = vh_dq{s}_{p};\n    for (i = qt.size() - 1; i >= 0; i--) if (qk[i] == k && qt[i] >= tt) begin qt.delete(i); qk.delete(i); qv.delete(i); end\n    if (mode == 1) begin\n      keep = 1;\n      for (i = qt.size() - 1; i >= 0; i--) begin\n        if (qk[i] != k) continue;\n        if (qt[i] < tt - rej) break;\n        if (keep && ({eq})) continue;\n        keep = 0;\n        qt.delete(i); qk.delete(i); qv.delete(i);\n      end\n    end\n    pos = qt.size();\n    for (i = 0; i < qt.size(); i++) if (qt[i] > tt) begin pos = i; break; end\n    if (pos == qt.size()) begin\n      qt.push_back(tt); qk.push_back(k); qv.push_back(v);\n    end else begin\n      qt.insert(pos, tt); qk.insert(pos, k); qv.insert(pos, v);\n    end\n    vh_dt{s}_{p} = qt;\n    vh_dk{s}_{p} = qk;\n    vh_dq{s}_{p} = qv;\n  endfunction\n  // A slice: its elements from offset `off`.\n  function automatic void vh_drsl_{s}_{p}(longint off, longint n, {t} v, longint after, longint rej, int mode, string file, int line);\n    if (v.d.size() != n) begin\n      vh_fatal($sformatf(\"bound check failure at %s:%0d\", file, line));\n      return;\n    end\n    for (int j = 0; j < n; j++) vh_drs_{s}_{p}(off + j, v.d[j], after, rej, mode);\n  endfunction\n  // The whole signal: every element.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode{g_param});\n{g_null}    for (int j = 0; j < v.d.size(); j++) vh_drs_{s}_{p}(j, v.d[j], after, rej, mode);\n  endfunction\n",
-                    et = et,
-                    t = t,
-                    s = s,
-                    p = p,
-                    eq = eq,
-                    g_param = g_param,
-                    g_null = g_null
-                );
-                let _ = name;
+                match self.slot_driver_sv(*s, *p, &t, &loc, guarded) {
+                    Some(d) => drv.push_str(&d),
+                    None => {
+                        self.err(
+                            &loc,
+                            "an assignment to part of a signal whose bounds are not static is not supported yet",
+                        );
+                        continue;
+                    }
+                }
             }
             match dr.init {
                 Some((o, inst)) => {
@@ -2167,8 +1972,9 @@ impl<'a> Lw<'a> {
             let kind = self.sig_kind(s);
             let tsv = r.sv();
             let mut body = String::new();
+            let any_slots = ds.iter().any(|(_, d)| d.slots);
             match (&r, res) {
-                (_, Some((f, false))) => {
+                (_, Some((f, false))) if !any_slots => {
                     // A resolved signal: f over every driver's value.
                     let pt = self.d.objects[self.d.subprograms[f].params[0]].ty;
                     let (pname, per) = match self.repr(pt, &info.loc) {
@@ -2218,87 +2024,12 @@ impl<'a> Lw<'a> {
                         }
                     }
                 }
-                (Repr::Rec(_), None) if kind.is_none() => {
-                    // Leaf by leaf (§14.7.3.2).
-                    let Some(b) = self.record_update_body(s, &ds, &tsv, &info) else {
+                (Repr::Arr(..) | Repr::Rec(_), _) => {
+                    // Scalar by scalar (§14.7.3.2).
+                    let Some(b) = self.leaf_update_body(s, &ds, &tsv, &info, kind) else {
                         continue;
                     };
                     body.push_str(&b);
-                }
-                (Repr::Arr(_, er), res) => {
-                    // Element by element: the drivers covering it.
-                    let et = er.sv();
-                    let n = self.static_bounds(sig.ty).map(|(l, dir, rr)| match dir {
-                        Dir::To => (rr - l + 1).max(0),
-                        Dir::Downto => (l - rr + 1).max(0),
-                    });
-                    if res.is_none() {
-                        // At most one driver per element of an unresolved
-                        // signal (§14.7.2).
-                        if let Some(n) = n {
-                            for k in 0..n {
-                                if ds.iter().filter(|(_, d)| d.cov.covers(k)).count() > 1 {
-                                    self.err(
-                                        &info.loc,
-                                        format!(
-                                            "unresolved signal '{}' has several drivers",
-                                            info.name
-                                        ),
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let _ = writeln!(body, "    {} nv;\n    {} rv[];\n    int c, cc;", tsv, et);
-                    let _ = writeln!(body, "    nv = vh_s{};", s);
-                    let _ = writeln!(body, "    rv = new[{}];", ds.len());
-                    let _ = writeln!(body, "    for (int k = 0; k < nv.d.size(); k++) begin");
-                    let _ = writeln!(body, "      c = 0; cc = 0;");
-                    for (p, dr) in &ds {
-                        let cond = cov_cond(&dr.cov);
-                        if kind.is_some() {
-                            let _ = writeln!(
-                                body,
-                                "      if ({c}) begin cc++; if (vh_don{s}_{p}) begin rv[c] = vh_dv{s}_{p}.d[k]; c++; end end",
-                                c = cond,
-                                s = s,
-                                p = p
-                            );
-                        } else {
-                            let _ = writeln!(
-                                body,
-                                "      if ({}) begin rv[c] = vh_dv{}_{}.d[k]; c++; end",
-                                cond, s, p
-                            );
-                        }
-                    }
-                    // An element of a guarded bus with every driver off is
-                    // resolved from none.
-                    let any = if kind == Some(SignalKind::Bus) {
-                        "cc"
-                    } else {
-                        "c"
-                    };
-                    match res {
-                        Some((f, _)) => {
-                            let pt = self.d.objects[self.d.subprograms[f].params[0]].ty;
-                            let pname = self.arr_name(pt, &info.loc);
-                            self.need_sub(f);
-                            let _ = writeln!(
-                                body,
-                                "      if ({any} > 0) begin\n        {et} ra[];\n        ra = new[c];\n        for (int j = 0; j < c; j++) ra[j] = rv[j];\n        nv.d[k] = {}({}_mk(0, c - 1, 0, ra));\n      end",
-                                self.sub_name(f),
-                                pname,
-                                et = et,
-                                any = any
-                            );
-                        }
-                        None => {
-                            let _ = writeln!(body, "      if (c > 0) nv.d[k] = rv[0];");
-                        }
-                    }
-                    let _ = writeln!(body, "    end");
                 }
                 _ => {
                     self.err(
@@ -2340,8 +2071,8 @@ impl<'a> Lw<'a> {
             "  function automatic longint vh_next();\n    longint n;\n    n = -64'sd1;"
         );
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
-            if dr.slots && self.is_record_sig(*s) {
-                k.push_str(&self.record_driver_next(*s, *p));
+            if dr.slots {
+                k.push_str(&self.slot_driver_next(*s, *p));
                 continue;
             }
             let _ = writeln!(
@@ -2395,15 +2126,8 @@ impl<'a> Lw<'a> {
         let _ = writeln!(k, "    vh_fpend = 0;");
         k.push_str(&self.boundary_sample("    "));
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
-            if dr.slots && self.is_record_sig(*s) {
-                k.push_str(&self.record_driver_due(*s, *p, "    "));
-            } else if dr.slots {
-                let _ = writeln!(
-                    k,
-                    "    while (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p}.d[vh_dk{s}_{p}.pop_front()] = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
-                    s = s,
-                    p = p
-                );
+            if dr.slots {
+                k.push_str(&self.slot_driver_due(*s, *p, "    "));
             } else {
                 let on = if self.sig_kind(*s).is_some() {
                     format!(" vh_don{s}_{p} = !vh_dn{s}_{p}.pop_front();", s = s, p = p)
@@ -2712,7 +2436,28 @@ impl<'a> Lw<'a> {
     /// The SV arguments of an actual: for a signal parameter, also the
     /// signal's attributes.
     pub(super) fn arg_values(&mut self, p: ObjId, a: &HExpr) -> Vec<String> {
-        let v = self.ex(a);
+        let mut v = self.ex(a);
+        // An actual of a constrained array formal takes the formal's bounds
+        // (§4.2.2.1, §14.6: the value is converted to the formal's subtype).
+        let pt = self.d.objects[p].ty;
+        if matches!(self.d.objects[p].kind, ObjKind::Param(_, Mode::In))
+            && self.ndims(pt) == 1
+            && self.static_bounds(pt).is_some()
+            && let Some((l, r, dn)) = self.dim_bounds(pt, 0)
+        {
+            let name = self.arr_name(pt, &a.loc);
+            let (f, line, _) = self.file_line(&a.loc);
+            v = format!(
+                "{}_rb({}, {}, {}, {}, {}, {})",
+                name,
+                v,
+                l,
+                r,
+                dn,
+                sv_string(&f),
+                line
+            );
+        }
         if !matches!(
             self.d.objects[p].kind,
             ObjKind::Param(ObjClass::Signal, Mode::In)
@@ -2744,7 +2489,20 @@ pub(super) fn is_implicit(name: &str) -> bool {
 }
 
 /// An SV condition on `k` for a driver's coverage.
-fn cov_cond(c: &Cov) -> String {
+
+/// Static path steps as path steps with offsets in SV.
+pub(super) fn dsels(path: &[Sel]) -> Vec<DSel> {
+    path.iter()
+        .map(|s| match s {
+            Sel::Field(i) => DSel::Field(*i),
+            Sel::Elem(k) => DSel::Elem(k.to_string(), Some(*k)),
+            Sel::Slice(k, n) => DSel::Slice(k.to_string(), n.to_string(), Some((*k, *n))),
+        })
+        .collect()
+}
+
+/// The SV condition that number `v` is covered.
+pub(super) fn cov_cond_var(c: &Cov, v: &str) -> String {
     match c {
         Cov::All => "1".into(),
         Cov::Set(set) => {
@@ -2757,9 +2515,9 @@ fn cov_cond(c: &Cov) -> String {
                     b = it.next().unwrap();
                 }
                 if a == b {
-                    parts.push(format!("k == {}", a));
+                    parts.push(format!("{} == {}", v, a));
                 } else {
-                    parts.push(format!("(k >= {} && k <= {})", a, b));
+                    parts.push(format!("({v} >= {} && {v} <= {})", a, b, v = v));
                 }
             }
             if parts.is_empty() {

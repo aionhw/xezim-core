@@ -222,10 +222,8 @@ impl<'a> Lw<'a> {
         self.fins.push(ForeignIn { sv, bnd, ty });
         let drv = super::elab::PSEUDO + self.links.len();
         let cov = match &sig.part {
-            Part::Field(path) => self.path_cov(self.sigs[sig.sig].ty, path),
+            Part::Path(path) => self.path_cov(self.sigs[sig.sig].ty, &super::elab::dsels(path)),
             Part::Whole => Cov::All,
-            Part::Elem(e) => Cov::Set([*e].into_iter().collect()),
-            Part::Slice(e, n) => Cov::Set((*e..*e + *n).collect()),
         };
         let slots = sig.part != Part::Whole;
         self.add_driver(sig.sig, drv, cov, slots);
@@ -357,9 +355,10 @@ impl<'a> Lw<'a> {
         };
         let (x, off) = match part {
             Part::Whole => ("a".to_string(), 0),
-            Part::Field(path) => (format!("a{}", Lw::path_sv(path)), 0),
-            Part::Elem(e) => (format!("a.d[{}]", e), 0),
-            Part::Slice(e, _) => ("a".to_string(), *e),
+            Part::Path(path) => {
+                let (sel, slice) = Lw::static_path_sv(path);
+                (format!("a{}", sel), slice.map_or(0, |(o, _)| o))
+            }
         };
         match bnd {
             Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, &x)),

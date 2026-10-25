@@ -8,8 +8,8 @@
 //! elaboration, the same hook as UPF (`upf.rs`). The standard packages
 //! (`std`, `ieee`) are vendored sources (`libraries`).
 //!
-//! Status: parsing and located syntax errors. Analysis and simulation of
-//! VHDL designs are not implemented yet.
+//! A design may mix VHDL with SystemVerilog (`foreign`, `lower::mixed`):
+//! SV modules instantiate VHDL entities, VHDL components bind to SV modules.
 
 pub mod ast;
 mod cst;
@@ -31,9 +31,30 @@ pub struct VhdlFile {
     pub library: String,
 }
 
+/// Run options, as GHDL's `--ieee-asserts=` and `--assert-level=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VhdlOptions {
+    /// Assertions of the IEEE library: 0 shown, 1 not shown, 2 not shown
+    /// at time 0.
+    pub ieee_asserts: u8,
+    /// The severity (0 note .. 3 failure; 4 none) from which an assertion
+    /// stops the simulation.
+    pub assert_level: u8,
+}
+
+impl Default for VhdlOptions {
+    fn default() -> Self {
+        VhdlOptions {
+            ieee_asserts: 0,
+            assert_level: 3,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct Config {
     files: Vec<VhdlFile>,
+    options: VhdlOptions,
 }
 
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
@@ -47,10 +68,15 @@ pub fn is_vhdl_path(path: &str) -> bool {
 /// The VHDL sources of the design, in command-line order. Call before
 /// elaboration; an empty list clears the configuration.
 pub fn configure(files: Vec<VhdlFile>) {
+    configure_with(files, VhdlOptions::default());
+}
+
+/// `configure`, with run options.
+pub fn configure_with(files: Vec<VhdlFile>, options: VhdlOptions) {
     *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = if files.is_empty() {
         None
     } else {
-        Some(Config { files })
+        Some(Config { files, options })
     };
 }
 
@@ -68,6 +94,7 @@ pub fn cache_digest() -> Option<u64> {
         f.hash(&mut h);
         std::fs::read(&f.path).ok().hash(&mut h);
     }
+    cfg.options.hash(&mut h);
     Some(h.finish())
 }
 
@@ -159,7 +186,7 @@ pub fn inject(
         }
         names.push(name);
     }
-    let lowered = lower::lower(&analysed, &names)
+    let lowered = lower::lower(&analysed, &names, cfg.options)
         .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
     if std::env::var_os("XEZIM_VHDL_DUMP").is_some() {
         eprintln!("{}", lowered.sv);

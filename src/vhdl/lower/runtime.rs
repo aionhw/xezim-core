@@ -18,8 +18,14 @@ pub const COMMON: &str = r#"
   endfunction
   // A report or assertion message (IEEE 1076-2008 §10.3, §10.4), formatted
   // as GHDL does; severity FAILURE ends the simulation with exit status 1.
+  // GHDL's --ieee-asserts: assertions of the IEEE packages hidden (1), or
+  // hidden at time 0 (2); --assert-level: the severity that stops.
+  function automatic bit vh_ieee_file(string f);
+    return f.len() > 19 && (f.substr(0, 17) == "../../src/ieee2008" || f.substr(0, 17) == "../../src/synopsys");
+  endfunction
   function automatic void vh_report(string file, int line, int col, int sev, string msg, bit is_assert);
     string sv_s;
+    if (is_assert && VH_IEEE_ASSERTS != 0 && (VH_IEEE_ASSERTS == 1 || $time == 0) && vh_ieee_file(file)) return;
     case (sev)
       0: sv_s = "note";
       1: sv_s = "warning";
@@ -27,7 +33,7 @@ pub const COMMON: &str = r#"
       default: sv_s = "failure";
     endcase
     $display("%s:%0d:%0d:@%s:(%s %s): %s", file, line, col, vh_time_at($time), is_assert ? "assertion" : "report", sv_s, msg);
-    if (sev >= 3) begin
+    if (sev >= VH_STOP_LEVEL) begin
       $display("ghdl:error: %s failed", is_assert ? "assertion" : "report");
       $display("ghdl:error: simulation failed");
       $__vh_fail;

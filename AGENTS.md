@@ -55,9 +55,12 @@ src/packed_value.rs       Separate packed-bit representation; current Value alre
 src/bits2.rs              2-state arbitrary-width value (Verilator-style, no X/Z mask);
                           the compute-core type for the cycle-based path
 src/sdf/                  SDF parser + annotator (IEEE 1497-2001): IOPATH/INTERCONNECT delays
-src/vhdl/                 VHDL (IEEE 1076-2008), in development: cst/ parses through the
+src/vhdl/                 VHDL (IEEE 1076-2008), in development (foreign.rs: SV instances of
+                          VHDL entities, found and rewritten): cst/ parses through the
                           `vhdl_syntax` crate (the only user of it); sema/ analyses to a typed
-                          HIR (config.rs: component binding and configurations; generics.rs:
+                          HIR (config.rs: component binding and configurations; ceval.rs:
+                          static evaluation, function bodies interpreted; mixed.rs: SV
+                          parameters and modules for mixed designs; generics.rs:
                           generic packages/subprograms instantiated by re-analysis with
                           bound generics; blocks and generate iterations become nested
                           architectures); lower/
@@ -65,6 +68,8 @@ src/vhdl/                 VHDL (IEEE 1076-2008), in development: cst/ parses thr
                           kernel (elab.rs: signals, drivers and null transactions,
                           resolution, port conversion links, implicit signals, procedures
                           lowered per calling process, postponed processes, kernel;
+                          leaves.rs: drivers of parts of signals by scalar leaf;
+                          mixed.rs: the SystemVerilog boundary of a mixed design;
                           textio.rs: TEXTIO as GHDL reads and writes; files.rs: file
                           objects in GHDL's binary format; runtime.rs: SV support
                           code; protected types are handles with per-type variable

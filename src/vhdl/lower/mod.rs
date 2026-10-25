@@ -13,8 +13,8 @@
 
 mod elab;
 mod files;
+mod leaves;
 mod mixed;
-mod records;
 mod runtime;
 mod textio;
 
@@ -169,12 +169,21 @@ struct Lw<'a> {
     sv_nets: usize,
     /// Processes with a sensitivity list, lowered as functions.
     fprocs: BTreeSet<usize>,
+    /// Transaction functions shared by the drivers of values of one
+    /// representation (by key), and their definitions.
+    tx_keys: BTreeSet<String>,
+    tx_defs: String,
+    opts: super::VhdlOptions,
 }
 
 /// Lower the analysed design.
 /// Lower the analysed design: the VHDL top level, and a module for each
 /// entity instantiated from SystemVerilog (named by `roots`).
-pub fn lower(an: &Analysed, roots: &[String]) -> Result<Lowered, Vec<String>> {
+pub fn lower(
+    an: &Analysed,
+    roots: &[String],
+    opts: super::VhdlOptions,
+) -> Result<Lowered, Vec<String>> {
     let d = &an.design;
     let mut sv = String::new();
     let mut errors = Vec::new();
@@ -189,6 +198,7 @@ pub fn lower(an: &Analysed, roots: &[String]) -> Result<Lowered, Vec<String>> {
     }
     for (a, boundary) in units {
         let mut lw = Lw::new(d, boundary);
+        lw.opts = opts;
         // STRING (messages) first.
         lw.arr_type(&Repr::U8);
         let m = lw.module(a);
@@ -260,6 +270,9 @@ impl<'a> Lw<'a> {
             sv_items: String::new(),
             sv_nets: 0,
             fprocs: BTreeSet::new(),
+            tx_keys: BTreeSet::new(),
+            tx_defs: String::new(),
+            opts: super::VhdlOptions::default(),
         }
     }
 }
