@@ -4404,10 +4404,44 @@ fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
         {
             args[1..].iter().all(|a| is_const_expr(a, params))
         }
+        // §6.24.1: a cast to a type (`int'(e)`, `T'(e)`, `pkg::T'(e)`) is
+        // constant when its operand is; the target is a type, not a value.
+        ExprKind::SystemCall { name, args }
+            if (name == "$__xz_type_cast" || name == "$__xz_named_cast")
+                && args.len() == 2
+                && cast_target_is_type(&args[0]) =>
+        {
+            is_const_expr(&args[1], params)
+        }
         // System constant functions used in generate conditions ($bits, $clog2…).
         ExprKind::SystemCall { args, .. } => args.iter().all(|a| is_const_expr(a, params)),
         _ => false, // Calls (new()) etc. are not constant
     }
+}
+
+/// A cast target that names a type: a type literal, or a typedef or type
+/// parameter known to the instance's types or the typedef tables.
+fn cast_target_is_type(target: &Expression) -> bool {
+    let name = match &target.kind {
+        ExprKind::TypeLiteral(_) => return true,
+        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+            h.path[0].name.name.clone()
+        }
+        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                format!("{}::{}", h.path[0].name.name, member.name)
+            }
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let leaf = name.rsplit("::").next().unwrap_or(&name);
+    CONST_FN_LOCAL_TYPES.with(|c| c.borrow().as_ref().is_some_and(|m| m.contains_key(leaf)))
+        || TYPEDEF_SHAPES_TLS.with(|c| {
+            let c = c.borrow();
+            c.0.contains_key(&name) || c.0.contains_key(leaf)
+        })
+        || TYPEDEFS_TLS.with(|c| c.borrow().as_ref().is_some_and(|m| m.contains_key(&name)))
 }
 
 /// Elaborate a module or interface declaration into a simulation model.
@@ -25292,8 +25326,19 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     out.is_signed = false;
                     return out;
                 }
-                // §6.24.1 TYPE cast through a typedef: the target is the
-                // operand's context, as for a keyword type cast below. Only an
+                // §6.24.1 TYPE cast to an integral typedef: the value takes the
+                // typedef's width and signing, and the target is the operand's
+                // context, as for a keyword type cast below.
+                if let Some((w, signed)) = const_typedef_cast_target(&nm, scoped.as_deref(), params)
+                {
+                    let v = eval_const_expr_val_ctx(&args[1], params, w);
+                    if !v.is_real {
+                        let mut out = v.resize(w);
+                        out.is_signed = signed;
+                        return out;
+                    }
+                }
+                // A typedef whose declared type is not known here: only an
                 // operator expression can observe a context, and the width
                 // table cannot tell an integral typedef from a string one, so
                 // a bare operand keeps its pass-through.
@@ -25820,6 +25865,72 @@ fn eval_const_expr_val_ctx(
         return own;
     }
     const_ctx_fold(expr, params, ctx_w.max(own.width), own.is_signed).unwrap_or(own)
+}
+
+/// Width and signing of the integral typedef a cast target `nm` (`scoped`
+/// when written `pkg::nm`) names, for `nm'(v)` in a constant expression.
+/// The instance's own types (`CONST_FN_LOCAL_TYPES`) come first, then the
+/// full typedef definitions (`TYPEDEF_SHAPES_TLS`); typedefs of typedefs are
+/// followed. The width of an instance's own type comes from its definition
+/// (the width table can still hold a type parameter's default); any other
+/// comes from the current scope's width table when it has the name. `None` for a name with no known definition, or a string,
+/// real or unpacked type: the caller keeps its pass-through.
+fn const_typedef_cast_target(
+    nm: &str,
+    scoped: Option<&str>,
+    params: &HashMap<String, Value>,
+) -> Option<(u32, bool)> {
+    let local = |n: &str| CONST_FN_LOCAL_TYPES.with(|c| c.borrow().as_ref()?.get(n).cloned());
+    let dt = TYPEDEF_SHAPES_TLS.with(|sh| {
+        let sh = sh.borrow();
+        let mut cur = match scoped {
+            Some(k) => sh.0.get(k).or_else(|| sh.0.get(nm))?.clone(),
+            None => match local(nm) {
+                Some(dt) => dt,
+                None if sh.1.contains_key(nm) => return None,
+                None => sh.0.get(nm)?.clone(),
+            },
+        };
+        for _ in 0..16 {
+            let DataType::TypeReference {
+                name, dimensions, ..
+            } = &cur
+            else {
+                break;
+            };
+            if !dimensions.is_empty() {
+                return None;
+            }
+            let next = name
+                .scopes
+                .is_empty()
+                .then(|| local(&name.name.name))
+                .flatten()
+                .or_else(|| lookup_scoped_type(name, &sh.0).cloned())?;
+            cur = next;
+        }
+        Some(cur)
+    })?;
+    let integral = match &dt {
+        DataType::IntegerAtom { .. } | DataType::IntegerVector { .. } | DataType::Enum(_) => true,
+        DataType::Struct(s) => s.packed,
+        _ => false,
+    };
+    if !integral {
+        return None;
+    }
+    let own = scoped.is_none() && local(nm).is_some();
+    let w = TYPEDEFS_TLS
+        .with(|c| {
+            let b = c.borrow();
+            let m = b.as_ref().filter(|_| !own)?;
+            scoped.and_then(|k| m.get(k)).or_else(|| m.get(nm)).copied()
+        })
+        .filter(|&w| w > 0)
+        .unwrap_or_else(|| {
+            TYPEDEFS_TLS.with(|c| resolve_type_width(&dt, Some(params), c.borrow().as_ref()))
+        });
+    (w > 0).then(|| (w, is_type_signed(&dt)))
 }
 
 /// True for an expression whose operands a surrounding context widens — an
@@ -34187,6 +34298,28 @@ fn inline_module_items(
                 let prev_in_instance = CONST_FN_IN_INSTANCE.with(|c| c.replace(true));
                 let _in_instance =
                     scopeguard_lite(move || CONST_FN_IN_INSTANCE.with(|c| c.set(prev_in_instance)));
+                // The instance's own types (`CONST_FN_LOCAL_TYPES`), installed
+                // once its body typedefs are known below and kept for the rest
+                // of this instance, so its declarations see them too.
+                // Its type parameters are known now (defaults and overrides),
+                // for header parameter defaults such as `H = T'(45)`.
+                let header_types: HashMap<String, DataType> = sub_mod
+                    .params_and_body_types()
+                    .filter_map(|p| match &p.kind {
+                        ParameterKind::Type { assignments } => Some(assignments),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter_map(|a| Some((a.name.name.clone(), a.init.clone()?)))
+                    .chain(type_overrides.iter().cloned())
+                    .collect();
+                let mut prev_local_types =
+                    Some(CONST_FN_LOCAL_TYPES.with(|c| c.replace(Some(header_types))));
+                let _local_types = scopeguard_lite(move || {
+                    if let Some(prev) = prev_local_types.take() {
+                        CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = prev);
+                    }
+                });
                 let mut inst_types: HashMap<String, DataType> = HashMap::default();
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
@@ -34728,7 +34861,7 @@ fn inline_module_items(
                     // typedefs and type parameters (`w_t'(x)`, `T'(x)`).
                     let mut fn_types = local_types.clone();
                     fn_types.extend(type_overrides.iter().cloned());
-                    let prev_fn_types = CONST_FN_LOCAL_TYPES.with(|c| c.replace(Some(fn_types)));
+                    CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = Some(fn_types));
                     add_params_from_items(
                         sub_mod.items(),
                         &mut sub_local_params,
@@ -34736,7 +34869,6 @@ fn inline_module_items(
                         &frozen_params,
                         &local_types,
                     );
-                    CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = prev_fn_types);
                     if sub_local_params == snapshot {
                         break;
                     }
