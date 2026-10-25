@@ -644,6 +644,17 @@ impl Converter {
     }
 
     fn discrete_range(&mut self, n: &N) -> Option<DiscreteRange> {
+        // `integer range 0 to n - 1`: a subtype indication with its
+        // constraint.
+        let constrained = n.kind() == K::SubtypeIndication
+            || (n.kind() == K::NameExpression
+                && child(n, K::Name).is_some_and(|x| child(&x, K::RangeConstraint).is_some()));
+        if constrained
+            && let Some(ind) = self.subtype_ind(n)
+            && ind.constraint.is_some()
+        {
+            return Some(DiscreteRange::Subtype(ind));
+        }
         let e = self.expr(n)?;
         Some(match e.kind {
             ExprKind::Range(r) => DiscreteRange::Range(*r),

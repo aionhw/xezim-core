@@ -1,7 +1,9 @@
 //! The VHDL standard packages built into xezim: `std` (STANDARD, TEXTIO,
 //! ENV) and `ieee` (STD_LOGIC_1164, NUMERIC_STD, …), the IEEE P1076 Working
 //! Group sources vendored unmodified under `libraries/` (Apache-2.0; see
-//! `libraries/README.md`).
+//! `libraries/README.md`), and the Synopsys packages most tools also put in
+//! `ieee` (STD_LOGIC_ARITH, STD_LOGIC_UNSIGNED, STD_LOGIC_SIGNED,
+//! STD_LOGIC_MISC; `libraries/synopsys/`, under Synopsys' notice).
 
 /// One vendored source file and the design library it is analysed into.
 pub struct LibSource {
@@ -145,5 +147,30 @@ pub static SOURCES: &[LibSource] = &[
         library: "ieee",
         file: "std_logic_textio.vhdl",
         text: include_bytes!("libraries/ieee/std_logic_textio.vhdl"),
+    },
+    LibSource {
+        library: "ieee",
+        file: "synopsys/std_logic_arith.vhdl",
+        text: include_bytes!("libraries/synopsys/std_logic_arith.vhdl"),
+    },
+    LibSource {
+        library: "ieee",
+        file: "synopsys/std_logic_signed.vhdl",
+        text: include_bytes!("libraries/synopsys/std_logic_signed.vhdl"),
+    },
+    LibSource {
+        library: "ieee",
+        file: "synopsys/std_logic_unsigned.vhdl",
+        text: include_bytes!("libraries/synopsys/std_logic_unsigned.vhdl"),
+    },
+    LibSource {
+        library: "ieee",
+        file: "synopsys/v08/std_logic_misc-body.vhdl",
+        text: include_bytes!("libraries/synopsys/v08/std_logic_misc-body.vhdl"),
+    },
+    LibSource {
+        library: "ieee",
+        file: "synopsys/v08/std_logic_misc.vhdl",
+        text: include_bytes!("libraries/synopsys/v08/std_logic_misc.vhdl"),
     },
 ];

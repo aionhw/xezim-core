@@ -69,16 +69,16 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
 }
 
 pub mod bits2;
+mod body_type_params;
 pub mod elaborate;
 pub mod packed_value;
-mod body_type_params;
 pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;
 pub mod upf;
 pub mod value;
-pub mod vhdl;
 pub mod vcd_sink;
+pub mod vhdl;
 
 /// Deterministic hasher for `HashMap`/`HashSet` so iteration order is
 /// reproducible across runs. Both `crate::hasher::HashMap` (default `RandomState`)
@@ -1283,7 +1283,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     // IEEE 1801 power intent: splice the generated UPF package and glue
     // processes into the parsed design before elaboration.
     // VHDL (IEEE 1076): the lowered VHDL design joins the SV descriptions.
-    let vhdl_top = vhdl::inject(&mut all_descriptions)?;
+    let vhdl_top = vhdl::inject(&mut all_descriptions, top_module_name)?;
     let top_module_name = top_module_name.or(vhdl_top.as_deref());
     upf::inject(&mut all_descriptions, top_module_name)?;
     let (lib_defines, module_timescales, module_ts_own_file) = match pre {
@@ -3283,7 +3283,7 @@ fn resolve_instance_binds(
     Ok(changed)
 }
 
-fn collect_instantiated_modules(
+pub(crate) fn collect_instantiated_modules(
     items: &[ast::decl::ModuleItem],
     set: &mut std::collections::HashSet<String>,
 ) {

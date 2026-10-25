@@ -6,11 +6,13 @@
 //! analyses that package (and what it depends on) first, so the order of the
 //! source files does not matter.
 
+mod ceval;
 mod config;
 mod decl;
 mod expr;
 mod generics;
 pub mod hir;
+mod mixed;
 mod predefined;
 mod stmt;
 
@@ -19,6 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::ast::{self, Ident, LibraryUnit, Name, NameKind, Span};
 use super::cst::{self, SourceFile};
 use hir::*;
+pub use mixed::{Mixed, RootReq, SvConst, SvModule};
 
 /// A named entity visible in a declarative region.
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +192,8 @@ pub struct Design {
     /// Library subprogram bodies not analysed yet.
     lazy_bodies: HashMap<SubId, LazyBody>,
     pub errors: Vec<(Loc, String)>,
+    /// The SV modules of a mixed-language design, by lower-case name.
+    pub sv_modules: BTreeMap<String, SvModule>,
     /// The library of the unit being analysed (for `work`).
     cur_lib: String,
     cur_file: FileId,
@@ -238,7 +243,12 @@ pub struct ComponentInfo {
 /// architecture (index into `archs`).
 pub struct Analysed {
     pub design: Design,
-    pub top: usize,
+    /// The top architecture of a VHDL top level (none when every entity
+    /// is instantiated from SystemVerilog).
+    pub top: Option<usize>,
+    /// The architectures of the entities instantiated from SV, in the
+    /// order of `Mixed::roots`.
+    pub roots: Vec<usize>,
 }
 
 impl Design {
@@ -285,6 +295,7 @@ impl Design {
             pre_cache: HashMap::new(),
             lazy_bodies: HashMap::new(),
             errors: Vec::new(),
+            sv_modules: BTreeMap::new(),
             cur_lib: "work".into(),
             cur_file: 0,
         }
@@ -554,15 +565,14 @@ impl Design {
             .filter(|s| s.library == lib)
         {
             // Named as GHDL names its copies of these sources in messages.
-            let dir = if lib == "std" {
-                "../../src/std/v08"
+            let path = if lib == "std" {
+                format!("../../src/std/v08/{}", s.file)
+            } else if s.file.starts_with("synopsys/") {
+                format!("../../src/{}", s.file)
             } else {
-                "../../src/ieee2008"
+                format!("../../src/ieee2008/{}", s.file)
             };
-            let p = cst::parse(SourceFile::new(
-                format!("{}/{}", dir, s.file),
-                s.text.to_vec(),
-            ));
+            let p = cst::parse(SourceFile::new(path, s.text.to_vec()));
             self.add_file(lib, p);
         }
     }
@@ -1084,8 +1094,10 @@ enum UnitKind {
 pub fn analyze(
     files: Vec<(String, cst::Parsed)>,
     top: Option<&str>,
+    mixed: &Mixed,
 ) -> Result<Analysed, Vec<String>> {
     let mut d = Design::new();
+    d.sv_modules = mixed.sv_modules.clone();
     d.add_universal_types();
     d.ensure_library("std");
     d.analyze_package("std", "standard");
@@ -1112,7 +1124,8 @@ pub fn analyze(
     }
     // The top: named, or the last entity no architecture instantiates and
     // no configuration configures, or the last configuration (§14.2).
-    let instantiated: Vec<String> = d.instantiated_entities();
+    let mut instantiated: Vec<String> = d.instantiated_entities();
+    instantiated.extend(mixed.roots.iter().map(|r| r.entity.clone()));
     let top_unit = match top {
         Some(t) => user_units
             .iter()
@@ -1124,9 +1137,61 @@ pub fn analyze(
             .find(|(_, n, cfg)| !instantiated.contains(n) && (*cfg || !configured.contains(n)))
             .cloned(),
     };
-    let Some((lib, name, is_cfg)) = top_unit else {
-        return Err(vec!["VHDL: no top-level entity found".to_string()]);
+    let top = match top_unit {
+        Some(u) => Some(analyze_top(&mut d, u)?),
+        None if !mixed.roots.is_empty() => None,
+        None => return Err(vec!["VHDL: no top-level entity found".to_string()]),
     };
+    // The entities instantiated from SV: each an elaboration root.
+    let mut roots = Vec::new();
+    let mut root_errs = Vec::new();
+    for r in &mixed.roots {
+        match analyze_root(&mut d, &user_units, r) {
+            Ok(a) => roots.push(a),
+            Err(e) => {
+                root_errs.push(e);
+                roots.push(0);
+            }
+        }
+    }
+    if !root_errs.is_empty() {
+        root_errs.extend(d.render_errors());
+        return Err(root_errs);
+    }
+    analyze_instantiated(&mut d);
+    // Package bodies of every package used, then the library subprogram
+    // bodies the design reaches.
+    // A body's context may use further packages.
+    let mut done: std::collections::BTreeSet<PkgKey> = Default::default();
+    loop {
+        let pkgs: Vec<PkgKey> = d
+            .packages
+            .keys()
+            .filter(|k| !done.contains(*k))
+            .cloned()
+            .collect();
+        if pkgs.is_empty() {
+            break;
+        }
+        for (lib, name) in pkgs {
+            d.analyze_package_body(&lib, &name);
+            done.insert((lib, name));
+        }
+    }
+    d.analyze_reachable_bodies();
+    if !d.errors.is_empty() {
+        return Err(d.render_errors());
+    }
+    Ok(Analysed {
+        design: d,
+        top,
+        roots,
+    })
+}
+
+/// The top-level entity's (or configuration's) architecture.
+fn analyze_top(d: &mut Design, unit: (String, String, bool)) -> Result<usize, Vec<String>> {
+    let (lib, name, is_cfg) = unit;
     let top = if is_cfg {
         match d.config_by_name(&lib, &name) {
             Some((elib, ename, arch, config)) => {
@@ -1156,10 +1221,81 @@ pub fn analyze(
     if !d.errors.is_empty() {
         return Err(d.render_errors());
     }
-    let Some(top) = top else {
-        return Err(vec![format!("VHDL: entity '{}' has no architecture", name)]);
+    top.ok_or_else(|| vec![format!("VHDL: entity '{}' has no architecture", name)])
+}
+
+/// The architecture of an entity an SV module instantiates, analysed for
+/// the instance's parameter values.
+fn analyze_root(
+    d: &mut Design,
+    user_units: &[(String, String, bool)],
+    r: &RootReq,
+) -> Result<usize, String> {
+    let lib = user_units
+        .iter()
+        .find(|(_, n, cfg)| !cfg && *n == r.entity)
+        .map(|(l, _, _)| l.clone())
+        .ok_or_else(|| {
+            format!(
+                "VHDL: no entity '{}' (instantiated in module '{}')",
+                r.entity, r.from
+            )
+        })?;
+    let no_arch = || {
+        format!(
+            "VHDL: entity '{}' (instantiated in module '{}') has no architecture",
+            r.entity, r.from
+        )
     };
-    // Analyse the architectures the design instantiates.
+    let info = d.analyze_entity(&lib, &r.entity).ok_or_else(no_arch)?;
+    let mut binding = Vec::new();
+    for (k, (name, v)) in r.generics.iter().enumerate() {
+        let g = match name {
+            Some(n) => info
+                .generics
+                .iter()
+                .copied()
+                .find(|g| d.objects[*g].name == *n),
+            None => info.generics.get(k).copied(),
+        };
+        let gname = name.clone().unwrap_or_else(|| format!("#{}", k + 1));
+        let Some(g) = g else {
+            return Err(format!(
+                "VHDL: entity '{}' has no generic '{}' (instantiated in module '{}')",
+                r.entity, gname, r.from
+            ));
+        };
+        let Some(val) = d.foreign_value(d.objects[g].ty, v) else {
+            return Err(format!(
+                "VHDL: the value of parameter '{}' of module '{}''s instance of '{}' does not convert to the generic's type",
+                gname, r.from, r.entity
+            ));
+        };
+        binding.push((d.objects[g].name.clone(), val));
+    }
+    let a = if binding.is_empty() {
+        d.analyze_arch(&lib, &r.entity, None)
+    } else {
+        let inst = Instance {
+            label: String::new(),
+            library: lib.clone(),
+            entity: r.entity.clone(),
+            arch: None,
+            arch_index: None,
+            generic_map: Vec::new(),
+            port_map: Vec::new(),
+            port_conv: Vec::new(),
+            generic_types: Vec::new(),
+            config: None,
+            loc: info.loc.clone(),
+        };
+        d.analyze_bound_arch(&inst, binding).map(|r| r.0)
+    };
+    a.ok_or_else(no_arch)
+}
+
+/// Analyse the architectures the design instantiates, below the roots.
+fn analyze_instantiated(d: &mut Design) {
     let mut i = 0;
     while i < d.archs.len() {
         let insts = d.archs[i].instances.clone();
@@ -1171,8 +1307,9 @@ pub fn analyze(
             // Generic values other than the defaults: a bound analysis.
             let mut binding = Vec::new();
             for (f, e) in &inst.generic_map {
+                let v = d.eval_static(e);
                 let fo = &d.objects[*f];
-                match d.eval(e) {
+                match v {
                     Some(v) => {
                         if fo.static_val.as_ref() != Some(&v) {
                             binding.push((fo.name.clone(), v));
@@ -1226,30 +1363,6 @@ pub fn analyze(
         }
         i += 1;
     }
-    // Package bodies of every package used, then the library subprogram
-    // bodies the design reaches.
-    // A body's context may use further packages.
-    let mut done: std::collections::BTreeSet<PkgKey> = Default::default();
-    loop {
-        let pkgs: Vec<PkgKey> = d
-            .packages
-            .keys()
-            .filter(|k| !done.contains(*k))
-            .cloned()
-            .collect();
-        if pkgs.is_empty() {
-            break;
-        }
-        for (lib, name) in pkgs {
-            d.analyze_package_body(&lib, &name);
-            done.insert((lib, name));
-        }
-    }
-    d.analyze_reachable_bodies();
-    if !d.errors.is_empty() {
-        return Err(d.render_errors());
-    }
-    Ok(Analysed { design: d, top })
 }
 
 impl Design {

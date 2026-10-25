@@ -144,7 +144,7 @@ impl Design {
                             }
                         },
                     };
-                    let static_val = init.as_ref().and_then(|e| self.eval(e));
+                    let static_val = init.as_ref().and_then(|e| self.eval_static(e));
                     let id = self.add_obj(ObjInfo {
                         name: n.name.clone(),
                         kind: ObjKind::Constant,

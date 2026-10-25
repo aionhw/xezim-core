@@ -13,6 +13,7 @@
 
 pub mod ast;
 mod cst;
+mod foreign;
 pub mod libraries;
 mod lower;
 pub mod sema;
@@ -72,7 +73,14 @@ pub fn cache_digest() -> Option<u64> {
 
 /// Parse the configured VHDL sources and add the lowered design to
 /// `descriptions`. Returns the top module to use when none was named.
-pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, String> {
+///
+/// In a mixed-language design the SV instances of VHDL entities are
+/// pointed at modules lowered for them, and the VHDL top level is the top
+/// only when no SV module is left uninstantiated.
+pub fn inject(
+    descriptions: &mut Vec<Description>,
+    top: Option<&str>,
+) -> Result<Option<String>, String> {
     let Some(cfg) = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return Ok(None);
     };
@@ -100,21 +108,84 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
             }
         }
     }
+    // The SV side: its modules, and its instances of VHDL entities.
+    let mut entities = std::collections::BTreeSet::new();
+    for p in &parsed {
+        for u in p.ast.iter().flat_map(|a| &a.units) {
+            if let ast::LibraryUnit::Entity(e) = &u.unit {
+                entities.insert(e.name.name.clone());
+            }
+        }
+    }
+    let sv_modules = foreign::sv_modules(descriptions);
+    let roots = foreign::root_requests(descriptions, &entities)?;
+    // A named VHDL top; SV tops are named as SV modules.
+    let vhdl_top = top
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| entities.contains(t) && !sv_modules.contains_key(t));
+    let mixed = sema::Mixed {
+        roots: roots.clone(),
+        sv_modules: sv_modules.clone(),
+    };
     let files = cfg
         .files
         .iter()
         .map(|f| f.library.clone())
         .zip(parsed)
         .collect();
-    let analysed = sema::analyze(files, None)
+    let mut analysed = sema::analyze(files, vhdl_top.as_deref(), &mixed)
         .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
-    let lowered = lower::lower(&analysed)
+    // An SV top (named, or an SV module nothing instantiates) leaves the
+    // VHDL top level out unless that is named.
+    let from_vhdl: std::collections::HashSet<String> = analysed
+        .design
+        .archs
+        .iter()
+        .flat_map(|a| a.foreign.iter().map(|f| f.module.clone()))
+        .collect();
+    if vhdl_top.is_none() && (top.is_some() || has_sv_top(descriptions, &from_vhdl)) {
+        analysed.top = None;
+    }
+    // A module per root, named after its entity (with a suffix for a
+    // second binding, or a clash with an SV module).
+    let mut names: Vec<String> = Vec::new();
+    for r in &roots {
+        let base = lower_ident(&r.entity);
+        let mut name = base.clone();
+        let mut k = 1;
+        while sv_modules.contains_key(&name.to_ascii_lowercase()) || names.contains(&name) {
+            name = format!("{}__vh{}", base, k);
+            k += 1;
+        }
+        names.push(name);
+    }
+    let lowered = lower::lower(&analysed, &names)
         .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
     if std::env::var_os("XEZIM_VHDL_DUMP").is_some() {
         eprintln!("{}", lowered.sv);
     }
+    foreign::rewrite(descriptions, &roots, &names);
     descriptions.extend(parse_generated(&lowered.sv)?);
-    Ok(Some(lowered.top))
+    Ok(lowered.top)
+}
+
+/// Whether some SV module is a top: neither an SV module nor the VHDL
+/// design (`from_vhdl`) instantiates it.
+fn has_sv_top(descs: &[Description], from_vhdl: &std::collections::HashSet<String>) -> bool {
+    let mut inst = from_vhdl.clone();
+    for d in descs {
+        if let Description::Module(m) = d {
+            crate::collect_instantiated_modules(&m.items, &mut inst);
+        }
+    }
+    descs
+        .iter()
+        .any(|d| matches!(d, Description::Module(m) if !inst.contains(&m.name.name)))
+}
+
+/// The SV name of a VHDL identifier.
+fn lower_ident(s: &str) -> String {
+    lower::sv_ident(&s.to_ascii_lowercase())
 }
 
 /// Base of the spans of generated SystemVerilog, far above any source
@@ -160,7 +231,7 @@ pub fn check_design(sources: &[(&str, &str, &[u8])]) -> Vec<String> {
         }
         files.push((lib.to_string(), p));
     }
-    match sema::analyze(files, None) {
+    match sema::analyze(files, None, &sema::Mixed::default()) {
         Ok(_) => Vec::new(),
         Err(e) => e,
     }

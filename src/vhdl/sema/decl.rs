@@ -1306,6 +1306,24 @@ impl Design {
 
     /// The range of a scalar (sub)type as an `HRange`.
     pub fn type_range(&mut self, t: TypeId, span: ast::Span) -> Option<HRange> {
+        // The nearest range constraint; a non-static one is its
+        // expression (`integer range 0 to a'length - 1`).
+        let mut cur = t;
+        loop {
+            match &self.types[cur].kind {
+                TypeKind::Subtype {
+                    constraint: Some(HConstraint::Range(hr)),
+                    ..
+                } => {
+                    if hr.static_val.is_none() {
+                        return Some(hr.clone());
+                    }
+                    break;
+                }
+                TypeKind::Subtype { base, .. } => cur = *base,
+                _ => break,
+            }
+        }
         let sr = self.scalar_range(t);
         match sr {
             Some(sr) => {
@@ -1361,7 +1379,7 @@ impl Design {
         };
         let init = o.value.as_ref().and_then(|v| self.expr(r, v, Some(ty)));
         let static_val = match (kind, &init) {
-            (ObjKind::Constant, Some(i)) => self.eval(i),
+            (ObjKind::Constant, Some(i)) => self.eval_static(i),
             _ => None,
         };
         let mut out = Vec::new();
@@ -1708,6 +1726,7 @@ impl Design {
             processes: Vec::new(),
             instances: Vec::new(),
             nested: false,
+            foreign: Vec::new(),
             loc: self.loc(a.name.span.clone()),
         };
         for s in &a.stmts {

@@ -3,7 +3,7 @@
 //! slice, conversion, field, attribute), aggregates, literals, and static
 //! evaluation of locally and globally static expressions.
 
-use super::decl::{expr_to_discrete_range, lit_expr, name_text, to_f64};
+use super::decl::{expr_to_discrete_range, lit_expr, name_text};
 use super::hir::*;
 use super::predefined::TypeSet;
 use super::{Design, RegionId, Sym};
@@ -872,6 +872,17 @@ impl Design {
                     }
                 }
             }
+            // An indexed name, slice or call as the prefix of another
+            // (`a(i)(j)`): its value, when it analyses without errors.
+            NameKind::Call(..) => {
+                let n_err = self.errors.len();
+                let h = self.name_expr(r, n, None);
+                if self.errors.len() > n_err {
+                    self.errors.truncate(n_err);
+                    return None;
+                }
+                h.map(Denot::Expr)
+            }
             _ => None,
         }
     }
@@ -1654,7 +1665,7 @@ impl Design {
                 let rr = self.expr(r, right, t.or(Some(l.ty)))?;
                 // Both universal: the right one's type follows the left.
                 let l = self.implicit_convert(l, Some(rr.ty));
-                let static_val = match (self.eval(&l), self.eval(&rr)) {
+                let static_val = match (self.eval_static(&l), self.eval_static(&rr)) {
                     (Some(a), Some(b)) => Some(StaticRange {
                         left: a,
                         dir: *dir,
@@ -1990,80 +2001,10 @@ impl Design {
 
     /// The value of a static expression (`None` when not static).
     pub fn eval(&self, h: &HExpr) -> Option<Value> {
-        match &h.kind {
-            HExprKind::Lit(v) => Some(v.clone()),
-            HExprKind::Obj(o) => match self.objects[*o].kind {
-                ObjKind::Constant | ObjKind::Generic => self.objects[*o].static_val.clone(),
-                _ => None,
-            },
-            HExprKind::Qualified(x) => self.eval(x),
-            HExprKind::RecordAgg(vals) => Some(Value::Record(
-                vals.iter()
-                    .map(|v| self.eval(v))
-                    .collect::<Option<Vec<_>>>()?,
-            )),
-            HExprKind::Convert(x) => {
-                let v = self.eval(x)?;
-                let t = self.base(h.ty);
-                if self.is_integer(t) {
-                    match v {
-                        Value::Real(r) => Some(Value::Int(r.round() as i64)),
-                        Value::Int(i) => Some(Value::Int(i)),
-                        _ => None,
-                    }
-                } else if self.is_real(t) {
-                    Some(Value::Real(to_f64(&v)))
-                } else {
-                    Some(v)
-                }
-            }
-            HExprKind::Call(id, args) => {
-                let s = &self.subprograms[*id];
-                let Some(Builtin::Op(op)) = &s.builtin else {
-                    return None;
-                };
-                let vals: Option<Vec<Value>> = args.iter().map(|a| self.eval(a)).collect();
-                let vals = vals?;
-                self.eval_op(op, &vals, h.ty, args)
-            }
-            HExprKind::Attr(name, prefix, param) => {
-                let p = param.as_ref().and_then(|x| self.eval(x));
-                match prefix.as_ref() {
-                    AttrPrefix::Type(t) => self.eval_type_attr(name, *t, p),
-                    AttrPrefix::Expr(x) => {
-                        // Array attributes of a constrained object.
-                        let dim = p.and_then(|v| v.as_i64()).unwrap_or(1) as usize - 1;
-                        let ranges = self.array_index_ranges(x.ty)?;
-                        let sr = ranges.get(dim)?.clone()?;
-                        let (l, rr) = (sr.left.as_i64()?, sr.right.as_i64()?);
-                        match name.as_str() {
-                            "left" => Some(sr.left.clone()),
-                            "right" => Some(sr.right.clone()),
-                            "high" => Some(if sr.dir == Dir::To {
-                                sr.right.clone()
-                            } else {
-                                sr.left.clone()
-                            }),
-                            "low" => Some(if sr.dir == Dir::To {
-                                sr.left.clone()
-                            } else {
-                                sr.right.clone()
-                            }),
-                            "length" => Some(Value::Int(match sr.dir {
-                                Dir::To => (rr - l + 1).max(0),
-                                Dir::Downto => (l - rr + 1).max(0),
-                            })),
-                            "ascending" => Some(Value::Enum((sr.dir == Dir::To) as u32)),
-                            _ => None,
-                        }
-                    }
-                }
-            }
-            _ => None,
-        }
+        super::ceval::Interp::new(self).expr(h)
     }
 
-    fn eval_type_attr(&self, name: &str, t: TypeId, p: Option<Value>) -> Option<Value> {
+    pub(super) fn eval_type_attr(&self, name: &str, t: TypeId, p: Option<Value>) -> Option<Value> {
         if self.is_scalar(t) {
             let sr = self.scalar_range(t)?;
             let asc = sr.dir == Dir::To;
@@ -2133,7 +2074,7 @@ impl Design {
     }
 
     /// A predefined operator on static values.
-    fn eval_op(&self, op: &str, v: &[Value], ty: TypeId, args: &[HExpr]) -> Option<Value> {
+    pub(super) fn eval_op(&self, op: &str, v: &[Value], ty: TypeId, args: &[HExpr]) -> Option<Value> {
         let bool_v = |b: bool| Value::Enum(b as u32);
         match (op, v) {
             ("+", [Value::Int(a), Value::Int(b)]) => a.checked_add(*b).map(Value::Int),

@@ -364,6 +364,22 @@ pub struct Architecture {
     /// A block statement or generate iteration (§11.2, §11.8): a scope
     /// nested in its parent's, instantiated in place.
     pub nested: bool,
+    /// Components bound to SystemVerilog modules.
+    pub foreign: Vec<ForeignInst>,
+    pub loc: Loc,
+}
+
+/// A component instance bound to an SV module of the component's name (a
+/// mixed-language design; the default binding finds no entity, §7.3.3).
+#[derive(Clone, Debug)]
+pub struct ForeignInst {
+    pub label: String,
+    /// The SV module, named as declared.
+    pub module: String,
+    /// The component's generics and their values (actual or default).
+    pub generics: Vec<(ObjId, Option<HExpr>)>,
+    /// The component's ports and their actuals (`None`: open).
+    pub ports: Vec<(ObjId, Option<HExpr>)>,
     pub loc: Loc,
 }
 

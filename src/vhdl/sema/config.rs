@@ -323,6 +323,7 @@ impl Design {
             })
             .collect();
         let cp: Vec<(ObjId, Option<HExpr>)> = cp.into_iter().map(|(f, a, _)| (f, a)).collect();
+        self.check_generic_actuals(&cg, &loc);
         let cfg_binding = self
             .cur_cfg
             .and_then(|c| self.component_config(c, label, &comp.name));
@@ -371,6 +372,26 @@ impl Design {
             }
         });
         let Some((lib, ename, mut archn, mut cfg)) = entity else {
+            // No entity by default: an SV module of the component's name
+            // (a mixed-language design).
+            if ind.is_none()
+                && let Some(m) = self.sv_modules.get(&comp.name).map(|m| m.name.clone())
+            {
+                if !cconv.is_empty() {
+                    self.error(
+                        loc.span.clone(),
+                        "a port of a SystemVerilog module cannot be associated through a conversion",
+                    );
+                }
+                arch.foreign.push(ForeignInst {
+                    label: label.to_string(),
+                    module: m,
+                    generics: cg,
+                    ports: cp,
+                    loc,
+                });
+                return;
+            }
             // Unbound: the instance is absent (GHDL warns at elaboration).
             return;
         };

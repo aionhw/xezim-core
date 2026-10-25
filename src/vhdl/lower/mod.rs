@@ -13,6 +13,8 @@
 
 mod elab;
 mod files;
+mod mixed;
+mod records;
 mod runtime;
 mod textio;
 
@@ -68,7 +70,8 @@ impl Repr {
 
 pub struct Lowered {
     pub sv: String,
-    pub top: String,
+    /// The module of the VHDL top level, if any.
+    pub top: Option<String>,
 }
 
 struct Lw<'a> {
@@ -155,80 +158,130 @@ struct Lw<'a> {
     pre_stmts: Vec<(String, String, String)>,
     /// Temporaries of the current scope: (name, type).
     temps: Vec<(String, String)>,
+    /// A root instantiated from SV: the module's name (it has ports).
+    boundary: Option<String>,
+    /// SV values driving VHDL signals, VHDL signals written to SV.
+    fins: Vec<mixed::ForeignIn>,
+    fouts: Vec<mixed::ForeignOut>,
+    /// SV module instances (VHDL components bound to SV modules) and their
+    /// wires; a counter naming their nets.
+    sv_items: String,
+    sv_nets: usize,
+    /// Processes with a sensitivity list, lowered as functions.
+    fprocs: BTreeSet<usize>,
 }
 
 /// Lower the analysed design.
-pub fn lower(an: &Analysed) -> Result<Lowered, Vec<String>> {
+/// Lower the analysed design: the VHDL top level, and a module for each
+/// entity instantiated from SystemVerilog (named by `roots`).
+pub fn lower(an: &Analysed, roots: &[String]) -> Result<Lowered, Vec<String>> {
     let d = &an.design;
-    let arch = &d.archs[an.top];
-    let mut lw = Lw {
-        d,
-        type_defs: String::new(),
-        arr_types: BTreeSet::new(),
-        heaps: BTreeSet::new(),
-        heap_defs: String::new(),
-        textio: false,
-        files: false,
-        prots: BTreeSet::new(),
-        prot_defs: String::new(),
-        cur_self: None,
-        logic_arrs: BTreeSet::new(),
-        rec_types: BTreeMap::new(),
-        lits: HashMap::new(),
-        lit_items: String::new(),
-        dflt: HashMap::new(),
-        errors: Vec::new(),
-        sigs: Vec::new(),
-        sig_map: HashMap::new(),
-        insts: Vec::new(),
-        arch_objs: Vec::new(),
-        inst: 0,
-        procs: Vec::new(),
-        drivers: BTreeMap::new(),
-        links: Vec::new(),
-        sites: Vec::new(),
-        pkg_objs: BTreeSet::new(),
-        read_last: false,
-        subs_done: BTreeSet::new(),
-        subs_todo: Vec::new(),
-        sub_items: String::new(),
-        cur_proc: None,
-        imps: Vec::new(),
-        imp_keys: HashMap::new(),
-        imp_refs: Vec::new(),
-        need_lact: BTreeSet::new(),
-        drv_checks: Vec::new(),
-        read_drv: None,
-        forced: BTreeSet::new(),
-        specs: Vec::new(),
-        spec_keys: HashMap::new(),
-        spec_todo: Vec::new(),
-        tmp: 0,
-        loops: Vec::new(),
-        loop_flags: BTreeSet::new(),
-        pre_stmts: Vec::new(),
-        temps: Vec::new(),
-    };
-    // STRING (messages) first.
-    lw.arr_type(&Repr::U8);
-    let sv = lw.module(an.top);
-    if !lw.errors.is_empty() {
-        lw.errors.dedup();
-        return Err(lw.errors);
+    let mut sv = String::new();
+    let mut errors = Vec::new();
+    let mut top = None;
+    let mut units: Vec<(usize, Option<String>)> = Vec::new();
+    if let Some(t) = an.top {
+        units.push((t, None));
+        top = Some(sv_ident(&d.archs[t].entity));
     }
-    Ok(Lowered {
-        sv,
-        top: arch.entity.clone(),
-    })
+    for (a, name) in an.roots.iter().zip(roots) {
+        units.push((*a, Some(name.clone())));
+    }
+    for (a, boundary) in units {
+        let mut lw = Lw::new(d, boundary);
+        // STRING (messages) first.
+        lw.arr_type(&Repr::U8);
+        let m = lw.module(a);
+        if lw.errors.is_empty() {
+            sv.push_str(&m);
+        } else {
+            lw.errors.dedup();
+            errors.extend(lw.errors);
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(Lowered { sv, top })
 }
 
-fn sv_ident(s: &str) -> String {
+impl<'a> Lw<'a> {
+    fn new(d: &'a Design, boundary: Option<String>) -> Self {
+        Lw {
+            d,
+            type_defs: String::new(),
+            arr_types: BTreeSet::new(),
+            heaps: BTreeSet::new(),
+            heap_defs: String::new(),
+            textio: false,
+            files: false,
+            prots: BTreeSet::new(),
+            prot_defs: String::new(),
+            cur_self: None,
+            logic_arrs: BTreeSet::new(),
+            rec_types: BTreeMap::new(),
+            lits: HashMap::new(),
+            lit_items: String::new(),
+            dflt: HashMap::new(),
+            errors: Vec::new(),
+            sigs: Vec::new(),
+            sig_map: HashMap::new(),
+            insts: Vec::new(),
+            arch_objs: Vec::new(),
+            inst: 0,
+            procs: Vec::new(),
+            drivers: BTreeMap::new(),
+            links: Vec::new(),
+            sites: Vec::new(),
+            pkg_objs: BTreeSet::new(),
+            read_last: false,
+            subs_done: BTreeSet::new(),
+            subs_todo: Vec::new(),
+            sub_items: String::new(),
+            cur_proc: None,
+            imps: Vec::new(),
+            imp_keys: HashMap::new(),
+            imp_refs: Vec::new(),
+            need_lact: BTreeSet::new(),
+            drv_checks: Vec::new(),
+            read_drv: None,
+            forced: BTreeSet::new(),
+            specs: Vec::new(),
+            spec_keys: HashMap::new(),
+            spec_todo: Vec::new(),
+            tmp: 0,
+            loops: Vec::new(),
+            loop_flags: BTreeSet::new(),
+            pre_stmts: Vec::new(),
+            temps: Vec::new(),
+            boundary,
+            fins: Vec::new(),
+            fouts: Vec::new(),
+            sv_items: String::new(),
+            sv_nets: 0,
+            fprocs: BTreeSet::new(),
+        }
+    }
+}
+
+/// The SV name of a VHDL object on the language boundary (a port or a
+/// mirrored signal): escaped when it is an SV keyword.
+fn port_ident(s: &str) -> String {
+    let id = sv_ident(s);
+    if crate::sv_parser::lexer::token::keyword(&id).is_some() {
+        format!("\\{} ", id)
+    } else {
+        id
+    }
+}
+
+pub(super) fn sv_ident(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
 }
 
-fn sv_string(s: &str) -> String {
+pub(super) fn sv_string(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {

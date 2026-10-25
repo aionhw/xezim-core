@@ -82,6 +82,8 @@ pub(super) enum Part {
     Elem(i64),
     /// Offset and length; the bounds are the formal's.
     Slice(i64, i64),
+    /// An element of a record signal: the field indices from the record.
+    Field(Vec<usize>),
 }
 
 #[derive(Clone, Debug)]
@@ -107,7 +109,7 @@ impl Cov {
             _ => *self = Cov::All,
         }
     }
-    fn covers(&self, k: i64) -> bool {
+    pub(super) fn covers(&self, k: i64) -> bool {
         match self {
             Cov::All => true,
             Cov::Set(s) => s.contains(&k),
@@ -151,6 +153,8 @@ enum Target {
     /// Signal, offset of the first element (SV), number of elements
     /// (`None`: one element), coverage.
     Slots(usize, String, Option<String>, Cov),
+    /// An element of a record signal: signal, element path, leaves covered.
+    Field(usize, Vec<usize>, Cov),
 }
 
 /// Package objects and top-level instance objects keep plain names.
@@ -158,7 +162,7 @@ pub(super) const GLOBAL: usize = usize::MAX;
 
 /// Driver ids from here on are the drivers of port associations with a
 /// formal conversion or partial formal (`Link`), not processes.
-const PSEUDO: usize = 1 << 30;
+pub(super) const PSEUDO: usize = 1 << 30;
 
 /// A port association through a conversion or a partial formal: a
 /// signal (part) computed from others without a delta (§14.7.3.4). Mode
@@ -175,6 +179,8 @@ pub(super) struct Link {
     pub sources: Vec<usize>,
     /// Mode `out`: the driver of the actual.
     pub drv: usize,
+    /// A driver with an SV value (`mixed::ForeignIn`, by index).
+    pub foreign: Option<usize>,
 }
 
 impl<'a> Lw<'a> {
@@ -333,10 +339,11 @@ impl<'a> Lw<'a> {
                 self.sig_sources(vctx, &pc.value, &mut sources);
                 let drv = PSEUDO + self.links.len();
                 if !inn {
-                    let (cov, slots) = match target.part {
+                    let (cov, slots) = match &target.part {
+                        Part::Field(path) => (self.path_cov(self.sigs[target.sig].ty, path), true),
                         Part::Whole => (Cov::All, false),
-                        Part::Elem(k) => (Cov::Set([k].into_iter().collect()), true),
-                        Part::Slice(k, n) => (Cov::Set((k..k + n).collect()), true),
+                        Part::Elem(k) => (Cov::Set([*k].into_iter().collect()), true),
+                        Part::Slice(k, n) => (Cov::Set((*k..*k + *n).collect()), true),
                     };
                     self.add_driver(target.sig, drv, cov, slots);
                 }
@@ -347,14 +354,20 @@ impl<'a> Lw<'a> {
                     ctx: vctx,
                     sources,
                     drv,
+                    foreign: None,
                 });
             }
             self.elab_inst(child);
         }
+        // SV modules bound to components.
+        let foreign = self.d.archs[ai].foreign.clone();
+        for fi in &foreign {
+            self.sv_instance(inst, fi);
+        }
     }
 
     /// The signal (part) an actual names in the context of `inst`.
-    fn actual_ref(&self, inst: usize, e: &HExpr) -> Option<SigRef> {
+    pub(super) fn actual_ref(&self, inst: usize, e: &HExpr) -> Option<SigRef> {
         match &e.kind {
             HExprKind::Obj(o) => self.lookup_sig(inst, *o),
             HExprKind::Index(b, idx) if idx.len() == 1 => {
@@ -375,6 +388,19 @@ impl<'a> Lw<'a> {
                     part: Part::Slice(off, sr.length()),
                 })
             }
+            HExprKind::Field(b, i) => {
+                let base = self.actual_ref(inst, b)?;
+                let mut path = match base.part {
+                    Part::Whole => Vec::new(),
+                    Part::Field(p) => p,
+                    _ => return None,
+                };
+                path.push(*i);
+                Some(SigRef {
+                    sig: base.sig,
+                    part: Part::Field(path),
+                })
+            }
             _ => None,
         }
     }
@@ -383,7 +409,7 @@ impl<'a> Lw<'a> {
     fn part_offset(&self, base: &SigRef, ty: TypeId, i: i64) -> Option<i64> {
         let (l, dir, _) = match base.part {
             Part::Whole | Part::Slice(..) => self.static_bounds(ty)?,
-            Part::Elem(_) => return None,
+            Part::Elem(_) | Part::Field(_) => return None,
         };
         let rel = match dir {
             Dir::To => i - l,
@@ -445,8 +471,33 @@ impl<'a> Lw<'a> {
         } else {
             format!("vh_dv{}_{}", s, l.drv)
         };
-        let assign = match l.target.part {
-            Part::Whole => {
+        let assign = match (l.target.part.clone(), l.foreign) {
+            (Part::Field(path), f) => {
+                let v = match f {
+                    Some(k) => self.foreign_value(k),
+                    None => self.ex(&l.value),
+                };
+                format!("    {}{} = {};\n", dst, Self::path_sv(&path), v)
+            }
+            (Part::Whole, Some(k)) => {
+                let v = self.foreign_value(k);
+                format!("    {} = {};\n", dst, v)
+            }
+            (Part::Elem(e), Some(k)) => {
+                let v = self.foreign_value(k);
+                format!("    {}.d[{}] = {};\n", dst, e, v)
+            }
+            (Part::Slice(e, len), Some(k)) => {
+                let v = self.foreign_value(k);
+                format!(
+                    "    vh_lv = {v};\n    for (int j = 0; j < {len}; j++) {dst}.d[{e} + j] = vh_lv.d[j];\n",
+                    v = v,
+                    len = len,
+                    dst = dst,
+                    e = e
+                )
+            }
+            (Part::Whole, None) => {
                 let target = HExpr {
                     kind: HExprKind::Obj(sig.obj),
                     ty: sig.ty,
@@ -455,11 +506,11 @@ impl<'a> Lw<'a> {
                 let v = self.store_value_init(&target, &l.value);
                 format!("    {} = {};\n", dst, v)
             }
-            Part::Elem(k) => {
+            (Part::Elem(k), None) => {
                 let v = self.ex(&l.value);
                 format!("    {}.d[{}] = {};\n", dst, k, v)
             }
-            Part::Slice(k, len) => {
+            (Part::Slice(k, len), None) => {
                 let v = self.ex(&l.value);
                 let (f, line, _) = self.file_line(&l.value.loc);
                 format!(
@@ -479,7 +530,13 @@ impl<'a> Lw<'a> {
             let _ = writeln!(temps, "    {} {};", t, name);
         }
         if let Part::Slice(..) = l.target.part {
-            let vt = self.repr(l.value.ty, &l.value.loc).sv();
+            let vt = match l.foreign {
+                Some(k) => {
+                    let ft = self.fins[k].ty;
+                    self.repr(ft, &l.value.loc).sv()
+                }
+                None => self.repr(l.value.ty, &l.value.loc).sv(),
+            };
             let _ = writeln!(temps, "    {} vh_lv;", vt);
         }
         self.inst = saved;
@@ -635,6 +692,7 @@ impl<'a> Lw<'a> {
         };
         match r.part {
             Part::Whole => base,
+            Part::Field(path) => format!("{}{}", base, Self::path_sv(&path)),
             Part::Elem(off) => format!("{}.d[{}]", base, off),
             Part::Slice(off, len) => {
                 let ty = self.d.objects[o].ty;
@@ -1109,9 +1167,21 @@ impl<'a> Lw<'a> {
     fn target(&mut self, t: &HExpr) -> Option<Target> {
         let (f, l, _) = self.file_line(&t.loc);
         match &t.kind {
+            HExprKind::Field(..) => {
+                let r = self.actual_ref(self.inst, t)?;
+                let Part::Field(path) = r.part else {
+                    return None;
+                };
+                let cov = self.path_cov(self.sigs[r.sig].ty, &path);
+                Some(Target::Field(r.sig, path, cov))
+            }
             HExprKind::Obj(o) => {
                 let r = self.lookup_sig(self.inst, *o)?;
                 Some(match r.part {
+                    Part::Field(path) => {
+                        let cov = self.path_cov(self.sigs[r.sig].ty, &path);
+                        Target::Field(r.sig, path, cov)
+                    }
                     Part::Whole => Target::Whole(r.sig),
                     Part::Elem(off) => Target::Slots(
                         r.sig,
@@ -1135,7 +1205,7 @@ impl<'a> Lw<'a> {
                 let (base_off, base_cov) = match r.part {
                     Part::Whole => (0, Cov::All),
                     Part::Slice(off, len) => (off, Cov::Set((off..off + len).collect())),
-                    Part::Elem(_) => return None,
+                    Part::Elem(_) | Part::Field(_) => return None,
                 };
                 let bv = self.ex(b);
                 let i = self.ex(&idx[0]);
@@ -1164,7 +1234,7 @@ impl<'a> Lw<'a> {
                 let (base_off, base_cov) = match r.part {
                     Part::Whole => (0, Cov::All),
                     Part::Slice(off, len) => (off, Cov::Set((off..off + len).collect())),
-                    Part::Elem(_) => return None,
+                    Part::Elem(_) | Part::Field(_) => return None,
                 };
                 let bv = self.ex(b);
                 let (left, right, dn) = self.range_parts(rg);
@@ -1229,6 +1299,14 @@ impl<'a> Lw<'a> {
             Target::Slots(s, off, n, cov) => {
                 self.add_driver(*s, p, cov.clone(), true);
                 (*s, Some((off.clone(), n.clone())))
+            }
+            Target::Field(s, path, cov) => {
+                self.add_driver(*s, p, cov.clone(), true);
+                if self.sig_kind(*s).is_some() {
+                    self.err(&loc, "an assignment to an element of a guarded signal is not supported yet");
+                    return String::new();
+                }
+                return self.field_assign(*s, p, path, target, delay, waves, ind);
             }
         };
         // A driver of an out port starts with the port's default value
@@ -1310,6 +1388,73 @@ impl<'a> Lw<'a> {
         out
     }
 
+    /// A signal assignment to element `path` of record signal `s`: each
+    /// leaf it covers gets a transaction on its own waveform.
+    #[allow(clippy::too_many_arguments)]
+    fn field_assign(
+        &mut self,
+        s: usize,
+        p: usize,
+        path: &[usize],
+        target: &HExpr,
+        delay: Option<&HDelay>,
+        waves: &[HWave],
+        ind: usize,
+    ) -> String {
+        let pad = " ".repeat(ind);
+        let loc = target.loc.clone();
+        let leaves: Vec<(usize, Vec<usize>)> = self
+            .rec_leaves(self.sigs[s].ty)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (lp, _))| lp.starts_with(path))
+            .map(|(j, (lp, _))| (j, lp[path.len()..].to_vec()))
+            .collect();
+        let transport = matches!(delay, Some(HDelay::Transport));
+        let reject = match delay {
+            Some(HDelay::Inertial(Some(r))) => Some(self.ex(r)),
+            _ => None,
+        };
+        let mut out = String::new();
+        let vt = self.repr(target.ty, &loc).sv();
+        for (i, w) in waves.iter().enumerate() {
+            let t = match &w.after {
+                Some(a) => self.ex(a),
+                None => "64'sd0".into(),
+            };
+            let Some(v) = &w.value else {
+                self.err(&loc, "null transactions to part of a signal are not supported yet");
+                continue;
+            };
+            let val = self.store_value(target, v);
+            let (mode, rej) = if i == 0 && !transport {
+                (1, reject.clone().unwrap_or_else(|| t.clone()))
+            } else {
+                (if i == 0 { 0 } else { 2 }, "64'sd0".into())
+            };
+            let tmp = format!("vh_rf{}", self.tmp);
+            self.tmp += 1;
+            self.temps.push((tmp.clone(), vt.clone()));
+            let _ = writeln!(out, "{}{} = {};", pad, tmp, val);
+            for (j, sub) in &leaves {
+                let _ = writeln!(
+                    out,
+                    "{}vh_drl_{}_{}_{}({}{}, {}, {}, {});",
+                    pad,
+                    s,
+                    p,
+                    j,
+                    tmp,
+                    Self::path_sv(sub),
+                    t,
+                    rej,
+                    mode
+                );
+            }
+        }
+        out
+    }
+
     /// `s <= force v` / `s <= release` (§10.5.2.1): a request applied in
     /// the next simulation cycle (§14.7.3.1); a forced signal keeps the
     /// forced value whatever its drivers do, a released one takes their
@@ -1340,7 +1485,7 @@ impl<'a> Lw<'a> {
         }
     }
 
-    fn add_driver(&mut self, s: usize, p: usize, cov: Cov, slots: bool) {
+    pub(super) fn add_driver(&mut self, s: usize, p: usize, cov: Cov, slots: bool) {
         match self.drivers.get_mut(&(s, p)) {
             Some(d) => {
                 d.cov.add(cov);
@@ -1363,7 +1508,7 @@ impl<'a> Lw<'a> {
 
     /// The resolution function of a signal's subtype: of the signal itself
     /// (`false`) or of each element (`true`).
-    fn resolution(&self, t: TypeId) -> Option<(SubId, bool)> {
+    pub(super) fn resolution(&self, t: TypeId) -> Option<(SubId, bool)> {
         let mut cur = t;
         loop {
             match &self.d.types[cur].kind {
@@ -1396,6 +1541,12 @@ impl<'a> Lw<'a> {
     pub(super) fn module(&mut self, top: usize) -> String {
         let d = self.d;
         self.elaborate(top);
+        // A root instantiated from SV: its ports.
+        let ports = if self.boundary.is_some() {
+            self.boundary_ports(top)
+        } else {
+            String::new()
+        };
         // GUARD signals of guarded blocks (§11.2): implicit signals.
         for si in 0..self.sigs.len() {
             if let Some(e) = d.guards.get(&self.sigs[si].obj) {
@@ -1522,12 +1673,25 @@ impl<'a> Lw<'a> {
         }
         // Processes.
         let mut procs = String::new();
+        // A process with a sensitivity list cannot wait (§11.3): it is a
+        // function the kernel calls.
+        self.fprocs = self
+            .procs
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, ai, pi))| {
+                let p = &d.archs[*ai].processes[*pi];
+                p.sens.is_some() && !p.postponed
+            })
+            .map(|(gp, _)| gp)
+            .collect();
         for (gp, (inst, ai, pi)) in self.procs.clone().into_iter().enumerate() {
             let p = d.archs[ai].processes[pi].clone();
             self.inst = inst;
             self.cur_proc = Some(gp);
             self.temps.clear();
-            let body = self.stmts(&p.stmts, 6);
+            let func = self.fprocs.contains(&gp);
+            let body = self.stmts(&p.stmts, if func { 4 } else { 6 });
             let mut implicit = String::new();
             if let Some(sens) = &p.sens {
                 let conds = self.sensitivity(sens);
@@ -1549,6 +1713,17 @@ impl<'a> Lw<'a> {
             } else {
                 sv_ident(&p.label)
             };
+            if func {
+                let _ = write!(
+                    procs,
+                    "  // process {label}\n  function automatic void vh_run{gp}();\n{temps}{body}  endfunction\n",
+                    label = label,
+                    gp = gp,
+                    temps = temps,
+                    body = body
+                );
+                continue;
+            }
             let _ = write!(
                 procs,
                 "  // process {label}\n  initial begin : vh_p{gp}_{label}\n{temps}    wait (vh_go[{gp}]);\n    forever begin\n{body}{implicit}    end\n  end\n",
@@ -1628,7 +1803,14 @@ impl<'a> Lw<'a> {
         }
         let arch = &d.archs[top];
         let mut m = String::new();
-        let _ = writeln!(m, "module {};", sv_ident(&arch.entity));
+        match self.boundary.clone() {
+            Some(name) => {
+                let _ = writeln!(m, "module {}({});", name, ports);
+            }
+            None => {
+                let _ = writeln!(m, "module {};", sv_ident(&arch.entity));
+            }
+        }
         let _ = writeln!(m, "  timeunit 1fs; timeprecision 1fs;");
         m.push_str(super::runtime::COMMON);
         // The STRING heap (TEXTIO lines).
@@ -1659,6 +1841,9 @@ impl<'a> Lw<'a> {
         );
         let files = self.files_sv();
         m.push_str(&files);
+        let bnd = self.boundary_sv();
+        m.push_str(&bnd);
+        m.push_str(&self.sv_items);
         m.push_str(&decls);
         m.push_str(&self.lit_items);
         let tio = self.textio_sv();
@@ -1891,6 +2076,9 @@ impl<'a> Lw<'a> {
                     g_push = g_push,
                     g_put = g_put
                 );
+            } else if let Repr::Rec(_) = &r {
+                let d = self.record_driver_sv(*s, *p, &t, &loc);
+                drv.push_str(&d);
             } else {
                 let Repr::Arr(name, er) = &r else {
                     self.err(
@@ -2030,6 +2218,13 @@ impl<'a> Lw<'a> {
                         }
                     }
                 }
+                (Repr::Rec(_), None) if kind.is_none() => {
+                    // Leaf by leaf (§14.7.3.2).
+                    let Some(b) = self.record_update_body(s, &ds, &tsv, &info) else {
+                        continue;
+                    };
+                    body.push_str(&b);
+                }
                 (Repr::Arr(_, er), res) => {
                     // Element by element: the drivers covering it.
                     let et = er.sv();
@@ -2144,7 +2339,11 @@ impl<'a> Lw<'a> {
             k,
             "  function automatic longint vh_next();\n    longint n;\n    n = -64'sd1;"
         );
-        for ((s, p), _) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
+        for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
+            if dr.slots && self.is_record_sig(*s) {
+                k.push_str(&self.record_driver_next(*s, *p));
+                continue;
+            }
             let _ = writeln!(
                 k,
                 "    if (vh_dt{s}_{p}.size() > 0 && (n < 0 || vh_dt{s}_{p}[0] < n)) n = vh_dt{s}_{p}[0];",
@@ -2181,12 +2380,203 @@ impl<'a> Lw<'a> {
             k,
             "    if (vh_fpend && (n < 0 || $time < n)) n = $time;\n    return n;\n  endfunction"
         );
+        let fp = self.fprocs.clone();
+        let boundary = self.has_boundary();
+        let order = self.update_order();
+        // The update phase (§14.7.3, §14.7.5.3 b, c).
+        let _ = writeln!(
+            k,
+            "  // The update phase of a simulation cycle (§14.7.3, §14.7.5.3 b, c).\n  function automatic void vh_update();"
+        );
+        
+        for s in 0..self.sigs.len() {
+            let _ = writeln!(k, "    vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
+        }
+        let _ = writeln!(k, "    vh_fpend = 0;");
+        k.push_str(&self.boundary_sample("    "));
+        for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
+            if dr.slots && self.is_record_sig(*s) {
+                k.push_str(&self.record_driver_due(*s, *p, "    "));
+            } else if dr.slots {
+                let _ = writeln!(
+                    k,
+                    "    while (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p}.d[vh_dk{s}_{p}.pop_front()] = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
+                    s = s,
+                    p = p
+                );
+            } else {
+                let on = if self.sig_kind(*s).is_some() {
+                    format!(" vh_don{s}_{p} = !vh_dn{s}_{p}.pop_front();", s = s, p = p)
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    k,
+                    "    if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
+                    s = s,
+                    p = p,
+                    on = on
+                );
+            }
+        }
+        for &s in &order {
+            // Links into this signal: the driving values from converted or
+            // partial out ports first, the in ports after its update.
+            let link_cond = |l: &Link| {
+                if let Some(f) = l.foreign {
+                    format!("vh_fx{}", f)
+                } else if l.sources.is_empty() {
+                    "0".to_string()
+                } else {
+                    l.sources
+                        .iter()
+                        .map(|x| format!("vh_s{}_act", x))
+                        .collect::<Vec<_>>()
+                        .join(" || ")
+                }
+            };
+            for (n, l) in self.links.iter().enumerate() {
+                if !l.inn && l.target.sig == s {
+                    let _ = writeln!(k, "    if ({}) vh_lnk{}();", link_cond(l), n);
+                }
+            }
+            let ins: Vec<String> = self
+                .links
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.inn && l.target.sig == s)
+                .map(|(n, l)| format!("    if ({}) vh_lnk{}(0);\n", link_cond(l), n))
+                .collect();
+            let ds = self.sig_drivers(s);
+            // A forced signal keeps its forced value (§14.7.3.1).
+            let unforced = if self.forced.contains(&s) {
+                let sig = self.sigs[s].clone();
+                let loc = self.d.objects[sig.obj].loc.clone();
+                let r = self.repr(sig.ty, &loc);
+                let eq = self.eq_expr(&r, &format!("vh_s{}_fnv", s), &format!("vh_s{}", s));
+                let _ = writeln!(
+                    k,
+                    "    if (vh_s{s}_freq) begin vh_s{s}_freq = 0; vh_s{s}_frc = 1; vh_s{s}_act = 1; if (!{eq}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end end\n    if (vh_s{s}_rreq) begin vh_s{s}_rreq = 0; vh_s{s}_frc = 0; vh_s{s}_act = 1; end",
+                    s = s,
+                    eq = eq
+                );
+                format!(" && !vh_s{}_frc", s)
+            } else {
+                String::new()
+            };
+            if ds.is_empty() {
+                k.push_str(&ins.concat());
+                continue;
+            }
+            if upd_sigs.contains(&s) {
+                let _ = writeln!(
+                    k,
+                    "    if (vh_s{s}_act{u}) vh_upd{s}(0);",
+                    s = s,
+                    u = unforced
+                );
+                k.push_str(&ins.concat());
+                continue;
+            }
+            let sig = self.sigs[s].clone();
+            let loc = self.d.objects[sig.obj].loc.clone();
+            let r = self.repr(sig.ty, &loc);
+            let ne = format!(
+                "!({})",
+                self.eq_expr(
+                    &r,
+                    &format!("vh_dv{}_{}", s, ds[0].0),
+                    &format!("vh_s{}", s)
+                )
+            );
+            let _ = writeln!(
+                k,
+                "    if (vh_s{s}_act{u} && {ne}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end",
+                s = s,
+                p = ds[0].0,
+                ne = ne,
+                u = unforced
+            );
+            k.push_str(&ins.concat());
+        }
+        // Implicit signals (§14.7.5.3 c).
+        for &n in &imp_order {
+            let _ = writeln!(k, "    vh_imp{}(0);", n);
+        }
+        for s in self.need_lact.clone() {
+            let _ = writeln!(k, "    if (vh_s{s}_act) vh_s{s}_lact = $time;", s = s);
+        }
+        k.push_str(&self.boundary_write(false, "    "));
+        let _ = writeln!(k, "  endfunction");
+        // The resumption of processes (§14.7.5.3 e).
+        let _ = writeln!(
+            k,
+            "  // Resume the processes from `from` on, in elaboration order (§14.7.5.3 e):\n  // a process with a sensitivity list runs here; one that waits is handed\n  // to the kernel (its index is returned; -1 when none is left).\n  function automatic int vh_resume(int from);"
+        );
+        for pi in 0..nprocs {
+            let mut conds = Vec::new();
+            if !fp.contains(&pi) {
+                conds.push(format!(
+                    "(vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time)",
+                    p = pi
+                ));
+            }
+            for (si, site) in self.sites[pi].iter().enumerate() {
+                if site.conds.is_empty() {
+                    continue;
+                }
+                if fp.contains(&pi) {
+                    conds.push(format!("({})", site.conds.join(" || ")));
+                } else {
+                    conds.push(format!(
+                        "(vh_site[{}] == {} && ({}))",
+                        pi,
+                        si,
+                        site.conds.join(" || ")
+                    ));
+                }
+            }
+            if conds.is_empty() {
+                continue;
+            }
+            let c = conds.join(" || ");
+            if post.contains(&pi) {
+                // A postponed process resumes now and runs at the end of
+                // the time step, where its wait condition is evaluated
+                // (§10.2, §14.7.5.3 h).
+                let _ = writeln!(
+                    k,
+                    "    if (from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
+                    p = pi,
+                    c = c
+                );
+            } else if fp.contains(&pi) {
+                let _ = writeln!(
+                    k,
+                    "    if (from <= {p} && ({c})) vh_run{p}();",
+                    p = pi,
+                    c = c
+                );
+            } else {
+                let _ = writeln!(
+                    k,
+                    "    if (from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; return {p}; end",
+                    p = pi,
+                    c = c
+                );
+            }
+        }
+        let _ = writeln!(k, "    return -1;\n  endfunction");
+        if boundary {
+            k.push_str(&self.eager_sv());
+        }
         let _ = writeln!(k, "  initial begin : vh_kernel");
         let _ = writeln!(k, "    longint vh_nxt;");
         let _ = writeln!(k, "    bit vh_any;");
+        let _ = writeln!(k, "    int vh_r;");
         let _ = writeln!(k, "    vh_elab();");
+        k.push_str(&self.boundary_sample_init());
         // Initial effective values (§14.7.5.2), in update order.
-        let order = self.update_order();
         for &s in &order {
             for (n, l) in self.links.iter().enumerate() {
                 if !l.inn && l.target.sig == s {
@@ -2215,28 +2605,42 @@ impl<'a> Lw<'a> {
         for &n in &imp_order {
             let _ = writeln!(k, "    vh_imp{}(1);", n);
         }
+        k.push_str(&self.boundary_write(true, "    "));
         let _ = writeln!(
             k,
             "    // Initialization (§14.7.5.2): every process runs until it suspends,\n    // the postponed ones last."
         );
-        if post.is_empty() {
-            let _ = writeln!(
-                k,
-                "    for (int p = 0; p < {}; p++) begin vh_go[p] = 1; wait (vh_go[p] == 0); end",
-                nprocs
-            );
-        } else {
-            for p in &post {
-                let _ = writeln!(k, "    vh_post[{}] = 1;", p);
+        for p in &post {
+            let _ = writeln!(k, "    vh_post[{}] = 1;", p);
+        }
+        for pass in [false, true] {
+            for p in 0..nprocs {
+                if post.contains(&p) != pass {
+                    continue;
+                }
+                if fp.contains(&p) {
+                    let _ = writeln!(k, "    vh_run{}();", p);
+                } else {
+                    let _ = writeln!(k, "    vh_go[{p}] = 1; wait (vh_go[{p}] == 0);", p = p);
+                }
             }
-            let _ = writeln!(
-                k,
-                "    for (int p = 0; p < {n}; p++) if (!vh_post[p]) begin vh_go[p] = 1; wait (vh_go[p] == 0); end\n    for (int p = 0; p < {n}; p++) if (vh_post[p]) begin vh_go[p] = 1; wait (vh_go[p] == 0); end",
-                n = nprocs
-            );
+        }
+        if boundary {
+            let _ = writeln!(k, "    vh_started = 1;");
         }
         let _ = writeln!(k, "    forever begin");
+        if boundary {
+            // A cycle the eager evaluation left: its processes that wait.
+            let _ = writeln!(
+                k,
+                "      if (vh_hand >= 0) begin\n        vh_busy = 1; vh_r = vh_hand; vh_hand = -1;\n        while (vh_r >= 0) begin vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end\n        vh_busy = 0;\n      end"
+            );
+        }
         let _ = writeln!(k, "      vh_nxt = vh_next();");
+        if boundary {
+            // A change on the SV side: a cycle now.
+            let _ = writeln!(k, "      if (vh_extn != vh_exts) vh_nxt = $time;");
+        }
         if !post.is_empty() {
             // §14.7.5.3 h: at the last cycle of a time step the resumed
             // postponed processes run; they must not cause a delta cycle.
@@ -2246,156 +2650,24 @@ impl<'a> Lw<'a> {
                 n = nprocs
             );
         }
-        let _ = writeln!(k, "      if (vh_nxt < 0 || vh_stop) break;");
-        let _ = writeln!(k, "      if (vh_nxt > $time) #(vh_nxt - $time);");
-        let _ = writeln!(k, "      // Signal update (§14.7.3).");
-        for s in 0..self.sigs.len() {
-            let _ = writeln!(k, "      vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
-        }
-        let _ = writeln!(k, "      vh_fpend = 0;");
-        for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
-            if dr.slots {
-                let _ = writeln!(
-                    k,
-                    "      while (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p}.d[vh_dk{s}_{p}.pop_front()] = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
-                    s = s,
-                    p = p
-                );
-            } else {
-                let on = if self.sig_kind(*s).is_some() {
-                    format!(" vh_don{s}_{p} = !vh_dn{s}_{p}.pop_front();", s = s, p = p)
-                } else {
-                    String::new()
-                };
-                let _ = writeln!(
-                    k,
-                    "      if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
-                    s = s,
-                    p = p,
-                    on = on
-                );
-            }
-        }
-        for &s in &order {
-            // Links into this signal: the driving values from converted or
-            // partial out ports first, the in ports after its update.
-            let link_cond = |l: &Link| {
-                if l.sources.is_empty() {
-                    "0".to_string()
-                } else {
-                    l.sources
-                        .iter()
-                        .map(|x| format!("vh_s{}_act", x))
-                        .collect::<Vec<_>>()
-                        .join(" || ")
-                }
-            };
-            for (n, l) in self.links.iter().enumerate() {
-                if !l.inn && l.target.sig == s {
-                    let _ = writeln!(k, "      if ({}) vh_lnk{}();", link_cond(l), n);
-                }
-            }
-            let ins: Vec<String> = self
-                .links
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.inn && l.target.sig == s)
-                .map(|(n, l)| format!("      if ({}) vh_lnk{}(0);\n", link_cond(l), n))
-                .collect();
-            let ds = self.sig_drivers(s);
-            // A forced signal keeps its forced value (§14.7.3.1).
-            let unforced = if self.forced.contains(&s) {
-                let sig = self.sigs[s].clone();
-                let loc = self.d.objects[sig.obj].loc.clone();
-                let r = self.repr(sig.ty, &loc);
-                let eq = self.eq_expr(&r, &format!("vh_s{}_fnv", s), &format!("vh_s{}", s));
-                let _ = writeln!(
-                    k,
-                    "      if (vh_s{s}_freq) begin vh_s{s}_freq = 0; vh_s{s}_frc = 1; vh_s{s}_act = 1; if (!{eq}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end end\n      if (vh_s{s}_rreq) begin vh_s{s}_rreq = 0; vh_s{s}_frc = 0; vh_s{s}_act = 1; end",
-                    s = s,
-                    eq = eq
-                );
-                format!(" && !vh_s{}_frc", s)
-            } else {
-                String::new()
-            };
-            if ds.is_empty() {
-                k.push_str(&ins.concat());
-                continue;
-            }
-            if upd_sigs.contains(&s) {
-                let _ = writeln!(
-                    k,
-                    "      if (vh_s{s}_act{u}) vh_upd{s}(0);",
-                    s = s,
-                    u = unforced
-                );
-                k.push_str(&ins.concat());
-                continue;
-            }
-            let sig = self.sigs[s].clone();
-            let loc = self.d.objects[sig.obj].loc.clone();
-            let r = self.repr(sig.ty, &loc);
-            let ne = format!(
-                "!({})",
-                self.eq_expr(
-                    &r,
-                    &format!("vh_dv{}_{}", s, ds[0].0),
-                    &format!("vh_s{}", s)
-                )
-            );
+        if boundary {
+            // Quiet VHDL waits for SV (the simulation ends with SV's).
+            let w = "vh_extn != vh_exts || vh_kick != vh_ksn";
             let _ = writeln!(
                 k,
-                "      if (vh_s{s}_act{u} && {ne}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end",
-                s = s,
-                p = ds[0].0,
-                ne = ne,
-                u = unforced
+                "      if (vh_stop) break;\n      if (vh_nxt < 0) begin wait ({w}); vh_ksn = vh_kick; continue; end\n      if (vh_nxt > $time) begin\n        fork\n          #(vh_nxt - $time);\n          wait ({w});\n        join_any\n        disable fork;\n        if ({w}) begin vh_ksn = vh_kick; continue; end\n      end\n      vh_busy = 1;",
+                w = w
             );
-            k.push_str(&ins.concat());
+        } else {
+            let _ = writeln!(k, "      if (vh_nxt < 0 || vh_stop) break;");
+            let _ = writeln!(k, "      if (vh_nxt > $time) #(vh_nxt - $time);");
         }
-        // Implicit signals (§14.7.5.3 c).
-        for &n in &imp_order {
-            let _ = writeln!(k, "      vh_imp{}(0);", n);
-        }
-        for s in self.need_lact.clone() {
-            let _ = writeln!(k, "      if (vh_s{s}_act) vh_s{s}_lact = $time;", s = s);
-        }
-        let _ = writeln!(k, "      // Resume (§14.7.5.3), in elaboration order.");
-        for pi in 0..nprocs {
-            let mut conds = vec![format!(
-                "(vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time)",
-                p = pi
-            )];
-            for (si, site) in self.sites[pi].iter().enumerate() {
-                if site.conds.is_empty() {
-                    continue;
-                }
-                conds.push(format!(
-                    "(vh_site[{}] == {} && ({}))",
-                    pi,
-                    si,
-                    site.conds.join(" || ")
-                ));
-            }
-            if post.contains(&pi) {
-                // A postponed process resumes now and runs at the end of
-                // the time step, where its wait condition is evaluated
-                // (§10.2, §14.7.5.3 h).
-                let _ = writeln!(
-                    k,
-                    "      if (!vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
-                    p = pi,
-                    c = conds.join(" || ")
-                );
-                continue;
-            }
-            let _ = writeln!(
-                k,
-                "      if (!vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_go[{p}] = 1; wait (vh_go[{p}] == 0); end",
-                p = pi,
-                c = conds.join(" || ")
-            );
+        let _ = writeln!(
+            k,
+            "      vh_update();\n      vh_r = vh_resume(0);\n      while (vh_r >= 0) begin vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end"
+        );
+        if boundary {
+            let _ = writeln!(k, "      vh_busy = 0;");
         }
         let _ = writeln!(k, "    end");
         let _ = writeln!(k, "    $finish;");

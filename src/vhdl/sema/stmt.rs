@@ -841,7 +841,7 @@ impl Design {
                             let Some(h) = self.condition(r, c) else {
                                 return;
                             };
-                            match self.eval(&h) {
+                            match self.eval_static(&h) {
                                 Some(v) => v == Value::Enum(1),
                                 None => {
                                     self.error(
@@ -863,7 +863,7 @@ impl Design {
                 let Some(x) = self.expr(r, expr, None) else {
                     return;
                 };
-                let Some(v) = self.eval(&x) else {
+                let Some(v) = self.eval_static(&x) else {
                     self.error(
                         expr.span.clone(),
                         "a case-generate expression must be static",
@@ -879,7 +879,7 @@ impl Design {
                                 let Some(h) = self.expr(r, e, Some(x.ty)) else {
                                     return;
                                 };
-                                self.eval(&h).as_ref() == Some(&v)
+                                self.eval_static(&h).as_ref() == Some(&v)
                             }
                             ast::Choice::Range(dr) => {
                                 let Some((_, hr)) = self.discrete_range(r, dr, Some(x.ty)) else {
@@ -1038,7 +1038,7 @@ impl Design {
         let generic_map = self.map_formals(r, &generics, b.generic_map, true, &loc);
         // The generic values, for the block's declarations (§14.5.2).
         for (g, a) in &generic_map {
-            if let Some(v) = a.as_ref().and_then(|a| self.eval(a)) {
+            if let Some(v) = a.as_ref().and_then(|a| self.eval_static(a)) {
                 let o = &mut self.objects[*g];
                 o.init = Some(super::decl::lit_expr(v.clone(), o.ty, o.loc.clone()));
                 o.static_val = Some(v);
@@ -1081,6 +1081,7 @@ impl Design {
             processes: Vec::new(),
             instances: Vec::new(),
             nested: true,
+            foreign: Vec::new(),
             loc: loc.clone(),
         };
         let sub = self
@@ -1469,12 +1470,28 @@ impl Design {
         formals: &[ObjId],
         assocs: &[ast::Assoc],
         generics: bool,
-        _loc: &Loc,
+        loc: &Loc,
     ) -> Vec<(ObjId, Option<HExpr>)> {
-        self.map_formals_ex(r, formals, assocs, generics)
+        let out: Vec<(ObjId, Option<HExpr>)> = self
+            .map_formals_ex(r, formals, assocs, generics)
             .into_iter()
             .map(|(f, a, _)| (f, a))
-            .collect()
+            .collect();
+        if generics {
+            self.check_generic_actuals(&out, loc);
+        }
+        out
+    }
+
+    /// A generic constant needs an actual or a default (§6.5.6.2).
+    pub fn check_generic_actuals(&mut self, map: &[(ObjId, Option<HExpr>)], loc: &Loc) {
+        for (f, a) in map {
+            let o = &self.objects[*f];
+            if a.is_none() && o.init.is_none() && matches!(o.kind, ObjKind::Generic) {
+                let msg = format!("no actual for constant interface \"{}\"", o.name);
+                self.errors.push((loc.clone(), msg));
+            }
+        }
     }
 
     /// `map_formals`, also telling which formals are associated

@@ -175,3 +175,115 @@ fn ambiguous_string_literal_operator() {
         all
     );
 }
+
+/// Static expressions that call functions (§9.4.1, §14.4.2): constants of
+/// package functions in generate conditions, for-generate ranges and
+/// generic actuals, as NEORV32 computes its configuration. The function
+/// bodies are in the package body, analysed when first needed.
+#[test]
+fn static_function_calls() {
+    let errs = vhdl::check_design(&[
+        (
+            "work",
+            "p.vhd",
+            br#"
+package p is
+  function sel_f(c : boolean; a, b : natural) return natural;
+  function log2_f(n : natural) return natural;
+  function ones_f(n : natural) return bit_vector;
+end package;
+package body p is
+  function sel_f(c : boolean; a, b : natural) return natural is
+  begin
+    if c then return a; else return b; end if;
+  end function;
+  function log2_f(n : natural) return natural is
+    variable r : natural := 0;
+  begin
+    while 2 ** r < n loop
+      r := r + 1;
+    end loop;
+    return r;
+  end function;
+  function ones_f(n : natural) return bit_vector is
+    variable v : bit_vector(n - 1 downto 0) := (others => '0');
+  begin
+    for i in integer range 0 to n - 1 loop
+      if i mod 2 = 0 then v(i) := '1'; end if;
+    end loop;
+    return v;
+  end function;
+end package body;
+"#,
+        ),
+        (
+            "work",
+            "t.vhd",
+            br#"
+use work.p.all;
+entity leaf is
+  generic (w : positive);
+  port (x : in bit_vector(w - 1 downto 0));
+end entity;
+architecture a of leaf is
+begin
+end architecture;
+use work.p.all;
+entity t is
+  generic (dual : boolean := true; size : natural := 1000);
+end entity;
+architecture a of t is
+  constant n_c : natural := sel_f(dual, 2, 1);
+  constant w_c : natural := log2_f(size);
+  constant pat_c : bit_vector := ones_f(4);
+  signal s : bit_vector(w_c - 1 downto 0);
+begin
+  two : if n_c = 2 generate
+    u : entity work.leaf generic map (w => w_c) port map (x => s);
+  end generate;
+  per : for i in 0 to n_c - 1 generate
+    assert pat_c(i * 2) = '1';
+  end generate;
+end architecture;
+"#,
+        ),
+    ]);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+/// The Synopsys packages in library IEEE (as GHDL `-fsynopsys` and Questa
+/// provide them).
+#[test]
+fn synopsys_packages() {
+    ok(r#"
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.std_logic_arith.all;
+use ieee.std_logic_unsigned.all;
+use ieee.std_logic_misc.all;
+entity t is end entity;
+architecture a of t is
+  signal x, y : std_logic_vector(7 downto 0);
+  signal z : std_logic;
+begin
+  y <= x + 1;
+  z <= or_reduce(x) when x > 5 else '0';
+end architecture;
+"#);
+}
+
+/// A generic without a default needs an actual (§6.5.6.2), in GHDL's words.
+#[test]
+fn missing_generic_actual() {
+    let errs = vhdl::check_design(&[(
+        "work",
+        "g.vhd",
+        b"entity c is\n  generic (n : integer);\nend entity;\narchitecture a of c is\nbegin\nend architecture;\nentity t is end entity;\narchitecture a of t is\nbegin\n  u : entity work.c;\nend architecture;\n",
+    )]);
+    let all = errs.join("\n");
+    assert!(
+        all.contains("g.vhd:10:3: error: VHDL: no actual for constant interface \"n\""),
+        "{}",
+        all
+    );
+}
