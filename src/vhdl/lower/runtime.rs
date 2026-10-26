@@ -138,6 +138,17 @@ pub const MATCHING: &str = r#"
     if (vh_ul_x01(a) == 1 || vh_ul_x01(b) == 1) return 1;
     return 3;
   endfunction
+  function automatic byte unsigned vh_ul_or(byte unsigned a, byte unsigned b);
+    if (vh_ul_x01(a) == 3 || vh_ul_x01(b) == 3) return 3;
+    if (a == 0 || b == 0) return 0;
+    if (vh_ul_x01(a) == 1 || vh_ul_x01(b) == 1) return 1;
+    return 2;
+  endfunction
+  function automatic byte unsigned vh_ul_xor(byte unsigned a, byte unsigned b);
+    if (a == 0 || b == 0) return 0;
+    if (vh_ul_x01(a) == 1 || vh_ul_x01(b) == 1) return 1;
+    return vh_ul_x01(a) == vh_ul_x01(b) ? 2 : 3;
+  endfunction
   function automatic byte unsigned vh_ul_meq(byte unsigned a, byte unsigned b);
     if (a == 8 || b == 8) return 3;
     if (a == 0 || b == 0) return 0;

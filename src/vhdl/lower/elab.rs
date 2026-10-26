@@ -1251,6 +1251,18 @@ impl<'a> Lw<'a> {
                 (if i == 0 { 0 } else { 2 }, "64'sd0".into())
             };
             match &path {
+                None if t == "64'sd0" && self.fast_driver(sig, p) => {
+                    let _ = writeln!(
+                        out,
+                        "{pad}if (vh_qn{s}_{p} == 0) begin vh_pv{s}_{p} = {v}; vh_pend{s}_{p} = 1; end else vh_drv_{s}_{p}({v}, 64'sd0, {rej}, {mode});",
+                        pad = pad,
+                        s = sig,
+                        p = p,
+                        v = val,
+                        rej = rej,
+                        mode = mode
+                    );
+                }
                 None => {
                     let _ = writeln!(
                         out,
@@ -1430,6 +1442,21 @@ impl<'a> Lw<'a> {
             self.inst = if inst == GLOBAL { 0 } else { inst };
             let r = self.repr(info.ty, &info.loc);
             let name = self.obj_name(o);
+            // A constant with a static scalar or packed value: a parameter,
+            // which compiled code folds instead of reading a variable.
+            let param_able = match (&r, &info.static_val) {
+                (Repr::Pk(..), Some(Value::Array(_))) => true,
+                (Repr::Arr(..) | Repr::Rec(_) | Repr::Pk(..), _) => false,
+                (_, Some(Value::Array(_) | Value::Record(_) | Value::Null)) => false,
+                (_, Some(_)) => true,
+                _ => false,
+            };
+            if info.kind == ObjKind::Constant && param_able {
+                let v = info.static_val.clone().unwrap();
+                let lit = self.value(&v, info.ty, &info.loc);
+                let _ = writeln!(decls, "  localparam {} {} = {};", r.sv(), name, lit);
+                continue;
+            }
             let _ = writeln!(decls, "  {} {};", r.sv(), name);
             // A generic: the instance's actual, else its default.
             let init = match info.kind {
@@ -1519,11 +1546,27 @@ impl<'a> Lw<'a> {
             })
             .map(|(gp, _)| gp)
             .collect();
+        // A discovery pass over the process bodies: the drivers (and
+        // whether one assigns parts, which decides its form) must be known
+        // before an assignment is emitted.
+        let nerr = self.errors.len();
         for (gp, (inst, ai, pi)) in self.procs.clone().into_iter().enumerate() {
             let p = d.archs[ai].processes[pi].clone();
             self.inst = inst;
             self.cur_proc = Some(gp);
             self.temps.clear();
+            let _ = self.stmts(&p.stmts, 4);
+            self.pre_stmts.clear();
+        }
+        self.sites = (0..nprocs).map(|_| Vec::new()).collect();
+        self.drv_checks.clear();
+        self.errors.truncate(nerr);
+        for (gp, (inst, ai, pi)) in self.procs.clone().into_iter().enumerate() {
+            let p = d.archs[ai].processes[pi].clone();
+            self.inst = inst;
+            self.cur_proc = Some(gp);
+            self.temps.clear();
+            self.proc_slow = false;
             let func = self.fprocs.contains(&gp);
             let body = self.stmts(&p.stmts, if func { 4 } else { 6 });
             let mut implicit = String::new();
@@ -1539,7 +1582,12 @@ impl<'a> Lw<'a> {
                 );
             }
             let mut temps = String::new();
+            let mut slow = self.proc_slow;
             for (n, t) in std::mem::take(&mut self.temps) {
+                // A temporary of a struct type: the body copies structs.
+                if t.starts_with("vh_") {
+                    slow = true;
+                }
                 let _ = writeln!(temps, "    {} {};", t, n);
             }
             let label = if p.label.is_empty() {
@@ -1553,15 +1601,23 @@ impl<'a> Lw<'a> {
                 } else {
                     ""
                 };
-                let _ = write!(
-                    procs,
-                    "  // process {label}\n  function automatic void vh_run{gp}();\n{temps}{clk}{body}  endfunction\n",
-                    label = label,
-                    gp = gp,
-                    temps = temps,
-                    clk = clk,
-                    body = body
-                );
+                let body = format!("{}{}", clk, body);
+                {
+                    let _ = write!(
+                        procs,
+                        "  // process {label}\n  function automatic void vh_run{gp}();\n{temps}{body}  endfunction\n",
+                        label = label,
+                        gp = gp,
+                        temps = temps,
+                        body = body
+                    );
+                }
+                if slow {
+                    self.fproc_bodies
+                        .push((gp, String::new(), format!("    vh_run{}();\n", gp)));
+                } else {
+                    self.fproc_bodies.push((gp, temps, body));
+                }
                 continue;
             }
             let _ = write!(
@@ -1714,6 +1770,13 @@ impl<'a> Lw<'a> {
         loop {
             if let Some(n) = self.spec_todo.pop() {
                 self.spec_sv(n);
+                continue;
+            }
+            if let Some(k) = self.pspec_todo.pop() {
+                let (s, inst) = (self.pspecs[k].sub, self.pspecs[k].inst);
+                let saved = std::mem::replace(&mut self.inst, inst);
+                self.subprogram_with(s, Some(k));
+                self.inst = saved;
                 continue;
             }
             let Some((s, inst)) = self.subs_todo.pop() else {
@@ -1907,10 +1970,13 @@ impl<'a> Lw<'a> {
                         )
                     };
                 if !guarded {
+                    // A zero-delay assignment to an empty waveform is kept
+                    // as a pending value (no queue); a later transaction
+                    // queues it first. `vh_qn` mirrors the queue's length.
                     let tx = self.whole_tx(&r);
                     let _ = write!(
                         drv,
-                        "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, v, after, rej, mode);\n  endfunction\n",
+                        "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  bit vh_pend{s}_{p};\n  {t} vh_pv{s}_{p};\n  int vh_qn{s}_{p};\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    if (vh_pend{s}_{p}) begin {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, vh_pv{s}_{p}, 64'sd0, 64'sd0, 0); vh_pend{s}_{p} = 0; end\n    {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, v, after, rej, mode);\n    vh_qn{s}_{p} = vh_dt{s}_{p}.size();\n  endfunction\n",
                         s = s,
                         p = p,
                         t = t,
@@ -1974,7 +2040,39 @@ impl<'a> Lw<'a> {
         ds.len() == 1
             && !ds[0].1.slots
             && ds[0].1.cov == Cov::All
-            && self.resolution(self.sigs[s].ty).is_none()
+            && match self.resolution(self.sigs[s].ty) {
+                None => true,
+                // std_logic_1164.resolved of one value is that value (an
+                // unguarded signal: a guarded one may have no driver on).
+                Some((f, _)) => {
+                    self.sig_kind(s).is_none()
+                        && self.d.subprograms[f]
+                            .path
+                            .eq_ignore_ascii_case("ieee.std_logic_1164.resolved")
+                }
+            }
+    }
+
+    /// Whether signal `s` is an SV scalar (a packed vector included): the
+    /// cycle block copies it; a struct is copied in a function (the
+    /// simulator's compiled `always` blocks do not copy structs between
+    /// module variables).
+    fn sig_scalar(&self, s: usize) -> bool {
+        let ty = self.sigs[s].ty;
+        !matches!(
+            self.d.types[self.base(ty)].kind,
+            TypeKind::Array { .. } | TypeKind::Record(_)
+        ) || self.pk_of(ty).is_some()
+    }
+
+    /// Whether driver (s, p) has the zero-delay fast path: a pending value
+    /// instead of a queued transaction (whole, unguarded drivers of scalar
+    /// signals).
+    fn fast_driver(&self, s: usize, p: usize) -> bool {
+        p < PSEUDO
+            && self.sig_scalar(s)
+            && self.sig_kind(s).is_none()
+            && self.drivers.get(&(s, p)).is_some_and(|d| !d.slots)
     }
 
     fn sig_drivers(&self, s: usize) -> Vec<(usize, Driver)> {
@@ -2083,7 +2181,13 @@ impl<'a> Lw<'a> {
         (out, list)
     }
 
-    /// The kernel: the VHDL simulation cycle (§14.7.5).
+    /// The kernel: the VHDL simulation cycle (§14.7.5). The work of a cycle
+    /// (the update phase, the resumption scan with the sensitized
+    /// processes' bodies, the time of the next cycle) is one `always`
+    /// block, which the simulator compiles; the kernel thread only
+    /// triggers it, hands control to processes that wait, and advances
+    /// time. A mixed design's eager evaluation calls the same phases as
+    /// functions.
     fn kernel(&mut self, upd_sigs: &[usize]) -> String {
         let nprocs = self.procs.len();
         let drivers: Vec<((usize, usize), Driver)> =
@@ -2095,42 +2199,56 @@ impl<'a> Lw<'a> {
             })
             .collect();
         let imp_order = self.imp_order();
+        let fp = self.fprocs.clone();
+        let boundary = self.has_boundary();
+        let order = self.update_order();
         let mut k = String::new();
-        // The time of the next simulation cycle (§14.7.5.3 g).
-        let _ = writeln!(
-            k,
-            "  function automatic longint vh_next();\n    longint n;\n    n = -64'sd1;"
-        );
+        // The kernel's state: the cycle block's trigger and acknowledgement,
+        // the initialization passes, the scan's start and the process it
+        // hands over, the next cycle's time.
+        let _ = writeln!(k, "  bit vh_tick, vh_tock;\n  int vh_from, vh_r;\n  longint vh_nxt;");
+
+        // ---- the time of the next simulation cycle (§14.7.5.3 g), into vh_n.
+        let mut nx = String::new();
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
             if dr.slots {
-                k.push_str(&self.slot_driver_next(*s, *p));
+                nx.push_str(&self.slot_driver_next(*s, *p).replace("n = ", "vh_n = ").replace("(n < 0", "(vh_n < 0").replace("< n)", "< vh_n)"));
                 continue;
             }
-            let _ = writeln!(
-                k,
-                "    if (vh_dt{s}_{p}.size() > 0 && (n < 0 || vh_dt{s}_{p}[0] < n)) n = vh_dt{s}_{p}[0];",
-                s = s,
-                p = p
-            );
+            if self.fast_driver(*s, *p) {
+                let _ = writeln!(
+                    nx,
+                    "    if (vh_pend{s}_{p}) vh_n = $time; else if (vh_qn{s}_{p} > 0 && (vh_n < 0 || vh_dt{s}_{p}[0] < vh_n)) vh_n = vh_dt{s}_{p}[0];",
+                    s = s,
+                    p = p
+                );
+            } else {
+                let _ = writeln!(
+                    nx,
+                    "    if (vh_dt{s}_{p}.size() > 0 && (vh_n < 0 || vh_dt{s}_{p}[0] < vh_n)) vh_n = vh_dt{s}_{p}[0];",
+                    s = s,
+                    p = p
+                );
+            }
         }
         let _ = writeln!(
-            k,
-            "    for (int p = 0; p < {}; p++) if (vh_tmo[p] >= 0 && (n < 0 || vh_tmo[p] < n)) n = vh_tmo[p];",
+            nx,
+            "    for (int p = 0; p < {}; p++) if (vh_tmo[p] >= 0 && (vh_n < 0 || vh_tmo[p] < vh_n)) vh_n = vh_tmo[p];",
             nprocs
         );
         for im in &self.imps {
             match im.kind {
                 ImpKind::Stable | ImpKind::Quiet => {
                     let _ = writeln!(
-                        k,
-                        "    if (vh_s{r}_due >= 0 && (n < 0 || vh_s{r}_due < n)) n = vh_s{r}_due;",
+                        nx,
+                        "    if (vh_s{r}_due >= 0 && (vh_n < 0 || vh_s{r}_due < vh_n)) vh_n = vh_s{r}_due;",
                         r = im.sig
                     );
                 }
                 ImpKind::Delayed => {
                     let _ = writeln!(
-                        k,
-                        "    if (vh_s{r}_qt.size() > 0 && (n < 0 || vh_s{r}_qt[0] < n)) n = vh_s{r}_qt[0];",
+                        nx,
+                        "    if (vh_s{r}_qt.size() > 0 && (vh_n < 0 || vh_s{r}_qt[0] < vh_n)) vh_n = vh_s{r}_qt[0];",
                         r = im.sig
                     );
                 }
@@ -2138,39 +2256,63 @@ impl<'a> Lw<'a> {
             }
         }
         // Force and release requests take effect in the next cycle.
-        let _ = writeln!(
+        let _ = writeln!(nx, "    if (vh_fpend && (vh_n < 0 || $time < vh_n)) vh_n = $time;");
+        let _ = write!(
             k,
-            "    if (vh_fpend && (n < 0 || $time < n)) n = $time;\n    return n;\n  endfunction"
+            "  function automatic longint vh_next();\n    longint vh_n;\n    vh_n = -64'sd1;\n{}    return vh_n;\n  endfunction\n",
+            nx
         );
-        let fp = self.fprocs.clone();
-        let boundary = self.has_boundary();
-        let order = self.update_order();
-        // The update phase (§14.7.3, §14.7.5.3 b, c).
-        let _ = writeln!(
-            k,
-            "  // The update phase of a simulation cycle (§14.7.3, §14.7.5.3 b, c).\n  function automatic void vh_update();"
-        );
-        
+
+        // ---- the update phase (§14.7.3, §14.7.5.3 b, c), as text.
+        let mut ub = String::new();
         for s in 0..self.sigs.len() {
-            let _ = writeln!(k, "    vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
+            let _ = writeln!(ub, "    vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
         }
-        let _ = writeln!(k, "    vh_fpend = 0;");
-        k.push_str(&self.boundary_sample("    "));
+        let _ = writeln!(ub, "    vh_fpend = 0;");
+        ub.push_str(&self.boundary_sample("    "));
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
             if dr.slots {
-                k.push_str(&self.slot_driver_due(*s, *p, "    "));
+                ub.push_str(&self.slot_driver_due(*s, *p, "    "));
+            } else if self.fast_driver(*s, *p) {
+                let _ = writeln!(
+                    ub,
+                    "    if (vh_pend{s}_{p}) begin vh_dv{s}_{p} = vh_pv{s}_{p}; vh_pend{s}_{p} = 0; vh_s{s}_act = 1; end else if (vh_qn{s}_{p} > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1; end",
+                    s = s,
+                    p = p
+                );
             } else {
                 let on = if self.sig_kind(*s).is_some() {
                     format!(" vh_don{s}_{p} = !vh_dn{s}_{p}.pop_front();", s = s, p = p)
                 } else {
                     String::new()
                 };
-                let _ = writeln!(
-                    k,
-                    "    if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1; end",
+                let pop = format!(
+                    "void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1;",
                     s = s,
                     p = p,
                     on = on
+                );
+                let pop = if self.sig_scalar(*s) {
+                    format!("begin {} end", pop)
+                } else {
+                    let _ = write!(
+                        k,
+                        "  function automatic void vh_pop{s}_{p}();
+    {pop}
+  endfunction
+",
+                        s = s,
+                        p = p,
+                        pop = pop
+                    );
+                    format!("vh_pop{}_{}();", s, p)
+                };
+                let _ = writeln!(
+                    ub,
+                    "    if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) {pop}",
+                    s = s,
+                    p = p,
+                    pop = pop
                 );
             }
         }
@@ -2192,7 +2334,7 @@ impl<'a> Lw<'a> {
             };
             for (n, l) in self.links.iter().enumerate() {
                 if !l.inn && l.target.sig == s {
-                    let _ = writeln!(k, "    if ({}) vh_lnk{}();", link_cond(l), n);
+                    let _ = writeln!(ub, "    if ({}) vh_lnk{}();", link_cond(l), n);
                 }
             }
             let ins: Vec<String> = self
@@ -2209,28 +2351,44 @@ impl<'a> Lw<'a> {
                 let loc = self.d.objects[sig.obj].loc.clone();
                 let r = self.repr(sig.ty, &loc);
                 let eq = self.eq_expr(&r, &format!("vh_s{}_fnv", s), &format!("vh_s{}", s));
+                let set = format!(
+                    "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = $time;",
+                    s = s
+                );
+                let set = if self.sig_scalar(s) {
+                    format!("if (!{}) begin {} end", eq, set)
+                } else {
+                    let _ = write!(
+                        k,
+                        "  function automatic void vh_setf{s}();\n    if (!{eq}) begin {set} end\n  endfunction\n",
+                        s = s,
+                        eq = eq,
+                        set = set
+                    );
+                    format!("vh_setf{}();", s)
+                };
                 let _ = writeln!(
-                    k,
-                    "    if (vh_s{s}_freq) begin vh_s{s}_freq = 0; vh_s{s}_frc = 1; vh_s{s}_act = 1; if (!{eq}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end end\n    if (vh_s{s}_rreq) begin vh_s{s}_rreq = 0; vh_s{s}_frc = 0; vh_s{s}_act = 1; end",
+                    ub,
+                    "    if (vh_s{s}_freq) begin vh_s{s}_freq = 0; vh_s{s}_frc = 1; vh_s{s}_act = 1; {set} end\n    if (vh_s{s}_rreq) begin vh_s{s}_rreq = 0; vh_s{s}_frc = 0; vh_s{s}_act = 1; end",
                     s = s,
-                    eq = eq
+                    set = set
                 );
                 format!(" && !vh_s{}_frc", s)
             } else {
                 String::new()
             };
             if ds.is_empty() {
-                k.push_str(&ins.concat());
+                ub.push_str(&ins.concat());
                 continue;
             }
             if upd_sigs.contains(&s) {
                 let _ = writeln!(
-                    k,
+                    ub,
                     "    if (vh_s{s}_act{u}) vh_upd{s}(0);",
                     s = s,
                     u = unforced
                 );
-                k.push_str(&ins.concat());
+                ub.push_str(&ins.concat());
                 continue;
             }
             let sig = self.sigs[s].clone();
@@ -2244,34 +2402,56 @@ impl<'a> Lw<'a> {
                     &format!("vh_s{}", s)
                 )
             );
-            let _ = writeln!(
-                k,
-                "    if (vh_s{s}_act{u} && {ne}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end",
+            let set = format!(
+                "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time;",
                 s = s,
-                p = ds[0].0,
-                ne = ne,
-                u = unforced
+                p = ds[0].0
             );
-            k.push_str(&ins.concat());
+            // A struct: compared and copied in a function (the compiled
+            // cycle block neither copies structs nor passes them).
+            let set = if self.sig_scalar(s) {
+                format!("if ({}) begin {} end", ne, set)
+            } else {
+                let _ = write!(
+                    k,
+                    "  function automatic void vh_set{s}();\n    if ({ne}) begin {set} end\n  endfunction\n",
+                    s = s,
+                    ne = ne,
+                    set = set
+                );
+                format!("vh_set{}();", s)
+            };
+            let _ = writeln!(
+                ub,
+                "    if (vh_s{s}_act{u}) {set}",
+                s = s,
+                u = unforced,
+                set = set
+            );
+            ub.push_str(&ins.concat());
         }
         // Implicit signals (§14.7.5.3 c).
         for &n in &imp_order {
-            let _ = writeln!(k, "    vh_imp{}(0);", n);
+            let _ = writeln!(ub, "    vh_imp{}(0);", n);
         }
         for s in self.need_lact.clone() {
-            let _ = writeln!(k, "    if (vh_s{s}_act) vh_s{s}_lact = $time;", s = s);
+            let _ = writeln!(ub, "    if (vh_s{s}_act) vh_s{s}_lact = $time;", s = s);
         }
-        k.push_str(&self.boundary_write(false, "    "));
-        let _ = writeln!(k, "  endfunction");
-        // The resumption of processes (§14.7.5.3 e).
-        let _ = writeln!(
-            k,
-            "  // Resume the processes from `from` on, in elaboration order (§14.7.5.3 e):\n  // a process with a sensitivity list runs here; one that waits is handed\n  // to the kernel (its index is returned; -1 when none is left).\n  function automatic int vh_resume(int from);"
-        );
+        ub.push_str(&self.boundary_write(false, "    "));
+        if boundary {
+            let _ = write!(
+                k,
+                "  // The update phase of a simulation cycle (§14.7.3, §14.7.5.3 b, c).\n  function automatic void vh_update();\n{}  endfunction\n",
+                ub
+            );
+        }
+
+        // ---- the resumption of processes (§14.7.5.3 e): the conditions.
+        let mut conds: Vec<Option<String>> = Vec::new();
         for pi in 0..nprocs {
-            let mut conds = Vec::new();
+            let mut c = Vec::new();
             if !fp.contains(&pi) {
-                conds.push(format!(
+                c.push(format!(
                     "(vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time)",
                     p = pi
                 ));
@@ -2281,9 +2461,9 @@ impl<'a> Lw<'a> {
                     continue;
                 }
                 if fp.contains(&pi) {
-                    conds.push(format!("({})", site.conds.join(" || ")));
+                    c.push(format!("({})", site.conds.join(" || ")));
                 } else {
-                    conds.push(format!(
+                    c.push(format!(
                         "(vh_site[{}] == {} && ({}))",
                         pi,
                         si,
@@ -2291,44 +2471,123 @@ impl<'a> Lw<'a> {
                     ));
                 }
             }
-            if conds.is_empty() {
-                continue;
+            conds.push(if c.is_empty() { None } else { Some(c.join(" || ")) });
+        }
+        if boundary {
+            // The eager path's function form: a process with a sensitivity
+            // list runs here; one that waits is handed to the kernel (its
+            // index is returned; -1 when none is left).
+            let _ = writeln!(
+                k,
+                "  function automatic int vh_resume(int from);"
+            );
+            for (pi, c) in conds.iter().enumerate() {
+                let Some(c) = c else { continue };
+                if post.contains(&pi) {
+                    let _ = writeln!(
+                        k,
+                        "    if (from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
+                        p = pi,
+                        c = c
+                    );
+                } else if fp.contains(&pi) {
+                    let _ = writeln!(k, "    if (from <= {p} && ({c})) vh_run{p}();", p = pi, c = c);
+                } else {
+                    let _ = writeln!(
+                        k,
+                        "    if (from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; return {p}; end",
+                        p = pi,
+                        c = c
+                    );
+                }
             }
-            let c = conds.join(" || ");
+            let _ = writeln!(k, "    return -1;\n  endfunction");
+            k.push_str(&self.eager_sv());
+        }
+
+        // ---- the cycle block: update, the resumption scan from vh_from
+        // (initialization, §14.7.5.2: pass 0 the processes, pass 1 the
+        // postponed ones, each run once), the next cycle's time.
+        let mut cyc = String::new();
+        let _ = writeln!(cyc, "  always @(vh_tick) begin : vh_cycle");
+        let _ = writeln!(cyc, "    longint vh_n;");
+        let bodies: std::collections::BTreeMap<usize, (String, String)> = self
+            .fproc_bodies
+            .iter()
+            .map(|(gp, t, b)| (*gp, (t.clone(), b.clone())))
+            .collect();
+        for (temps, _) in bodies.values() {
+            cyc.push_str(temps);
+        }
+        let _ = writeln!(cyc, "    if (vh_from == 0) begin");
+        for line in ub.lines() {
+            let _ = writeln!(cyc, "  {}", line);
+        }
+        let _ = writeln!(cyc, "    end");
+        let _ = writeln!(cyc, "    vh_r = -1;");
+        for (pi, c) in conds.iter().enumerate() {
+            let Some(c) = c.clone() else { continue };
             if post.contains(&pi) {
-                // A postponed process resumes now and runs at the end of
-                // the time step, where its wait condition is evaluated
-                // (§10.2, §14.7.5.3 h).
                 let _ = writeln!(
-                    k,
-                    "    if (from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
+                    cyc,
+                    "    if (vh_r < 0 && vh_from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
                     p = pi,
                     c = c
                 );
             } else if fp.contains(&pi) {
+                let body = bodies.get(&pi).map(|b| b.1.clone()).unwrap_or_default();
                 let _ = writeln!(
-                    k,
-                    "    if (from <= {p} && ({c})) vh_run{p}();",
+                    cyc,
+                    "    if (vh_r < 0 && vh_from <= {p} && ({c})) begin",
                     p = pi,
                     c = c
                 );
+                for line in body.lines() {
+                    let _ = writeln!(cyc, "  {}", line);
+                }
+                let _ = writeln!(cyc, "    end");
             } else {
                 let _ = writeln!(
-                    k,
-                    "    if (from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; return {p}; end",
+                    cyc,
+                    "    if (vh_r < 0 && vh_from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_r = {p}; end",
                     p = pi,
                     c = c
                 );
             }
         }
-        let _ = writeln!(k, "    return -1;\n  endfunction");
-        if boundary {
-            k.push_str(&self.eager_sv());
+        let _ = writeln!(cyc, "    if (vh_r < 0) begin\n      vh_n = -64'sd1;");
+        for line in nx.lines() {
+            let _ = writeln!(cyc, "  {}", line);
         }
+        let _ = writeln!(cyc, "      vh_nxt = vh_n;\n    end");
+        let _ = writeln!(cyc, "    vh_tock = !vh_tock;");
+        let _ = writeln!(cyc, "  end");
+        k.push_str(&cyc);
+
+        // ---- the kernel thread.
+        // A clocked process that waits marks its resumption.
+        let ct: Vec<String> = self
+            .clocked
+            .iter()
+            .filter(|p| !fp.contains(p))
+            .map(|p| format!("vh_r == {}", p))
+            .collect();
+        let mark = if boundary && !ct.is_empty() {
+            format!(" if ({}) vh_clkd = 1;", ct.join(" || "))
+        } else {
+            String::new()
+        };
+        // One pass of the cycle block, handing control to the processes
+        // that wait, until the scan finds none.
+        let scan = |ind: &str| {
+            format!(
+                "{i}forever begin\n{i}  vh_tick = !vh_tick; @(vh_tock);\n{i}  if (vh_r < 0) break;\n{i} {mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_from = vh_r + 1;\n{i}end\n",
+                i = ind,
+                mark = mark
+            )
+        };
         let _ = writeln!(k, "  initial begin : vh_kernel");
-        let _ = writeln!(k, "    longint vh_nxt;");
         let _ = writeln!(k, "    bit vh_any;");
-        let _ = writeln!(k, "    int vh_r;");
         let _ = writeln!(k, "    vh_elab();");
         k.push_str(&self.boundary_sample_init());
         // Initial effective values (§14.7.5.2), in update order.
@@ -2380,28 +2639,27 @@ impl<'a> Lw<'a> {
                 }
             }
         }
+        let _ = writeln!(k, "    vh_nxt = vh_next();");
         if boundary {
-            let _ = writeln!(k, "    vh_started = 1;");
-        }
-        // A clocked process that waits marks its resumption.
-        let ct: Vec<String> = self
-            .clocked
-            .iter()
-            .filter(|p| !fp.contains(p))
-            .map(|p| format!("vh_r == {}", p))
-            .collect();
-        let mark = if boundary && !ct.is_empty() {
-            format!(" if ({}) vh_clkd = 1;", ct.join(" || "))
-        } else {
-            String::new()
-        };
-        let _ = writeln!(k, "    forever begin");
-        if boundary {
-            // A cycle the eager evaluation left: its processes that wait.
+            // The cycles at time 0 synchronously (the function path), so SV
+            // code running at time 0 sees the settled design, as it did
+            // the VHDL elaboration.
             let _ = writeln!(
                 k,
-                "      if (vh_hand >= 0) begin\n        vh_busy = 1; vh_r = vh_hand; vh_hand = -1;\n        while (vh_r >= 0) begin{mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end\n        vh_busy = 0;\n      end",
+                "    while (vh_nxt == $time && !vh_stop) begin\n      vh_update();\n      vh_r = vh_resume(0);\n      while (vh_r >= 0) begin{mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end\n      vh_nxt = vh_next();\n    end",
                 mark = mark
+            );
+            let _ = writeln!(k, "    vh_started = 1;");
+        }
+        let _ = writeln!(k, "    forever begin");
+        if boundary {
+            // A cycle the eager evaluation left: its processes that wait,
+            // then the rest of the scan.
+            let _ = writeln!(
+                k,
+                "      if (vh_hand >= 0) begin\n        vh_busy = 1; vh_r = vh_hand; vh_hand = -1;\n       {mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_from = vh_r + 1;\n{scan}        vh_busy = 0;\n      end",
+                mark = mark,
+                scan = scan("        ")
             );
             // A clocked process ran: the next cycle waits for SV's NBA region,
             // as an SV flip-flop's update does.
@@ -2409,9 +2667,6 @@ impl<'a> Lw<'a> {
                 k,
                 "      if (vh_clkd) begin\n        vh_busy = 1; vh_clkd = 0;\n        vh_nbt <= !vh_nbt; @(vh_nbt);\n        vh_busy = 0;\n      end"
             );
-        }
-        let _ = writeln!(k, "      vh_nxt = vh_next();");
-        if boundary {
             // A change on the SV side: a cycle now.
             let _ = writeln!(k, "      if (vh_extn != vh_exts) vh_nxt = $time;");
         }
@@ -2436,11 +2691,8 @@ impl<'a> Lw<'a> {
             let _ = writeln!(k, "      if (vh_nxt < 0 || vh_stop) break;");
             let _ = writeln!(k, "      if (vh_nxt > $time) #(vh_nxt - $time);");
         }
-        let _ = writeln!(
-            k,
-            "      vh_update();\n      vh_r = vh_resume(0);\n      while (vh_r >= 0) begin{mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end",
-            mark = mark
-        );
+        let _ = writeln!(k, "      vh_from = 0;");
+        k.push_str(&scan("      "));
         if boundary {
             let _ = writeln!(k, "      vh_busy = 0;");
         }
@@ -2454,7 +2706,7 @@ impl<'a> Lw<'a> {
     /// of mode `in` also passes its attributes (§4.2.2.3).
     pub(super) fn param_decls(&mut self, p: ObjId, loc: &Loc) -> Vec<String> {
         let o = self.d.objects[p].clone();
-        let r = self.repr(o.ty, loc);
+        let r = self.obj_repr(p, loc);
         let name = self.obj_name(p);
         match o.kind {
             ObjKind::Param(ObjClass::Signal, Mode::In) => vec![

@@ -273,7 +273,7 @@ impl<'a> Lw<'a> {
             let body = self.conv_in(&f.bnd, &r, f.ty);
             let _ = write!(
                 s,
-                "  function automatic {t} vh_fci{k}({b} v);\n{body}  endfunction\n",
+                "  function automatic {t} vh_fci{k}({b} vh_v);\n{body}  endfunction\n",
                 t = r.sv(),
                 k = k,
                 b = f.bnd.sv(),
@@ -301,7 +301,7 @@ impl<'a> Lw<'a> {
             };
             let _ = write!(
                 s,
-                "  function automatic {b} vh_fco{k}({t} a);\n{body}  endfunction\n",
+                "  function automatic {b} vh_fco{k}({t} vh_a);\n{body}  endfunction\n",
                 t = r.sv(),
                 k = k,
                 b = ret,
@@ -321,16 +321,16 @@ impl<'a> Lw<'a> {
             }
         };
         match bnd {
-            Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, "v")),
+            Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, "vh_v")),
             Bnd::Vec(ul, n) => {
                 if let Repr::Pk(w, _) = r {
                     return format!(
-                        "    bit [{hi}:0] t;\n    for (int i = 0; i < {n}; i++) t[{w} * ({m} - i) +: {w}] = {b};\n    return t;\n",
+                        "    bit [{hi}:0] vh_t;\n    for (int vh_i = 0; vh_i < {n}; vh_i++) vh_t[{w} * ({m} - vh_i) +: {w}] = {b};\n    return vh_t;\n",
                         hi = *w as i64 * n - 1,
                         n = n,
                         w = w,
                         m = n - 1,
-                        b = bit(*ul, &format!("v[{} - i]", n - 1))
+                        b = bit(*ul, &format!("vh_v[{} - vh_i]", n - 1))
                     );
                 }
                 let Repr::Arr(name, er) = r else {
@@ -341,15 +341,15 @@ impl<'a> Lw<'a> {
                     "    {et} t[];\n    t = new[{n}];\n    for (int i = 0; i < {n}; i++) t[i] = {b};\n    return {name}_mk({l}, {rr}, {dn}, t);\n",
                     et = er.sv(),
                     n = n,
-                    b = bit(*ul, &format!("v[{} - i]", n - 1)),
+                    b = bit(*ul, &format!("vh_v[{} - i]", n - 1)),
                     name = name,
                     l = l,
                     rr = rr,
                     dn = (dir == Dir::Downto) as u8
                 )
             }
-            Bnd::Int => format!("    return $isunknown(v) ? 0 : {}'(v);\n", r.sv()),
-            Bnd::Real => "    return v;\n".into(),
+            Bnd::Int => format!("    return $isunknown(vh_v) ? 0 : {}'(vh_v);\n", r.sv()),
+            Bnd::Real => "    return vh_v;\n".into(),
             Bnd::Arr(..) => "    return 0;\n".into(),
         }
     }
@@ -366,10 +366,10 @@ impl<'a> Lw<'a> {
         };
         let loc = self.d.objects[0].loc.clone();
         let (x, off, at) = match part {
-            Part::Whole => ("a".to_string(), 0, sty),
+            Part::Whole => ("vh_a".to_string(), 0, sty),
             Part::Path(path) => {
                 let (sel, slice, at) = self.path_sv(sty, path, &loc);
-                (format!("a{}", sel), slice.map_or(0, |(o, _)| o), at)
+                (format!("vh_a{}", sel), slice.map_or(0, |(o, _)| o), at)
             }
         };
         let pk = match self.repr(at, &loc) {
@@ -380,11 +380,11 @@ impl<'a> Lw<'a> {
             Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, &x)),
             Bnd::Vec(ul, n) => {
                 let e = match pk {
-                    Some((w, pn)) => Lw::pk_sel(&x, w, pn, &format!("{} + i", off)),
-                    None => format!("{}.d[{} + i]", x, off),
+                    Some((w, pn)) => Lw::pk_sel(&x, w, pn, &format!("{} + vh_i", off)),
+                    None => format!("{}.d[{} + vh_i]", x, off),
                 };
                 format!(
-                    "    {t} v;\n    for (int i = 0; i < {n}; i++) v[{m} - i] = {b};\n    return v;\n",
+                    "    {t} vh_v;\n    for (int vh_i = 0; vh_i < {n}; vh_i++) vh_v[{m} - vh_i] = {b};\n    return vh_v;\n",
                     t = bnd.sv(),
                     n = n,
                     m = n - 1,

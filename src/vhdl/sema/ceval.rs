@@ -782,6 +782,14 @@ fn array_attr(name: &str, l: i64, dir: Dir, r: i64) -> Option<Value> {
 }
 
 impl Design {
+    /// The value of an expression with the objects of `frame` bound to
+    /// values (a specialised subprogram's formals and constants).
+    pub fn eval_with(&self, h: &HExpr, frame: HashMap<ObjId, Value>) -> Option<Value> {
+        let mut it = Interp::new(self);
+        it.frames.push(frame);
+        it.expr(h)
+    }
+
     /// The value of a static expression, analysing first the bodies of the
     /// functions it calls (they may be declared in package bodies not yet
     /// analysed, or be library functions analysed on first use).

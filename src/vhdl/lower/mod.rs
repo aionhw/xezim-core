@@ -13,16 +13,19 @@
 
 mod elab;
 mod files;
+mod intrinsics;
 mod leaves;
 mod mixed;
 mod packed;
 mod runtime;
+mod spec;
 mod textio;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use elab::{Driver, GLOBAL, InstInfo, Sig, SigRef, Site};
-use packed::bounds_len;
+use packed::{Bounds, bounds_len};
+use spec::PSpec;
 use std::fmt::Write as _;
 
 use super::ast::{Dir, Mode, ObjClass};
@@ -183,8 +186,15 @@ struct Lw<'a> {
     /// wires; a counter naming their nets.
     sv_items: String,
     sv_nets: usize,
-    /// Processes with a sensitivity list, lowered as functions.
+    /// Processes with a sensitivity list, run by the kernel's cycle block
+    /// (and lowered as functions in a mixed design, for the eager path).
     fprocs: BTreeSet<usize>,
+    /// Their bodies: process, temporaries, statements.
+    fproc_bodies: Vec<(usize, String, String)>,
+    /// The process being lowered assigns a record or struct-array
+    /// variable: it runs as a called function (the simulator's compiled
+    /// `always` blocks do not copy structs between module variables).
+    proc_slow: bool,
     /// Processes that test a signal's 'event (rising_edge, falling_edge):
     /// clocked logic, whose updates SV sees after its NBA region.
     clocked: BTreeSet<usize>,
@@ -197,6 +207,16 @@ struct Lw<'a> {
     /// The representation of the value returned by the subprogram being
     /// lowered.
     cur_ret: Option<Repr>,
+    /// Specialised copies of subprograms (spec.rs), by key; those still
+    /// to lower; the one being lowered or shaped, and the nesting of
+    /// specialisations made while shaping.
+    pspecs: Vec<PSpec>,
+    pspec_keys: HashMap<String, usize>,
+    pspec_todo: Vec<usize>,
+    spec_env: Option<usize>,
+    spec_depth: usize,
+    /// Per subprogram: the integer formals its bounds depend on.
+    shaping: HashMap<SubId, BTreeSet<ObjId>>,
     opts: super::VhdlOptions,
 }
 
@@ -294,11 +314,19 @@ impl<'a> Lw<'a> {
             sv_items: String::new(),
             sv_nets: 0,
             fprocs: BTreeSet::new(),
+            fproc_bodies: Vec::new(),
+            proc_slow: false,
             clocked: BTreeSet::new(),
             tx_keys: BTreeSet::new(),
             tx_defs: String::new(),
             pk_fns: BTreeSet::new(),
             cur_ret: None,
+            pspecs: Vec::new(),
+            pspec_keys: HashMap::new(),
+            pspec_todo: Vec::new(),
+            spec_env: None,
+            spec_depth: 0,
+            shaping: HashMap::new(),
             opts: super::VhdlOptions::default(),
         }
     }
@@ -380,8 +408,10 @@ impl<'a> Lw<'a> {
             }
             TypeKind::UniversalInteger | TypeKind::Physical(_) => Repr::I64,
             TypeKind::Real | TypeKind::UniversalReal => Repr::Real,
-            TypeKind::Array { .. } if self.pk_of(t).is_some() => self.pk_of(t).unwrap(),
-            TypeKind::Array { .. } => self.fat_repr(t, loc),
+            TypeKind::Array { .. } => match self.pk_of_env(t) {
+                Some(pk) => pk,
+                None => self.fat_repr(t, loc),
+            },
             // An access value: a handle into the designated type's heap (0:
             // null, §5.4).
             TypeKind::Access(_) => Repr::I64,
@@ -702,16 +732,7 @@ impl<'a> Lw<'a> {
         }
         let r = self.repr(t, loc);
         match &r {
-            Repr::Pk(w, n) => {
-                // T'LEFT of the element, n times.
-                let et = self.d.element_subtype(t).unwrap_or(t);
-                let code = self
-                    .d
-                    .scalar_range(et)
-                    .and_then(|sr| sr.left.as_i64())
-                    .unwrap_or(0) as u32;
-                Self::pk_lit(*w, &vec![code; *n as usize])
-            }
+            Repr::Pk(w, n) => self.pk_default(t, *w, *n),
             Repr::Arr(name, _) => {
                 let n = self.ndims(t);
                 if !(0..n).all(|k| self.static_dim(t, k).is_some()) {
@@ -763,6 +784,18 @@ impl<'a> Lw<'a> {
                 }
             }
         }
+    }
+
+    /// The default value of a packed array of type `t`: T'LEFT of the
+    /// element, n times (§14.4.2.5).
+    fn pk_default(&self, t: TypeId, w: u32, n: i64) -> String {
+        let et = self.d.element_subtype(t).unwrap_or(t);
+        let code = self
+            .d
+            .scalar_range(et)
+            .and_then(|sr| sr.left.as_i64())
+            .unwrap_or(0) as u32;
+        Self::pk_lit(w, &vec![code; n as usize])
     }
 
     /// The default value of dimension `k` onwards of array type `t`.
@@ -873,9 +906,15 @@ impl<'a> Lw<'a> {
             HExprKind::Convert(x) => self.convert(x, h.ty, &h.loc),
             HExprKind::Call(s, args) => self.call(*s, args, h),
             HExprKind::Index(b, idx) => {
+                // An element of a slice of a packed value: one select of
+                // the slice's base (a select of a select is not SV).
+                let (b, extra) = self.pk_slice_base(b);
                 let mut cur = self.ex(b);
                 let mut cr = self.erepr(b);
-                let shape0 = self.shape(b);
+                let shape0 = match &extra {
+                    Some((_, sb)) => Some(*sb),
+                    None => self.shape(b),
+                };
                 let (f, l, _) = self.file_line(&h.loc);
                 // A call result is evaluated once, through `_at`.
                 let call = !Self::selectable(&cur);
@@ -886,6 +925,7 @@ impl<'a> Lw<'a> {
                             let bnd = if k == 0 { shape0 } else { None }
                                 .unwrap_or((n - 1, Dir::Downto, 0));
                             let off = self.pk_off(&i, bnd, &h.loc);
+                            let off = Self::add_off(extra.as_ref().map(|e| e.0).unwrap_or(0), &off);
                             let base = self.as_selectable(cur, &Repr::Pk(w, n));
                             cur = Self::pk_sel(&base, w, n, &off);
                             cr = Repr::U8;
@@ -1164,6 +1204,13 @@ impl<'a> Lw<'a> {
                 "0".into()
             }
             None => {
+                if let Some(x) = self.intrinsic(s, args, h) {
+                    return x;
+                }
+                if let Some(k) = self.try_specialise(s, args) {
+                    let a = self.pspec_args(k, args);
+                    return format!("{}({})", self.pspecs[k].name, a.join(", "));
+                }
                 self.need_sub(s);
                 let params = self.d.subprograms[s].params.clone();
                 let mut a = Vec::new();
@@ -1713,6 +1760,10 @@ impl<'a> Lw<'a> {
             Dir::To => format!("({}) - ({})", k, b.0),
             Dir::Downto => format!("({}) - ({})", b.0, k),
         };
+        // Stores through the helper (compiled in function bodies); the
+        // `set` mask likewise by arithmetic.
+        let setf = self.pk_set_fn(w, n);
+        let mark = |off: &str| format!("{s} = {s} | ({n}'d1 << ({off}));", s = set, n = n, off = off);
         for (choices, v) in items {
             let x = self.ex_as(v, &er);
             let many = choices.len() > 1
@@ -1721,10 +1772,9 @@ impl<'a> Lw<'a> {
                     .any(|c| matches!(c, HChoice::Range(_) | HChoice::Others));
             let x = if many { self.as_tmp(x, &er.sv()) } else { x };
             if choices.is_empty() {
-                let sel = Self::pk_sel(&agg, w, n, &pos.to_string());
-                let _ = writeln!(body, "{} = {};", sel, x);
+                let _ = writeln!(body, "{a} = {f}({a}, {p}, {x});", a = agg, f = setf, p = pos, x = x);
                 if named {
-                    let _ = writeln!(body, "{}[{}] = 1;", set, pos);
+                    let _ = writeln!(body, "{}", mark(&pos.to_string()));
                 }
                 pos += 1;
                 continue;
@@ -1734,35 +1784,32 @@ impl<'a> Lw<'a> {
                     HChoice::Others => {
                         let _ = writeln!(
                             body,
-                            "for (int k = 0; k < {n}; k++) if (!{s}[k]) {a}[{w} * ({m} - k) +: {w}] = {x};",
+                            "for (int k = 0; k < {n}; k++) if (!{s}[k]) {a} = {f}({a}, k, {x});",
                             n = n,
                             s = set,
                             a = agg,
-                            w = w,
-                            m = n - 1,
+                            f = setf,
                             x = x
                         );
                     }
                     HChoice::Expr(e) => {
                         let i = self.ex(e);
                         let off = self.pk_off(&i, b, &loc);
-                        let sel = Self::pk_sel(&agg, w, n, &off);
-                        let _ = writeln!(body, "{} = {}; {}[{}] = 1;", sel, x, set, off);
+                        let _ = writeln!(body, "{a} = {f}({a}, {o}, {x}); {m}", a = agg, f = setf, o = off, x = x, m = mark(&off));
                     }
                     HChoice::Range(hr) => {
                         let (a, z, _) = self.range_parts(hr);
                         let o = off_of("k");
                         let _ = writeln!(
                             body,
-                            "for (longint k = (({a}) < ({z}) ? ({a}) : ({z})); k <= (({a}) < ({z}) ? ({z}) : ({a})); k++) begin {g}[{w} * ({m} - ({o})) +: {w}] = {x}; {s}[{o}] = 1; end",
+                            "for (longint k = (({a}) < ({z}) ? ({a}) : ({z})); k <= (({a}) < ({z}) ? ({z}) : ({a})); k++) begin {g} = {f}({g}, {o}, {x}); {m} end",
                             a = a,
                             z = z,
                             g = agg,
-                            w = w,
-                            m = n - 1,
+                            f = setf,
                             o = o,
                             x = x,
-                            s = set
+                            m = mark(&o)
                         );
                     }
                 }
@@ -2030,6 +2077,55 @@ impl<'a> Lw<'a> {
         out
     }
 
+    /// For an expression that is a slice with static bounds of a packed
+    /// value: the slice's base and (the slice's offset in it, the slice's
+    /// bounds), so an element of the slice selects the base once.
+    fn pk_slice_base<'h>(&mut self, b: &'h HExpr) -> (&'h HExpr, Option<(i64, Bounds)>) {
+        if let HExprKind::Slice(bb, r) = &b.kind
+            && matches!(self.erepr(bb), Repr::Pk(..))
+            && let Some(sb) = self.range_bounds(r)
+            && let Some(bbnd) = self.shape(bb)
+            && sb.1 == bbnd.1
+        {
+            let off = match bbnd.1 {
+                Dir::To => sb.0 - bbnd.0,
+                Dir::Downto => bbnd.0 - sb.0,
+            };
+            if off >= 0 {
+                return (bb, Some((off, sb)));
+            }
+        }
+        (b, None)
+    }
+
+    /// `extra + off` (SV), folded when `off` is a literal.
+    fn add_off(extra: i64, off: &str) -> String {
+        if extra == 0 {
+            return off.to_string();
+        }
+        match off.parse::<i64>() {
+            Ok(k) => (extra + k).to_string(),
+            Err(_) => format!("({} + {})", extra, off),
+        }
+    }
+
+    /// Whether an assignment target is, or is part of, a variable of a
+    /// record or struct-array representation.
+    fn struct_root(&mut self, t: &HExpr) -> bool {
+        let mut cur = t;
+        loop {
+            match &cur.kind {
+                HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) => {
+                    if matches!(self.erepr(cur), Repr::Rec(_) | Repr::Arr(..)) {
+                        return true;
+                    }
+                    cur = b;
+                }
+                _ => return matches!(self.erepr(cur), Repr::Rec(_) | Repr::Arr(..)),
+            }
+        }
+    }
+
     /// An lvalue: the target of a variable assignment.
     fn assign_to(&mut self, target: &HExpr, value: String, ind: usize) -> String {
         let pad = " ".repeat(ind);
@@ -2037,9 +2133,13 @@ impl<'a> Lw<'a> {
         let (f, l, _) = self.file_line(&loc);
         match &target.kind {
             HExprKind::Index(b, idx) => {
+                let (b, extra) = self.pk_slice_base(b);
                 let mut cur = self.ex(b);
                 let mut cr = self.erepr(b);
-                let shape0 = self.shape(b);
+                let shape0 = match &extra {
+                    Some((_, sb)) => Some(*sb),
+                    None => self.shape(b),
+                };
                 for (k, ix) in idx.iter().enumerate() {
                     let i = self.ex(ix);
                     match cr.clone() {
@@ -2047,6 +2147,15 @@ impl<'a> Lw<'a> {
                             let bnd = if k == 0 { shape0 } else { None }
                                 .unwrap_or((n - 1, Dir::Downto, 0));
                             let off = self.pk_off(&i, bnd, &loc);
+                            let off = Self::add_off(extra.as_ref().map(|e| e.0).unwrap_or(0), &off);
+                            if self.cur_proc.is_none() {
+                                // In a subprogram: by the store helper.
+                                let f = self.pk_set_fn(w, n);
+                                return format!(
+                                    "{}{} = {}({}, {}, {});\n",
+                                    pad, cur, f, cur, off, value
+                                );
+                            }
                             cur = Self::pk_sel(&cur, w, n, &off);
                             cr = Repr::U8;
                         }
@@ -2080,6 +2189,13 @@ impl<'a> Lw<'a> {
                             Dir::Downto => bb.0 - sb.0,
                         };
                         if sb.1 == bb.1 && off >= 0 && off + len <= n {
+                            if self.cur_proc.is_none() {
+                                let f = self.pk_put_fn(w, n, len);
+                                return format!(
+                                    "{}{} = {}({}, {}, {});\n",
+                                    pad, base, f, base, off, value
+                                );
+                            }
                             let sel = Self::pk_part(&base, w, n, off, len);
                             return format!("{}{} = {};\n", pad, sel, value);
                         }
@@ -2211,6 +2327,9 @@ impl<'a> Lw<'a> {
         match &s.kind {
             HStmtKind::Null => String::new(),
             HStmtKind::VarAssign { target, value } => {
+                if self.struct_root(target) {
+                    self.proc_slow = true;
+                }
                 let v = self.store_value(target, value);
                 self.assign_to(target, v, ind)
             }
@@ -2254,23 +2373,43 @@ impl<'a> Lw<'a> {
                 }
             }
             HStmtKind::If(branches, else_b) => {
+                // A condition that folds (a specialisation's bounds) drops
+                // its branch, or the branches after it.
                 let mut out = String::new();
-                for (i, (c, body)) in branches.iter().enumerate() {
-                    let cv = self.ex(c);
+                let mut n = 0;
+                let mut taken = false;
+                for (c, body) in branches {
+                    let cv = match self.static_cond(c) {
+                        Some(false) => continue,
+                        Some(true) => "1".to_string(),
+                        None => self.ex(c),
+                    };
                     let _ = writeln!(
                         out,
                         "{}{}if ({}) begin",
                         pad,
-                        if i == 0 { "" } else { "end else " },
+                        if n == 0 { "" } else { "end else " },
                         cv
                     );
                     out.push_str(&self.stmts(body, ind + 2));
+                    n += 1;
+                    if cv == "1" {
+                        taken = true;
+                        break;
+                    }
                 }
-                if let Some(e) = else_b {
+                if let Some(e) = else_b
+                    && !taken
+                {
+                    if n == 0 {
+                        return self.stmts(e, ind);
+                    }
                     let _ = writeln!(out, "{}end else begin", pad);
                     out.push_str(&self.stmts(e, ind + 2));
                 }
-                let _ = writeln!(out, "{}end", pad);
+                if n > 0 {
+                    let _ = writeln!(out, "{}end", pad);
+                }
                 out
             }
             HStmtKind::Case { expr, alts } => self.case(expr, alts, ind),
@@ -2531,6 +2670,9 @@ impl<'a> Lw<'a> {
             }
             None if self.needs_spec(sub) => self.spec_call(sub, args, ind, loc),
             None => {
+                if let Some(k) = self.try_specialise(sub, args) {
+                    return self.pspec_proc_call(k, args, ind, loc);
+                }
                 self.need_sub(sub);
                 let mut a = Vec::new();
                 let (mut before, mut after) = (String::new(), String::new());
@@ -2631,6 +2773,12 @@ impl<'a> Lw<'a> {
     }
 
     fn subprogram(&mut self, s: SubId) {
+        self.subprogram_with(s, None);
+    }
+
+    /// Lower subprogram `s`, as specialisation `spec` when given (its
+    /// formals and locals with the specialisation's bounds).
+    fn subprogram_with(&mut self, s: SubId, spec: Option<usize>) {
         let info = self.d.subprograms[s].clone();
         let Some(body) = info.body.clone() else {
             let loc = info.loc.clone().unwrap_or(Loc {
@@ -2653,8 +2801,12 @@ impl<'a> Lw<'a> {
         }
         let saved_temps = std::mem::take(&mut self.temps);
         let saved_proc = self.cur_proc.take();
-        let ret_repr = info.ret.map(|rt| self.repr(rt, &loc));
-        let saved_ret = std::mem::replace(&mut self.cur_ret, ret_repr);
+        let saved_env = std::mem::replace(&mut self.spec_env, spec);
+        let ret_repr = match spec {
+            Some(k) => self.pspecs[k].ret.clone(),
+            None => info.ret.map(|rt| self.repr(rt, &loc)),
+        };
+        let saved_ret = std::mem::replace(&mut self.cur_ret, ret_repr.clone());
         // A method: its object is the first parameter.
         let me = if self.d.method_of.contains_key(&s) {
             Some(self.obj_name(info.params[0]))
@@ -2670,10 +2822,10 @@ impl<'a> Lw<'a> {
         let mut inits = String::new();
         for l in &body.locals {
             let o = self.d.objects[*l].clone();
-            let r = self.repr(o.ty, &o.loc);
+            let r = self.obj_repr(*l, &o.loc);
             let _ = writeln!(locals, "    {} {};", r.sv(), self.obj_name(*l));
-            let v = match &o.init {
-                Some(i) => {
+            let v = match (&o.init, &r) {
+                (Some(i), _) => {
                     let target = HExpr {
                         kind: HExprKind::Obj(*l),
                         ty: o.ty,
@@ -2681,7 +2833,8 @@ impl<'a> Lw<'a> {
                     };
                     self.store_value_init(&target, i)
                 }
-                None => self.default_value(o.ty, &o.loc),
+                (None, Repr::Pk(w, n)) => self.pk_default(o.ty, *w, *n),
+                (None, _) => self.default_value(o.ty, &o.loc),
             };
             let flushed = self.flush_pre(4);
             inits.push_str(&flushed);
@@ -2696,15 +2849,19 @@ impl<'a> Lw<'a> {
         for (n, t) in std::mem::take(&mut self.temps) {
             let _ = writeln!(temps, "    {} {};", t, n);
         }
-        let ret = match info.ret {
-            Some(rt) => self.repr(rt, &loc).sv(),
+        let ret = match ret_repr {
+            Some(r) => r.sv(),
             None => "void".into(),
+        };
+        let name = match spec {
+            Some(k) => self.pspecs[k].name.clone(),
+            None => self.sub_name(s),
         };
         let _ = write!(
             self.sub_items,
             "  function automatic {} {}({});\n{}{}{}{}  endfunction\n",
             ret,
-            self.sub_name(s),
+            name,
             params.join(", "),
             locals,
             temps,
@@ -2715,6 +2872,7 @@ impl<'a> Lw<'a> {
         self.cur_proc = saved_proc;
         self.cur_self = saved_self;
         self.cur_ret = saved_ret;
+        self.spec_env = saved_env;
     }
 
     /// A new object of protected type `t` (§5.6.2): the next handle, with

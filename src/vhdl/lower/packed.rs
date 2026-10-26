@@ -87,6 +87,39 @@ impl<'a> Lw<'a> {
         n >= 1 && n * w as i64 <= MAX_PK_BITS
     }
 
+    /// The bounds of array subtype `t`: static, or folding in the active
+    /// specialisation (`UNSIGNED(L_LEFT downto 0)` with L_LEFT a constant
+    /// of the specialised formals).
+    pub(super) fn type_bounds(&mut self, t: TypeId) -> Option<Bounds> {
+        if let Some(b) = self.static_bounds(t) {
+            return Some(b);
+        }
+        if self.spec_env.is_none() || self.ndims(t) != 1 {
+            return None;
+        }
+        let cons = self.d.array_constraint(t)?;
+        let r = cons.first()?.clone()?;
+        self.range_bounds(&r)
+    }
+
+    /// `pk_of` with the active specialisation's bounds.
+    pub(super) fn pk_of_env(&mut self, t: TypeId) -> Option<Repr> {
+        if let Some(r) = self.pk_of(t) {
+            return Some(r);
+        }
+        self.spec_env?;
+        let b = self.base(t);
+        let TypeKind::Array { index, elem } = &self.d.types[b].kind else {
+            return None;
+        };
+        if index.len() != 1 {
+            return None;
+        }
+        let w = self.pack_elem(*elem)?;
+        let n = bounds_len(self.type_bounds(t)?);
+        Self::pk_fits(w, n).then_some(Repr::Pk(w, n))
+    }
+
     pub(super) fn bounds_sv(&self, b: Bounds) -> (String, String, String) {
         (
             self.scalar_lit(&Value::Int(b.0), &Repr::I64),
@@ -106,10 +139,10 @@ impl<'a> Lw<'a> {
             HExprKind::Lit(_) => None,
             // A qualified expression keeps its operand's bounds (§9.3.5); a
             // conversion to a constrained subtype takes its bounds (§9.3.6).
-            HExprKind::Qualified(x) => self.shape(x).or_else(|| self.static_bounds(h.ty)),
+            HExprKind::Qualified(x) => self.shape(x).or_else(|| self.type_bounds(h.ty)),
             HExprKind::Convert(x) => {
                 if self.constrained_dim0(h.ty) {
-                    self.static_bounds(h.ty)
+                    self.type_bounds(h.ty)
                 } else {
                     self.shape(x)
                 }
@@ -117,7 +150,7 @@ impl<'a> Lw<'a> {
             HExprKind::Slice(_, r) => self.range_bounds(r),
             HExprKind::Call(s, args) => self.call_shape(*s, args, h),
             HExprKind::ArrayAgg(items) => {
-                if let Some(b) = self.static_bounds(h.ty) {
+                if let Some(b) = self.type_bounds(h.ty) {
                     return Some(b);
                 }
                 // Positional: from the index subtype's left bound (§9.3.3.3).
@@ -128,7 +161,7 @@ impl<'a> Lw<'a> {
                 }
                 None
             }
-            _ => self.static_bounds(h.ty),
+            _ => self.type_bounds(h.ty),
         }
     }
 
@@ -183,13 +216,16 @@ impl<'a> Lw<'a> {
                 b
             });
         }
-        let l = self.d.eval(&r.left)?.as_i64()?;
-        let rr = self.d.eval(&r.right)?.as_i64()?;
+        let l = self.eval_env(&r.left)?.as_i64()?;
+        let rr = self.eval_env(&r.right)?.as_i64()?;
         Some((l, r.dir, rr))
     }
 
     /// The bounds of the array a signal or variable object names.
     pub(super) fn obj_bounds(&self, o: ObjId) -> Option<Bounds> {
+        if let Some(b) = self.env_bounds(o) {
+            return Some(b);
+        }
         let info = &self.d.objects[o];
         if self.obj_is_sig(o)
             && let Some(r) = self.lookup_sig(self.inst, o)
@@ -238,7 +274,14 @@ impl<'a> Lw<'a> {
     fn call_shape(&mut self, s: SubId, args: &[HExpr], h: &HExpr) -> Option<Bounds> {
         let info = &self.d.subprograms[s];
         let Some(Builtin::Op(op)) = info.builtin.clone() else {
-            return self.static_bounds(h.ty);
+            // A specialised copy: its result's bounds.
+            if info.builtin.is_none()
+                && let Some(k) = self.try_specialise(s, args)
+                && let Some(b) = self.pspecs[k].ret_bounds
+            {
+                return Some(b);
+            }
+            return self.type_bounds(h.ty);
         };
         match op.as_str() {
             "and" | "or" | "nand" | "nor" | "xor" | "xnor" | "not" => {
@@ -275,7 +318,7 @@ impl<'a> Lw<'a> {
                     (false, false) => Some(bounds_from(il, idir, 2)),
                 }
             }
-            _ => self.static_bounds(h.ty),
+            _ => self.type_bounds(h.ty),
         }
     }
 
@@ -339,6 +382,9 @@ impl<'a> Lw<'a> {
     /// its signal's (a port shares its actual's signal, a formal
     /// associated with a slice reads that slice).
     pub(super) fn obj_repr(&mut self, o: ObjId, loc: &Loc) -> Repr {
+        if let Some(r) = self.env_repr(o, loc) {
+            return r;
+        }
         let ty = self.d.objects[o].ty;
         if self.obj_is_sig(o)
             && let Some(r) = self.lookup_sig(self.inst, o)
@@ -397,6 +443,14 @@ impl<'a> Lw<'a> {
                 }
                 _ => self.repr(h.ty, &h.loc),
             },
+            None => {
+                if let Some(k) = self.try_specialise(s, args)
+                    && let Some(r) = self.pspecs[k].ret.clone()
+                {
+                    return r;
+                }
+                self.repr(h.ty, &h.loc)
+            }
             _ => self.repr(h.ty, &h.loc),
         }
     }
@@ -488,7 +542,7 @@ impl<'a> Lw<'a> {
             let elem = self.arr_elem_sv(name);
             let _ = write!(
                 self.type_defs,
-                "  function automatic {name} {f}(bit [{hi}:0] v, longint l, longint r, bit dn, string file, int line);\n    {elem} t[];\n    if (vh_len(l, r, dn) != {n}) vh_fatal($sformatf(\"bound check failure at %s:%0d\", file, line));\n    t = new[{n}];\n    for (int i = 0; i < {n}; i++) t[i] = v[{w} * ({m} - i) +: {w}];\n    return {name}_mk(l, r, dn, t);\n  endfunction\n",
+                "  function automatic {name} {f}(bit [{hi}:0] vh_v, longint vh_l, longint vh_r, bit vh_dn, string file, int line);\n    {elem} vh_t[];\n    if (vh_len(vh_l, vh_r, vh_dn) != {n}) vh_fatal($sformatf(\"bound check failure at %s:%0d\", file, line));\n    vh_t = new[{n}];\n    for (int vh_i = 0; vh_i < {n}; vh_i++) vh_t[vh_i] = vh_v[{w} * ({m} - vh_i) +: {w}];\n    return {name}_mk(vh_l, vh_r, vh_dn, vh_t);\n  endfunction\n",
                 name = name,
                 f = fname,
                 hi = w as i64 * n - 1,
@@ -507,7 +561,7 @@ impl<'a> Lw<'a> {
         if self.pk_fns.insert(fname.clone()) {
             let _ = write!(
                 self.type_defs,
-                "  function automatic bit [{hi}:0] {f}({name} a, string file, int line);\n    bit [{hi}:0] v;\n    if (a.d.size() != {n}) begin vh_fatal($sformatf(\"bound check failure at %s:%0d\", file, line)); return v; end\n    for (int i = 0; i < {n}; i++) v[{w} * ({m} - i) +: {w}] = a.d[i];\n    return v;\n  endfunction\n",
+                "  function automatic bit [{hi}:0] {f}({name} vh_a, string file, int line);\n    bit [{hi}:0] vh_v;\n    if (vh_a.d.size() != {n}) begin vh_fatal($sformatf(\"bound check failure at %s:%0d\", file, line)); return vh_v; end\n    for (int vh_i = 0; vh_i < {n}; vh_i++) vh_v[{w} * ({m} - vh_i) +: {w}] = vh_a.d[vh_i];\n    return vh_v;\n  endfunction\n",
                 name = name,
                 f = fname,
                 hi = w as i64 * n - 1,
@@ -533,6 +587,48 @@ impl<'a> Lw<'a> {
         fname
     }
 
+    /// The function storing element `e` at offset `off` of a packed value
+    /// (`v = f(v, off, e)`): by mask arithmetic, which the simulator's
+    /// compiled tier accepts in a function body where a part-select store
+    /// into a local is not.
+    pub(super) fn pk_set_fn(&mut self, w: u32, n: i64) -> String {
+        let fname = format!("vh_pkset{}_{}", w, n);
+        if self.pk_fns.insert(fname.clone()) {
+            let hi = w as i64 * n - 1;
+            let _ = write!(
+                self.type_defs,
+                "  function automatic bit [{hi}:0] {f}(bit [{hi}:0] vh_v, longint vh_off, byte unsigned vh_e);\n    bit [{hi}:0] vh_ve, vh_m;\n    int vh_sh;\n    vh_sh = {w} * ({m} - vh_off);\n    vh_ve = vh_e;\n    vh_m = 0;\n    vh_m = ~vh_m;\n    vh_m = vh_m >> {rest};\n    return (vh_v & ~(vh_m << vh_sh)) | ((vh_ve & vh_m) << vh_sh);\n  endfunction\n",
+                hi = hi,
+                f = fname,
+                w = w,
+                m = n - 1,
+                rest = hi + 1 - w as i64
+            );
+        }
+        fname
+    }
+
+    /// The function storing `len` elements from offset `off` of a packed
+    /// value (`v = f(v, off, part)`).
+    pub(super) fn pk_put_fn(&mut self, w: u32, n: i64, len: i64) -> String {
+        let fname = format!("vh_pkput{}_{}_{}", w, n, len);
+        if self.pk_fns.insert(fname.clone()) {
+            let hi = w as i64 * n - 1;
+            let _ = write!(
+                self.type_defs,
+                "  function automatic bit [{hi}:0] {f}(bit [{hi}:0] vh_v, longint vh_off, bit [{phi}:0] vh_p);\n    bit [{hi}:0] vh_vp, vh_m;\n    int vh_sh;\n    vh_sh = {w} * ({n} - vh_off - {len});\n    vh_vp = vh_p;\n    vh_m = 0;\n    vh_m = ~vh_m;\n    vh_m = vh_m >> {rest};\n    return (vh_v & ~(vh_m << vh_sh)) | ((vh_vp & vh_m) << vh_sh);\n  endfunction\n",
+                hi = hi,
+                f = fname,
+                phi = w as i64 * len - 1,
+                w = w,
+                n = n,
+                len = len,
+                rest = hi + 1 - w as i64 * len
+            );
+        }
+        fname
+    }
+
     /// Concatenation helpers on packed values: an element with a vector
     /// (`ea`), a vector with an element (`ae`), two elements (`ee`).
     pub(super) fn pk_cat_fn(&mut self, kind: &str, w: u32, n: i64) -> String {
@@ -541,21 +637,21 @@ impl<'a> Lw<'a> {
             let hi = w as i64 * n - 1;
             let body = match kind {
                 "e" => format!(
-                    "(byte unsigned e);\n    return e[{w1}:0];",
+                    "(byte unsigned vh_e);\n    return vh_e[{w1}:0];",
                     w1 = w - 1
                 ),
                 "ea" => format!(
-                    "(byte unsigned e, bit [{hi}:0] a);\n    return {{e[{w1}:0], a}};",
+                    "(byte unsigned vh_e, bit [{hi}:0] vh_a);\n    return {{vh_e[{w1}:0], vh_a}};",
                     hi = hi,
                     w1 = w - 1
                 ),
                 "ae" => format!(
-                    "(bit [{hi}:0] a, byte unsigned e);\n    return {{a, e[{w1}:0]}};",
+                    "(bit [{hi}:0] vh_a, byte unsigned vh_e);\n    return {{vh_a, vh_e[{w1}:0]}};",
                     hi = hi,
                     w1 = w - 1
                 ),
                 _ => format!(
-                    "(byte unsigned e, byte unsigned f);\n    return {{e[{w1}:0], f[{w1}:0]}};",
+                    "(byte unsigned vh_e, byte unsigned vh_f);\n    return {{vh_e[{w1}:0], vh_f[{w1}:0]}};",
                     w1 = w - 1
                 ),
             };
