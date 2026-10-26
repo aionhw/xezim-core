@@ -36708,6 +36708,23 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // §7.4.1: a formal whose packed range is not `[N:0]`
+                    // indexes by its own labels (`input [11:2] p`,
+                    // `input [0:7] p`). Substituting a zero-based actual — a
+                    // part-select `addr[2+:10]`, a constant range, a concat,
+                    // a `[N:0]` net — makes `p[k]` index THAT value. The
+                    // labels then land on the wrong physical bits, and a
+                    // label past the actual's MSB is X. The connection
+                    // assign keeps the formal, stored LSB-aligned and
+                    // selected with its declared bounds.
+                    if is_input
+                        && elab
+                            .packed_full_dims
+                            .get(&cat2(&inst_prefix, &pname))
+                            .is_some_and(|d| d.iter().any(|&(l, r)| r != 0 || l < 0))
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     // §7.2.1/§23.3.3: a PACKED-STRUCT formal read member-wise
                     // (`din.f0`) needs its own member layout. Substituting a
                     // FLAT actual (a plain vector net, a concat, a select)
