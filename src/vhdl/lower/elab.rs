@@ -779,7 +779,7 @@ impl<'a> Lw<'a> {
                     );
                     "0".into()
                 }
-                _ => format!("(longint'($time) - {}_lev)", p),
+                _ => format!("(vh_now - {}_lev)", p),
             });
         }
         if let HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) = &x.kind
@@ -802,7 +802,7 @@ impl<'a> Lw<'a> {
                     );
                     "0".into()
                 }
-                _ => format!("(longint'($time) - {}_lev)", p),
+                _ => format!("(vh_now - {}_lev)", p),
             });
         }
         let s = self.sig_of(x)?;
@@ -827,9 +827,9 @@ impl<'a> Lw<'a> {
             "last_value" => format!("vh_s{}_last", s),
             "last_active" => {
                 self.need_lact.insert(s);
-                format!("(longint'($time) - vh_s{}_lact)", s)
+                format!("(vh_now - vh_s{}_lact)", s)
             }
-            _ => format!("(longint'($time) - vh_s{}_lev)", s),
+            _ => format!("(vh_now - vh_s{}_lev)", s),
         }
     }
 
@@ -1251,6 +1251,22 @@ impl<'a> Lw<'a> {
                 (if i == 0 { 0 } else { 2 }, "64'sd0".into())
             };
             match &path {
+                // A whole zero-delay assignment to a driver assigned by
+                // parts too: pending values leaf by leaf (compiled), not the
+                // whole-value function's queued transactions.
+                None if t == "64'sd0"
+                    && mode == 1
+                    && !guarded
+                    && self.drivers.get(&(sig, p)).is_some_and(|d| d.slots) =>
+                {
+                    let vt = self.erepr(target).sv();
+                    let tmp = format!("vh_tv{}", self.tmp);
+                    self.tmp += 1;
+                    self.temps.push((tmp.clone(), vt));
+                    let _ = writeln!(out, "{}{} = {};", pad, tmp, val);
+                    let code = self.drive_path(sig, p, &[], target.ty, &tmp, (&t, &rej, mode), ind);
+                    out.push_str(&code);
+                }
                 None if t == "64'sd0" && self.fast_driver(sig, p) => {
                     let _ = writeln!(
                         out,
@@ -1920,6 +1936,17 @@ impl<'a> Lw<'a> {
     /// The drivers: transaction queues and the procedures updating their
     /// projected waveforms (§10.5.2.2).
     fn drivers_sv(&mut self, elab: &mut String) -> String {
+        let drv = self.drivers_body(elab);
+        // The leaf code's variables: the leaf and index of a pending value,
+        // and the loop variables of whole-value assignments to parts.
+        let mut head = String::from("  longint vh_lk, vh_lkk;\n  int vh_pi, vh_pj;\n");
+        for v in &self.leaf_vars {
+            let _ = writeln!(head, "  longint {};", v);
+        }
+        head + &drv
+    }
+
+    fn drivers_body(&mut self, elab: &mut String) -> String {
         let mut drv = String::new();
         let drivers: Vec<((usize, usize), Driver)> =
             self.drivers.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -1985,7 +2012,7 @@ impl<'a> Lw<'a> {
                 } else {
                 let _ = write!(
                     drv,
-                    "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n{g_decl}  {t} vh_dv{s}_{p};\n  // Update the projected output waveform (§10.5.2.2): mode 0 transport,\n  // 1 inertial first element (reject limit), 2 later elements.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode{g_param});\n    longint tt;\n    longint qt[$];\n    {t} qv[$];\n{g_local}    int k;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qv = vh_dq{s}_{p};\n{g_get}    while (qt.size() > 0 && qt[qt.size()-1] >= tt) begin void'(qt.pop_back()); void'(qv.pop_back());{g_pop} end\n    if (mode == 1) begin\n      // Pulse rejection: of the old transactions in [tt - rej, tt), keep\n      // the run immediately before the new one that has its value.\n      k = qt.size() - 1;\n      while (k >= 0 && qt[k] >= tt - rej && ({g_eq})) k--;\n      while (k >= 0 && qt[k] >= tt - rej) begin qt.delete(k); qv.delete(k);{g_del} k--; end\n    end\n    qt.push_back(tt);\n    qv.push_back(v);\n{g_push}    vh_dt{s}_{p} = qt;\n    vh_dq{s}_{p} = qv;\n{g_put}  endfunction\n",
+                    "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n{g_decl}  {t} vh_dv{s}_{p};\n  int vh_qn{s}_{p};\n  // Update the projected output waveform (§10.5.2.2): mode 0 transport,\n  // 1 inertial first element (reject limit), 2 later elements.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode{g_param});\n    longint tt;\n    longint qt[$];\n    {t} qv[$];\n{g_local}    int k;\n    tt = longint'($time) + after;\n    qt = vh_dt{s}_{p};\n    qv = vh_dq{s}_{p};\n{g_get}    while (qt.size() > 0 && qt[qt.size()-1] >= tt) begin void'(qt.pop_back()); void'(qv.pop_back());{g_pop} end\n    if (mode == 1) begin\n      // Pulse rejection: of the old transactions in [tt - rej, tt), keep\n      // the run immediately before the new one that has its value.\n      k = qt.size() - 1;\n      while (k >= 0 && qt[k] >= tt - rej && ({g_eq})) k--;\n      while (k >= 0 && qt[k] >= tt - rej) begin qt.delete(k); qv.delete(k);{g_del} k--; end\n    end\n    qt.push_back(tt);\n    qv.push_back(v);\n{g_push}    vh_dt{s}_{p} = qt;\n    vh_dq{s}_{p} = qv;\n    vh_qn{s}_{p} = qt.size();\n{g_put}  endfunction\n",
                     t = t,
                     s = s,
                     p = p,
@@ -2206,7 +2233,7 @@ impl<'a> Lw<'a> {
         // The kernel's state: the cycle block's trigger and acknowledgement,
         // the initialization passes, the scan's start and the process it
         // hands over, the next cycle's time.
-        let _ = writeln!(k, "  bit vh_tick, vh_tock;\n  int vh_from, vh_r;\n  longint vh_nxt;");
+        let _ = writeln!(k, "  bit vh_tick, vh_tock;\n  int vh_from, vh_r;\n  longint vh_nxt;\n  // The current time, published by the kernel thread: `$time` in the\n  // cycle block would be an expression the simulator interprets.\n  longint vh_now;");
 
         // ---- the time of the next simulation cycle (§14.7.5.3 g), into vh_n.
         let mut nx = String::new();
@@ -2218,14 +2245,14 @@ impl<'a> Lw<'a> {
             if self.fast_driver(*s, *p) {
                 let _ = writeln!(
                     nx,
-                    "    if (vh_pend{s}_{p}) vh_n = $time; else if (vh_qn{s}_{p} > 0 && (vh_n < 0 || vh_dt{s}_{p}[0] < vh_n)) vh_n = vh_dt{s}_{p}[0];",
+                    "    if (vh_pend{s}_{p}) vh_n = vh_now; else if (vh_qn{s}_{p} > 0 && (vh_n < 0 || vh_dt{s}_{p}[0] < vh_n)) vh_n = vh_dt{s}_{p}[0];",
                     s = s,
                     p = p
                 );
             } else {
                 let _ = writeln!(
                     nx,
-                    "    if (vh_dt{s}_{p}.size() > 0 && (vh_n < 0 || vh_dt{s}_{p}[0] < vh_n)) vh_n = vh_dt{s}_{p}[0];",
+                    "    if (vh_qn{s}_{p} > 0 && (vh_n < 0 || vh_dt{s}_{p}[0] < vh_n)) vh_n = vh_dt{s}_{p}[0];",
                     s = s,
                     p = p
                 );
@@ -2256,7 +2283,7 @@ impl<'a> Lw<'a> {
             }
         }
         // Force and release requests take effect in the next cycle.
-        let _ = writeln!(nx, "    if (vh_fpend && (vh_n < 0 || $time < vh_n)) vh_n = $time;");
+        let _ = writeln!(nx, "    if (vh_fpend && (vh_n < 0 || vh_now < vh_n)) vh_n = vh_now;");
         let _ = write!(
             k,
             "  function automatic longint vh_next();\n    longint vh_n;\n    vh_n = -64'sd1;\n{}    return vh_n;\n  endfunction\n",
@@ -2276,7 +2303,7 @@ impl<'a> Lw<'a> {
             } else if self.fast_driver(*s, *p) {
                 let _ = writeln!(
                     ub,
-                    "    if (vh_pend{s}_{p}) begin vh_dv{s}_{p} = vh_pv{s}_{p}; vh_pend{s}_{p} = 0; vh_s{s}_act = 1; end else if (vh_qn{s}_{p} > 0 && vh_dt{s}_{p}[0] <= $time) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1; end",
+                    "    if (vh_pend{s}_{p}) begin vh_dv{s}_{p} = vh_pv{s}_{p}; vh_pend{s}_{p} = 0; vh_s{s}_act = 1; end else if (vh_qn{s}_{p} > 0 && vh_dt{s}_{p}[0] <= vh_now) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1; end",
                     s = s,
                     p = p
                 );
@@ -2287,7 +2314,7 @@ impl<'a> Lw<'a> {
                     String::new()
                 };
                 let pop = format!(
-                    "void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_s{s}_act = 1;",
+                    "void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1;",
                     s = s,
                     p = p,
                     on = on
@@ -2309,7 +2336,7 @@ impl<'a> Lw<'a> {
                 };
                 let _ = writeln!(
                     ub,
-                    "    if (vh_dt{s}_{p}.size() > 0 && vh_dt{s}_{p}[0] <= $time) {pop}",
+                    "    if (vh_qn{s}_{p} > 0 && vh_dt{s}_{p}[0] <= vh_now) {pop}",
                     s = s,
                     p = p,
                     pop = pop
@@ -2352,7 +2379,7 @@ impl<'a> Lw<'a> {
                 let r = self.repr(sig.ty, &loc);
                 let eq = self.eq_expr(&r, &format!("vh_s{}_fnv", s), &format!("vh_s{}", s));
                 let set = format!(
-                    "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = $time;",
+                    "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = vh_now;",
                     s = s
                 );
                 let set = if self.sig_scalar(s) {
@@ -2403,7 +2430,7 @@ impl<'a> Lw<'a> {
                 )
             );
             let set = format!(
-                "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = $time;",
+                "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = vh_now;",
                 s = s,
                 p = ds[0].0
             );
@@ -2435,7 +2462,7 @@ impl<'a> Lw<'a> {
             let _ = writeln!(ub, "    vh_imp{}(0);", n);
         }
         for s in self.need_lact.clone() {
-            let _ = writeln!(ub, "    if (vh_s{s}_act) vh_s{s}_lact = $time;", s = s);
+            let _ = writeln!(ub, "    if (vh_s{s}_act) vh_s{s}_lact = vh_now;", s = s);
         }
         ub.push_str(&self.boundary_write(false, "    "));
         if boundary {
@@ -2452,7 +2479,7 @@ impl<'a> Lw<'a> {
             let mut c = Vec::new();
             if !fp.contains(&pi) {
                 c.push(format!(
-                    "(vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time)",
+                    "(vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= vh_now)",
                     p = pi
                 ));
             }
@@ -2486,7 +2513,7 @@ impl<'a> Lw<'a> {
                 if post.contains(&pi) {
                     let _ = writeln!(
                         k,
-                        "    if (from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
+                        "    if (from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= vh_now); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
                         p = pi,
                         c = c
                     );
@@ -2495,7 +2522,7 @@ impl<'a> Lw<'a> {
                 } else {
                     let _ = writeln!(
                         k,
-                        "    if (from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; return {p}; end",
+                        "    if (from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= vh_now); vh_tmo[{p}] = -64'sd1; return {p}; end",
                         p = pi,
                         c = c
                     );
@@ -2505,63 +2532,142 @@ impl<'a> Lw<'a> {
             k.push_str(&self.eager_sv());
         }
 
-        // ---- the cycle block: update, the resumption scan from vh_from
-        // (initialization, §14.7.5.2: pass 0 the processes, pass 1 the
-        // postponed ones, each run once), the next cycle's time.
-        let mut cyc = String::new();
-        let _ = writeln!(cyc, "  always @(vh_tick) begin : vh_cycle");
-        let _ = writeln!(cyc, "    longint vh_n;");
+        // ---- the cycle blocks: the update phase, the resumption scan from
+        // vh_from, the next cycle's time; split into a chain of always
+        // blocks of bounded size (a block too large for the simulator's
+        // register file is interpreted). Each block triggers the next; the
+        // last acknowledges the kernel.
+        const MAX_LINES: usize = 2500;
+        #[derive(PartialEq, Clone, Copy)]
+        enum Seg {
+            Update,
+            Scan,
+            Next,
+        }
+        let mut segs: Vec<(Seg, String)> = Vec::new();
+        for line in ub.lines() {
+            segs.push((Seg::Update, format!("  {}\n", line)));
+        }
         let bodies: std::collections::BTreeMap<usize, (String, String)> = self
             .fproc_bodies
             .iter()
             .map(|(gp, t, b)| (*gp, (t.clone(), b.clone())))
             .collect();
+        // The blocks' variables at module scope: a block-local declaration
+        // keeps the simulator from compiling the block.
+        let mut cyc = String::new();
+        let _ = writeln!(cyc, "  longint vh_cyc_n;");
         for (temps, _) in bodies.values() {
-            cyc.push_str(temps);
+            for line in temps.lines() {
+                let _ = writeln!(cyc, "  {}", line.trim_start());
+            }
         }
-        let _ = writeln!(cyc, "    if (vh_from == 0) begin");
-        for line in ub.lines() {
-            let _ = writeln!(cyc, "  {}", line);
-        }
-        let _ = writeln!(cyc, "    end");
-        let _ = writeln!(cyc, "    vh_r = -1;");
         for (pi, c) in conds.iter().enumerate() {
             let Some(c) = c.clone() else { continue };
+            let mut t = String::new();
             if post.contains(&pi) {
                 let _ = writeln!(
-                    cyc,
-                    "    if (vh_r < 0 && vh_from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
+                    t,
+                    "    if (vh_r < 0 && vh_from <= {p} && !vh_go[{p}] && !vh_pres[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= vh_now); vh_tmo[{p}] = -64'sd1; vh_pres[{p}] = 1; end",
                     p = pi,
                     c = c
                 );
             } else if fp.contains(&pi) {
                 let body = bodies.get(&pi).map(|b| b.1.clone()).unwrap_or_default();
                 let _ = writeln!(
-                    cyc,
+                    t,
                     "    if (vh_r < 0 && vh_from <= {p} && ({c})) begin",
                     p = pi,
                     c = c
                 );
                 for line in body.lines() {
-                    let _ = writeln!(cyc, "  {}", line);
+                    let _ = writeln!(t, "  {}", line);
                 }
-                let _ = writeln!(cyc, "    end");
+                let _ = writeln!(t, "    end");
             } else {
                 let _ = writeln!(
-                    cyc,
-                    "    if (vh_r < 0 && vh_from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= $time); vh_tmo[{p}] = -64'sd1; vh_r = {p}; end",
+                    t,
+                    "    if (vh_r < 0 && vh_from <= {p} && !vh_go[{p}] && ({c})) begin vh_tmoh[{p}] = (vh_tmo[{p}] >= 0 && vh_tmo[{p}] <= vh_now); vh_tmo[{p}] = -64'sd1; vh_r = {p}; end",
                     p = pi,
                     c = c
                 );
             }
+            segs.push((Seg::Scan, t));
         }
-        let _ = writeln!(cyc, "    if (vh_r < 0) begin\n      vh_n = -64'sd1;");
+        segs.push((Seg::Next, "      vh_cyc_n = -64'sd1;\n".into()));
         for line in nx.lines() {
-            let _ = writeln!(cyc, "  {}", line);
+            // `vh_n` only (not `vh_now`).
+            segs.push((
+                Seg::Next,
+                format!(
+                    "  {}\n",
+                    line.replace("vh_now", "\u{1}").replace("vh_n", "vh_cyc_n").replace('\u{1}', "vh_now")
+                ),
+            ));
         }
-        let _ = writeln!(cyc, "      vh_nxt = vh_n;\n    end");
-        let _ = writeln!(cyc, "    vh_tock = !vh_tock;");
-        let _ = writeln!(cyc, "  end");
+        segs.push((Seg::Next, "      vh_nxt = vh_cyc_n;\n".into()));
+        // Pack the segments into blocks.
+        let mut blocks: Vec<Vec<(Seg, String)>> = vec![Vec::new()];
+        let mut lines = 0usize;
+        for seg in segs {
+            let n = seg.1.lines().count();
+            if lines + n > MAX_LINES && !blocks.last().unwrap().is_empty() {
+                blocks.push(Vec::new());
+                lines = 0;
+            }
+            lines += n;
+            blocks.last_mut().unwrap().push(seg);
+        }
+        let nb = blocks.len();
+        let mut trig = String::new();
+        for i in 1..nb {
+            let _ = write!(trig, " vh_tk{},", i);
+        }
+        if nb > 1 {
+            let _ = writeln!(cyc, "  bit{};", trig.trim_end_matches(','));
+        }
+        for (i, block) in blocks.iter().enumerate() {
+            let t = if i == 0 { "vh_tick".to_string() } else { format!("vh_tk{}", i) };
+            let _ = writeln!(cyc, "  always @({}) begin : vh_cycle{}", t, i);
+            let mut cur: Option<Seg> = None;
+            for (kind, text) in block {
+                if cur != Some(*kind) {
+                    if let Some(k) = cur
+                        && k != Seg::Scan
+                    {
+                        let _ = writeln!(cyc, "    end");
+                    }
+                    match kind {
+                        Seg::Update => {
+                            let _ = writeln!(cyc, "    if (vh_from == 0) begin");
+                        }
+                        Seg::Next => {
+                            let _ = writeln!(cyc, "    if (vh_r < 0) begin");
+                        }
+                        Seg::Scan => {
+                            // The first scan segment of the cycle resets the
+                            // process found.
+                            if i == 0 || blocks[..i].iter().all(|b| b.iter().all(|(k, _)| *k != Seg::Scan)) {
+                                let _ = writeln!(cyc, "    vh_r = -1;");
+                            }
+                        }
+                    }
+                    cur = Some(*kind);
+                }
+                cyc.push_str(text);
+            }
+            if let Some(k) = cur
+                && k != Seg::Scan
+            {
+                let _ = writeln!(cyc, "    end");
+            }
+            if i + 1 < nb {
+                let _ = writeln!(cyc, "    vh_tk{} = !vh_tk{};", i + 1, i + 1);
+            } else {
+                let _ = writeln!(cyc, "    vh_tock = !vh_tock;");
+            }
+            let _ = writeln!(cyc, "  end");
+        }
         k.push_str(&cyc);
 
         // ---- the kernel thread.
@@ -2581,14 +2687,14 @@ impl<'a> Lw<'a> {
         // that wait, until the scan finds none.
         let scan = |ind: &str| {
             format!(
-                "{i}forever begin\n{i}  vh_tick = !vh_tick; @(vh_tock);\n{i}  if (vh_r < 0) break;\n{i} {mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_from = vh_r + 1;\n{i}end\n",
+                "{i}vh_now = $time;\n{i}forever begin\n{i}  vh_tick = !vh_tick; @(vh_tock);\n{i}  if (vh_r < 0) break;\n{i} {mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_from = vh_r + 1;\n{i}end\n",
                 i = ind,
                 mark = mark
             )
         };
         let _ = writeln!(k, "  initial begin : vh_kernel");
         let _ = writeln!(k, "    bit vh_any;");
-        let _ = writeln!(k, "    vh_elab();");
+        let _ = writeln!(k, "    vh_elab();\n    vh_now = $time;");
         k.push_str(&self.boundary_sample_init());
         // Initial effective values (§14.7.5.2), in update order.
         for &s in &order {
@@ -2646,7 +2752,7 @@ impl<'a> Lw<'a> {
             // the VHDL elaboration.
             let _ = writeln!(
                 k,
-                "    while (vh_nxt == $time && !vh_stop) begin\n      vh_update();\n      vh_r = vh_resume(0);\n      while (vh_r >= 0) begin{mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end\n      vh_nxt = vh_next();\n    end",
+                "    while (vh_nxt == $time && !vh_stop) begin\n      vh_now = $time;\n      vh_update();\n      vh_r = vh_resume(0);\n      while (vh_r >= 0) begin{mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end\n      vh_nxt = vh_next();\n    end",
                 mark = mark
             );
             let _ = writeln!(k, "    vh_started = 1;");
@@ -2778,7 +2884,7 @@ impl<'a> Lw<'a> {
             match self.sig_attr(a, n) {
                 Some(x) => out.push(if n == "last_event" {
                     // The parameter carries the time of the last event.
-                    format!("(longint'($time) - {})", x)
+                    format!("(vh_now - {})", x)
                 } else if n == "last_value" {
                     self.coerce(x, &ar, &pr, bsv.clone(), &a.loc)
                 } else {

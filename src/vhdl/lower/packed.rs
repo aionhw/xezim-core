@@ -756,9 +756,11 @@ impl<'a> Lw<'a> {
         !s.contains('(') && !s.contains('{') && !s.contains('\'') && !s.contains(' ')
     }
 
-    /// `v` as a selectable name: a temporary when it is not one.
+    /// `v` as a selectable name: a temporary when it is not one, or is a
+    /// select already (a port associated with a slice; SV has no select
+    /// of a select).
     pub(super) fn as_selectable(&mut self, v: String, r: &Repr) -> String {
-        if Self::selectable(&v) {
+        if Self::selectable(&v) && !v.contains('[') {
             return v;
         }
         self.as_tmp(v, &r.sv())

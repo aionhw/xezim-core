@@ -329,14 +329,20 @@ impl<'a> Lw<'a> {
             let r = self.repr(c.scalar, loc);
             let et = r.sv();
             let tx = self.slot_tx(&r);
+            let cap = c.count.max(1);
+            // Pending zero-delay values by leaf, the leaves pending (each
+            // once), and their number (the fast path of `emit_leaves`); a
+            // queued transaction first moves the pending ones into the queue.
             let _ = write!(
                 out,
-                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= $time) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;\n    end\n  endfunction\n",
+                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  int vh_sqn{s}_{p}_c{c};\n  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n    for (vh_pj = 0; vh_pj < vh_pn{s}_{p}_c{c}; vh_pj = vh_pj + 1) begin\n      vh_lkk = vh_pl{s}_{p}_c{c}[vh_pj];\n      if (vh_pm{s}_{p}_c{c}[vh_lkk]) begin {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, vh_lkk, vh_pf{s}_{p}_c{c}[vh_lkk], 64'sd0, 64'sd0, 0); vh_pm{s}_{p}_c{c}[vh_lkk] = 0; end\n    end\n    vh_pn{s}_{p}_c{c} = 0;\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= vh_now) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;\n    end\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n",
                 s = s,
                 p = p,
                 c = ci,
                 et = et,
                 tx = tx,
+                cnt1 = c.count.max(1) - 1,
+                cap1 = cap - 1,
                 leaf = Self::leaf_sv(c, "k")
             );
         }
@@ -411,9 +417,10 @@ impl<'a> Lw<'a> {
                         Some((_, n)) => n.to_string(),
                         None => format!("{}.d.size()", v),
                     };
+                    self.leaf_vars.insert(iv.clone());
                     let _ = writeln!(
                         out,
-                        "{}{}for (longint {iv} = 0; {iv} < {count}; {iv}++) begin",
+                        "{}{}for ({iv} = 0; {iv} < {count}; {iv} = {iv} + 1) begin",
                         pad,
                         "  ".repeat(opened),
                         iv = iv,
@@ -464,6 +471,22 @@ impl<'a> Lw<'a> {
                         format!("({}) * {} + {}", key, n, offs[k])
                     };
                 }
+                if self.leaf_zero && self.sig_kind(s).is_none() {
+                    // A zero-delay assignment to a leaf without queued
+                    // transactions: a pending value (compiled code), applied
+                    // by the update phase; else the queue (`vh_drs`).
+                    let _ = writeln!(
+                        out,
+                        "{pad}vh_lk = {key};\n{pad}if (vh_sqn{s}_{p}_c{c} == 0) begin vh_pf{s}_{p}_c{c}[vh_lk] = {val}; if (!vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_pm{s}_{p}_c{c}[vh_lk] = 1; vh_pl{s}_{p}_c{c}[vh_pn{s}_{p}_c{c}] = vh_lk; vh_pn{s}_{p}_c{c} = vh_pn{s}_{p}_c{c} + 1; end end else vh_drs_{s}_{p}_c{c}(vh_lk, {val}, after, rej, mode);",
+                        pad = pad,
+                        key = key,
+                        s = s,
+                        p = p,
+                        c = ci,
+                        val = val
+                    );
+                    return;
+                }
                 let _ = writeln!(
                     out,
                     "{}vh_drs_{}_{}_c{}({}, {}, after, rej, mode);",
@@ -476,8 +499,21 @@ impl<'a> Lw<'a> {
     /// Kernel: apply the due transactions of driver (s, p) by parts.
     pub(super) fn slot_driver_due(&self, s: usize, p: usize, ind: &str) -> String {
         let mut out = String::new();
+        let Some(classes) = self.leaf_classes(self.sigs[s].ty) else {
+            return out;
+        };
         for c in self.driver_classes(s, p) {
-            let _ = writeln!(out, "{}vh_drd_{}_{}_c{}();", ind, s, p, c);
+            let leaf = Self::leaf_sv(&classes[c], "vh_lk");
+            let _ = writeln!(
+                out,
+                "{ind}if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pl{s}_{p}_c{c}[vh_pi]; if (vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{leaf} = vh_pf{s}_{p}_c{c}[vh_lk]; vh_pm{s}_{p}_c{c}[vh_lk] = 0; end end vh_pn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end",
+                ind = ind,
+                s = s,
+                p = p,
+                c = c,
+                leaf = leaf
+            );
+            let _ = writeln!(out, "{ind}if (vh_sqn{s}_{p}_c{c} > 0) vh_drd_{s}_{p}_c{c}();", ind = ind, s = s, p = p, c = c);
         }
         out
     }
@@ -488,7 +524,7 @@ impl<'a> Lw<'a> {
         for c in self.driver_classes(s, p) {
             let _ = writeln!(
                 out,
-                "    if (vh_dt{s}_{p}_c{c}.size() > 0 && (n < 0 || vh_dt{s}_{p}_c{c}[0] < n)) n = vh_dt{s}_{p}_c{c}[0];",
+                "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now; else if (vh_sqn{s}_{p}_c{c} > 0 && (n < 0 || vh_dt{s}_{p}_c{c}[0] < n)) n = vh_dt{s}_{p}_c{c}[0];",
                 s = s,
                 p = p,
                 c = c
@@ -758,8 +794,10 @@ impl<'a> Lw<'a> {
             }
         }
         let mut body = String::new();
-        self.emit_leaves(s, p, t, val, &mut prefix, slice_start, slice_len, &mut body, ind + 2, 0);
         let (after, rej, mode) = timing;
+        let saved = std::mem::replace(&mut self.leaf_zero, after == "64'sd0" && rej == "64'sd0" && mode == 1);
+        self.emit_leaves(s, p, t, val, &mut prefix, slice_start, slice_len, &mut body, ind + 2, 0);
+        self.leaf_zero = saved;
         format!(
             "{pad}begin\n{pad}  longint after, rej;\n{pad}  int mode;\n{pad}  after = {after}; rej = {rej}; mode = {mode};\n{body}{pad}end\n",
             pad = pad,

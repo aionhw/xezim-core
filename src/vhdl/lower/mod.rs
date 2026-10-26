@@ -195,6 +195,12 @@ struct Lw<'a> {
     /// variable: it runs as a called function (the simulator's compiled
     /// `always` blocks do not copy structs between module variables).
     proc_slow: bool,
+    /// The leaf transactions being emitted are a zero-delay inertial
+    /// assignment (the pending fast path applies, leaves.rs).
+    leaf_zero: bool,
+    /// Module-level loop variables of the leaf code (a loop declaring its
+    /// own variable is interpreted).
+    leaf_vars: BTreeSet<String>,
     /// Processes that test a signal's 'event (rising_edge, falling_edge):
     /// clocked logic, whose updates SV sees after its NBA region.
     clocked: BTreeSet<usize>,
@@ -316,6 +322,8 @@ impl<'a> Lw<'a> {
             fprocs: BTreeSet::new(),
             fproc_bodies: Vec::new(),
             proc_slow: false,
+            leaf_zero: false,
+            leaf_vars: BTreeSet::new(),
             clocked: BTreeSet::new(),
             tx_keys: BTreeSet::new(),
             tx_defs: String::new(),
@@ -1188,7 +1196,7 @@ impl<'a> Lw<'a> {
                 let v = self.ex(a);
                 format!("({} && {} == {})", ev, v, one as u8)
             }
-            Some(Builtin::Now) => "longint'($time)".into(),
+            Some(Builtin::Now) => "vh_now".into(),
             Some(Builtin::EndFile) => self.endfile(&args[0]),
             Some(Builtin::Native(n)) if n == "textio.justify" => {
                 self.textio = true;
