@@ -15,12 +15,14 @@ mod elab;
 mod files;
 mod leaves;
 mod mixed;
+mod packed;
 mod runtime;
 mod textio;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use elab::{Driver, GLOBAL, InstInfo, Sig, SigRef, Site};
+use packed::bounds_len;
 use std::fmt::Write as _;
 
 use super::ast::{Dir, Mode, ObjClass};
@@ -41,7 +43,15 @@ enum Repr {
     /// One-dimensional array: struct name and element representation.
     Arr(String, Box<Repr>),
     Rec(String),
+    /// A one-dimensional array with static bounds of an enumeration
+    /// element: a packed vector of `n` elements of `w` bits each (the
+    /// element's position), the left element the most significant. Its
+    /// bounds are those of its subtype, known where it is used.
+    Pk(u32, i64),
 }
+
+/// The widest packed vector (bits); larger arrays keep the struct.
+const MAX_PK_BITS: i64 = 2048;
 
 impl Repr {
     fn sv(&self) -> String {
@@ -53,6 +63,7 @@ impl Repr {
             Repr::Real => "real".into(),
             Repr::Arr(n, _) => n.clone(),
             Repr::Rec(n) => n.clone(),
+            Repr::Pk(w, n) => format!("bit [{}:0]", *w as i64 * n - 1),
         }
     }
     fn key(&self) -> String {
@@ -64,7 +75,12 @@ impl Repr {
             Repr::Real => "r".into(),
             Repr::Arr(n, _) => n.clone(),
             Repr::Rec(n) => n.clone(),
+            Repr::Pk(w, n) => format!("pk{}_{}", w, n),
         }
+    }
+    /// A representation whose values are SV integral values.
+    fn is_scalar(&self) -> bool {
+        !matches!(self, Repr::Arr(..) | Repr::Rec(_))
     }
 }
 
@@ -176,6 +192,11 @@ struct Lw<'a> {
     /// representation (by key), and their definitions.
     tx_keys: BTreeSet<String>,
     tx_defs: String,
+    /// Conversion helpers between packed and struct arrays (packed.rs).
+    pk_fns: BTreeSet<String>,
+    /// The representation of the value returned by the subprogram being
+    /// lowered.
+    cur_ret: Option<Repr>,
     opts: super::VhdlOptions,
 }
 
@@ -276,6 +297,8 @@ impl<'a> Lw<'a> {
             clocked: BTreeSet::new(),
             tx_keys: BTreeSet::new(),
             tx_defs: String::new(),
+            pk_fns: BTreeSet::new(),
+            cur_ret: None,
             opts: super::VhdlOptions::default(),
         }
     }
@@ -357,21 +380,8 @@ impl<'a> Lw<'a> {
             }
             TypeKind::UniversalInteger | TypeKind::Physical(_) => Repr::I64,
             TypeKind::Real | TypeKind::UniversalReal => Repr::Real,
-            TypeKind::Array { index, elem } => {
-                // A multi-dimensional array is an array (first dimension)
-                // of arrays of the remaining dimensions.
-                let er = self.repr(*elem, loc);
-                let logic = self.d.is_bit_or_bool(*elem);
-                let mut r = er;
-                for k in (0..index.len()).rev() {
-                    let name = self.arr_type(&r);
-                    if k == index.len() - 1 && logic {
-                        self.logic_arrs.insert(name.clone());
-                    }
-                    r = Repr::Arr(name, Box::new(r));
-                }
-                r
-            }
+            TypeKind::Array { .. } if self.pk_of(t).is_some() => self.pk_of(t).unwrap(),
+            TypeKind::Array { .. } => self.fat_repr(t, loc),
             // An access value: a handle into the designated type's heap (0:
             // null, §5.4).
             TypeKind::Access(_) => Repr::I64,
@@ -420,6 +430,30 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// The struct representation of an array type, whatever its bounds
+    /// (of a scalar type: its representation).
+    fn fat_repr(&mut self, t: TypeId, loc: &Loc) -> Repr {
+        let b = self.base(t);
+        match &self.d.types[b].kind {
+            TypeKind::Array { index, elem } => {
+                // A multi-dimensional array is an array (first dimension)
+                // of arrays of the remaining dimensions.
+                let er = self.repr(*elem, loc);
+                let logic = self.d.is_bit_or_bool(*elem);
+                let mut r = er;
+                for k in (0..index.len()).rev() {
+                    let name = self.arr_type(&r);
+                    if k == index.len() - 1 && logic {
+                        self.logic_arrs.insert(name.clone());
+                    }
+                    r = Repr::Arr(name, Box::new(r));
+                }
+                r
+            }
+            _ => self.repr(t, loc),
+        }
+    }
+
     /// The heap of an access type's designated type (its key).
     fn heap(&mut self, acc: TypeId, loc: &Loc) -> String {
         let des = self.d.designated(acc).unwrap_or(acc);
@@ -442,7 +476,7 @@ impl<'a> Lw<'a> {
         let name = format!("vh_a_{}", er.key());
         if self.arr_types.insert(name.clone()) {
             let eq = self.eq_expr(er, "x.d[i]", "y.d[i]");
-            let scalar = !matches!(er, Repr::Arr(..) | Repr::Rec(_));
+            let scalar = er.is_scalar();
             let t = runtime::ARRAY_TEMPLATE
                 .replace("EQ(x.d[i], y.d[i])", &eq)
                 .replace(
@@ -580,6 +614,14 @@ impl<'a> Lw<'a> {
     fn value(&mut self, v: &Value, t: TypeId, loc: &Loc) -> String {
         let r = self.repr(t, loc);
         match (v, &r) {
+            (Value::Array(av), Repr::Pk(w, n)) => {
+                if av.elems.len() as i64 != *n {
+                    let f = self.pk_fail_fn(*w, *n);
+                    let (file, line, _) = self.file_line(loc);
+                    return format!("{}({}, {})", f, sv_string(&file), line);
+                }
+                Self::pk_value(*w, av).unwrap_or_else(|| "0".into())
+            }
             (Value::Array(av), Repr::Arr(..)) => self.value_arr(av, t, 0, loc),
             (Value::Record(vals), Repr::Rec(_)) => {
                 let TypeKind::Record(fields) = self.d.types[self.base(t)].kind.clone() else {
@@ -660,6 +702,16 @@ impl<'a> Lw<'a> {
         }
         let r = self.repr(t, loc);
         match &r {
+            Repr::Pk(w, n) => {
+                // T'LEFT of the element, n times.
+                let et = self.d.element_subtype(t).unwrap_or(t);
+                let code = self
+                    .d
+                    .scalar_range(et)
+                    .and_then(|sr| sr.left.as_i64())
+                    .unwrap_or(0) as u32;
+                Self::pk_lit(*w, &vec![code; *n as usize])
+            }
             Repr::Arr(name, _) => {
                 let n = self.ndims(t);
                 if !(0..n).all(|k| self.static_dim(t, k).is_some()) {
@@ -687,14 +739,20 @@ impl<'a> Lw<'a> {
                 format!("{}()", f)
             }
             Repr::Rec(_) => {
+                // Each field's default in its (constrained) subtype, stored
+                // as the struct member.
                 let fields = self.d.record_fields(t);
+                let storage = self.field_storage(t);
                 if fields.is_empty() {
                     return "'{default:0}".into();
                 }
-                let parts: Vec<String> = fields
-                    .iter()
-                    .map(|(_, ft)| self.default_value(*ft, loc))
-                    .collect();
+                let mut parts = Vec::new();
+                for ((_, ft), st) in fields.iter().zip(&storage) {
+                    let v = self.default_value(*ft, loc);
+                    let (fr, sr) = (self.repr(*ft, loc), self.repr(*st, loc));
+                    let bsv = self.static_bounds(*ft).map(|b| self.bounds_sv(b));
+                    parts.push(self.coerce(v, &fr, &sr, bsv, loc));
+                }
                 format!("'{{{}}}", parts.join(", "))
             }
             _ => {
@@ -797,7 +855,12 @@ impl<'a> Lw<'a> {
 
     fn ex(&mut self, h: &HExpr) -> String {
         match &h.kind {
-            HExprKind::Lit(v) => self.value(v, h.ty, &h.loc),
+            HExprKind::Lit(v) => {
+                if let (Value::Array(av), Repr::Pk(w, _)) = (v, self.erepr(h)) {
+                    return Self::pk_value(w, av).unwrap_or_else(|| "0".into());
+                }
+                self.value(v, h.ty, &h.loc)
+            }
             HExprKind::Obj(o) => {
                 if let Some(v) = &self.d.objects[*o].static_val
                     && matches!(self.d.objects[*o].kind, ObjKind::Generic)
@@ -810,42 +873,82 @@ impl<'a> Lw<'a> {
             HExprKind::Convert(x) => self.convert(x, h.ty, &h.loc),
             HExprKind::Call(s, args) => self.call(*s, args, h),
             HExprKind::Index(b, idx) => {
-                let (levels, _) = self.arr_levels(b.ty, &h.loc);
                 let mut cur = self.ex(b);
+                let mut cr = self.erepr(b);
+                let shape0 = self.shape(b);
                 let (f, l, _) = self.file_line(&h.loc);
                 // A call result is evaluated once, through `_at`.
-                let call = cur.contains('(');
+                let call = !Self::selectable(&cur);
                 for (k, ix) in idx.iter().enumerate() {
                     let i = self.ex(ix);
-                    cur = if call {
-                        format!(
-                            "{}_at({}, {}, {}, {})",
-                            levels.get(k).cloned().unwrap_or_default(),
-                            cur,
-                            i,
-                            sv_string(&f),
-                            l
-                        )
-                    } else {
-                        format!(
-                            "{c}.d[vh_ix({i}, {c}.l, {c}.r, {c}.dn, {f}, {l})]",
-                            c = cur,
-                            i = i,
-                            f = sv_string(&f),
-                            l = l
-                        )
-                    };
+                    match cr.clone() {
+                        Repr::Pk(w, n) => {
+                            let bnd = if k == 0 { shape0 } else { None }
+                                .unwrap_or((n - 1, Dir::Downto, 0));
+                            let off = self.pk_off(&i, bnd, &h.loc);
+                            let base = self.as_selectable(cur, &Repr::Pk(w, n));
+                            cur = Self::pk_sel(&base, w, n, &off);
+                            cr = Repr::U8;
+                        }
+                        Repr::Arr(name, er) => {
+                            cur = if call {
+                                format!("{}_at({}, {}, {}, {})", name, cur, i, sv_string(&f), l)
+                            } else {
+                                format!(
+                                    "{c}.d[vh_ix({i}, {c}.l, {c}.r, {c}.dn, {f}, {l})]",
+                                    c = cur,
+                                    i = i,
+                                    f = sv_string(&f),
+                                    l = l
+                                )
+                            };
+                            cr = *er;
+                        }
+                        _ => break,
+                    }
                 }
                 cur
             }
             HExprKind::Slice(b, r) => {
                 let base = self.ex(b);
-                let (left, right, dn) = self.range_parts(r);
-                let name = match self.repr(b.ty, &h.loc) {
-                    Repr::Arr(n, _) => n,
-                    _ => return "0".into(),
-                };
+                let br = self.erepr(b);
                 let (f, l, _) = self.file_line(&h.loc);
+                if let Repr::Pk(w, n) = br {
+                    let bb = self.shape(b).unwrap_or((n - 1, Dir::Downto, 0));
+                    if let Some(sb) = self.range_bounds(r) {
+                        let len = bounds_len(sb);
+                        if len == 0 {
+                            // A null slice: an empty struct.
+                            let name = self.arr_name(h.ty, &h.loc);
+                            return format!(
+                                "{}_new({}, {}, 0)",
+                                name,
+                                self.scalar_lit(&Value::Int(sb.0), &Repr::I64),
+                                (sb.1 == Dir::Downto) as u8
+                            );
+                        }
+                        let off = match bb.1 {
+                            Dir::To => sb.0 - bb.0,
+                            Dir::Downto => bb.0 - sb.0,
+                        };
+                        if sb.1 == bb.1 && off >= 0 && off + len <= n {
+                            let base = self.as_selectable(base, &br);
+                            return Self::pk_part(&base, w, n, off, len);
+                        }
+                        // Outside the array or against its direction: the
+                        // bound check failure.
+                        let fail = self.pk_fail_fn(w, len);
+                        return format!("{}({}, {})", fail, sv_string(&f), l);
+                    }
+                }
+                // Bounds known at run time: a slice of the struct.
+                let fat = self.fat_repr(b.ty, &h.loc);
+                let Repr::Arr(name, _) = fat.clone() else {
+                    return "0".into();
+                };
+                let bsv = self.shape(b).map(|x| self.bounds_sv(x));
+                let base = self.coerce(base, &br, &fat, bsv, &h.loc);
+                let (left, right, dn) = self.range_parts(r);
                 format!(
                     "{}_slice({}, {}, {}, {}, {}, {})",
                     name,
@@ -863,7 +966,12 @@ impl<'a> Lw<'a> {
                 // Built field by field into a temporary (a pattern of
                 // struct-valued members is not copied reliably by the
                 // simulator).
-                let parts: Vec<String> = vals.iter().map(|v| self.ex(v)).collect();
+                let storage = self.field_storage(h.ty);
+                let mut parts = Vec::new();
+                for (v, st) in vals.iter().zip(&storage) {
+                    let fr = self.repr(*st, &h.loc);
+                    parts.push(self.ex_as(v, &fr));
+                }
                 let t = self.repr(h.ty, &h.loc).sv();
                 self.tmp += 1;
                 let agg = format!("vh_rag{}", self.tmp);
@@ -910,9 +1018,13 @@ impl<'a> Lw<'a> {
     }
 
     fn range_parts(&mut self, r: &HRange) -> (String, String, String) {
+        if let Some(b) = self.range_bounds(r) {
+            return self.bounds_sv(b);
+        }
         if let Some((o, dim, rev)) = &r.of_obj {
             let _ = dim;
-            let b = self.ex(o);
+            let fat = self.fat_repr(o.ty, &o.loc);
+            let b = self.ex_as(o, &fat);
             return if *rev {
                 (format!("{}.r", b), format!("{}.l", b), format!("!{}.dn", b))
             } else {
@@ -925,8 +1037,38 @@ impl<'a> Lw<'a> {
     }
 
     fn convert(&mut self, x: &HExpr, to: TypeId, loc: &Loc) -> String {
-        let v = self.ex(x);
         let (fb, tb) = (self.base(x.ty), self.base(to));
+        // Closely related arrays (§9.3.6): to a constrained subtype, its
+        // bounds (lengths must match); else the operand's.
+        if self.ndims(tb) == 1 {
+            let tr = if self.constrained_dim0(to) {
+                self.repr(to, loc)
+            } else {
+                self.erepr(x)
+            };
+            match tr {
+                Repr::Pk(..) => return self.ex_as(x, &tr),
+                Repr::Arr(ref name, _) => {
+                    let v = self.ex_as(x, &tr);
+                    if let Some((l, r, dn)) = self.dim_bounds(to, 0) {
+                        let (f, line, _) = self.file_line(loc);
+                        return format!(
+                            "{}_rb({}, {}, {}, {}, {}, {})",
+                            name,
+                            v,
+                            l,
+                            r,
+                            dn,
+                            sv_string(&f),
+                            line
+                        );
+                    }
+                    return v;
+                }
+                _ => {}
+            }
+        }
+        let v = self.ex(x);
         if self.d.is_real(tb) && !self.d.is_real(fb) {
             return format!("real'({})", v);
         }
@@ -935,24 +1077,6 @@ impl<'a> Lw<'a> {
         }
         if self.d.is_integer(tb) && self.d.is_integer(fb) {
             return self.checked_int(v, to, loc);
-        }
-        // Closely related arrays (§9.3.6): to a constrained subtype, its
-        // bounds (lengths must match); else the operand's.
-        if self.ndims(tb) == 1
-            && let Some((l, r, dn)) = self.dim_bounds(to, 0)
-        {
-            let name = self.arr_name(to, loc);
-            let (f, line, _) = self.file_line(loc);
-            return format!(
-                "{}_rb({}, {}, {}, {}, {}, {})",
-                name,
-                v,
-                l,
-                r,
-                dn,
-                sv_string(&f),
-                line
-            );
         }
         v
     }
@@ -1010,7 +1134,7 @@ impl<'a> Lw<'a> {
             }
             Some(Builtin::ToString) => self.image(&args[0], args[0].ty, false),
             Some(Builtin::BitString(w)) => {
-                let x = self.ex(&args[0]);
+                let x = self.ex_fat(&args[0]);
                 format!("vh_bvstr({}, {})", x, w)
             }
             Some(Builtin::RisingEdge) | Some(Builtin::FallingEdge) => {
@@ -1072,36 +1196,61 @@ impl<'a> Lw<'a> {
         let loc = h.loc.clone();
         let is_arr =
             |lw: &Self, t: TypeId| matches!(lw.d.types[lw.base(t)].kind, TypeKind::Array { .. });
-        let a: Vec<String> = args.iter().map(|x| self.ex(x)).collect();
         if args.len() == 1 {
-            let x = &a[0];
             return match op {
-                "-" => self.arith(format!("-({})", x), ty, &loc),
-                "+" => x.clone(),
-                "abs" => self.arith(format!("((({x}) < 0) ? -({x}) : ({x}))", x = x), ty, &loc),
-                "not" if is_arr(self, pt[0]) => {
-                    format!("{}_not({})", self.arr_name(pt[0], &loc), x)
-                }
-                "not" => format!("(({}) == 0)", x),
-                "??" => format!("(({}) == 1)", x),
+                "not" if is_arr(self, pt[0]) => match self.erepr(h) {
+                    Repr::Pk(1, n) => {
+                        let x = self.ex_as(&args[0], &Repr::Pk(1, n));
+                        format!("(~({}))", x)
+                    }
+                    _ => {
+                        let x = self.ex_fat(&args[0]);
+                        format!("{}_not({})", self.arr_name(pt[0], &loc), x)
+                    }
+                },
                 _ => {
-                    self.err(&loc, format!("operator \"{}\" is not supported yet", op));
-                    "0".into()
+                    let x = self.ex(&args[0]);
+                    match op {
+                        "-" => self.arith(format!("-({})", x), ty, &loc),
+                        "+" => x.clone(),
+                        "abs" => {
+                            self.arith(format!("((({x}) < 0) ? -({x}) : ({x}))", x = x), ty, &loc)
+                        }
+                        "not" => format!("(({}) == 0)", x),
+                        "??" => format!("(({}) == 1)", x),
+                        _ => {
+                            self.err(&loc, format!("operator \"{}\" is not supported yet", op));
+                            "0".into()
+                        }
+                    }
                 }
             };
         }
-        let (x, y) = (&a[0], &a[1]);
         if op.starts_with('?') {
-            return self.matching_op(op, pt[0], x, y, &loc);
+            let (x, y) = if is_arr(self, pt[0]) {
+                (self.ex_fat(&args[0]), self.ex_fat(&args[1]))
+            } else {
+                (self.ex(&args[0]), self.ex(&args[1]))
+            };
+            return self.matching_op(op, pt[0], &x, &y, &loc);
         }
         let real = self.d.is_real(self.base(pt[0])) || self.d.is_real(self.base(pt[1]));
         match op {
             "=" | "/=" => {
-                let r0 = self.repr(pt[0], &loc);
-                let eq = self.eq_expr(&r0, x, y);
+                let eq = self.eq_args(&args[0], &args[1]);
                 if op == "=" { eq } else { format!("!{}", eq) }
             }
             "<" | "<=" | ">" | ">=" if is_arr(self, pt[0]) => {
+                // Packed values of one length compare as numbers: the left
+                // element is the most significant (§9.2.3).
+                let (r0, r1) = (self.erepr(&args[0]), self.erepr(&args[1]));
+                let (x, y) = match (&r0, &r1) {
+                    (Repr::Pk(w, n), Repr::Pk(w2, n2)) if w == w2 && n == n2 => {
+                        let (x, y) = (self.ex(&args[0]), self.ex(&args[1]));
+                        return format!("(({}) {} ({}))", x, op, y);
+                    }
+                    _ => (self.ex_fat(&args[0]), self.ex_fat(&args[1])),
+                };
                 let n = self.arr_name(pt[0], &loc);
                 match op {
                     "<" => format!("{}_lt({}, {})", n, x, y),
@@ -1110,15 +1259,31 @@ impl<'a> Lw<'a> {
                     _ => format!("!{}_lt({}, {})", n, x, y),
                 }
             }
-            "<" | "<=" | ">" | ">=" => format!("(({}) {} ({}))", x, op, y),
+            "<" | "<=" | ">" | ">=" => {
+                let (x, y) = (self.ex(&args[0]), self.ex(&args[1]));
+                format!("(({}) {} ({}))", x, op, y)
+            }
             "and" | "or" | "nand" | "nor" | "xor" | "xnor"
                 if is_arr(self, pt[0]) && is_arr(self, pt[1]) =>
             {
+                if let Repr::Pk(1, n) = self.erepr(h) {
+                    let r = Repr::Pk(1, n);
+                    let (x, y) = (self.ex_as(&args[0], &r), self.ex_as(&args[1], &r));
+                    return match op {
+                        "and" => format!("(({}) & ({}))", x, y),
+                        "or" => format!("(({}) | ({}))", x, y),
+                        "xor" => format!("(({}) ^ ({}))", x, y),
+                        "nand" => format!("(~(({}) & ({})))", x, y),
+                        "nor" => format!("(~(({}) | ({})))", x, y),
+                        _ => format!("(~(({}) ^ ({})))", x, y),
+                    };
+                }
                 let code = ["and", "or", "nand", "nor", "xor", "xnor"]
                     .iter()
                     .position(|o| *o == op)
                     .unwrap();
                 let (f, l, _) = self.file_line(&loc);
+                let (x, y) = (self.ex_fat(&args[0]), self.ex_fat(&args[1]));
                 format!(
                     "{}_lop({}, {}, {}, {}, {})",
                     self.arr_name(pt[0], &loc),
@@ -1129,51 +1294,135 @@ impl<'a> Lw<'a> {
                     l
                 )
             }
-            // BIT/BOOLEAN `and`, `or`, `nand`, `nor` evaluate the right
-            // operand only when needed (§9.2.2).
-            "and" => format!("(({}) && ({}))", x, y),
-            "or" => format!("(({}) || ({}))", x, y),
-            "xor" => format!("(({}) ^ ({}))", x, y),
-            "nand" => format!("!(({}) && ({}))", x, y),
-            "nor" => format!("!(({}) || ({}))", x, y),
-            "xnor" => format!("!(({}) ^ ({}))", x, y),
+            "and" | "or" | "nand" | "nor" | "xor" | "xnor" => {
+                // BIT/BOOLEAN `and`, `or`, `nand`, `nor` evaluate the right
+                // operand only when needed (§9.2.2).
+                let (x, y) = (self.ex(&args[0]), self.ex(&args[1]));
+                match op {
+                    "and" => format!("(({}) && ({}))", x, y),
+                    "or" => format!("(({}) || ({}))", x, y),
+                    "xor" => format!("(({}) ^ ({}))", x, y),
+                    "nand" => format!("!(({}) && ({}))", x, y),
+                    "nor" => format!("!(({}) || ({}))", x, y),
+                    _ => format!("!(({}) ^ ({}))", x, y),
+                }
+            }
             "&" => {
+                let arrs = (is_arr(self, pt[0]), is_arr(self, pt[1]));
+                if let Repr::Pk(w, n) = self.erepr(h) {
+                    let len = |lw: &mut Self, x: &HExpr| lw.shape(x).map(bounds_len).unwrap_or(0);
+                    return match arrs {
+                        (true, true) => {
+                            let (na, nb) = (len(self, &args[0]), len(self, &args[1]));
+                            if na == 0 {
+                                return self.ex_as(&args[1], &Repr::Pk(w, n));
+                            }
+                            if nb == 0 {
+                                return self.ex_as(&args[0], &Repr::Pk(w, n));
+                            }
+                            let x = self.ex_as(&args[0], &Repr::Pk(w, na));
+                            let y = self.ex_as(&args[1], &Repr::Pk(w, nb));
+                            format!("{{{}, {}}}", x, y)
+                        }
+                        (true, false) => {
+                            let na = len(self, &args[0]);
+                            let e = self.ex(&args[1]);
+                            if na == 0 {
+                                let f = self.pk_cat_fn("e", w, 1);
+                                return format!("{}({})", f, e);
+                            }
+                            let x = self.ex_as(&args[0], &Repr::Pk(w, na));
+                            let f = self.pk_cat_fn("ae", w, na);
+                            format!("{}({}, {})", f, x, e)
+                        }
+                        (false, true) => {
+                            let nb = len(self, &args[1]);
+                            let e = self.ex(&args[0]);
+                            if nb == 0 {
+                                let f = self.pk_cat_fn("e", w, 1);
+                                return format!("{}({})", f, e);
+                            }
+                            let y = self.ex_as(&args[1], &Repr::Pk(w, nb));
+                            let f = self.pk_cat_fn("ea", w, nb);
+                            format!("{}({}, {})", f, e, y)
+                        }
+                        (false, false) => {
+                            let (e, g) = (self.ex(&args[0]), self.ex(&args[1]));
+                            let f = self.pk_cat_fn("ee", w, 1);
+                            format!("{}({}, {})", f, e, g)
+                        }
+                    };
+                }
                 let n = self.arr_name(ty, &loc);
                 let (il, idn) = self.index_left_dir(ty);
                 let il = self.scalar_lit(&Value::Int(il), &Repr::I64);
-                match (is_arr(self, pt[0]), is_arr(self, pt[1])) {
+                let x = if arrs.0 { self.ex_fat(&args[0]) } else { self.ex(&args[0]) };
+                let y = if arrs.1 { self.ex_fat(&args[1]) } else { self.ex(&args[1]) };
+                match arrs {
                     (true, true) => format!("{}_cat({}, {})", n, x, y),
                     (true, false) => format!("{}_cat_ae({}, {}, {}, {})", n, x, y, il, idn as u8),
                     (false, true) => format!("{}_cat_ea({}, {}, {}, {})", n, x, y, il, idn as u8),
                     (false, false) => format!("{}_cat_ee({}, {}, {}, {})", n, x, y, il, idn as u8),
                 }
             }
-            "+" | "-" if real => format!("(({}) {} ({}))", x, op, y),
-            "+" | "-" => self.arith(
-                format!("(longint'({}) {} longint'({}))", x, op, y),
-                ty,
-                &loc,
-            ),
-            "*" if real && self.d.is_physical(ty) => {
-                // physical × real (either order): rounded (§9.2.7).
-                let (p, r) = if self.d.is_physical(pt[0]) {
-                    (x, y)
-                } else {
-                    (y, x)
-                };
-                format!("vh_rtoi(real'({}) * ({}))", p, r)
-            }
-            "/" if real && self.d.is_physical(ty) => format!("vh_rtoi(real'({}) / ({}))", x, y),
-            "*" | "/" if real => format!("(({}) {} ({}))", x, op, y),
-            "*" => self.arith(format!("(longint'({}) * longint'({}))", x, y), ty, &loc),
-            "/" => self.arith(format!("vh_div({}, {})", x, y), ty, &loc),
-            "mod" => self.arith(format!("vh_mod({}, {})", x, y), ty, &loc),
-            "rem" => self.arith(format!("vh_rem({}, {})", x, y), ty, &loc),
-            "**" if real => format!("vh_powr({}, {})", x, y),
-            "**" => self.arith(format!("vh_pow({}, {})", x, y), ty, &loc),
             _ => {
-                self.err(&loc, format!("operator \"{}\" is not supported yet", op));
-                "0".into()
+                let (x, y) = (self.ex(&args[0]), self.ex(&args[1]));
+                let (x, y) = (&x, &y);
+                match op {
+                    "+" | "-" if real => format!("(({}) {} ({}))", x, op, y),
+                    "+" | "-" => self.arith(
+                        format!("(longint'({}) {} longint'({}))", x, op, y),
+                        ty,
+                        &loc,
+                    ),
+                    "*" if real && self.d.is_physical(ty) => {
+                        // physical × real (either order): rounded (§9.2.7).
+                        let (p, r) = if self.d.is_physical(pt[0]) {
+                            (x, y)
+                        } else {
+                            (y, x)
+                        };
+                        format!("vh_rtoi(real'({}) * ({}))", p, r)
+                    }
+                    "/" if real && self.d.is_physical(ty) => {
+                        format!("vh_rtoi(real'({}) / ({}))", x, y)
+                    }
+                    "*" | "/" if real => format!("(({}) {} ({}))", x, op, y),
+                    "*" => self.arith(format!("(longint'({}) * longint'({}))", x, y), ty, &loc),
+                    "/" => self.arith(format!("vh_div({}, {})", x, y), ty, &loc),
+                    "mod" => self.arith(format!("vh_mod({}, {})", x, y), ty, &loc),
+                    "rem" => self.arith(format!("vh_rem({}, {})", x, y), ty, &loc),
+                    "**" if real => format!("vh_powr({}, {})", x, y),
+                    "**" => self.arith(format!("vh_pow({}, {})", x, y), ty, &loc),
+                    _ => {
+                        self.err(&loc, format!("operator \"{}\" is not supported yet", op));
+                        "0".into()
+                    }
+                }
+            }
+        }
+    }
+
+    /// `a = b` (§9.2.3) by the operands' representations: packed values of
+    /// one length compare natively, of different lengths are unequal.
+    fn eq_args(&mut self, a: &HExpr, b: &HExpr) -> String {
+        let (ra, rb) = (self.erepr(a), self.erepr(b));
+        match (&ra, &rb) {
+            (Repr::Pk(_, n), Repr::Pk(_, n2)) => {
+                if n != n2 {
+                    return "0".into();
+                }
+                let (x, y) = (self.ex(a), self.ex(b));
+                format!("({} == {})", x, y)
+            }
+            (Repr::Pk(..) | Repr::Arr(..), Repr::Pk(..) | Repr::Arr(..)) => {
+                let fat = self.fat_repr(a.ty, &a.loc);
+                let (x, y) = (self.ex_as(a, &fat), self.ex_as(b, &fat));
+                self.eq_expr(&fat, &x, &y)
+            }
+            _ => {
+                let (x, y) = (self.ex(a), self.ex(b));
+                self.eq_expr(&ra, &x, &y)
             }
         }
     }
@@ -1256,8 +1505,12 @@ impl<'a> Lw<'a> {
     /// The text of a scalar value: as 'IMAGE (`quote`), or as TO_STRING,
     /// which gives a character literal without its quotes (§5.7).
     fn image(&mut self, x: &HExpr, t: TypeId, quote: bool) -> String {
-        let v = self.ex(x);
         let b = self.base(t);
+        let v = if self.ndims(t) == 1 {
+            self.ex_fat(x)
+        } else {
+            self.ex(x)
+        };
         match self.d.types[b].kind.clone() {
             TypeKind::Integer | TypeKind::UniversalInteger => {
                 format!("vh_str($sformatf(\"%0d\", {}))", v)
@@ -1393,7 +1646,25 @@ impl<'a> Lw<'a> {
                 if matches!(name, "driving" | "driving_value") && self.d.is_signal_expr(x) {
                     return self.driving(name, x, &h.loc);
                 }
-                let b = self.ex(x);
+                // Static bounds of the array (always those of a packed value).
+                if matches!(name, "left" | "right" | "high" | "low" | "length" | "ascending")
+                    && param.is_none()
+                    && self.ndims(x.ty) >= 1
+                    && let Some((l, dir, r)) = self.shape(x)
+                {
+                    let asc = dir == Dir::To;
+                    let i = |v: i64| self.scalar_lit(&Value::Int(v), &Repr::I64);
+                    return match name {
+                        "left" => i(l),
+                        "right" => i(r),
+                        "high" => i(if asc { r } else { l }),
+                        "low" => i(if asc { l } else { r }),
+                        "length" => i(bounds_len((l, dir, r))),
+                        _ => (asc as u8).to_string(),
+                    };
+                }
+                let fat = self.fat_repr(x.ty, &x.loc);
+                let b = self.ex_as(x, &fat);
                 match name {
                     "left" => format!("{}.l", b),
                     "right" => format!("{}.r", b),
@@ -1415,7 +1686,94 @@ impl<'a> Lw<'a> {
     /// choices and `others`. Built by statements run before the statement
     /// using it, into temporaries declared in the enclosing scope.
     fn array_agg(&mut self, items: &[(Vec<HChoice>, HExpr)], h: &HExpr) -> String {
+        if let Repr::Pk(w, n) = self.erepr(h) {
+            return self.pk_agg(items, h, w, n);
+        }
         self.array_agg_at(items, h.ty, 0, &h.loc)
+    }
+
+    /// An aggregate of a packed array (§9.3.3): its elements written into
+    /// a temporary before the statement; `others` covers the elements no
+    /// choice named.
+    fn pk_agg(&mut self, items: &[(Vec<HChoice>, HExpr)], h: &HExpr, w: u32, n: i64) -> String {
+        let loc = h.loc.clone();
+        let b = self.shape(h).unwrap_or((n - 1, Dir::Downto, 0));
+        let et = self.d.element_subtype(h.ty).unwrap_or(h.ty);
+        let er = self.repr(et, &loc);
+        self.tmp += 1;
+        let agg = format!("vh_agg{}", self.tmp);
+        let set = format!("{}_set", agg);
+        let named = items.iter().any(|(c, _)| !c.is_empty());
+        let mut body = String::new();
+        if named {
+            let _ = writeln!(body, "{} = 0;", set);
+        }
+        let mut pos = 0i64;
+        let off_of = |k: &str| match b.1 {
+            Dir::To => format!("({}) - ({})", k, b.0),
+            Dir::Downto => format!("({}) - ({})", b.0, k),
+        };
+        for (choices, v) in items {
+            let x = self.ex_as(v, &er);
+            let many = choices.len() > 1
+                || choices
+                    .iter()
+                    .any(|c| matches!(c, HChoice::Range(_) | HChoice::Others));
+            let x = if many { self.as_tmp(x, &er.sv()) } else { x };
+            if choices.is_empty() {
+                let sel = Self::pk_sel(&agg, w, n, &pos.to_string());
+                let _ = writeln!(body, "{} = {};", sel, x);
+                if named {
+                    let _ = writeln!(body, "{}[{}] = 1;", set, pos);
+                }
+                pos += 1;
+                continue;
+            }
+            for c in choices {
+                match c {
+                    HChoice::Others => {
+                        let _ = writeln!(
+                            body,
+                            "for (int k = 0; k < {n}; k++) if (!{s}[k]) {a}[{w} * ({m} - k) +: {w}] = {x};",
+                            n = n,
+                            s = set,
+                            a = agg,
+                            w = w,
+                            m = n - 1,
+                            x = x
+                        );
+                    }
+                    HChoice::Expr(e) => {
+                        let i = self.ex(e);
+                        let off = self.pk_off(&i, b, &loc);
+                        let sel = Self::pk_sel(&agg, w, n, &off);
+                        let _ = writeln!(body, "{} = {}; {}[{}] = 1;", sel, x, set, off);
+                    }
+                    HChoice::Range(hr) => {
+                        let (a, z, _) = self.range_parts(hr);
+                        let o = off_of("k");
+                        let _ = writeln!(
+                            body,
+                            "for (longint k = (({a}) < ({z}) ? ({a}) : ({z})); k <= (({a}) < ({z}) ? ({z}) : ({a})); k++) begin {g}[{w} * ({m} - ({o})) +: {w}] = {x}; {s}[{o}] = 1; end",
+                            a = a,
+                            z = z,
+                            g = agg,
+                            w = w,
+                            m = n - 1,
+                            o = o,
+                            x = x,
+                            s = set
+                        );
+                    }
+                }
+            }
+        }
+        if named {
+            self.temps.push((set, format!("bit [{}:0]", n - 1)));
+        }
+        self.pre_stmts
+            .push((agg.clone(), Repr::Pk(w, n).sv(), body));
+        agg
     }
 
     /// The aggregate of dimension `k` of array type `t` (`k > 0`: a
@@ -1463,7 +1821,8 @@ impl<'a> Lw<'a> {
                 if let HExprKind::ArrayAgg(sub) = &v.kind {
                     return lw.array_agg_at(sub, t, k + 1, &v.loc);
                 }
-                let x = lw.ex(v);
+                let row = Repr::Arr(levels[k + 1].clone(), Box::new(Repr::U8));
+                let x = lw.ex_as(v, &row);
                 if let Some((l, r, dn)) = lw.dim_bounds(t, k + 1) {
                     return format!(
                         "{}_rb({}, {}, {}, {}, {}, {})",
@@ -1478,7 +1837,7 @@ impl<'a> Lw<'a> {
                 }
                 return x;
             }
-            lw.ex(v)
+            lw.ex_as(v, &er)
         };
         if positional {
             // The context's bounds when constrained, else from the index
@@ -1679,20 +2038,82 @@ impl<'a> Lw<'a> {
         match &target.kind {
             HExprKind::Index(b, idx) => {
                 let mut cur = self.ex(b);
-                for ix in idx {
+                let mut cr = self.erepr(b);
+                let shape0 = self.shape(b);
+                for (k, ix) in idx.iter().enumerate() {
                     let i = self.ex(ix);
-                    cur = format!(
-                        "{c}.d[vh_ix({i}, {c}.l, {c}.r, {c}.dn, {f}, {l})]",
-                        c = cur,
-                        i = i,
-                        f = sv_string(&f),
-                        l = l
-                    );
+                    match cr.clone() {
+                        Repr::Pk(w, n) => {
+                            let bnd = if k == 0 { shape0 } else { None }
+                                .unwrap_or((n - 1, Dir::Downto, 0));
+                            let off = self.pk_off(&i, bnd, &loc);
+                            cur = Self::pk_sel(&cur, w, n, &off);
+                            cr = Repr::U8;
+                        }
+                        Repr::Arr(_, er) => {
+                            cur = format!(
+                                "{c}.d[vh_ix({i}, {c}.l, {c}.r, {c}.dn, {f}, {l})]",
+                                c = cur,
+                                i = i,
+                                f = sv_string(&f),
+                                l = l
+                            );
+                            cr = *er;
+                        }
+                        _ => break,
+                    }
                 }
                 format!("{}{} = {};\n", pad, cur, value)
             }
             HExprKind::Slice(b, r) => {
                 let base = self.ex(b);
+                let br = self.erepr(b);
+                if let Repr::Pk(w, n) = br {
+                    let bb = self.shape(b).unwrap_or((n - 1, Dir::Downto, 0));
+                    if let Some(sb) = self.range_bounds(r) {
+                        let len = bounds_len(sb);
+                        if len == 0 {
+                            return String::new();
+                        }
+                        let off = match bb.1 {
+                            Dir::To => sb.0 - bb.0,
+                            Dir::Downto => bb.0 - sb.0,
+                        };
+                        if sb.1 == bb.1 && off >= 0 && off + len <= n {
+                            let sel = Self::pk_part(&base, w, n, off, len);
+                            return format!("{}{} = {};\n", pad, sel, value);
+                        }
+                        return format!(
+                            "{}vh_fatal($sformatf(\"bound check failure at %s:%0d\", {}, {}));\n",
+                            pad,
+                            sv_string(&f),
+                            l
+                        );
+                    }
+                    // A slice with run-time bounds of a packed variable:
+                    // through the struct (the value is a struct too).
+                    let fat = self.fat_repr(b.ty, &loc);
+                    let Repr::Arr(name, _) = fat.clone() else {
+                        return String::new();
+                    };
+                    let bsv = self.bounds_sv(bb);
+                    let bf = self.coerce(base.clone(), &br, &fat, Some(bsv.clone()), &loc);
+                    let (left, _, _) = self.range_parts(r);
+                    let put = format!(
+                        "{name}_put({bf}, vh_ix({left}, {bl}, {brr}, {bdn}, {f}, {l}), {value}, {f}, {l})",
+                        name = name,
+                        bf = bf,
+                        left = left,
+                        bl = bsv.0,
+                        brr = bsv.1,
+                        bdn = bsv.2,
+                        f = sv_string(&f),
+                        l = l,
+                        value = value
+                    );
+                    let back = self.coerce(put, &fat, &br, None, &loc);
+                    return format!("{}{} = {};\n", pad, base, back);
+                }
                 let name = self.arr_name(b.ty, &loc);
                 let (left, _right, _dn) = self.range_parts(r);
                 format!(
@@ -1716,10 +2137,12 @@ impl<'a> Lw<'a> {
     /// The value to store in an object of type `t` (array: length check
     /// and the target's bounds; scalar: range check).
     fn store_value(&mut self, target: &HExpr, v: &HExpr) -> String {
-        let x = self.ex(v);
         let t = target.ty;
-        match self.repr(t, &target.loc) {
-            Repr::Arr(name, _) => {
+        let tr = self.erepr(target);
+        match tr {
+            Repr::Pk(..) => self.ex_as(v, &tr),
+            Repr::Arr(ref name, _) => {
+                let x = self.ex_as(v, &tr);
                 if matches!(target.kind, HExprKind::Slice(..)) {
                     return x;
                 }
@@ -1727,9 +2150,15 @@ impl<'a> Lw<'a> {
                 let (f, l, _) = self.file_line(&v.loc);
                 format!("{}_conv({}, {}, {}, {})", name, tv, x, sv_string(&f), l)
             }
-            Repr::I32 | Repr::I64 if self.d.is_integer(t) => self.checked_int(x, t, &v.loc),
-            Repr::Rec(_) => self.rec_conv(t, x, &v.loc),
-            _ => x,
+            Repr::I32 | Repr::I64 if self.d.is_integer(t) => {
+                let x = self.ex(v);
+                self.checked_int(x, t, &v.loc)
+            }
+            Repr::Rec(_) => {
+                let x = self.ex(v);
+                self.rec_conv(t, x, &v.loc)
+            }
+            _ => self.ex(v),
         }
     }
 
@@ -1737,11 +2166,12 @@ impl<'a> Lw<'a> {
     /// array element takes the bounds of its constrained element subtype.
     fn rec_conv(&mut self, t: TypeId, x: String, loc: &Loc) -> String {
         let fields = self.d.record_fields(t);
+        let storage = self.field_storage(t);
         let mut body = String::new();
         let mut name = String::new();
         let (f, l, _) = self.file_line(loc);
         for (k, (_, ft)) in fields.iter().enumerate() {
-            let Repr::Arr(an, _) = self.repr(*ft, loc) else {
+            let Repr::Arr(an, _) = self.repr(storage[k], loc) else {
                 continue;
             };
             if self.ndims(*ft) != 1 {
@@ -1876,7 +2306,10 @@ impl<'a> Lw<'a> {
             }
             HStmtKind::Return(v) => match v {
                 Some(x) => {
-                    let e = self.ex(x);
+                    let e = match self.cur_ret.clone() {
+                        Some(r) => self.ex_as(x, &r),
+                        None => self.ex(x),
+                    };
                     format!("{}return {};\n", pad, e)
                 }
                 None => format!("{}return;\n", pad),
@@ -1895,24 +2328,35 @@ impl<'a> Lw<'a> {
 
     fn case(&mut self, expr: &HExpr, alts: &[(Vec<HChoice>, Vec<HStmt>)], ind: usize) -> String {
         let pad = " ".repeat(ind);
-        let x = self.ex(expr);
         let mut out = String::new();
         let is_arr = matches!(
             self.d.types[self.base(expr.ty)].kind,
             TypeKind::Array { .. }
         );
         if is_arr {
+            let xr = self.erepr(expr);
+            let x = self.ex(expr);
             let name = self.arr_name(expr.ty, &expr.loc);
+            let fat = self.fat_repr(expr.ty, &expr.loc);
             let mut first = true;
             for (choices, body) in alts {
-                let conds: Vec<String> = choices
-                    .iter()
-                    .map(|c| match c {
+                let mut conds = Vec::new();
+                for c in choices {
+                    conds.push(match c {
                         HChoice::Others => "1".to_string(),
-                        HChoice::Expr(e) => format!("{}_eq({}, {})", name, x, self.ex(e)),
+                        HChoice::Expr(e) => match &xr {
+                            Repr::Pk(..) => {
+                                let l = self.ex_as(e, &xr);
+                                format!("({} == {})", x, l)
+                            }
+                            _ => {
+                                let l = self.ex_as(e, &fat);
+                                format!("{}_eq({}, {})", name, x, l)
+                            }
+                        },
                         HChoice::Range(_) => "0".to_string(),
-                    })
-                    .collect();
+                    });
+                }
                 let _ = writeln!(
                     out,
                     "{}{}if ({}) begin",
@@ -1926,6 +2370,7 @@ impl<'a> Lw<'a> {
             let _ = writeln!(out, "{}end", pad);
             return out;
         }
+        let x = self.ex(expr);
         let _ = writeln!(out, "{}case ({}) inside", pad, x);
         for (choices, body) in alts {
             let mut labels = Vec::new();
@@ -2094,17 +2539,20 @@ impl<'a> Lw<'a> {
                         self.d.objects[*p].kind,
                         ObjKind::Param(ObjClass::Variable, Mode::Out | Mode::InOut)
                     );
-                    if writes && matches!(x.kind, HExprKind::Slice(..)) {
-                        // A slice actual of an out/inout parameter: through
-                        // a temporary stored back into the slice after the
-                        // call (§4.2.2.2).
-                        let r = self.repr(x.ty, loc).sv();
+                    let pr = self.repr(self.d.objects[*p].ty, loc);
+                    let ar = self.erepr(x);
+                    if writes && (matches!(x.kind, HExprKind::Slice(..)) || pr != ar) {
+                        // A slice actual of an out/inout parameter, or one of
+                        // another representation: through a temporary stored
+                        // back into the actual after the call (§4.2.2.2).
                         self.tmp += 1;
                         let t = format!("vh_sa{}", self.tmp);
-                        self.temps.push((t.clone(), r));
-                        let v = self.ex(x);
+                        self.temps.push((t.clone(), pr.sv()));
+                        let v = self.ex_as(x, &pr);
                         let _ = writeln!(before, "{}{} = {};", pad, t, v);
-                        after.push_str(&self.assign_to(x, t.clone(), ind));
+                        let bsv = self.shape(x).map(|b| self.bounds_sv(b));
+                        let back = self.coerce(t.clone(), &pr, &ar, bsv, loc);
+                        after.push_str(&self.assign_to(x, back, ind));
                         a.push(t);
                     } else {
                         a.extend(self.arg_values(*p, x));
@@ -2205,6 +2653,8 @@ impl<'a> Lw<'a> {
         }
         let saved_temps = std::mem::take(&mut self.temps);
         let saved_proc = self.cur_proc.take();
+        let ret_repr = info.ret.map(|rt| self.repr(rt, &loc));
+        let saved_ret = std::mem::replace(&mut self.cur_ret, ret_repr);
         // A method: its object is the first parameter.
         let me = if self.d.method_of.contains_key(&s) {
             Some(self.obj_name(info.params[0]))
@@ -2264,6 +2714,7 @@ impl<'a> Lw<'a> {
         self.temps = saved_temps;
         self.cur_proc = saved_proc;
         self.cur_self = saved_self;
+        self.cur_ret = saved_ret;
     }
 
     /// A new object of protected type `t` (§5.6.2): the next handle, with
@@ -2329,11 +2780,15 @@ impl<'a> Lw<'a> {
     fn store_value_init(&mut self, target: &HExpr, v: &HExpr) -> String {
         // An object's initial value: an array takes its declared bounds when
         // the subtype is constrained, else the value's own.
-        if let Repr::Arr(name, _) = self.repr(target.ty, &target.loc)
+        let tr = self.erepr(target);
+        if let Repr::Pk(..) = tr {
+            return self.ex_as(v, &tr);
+        }
+        if let Repr::Arr(name, _) = tr.clone()
             && self.ndims(target.ty) == 1
             && let Some((bl, br, bdn)) = self.dim_bounds(target.ty, 0)
         {
-            let x = self.ex(v);
+            let x = self.ex_as(v, &tr);
             let (f, l, _) = self.file_line(&v.loc);
             return format!(
                 "{}_rb({}, {}, {}, {}, {}, {})",
@@ -2346,10 +2801,10 @@ impl<'a> Lw<'a> {
                 l
             );
         }
-        if let Repr::Arr(name, _) = self.repr(target.ty, &target.loc)
+        if let Repr::Arr(name, _) = tr.clone()
             && self.static_bounds(target.ty).is_some()
         {
-            let x = self.ex(v);
+            let x = self.ex_as(v, &tr);
             let d = self.default_value(target.ty, &target.loc);
             let (f, l, _) = self.file_line(&v.loc);
             return format!("{}_conv({}, {}, {}, {})", name, d, x, sv_string(&f), l);
@@ -2383,7 +2838,15 @@ impl<'a> Lw<'a> {
             "i32" => "int".into(),
             "i64" => "longint".into(),
             "r" => "real".into(),
-            other => other.to_string(),
+            other => {
+                if let Some(rest) = other.strip_prefix("pk")
+                    && let Some((w, n)) = rest.split_once('_')
+                    && let (Ok(w), Ok(n)) = (w.parse::<i64>(), n.parse::<i64>())
+                {
+                    return format!("bit [{}:0]", w * n - 1);
+                }
+                other.to_string()
+            }
         }
     }
 

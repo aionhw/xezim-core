@@ -501,14 +501,33 @@ impl<'a> Lw<'a> {
                 format!("    {} = {};\n", dst, v)
             }
             (Part::Path(path), f) => {
-                let v = match f {
-                    Some(k) => self.foreign_value(k),
-                    None => self.ex(&l.value),
+                let (sel, slice, at) = self.path_sv(sig.ty, &path, &loc);
+                let tr = match slice {
+                    None => self.repr(at, &loc),
+                    Some((_, len)) => match self.repr(at, &loc) {
+                        Repr::Pk(w, _) => Repr::Pk(w, len),
+                        r => r,
+                    },
                 };
-                let (sel, slice) = Self::static_path_sv(&path);
-                match slice {
-                    None => format!("    {}{} = {};\n", dst, sel, v),
-                    Some((k, len)) => {
+                let v = match f {
+                    Some(k) => {
+                        let v = self.foreign_value(k);
+                        let fr = self.repr(self.fins[k].ty, &loc);
+                        let bsv = self.static_bounds(self.fins[k].ty).map(|b| self.bounds_sv(b));
+                        self.coerce(v, &fr, &tr, bsv, &loc)
+                    }
+                    None => self.ex_as(&l.value, &tr),
+                };
+                match (slice, &tr) {
+                    (None, _) => format!("    {}{} = {};\n", dst, sel, v),
+                    (Some((k, len)), Repr::Pk(w, _)) => {
+                        let Repr::Pk(_, n) = self.repr(at, &loc) else {
+                            unreachable!()
+                        };
+                        let part = Self::pk_part(&format!("{}{}", dst, sel), *w, n, k, len);
+                        format!("    {} = {};\n", part, v)
+                    }
+                    (Some((k, len)), _) => {
                         let (f, line, _) = self.file_line(&l.value.loc);
                         format!(
                             "    vh_lv = {v};\n    if (vh_lv.d.size() != {len}) vh_fatal($sformatf(\"bound check failure at %s:%0d\", {f}, {line}));\n    else for (int j = 0; j < {len}; j++) {dst}{sel}.d[{k} + j] = vh_lv.d[j];\n",
@@ -531,15 +550,10 @@ impl<'a> Lw<'a> {
         }
         if let Part::Path(p) = &l.target.part
             && matches!(p.last(), Some(Sel::Slice(..)))
+            && let (_, Some(_), at) = self.path_sv(sig.ty, p, &loc)
+            && let r @ Repr::Arr(..) = self.repr(at, &loc)
         {
-            let vt = match l.foreign {
-                Some(k) => {
-                    let ft = self.fins[k].ty;
-                    self.repr(ft, &l.value.loc).sv()
-                }
-                None => self.repr(l.value.ty, &l.value.loc).sv(),
-            };
-            let _ = writeln!(temps, "    {} vh_lv;", vt);
+            let _ = writeln!(temps, "    {} vh_lv;", r.sv());
         }
         self.inst = saved;
         let t = r.sv();
@@ -1010,6 +1024,7 @@ impl<'a> Lw<'a> {
         let saved_inst = std::mem::replace(&mut self.inst, sp.inst);
         let saved_proc = self.cur_proc.replace(sp.proc);
         let saved_temps = std::mem::take(&mut self.temps);
+        let saved_ret = self.cur_ret.take();
         let mut saved_map = Vec::new();
         for (o, r) in &sp.binds {
             saved_map.push((*o, self.sig_map.insert((sp.inst, *o), r.clone())));
@@ -1075,6 +1090,7 @@ impl<'a> Lw<'a> {
         }
         self.temps = saved_temps;
         self.cur_proc = saved_proc;
+        self.cur_ret = saved_ret;
         self.inst = saved_inst;
     }
 
@@ -1244,12 +1260,14 @@ impl<'a> Lw<'a> {
                 }
                 Some(path) => {
                     // The value once, then a transaction per scalar leaf.
-                    let vt = self.repr(target.ty, &loc).sv();
+                    let vt = self.erepr(target).sv();
                     let tmp = format!("vh_tv{}", self.tmp);
                     self.tmp += 1;
-                    self.temps.push((tmp.clone(), vt));
+                    self.temps.push((tmp.clone(), vt.clone()));
                     let _ = writeln!(out, "{}{} = {};", pad, tmp, val);
-                    if let Some(DSel::Slice(_, n, _)) = path.last() {
+                    if let Some(DSel::Slice(_, n, _)) = path.last()
+                        && !vt.starts_with("bit [")
+                    {
                         let (f, line, _) = self.file_line(&loc);
                         let _ = writeln!(
                             out,
@@ -2037,7 +2055,7 @@ impl<'a> Lw<'a> {
                         }
                     }
                 }
-                (Repr::Arr(..) | Repr::Rec(_), _) => {
+                (Repr::Arr(..) | Repr::Rec(_) | Repr::Pk(..), _) => {
                     // Scalar by scalar (§14.7.3.2).
                     let Some(b) = self.leaf_update_body(s, &ds, &tsv, &info, kind) else {
                         continue;
@@ -2469,16 +2487,18 @@ impl<'a> Lw<'a> {
     /// The SV arguments of an actual: for a signal parameter, also the
     /// signal's attributes.
     pub(super) fn arg_values(&mut self, p: ObjId, a: &HExpr) -> Vec<String> {
-        let mut v = self.ex(a);
+        let pt = self.d.objects[p].ty;
+        let pr = self.repr(pt, &a.loc);
+        let ar = self.erepr(a);
+        let mut v = self.ex_as(a, &pr);
         // An actual of a constrained array formal takes the formal's bounds
         // (§4.2.2.1, §14.6: the value is converted to the formal's subtype).
-        let pt = self.d.objects[p].ty;
         if matches!(self.d.objects[p].kind, ObjKind::Param(_, Mode::In))
             && self.ndims(pt) == 1
             && self.static_bounds(pt).is_some()
+            && let Repr::Arr(name, _) = pr.clone()
             && let Some((l, r, dn)) = self.dim_bounds(pt, 0)
         {
-            let name = self.arr_name(pt, &a.loc);
             let (f, line, _) = self.file_line(&a.loc);
             v = format!(
                 "{}_rb({}, {}, {}, {}, {}, {})",
@@ -2501,11 +2521,14 @@ impl<'a> Lw<'a> {
         // std_logic_1164).
         self.mark_clocked();
         let mut out = vec![v];
+        let bsv = self.shape(a).map(|b| self.bounds_sv(b));
         for n in ["event", "active", "last_value", "last_event"] {
             match self.sig_attr(a, n) {
                 Some(x) => out.push(if n == "last_event" {
                     // The parameter carries the time of the last event.
                     format!("(longint'($time) - {})", x)
+                } else if n == "last_value" {
+                    self.coerce(x, &ar, &pr, bsv.clone(), &a.loc)
                 } else {
                     x
                 }),

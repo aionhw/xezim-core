@@ -166,7 +166,11 @@ impl<'a> Lw<'a> {
             }
             Builtin::Write => {
                 let f = self.ex(&args[0]);
-                let v = self.ex(&args[1]);
+                let v = if self.ndims(args[1].ty) >= 1 {
+                    self.ex_fat(&args[1])
+                } else {
+                    self.ex(&args[1])
+                };
                 let mut out = format!("{}vh_fchk({}, 0);\n", pad, f);
                 if self.is_text(args[0].ty) {
                     // A string written to a TEXT file: its characters.
@@ -181,7 +185,7 @@ impl<'a> Lw<'a> {
                 }
                 let t = args[1].ty;
                 // The value, once.
-                let r = self.repr(t, loc);
+                let r = self.fat_repr(t, loc);
                 let v = if matches!(r, Repr::Arr(..) | Repr::Rec(_)) {
                     self.tmp += 1;
                     let n = format!("vh_fv{}", self.tmp);
@@ -206,9 +210,23 @@ impl<'a> Lw<'a> {
                     return String::new();
                 }
                 let f = self.ex(&args[0]);
-                let v = self.ex(&args[1]);
                 let t = args[1].ty;
                 let mut out = format!("{}vh_fchk({}, 1);\n", pad, f);
+                // A packed target is read through a struct temporary.
+                let tr = self.erepr(&args[1]);
+                let fat = self.fat_repr(t, loc);
+                let (v, back) = if matches!(tr, Repr::Pk(..)) {
+                    self.tmp += 1;
+                    let n = format!("vh_fv{}", self.tmp);
+                    self.temps.push((n.clone(), fat.sv()));
+                    let x = self.ex_as(&args[1], &fat);
+                    let _ = writeln!(out, "{}{} = {};", pad, n, x);
+                    let b = self.coerce(n.clone(), &fat, &tr, None, loc);
+                    (n, Some(self.assign_to(&args[1], b, ind)))
+                } else {
+                    (self.ex(&args[1]), None)
+                };
+                let back = back.unwrap_or_default();
                 if args.len() == 3 {
                     // An unconstrained array (§5.5.2): as many elements as
                     // fit, the rest skipped.
@@ -250,10 +268,12 @@ impl<'a> Lw<'a> {
                     );
                     // LENGTH: the elements stored in VALUE (as GHDL sets it).
                     let stored = format!("({n} < {v}.d.size() ? {n} : {v}.d.size())", n = n, v = v);
+                    out.push_str(&back);
                     out.push_str(&self.assign_to(&args[2], stored, ind));
                     return out;
                 }
                 out.push_str(&self.file_get(t, &v, &f, ind, 0, loc));
+                out.push_str(&back);
                 out
             }
             _ => String::new(),
@@ -407,7 +427,7 @@ impl<'a> Lw<'a> {
             TypeKind::Array { .. } => self.file_arr(t, 0, v, f, ind, k, loc, true),
             TypeKind::Record(_) => {
                 let mut out = String::new();
-                for (i, (_, ft)) in self.d.record_fields(t).into_iter().enumerate() {
+                for (i, ft) in self.field_storage(t).into_iter().enumerate() {
                     out.push_str(&self.file_put(ft, &format!("{}.f{}", v, i), f, ind, k, loc));
                 }
                 out
@@ -444,7 +464,7 @@ impl<'a> Lw<'a> {
             TypeKind::Array { .. } => self.file_arr(t, 0, lv, f, ind, k, loc, false),
             TypeKind::Record(_) => {
                 let mut out = String::new();
-                for (i, (_, ft)) in self.d.record_fields(t).into_iter().enumerate() {
+                for (i, ft) in self.field_storage(t).into_iter().enumerate() {
                     out.push_str(&self.file_get(ft, &format!("{}.f{}", lv, i), f, ind, k, loc));
                 }
                 out
@@ -471,7 +491,19 @@ impl<'a> Lw<'a> {
     ) -> String {
         let pad = " ".repeat(ind);
         let i = format!("vh_fi{}", k);
-        let e = format!("{}.d[{}]", v, i);
+        // A packed array: its elements by position.
+        let pk = match self.repr(t, loc) {
+            Repr::Pk(w, n) => Some((w, n)),
+            _ => None,
+        };
+        let e = match pk {
+            Some((w, n)) => Lw::pk_sel(v, w, n, &i),
+            None => format!("{}.d[{}]", v, i),
+        };
+        let count = match pk {
+            Some((_, n)) => n.to_string(),
+            None => format!("{}.d.size()", v),
+        };
         let inner = if dim + 1 < self.ndims(t) {
             self.file_arr(t, dim + 1, &e, f, ind + 2, k + 1, loc, put)
         } else {
@@ -485,10 +517,10 @@ impl<'a> Lw<'a> {
             }
         };
         format!(
-            "{p}for (longint {i} = 0; {i} < {v}.d.size(); {i}++) begin\n{inner}{p}end\n",
+            "{p}for (longint {i} = 0; {i} < {count}; {i}++) begin\n{inner}{p}end\n",
             p = pad,
             i = i,
-            v = v,
+            count = count,
             inner = inner
         )
     }

@@ -324,7 +324,7 @@ impl<'a> Lw<'a> {
                 let s = match name {
                     // The digits of a BIT_VECTOR (§16.4).
                     "hwrite" | "owrite" => {
-                        let v = self.ex(&args[1]);
+                        let v = self.ex_fat(&args[1]);
                         format!("vh_bvstr({}, {})", v, if name == "hwrite" { 4 } else { 3 })
                     }
                     _ => match self.write_image(info, args, loc) {
@@ -378,7 +378,7 @@ impl<'a> Lw<'a> {
         let mut out = String::new();
         let is_arr = matches!(r, Repr::Arr(..));
         if is_arr {
-            let x = self.ex(target);
+            let x = self.ex_as(target, &r);
             let _ = writeln!(out, "{}{} = {};", pad, val, x);
         }
         // The function reading the value, and GHDL's failure line and name.
@@ -463,6 +463,8 @@ impl<'a> Lw<'a> {
         // The value read, or (scalar) the leftmost value of the formal's
         // subtype on a failure.
         let rv = self.read_value(target.ty, &val, loc);
+        let tr = self.erepr(target);
+        let rv = self.coerce(rv, &r, &tr, None, loc);
         let mut store = self.assign_to(target, rv, ind + 2);
         if !is_arr {
             let left = self.default_value(self.d.objects[info.params[1]].ty, loc);

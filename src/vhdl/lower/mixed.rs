@@ -291,7 +291,8 @@ impl<'a> Lw<'a> {
                 .as_ref()
                 .map(|r| r.part.clone())
                 .unwrap_or(Part::Whole);
-            let body = self.conv_out(&f.bnd, &part);
+            let sty = f.sig.as_ref().map(|r| self.sigs[r.sig].ty).unwrap_or(f.ty);
+            let body = self.conv_out(&f.bnd, &part, sty);
             let ret = if let Bnd::Arr(..) = f.bnd {
                 let _ = writeln!(s, "  typedef {} vh_fat{}{};", f.bnd.sv(), k, f.bnd.dims());
                 format!("vh_fat{}", k)
@@ -322,6 +323,16 @@ impl<'a> Lw<'a> {
         match bnd {
             Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, "v")),
             Bnd::Vec(ul, n) => {
+                if let Repr::Pk(w, _) = r {
+                    return format!(
+                        "    bit [{hi}:0] t;\n    for (int i = 0; i < {n}; i++) t[{w} * ({m} - i) +: {w}] = {b};\n    return t;\n",
+                        hi = *w as i64 * n - 1,
+                        n = n,
+                        w = w,
+                        m = n - 1,
+                        b = bit(*ul, &format!("v[{} - i]", n - 1))
+                    );
+                }
                 let Repr::Arr(name, er) = r else {
                     return "    return 0;\n".into();
                 };
@@ -343,9 +354,9 @@ impl<'a> Lw<'a> {
         }
     }
 
-    /// The body of the conversion of VHDL value `a` (of a signal; `part`
-    /// selects the part written) to an SV value.
-    fn conv_out(&mut self, bnd: &Bnd, part: &Part) -> String {
+    /// The body of the conversion of VHDL value `a` (of a signal of type
+    /// `sty`; `part` selects the part written) to an SV value.
+    fn conv_out(&mut self, bnd: &Bnd, part: &Part, sty: TypeId) -> String {
         let bit = |ul: bool, x: &str| {
             if ul {
                 format!("vh_u2l({})", x)
@@ -353,22 +364,33 @@ impl<'a> Lw<'a> {
                 format!("logic'({} != 0)", x)
             }
         };
-        let (x, off) = match part {
-            Part::Whole => ("a".to_string(), 0),
+        let loc = self.d.objects[0].loc.clone();
+        let (x, off, at) = match part {
+            Part::Whole => ("a".to_string(), 0, sty),
             Part::Path(path) => {
-                let (sel, slice) = Lw::static_path_sv(path);
-                (format!("a{}", sel), slice.map_or(0, |(o, _)| o))
+                let (sel, slice, at) = self.path_sv(sty, path, &loc);
+                (format!("a{}", sel), slice.map_or(0, |(o, _)| o), at)
             }
+        };
+        let pk = match self.repr(at, &loc) {
+            Repr::Pk(w, n) => Some((w, n)),
+            _ => None,
         };
         match bnd {
             Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, &x)),
-            Bnd::Vec(ul, n) => format!(
-                "    {t} v;\n    for (int i = 0; i < {n}; i++) v[{m} - i] = {b};\n    return v;\n",
-                t = bnd.sv(),
-                n = n,
-                m = n - 1,
-                b = bit(*ul, &format!("{}.d[{} + i]", x, off))
-            ),
+            Bnd::Vec(ul, n) => {
+                let e = match pk {
+                    Some((w, pn)) => Lw::pk_sel(&x, w, pn, &format!("{} + i", off)),
+                    None => format!("{}.d[{} + i]", x, off),
+                };
+                format!(
+                    "    {t} v;\n    for (int i = 0; i < {n}; i++) v[{m} - i] = {b};\n    return v;\n",
+                    t = bnd.sv(),
+                    n = n,
+                    m = n - 1,
+                    b = bit(*ul, &e)
+                )
+            }
             Bnd::Int | Bnd::Real => format!("    return {};\n", x),
             Bnd::Arr(_, l, r) => {
                 let n = (l - r).abs() + 1;

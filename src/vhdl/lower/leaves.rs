@@ -46,6 +46,8 @@ enum Step {
     Field(usize),
     /// An array dimension and its length.
     Dim(i64),
+    /// The dimension of a packed array: its length and element bits.
+    PDim(i64, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -61,7 +63,7 @@ impl LeafClass {
         self.steps
             .iter()
             .filter_map(|s| match s {
-                Step::Dim(n) => Some(*n),
+                Step::Dim(n) | Step::PDim(n, _) => Some(*n),
                 _ => None,
             })
             .collect()
@@ -76,7 +78,7 @@ impl<'a> Lw<'a> {
     /// that are not static).
     pub(super) fn leaf_classes(&self, t: TypeId) -> Option<Vec<LeafClass>> {
         let mut out = Vec::new();
-        self.collect_classes(t, &mut Vec::new(), &mut out)?;
+        self.collect_classes(t, &mut Vec::new(), &mut out, true)?;
         let mut base = 0;
         for c in &mut out {
             c.base = base;
@@ -85,13 +87,17 @@ impl<'a> Lw<'a> {
         Some(out)
     }
 
-    fn collect_classes(&self, t: TypeId, steps: &mut Vec<Step>, out: &mut Vec<LeafClass>) -> Option<()> {
+    /// `packed`: the storage of `t` may be a packed vector (not for a
+    /// record field whose declared type is unconstrained).
+    fn collect_classes(&self, t: TypeId, steps: &mut Vec<Step>, out: &mut Vec<LeafClass>, packed: bool) -> Option<()> {
         let b = self.base(t);
         match &self.d.types[b].kind {
             TypeKind::Record(_) => {
+                let storage = self.field_storage(t);
                 for (i, (_, ft)) in self.d.record_fields(t).into_iter().enumerate() {
                     steps.push(Step::Field(i));
-                    self.collect_classes(ft, steps, out)?;
+                    let pk = self.pk_of(storage[i]).is_some() || self.ndims(storage[i]) == 0;
+                    self.collect_classes(ft, steps, out, pk)?;
                     steps.pop();
                 }
                 Some(())
@@ -99,12 +105,16 @@ impl<'a> Lw<'a> {
             TypeKind::Array { index, .. } => {
                 let ranges = self.d.array_index_ranges(t)?;
                 let n0 = steps.len();
-                for k in 0..index.len() {
-                    let r = ranges.get(k)?.clone()?;
-                    steps.push(Step::Dim(r.length().max(0)));
+                if packed && let Some(Repr::Pk(w, n)) = self.pk_of(t) {
+                    steps.push(Step::PDim(n, w));
+                } else {
+                    for k in 0..index.len() {
+                        let r = ranges.get(k)?.clone()?;
+                        steps.push(Step::Dim(r.length().max(0)));
+                    }
                 }
                 let e = self.d.element_subtype(t)?;
-                self.collect_classes(e, steps, out)?;
+                self.collect_classes(e, steps, out, true)?;
                 steps.truncate(n0);
                 Some(())
             }
@@ -112,7 +122,7 @@ impl<'a> Lw<'a> {
                 let count = steps
                     .iter()
                     .map(|s| match s {
-                        Step::Dim(n) => *n,
+                        Step::Dim(n) | Step::PDim(n, _) => *n,
                         _ => 1,
                     })
                     .product();
@@ -137,7 +147,7 @@ impl<'a> Lw<'a> {
                 Step::Field(i) => {
                     let _ = write!(out, ".f{}", i);
                 }
-                Step::Dim(n) => {
+                Step::Dim(n) | Step::PDim(n, _) => {
                     let stride: i64 = dims[di + 1..].iter().product();
                     di += 1;
                     let idx = match (stride, dims.len() == 1) {
@@ -145,7 +155,14 @@ impl<'a> Lw<'a> {
                         (1, false) => format!("(({}) % {})", k, n),
                         _ => format!("((({}) / {}) % {})", k, stride, n),
                     };
-                    let _ = write!(out, ".d[{}]", idx);
+                    match s {
+                        Step::PDim(n, w) => {
+                            let _ = write!(out, "[{} * ({} - ({})) +: {}]", w, n - 1, idx, w);
+                        }
+                        _ => {
+                            let _ = write!(out, ".d[{}]", idx);
+                        }
+                    }
                 }
             }
         }
@@ -174,11 +191,11 @@ impl<'a> Lw<'a> {
                 };
                 match (sel, step) {
                     (DSel::Field(i), Step::Field(j)) if i == j => {}
-                    (DSel::Elem(_, v), Step::Dim(_)) => {
+                    (DSel::Elem(_, v), Step::Dim(_) | Step::PDim(..)) => {
                         allowed[di] = v.map(|k| (k, 1));
                         di += 1;
                     }
-                    (DSel::Slice(_, _, v), Step::Dim(_)) => {
+                    (DSel::Slice(_, _, v), Step::Dim(_) | Step::PDim(..)) => {
                         allowed[di] = *v;
                         di += 1;
                     }
@@ -230,24 +247,6 @@ impl<'a> Lw<'a> {
             }
         }
         Cov::Set(set)
-    }
-
-    /// The SV of a static path from a value `base` of type `t`: the
-    /// selection, and a trailing slice (offset, length) if any.
-    pub(super) fn static_path_sv(path: &[Sel]) -> (String, Option<(i64, i64)>) {
-        let mut out = String::new();
-        for s in path {
-            match s {
-                Sel::Field(i) => {
-                    let _ = write!(out, ".f{}", i);
-                }
-                Sel::Elem(k) => {
-                    let _ = write!(out, ".d[{}]", k);
-                }
-                Sel::Slice(k, n) => return (out, Some((*k, *n))),
-            }
-        }
-        (out, None)
     }
 
     /// The transaction function shared by the per-leaf drivers of values of
@@ -349,7 +348,7 @@ impl<'a> Lw<'a> {
         if guarded {
             body.push_str("    if (nl) begin vh_fatal(\"a null transaction to a signal also assigned by parts is not supported\"); return; end\n");
         }
-        self.emit_leaves(s, p, ty, "v", &mut Vec::new(), None, &mut body, 4, 0);
+        self.emit_leaves(s, p, ty, "v", &mut Vec::new(), None, None, &mut body, 4, 0);
         let _ = write!(
             out,
             "  // The whole signal: every leaf.\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode{g});\n{body}  endfunction\n",
@@ -364,7 +363,8 @@ impl<'a> Lw<'a> {
 
     /// Code adding a transaction for every scalar leaf of value `val` of
     /// type `t`, at path `path` (SV offsets) of signal `s`; `slice_start`
-    /// shifts the offsets of the value's first dimension (a slice target).
+    /// shifts the offsets of the value's first dimension (a slice target,
+    /// whose value has `slice_len` elements when static).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_leaves(
         &mut self,
@@ -374,6 +374,7 @@ impl<'a> Lw<'a> {
         val: &str,
         path: &mut Vec<(Option<usize>, String)>,
         slice_start: Option<String>,
+        slice_len: Option<i64>,
         out: &mut String,
         ind: usize,
         depth: usize,
@@ -382,9 +383,10 @@ impl<'a> Lw<'a> {
         let b = self.base(t);
         match &self.d.types[b].kind.clone() {
             TypeKind::Record(_) => {
-                for (i, (_, ft)) in self.d.record_fields(t).into_iter().enumerate() {
+                // Fields as stored (an unconstrained element is a struct).
+                for (i, ft) in self.field_storage(t).into_iter().enumerate() {
                     path.push((Some(i), String::new()));
-                    self.emit_leaves(s, p, ft, &format!("{}.f{}", val, i), path, None, out, ind, depth);
+                    self.emit_leaves(s, p, ft, &format!("{}.f{}", val, i), path, None, None, out, ind, depth);
                     path.pop();
                 }
             }
@@ -393,25 +395,38 @@ impl<'a> Lw<'a> {
                 let Some(e) = self.d.element_subtype(t) else { return };
                 let mut v = val.to_string();
                 let mut opened = 0;
+                // A packed value: `pk_n` elements (a slice target's value has
+                // the slice's length, `slice_len`).
+                let pk = match self.repr(t, &self.d.objects[0].loc.clone()) {
+                    Repr::Pk(w, n) => Some((w, slice_len.unwrap_or(n))),
+                    _ => None,
+                };
                 for k in 0..ndim {
                     let iv = format!("vh_li{}_{}", depth, k);
                     let off = match (&slice_start, k) {
                         (Some(st), 0) => format!("({} + {})", st, iv),
                         _ => iv.clone(),
                     };
+                    let count = match pk {
+                        Some((_, n)) => n.to_string(),
+                        None => format!("{}.d.size()", v),
+                    };
                     let _ = writeln!(
                         out,
-                        "{}{}for (longint {iv} = 0; {iv} < {v}.d.size(); {iv}++) begin",
+                        "{}{}for (longint {iv} = 0; {iv} < {count}; {iv}++) begin",
                         pad,
                         "  ".repeat(opened),
                         iv = iv,
-                        v = v
+                        count = count
                     );
                     opened += 1;
                     path.push((None, off));
-                    v = format!("{}.d[{}]", v, iv);
+                    v = match pk {
+                        Some((w, n)) => Lw::pk_sel(&v, w, n, &iv),
+                        None => format!("{}.d[{}]", v, iv),
+                    };
                 }
-                self.emit_leaves(s, p, e, &v, path, None, out, ind + 2 * opened, depth + 1);
+                self.emit_leaves(s, p, e, &v, path, None, None, out, ind + 2 * opened, depth + 1);
                 for _ in 0..ndim {
                     path.pop();
                 }
@@ -433,7 +448,7 @@ impl<'a> Lw<'a> {
                     c.steps.len() == shape.len()
                         && c.steps.iter().zip(&shape).all(|(a, b)| match (a, b) {
                             (Step::Field(x), Step::Field(y)) => x == y,
-                            (Step::Dim(_), Step::Dim(_)) => true,
+                            (Step::Dim(_) | Step::PDim(..), Step::Dim(_)) => true,
                             _ => false,
                         })
                 }) else {
@@ -629,18 +644,24 @@ impl<'a> Lw<'a> {
                 if start.is_some() {
                     path.pop();
                 }
-                let bv = self.ex(b);
-                let bounds = self.static_bounds(b.ty);
+                let bounds = self.shape(b);
+                let bv = match bounds {
+                    Some(_) => String::new(),
+                    None => self.ex(b),
+                };
                 for (k, x) in idx.iter().enumerate() {
                     let i = self.ex(x);
                     let arr = if k == 0 { bv.clone() } else { format!("{}{}", bv, ".d[0]".repeat(k)) };
-                    let mut off = format!(
-                        "vh_ix({}, {a}.l, {a}.r, {a}.dn, {}, {})",
-                        i,
-                        sv_string(&f),
-                        l,
-                        a = arr
-                    );
+                    let mut off = match (k, bounds) {
+                        (0, Some(bnd)) => self.pk_off(&i, bnd, &t.loc),
+                        _ => format!(
+                            "vh_ix({}, {a}.l, {a}.r, {a}.dn, {}, {})",
+                            i,
+                            sv_string(&f),
+                            l,
+                            a = arr
+                        ),
+                    };
                     let mut v = match (k, bounds, self.d.eval(x).and_then(|v| v.as_i64())) {
                         (0, Some((lb, dir, _)), Some(iv)) => Some(match dir {
                             Dir::To => iv - lb,
@@ -670,24 +691,30 @@ impl<'a> Lw<'a> {
                 if start.is_some() {
                     path.pop();
                 }
-                let bv = self.ex(b);
+                let bounds = self.shape(b);
                 let (left, right, dn) = self.range_parts(rg);
-                let mut off = format!(
-                    "vh_ix({}, {b}.l, {b}.r, {b}.dn, {}, {})",
-                    left,
-                    sv_string(&f),
-                    l,
-                    b = bv
-                );
+                let mut off = match bounds {
+                    Some(bnd) => self.pk_off(&left, bnd, &t.loc),
+                    None => {
+                        let bv = self.ex(b);
+                        format!(
+                            "vh_ix({}, {b}.l, {b}.r, {b}.dn, {}, {})",
+                            left,
+                            sv_string(&f),
+                            l,
+                            b = bv
+                        )
+                    }
+                };
                 let n = format!("vh_len({}, {}, {})", left, right, dn);
-                let mut v = match (&rg.static_val, self.static_bounds(b.ty)) {
-                    (Some(sr), Some((lb, dir, _))) => sr.left.as_i64().map(|x| {
+                let mut v = match (self.range_bounds(rg), bounds) {
+                    (Some(sr), Some((lb, dir, _))) => {
                         let o = match dir {
-                            Dir::To => x - lb,
-                            Dir::Downto => lb - x,
+                            Dir::To => sr.0 - lb,
+                            Dir::Downto => lb - sr.0,
                         };
-                        (o, sr.length())
-                    }),
+                        Some((o, super::packed::bounds_len(sr)))
+                    }
                     _ => None,
                 };
                 if let Some(st) = &start {
@@ -719,15 +746,19 @@ impl<'a> Lw<'a> {
         let pad = " ".repeat(ind);
         let mut prefix: Vec<(Option<usize>, String)> = Vec::new();
         let mut slice_start = None;
+        let mut slice_len = None;
         for sel in path {
             match sel {
                 DSel::Field(i) => prefix.push((Some(*i), String::new())),
                 DSel::Elem(o, _) => prefix.push((None, o.clone())),
-                DSel::Slice(o, _, _) => slice_start = Some(o.clone()),
+                DSel::Slice(o, _, v) => {
+                    slice_start = Some(o.clone());
+                    slice_len = v.map(|x| x.1);
+                }
             }
         }
         let mut body = String::new();
-        self.emit_leaves(s, p, t, val, &mut prefix, slice_start, &mut body, ind + 2, 0);
+        self.emit_leaves(s, p, t, val, &mut prefix, slice_start, slice_len, &mut body, ind + 2, 0);
         let (after, rej, mode) = timing;
         format!(
             "{pad}begin\n{pad}  longint after, rej;\n{pad}  int mode;\n{pad}  after = {after}; rej = {rej}; mode = {mode};\n{body}{pad}end\n",
@@ -742,10 +773,13 @@ impl<'a> Lw<'a> {
     /// The SV reading part `path` of value `base` of signal `s` (a formal
     /// associated with that part: `ty`, the formal's subtype).
     pub(super) fn path_read(&mut self, base: &str, path: &[Sel], s: usize, ty: TypeId, loc: &Loc) -> String {
-        let (sel, slice) = Self::static_path_sv(path);
+        let (sel, slice, at) = self.path_sv(self.sigs[s].ty, path, loc);
         let Some((off, len)) = slice else {
             return format!("{}{}", base, sel);
         };
+        if let Repr::Pk(w, n) = self.repr(at, loc) {
+            return Lw::pk_part(&format!("{}{}", base, sel), w, n, off, len);
+        }
         let name = self.arr_name(ty, loc);
         // The formal's bounds, else those of the actual's part.
         let (l, r, dn) = match self.dim_bounds(ty, 0) {
