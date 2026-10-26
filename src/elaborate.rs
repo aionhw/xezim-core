@@ -36211,6 +36211,29 @@ fn inline_module_items(
                                         }
                                     }
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    // §7.4.2/§7.6: the declared DIRECTION, as the
+                                    // top-level path records it. Without it a child's
+                                    // `int a [3:0];` was taken as `[0:3]`, so a
+                                    // whole-array copy to or from a procedural local
+                                    // (`a = w;`, `a = f();`) paired the elements in
+                                    // reverse.
+                                    if let Some(UnpackedDimension::Range { left, right, .. }) =
+                                        effective_decl_dims.first()
+                                    {
+                                        let l = const_eval_i64_with_params(
+                                            left,
+                                            Some(&sub_merged_params),
+                                        );
+                                        let r = const_eval_i64_with_params(
+                                            right,
+                                            Some(&sub_merged_params),
+                                        );
+                                        if let (Some(l), Some(r)) = (l, r)
+                                            && l > r
+                                        {
+                                            elab.descending_arrays.insert(sig_name.clone());
+                                        }
+                                    }
                                     // §6.8: a fixed array's declaration initializer is
                                     // deferred like every other instance declaration's
                                     // (one whole-pattern assignment, rewritten into the
