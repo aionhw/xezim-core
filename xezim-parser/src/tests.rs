@@ -178,6 +178,21 @@ fn test_assignment_pattern() {
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
 }
 
+/// `pkg::type_t'{...}` is a typed assignment pattern. Release 0.11.3 only
+/// folded a bare typedef name, so `dm::hartinfo_t'{...}` inside a
+/// concatenation failed with `expected RBrace`.
+#[test]
+fn test_scoped_typed_assignment_pattern() {
+    let source = "module m; initial p = {dm::hartinfo_t'{8'h0, 4'h2, 3'b0, 1'b1, dm::DataCount, dm::DataAddr}}; endmodule";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+    let ast = format!("{:?}", result.source);
+    assert!(
+        ast.contains("AssignmentPattern"),
+        "scoped type prefix was not folded into an assignment pattern: {ast}"
+    );
+}
+
 #[test]
 fn test_associative_arrays() {
     let source = "module m; int aa [string]; int aa2 [*]; endmodule";

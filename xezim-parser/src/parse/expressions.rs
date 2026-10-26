@@ -546,6 +546,24 @@ impl Parser {
                 continue;
             }
 
+            // §10.9.2 typed assignment pattern after a scoped type:
+            // `pkg::type_t'{...}`. The bare `type_t'{...}` form is folded in
+            // the primary. A package qualifier is applied here, afterwards,
+            // so the `'{` was left for the enclosing concatenation and the
+            // parse died on `expected RBrace`. The type prefix is dropped;
+            // member layout comes from the assignment context, same as the
+            // bare form.
+            if self.at(TokenKind::ApostropheLBrace) {
+                self.bump();
+                let items = self.parse_assignment_pattern_items();
+                self.expect(TokenKind::RBrace);
+                lhs = Expression::new(
+                    ExprKind::AssignmentPattern(items),
+                    self.span_from(start),
+                );
+                continue;
+            }
+
             // Ternary: ? :
             if self.at(TokenKind::Question) {
                 let (l_bp, _) = ternary_bp();
