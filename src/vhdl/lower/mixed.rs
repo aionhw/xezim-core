@@ -592,7 +592,7 @@ impl<'a> Lw<'a> {
     /// resumes a process with waits is left to the kernel).
     pub(super) fn eager_sv(&self) -> String {
         let mut s = String::from(
-            "  bit vh_busy, vh_started;\n  int vh_hand = -1;\n  int vh_kick, vh_ksn;\n",
+            "  bit vh_busy, vh_started, vh_clkd, vh_nbt;\n  int vh_hand = -1;\n  int vh_kick, vh_ksn;\n",
         );
         if self.fins.is_empty() {
             return s;
@@ -605,7 +605,7 @@ impl<'a> Lw<'a> {
             .collect();
         let _ = write!(
             s,
-            "  // Writes nothing when there is nothing to do: the continuous assignment\n  // calling it is evaluated again when what it writes changes.\n  function automatic void vh_eager();\n    int r;\n    if (!vh_started || vh_busy || vh_hand >= 0 || vh_stop) return;\n    if (!(({ch}) || vh_next() == $time)) return;\n    vh_busy = 1;\n    while (({ch}) || vh_next() == $time) begin\n      vh_update();\n      r = vh_resume(0);\n      if (r >= 0) begin vh_hand = r; break; end\n      if (vh_stop) break;\n    end\n    vh_busy = 0;\n    vh_kick++;\n  endfunction\n",
+            "  // Writes nothing when there is nothing to do: the continuous assignment\n  // calling it is evaluated again when what it writes changes.\n  function automatic void vh_eager();\n    int r;\n    if (!vh_started || vh_busy || vh_hand >= 0 || vh_clkd || vh_stop) return;\n    if (!(({ch}) || vh_next() == $time)) return;\n    vh_busy = 1;\n    while (({ch}) || vh_next() == $time) begin\n      vh_update();\n      r = vh_resume(0);\n      if (r >= 0) begin vh_hand = r; break; end\n      if (vh_stop || vh_clkd) break;\n    end\n    vh_busy = 0;\n    vh_kick++;\n  endfunction\n",
             ch = changed.join(" || ")
         );
         let params: Vec<String> = self

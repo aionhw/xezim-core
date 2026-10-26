@@ -731,6 +731,13 @@ impl<'a> Lw<'a> {
     /// `'last_value`, `'last_event`, `'last_active`, §16.2.4): of the whole
     /// signal, or for a part, from the whole signal's flags and the part's
     /// values.
+    /// The process being lowered tests a signal's 'event.
+    pub(super) fn mark_clocked(&mut self) {
+        if let Some(p) = self.cur_proc {
+            self.clocked.insert(p);
+        }
+    }
+
     pub(super) fn sig_attr(&mut self, x: &HExpr, name: &str) -> Option<String> {
         // An implicit signal.
         if let HExprKind::Attr(an, p, prm) = &x.kind
@@ -1523,12 +1530,18 @@ impl<'a> Lw<'a> {
                 sv_ident(&p.label)
             };
             if func {
+                let clk = if self.has_boundary() && self.clocked.contains(&gp) {
+                    "    vh_clkd = 1;\n"
+                } else {
+                    ""
+                };
                 let _ = write!(
                     procs,
-                    "  // process {label}\n  function automatic void vh_run{gp}();\n{temps}{body}  endfunction\n",
+                    "  // process {label}\n  function automatic void vh_run{gp}();\n{temps}{clk}{body}  endfunction\n",
                     label = label,
                     gp = gp,
                     temps = temps,
+                    clk = clk,
                     body = body
                 );
                 continue;
@@ -2352,12 +2365,31 @@ impl<'a> Lw<'a> {
         if boundary {
             let _ = writeln!(k, "    vh_started = 1;");
         }
+        // A clocked process that waits marks its resumption.
+        let ct: Vec<String> = self
+            .clocked
+            .iter()
+            .filter(|p| !fp.contains(p))
+            .map(|p| format!("vh_r == {}", p))
+            .collect();
+        let mark = if boundary && !ct.is_empty() {
+            format!(" if ({}) vh_clkd = 1;", ct.join(" || "))
+        } else {
+            String::new()
+        };
         let _ = writeln!(k, "    forever begin");
         if boundary {
             // A cycle the eager evaluation left: its processes that wait.
             let _ = writeln!(
                 k,
-                "      if (vh_hand >= 0) begin\n        vh_busy = 1; vh_r = vh_hand; vh_hand = -1;\n        while (vh_r >= 0) begin vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end\n        vh_busy = 0;\n      end"
+                "      if (vh_hand >= 0) begin\n        vh_busy = 1; vh_r = vh_hand; vh_hand = -1;\n        while (vh_r >= 0) begin{mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end\n        vh_busy = 0;\n      end",
+                mark = mark
+            );
+            // A clocked process ran: the next cycle waits for SV's NBA region,
+            // as an SV flip-flop's update does.
+            let _ = writeln!(
+                k,
+                "      if (vh_clkd) begin\n        vh_busy = 1; vh_clkd = 0;\n        vh_nbt <= !vh_nbt; @(vh_nbt);\n        vh_busy = 0;\n      end"
             );
         }
         let _ = writeln!(k, "      vh_nxt = vh_next();");
@@ -2388,7 +2420,8 @@ impl<'a> Lw<'a> {
         }
         let _ = writeln!(
             k,
-            "      vh_update();\n      vh_r = vh_resume(0);\n      while (vh_r >= 0) begin vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end"
+            "      vh_update();\n      vh_r = vh_resume(0);\n      while (vh_r >= 0) begin{mark} vh_go[vh_r] = 1; wait (vh_go[vh_r] == 0); vh_r = vh_resume(vh_r + 1); end",
+            mark = mark
         );
         if boundary {
             let _ = writeln!(k, "      vh_busy = 0;");
@@ -2464,6 +2497,9 @@ impl<'a> Lw<'a> {
         ) {
             return vec![v];
         }
+        // The callee may test the signal's 'event (rising_edge of
+        // std_logic_1164).
+        self.mark_clocked();
         let mut out = vec![v];
         for n in ["event", "active", "last_value", "last_event"] {
             match self.sig_attr(a, n) {

@@ -169,6 +169,9 @@ struct Lw<'a> {
     sv_nets: usize,
     /// Processes with a sensitivity list, lowered as functions.
     fprocs: BTreeSet<usize>,
+    /// Processes that test a signal's 'event (rising_edge, falling_edge):
+    /// clocked logic, whose updates SV sees after its NBA region.
+    clocked: BTreeSet<usize>,
     /// Transaction functions shared by the drivers of values of one
     /// representation (by key), and their definitions.
     tx_keys: BTreeSet<String>,
@@ -270,6 +273,7 @@ impl<'a> Lw<'a> {
             sv_items: String::new(),
             sv_nets: 0,
             fprocs: BTreeSet::new(),
+            clocked: BTreeSet::new(),
             tx_keys: BTreeSet::new(),
             tx_defs: String::new(),
             opts: super::VhdlOptions::default(),
@@ -1012,6 +1016,7 @@ impl<'a> Lw<'a> {
             Some(Builtin::RisingEdge) | Some(Builtin::FallingEdge) => {
                 let a = &args[0];
                 let one = matches!(info.builtin, Some(Builtin::RisingEdge));
+                self.mark_clocked();
                 let Some(ev) = self.sig_attr(a, "event") else {
                     self.err(&h.loc, "rising_edge/falling_edge needs a signal");
                     return "0".into();
@@ -1365,7 +1370,12 @@ impl<'a> Lw<'a> {
                     name,
                     "event" | "active" | "last_value" | "last_event" | "last_active"
                 ) && self.d.is_signal_expr(x)
-                    && let Some(v) = self.sig_attr(x, name)
+                    && let Some(v) = {
+                        if name == "event" {
+                            self.mark_clocked();
+                        }
+                        self.sig_attr(x, name)
+                    }
                 {
                     return v;
                 }
