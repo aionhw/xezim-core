@@ -198,7 +198,8 @@ pub use value::Value;
 /// entry is 2-state (§23.3.3).
 /// \x3a = \x39 + the formal's path, not its instance's, in
 /// ElaboratedModule.input_port_actuals.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3a";
+/// \x3b = \x3a + clocking skew edges (§14.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3b";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
