@@ -73,6 +73,19 @@ pub(super) fn elements(
     let items =
         init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, struct_elem, init_params));
     let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    // §6.20.2 / §23.10: `localparam t OFF[N] = pkg::OffloadInstr` (and the
+    // same expression as an instance override) is a whole-array copy, not a
+    // pattern. Without this the initializer is refused and every element
+    // stays at the type's default — x for a `logic` struct — so a predecoder
+    // table of instruction masks never matches.
+    if override_val.is_none() && items.is_none() && dims.len() == 1 {
+        if let Some(init) = init
+            && let Some(copied) =
+                referenced_array_elements(name, &outer, init, init_params, elab)
+        {
+            return Some(copied);
+        }
+    }
     let row_count = dims[1..].iter().try_fold(1usize, |n, d| {
         n.checked_mul(const_dim_indices(std::slice::from_ref(d), params)?.len())
     })?;
@@ -131,6 +144,41 @@ pub(super) fn elements(
         out.push((key, value));
     }
     Some(out)
+}
+
+/// Whole-array copy of an unpacked parameter (`localparam t B[N] = pkg::A`,
+/// or `#(.B(pkg::A))`). Elements live under `base[index]` (§6.20.2). A
+/// pattern is handled by `pattern_items`; this is the name-reference form.
+fn referenced_array_elements(
+    name: &str,
+    outer: &[i64],
+    init: &Expression,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+) -> Option<Vec<(String, Value)>> {
+    let mut keys = Vec::new();
+    super::const_index_base_keys(init, Some(params), &mut keys);
+    for key in keys {
+        let mut out = Vec::with_capacity(outer.len());
+        let mut complete = true;
+        for index in outer {
+            let elem = params
+                .get(&format!("{key}[{index}]"))
+                .or_else(|| elab.parameters.get(&format!("{key}[{index}]")))
+                .cloned();
+            match elem {
+                Some(value) => out.push((format!("{name}[{index}]"), value)),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete && !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// One initializer per index of `outer` (declared order), from pattern `e`.

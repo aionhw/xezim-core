@@ -2,7 +2,7 @@
 
 use xezim_core::{
     ast::Description,
-    elaborate::{Definition, elaborate_module},
+    elaborate::{elaborate_module, Definition},
     hasher::HashMap,
 };
 
@@ -103,4 +103,54 @@ endmodule
     assert_eq!(get("c5.CN"), Some(5));
     assert_eq!(get("c6.CW"), Some(37));
     assert_eq!(get("c6.CT"), Some(5));
+}
+
+/// `pkg::opgroup_e'(genvar)` as a constant-function actual. The cast is a
+/// named-cast intrinsic; rejecting it left the localparam at 0, so fpnew
+/// sized every operation group as 0 operands.
+#[test]
+fn genvar_enum_cast_argument_folds_per_iteration() {
+    let design = xezim_core::parse_and_elaborate_multi(
+        &[r#"
+package p;
+  typedef enum logic [1:0] { ADDMUL, DIVSQRT, NONCOMP, CONV } opgroup_e;
+  function automatic int unsigned num_operands(opgroup_e grp);
+    case (grp)
+      ADDMUL:  return 3;
+      DIVSQRT: return 2;
+      NONCOMP: return 2;
+      CONV:    return 3;
+      default: return 0;
+    endcase
+  endfunction
+  localparam int unsigned NUM_OPGROUPS = 4;
+endpackage
+module top;
+  import p::*;
+  for (genvar opgrp = 0; opgrp < int'(NUM_OPGROUPS); opgrp++) begin : g
+    localparam int unsigned NUM_OPS = p::num_operands(p::opgroup_e'(opgrp));
+  end
+endmodule
+"#
+        .to_string()],
+        Some("top"),
+        &[],
+        &["top.sv".to_string()],
+        &[],
+    )
+    .expect("elaborate")
+    .1;
+    let mut found: Vec<(String, Option<i64>)> = design
+        .parameters
+        .iter()
+        .filter(|(k, _)| k.ends_with("NUM_OPS"))
+        .map(|(k, v)| (k.clone(), v.to_i64()))
+        .collect();
+    found.sort();
+    let values: Vec<Option<i64>> = found.iter().map(|(_, v)| *v).collect();
+    assert_eq!(
+        values,
+        vec![Some(3), Some(2), Some(2), Some(3)],
+        "keys: {found:?}"
+    );
 }
