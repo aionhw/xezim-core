@@ -20739,6 +20739,9 @@ pub fn const_eval_i64_with_params(
                     }
                     ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
                     ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
+                    ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => params
+                        .and_then(|p| const_cast_bits(inner, p))
+                        .map(i64::from),
                     // §20.6.2 over an EXPRESSION operand: compute the
                     // self-determined width structurally. A port declared
                     // `[$bits({{A{1'b0}}, {(A*B){1'b0}}})-1:0]` elaborated to
@@ -22550,6 +22553,62 @@ fn atom_keyword_width(name: &str) -> Option<u32> {
         "longint" | "time" => 64,
         _ => return None,
     })
+}
+
+/// §20.6.2 + §6.24.1: `$bits` of a cast is the width of the cast's target,
+/// whatever the operand (`$bits(int'(45))` is 32, `$bits(5'(45))` is 5).
+/// None when the target width is not known here.
+fn const_cast_bits(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
+    let ExprKind::SystemCall { name, args } = &e.kind else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let w = match name.as_str() {
+        "$__xz_size_cast" => {
+            u32::try_from(const_eval_i64_with_params(&args[0], Some(params))?).ok()?
+        }
+        "$__xz_type_cast" | "$__xz_named_cast" => match &args[0].kind {
+            ExprKind::TypeLiteral(dt) => {
+                let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
+                resolve_type_width(dt, Some(params), td.as_ref())
+            }
+            // `N'(e)` with a constant `N` lowers to a named cast too.
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let n = h.path[0].name.name.as_str();
+                match params.get(n).and_then(|v| v.to_u64()) {
+                    Some(v) => u32::try_from(v).ok()?,
+                    None => TYPEDEFS_TLS
+                        .with(|td| td.borrow().as_ref().and_then(|m| m.get(n).copied()))?,
+                }
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let ExprKind::Ident(h) = &base.kind else {
+                    return None;
+                };
+                let scoped = format!("{}::{}", h.path.last()?.name.name, member.name);
+                TYPEDEFS_TLS.with(|td| {
+                    let b = td.borrow();
+                    let m = b.as_ref()?;
+                    m.get(&scoped)
+                        .or_else(|| m.get(member.name.as_str()))
+                        .copied()
+                })?
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (w > 0).then_some(w)
+}
+
+/// The constant-evaluator lowerings of a cast (§6.24.1).
+fn is_cast_call(name: &str) -> bool {
+    matches!(
+        name,
+        "$__xz_size_cast" | "$__xz_type_cast" | "$__xz_named_cast"
+    )
 }
 
 /// Append a type's packed dimensions, declared order preserved. Stops at the
@@ -25148,6 +25207,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
                 ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
                 ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
+                ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => {
+                    const_cast_bits(inner, params).unwrap_or(0)
+                }
                 // §20.6.2 `$bits(<data_type>)`. `logic [0:0][1:0][1:0]` parses
                 // to a TypeLiteral, which no arm evaluated, so the `_ => 0`
                 // default made the enclosing localparam 0 — and
