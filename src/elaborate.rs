@@ -8277,7 +8277,12 @@ pub fn elaborate_module_with_defs(
                                 &elab.typedefs,
                                 &elab.parameters,
                             );
-                            register_packed_param_index(&mut elab, &assign.name.name, data_type);
+                            register_packed_param_index(
+                                &mut elab,
+                                &assign.name.name,
+                                data_type,
+                                None,
+                            );
                             if matches!(
                                 data_type,
                                 DataType::Simple {
@@ -11238,13 +11243,12 @@ pub fn elaborate_module_with_defs(
                         if let Some(elem_w) =
                             packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs)
                         {
-                            elab.packed_signal_elem_widths
-                                .insert(assign.name.name.clone(), elem_w);
                             // The CONST-eval index arm reads its own TLS table
                             // (only `register_packed_array_elem_w` fed it, which
                             // handles a typedef'd element type). Without this a
                             // `localparam logic [1:0][7:0] MP` element select
                             // `MP[0]` in another localparam bit-selected instead.
+                            // The runtime map is `register_packed_param_index`.
                             tls_register_elem_w(&assign.name.name, elem_w);
                         }
                         if let Some((ew, msb0)) =
@@ -11260,11 +11264,12 @@ pub fn elaborate_module_with_defs(
                         // range. `packed_inner_elem_width` / `packed_full_dims_of`
                         // miss those, so a variable index bit-selects or reads
                         // the last element.
-                        register_packed_param_index(&mut elab, &assign.name.name, data_type);
-                        if let Some(fdims) = packed_full_dims_of(data_type, &elab.parameters) {
-                            elab.packed_full_dims
-                                .insert(assign.name.name.clone(), fdims);
-                        }
+                        register_packed_param_index(
+                            &mut elab,
+                            &assign.name.name,
+                            data_type,
+                            None,
+                        );
                         let mut current_width = width;
                         let mut current_is_real = is_real;
                         let mut current_signed = signed;
@@ -21590,25 +21595,55 @@ fn const_packed_array_elem(
 /// the simulator, which bit-selects unless the parameter is in
 /// `packed_signal_elem_widths`. An ascending `[0:N]` array also needs its
 /// declared bounds, or index 0 reads the last element.
-fn register_packed_param_index(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
-    let ew = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs).or_else(|| {
-        packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types)
-            .map(|(ew, _)| ew)
-            .filter(|ew| *ew > 1)
-    });
-    if let Some(ew) = ew.filter(|ew| *ew > 1) {
-        elab.packed_signal_elem_widths.insert(name.to_string(), ew);
+fn register_packed_param_index(
+    elab: &mut ElaboratedModule,
+    key: &str,
+    data_type: &DataType,
+    params: Option<&HashMap<String, Value>>,
+) {
+    let ew = {
+        let params = params.unwrap_or(&elab.parameters);
+        packed_inner_elem_width(data_type, params, &elab.typedefs).or_else(|| {
+            packed_outer_elem(data_type, params, &elab.typedef_types)
+                .map(|(ew, _)| ew)
+                .filter(|ew| *ew > 1)
+        })
+    };
+    let fdims = {
+        let params = params.unwrap_or(&elab.parameters);
+        packed_struct_array_info(data_type, params, &elab.typedef_types)
+            .map(|(dims, _)| dims)
+            .or_else(|| packed_full_dims_chained(data_type, params, &elab.typedef_types))
+            .or_else(|| packed_full_dims_of(data_type, params))
+            .or_else(|| {
+                // A typedef'd enum or mask (`unit_type_t [0:4]`, `logic [0:4]`)
+                // keeps its range on the typedef. A lone normalized `[N-1:0]`
+                // stays unrecorded; `packed_full_dims_of` already declined it.
+                let (dims, _) = packed_pattern_shape(data_type, params, &elab.typedef_types)?;
+                let mut out = Vec::with_capacity(dims.len());
+                for d in &dims {
+                    let PackedDimension::Range { left, right, .. } = d else {
+                        return None;
+                    };
+                    out.push((
+                        const_eval_i64_with_params(left, Some(params))?,
+                        const_eval_i64_with_params(right, Some(params))?,
+                    ));
+                }
+                if out.len() == 1 {
+                    let (l, r) = out[0];
+                    if r == 0 && l >= 0 {
+                        return None;
+                    }
+                }
+                Some(out)
+            })
+    };
+    if let Some(ew) = ew.filter(|ew| *ew > 0) {
+        elab.packed_signal_elem_widths.insert(key.to_string(), ew);
     }
-    if let Some(fdims) = packed_struct_array_info(
-        data_type,
-        &elab.parameters,
-        &elab.typedef_types,
-    )
-    .map(|(dims, _)| dims)
-    .or_else(|| packed_full_dims_chained(data_type, &elab.parameters, &elab.typedef_types))
-    .or_else(|| packed_full_dims_of(data_type, &elab.parameters))
-    {
-        elab.packed_full_dims.insert(name.to_string(), fdims);
+    if let Some(fdims) = fdims {
+        elab.packed_full_dims.insert(key.to_string(), fdims);
     }
 }
 
@@ -28566,6 +28601,7 @@ fn inline_instantiations_inner(
                                             elab,
                                             &assign.name.name,
                                             data_type,
+                                            None,
                                         );
                                         if let Some(init) = &assign.init {
                                             // §13.4.3 const-function calls.
@@ -34773,20 +34809,19 @@ fn inline_module_items(
                                 _ => None,
                             };
                             // Element-select support for a multi-dim packed
-                            // parameter of THIS instance (`inst.PARAM[i]`) —
-                            // mirror of the module-scope registration.
+                            // parameter of THIS instance (`inst.PARAM[i]`).
+                            // Const-eval reads the TLS tables under the bare
+                            // name; the simulator reads the prefixed key.
                             if let Some(elem_w) = packed_inner_elem_width(
                                 data_type,
                                 &sub_local_params,
                                 &elab.typedefs,
                             ) {
-                                elab.packed_signal_elem_widths
-                                    .insert(cat2(&inst_prefix, &assign.name.name), elem_w);
                                 tls_register_elem_w(&assign.name.name, elem_w);
                             }
                             // `fmt_logic_t` is `logic [0:N]`. The typedef carries
-                            // the range, so the formal `FpFmtMask[fmt]` is not a
-                            // `[N:0]` bit-select: index 0 is the high bit.
+                            // the range, so `FpFmtMask[fmt]` keeps index 0 in
+                            // the high bit.
                             if let Some((ew, msb0)) = packed_outer_elem(
                                 data_type,
                                 &sub_local_params,
@@ -34796,54 +34831,13 @@ fn inline_module_items(
                                 if msb0 {
                                     tls_register_elem_msb0(&assign.name.name);
                                 }
-                                // `typedef unit_type_t [0:4] fmt_t` keeps the
-                                // array dims on the typedef. `packed_inner_elem_width`
-                                // only sees dims written on the parameter itself, so
-                                // `FmtUnitTypes[dst_fmt]` was a bit-select and the
-                                // merged slice never saw a valid op.
-                                if ew > 1 {
-                                    elab.packed_signal_elem_widths.insert(
-                                        cat2(&inst_prefix, &assign.name.name),
-                                        ew,
-                                    );
-                                }
                             }
-                            if let Some(fdims) = packed_full_dims_of(data_type, &sub_local_params)
-                                .or_else(|| {
-                                    packed_pattern_shape(
-                                        data_type,
-                                        &sub_local_params,
-                                        &elab.typedef_types,
-                                    )
-                                    .and_then(|(dims, _)| {
-                                        let PackedDimension::Range { left, right, .. } =
-                                            dims.first()?
-                                        else {
-                                            return None;
-                                        };
-                                        let l = const_eval_i64_with_params(
-                                            left,
-                                            Some(&sub_local_params),
-                                        )?;
-                                        let r = const_eval_i64_with_params(
-                                            right,
-                                            Some(&sub_local_params),
-                                        )?;
-                                        // A lone `[N-1:0]` is the normalized
-                                        // vector `packed_full_dims_of` already
-                                        // declines. Anything else (ascending
-                                        // `[0:N]`, a non-zero LSB) has to be
-                                        // recorded or element 0 is the low bits.
-                                        if dims.len() == 1 && r == 0 && l >= 0 {
-                                            return None;
-                                        }
-                                        Some(vec![(l, r)])
-                                    })
-                                })
-                            {
-                                elab.packed_full_dims
-                                    .insert(cat2(&inst_prefix, &assign.name.name), fdims);
-                            }
+                            register_packed_param_index(
+                                elab,
+                                &cat2(&inst_prefix, &assign.name.name),
+                                data_type,
+                                Some(&sub_local_params),
+                            );
                             // §6.20.2 unpacked-array parameter. This runs even when the
                             // parameter is OVERRIDDEN: the override arrives as a single
                             // packed value, so without slicing it here no element ever
