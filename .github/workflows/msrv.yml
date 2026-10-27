@@ -10,26 +10,45 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # `cargo msrv verify` downloaded the Rust release index on every run
+      # and failed the job with "HTTP error: http status: 429" whenever that
+      # download was rate-limited. The pinned `rust-version` is all the
+      # check needs, so install that exact toolchain and build with it.
+      - name: Read the pinned rust-version
+        run: |
+          CORE_MSRV=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          PARSER_MSRV=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' xezim-parser/Cargo.toml)
+          test -n "$CORE_MSRV"
+          if [ "$CORE_MSRV" != "$PARSER_MSRV" ]; then
+            echo "rust-version differs: xezim-core $CORE_MSRV, sv-parser $PARSER_MSRV"
+            exit 1
+          fi
+          echo "MSRV=$CORE_MSRV" >> "$GITHUB_ENV"
 
-      - name: Cache cargo registry
+      - name: Install the MSRV toolchain
+        run: rustup toolchain install "$MSRV" --profile minimal
+
+      # Cargo.lock is gitignored, so a key hashed from it never changes and
+      # the cache saved by the first run would be reused for every commit.
+      # Hash the manifests and add the commit so each run saves a fresh
+      # cache and the next one restores the newest.
+      - name: Cache cargo registry and build
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-msrv-cargo-
+          key: ${{ runner.os }}-msrv-${{ env.MSRV }}-${{ hashFiles('**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-${{ env.MSRV }}-${{ hashFiles('**/Cargo.toml') }}-
+            ${{ runner.os }}-msrv-${{ env.MSRV }}-
 
-      - name: Install cargo-msrv
-        run: cargo install cargo-msrv --locked
+      - name: Core builds on the MSRV
+        run: cargo +"$MSRV" check --all-targets
 
-      - name: cargo msrv verify
-        run: cargo msrv verify
-
-      - name: Parser MSRV
+      # The parser is a path dependency, so the root check does not cover
+      # its own test and bin targets.
+      - name: Parser builds on the MSRV
         if: always()
-        working-directory: xezim-parser
-        run: cargo msrv verify
+        run: cargo +"$MSRV" check --all-targets --manifest-path xezim-parser/Cargo.toml

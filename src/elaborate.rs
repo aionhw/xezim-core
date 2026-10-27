@@ -1236,6 +1236,13 @@ pub struct ElaboratedClass {
     /// each object's rows are registered when new[n] allocates them.
     #[serde(default)]
     pub dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>>,
+    /// §7.4.5/§7.5: a dynamic or queue outer dimension whose elements are
+    /// themselves unpacked arrays (`T a[][N]`, `T a[][]`, `T a[$][N]`): the
+    /// tail dimensions after the outer one. The member's leaf width is in
+    /// `queue_properties`; the runtime shapes each object's storage from the
+    /// tail the way a module-scope declaration of the same shape is shaped.
+    #[serde(default)]
+    pub dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>>,
     /// §7.4.2 / §20.7: the DECLARED `(left, right)` bounds of every unpacked
     /// dimension of a fixed-size array member with at least one descending
     /// dimension (`int ds[3:1]`). `array_properties` / `array_nd_properties`
@@ -2071,6 +2078,7 @@ fn elaborate_class_in_scope(
     let mut array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)> =
         HashMap::default();
     let mut dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
+    let mut dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
@@ -2329,6 +2337,23 @@ fn elaborate_class_in_scope(
                                 .all(|d| matches!(d, UnpackedDimension::Associative { .. }))
                         {
                             dynamic_assoc_properties
+                                .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
+                        }
+                        if matches!(
+                            effective_dims.first(),
+                            Some(UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. })
+                        ) && effective_dims.len() > 1
+                            && effective_dims[1..].iter().all(|d| {
+                                matches!(
+                                    d,
+                                    UnpackedDimension::Range { .. }
+                                        | UnpackedDimension::Expression { .. }
+                                        | UnpackedDimension::Unsized(_)
+                                        | UnpackedDimension::Queue { .. }
+                                )
+                            })
+                        {
+                            dynamic_tail_properties
                                 .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
                         }
                         // §8.25: a fixed array sized by a header VALUE
@@ -3095,6 +3120,7 @@ fn elaborate_class_in_scope(
         array_nd_properties,
         array_of_coll_properties,
         dynamic_assoc_properties,
+        dynamic_tail_properties,
         array_prop_decl_dims,
     }
 }
@@ -4405,10 +4431,44 @@ fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
         {
             args[1..].iter().all(|a| is_const_expr(a, params))
         }
+        // §6.24.1: a cast to a type (`int'(e)`, `T'(e)`, `pkg::T'(e)`) is
+        // constant when its operand is; the target is a type, not a value.
+        ExprKind::SystemCall { name, args }
+            if (name == "$__xz_type_cast" || name == "$__xz_named_cast")
+                && args.len() == 2
+                && cast_target_is_type(&args[0]) =>
+        {
+            is_const_expr(&args[1], params)
+        }
         // System constant functions used in generate conditions ($bits, $clog2…).
         ExprKind::SystemCall { args, .. } => args.iter().all(|a| is_const_expr(a, params)),
         _ => false, // Calls (new()) etc. are not constant
     }
+}
+
+/// A cast target that names a type: a type literal, or a typedef or type
+/// parameter known to the instance's types or the typedef tables.
+fn cast_target_is_type(target: &Expression) -> bool {
+    let name = match &target.kind {
+        ExprKind::TypeLiteral(_) => return true,
+        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+            h.path[0].name.name.clone()
+        }
+        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                format!("{}::{}", h.path[0].name.name, member.name)
+            }
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let leaf = name.rsplit("::").next().unwrap_or(&name);
+    CONST_FN_LOCAL_TYPES.with(|c| c.borrow().as_ref().is_some_and(|m| m.contains_key(leaf)))
+        || TYPEDEF_SHAPES_TLS.with(|c| {
+            let c = c.borrow();
+            c.0.contains_key(&name) || c.0.contains_key(leaf)
+        })
+        || TYPEDEFS_TLS.with(|c| c.borrow().as_ref().is_some_and(|m| m.contains_key(&name)))
 }
 
 /// Elaborate a module or interface declaration into a simulation model.
@@ -7516,6 +7576,8 @@ pub fn elaborate_module_with_defs(
     // $unit-scope definitions are installed after that, see `seed_ooc_bodies`.
 
     // Process top-level typedefs and other global definitions from all_defs
+    // Set below once the `$unit` typedefs are known; never another design's.
+    CONST_FN_UNIT_TYPES.with(|c| *c.borrow_mut() = None);
     if let Some(defs) = all_defs {
         // §6.18: typedefs must be processed in DEPENDENCY order. A struct
         // typedef's width is resolved from the width map built by the
@@ -7707,6 +7769,14 @@ pub fn elaborate_module_with_defs(
         for td in ordered_typedefs(defs) {
             process_typedef(td, &mut elab);
         }
+        let unit_types: HashMap<String, DataType> = ordered_typedefs(defs)
+            .into_iter()
+            .filter_map(|td| {
+                let dt = elab.typedef_types.get(&td.name.name)?;
+                Some((td.name.name.clone(), dt.clone()))
+            })
+            .collect();
+        CONST_FN_UNIT_TYPES.with(|c| *c.borrow_mut() = Some(unit_types));
         // Package parameters again, now that typedefs and enum members exist:
         // the first hoist ran before either, so an enum-valued parameter
         // (`localparam cache_type_t T = config_pkg::WT`) folded to 0 — and a
@@ -8059,6 +8129,10 @@ pub fn elaborate_module_with_defs(
                         w,
                     );
                     elab.typedef_types.insert(a.name.name.clone(), dt.clone());
+                    // §6.24.1: a cast to the type parameter in a constant
+                    // expression (`T'(45)`) reads its declared type from the
+                    // shape table, like a typedef.
+                    tls_register_typedef_shape(&a.name.name, dt, &[]);
                     register_anonymous_enum_members(dt, &mut elab);
                     sync_typedefs_tls(&elab.typedefs);
                 }
@@ -11064,6 +11138,10 @@ pub fn elaborate_module_with_defs(
                                 w,
                             );
                             elab.typedef_types.insert(a.name.name.clone(), dt.clone());
+                            // §6.24.1: a cast to the type parameter in a constant
+                            // expression (`T'(45)`) reads its declared type from the
+                            // shape table, like a typedef.
+                            tls_register_typedef_shape(&a.name.name, dt, &[]);
                             register_anonymous_enum_members(dt, &mut elab);
                             sync_typedefs_tls(&elab.typedefs);
                         }
@@ -20344,16 +20422,32 @@ fn const_eval_user_call(
             &shell,
         ));
     }
-    let owner = const_fn_owner_package(&fname, scoped_key.as_deref(), &fd, &shell).or_else(|| {
-        scoped_key
-            .as_deref()
-            .and_then(|k| k.split_once("::"))
-            .map(|(pkg, _)| pkg.to_string())
-    });
+    // §13.4.3/§6.24.1: the function casts to the typedefs of the scope
+    // that declares it: its package (registered as `pkg::f` with this
+    // body), else, called from an instance that does not declare it, `$unit`.
+    let owner = match scoped_key.as_deref().and_then(|k| k.split_once("::")) {
+        Some((pkg, _)) => Some(pkg.to_string()),
+        None => funcs
+            .iter()
+            .filter(|(k, f)| {
+                f.span == fd.span && k.split_once("::").is_some_and(|(_, leaf)| leaf == fname)
+            })
+            .map(|(k, _)| {
+                k.split_once("::")
+                    .map_or(k.as_str(), |(pkg, _)| pkg)
+                    .to_string()
+            })
+            .min(),
+    };
+    let foreign = owner.is_none()
+        && CONST_FN_LOCAL_FUNCS
+            .with(|c| c.borrow().as_ref().is_some_and(|own| !own.contains(&fname)));
+    let prev_in_unit = CONST_FN_IN_UNIT.with(|c| c.replace(foreign));
     let prev_owner = CONST_FN_PACKAGE.with(|c| c.replace(owner));
-    let result = eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0);
+    let v = eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0);
     CONST_FN_PACKAGE.with(|c| *c.borrow_mut() = prev_owner);
-    result
+    CONST_FN_IN_UNIT.with(|c| c.set(prev_in_unit));
+    v
 }
 
 /// Candidate ENV KEYS for the base of a constant `base[index]` element
@@ -25769,8 +25863,19 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     out.is_signed = false;
                     return out;
                 }
-                // §6.24.1 TYPE cast through a typedef: the target is the
-                // operand's context, as for a keyword type cast below. Only an
+                // §6.24.1 TYPE cast to an integral typedef: the value takes the
+                // typedef's width and signing, and the target is the operand's
+                // context, as for a keyword type cast below.
+                if let Some((w, signed)) = const_typedef_cast_target(&nm, scoped.as_deref(), params)
+                {
+                    let v = eval_const_expr_val_ctx(&args[1], params, w);
+                    if !v.is_real {
+                        let mut out = v.resize(w);
+                        out.is_signed = signed;
+                        return out;
+                    }
+                }
+                // A typedef whose declared type is not known here: only an
                 // operator expression can observe a context, and the width
                 // table cannot tell an integral typedef from a string one, so
                 // a bare operand keeps its pass-through.
@@ -26305,6 +26410,72 @@ fn eval_const_expr_val_ctx(
         return own;
     }
     const_ctx_fold(expr, params, ctx_w.max(own.width), own.is_signed).unwrap_or(own)
+}
+
+/// Width and signing of the integral typedef a cast target `nm` (`scoped`
+/// when written `pkg::nm`) names, for `nm'(v)` in a constant expression.
+/// The instance's own types (`CONST_FN_LOCAL_TYPES`) come first, then the
+/// full typedef definitions (`TYPEDEF_SHAPES_TLS`); typedefs of typedefs are
+/// followed. The width of an instance's own type comes from its definition
+/// (the width table can still hold a type parameter's default); any other
+/// comes from the current scope's width table when it has the name. `None` for a name with no known definition, or a string,
+/// real or unpacked type: the caller keeps its pass-through.
+fn const_typedef_cast_target(
+    nm: &str,
+    scoped: Option<&str>,
+    params: &HashMap<String, Value>,
+) -> Option<(u32, bool)> {
+    let local = |n: &str| CONST_FN_LOCAL_TYPES.with(|c| c.borrow().as_ref()?.get(n).cloned());
+    let dt = TYPEDEF_SHAPES_TLS.with(|sh| {
+        let sh = sh.borrow();
+        let mut cur = match scoped {
+            Some(k) => sh.0.get(k).or_else(|| sh.0.get(nm))?.clone(),
+            None => match local(nm) {
+                Some(dt) => dt,
+                None if sh.1.contains_key(nm) => return None,
+                None => sh.0.get(nm)?.clone(),
+            },
+        };
+        for _ in 0..16 {
+            let DataType::TypeReference {
+                name, dimensions, ..
+            } = &cur
+            else {
+                break;
+            };
+            if !dimensions.is_empty() {
+                return None;
+            }
+            let next = name
+                .scopes
+                .is_empty()
+                .then(|| local(&name.name.name))
+                .flatten()
+                .or_else(|| lookup_scoped_type(name, &sh.0).cloned())?;
+            cur = next;
+        }
+        Some(cur)
+    })?;
+    let integral = match &dt {
+        DataType::IntegerAtom { .. } | DataType::IntegerVector { .. } | DataType::Enum(_) => true,
+        DataType::Struct(s) => s.packed,
+        _ => false,
+    };
+    if !integral {
+        return None;
+    }
+    let own = scoped.is_none() && local(nm).is_some();
+    let w = TYPEDEFS_TLS
+        .with(|c| {
+            let b = c.borrow();
+            let m = b.as_ref().filter(|_| !own)?;
+            scoped.and_then(|k| m.get(k)).or_else(|| m.get(nm)).copied()
+        })
+        .filter(|&w| w > 0)
+        .unwrap_or_else(|| {
+            TYPEDEFS_TLS.with(|c| resolve_type_width(&dt, Some(params), c.borrow().as_ref()))
+        });
+    (w > 0).then(|| (w, is_type_signed(&dt)))
 }
 
 /// True for an expression whose operands a surrounding context widens — an
@@ -34770,6 +34941,55 @@ fn inline_module_items(
                 let prev_in_instance = CONST_FN_IN_INSTANCE.with(|c| c.replace(true));
                 let _in_instance =
                     scopeguard_lite(move || CONST_FN_IN_INSTANCE.with(|c| c.set(prev_in_instance)));
+                // The instance's own types (`CONST_FN_LOCAL_TYPES`), installed
+                // once its body typedefs are known below and kept for the rest
+                // of this instance, so its declarations see them too.
+                // Its type parameters are known now (defaults and overrides),
+                // for header parameter defaults such as `H = T'(45)`.
+                let header_types: HashMap<String, DataType> = sub_mod
+                    .params_and_body_types()
+                    .filter_map(|p| match &p.kind {
+                        ParameterKind::Type { assignments } => Some(assignments),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter_map(|a| Some((a.name.name.clone(), a.init.clone()?)))
+                    .chain(type_overrides.iter().cloned())
+                    .collect();
+                let mut prev_local_types =
+                    Some(CONST_FN_LOCAL_TYPES.with(|c| c.replace(Some(header_types))));
+                let _local_types = scopeguard_lite(move || {
+                    if let Some(prev) = prev_local_types.take() {
+                        CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = prev);
+                    }
+                });
+                // Its own functions, not the `$unit` ones injected into it.
+                let local_funcs: HashSet<String> = UNIT_FUNCTION_SITES.with(|u| {
+                    let u = u.borrow();
+                    sub_mod
+                        .items()
+                        .iter()
+                        .filter_map(|it| match it {
+                            ModuleItem::FunctionDeclaration(fd)
+                                if !u.contains(&(
+                                    fd.name.name.name.clone(),
+                                    fd.span.start,
+                                    fd.span.end,
+                                )) =>
+                            {
+                                Some(fd.name.name.name.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                });
+                let mut prev_local_funcs =
+                    Some(CONST_FN_LOCAL_FUNCS.with(|c| c.replace(Some(local_funcs))));
+                let _local_funcs = scopeguard_lite(move || {
+                    if let Some(prev) = prev_local_funcs.take() {
+                        CONST_FN_LOCAL_FUNCS.with(|c| *c.borrow_mut() = prev);
+                    }
+                });
                 let mut inst_types: HashMap<String, DataType> = HashMap::default();
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
@@ -35381,7 +35601,7 @@ fn inline_module_items(
                     // typedefs and type parameters (`w_t'(x)`, `T'(x)`).
                     let mut fn_types = local_types.clone();
                     fn_types.extend(type_overrides.iter().cloned());
-                    let prev_fn_types = CONST_FN_LOCAL_TYPES.with(|c| c.replace(Some(fn_types)));
+                    CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = Some(fn_types));
                     add_params_from_items(
                         sub_mod.items(),
                         &mut sub_local_params,
@@ -35389,7 +35609,6 @@ fn inline_module_items(
                         &frozen_params,
                         &local_types,
                     );
-                    CONST_FN_LOCAL_TYPES.with(|c| *c.borrow_mut() = prev_fn_types);
                     if sub_local_params == snapshot {
                         break;
                     }
@@ -40211,6 +40430,25 @@ thread_local! {
     /// module resolves in that instance and nowhere else.
     static CONST_FN_LOCAL_TYPES: std::cell::RefCell<Option<HashMap<String, DataType>>> =
         const { std::cell::RefCell::new(None) };
+    /// The functions the instance being elaborated declares itself. A
+    /// constant function it calls but does not declare (a `$unit` one)
+    /// resolves the typedefs it casts to in its own scope, not through
+    /// `CONST_FN_LOCAL_TYPES`.
+    static CONST_FN_LOCAL_FUNCS: std::cell::RefCell<Option<HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set while a `$unit` constant function called from inside an instance
+    /// is folded: its bare cast targets resolve in `CONST_FN_UNIT_TYPES`.
+    static CONST_FN_IN_UNIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// (name, span start, span end) of each `$unit` function. They are
+    /// injected into every module's items, where they look like the
+    /// module's own; see `set_unit_function_sites`.
+    static UNIT_FUNCTION_SITES: std::cell::RefCell<HashSet<(String, usize, usize)>> =
+        std::cell::RefCell::new(HashSet::default());
+    /// The `$unit` typedefs' declared types, taken once they are all
+    /// registered. The shared typedef table is overwritten by an instance's
+    /// same-named body typedefs, so it cannot answer for `$unit` there.
+    static CONST_FN_UNIT_TYPES: std::cell::RefCell<Option<HashMap<String, DataType>>> =
+        const { std::cell::RefCell::new(None) };
     /// The package that declares the constant function being folded, if
     /// any. Its body sees that package's typedefs (and what it imports), not
     /// those of the scope that called it.
@@ -40281,6 +40519,22 @@ fn const_fn_local_typedef(name: &str, elab: &ElaboratedModule) -> Option<DataTyp
     })
 }
 
+/// Record the `$unit` functions of the design being elaborated (name and
+/// declaration span), so an injected copy in a module is not taken for a
+/// function the module declares itself.
+pub(crate) fn set_unit_function_sites(sites: HashSet<(String, usize, usize)>) {
+    UNIT_FUNCTION_SITES.with(|c| *c.borrow_mut() = sites);
+}
+
+/// A bare type name inside a `$unit` constant function folded for an
+/// instance: the `$unit` typedef of that name, else the one package that
+/// declares it (an imported typedef).
+fn const_fn_unit_typedef(name: &str, elab: &ElaboratedModule) -> Option<DataType> {
+    CONST_FN_UNIT_TYPES
+        .with(|c| c.borrow().as_ref()?.get(name).cloned())
+        .or_else(|| const_fn_imported_typedef(name, elab).cloned())
+}
+
 /// The declared type of the typedef a cast target names (`dir_e`, `p::dir_e`,
 /// or a type literal referring to one), followed through typedefs of
 /// typedefs. `None` when the target is not a typedef of `elab`, e.g. a
@@ -40320,6 +40574,7 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
     let mut dt = match (&scoped, &pkg) {
         (Some(k), _) => elab.typedef_types.get(k)?.clone(),
         (None, Some(pkg)) => const_fn_package_typedef(pkg, &leaf, elab)?.clone(),
+        (None, None) if CONST_FN_IN_UNIT.with(|c| c.get()) => const_fn_unit_typedef(&leaf, elab)?,
         (None, None) if CONST_FN_IN_INSTANCE.with(|c| c.get()) => {
             const_fn_local_typedef(&leaf, elab)?
         }
@@ -40333,6 +40588,9 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
                 dt = match &pkg {
                     Some(pkg) if name.scopes.is_empty() => {
                         const_fn_package_typedef(pkg, &name.name.name, elab)?.clone()
+                    }
+                    None if name.scopes.is_empty() && CONST_FN_IN_UNIT.with(|c| c.get()) => {
+                        const_fn_unit_typedef(&name.name.name, elab)?
                     }
                     None if name.scopes.is_empty() && CONST_FN_IN_INSTANCE.with(|c| c.get()) => {
                         const_fn_local_typedef(&name.name.name, elab)?
@@ -40493,9 +40751,19 @@ fn substitute_const_fn_calls(
                 ));
             }
             let owner = const_fn_owner_package(&fname, scoped_key.as_deref(), &fd, elab);
+            // §13.4.3/§6.24.1: a function the instance calls but does not
+            // declare (a `$unit` one) casts to the typedefs of ITS scope.
+            // Folded as the instance's own, `w_t'(x)` took the instance's
+            // `w_t` when the body declared one of that name.
+            let foreign = owner.is_none()
+                && scoped_key.is_none()
+                && CONST_FN_LOCAL_FUNCS
+                    .with(|c| c.borrow().as_ref().is_some_and(|own| !own.contains(&fname)));
+            let prev_in_unit = CONST_FN_IN_UNIT.with(|c| c.replace(foreign));
             let prev_owner = CONST_FN_PACKAGE.with(|c| c.replace(owner));
             let v = eval_const_user_function(&fd, &argv, params, elab, depth);
             CONST_FN_PACKAGE.with(|c| *c.borrow_mut() = prev_owner);
+            CONST_FN_IN_UNIT.with(|c| c.set(prev_in_unit));
             let v = v?;
             // §13.4.1: preserve the declared return width and signedness,
             // including wide and four-state results used by another call.
@@ -46986,6 +47254,35 @@ mod logged_map_tests {
             if matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }))
         );
         assert_eq!(restored.dynamic_assoc_properties["deep"].len(), 2);
+    }
+
+    /// §7.4.5: a dynamic or queue outer dimension over unpacked rows keeps
+    /// its row dimensions across artifacts; an associative tail, a scalar
+    /// dynamic array and a fixed outer shape record none.
+    #[test]
+    fn dynamic_tail_property_metadata_roundtrips() {
+        let parsed = crate::parse(
+            "class holder; bit [7:0] raw[][2]; int d[][]; int q3[$][2][3]; int v[][string]; int plain[]; int fixed[2][3]; endclass",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Class(decl) = &parsed.source.descriptions[0] else {
+            panic!("class expected");
+        };
+        let cd = elaborate_class(decl);
+        assert_eq!(cd.dynamic_tail_properties.len(), 3);
+        assert_eq!(cd.dynamic_tail_properties["raw"].len(), 1);
+        assert!(matches!(
+            cd.dynamic_tail_properties["d"][..],
+            [UnpackedDimension::Unsized(_)]
+        ));
+        assert_eq!(cd.dynamic_tail_properties["q3"].len(), 2);
+        assert!(cd.queue_properties.contains_key("raw"));
+        assert!(!cd.dynamic_tail_properties.contains_key("v"));
+        let cfg = crate::xez_bincode_config();
+        let encoded = bincode::serde::encode_to_vec(&cd, cfg).unwrap();
+        let (restored, _): (ElaboratedClass, usize) =
+            bincode::serde::decode_from_slice(&encoded, cfg).unwrap();
+        assert_eq!(restored.dynamic_tail_properties["q3"].len(), 2);
     }
 
     fn tls_snapshot() -> Option<HashMap<String, u32>> {

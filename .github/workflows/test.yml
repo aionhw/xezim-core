@@ -13,15 +13,21 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
+      # Cargo.lock is gitignored, so a key hashed from it never changes and
+      # the cache saved by the first run would be reused for every commit.
+      # Hash the manifests and add the commit so each run saves a fresh
+      # cache and the next one restores the newest.
+      - name: Cache cargo registry and build
         uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}-
+            ${{ runner.os }}-cargo-
 
       - name: cargo test (no features)
         run: cargo test

@@ -172,7 +172,8 @@ pub use value::Value;
 /// \x29 = \x28 + retained specify-parameter declaration kind (§6.20.5).
 /// \x2a = \x29 + constructor argument forwarding flags (IEEE 1800-2023 §8.17).
 /// \x2b = \x2a + bincode 2 encoding (the standard configuration).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2b";
+/// \x2c = \x2b + class members with a dynamic outer dimension over unpacked tails (§7.4.5).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x2c";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -2189,6 +2190,16 @@ fn parse_and_elaborate(
     // Before binds clone any definition, so a specialized clone carries the
     // overridden default too.
     let mut param_override_hits = apply_param_overrides(&mut definitions, None)?;
+
+    // §13.4.3/§6.24.1: the `$unit` functions are injected into every module
+    // below; constant folding needs to tell such a copy from a function the
+    // module declares itself.
+    elaborate::set_unit_function_sites(
+        top_level_functions
+            .iter()
+            .map(|f| (f.name.name.name.clone(), f.span.start, f.span.end))
+            .collect(),
+    );
 
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
