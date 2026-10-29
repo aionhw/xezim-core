@@ -31,7 +31,26 @@ pub struct VhdlFile {
     pub library: String,
 }
 
-/// Run options, as GHDL's `--ieee-asserts=` and `--assert-level=`.
+/// The VHDL revision a design is analysed as (`--std=08`, `--std=19`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VhdlStd {
+    #[default]
+    V2008,
+    V2019,
+}
+
+impl VhdlStd {
+    /// The revision named by a `--std=` value (`08`, `2008`, `19`, `2019`).
+    pub fn from_arg(v: &str) -> Option<VhdlStd> {
+        match v {
+            "08" | "2008" => Some(VhdlStd::V2008),
+            "19" | "2019" => Some(VhdlStd::V2019),
+            _ => None,
+        }
+    }
+}
+
+/// Run options, as GHDL's `--std=`, `--ieee-asserts=` and `--assert-level=`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VhdlOptions {
     /// Assertions of the IEEE library: 0 shown, 1 not shown, 2 not shown
@@ -40,6 +59,8 @@ pub struct VhdlOptions {
     /// The severity (0 note .. 3 failure; 4 none) from which an assertion
     /// stops the simulation.
     pub assert_level: u8,
+    /// The revision of the language.
+    pub std: VhdlStd,
 }
 
 impl Default for VhdlOptions {
@@ -47,6 +68,7 @@ impl Default for VhdlOptions {
         VhdlOptions {
             ieee_asserts: 0,
             assert_level: 3,
+            std: VhdlStd::V2008,
         }
     }
 }
@@ -116,7 +138,7 @@ pub fn inject(
     for f in &cfg.files {
         let text =
             std::fs::read(&f.path).map_err(|e| format!("VHDL: cannot read '{}': {}", f.path, e))?;
-        let p = cst::parse(cst::SourceFile::new(f.path.clone(), text));
+        let p = cst::parse_std(cst::SourceFile::new(f.path.clone(), text), cfg.options.std);
         msgs.extend(p.errors.iter().map(|d| p.file.render(d)));
         debug_assert!(!p.errors.is_empty() || p.ast.is_some());
         parsed.push(p);
@@ -160,7 +182,7 @@ pub fn inject(
         .map(|f| f.library.clone())
         .zip(parsed)
         .collect();
-    let mut analysed = sema::analyze(files, vhdl_top.as_deref(), &mixed)
+    let mut analysed = sema::analyze(files, vhdl_top.as_deref(), &mixed, cfg.options.std)
         .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
     // An SV top (named, or an SV module nothing instantiates) leaves the
     // VHDL top level out unless that is named.
@@ -258,7 +280,7 @@ pub fn check_design(sources: &[(&str, &str, &[u8])]) -> Vec<String> {
         }
         files.push((lib.to_string(), p));
     }
-    match sema::analyze(files, None, &sema::Mixed::default()) {
+    match sema::analyze(files, None, &sema::Mixed::default(), VhdlStd::V2008) {
         Ok(_) => Vec::new(),
         Err(e) => e,
     }

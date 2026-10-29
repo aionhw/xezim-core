@@ -97,11 +97,20 @@ pub struct Parsed {
     pub ast: Option<ast::DesignFile>,
 }
 
-/// Parse a VHDL-2008 file. One syntax error makes the parser report many
-/// follow-on errors in the same design unit, so only the first error of
-/// each design unit is kept.
+/// Parse a VHDL-2008 file.
 pub fn parse(file: SourceFile) -> Parsed {
-    let (design, errs) = parser::parse(file.text.clone());
+    parse_std(file, super::VhdlStd::V2008)
+}
+
+/// Parse a file of revision `std`. One syntax error makes the parser report
+/// many follow-on errors in the same design unit, so only the first error of
+/// each design unit is kept.
+pub fn parse_std(file: SourceFile, std: super::VhdlStd) -> Parsed {
+    let standard = match std {
+        super::VhdlStd::V2008 => vhdl_syntax::standard::VHDLStandard::VHDL2008,
+        super::VhdlStd::V2019 => vhdl_syntax::standard::VHDLStandard::VHDL2019,
+    };
+    let (design, errs) = parser::parse_with_standard(standard, file.text.clone());
     let units: Vec<Range<usize>> = design.design_units().map(|u| u.raw().range()).collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut errors = Vec::new();

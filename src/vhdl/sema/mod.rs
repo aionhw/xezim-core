@@ -118,6 +118,8 @@ pub struct StdTypes {
 
 /// The whole analysed design.
 pub struct Design {
+    /// The revision of the language the design is analysed as.
+    pub revision: super::VhdlStd,
     pub files: Vec<SourceFile>,
     asts: Vec<Option<ast::DesignFile>>,
     pub types: Vec<TypeInfo>,
@@ -254,6 +256,7 @@ pub struct Analysed {
 impl Design {
     fn new() -> Self {
         Design {
+            revision: super::VhdlStd::V2008,
             files: Vec::new(),
             asts: Vec::new(),
             types: Vec::new(),
@@ -572,7 +575,7 @@ impl Design {
             } else {
                 format!("../../src/ieee2008/{}", s.file)
             };
-            let p = cst::parse(SourceFile::new(path, s.text.to_vec()));
+            let p = cst::parse_std(SourceFile::new(path, s.text.to_vec()), self.revision);
             self.add_file(lib, p);
         }
     }
@@ -1095,8 +1098,10 @@ pub fn analyze(
     files: Vec<(String, cst::Parsed)>,
     top: Option<&str>,
     mixed: &Mixed,
+    std: super::VhdlStd,
 ) -> Result<Analysed, Vec<String>> {
     let mut d = Design::new();
+    d.revision = std;
     d.sv_modules = mixed.sv_modules.clone();
     d.add_universal_types();
     d.ensure_library("std");
