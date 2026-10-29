@@ -210,6 +210,9 @@ impl<'a> AnalyzeContext<'a, '_> {
                                 }
                             }
                         }
+                        // xezim: not analysed (xezim uses the parser only).
+                        ProtectedTypeDeclarativeItem::Other(_)
+                        | ProtectedTypeDeclarativeItem::Private(_) => {}
                     }
                 }
 

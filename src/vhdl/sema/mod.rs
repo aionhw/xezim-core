@@ -950,7 +950,7 @@ impl Design {
                     ast::InterfaceDecl::Object(o) => {
                         generic_names.extend(o.names.iter().map(|n| (n.name.clone(), false)))
                     }
-                    ast::InterfaceDecl::Type(i) => generic_names.push((i.name.clone(), true)),
+                    ast::InterfaceDecl::Type(i, _) => generic_names.push((i.name.clone(), true)),
                     ast::InterfaceDecl::Subprogram { spec, .. } => {
                         generic_names.push((Design::designator_key(&spec.designator), false))
                     }

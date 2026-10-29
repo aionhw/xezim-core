@@ -296,6 +296,15 @@ fn parse_interface_declaration(
         Type => {
             ctx.stream.skip();
             let ident = ctx.stream.expect_ident()?;
+            // xezim: VHDL-2019 generic type classes, `type t is range <>`.
+            if ctx.standard >= VHDL2019 && ctx.stream.skip_if_kind(Is) {
+                let definition = parse_incomplete_type_definition(ctx)?;
+                return Ok(InterfaceDeclaration::TypeClass(InterfaceTypeClass {
+                    span: TokenSpan::new(start_token, ctx.stream.get_last_token_id()),
+                    ident: WithDecl::new(ident),
+                    definition,
+                }));
+            }
             Ok(InterfaceDeclaration::Type(WithDecl::new(ident)))
         },
         Function | Procedure | Impure | Pure => {
@@ -310,6 +319,83 @@ fn parse_interface_declaration(
             Ok(InterfaceDeclaration::Package (parse_interface_package(ctx)?))
         }
     )
+}
+
+/// xezim: VHDL-2019 LRM 6.5.3 incomplete type definition.
+fn parse_incomplete_type_definition(
+    ctx: &mut ParsingContext<'_>,
+) -> ParseResult<WithTokenSpan<IncompleteTypeDefinition>> {
+    let start_token = ctx.stream.get_current_token_id();
+    let def = expect_token!(
+        ctx.stream, token,
+        Private => IncompleteTypeDefinition::Private,
+        BOX => IncompleteTypeDefinition::Scalar,
+        LeftPar => {
+            ctx.stream.expect_kind(BOX)?;
+            ctx.stream.expect_kind(RightPar)?;
+            IncompleteTypeDefinition::Discrete
+        },
+        Range => {
+            ctx.stream.expect_kind(BOX)?;
+            if ctx.stream.skip_if_kind(Dot) {
+                ctx.stream.expect_kind(BOX)?;
+                IncompleteTypeDefinition::Floating
+            } else {
+                IncompleteTypeDefinition::Integer
+            }
+        },
+        Units => {
+            ctx.stream.expect_kind(BOX)?;
+            IncompleteTypeDefinition::Physical
+        },
+        Array => {
+            ctx.stream.expect_kind(LeftPar)?;
+            let mut indexes = Vec::new();
+            loop {
+                if ctx.stream.next_kind_is(Type) {
+                    indexes.push(IncompleteArrayIndex::Anonymous(parse_anonymous_type_indication(ctx)?));
+                } else {
+                    indexes.push(match crate::syntax::range::parse_array_index_constraint(ctx)? {
+                        ArrayIndex::IndexSubtypeDefintion(mark) => IncompleteArrayIndex::Unbounded(mark),
+                        ArrayIndex::Discrete(r) => IncompleteArrayIndex::Constraint(r.item),
+                    });
+                }
+                if !ctx.stream.skip_if_kind(Comma) {
+                    break;
+                }
+            }
+            ctx.stream.expect_kind(RightPar)?;
+            ctx.stream.expect_kind(Of)?;
+            IncompleteTypeDefinition::Array(indexes, Box::new(parse_incomplete_subtype(ctx)?))
+        },
+        Access => IncompleteTypeDefinition::Access(Box::new(parse_incomplete_subtype(ctx)?)),
+        File => {
+            ctx.stream.expect_kind(Of)?;
+            IncompleteTypeDefinition::File(Box::new(parse_incomplete_subtype(ctx)?))
+        }
+    );
+    Ok(WithTokenSpan::new(
+        def,
+        TokenSpan::new(start_token, ctx.stream.get_last_token_id()),
+    ))
+}
+
+/// xezim: `type is <incomplete type definition>`.
+fn parse_anonymous_type_indication(
+    ctx: &mut ParsingContext<'_>,
+) -> ParseResult<WithTokenSpan<IncompleteTypeDefinition>> {
+    ctx.stream.expect_kind(Type)?;
+    ctx.stream.expect_kind(Is)?;
+    parse_incomplete_type_definition(ctx)
+}
+
+/// xezim: a subtype indication or an anonymous type indication.
+fn parse_incomplete_subtype(ctx: &mut ParsingContext<'_>) -> ParseResult<IncompleteSubtype> {
+    if ctx.stream.next_kind_is(Type) {
+        Ok(IncompleteSubtype::Anonymous(parse_anonymous_type_indication(ctx)?))
+    } else {
+        Ok(IncompleteSubtype::Subtype(parse_subtype_indication(ctx)?))
+    }
 }
 
 /// Parse ; separator in generic or port lists.

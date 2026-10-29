@@ -311,7 +311,7 @@ impl Search for LabeledSequentialStatement {
             .or_not_found());
         match self.statement.item {
             SequentialStatement::Return(ref ret) => {
-                let ReturnStatement { ref expression } = ret;
+                let ReturnStatement { ref expression, .. } = ret;
                 return_if_found!(expression.search(ctx, searcher));
             }
             SequentialStatement::ProcedureCall(ref pcall) => {
@@ -428,6 +428,11 @@ impl Search for LabeledSequentialStatement {
                 return_if_found!(target.search(ctx, searcher));
             }
             SequentialStatement::Null => {}
+            // xezim
+            SequentialStatement::Block(ref block) => {
+                return_if_found!(block.decl.search(ctx, searcher));
+                return_if_found!(block.statements.search(ctx, searcher));
+            }
         }
 
         if let Some(end_label_pos) = self.statement.item.end_label_pos() {
@@ -809,6 +814,9 @@ impl Search for TypeDeclaration {
                         ProtectedTypeDeclarativeItem::Subprogram(ref subprogram) => {
                             return_if_found!(subprogram.search(ctx, searcher));
                         }
+                        // xezim
+                        ProtectedTypeDeclarativeItem::Other(_)
+                        | ProtectedTypeDeclarativeItem::Private(_) => {}
                     }
                 }
             }
@@ -1330,7 +1338,9 @@ impl Search for InterfaceDeclaration {
                     }
                 }
             }
-            InterfaceDeclaration::Type(decl) => {
+            InterfaceDeclaration::Type(decl)
+            // xezim
+            | InterfaceDeclaration::TypeClass(InterfaceTypeClass { ident: decl, .. }) => {
                 return_if_found!(searcher
                     .search_decl(
                         ctx,

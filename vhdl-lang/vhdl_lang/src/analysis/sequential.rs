@@ -114,7 +114,9 @@ impl<'a> AnalyzeContext<'a, '_> {
         let statement_span = statement.statement.span;
         match statement.statement.item {
             SequentialStatement::Return(ref mut ret) => {
-                let ReturnStatement { ref mut expression } = ret;
+                let ReturnStatement {
+                    ref mut expression, ..
+                } = ret;
 
                 match SequentialRoot::from(parent) {
                     SequentialRoot::Function(ttyp) => {
@@ -325,6 +327,8 @@ impl<'a> AnalyzeContext<'a, '_> {
                 as_fatal(self.resolve_target(scope, target, AssignmentType::Signal, diagnostics))?;
             }
             SequentialStatement::Null => {}
+            // xezim: not analysed (xezim uses the parser only).
+            SequentialStatement::Block(_) => {}
         }
         Ok(())
     }

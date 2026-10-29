@@ -45,6 +45,27 @@ files here stay under the MPL-2.0; changes are marked with a comment starting
 - `syntax/tokens/tokenizer.rs`: the `-- vhdl_ls off` comment pragma (the
   language server's way of leaving code out) is not honoured: a simulator
   analyses every line.
+- VHDL-2019 generic type classes (LRM 6.5.3, `type t is range <>`, `(<>)`,
+  `private`, `array (...) of ...`, ...): `ast.rs`
+  `InterfaceDeclaration::TypeClass`, `IncompleteTypeDefinition`;
+  `syntax/interface_declaration.rs`.
+- VHDL-2019 return statements (LRM 10.13): `return when c;` and
+  `return a when c else b [else unaffected];`, the `condition` and
+  `conditionals` fields of `ast.rs` `ReturnStatement`;
+  `syntax/sequential_statement.rs`.
+- VHDL-2019 sequential block statements: `ast.rs`
+  `SequentialStatement::Block`, `syntax/sequential_statement.rs` (an error
+  before VHDL-2019).
+- Protected type declarations (LRM 5.6.2): the VHDL-2019 generic clause and
+  map (`ProtectedTypeDeclaration::generic_clause`, `generic_map`) and
+  `private variable` declarations, and the subprogram instantiations, use
+  clauses, alias declarations and attribute specifications 2008 already
+  allows (`ProtectedTypeDeclarativeItem::Other`, `Private`);
+  `syntax/type_declaration.rs`.
+- The matches over the new variants in `ast/display.rs`, `ast/search.rs`,
+  `ast/util.rs`, `analysis/*.rs`, `lint/sensitivity_list.rs` and
+  `formatting/*.rs` (the formatter writes the new forms as in the source;
+  the analysis skips them: xezim uses the parser only).
 - `syntax/xezim_tests.rs` (in `syntax.rs`): a test of each change above.
   Upstream tests adjusted to the changes: the expected-keyword lists of
   `syntax/declarative_part.rs` include `disconnect`; the two `vhdl_ls off`

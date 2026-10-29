@@ -126,6 +126,8 @@ impl VHDLFormatter<'_> {
                 self.format_interface_subprogram_declaration(subprogram, buffer)
             }
             Package(package) => self.format_interface_package_declaration(package, buffer),
+            // xezim: written as in the source.
+            TypeClass(t) => self.format_token_span(t.span, buffer),
         }
     }
 

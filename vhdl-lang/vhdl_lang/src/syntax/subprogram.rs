@@ -213,6 +213,8 @@ pub fn parse_subprogram_specification(
     }
 }
 
+// xezim: protected types parse through parse_subprogram now; upstream tests use this.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_subprogram_declaration(
     ctx: &mut ParsingContext<'_>,
 ) -> ParseResult<SubprogramDeclaration> {

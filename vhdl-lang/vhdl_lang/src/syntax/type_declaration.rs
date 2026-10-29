@@ -9,7 +9,6 @@ use super::common::ParseResult;
 use super::declarative_part::parse_declarative_part;
 use super::names::parse_identifier_list;
 use super::range::{parse_array_index_constraint, parse_range};
-use super::subprogram::parse_subprogram_declaration;
 use super::subtype_indication::parse_subtype_indication;
 use super::tokens::{Kind::*, TokenSpan, Value};
 use crate::ast::token_range::WithToken;
@@ -127,15 +126,62 @@ pub fn parse_protected_type_declaration(
 ) -> ParseResult<(ProtectedTypeDeclaration, Option<Ident>)> {
     let mut items = Vec::new();
 
+    // xezim: VHDL-2019 protected type header, `generic (...); [generic map (...);]`.
+    let (mut generic_clause, mut generic_map) = (None, None);
+    if ctx.standard >= crate::VHDLStandard::VHDL2019 && ctx.stream.skip_if_kind(Generic) {
+        generic_clause = Some(super::interface_declaration::parse_generic_interface_list(ctx)?);
+        expect_semicolon(ctx);
+        generic_map = super::concurrent_statement::parse_map_aspect(ctx, Generic)?;
+        if generic_map.is_some() {
+            expect_semicolon(ctx);
+        }
+    }
+
     loop {
         let token = ctx.stream.peek_expect()?;
+        let start_token = ctx.stream.get_current_token_id();
 
         try_init_token_kind!(
             token,
-            // xezim: `pure function` too (LRM 5.6.2: any subprogram declaration).
-            Pure | Impure | Function | Procedure => items.push(ProtectedTypeDeclarativeItem::Subprogram(
-                parse_subprogram_declaration(ctx)?,
+            // xezim: any subprogram declaration (`pure function` too) and
+            // subprogram instantiations (LRM 5.6.2).
+            Pure | Impure | Function | Procedure => {
+                match super::subprogram::parse_subprogram(ctx)? {
+                    Declaration::SubprogramDeclaration(d) => {
+                        items.push(ProtectedTypeDeclarativeItem::Subprogram(d))
+                    }
+                    other => items.push(ProtectedTypeDeclarativeItem::Other(WithTokenSpan::new(
+                        other,
+                        TokenSpan::new(start_token, ctx.stream.get_last_token_id()),
+                    ))),
+                }
+            },
+            // xezim: use clauses, alias declarations and attribute
+            // specifications (LRM 5.6.2).
+            Use => items.push(ProtectedTypeDeclarativeItem::Other(
+                super::context::parse_use_clause(ctx)?.map_into(Declaration::Use),
             )),
+            Alias => items.push(ProtectedTypeDeclarativeItem::Other(
+                super::alias_declaration::parse_alias_declaration(ctx)?
+                    .map_into(Declaration::Alias),
+            )),
+            Attribute => {
+                for a in super::attributes::parse_attribute(ctx)? {
+                    items.push(ProtectedTypeDeclarativeItem::Other(a.map_into(Declaration::Attribute)));
+                }
+            },
+            // xezim: VHDL-2019 private variable declarations.
+            Private => {
+                ctx.stream.skip();
+                if !ctx.stream.next_kind_is(Variable) {
+                    let token = ctx.stream.peek_expect()?;
+                    return Err(token.kinds_error(&[Variable]));
+                }
+                items.push(ProtectedTypeDeclarativeItem::Private(
+                    super::object_declaration::parse_object_declaration(ctx)?
+                        .map_into(Declaration::Object),
+                ));
+            },
             End => {
                 ctx.stream.skip();
                 break;
@@ -144,7 +190,14 @@ pub fn parse_protected_type_declaration(
     }
     ctx.stream.expect_kind(Protected)?;
     let end_ident = ctx.stream.pop_optional_ident();
-    Ok((ProtectedTypeDeclaration { items }, end_ident))
+    Ok((
+        ProtectedTypeDeclaration {
+            generic_clause,
+            generic_map,
+            items,
+        },
+        end_ident,
+    ))
 }
 
 /// LRM 5.2.4 Physical types
@@ -722,7 +775,11 @@ end foo;",
         TypeDeclaration {
             span: token_span,
             ident: ident.into(),
-            def: TypeDefinition::Protected(ProtectedTypeDeclaration { items }),
+            def: TypeDefinition::Protected(ProtectedTypeDeclaration {
+                generic_clause: None,
+                generic_map: None,
+                items,
+            }),
             end_ident_pos,
         }
     }

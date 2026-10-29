@@ -1109,6 +1109,8 @@ impl Display for InterfaceDeclaration {
             InterfaceDeclaration::Object(ref decl) => write!(f, "{decl}"),
             InterfaceDeclaration::File(ref decl) => write!(f, "{decl}"),
             InterfaceDeclaration::Type(ref ident) => write!(f, "type {ident}"),
+            // xezim
+            InterfaceDeclaration::TypeClass(ref t) => write!(f, "type {} is <class>", t.ident),
             InterfaceDeclaration::Subprogram(ref decl) => {
                 write!(f, "{}", decl.specification)?;
                 match &decl.default {

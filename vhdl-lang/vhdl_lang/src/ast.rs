@@ -445,6 +445,11 @@ pub struct ElementDeclaration {
 #[derive(PartialEq, Debug, Clone)]
 pub enum ProtectedTypeDeclarativeItem {
     Subprogram(SubprogramDeclaration),
+    /// xezim: a subprogram instantiation, attribute specification, use
+    /// clause or alias declaration (LRM 5.6.2).
+    Other(WithTokenSpan<Declaration>),
+    /// xezim: VHDL-2019 private variable declaration, `private variable v : t;`.
+    Private(WithTokenSpan<Declaration>),
 }
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone)]
@@ -588,6 +593,9 @@ pub enum Attribute {
 /// LRM 5.6.2 Protected type declarations
 #[derive(PartialEq, Debug, Clone)]
 pub struct ProtectedTypeDeclaration {
+    /// xezim: VHDL-2019 protected type header, a generic clause and map.
+    pub generic_clause: Option<InterfaceList>,
+    pub generic_map: Option<MapAspect>,
     pub items: Vec<ProtectedTypeDeclarativeItem>,
 }
 
@@ -898,10 +906,64 @@ pub enum InterfaceDeclaration {
     Object(InterfaceObjectDeclaration),
     File(InterfaceFileDeclaration),
     Type(WithDecl<Ident>),
+    /// xezim: VHDL-2019 LRM 6.5.3, an interface type with its class,
+    /// `type t is range <>`.
+    TypeClass(InterfaceTypeClass),
     /// LRM 6.5.4 Interface subprogram declarations
     Subprogram(InterfaceSubprogramDeclaration),
     /// LRM 6.5.5 Interface package declaration
     Package(InterfacePackageDeclaration),
+}
+
+/// xezim: VHDL-2019 LRM 6.5.3 incomplete type definition (the class of a
+/// generic type).
+#[derive(PartialEq, Debug, Clone)]
+pub enum IncompleteTypeDefinition {
+    /// `private`
+    Private,
+    /// `<>`
+    Scalar,
+    /// `(<>)`
+    Discrete,
+    /// `range <>`
+    Integer,
+    /// `units <>`
+    Physical,
+    /// `range <> . <>`
+    Floating,
+    /// `array (index, ...) of element`
+    Array(Vec<IncompleteArrayIndex>, Box<IncompleteSubtype>),
+    /// `access subtype`
+    Access(Box<IncompleteSubtype>),
+    /// `file of type_mark`
+    File(Box<IncompleteSubtype>),
+}
+
+/// xezim: an interface type declaration with its class.
+#[with_token_span]
+#[derive(PartialEq, Debug, Clone)]
+pub struct InterfaceTypeClass {
+    pub ident: WithDecl<Ident>,
+    pub definition: WithTokenSpan<IncompleteTypeDefinition>,
+}
+
+/// xezim: a subtype in an incomplete type definition: a subtype indication
+/// or `type is <incomplete type definition>`.
+#[derive(PartialEq, Debug, Clone)]
+pub enum IncompleteSubtype {
+    Subtype(SubtypeIndication),
+    Anonymous(WithTokenSpan<IncompleteTypeDefinition>),
+}
+
+/// xezim: an index of an array incomplete type definition.
+#[derive(PartialEq, Debug, Clone)]
+pub enum IncompleteArrayIndex {
+    /// `t range <>`
+    Unbounded(WithTokenSpan<Name>),
+    /// a discrete range
+    Constraint(DiscreteRange),
+    /// `type is <incomplete type definition>`
+    Anonymous(WithTokenSpan<IncompleteTypeDefinition>),
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
@@ -1161,6 +1223,21 @@ pub struct ExitStatement {
 #[derive(PartialEq, Debug, Clone)]
 pub struct ReturnStatement {
     pub expression: Option<WithTokenSpan<Expression>>,
+    /// xezim: VHDL-2019 `return when c;`.
+    pub condition: Option<WithTokenSpan<Expression>>,
+    /// xezim: VHDL-2019 `return a when c1 else b when c2 [else unaffected];`;
+    /// `None` items are `unaffected` (no return). `expression` is `None`.
+    pub conditionals: Option<Box<Conditionals<Option<WithTokenSpan<Expression>>>>>,
+}
+
+/// xezim: VHDL-2019 sequential block statement.
+#[derive(PartialEq, Debug, Clone)]
+pub struct SequentialBlock {
+    pub decl: Vec<WithTokenSpan<Declaration>>,
+    pub begin_token: TokenId,
+    pub statements: Vec<LabeledSequentialStatement>,
+    pub end_token: TokenId,
+    pub end_label_pos: Option<SrcPos>,
 }
 
 /// LRM 10. Sequential statements
@@ -1181,6 +1258,8 @@ pub enum SequentialStatement {
     Exit(ExitStatement),
     Return(ReturnStatement),
     Null,
+    /// xezim: VHDL-2019 sequential block statement.
+    Block(Box<SequentialBlock>),
 }
 
 /// LRM 10. Sequential statements

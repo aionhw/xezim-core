@@ -220,7 +220,8 @@ pub enum Mode {
 #[derive(Clone, Debug)]
 pub enum InterfaceDecl {
     Object(InterfaceObject),
-    Type(Ident),
+    /// `type t`, or with its class (VHDL-2019 §6.5.3, `type t is range <>`).
+    Type(Ident, Option<TypeClass>),
     Subprogram {
         spec: SubprogramSpec,
         default: Option<SubprogramDefault>,
@@ -231,6 +232,49 @@ pub enum InterfaceDecl {
         generic_map: Option<Vec<Assoc>>,
         span: Span,
     },
+}
+
+/// The class of a generic type (VHDL-2019 §6.5.3, incomplete type
+/// definitions).
+#[derive(Clone, Debug)]
+pub enum TypeClass {
+    /// `private`: any type.
+    Private,
+    /// `<>`: a scalar type.
+    Scalar,
+    /// `(<>)`: a discrete type.
+    Discrete,
+    /// `range <>`: an integer type.
+    Integer,
+    /// `units <>`: a physical type.
+    Physical,
+    /// `range <> . <>`: a floating-point type.
+    Floating,
+    /// `array (index, ...) of element`.
+    Array(Vec<ClassIndex>, Box<ClassSubtype>),
+    /// `access subtype`.
+    Access(Box<ClassSubtype>),
+    /// `file of type_mark`.
+    File(Box<ClassSubtype>),
+}
+
+/// A subtype in a type class: a subtype indication, or an anonymous generic
+/// type (`type is (<>)`).
+#[derive(Clone, Debug)]
+pub enum ClassSubtype {
+    Subtype(Box<SubtypeInd>),
+    Anonymous(TypeClass),
+}
+
+/// An index of an array type class.
+#[derive(Clone, Debug)]
+pub enum ClassIndex {
+    /// `t range <>`
+    Unbounded(Name),
+    /// A discrete range (`natural range 0 to 3`).
+    Range(DiscreteRange),
+    /// `type is (<>)`
+    Anonymous(TypeClass),
 }
 
 #[derive(Clone, Debug)]
@@ -353,7 +397,13 @@ pub enum TypeDef {
     Record(Vec<(Vec<Ident>, SubtypeInd)>),
     Access(SubtypeInd),
     File(Name),
-    Protected(Vec<Decl>),
+    /// A protected type declaration; VHDL-2019 adds a generic clause and map
+    /// (§5.6.2), and private variables (the `Decl::Variable`s of `decls`).
+    Protected {
+        generics: Vec<InterfaceDecl>,
+        generic_map: Option<Vec<Assoc>>,
+        decls: Vec<Decl>,
+    },
     ProtectedBody(Vec<Decl>),
     /// `type t is range implementation_defined` (std.standard only).
     ImplementationDefined,
@@ -723,6 +773,11 @@ pub enum SeqKind {
     },
     Return(Option<Expr>),
     Null,
+    /// A sequential block statement (VHDL-2019).
+    Block {
+        decls: Vec<Decl>,
+        stmts: Vec<SeqStmt>,
+    },
     Unsupported(String),
 }
 
@@ -934,6 +989,9 @@ pub enum ExprKind {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Paren(Box<Expr>),
+    /// A conditional expression (VHDL-2019 §9.1), `a when c1 else b when c2
+    /// else d`: the (value, condition) arms and the final value.
+    Cond(Vec<(Expr, Expr)>, Box<Expr>),
     /// A range where an expression was parsed (slice index, choice).
     Range(Box<RangeExpr>),
 }

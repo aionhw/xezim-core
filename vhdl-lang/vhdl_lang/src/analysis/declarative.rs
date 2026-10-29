@@ -918,7 +918,12 @@ impl<'a> AnalyzeContext<'a, '_> {
             InterfaceDeclaration::Object(ref mut object_decl) => {
                 self.analyze_interface_object_declaration(scope, parent, object_decl, diagnostics)?
             }
-            InterfaceDeclaration::Type(ref mut ident) => {
+            InterfaceDeclaration::Type(ref mut ident)
+            // xezim
+            | InterfaceDeclaration::TypeClass(InterfaceTypeClass {
+                ref mut ident,
+                ..
+            }) => {
                 let typ = TypeEnt::from_any(self.define(
                     ident,
                     parent,

@@ -306,6 +306,13 @@ impl Design {
                 }
             },
             ast::SeqKind::Null => HStmtKind::Null,
+            ast::SeqKind::Block { .. } => {
+                self.error(
+                    s.span.clone(),
+                    "sequential block statements (VHDL-2019) are not supported yet",
+                );
+                return None;
+            }
             ast::SeqKind::Unsupported(what) => {
                 self.error(s.span.clone(), format!("{} is not supported yet", what));
                 return None;

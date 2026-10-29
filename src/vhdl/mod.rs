@@ -32,6 +32,16 @@ pub struct VhdlFile {
     pub library: String,
 }
 
+/// What the tool reports itself as: the values of the conditional analysis
+/// identifiers TOOL_TYPE, TOOL_VENDOR, TOOL_NAME, TOOL_EDITION and
+/// TOOL_VERSION (VHDL-2019 §24.2) and of the STD.ENV functions of the same
+/// names (§16.5).
+pub const TOOL_TYPE: &str = "SIMULATION";
+pub const TOOL_VENDOR: &str = "xezim";
+pub const TOOL_NAME: &str = "xezim";
+pub const TOOL_EDITION: &str = "";
+pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The VHDL revision a design is analysed as (`--std=08`, `--std=19`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VhdlStd {
@@ -140,6 +150,9 @@ pub fn inject(
         let text =
             std::fs::read(&f.path).map_err(|e| format!("VHDL: cannot read '{}': {}", f.path, e))?;
         let p = cst::parse_std(cst::SourceFile::new(f.path.clone(), text), cfg.options.std);
+        for w in &p.warnings {
+            crate::log_eprintln(&p.file.render_warning(w));
+        }
         msgs.extend(p.errors.iter().map(|d| p.file.render(d)));
         debug_assert!(!p.errors.is_empty() || p.ast.is_some());
         parsed.push(p);
@@ -271,17 +284,22 @@ fn parse_generated(text: &str) -> Result<Vec<Description>, String> {
     Ok(source.descriptions)
 }
 
-/// Analyse VHDL sources (a test hook): the rendered errors.
+/// Analyse VHDL-2008 sources (a test hook): the rendered errors.
 pub fn check_design(sources: &[(&str, &str, &[u8])]) -> Vec<String> {
+    check_design_std(sources, VhdlStd::V2008)
+}
+
+/// Analyse VHDL sources of revision `std` (a test hook): the rendered errors.
+pub fn check_design_std(sources: &[(&str, &str, &[u8])], std: VhdlStd) -> Vec<String> {
     let mut files = Vec::new();
     for (lib, path, text) in sources {
-        let p = cst::parse(cst::SourceFile::new(path.to_string(), text.to_vec()));
+        let p = cst::parse_std(cst::SourceFile::new(path.to_string(), text.to_vec()), std);
         if !p.errors.is_empty() {
             return p.errors.iter().map(|d| p.file.render(d)).collect();
         }
         files.push((lib.to_string(), p));
     }
-    match sema::analyze(files, None, &sema::Mixed::default(), VhdlStd::V2008) {
+    match sema::analyze(files, None, &sema::Mixed::default(), std) {
         Ok(_) => Vec::new(),
         Err(e) => e,
     }

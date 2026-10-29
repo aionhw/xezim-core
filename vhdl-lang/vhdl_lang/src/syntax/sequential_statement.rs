@@ -274,6 +274,17 @@ fn parse_exit_statement(ctx: &mut ParsingContext<'_>) -> ParseResult<ExitStateme
 /// LRM 10.13 Return statement
 fn parse_return_statement(ctx: &mut ParsingContext<'_>) -> ParseResult<ReturnStatement> {
     ctx.stream.expect_kind(Return)?;
+    let is_2019 = ctx.standard >= crate::VHDLStandard::VHDL2019;
+    // xezim: VHDL-2019 `return when c;`.
+    if is_2019 && ctx.stream.skip_if_kind(When) {
+        let condition = parse_expression(ctx)?;
+        expect_semicolon(ctx);
+        return Ok(ReturnStatement {
+            expression: None,
+            condition: Some(condition),
+            conditionals: None,
+        });
+    }
     let expression = {
         if ctx.stream.peek_kind() == Some(SemiColon) {
             None
@@ -281,8 +292,84 @@ fn parse_return_statement(ctx: &mut ParsingContext<'_>) -> ParseResult<ReturnSta
             Some(parse_expression(ctx)?)
         }
     };
+    // xezim: VHDL-2019 conditional_or_unaffected_expression,
+    // `return a when c1 else b when c2 [else unaffected];`.
+    if is_2019 && expression.is_some() && ctx.stream.next_kind_is(When) {
+        let mut item = expression;
+        let mut conditionals = Vec::new();
+        let mut else_item = None;
+        loop {
+            ctx.stream.expect_kind(When)?;
+            let condition = parse_expression(ctx)?;
+            conditionals.push(Conditional {
+                condition,
+                item: item.take(),
+            });
+            if !ctx.stream.next_kind_is(Else) {
+                break;
+            }
+            let else_id = ctx.stream.get_current_token_id();
+            ctx.stream.skip();
+            let next = if ctx.stream.skip_if_kind(Unaffected) {
+                None
+            } else {
+                Some(parse_expression(ctx)?)
+            };
+            if ctx.stream.next_kind_is(When) {
+                item = next;
+            } else {
+                else_item = Some((next, else_id));
+                break;
+            }
+        }
+        expect_semicolon(ctx);
+        return Ok(ReturnStatement {
+            expression: None,
+            condition: None,
+            conditionals: Some(Box::new(Conditionals {
+                conditionals,
+                else_item,
+            })),
+        });
+    }
     expect_semicolon(ctx);
-    Ok(ReturnStatement { expression })
+    Ok(ReturnStatement {
+        expression,
+        condition: None,
+        conditionals: None,
+    })
+}
+
+/// xezim: VHDL-2019 sequential block statement,
+/// `[label :] block [is] declarations begin statements end [block] [label];`.
+fn parse_sequential_block(
+    ctx: &mut ParsingContext<'_>,
+    label: Option<&Ident>,
+) -> ParseResult<SequentialBlock> {
+    if ctx.standard < crate::VHDLStandard::VHDL2019 {
+        let token = ctx.stream.peek_expect()?;
+        return Err(Diagnostic::syntax_error(
+            &token.pos,
+            "A sequential block statement requires VHDL-2019",
+        ));
+    }
+    ctx.stream.expect_kind(Block)?;
+    ctx.stream.skip_if_kind(Is);
+    let decl = crate::syntax::declarative_part::parse_declarative_part(ctx)?;
+    let begin_token = ctx.stream.expect_kind(Begin)?;
+    let statements = parse_labeled_sequential_statements(ctx)?;
+    let end_token = ctx.stream.expect_kind(End)?;
+    ctx.stream.skip_if_kind(Block);
+    let end_label_pos =
+        check_label_identifier_mismatch(ctx, label, ctx.stream.pop_optional_ident());
+    expect_semicolon(ctx);
+    Ok(SequentialBlock {
+        decl,
+        begin_token,
+        statements,
+        end_token,
+        end_label_pos,
+    })
 }
 
 /// LRM 10.5 Signal assignment statement
@@ -569,6 +656,7 @@ fn parse_unlabeled_sequential_statement(
             Next => SequentialStatement::Next(parse_next_statement(ctx)?),
             Exit => SequentialStatement::Exit(parse_exit_statement(ctx)?),
             Return => SequentialStatement::Return(parse_return_statement(ctx)?),
+            Block => SequentialStatement::Block(Box::new(parse_sequential_block(ctx, label)?)),
             Null => {
                 ctx.stream.skip();
                 expect_semicolon(ctx);
@@ -1949,7 +2037,11 @@ end loop;",
             with_label(
                 None,
                 WithTokenSpan::new(
-                    SequentialStatement::Return(ReturnStatement { expression: None }),
+                    SequentialStatement::Return(ReturnStatement {
+                        expression: None,
+                        condition: None,
+                        conditionals: None,
+                    }),
                     code.token_span()
                 )
             )
@@ -1967,6 +2059,8 @@ end loop;",
                 WithTokenSpan::new(
                     SequentialStatement::Return(ReturnStatement {
                         expression: Some(code.s1("1 + 2").expr()),
+                        condition: None,
+                        conditionals: None,
                     }),
                     code.token_span()
                 )

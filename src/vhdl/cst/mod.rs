@@ -5,6 +5,7 @@
 use std::ops::Range;
 use std::sync::OnceLock;
 
+mod condanalysis;
 mod convert;
 
 use vhdl_lang::{Severity, SeverityMap, Source, VHDLParser, VHDLStandard};
@@ -58,6 +59,15 @@ impl SourceFile {
     /// `file:line:col: error: msg`, the source line and a caret under the
     /// span (on its first line).
     pub fn render(&self, d: &Diagnostic) -> String {
+        self.render_as(d, "error")
+    }
+
+    /// `file:line:col: warning: msg`, as `render`.
+    pub fn render_warning(&self, d: &Diagnostic) -> String {
+        self.render_as(d, "warning")
+    }
+
+    fn render_as(&self, d: &Diagnostic, severity: &str) -> String {
         let (line, col) = self.line_col(d.span.start);
         let src = self.line_text(line);
         let width = d
@@ -66,10 +76,11 @@ impl SourceFile {
             .clamp(1, src.chars().count().saturating_sub(col - 1).max(1));
         let gutter = line.to_string().len();
         format!(
-            "{}:{}:{}: error: {}\n{:>g$} |\n{} | {}\n{:>g$} | {}^{}",
+            "{}:{}:{}: {}: {}\n{:>g$} |\n{} | {}\n{:>g$} | {}^{}",
             self.path,
             line,
             col,
+            severity,
             d.message,
             "",
             line,
@@ -94,6 +105,8 @@ pub struct Parsed {
     pub file: SourceFile,
     pub units: Vec<Range<usize>>,
     pub errors: Vec<Diagnostic>,
+    /// `` `warning `` directives (VHDL-2019 conditional analysis).
+    pub warnings: Vec<Diagnostic>,
     pub ast: Option<ast::DesignFile>,
 }
 
@@ -116,9 +129,27 @@ fn parser(std: super::VhdlStd) -> &'static VHDLParser {
 /// follow-on errors in the same design unit, so only the first error of
 /// each design unit is kept.
 pub fn parse_std(file: SourceFile, std: super::VhdlStd) -> Parsed {
+    // Conditional analysis (VHDL-2019): the text with directives and
+    // excluded regions blanked, offsets unchanged.
+    let mut warnings = Vec::new();
+    let mut pre_text = None;
+    if let Some(o) = condanalysis::preprocess(&file.text, std) {
+        warnings = o.warnings;
+        if !o.errors.is_empty() {
+            return Parsed {
+                file,
+                units: Vec::new(),
+                errors: o.errors,
+                warnings,
+                ast: None,
+            };
+        }
+        pre_text = Some(o.text);
+    }
+    let bytes: &[u8] = pre_text.as_deref().unwrap_or(&file.text);
     // Latin-1: each byte is the character of the same code, so a column the
     // parser reports is a byte offset in its line.
-    let text: String = file.text.iter().map(|&b| b as char).collect();
+    let text: String = bytes.iter().map(|&b| b as char).collect();
     let source = Source::inline(std::path::Path::new(&file.path), &text);
     let mut diags: Vec<vhdl_lang::Diagnostic> = Vec::new();
     let design = parser(std).parse_design_source(&source, &mut diags);
@@ -151,7 +182,7 @@ pub fn parse_std(file: SourceFile, std: super::VhdlStd) -> Parsed {
     let ast = if errors.is_empty() {
         let mut out = Vec::new();
         for ((tokens, unit), span) in design.design_units.iter().zip(&units) {
-            let mut cv = convert::Converter::new(tokens, &lines, &file.text);
+            let mut cv = convert::Converter::new(tokens, &lines, bytes);
             if let Some(u) = cv.design_unit(unit, span.clone()) {
                 out.push(u);
             }
@@ -165,6 +196,7 @@ pub fn parse_std(file: SourceFile, std: super::VhdlStd) -> Parsed {
         file,
         units,
         errors,
+        warnings,
         ast,
     }
 }

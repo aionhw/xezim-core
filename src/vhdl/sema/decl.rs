@@ -583,7 +583,25 @@ impl Design {
         let name = td.name.name.clone();
         let loc = Some(self.loc(td.name.span.clone()));
         match &td.def {
-            Some(ast::TypeDef::Protected(decls)) => {
+            Some(ast::TypeDef::Protected {
+                generics,
+                generic_map,
+                decls,
+            }) => {
+                if !generics.is_empty() || generic_map.is_some() {
+                    self.error(
+                        td.name.span.clone(),
+                        "generics of protected types (VHDL-2019) are not supported yet",
+                    );
+                }
+                for d in decls {
+                    if let ast::Decl::Variable { obj, .. } = d {
+                        self.error(
+                            obj.span.clone(),
+                            "private variables of protected types (VHDL-2019) are not supported yet",
+                        );
+                    }
+                }
                 self.protected_decl(r, &name, decls, loc, path);
                 return;
             }
@@ -817,7 +835,7 @@ impl Design {
                 };
                 self.add_type(&name, TypeKind::File(ft), None, loc)
             }
-            ast::TypeDef::Protected(_) | ast::TypeDef::ProtectedBody(_) => return,
+            ast::TypeDef::Protected { .. } | ast::TypeDef::ProtectedBody(_) => return,
         };
         // Completing an incomplete type declaration: reuse its id.
         if let Some(Sym::Type(prev)) = self.regions[r]
@@ -1468,7 +1486,10 @@ impl Design {
                         out.push(id);
                     }
                 }
-                ast::InterfaceDecl::Type(i) => {
+                // The class of a generic type (VHDL-2019) is not checked
+                // against the actual yet; operations on the type resolve
+                // when the unit is analysed with its actual bound.
+                ast::InterfaceDecl::Type(i, _) => {
                     // A generic type (§6.5.3): the instance's actual type, or
                     // an incomplete type while there is none.
                     let t = match self.type_binding.iter().find(|(n, _)| *n == i.name) {

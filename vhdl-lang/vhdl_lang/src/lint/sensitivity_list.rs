@@ -549,7 +549,8 @@ impl Searcher for SensitivityListChecker<'_> {
                         }
                     }
                 }
-                Wait(_) | Null | SignalReleaseAssignment(_) => {}
+                // xezim: Block
+                Wait(_) | Null | SignalReleaseAssignment(_) | Block(_) => {}
             }
         }
         SearchState::NotFinished

@@ -379,6 +379,18 @@ impl VHDLFormatter<'_> {
                         self.format_subprogram_declaration(subprogram, buffer);
                         last_token = subprogram.span.end_token;
                     }
+                    // xezim: written as in the source.
+                    ProtectedTypeDeclarativeItem::Other(decl) => {
+                        self.format_token_span(decl.span, buffer);
+                        last_token = decl.span.end_token;
+                    }
+                    ProtectedTypeDeclarativeItem::Private(decl) => {
+                        self.format_token_span(
+                            TokenSpan::new(decl.span.start_token - 1, decl.span.end_token),
+                            buffer,
+                        );
+                        last_token = decl.span.end_token;
+                    }
                 }
             }
         });

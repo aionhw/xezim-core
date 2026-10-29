@@ -64,6 +64,13 @@ impl Design {
         match &e.kind {
             ast::ExprKind::Lit(l) => self.literal(r, l, expect, e.span.clone()),
             ast::ExprKind::Paren(x) => self.expr_inner(r, x, expect),
+            ast::ExprKind::Cond(..) => {
+                self.error(
+                    e.span.clone(),
+                    "conditional expressions (VHDL-2019) are not supported yet",
+                );
+                None
+            }
             ast::ExprKind::Name(n) => self.name_expr(r, n, expect),
             ast::ExprKind::Qualified(mark, x) => {
                 let t = self.type_mark(r, mark)?;

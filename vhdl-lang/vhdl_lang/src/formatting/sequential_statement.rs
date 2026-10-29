@@ -58,6 +58,8 @@ impl VHDLFormatter<'_> {
         let span = statement.span;
         match &statement.item {
             Wait(wait_statement) => self.format_wait_statement(wait_statement, span, buffer),
+            // xezim: written as in the source.
+            Block(_) => self.format_token_span(span, buffer),
             Assert(assert) => {
                 self.format_token_id(span.start_token, buffer);
                 buffer.push_whitespace();

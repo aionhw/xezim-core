@@ -429,7 +429,14 @@ impl<'a> Converter<'a> {
                         span,
                     }));
                 }
-                v::InterfaceDeclaration::Type(t) => out.push(InterfaceDecl::Type(self.ident(&t.tree))),
+                v::InterfaceDeclaration::Type(t) => {
+                    out.push(InterfaceDecl::Type(self.ident(&t.tree), None))
+                }
+                v::InterfaceDeclaration::TypeClass(t) => {
+                    if let Some(class) = self.type_class(&t.definition.item) {
+                        out.push(InterfaceDecl::Type(self.ident(&t.ident.tree), Some(class)));
+                    }
+                }
                 v::InterfaceDeclaration::Subprogram(s) => {
                     let Some(spec) = self.subprogram_spec(&s.specification) else {
                         continue;
@@ -457,6 +464,43 @@ impl<'a> Converter<'a> {
             }
         }
         out
+    }
+
+    /// The class of a generic type (VHDL-2019 §6.5.3).
+    fn type_class(&mut self, d: &v::IncompleteTypeDefinition) -> Option<TypeClass> {
+        use v::IncompleteTypeDefinition as I;
+        Some(match d {
+            I::Private => TypeClass::Private,
+            I::Scalar => TypeClass::Scalar,
+            I::Discrete => TypeClass::Discrete,
+            I::Integer => TypeClass::Integer,
+            I::Physical => TypeClass::Physical,
+            I::Floating => TypeClass::Floating,
+            I::Array(indexes, elem) => {
+                let mut out = Vec::new();
+                for i in indexes {
+                    out.push(match i {
+                        v::IncompleteArrayIndex::Unbounded(m) => ClassIndex::Unbounded(self.name(m)?),
+                        v::IncompleteArrayIndex::Constraint(r) => {
+                            ClassIndex::Range(self.discrete_range(r)?)
+                        }
+                        v::IncompleteArrayIndex::Anonymous(a) => {
+                            ClassIndex::Anonymous(self.type_class(&a.item)?)
+                        }
+                    });
+                }
+                TypeClass::Array(out, Box::new(self.class_subtype(elem)?))
+            }
+            I::Access(s) => TypeClass::Access(Box::new(self.class_subtype(s)?)),
+            I::File(s) => TypeClass::File(Box::new(self.class_subtype(s)?)),
+        })
+    }
+
+    fn class_subtype(&mut self, s: &v::IncompleteSubtype) -> Option<ClassSubtype> {
+        Some(match s {
+            v::IncompleteSubtype::Subtype(s) => ClassSubtype::Subtype(Box::new(self.subtype_ind(s)?)),
+            v::IncompleteSubtype::Anonymous(a) => ClassSubtype::Anonymous(self.type_class(&a.item)?),
+        })
     }
 
     fn subprogram_spec(&mut self, s: &v::SubprogramSpecification) -> Option<SubprogramSpec> {
@@ -790,9 +834,30 @@ impl<'a> Converter<'a> {
                                 decls.push(Decl::SubprogramDecl(spec));
                             }
                         }
+                        v::ProtectedTypeDeclarativeItem::Other(d) => {
+                            if let v::Declaration::SubprogramBody(_) = &d.item {
+                                let s = self.span(d.span);
+                                self.err(
+                                    s,
+                                    "VHDL: a subprogram body is not allowed in a protected type declaration",
+                                );
+                                continue;
+                            }
+                            decls.extend(self.decl(d));
+                        }
+                        // A private variable (VHDL-2019): the only variable
+                        // declaration a protected type declaration has.
+                        v::ProtectedTypeDeclarativeItem::Private(d) => decls.extend(self.decl(d)),
                     }
                 }
-                TypeDef::Protected(decls)
+                TypeDef::Protected {
+                    generics: self.interface_list(p.generic_clause.as_ref()),
+                    generic_map: p
+                        .generic_map
+                        .as_ref()
+                        .map(|m| self.assoc_list(&m.list.items)),
+                    decls,
+                }
             }
             v::TypeDefinition::ProtectedBody(b) => TypeDef::ProtectedBody(self.decls(&b.decl)),
             v::TypeDefinition::Incomplete(_) | v::TypeDefinition::Subtype(_) => {
@@ -1288,9 +1353,20 @@ impl<'a> Converter<'a> {
     fn cond_expr_at(&mut self, e: &v::ConditionalExpression, span: Span) -> Option<Expr> {
         match e {
             v::ConditionalExpression::Simple(x) => self.expr_at(x, span),
-            v::ConditionalExpression::Conditional(_) => {
-                self.unsupported(span, "a conditional expression");
-                None
+            // VHDL-2019 §9.1: `a when c1 else b when c2 else d`.
+            v::ConditionalExpression::Conditional(c) => {
+                let Some((last, _)) = &c.else_item else {
+                    self.err(span, "VHDL: a conditional expression needs a final else");
+                    return None;
+                };
+                let mut arms = Vec::new();
+                for x in &c.conditionals {
+                    arms.push((self.expr(&x.item)?, self.expr(&x.condition)?));
+                }
+                Some(Expr {
+                    kind: ExprKind::Cond(arms, Box::new(self.expr(last)?)),
+                    span,
+                })
             }
         }
     }
@@ -1901,13 +1977,62 @@ impl<'a> Converter<'a> {
                     None => None,
                 },
             },
-            v::SequentialStatement::Return(r) => SeqKind::Return(match &r.expression {
-                Some(e) => Some(self.expr(e)?),
-                None => None,
-            }),
+            v::SequentialStatement::Return(r) => self.return_stmt(r, &span)?,
             v::SequentialStatement::Null => SeqKind::Null,
+            v::SequentialStatement::Block(b) => SeqKind::Block {
+                decls: self.decls(&b.decl),
+                stmts: self.seq_stmts(&b.statements),
+            },
         };
         Some(SeqStmt { label, kind, span })
+    }
+}
+
+impl Converter<'_> {
+    /// A return statement. VHDL-2019's `return when c;` and
+    /// `return a when c1 else b when c2 [else unaffected];` (§10.13) are
+    /// `if` statements around plain returns; an `unaffected` arm returns
+    /// nothing and the execution continues.
+    fn return_stmt(&mut self, r: &v::ReturnStatement, span: &Span) -> Option<SeqKind> {
+        let ret = |value: Option<Expr>| {
+            vec![SeqStmt {
+                label: None,
+                kind: SeqKind::Return(value),
+                span: span.clone(),
+            }]
+        };
+        if let Some(c) = &r.condition {
+            return Some(SeqKind::If {
+                branches: vec![(self.expr(c)?, ret(None))],
+                else_branch: None,
+            });
+        }
+        if let Some(cs) = &r.conditionals {
+            let mut branches = Vec::new();
+            for x in &cs.conditionals {
+                let value = match &x.item {
+                    Some(e) => Some(self.expr(e)?),
+                    None => None,
+                };
+                let body = match value {
+                    Some(v) => ret(Some(v)),
+                    None => Vec::new(),
+                };
+                branches.push((self.expr(&x.condition)?, body));
+            }
+            let else_branch = match &cs.else_item {
+                Some((Some(e), _)) => Some(ret(Some(self.expr(e)?))),
+                _ => None,
+            };
+            return Some(SeqKind::If {
+                branches,
+                else_branch,
+            });
+        }
+        Some(SeqKind::Return(match &r.expression {
+            Some(e) => Some(self.expr(e)?),
+            None => None,
+        }))
     }
 }
 

@@ -87,7 +87,7 @@ impl Design {
                         flat.push(Formal::Obj(n, o));
                     }
                 }
-                ast::InterfaceDecl::Type(i) => flat.push(Formal::Type(i)),
+                ast::InterfaceDecl::Type(i, _) => flat.push(Formal::Type(i)),
                 ast::InterfaceDecl::Subprogram { spec, default } => {
                     flat.push(Formal::Sub(spec, default))
                 }

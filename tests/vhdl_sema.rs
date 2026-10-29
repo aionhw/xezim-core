@@ -287,3 +287,66 @@ fn missing_generic_actual() {
         all
     );
 }
+
+/// VHDL-2019 forms the analysis does not handle yet are located errors,
+/// never silently dropped: conditional expressions (§9.1), sequential block
+/// statements, and protected-type generics and private variables (§5.6.2).
+/// The parser accepts them (vhdl-lang/vhdl_lang/src/syntax/xezim_tests.rs).
+#[test]
+fn vhdl2019_forms_not_supported_yet() {
+    let arch = |decls: &str, stmts: &str| {
+        format!(
+            "entity e is end entity;\narchitecture a of e is\n{decls}begin\n  process\n  begin\n{stmts}    wait;\n  end process;\nend architecture;\n"
+        )
+    };
+    for (src, at, what) in [
+        (
+            arch("  constant c : integer := 1 when true else 2;\n", ""),
+            "t19.vhd:3:27:",
+            "conditional expressions",
+        ),
+        (
+            arch("", "    block\n    begin\n      null;\n    end block;\n"),
+            "t19.vhd:6:5:",
+            "sequential block statements",
+        ),
+        (
+            arch(
+                "  type pt is protected\n    generic (n : natural);\n    procedure put(x : integer);\n  end protected;\n",
+                "",
+            ),
+            "t19.vhd:3:8:",
+            "generics of protected types",
+        ),
+        (
+            arch(
+                "  type pt is protected\n    private variable v : integer;\n    procedure put(x : integer);\n  end protected;\n",
+                "",
+            ),
+            "t19.vhd:4:",
+            "private variables",
+        ),
+    ] {
+        let errs =
+            vhdl::check_design_std(&[("work", "t19.vhd", src.as_bytes())], vhdl::VhdlStd::V2019);
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with(at) && e.contains(what) && e.contains("not supported yet")),
+            "{at} {what}:\n{}\n{src}",
+            errs.join("\n")
+        );
+    }
+}
+
+/// The VHDL-2019 forms are syntax errors in VHDL-2008.
+#[test]
+fn vhdl2019_forms_rejected_in_2008() {
+    for src in [
+        "package p is\n  function f(x : integer) return integer;\nend package;\npackage body p is\n  function f(x : integer) return integer is\n  begin\n    return 1 when x > 0 else 0;\n  end function;\nend package body;\n",
+        "entity e is\n  generic (type t is (<>));\nend entity;\n",
+        "entity e is end entity;\narchitecture a of e is\nbegin\n  process\n  begin\n    block begin null; end block;\n    wait;\n  end process;\nend architecture;\n",
+    ] {
+        let errs = vhdl::check_design(&[("work", "t08.vhd", src.as_bytes())]);
+        assert!(!errs.is_empty(), "{src}");
+    }
+}

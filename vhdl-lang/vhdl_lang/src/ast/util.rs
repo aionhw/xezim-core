@@ -549,6 +549,8 @@ impl SequentialStatement {
             Exit(_) => None,
             Return(_) => None,
             Null => None,
+            // xezim
+            Block(_) => None,
         }
     }
 
@@ -570,6 +572,8 @@ impl SequentialStatement {
             Exit(_) => None,
             Return(_) => None,
             Null => None,
+            // xezim
+            Block(value) => value.end_label_pos.as_ref(),
         }
     }
 
