@@ -55,9 +55,11 @@ src/packed_value.rs       Separate packed-bit representation; current Value alre
 src/bits2.rs              2-state arbitrary-width value (Verilator-style, no X/Z mask);
                           the compute-core type for the cycle-based path
 src/sdf/                  SDF parser + annotator (IEEE 1497-2001): IOPATH/INTERCONNECT delays
-src/vhdl/                 VHDL (IEEE 1076-2008), in development (foreign.rs: SV instances of
-                          VHDL entities, found and rewritten): cst/ parses through the
-                          `vhdl_syntax` crate (the only user of it); sema/ analyses to a typed
+src/vhdl/                 VHDL (IEEE 1076-2008; 1076-2019 with --std=19, in development)
+                          (foreign.rs: SV instances of VHDL entities, found and rewritten):
+                          cst/ parses through rust_hdl's vhdl_lang parser, vendored and
+                          patched in vhdl-lang/ (README.md lists the patches; cst/ is its
+                          only user) and converts to the own AST; sema/ analyses to a typed
                           HIR (config.rs: component binding and configurations; ceval.rs:
                           static evaluation, function bodies interpreted; mixed.rs: SV
                           parameters and modules for mixed designs; generics.rs:
@@ -84,6 +86,9 @@ xezim-parser/src/parse/   Recursive-descent parser → AST (declarations, expres
 xezim-parser/src/ast/     Typed AST (decl, expr, module, stmt, types)
 xezim-parser/src/diagnostics/  Diagnostic type + rendering
 xezim-parser/src/strict_check.rs  Additive negative-case lint (gated by --strict)
+vhdl-lang/                rust_hdl's vhdl_lang + vhdl_lang_macros 0.88 (MPL-2.0), vendored as
+                          path crates: the VHDL parser. xezim's changes are marked `xezim:`
+                          and listed in vhdl-lang/README.md; keep that list current
 ```
 
 ## Build & test
@@ -97,6 +102,7 @@ cargo build                          # debug
 cargo build --release                # optimized (lto=true, codegen-units=1)
 cargo test                           # core unit and integration tests
 cargo test --manifest-path xezim-parser/Cargo.toml # parser unit/integration/doc tests
+cargo test --manifest-path vhdl-lang/vhdl_lang/Cargo.toml --lib # vendored VHDL parser
 cargo run --manifest-path xezim-parser/Cargo.toml -- --check design.sv # parse-only
 cargo run --manifest-path xezim-parser/Cargo.toml -- --dump-ast design.sv # AST
 cargo run --manifest-path xezim-parser/Cargo.toml -- --dump-json design.sv # JSON

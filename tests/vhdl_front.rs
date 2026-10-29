@@ -28,7 +28,7 @@ fn syntax_error_located_once_per_unit() {
     let errs = vhdl::check_syntax("bad.vhd", src);
     assert_eq!(errs.len(), 2, "{}", errs.join("\n"));
     assert!(
-        errs[0].starts_with("bad.vhd:2:19: error: VHDL: syntax error: expected ')'"),
+        errs[0].starts_with("bad.vhd:2:19: error: VHDL: syntax error: Expected ';' or ')'"),
         "{}",
         errs[0]
     );

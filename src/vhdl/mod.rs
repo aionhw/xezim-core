@@ -1,7 +1,8 @@
-//! VHDL (IEEE Std 1076-2008) simulation.
+//! VHDL (IEEE Std 1076-2008, and 1076-2019 with `--std=19`) simulation.
 //!
-//! VHDL sources are parsed with the `vhdl_syntax` crate (`cst`, the only
-//! module that uses it). What the parser leaves to the tool — design
+//! VHDL sources are parsed with rust_hdl's `vhdl_lang` parser, vendored with
+//! xezim's patches in `vhdl-lang/` (`cst`, the only module that uses it).
+//! What the parser leaves to the tool — design
 //! libraries, name resolution, types, overload resolution, static
 //! evaluation and elaboration — is done here, and the elaborated design is
 //! lowered to SystemVerilog AST descriptions that join the design before

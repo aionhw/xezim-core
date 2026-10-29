@@ -1,80 +1,53 @@
-//! Concrete syntax tree (vhdl_syntax) → xezim's VHDL AST (`ast`).
+//! vhdl_lang's syntax tree → xezim's VHDL AST (`ast`).
 //!
-//! The conversion walks the untyped tree by node and token kind. A node it
-//! does not know becomes an error at its location ("not supported yet"),
-//! never a silently dropped construct.
+//! The conversion keeps the shapes the analysis expects from the earlier
+//! parser: names stay unclassified (`f(x)`, `a(i)`, `a(3 downto 0)` are all
+//! calls; sema decides), index, element and record constraints are lists of
+//! associations, and a single parenthesized value is `Paren`. A construct
+//! the conversion does not know becomes an error at its location ("not
+//! supported yet"), never a silently dropped one.
+//!
+//! Positions: vhdl_lang gives each token a line and a UTF-16 column. The
+//! source is handed to it as Latin-1 (one byte, one character), so a column
+//! is a byte offset in its line; `Lines` turns positions into byte offsets.
 
-use vhdl_syntax::syntax::node::{SyntaxNode, SyntaxToken};
-use vhdl_syntax::syntax::{NodeKind as K, SyntaxElement};
-use vhdl_syntax::tokens::TokenKind as T;
+use vhdl_lang::ast as v;
+use vhdl_lang::ast::token_range::WithTokenSpan;
+use vhdl_lang::{HasTokenSpan, Position, Token, TokenAccess, TokenId, TokenSpan};
 
 use super::Diagnostic;
 use crate::vhdl::ast::*;
 
-type N = SyntaxNode;
-type Tk = SyntaxToken;
-
-pub struct Converter {
-    pub errors: Vec<Diagnostic>,
+/// Line start offsets with vhdl_lang's line breaks (`\r\n`, `\r`, `\n`).
+pub struct Lines {
+    starts: Vec<usize>,
 }
 
-// ---- tree helpers -------------------------------------------------------------
-
-fn nodes(n: &N) -> Vec<N> {
-    n.children().collect()
-}
-
-fn elems(n: &N) -> Vec<SyntaxElement> {
-    n.children_with_tokens().collect()
-}
-
-fn toks(n: &N) -> Vec<Tk> {
-    n.children_with_tokens()
-        .filter_map(|c| match c {
-            SyntaxElement::Token(t) => Some(t),
-            SyntaxElement::Node(_) => None,
-        })
-        .collect()
-}
-
-/// The first child node that is not a statement label.
-fn first_node(n: &N) -> Option<N> {
-    n.children().find(|c| c.kind() != K::StmtLabel)
-}
-
-fn child(n: &N, k: K) -> Option<N> {
-    n.children().find(|c| c.kind() == k)
-}
-
-fn childs(n: &N, k: K) -> Vec<N> {
-    n.children().filter(|c| c.kind() == k).collect()
-}
-
-fn text(t: &Tk) -> String {
-    t.text().to_string()
-}
-
-/// The keyword a token is, lower case.
-fn kw(t: &Tk) -> Option<String> {
-    match t.kind() {
-        T::Keyword(_) => Some(text(t).to_ascii_lowercase()),
-        _ => None,
+impl Lines {
+    pub fn new(text: &[u8]) -> Lines {
+        let mut starts = vec![0];
+        let mut i = 0;
+        while i < text.len() {
+            match text[i] {
+                b'\r' if text.get(i + 1) == Some(&b'\n') => {
+                    i += 2;
+                    starts.push(i);
+                }
+                b'\r' | b'\n' => {
+                    i += 1;
+                    starts.push(i);
+                }
+                _ => i += 1,
+            }
+        }
+        Lines { starts }
     }
-}
 
-fn has_kw(n: &N, k: &str) -> bool {
-    toks(n).iter().any(|t| kw(t).as_deref() == Some(k))
-}
-
-fn tok(n: &N, k: T) -> Option<Tk> {
-    toks(n).into_iter().find(|t| t.kind() == k)
-}
-
-/// The source span without leading/trailing trivia.
-pub fn span(n: &N) -> Span {
-    match (n.first_token(), n.last_token()) {
-        (Some(f), Some(l)) => f.text_range().start..l.text_range().end,
-        _ => n.range(),
+    /// The byte offset of a position.
+    pub fn offset(&self, p: Position) -> usize {
+        self.starts
+            .get(p.line as usize)
+            .map_or(usize::MAX, |s| s + p.character as usize)
     }
 }
 
@@ -87,2156 +60,99 @@ pub fn fold(s: &str) -> String {
     }
 }
 
-fn ident(t: &Tk) -> Ident {
-    Ident {
-        name: fold(&text(t)),
-        span: t.text_range(),
+/// Latin-1 bytes as a string, one character per byte.
+fn latin1(b: &[u8]) -> String {
+    b.iter().map(|&c| c as char).collect()
+}
+
+/// The text of an operator symbol (`"+"`, `"and"`).
+fn op_text(op: v::Operator) -> &'static str {
+    use v::Operator::*;
+    match op {
+        And => "and",
+        Or => "or",
+        Nand => "nand",
+        Nor => "nor",
+        Xor => "xor",
+        Xnor => "xnor",
+        Abs => "abs",
+        Not => "not",
+        Minus => "-",
+        Plus => "+",
+        QueQue => "??",
+        EQ => "=",
+        NE => "/=",
+        LT => "<",
+        LTE => "<=",
+        GT => ">",
+        GTE => ">=",
+        QueEQ => "?=",
+        QueNE => "?/=",
+        QueLT => "?<",
+        QueLTE => "?<=",
+        QueGT => "?>",
+        QueGTE => "?>=",
+        SLL => "sll",
+        SRL => "srl",
+        SLA => "sla",
+        SRA => "sra",
+        ROL => "rol",
+        ROR => "ror",
+        Concat => "&",
+        Times => "*",
+        Div => "/",
+        Mod => "mod",
+        Rem => "rem",
+        Pow => "**",
     }
 }
 
-fn first_ident(n: &N) -> Option<Ident> {
-    tok(n, T::Identifier).map(|t| ident(&t))
-}
-
-fn idents(n: &N) -> Vec<Ident> {
-    toks(n)
-        .iter()
-        .filter(|t| t.kind() == T::Identifier)
-        .map(ident)
-        .collect()
-}
-
-/// Latin-1 bytes of a token's text.
-fn bytes(t: &Tk) -> Vec<u8> {
-    // Raw bytes: the parser's text display maps some Latin-1 characters
-    // (e.g. the soft hyphen) to others.
-    t.text().as_bytes().to_vec()
-}
-
-/// `"ab""c"` → `ab"c`.
-fn string_value(raw: &[u8]) -> Vec<u8> {
-    let q = raw[0];
-    let inner = &raw[1..raw.len().saturating_sub(1)];
-    let mut out = Vec::with_capacity(inner.len());
-    let mut i = 0;
-    while i < inner.len() {
-        out.push(inner[i]);
-        if inner[i] == q && inner.get(i + 1) == Some(&q) {
-            i += 1;
+/// The name of an attribute designator, lower case.
+fn attr_text(a: &v::AttributeDesignator) -> String {
+    use v::AttributeDesignator::*;
+    match a {
+        Type(v::TypeAttribute::Subtype) => "subtype".into(),
+        Type(v::TypeAttribute::Element) => "element".into(),
+        Range(v::RangeAttribute::Range) => "range".into(),
+        Range(v::RangeAttribute::ReverseRange) => "reverse_range".into(),
+        Ident(s) => fold(&latin1(&s.item.name().bytes)),
+        Ascending => "ascending".into(),
+        Left => "left".into(),
+        Right => "right".into(),
+        High => "high".into(),
+        Low => "low".into(),
+        Length => "length".into(),
+        Image => "image".into(),
+        Value => "value".into(),
+        Pos => "pos".into(),
+        Val => "val".into(),
+        Succ => "succ".into(),
+        Pred => "pred".into(),
+        LeftOf => "leftof".into(),
+        RightOf => "rightof".into(),
+        Signal(s) => match s {
+            v::SignalAttribute::Delayed => "delayed",
+            v::SignalAttribute::Stable => "stable",
+            v::SignalAttribute::Quiet => "quiet",
+            v::SignalAttribute::Transaction => "transaction",
+            v::SignalAttribute::Event => "event",
+            v::SignalAttribute::Active => "active",
+            v::SignalAttribute::LastEvent => "last_event",
+            v::SignalAttribute::LastActive => "last_active",
+            v::SignalAttribute::LastValue => "last_value",
+            v::SignalAttribute::Driving => "driving",
+            v::SignalAttribute::DrivingValue => "driving_value",
         }
-        i += 1;
-    }
-    out
-}
-
-impl Converter {
-    pub fn new() -> Self {
-        Converter { errors: Vec::new() }
-    }
-
-    fn err(&mut self, s: Span, msg: impl Into<String>) {
-        self.errors.push(Diagnostic {
-            span: s,
-            message: msg.into(),
-        });
-    }
-
-    fn unsupported(&mut self, n: &N, what: &str) {
-        self.err(span(n), format!("VHDL: {} is not supported yet", what));
-    }
-
-    fn unexpected(&mut self, n: &N) {
-        self.err(
-            span(n),
-            format!("VHDL: internal: unexpected syntax ({:?})", n.kind()),
-        );
-    }
-
-    // ---- design units -------------------------------------------------------
-
-    pub fn design_file(&mut self, root: &N) -> DesignFile {
-        let mut units = Vec::new();
-        for du in childs(root, K::DesignUnit) {
-            if let Some(u) = self.design_unit(&du) {
-                units.push(u);
-            }
-        }
-        DesignFile { units }
-    }
-
-    fn design_unit(&mut self, du: &N) -> Option<DesignUnit> {
-        let context = child(du, K::ContextClause)
-            .map(|c| self.context_items(&c))
-            .unwrap_or_default();
-        let lu = nodes(du)
-            .into_iter()
-            .find(|c| c.kind() != K::ContextClause)?;
-        let unit = self.library_unit(&lu)?;
-        Some(DesignUnit {
-            context,
-            unit,
-            span: span(du),
-        })
-    }
-
-    fn context_items(&mut self, n: &N) -> Vec<ContextItem> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            match c.kind() {
-                K::LibraryClause => {
-                    let names = child(&c, K::LogicalNameList)
-                        .map(|l| idents(&l))
-                        .unwrap_or_default();
-                    out.push(ContextItem::Library(names));
-                }
-                K::UseClauseContextItem | K::UseClauseDeclaration => {
-                    if let Some(u) = child(&c, K::UseClause) {
-                        out.push(ContextItem::Use(self.name_list(&u)));
-                    }
-                }
-                K::UseClause => out.push(ContextItem::Use(self.name_list(&c))),
-                K::ContextReference => out.push(ContextItem::Context(self.name_list(&c))),
-                _ => self.unexpected(&c),
-            }
-        }
-        out
-    }
-
-    fn name_list(&mut self, n: &N) -> Vec<Name> {
-        let list = child(n, K::NameList).unwrap_or_else(|| n.clone());
-        childs(&list, K::Name)
-            .iter()
-            .filter_map(|x| self.name(x))
-            .collect()
-    }
-
-    fn library_unit(&mut self, n: &N) -> Option<LibraryUnit> {
-        Some(match n.kind() {
-            K::EntityDeclaration => LibraryUnit::Entity(self.entity(n)?),
-            K::ArchitectureBody => LibraryUnit::Architecture(self.architecture(n)?),
-            K::PrimaryUnitPackageDeclaration => {
-                let p = child(n, K::PackageDeclaration)?;
-                LibraryUnit::Package(self.package(&p)?)
-            }
-            K::PackageDeclaration => LibraryUnit::Package(self.package(n)?),
-            K::SecondaryUnitPackageBody => {
-                let p = child(n, K::PackageBody)?;
-                LibraryUnit::PackageBody(self.package_body(&p)?)
-            }
-            K::PackageBody => LibraryUnit::PackageBody(self.package_body(n)?),
-            K::PackageInstantiationDeclarationPrimaryUnit => {
-                let p = child(n, K::PackageInstantiationDeclaration)?;
-                LibraryUnit::PackageInst(self.package_inst(&p)?)
-            }
-            K::ConfigurationDeclaration => {
-                let pre = child(n, K::ConfigurationDeclarationPreamble)?;
-                if let Some(d) = child(n, K::ConfigurationDeclarativePart)
-                    && d.children().next().is_some()
-                {
-                    self.unsupported(&d, "a configuration declarative part");
-                }
-                LibraryUnit::Configuration(ConfigDecl {
-                    name: first_ident(&pre)?,
-                    entity: self.name(&child(&pre, K::Name)?)?,
-                    block: child(n, K::BlockConfiguration).and_then(|b| self.block_config(&b)),
-                    span: span(n),
-                })
-            }
-            K::ContextDeclaration => {
-                let pre = child(n, K::ContextDeclarationPreamble)?;
-                let items = child(n, K::ContextClause)
-                    .map(|c| self.context_items(&c))
-                    .unwrap_or_default();
-                LibraryUnit::Context(ContextDecl {
-                    name: first_ident(&pre)?,
-                    items,
-                })
-            }
-            _ => {
-                self.unsupported(n, "this design unit");
-                return None;
-            }
-        })
-    }
-
-    fn entity(&mut self, n: &N) -> Option<EntityDecl> {
-        let pre = child(n, K::EntityDeclarationPreamble)?;
-        let header = child(n, K::EntityHeader);
-        let generics = header
-            .as_ref()
-            .and_then(|h| child(h, K::GenericClause))
-            .map(|g| self.interface_clause(&g))
-            .unwrap_or_default();
-        let ports = header
-            .as_ref()
-            .and_then(|h| child(h, K::PortClause))
-            .map(|g| self.interface_clause(&g))
-            .unwrap_or_default();
-        let decls = child(n, K::EntityDeclarativePart)
-            .map(|d| self.decls(&d))
-            .unwrap_or_default();
-        let stmts = child(n, K::EntityStatements)
-            .or_else(|| child(n, K::EntityStatementPart))
-            .map(|s| self.conc_stmts(&s))
-            .unwrap_or_default();
-        Some(EntityDecl {
-            name: first_ident(&pre)?,
-            generics,
-            ports,
-            decls,
-            stmts,
-        })
-    }
-
-    fn architecture(&mut self, n: &N) -> Option<ArchBody> {
-        let pre = child(n, K::ArchitecturePreamble)?;
-        let entity = child(&pre, K::Name)
-            .and_then(|x| self.name(&x))
-            .and_then(|x| match x.kind {
-                NameKind::Simple(i) => Some(i),
-                _ => None,
-            })?;
-        Some(ArchBody {
-            name: first_ident(&pre)?,
-            entity,
-            decls: child(n, K::ArchitectureDeclarativePart)
-                .map(|d| self.decls(&d))
-                .unwrap_or_default(),
-            stmts: child(n, K::ArchitectureStatementPart)
-                .map(|s| self.conc_stmts(&s))
-                .unwrap_or_default(),
-        })
-    }
-
-    fn package(&mut self, n: &N) -> Option<PackageDecl> {
-        let pre = child(n, K::PackagePreamble)?;
-        let header = child(n, K::PackageHeader);
-        let generics = header
-            .as_ref()
-            .and_then(|h| child(h, K::GenericClause))
-            .map(|g| self.interface_clause(&g))
-            .unwrap_or_default();
-        let generic_map = header
-            .as_ref()
-            .and_then(|h| child(h, K::GenericMapAspect))
-            .map(|g| self.map_aspect(&g));
-        Some(PackageDecl {
-            name: first_ident(&pre)?,
-            generics,
-            generic_map,
-            decls: child(n, K::PackageDeclarativePart)
-                .map(|d| self.decls(&d))
-                .unwrap_or_default(),
-            span: span(n),
-        })
-    }
-
-    fn package_body(&mut self, n: &N) -> Option<PackageBody> {
-        let pre = child(n, K::PackageBodyPreamble)?;
-        Some(PackageBody {
-            name: first_ident(&pre)?,
-            decls: child(n, K::PackageBodyDeclarativePart)
-                .map(|d| self.decls(&d))
-                .unwrap_or_default(),
-            span: span(n),
-        })
-    }
-
-    fn package_inst(&mut self, n: &N) -> Option<PackageInst> {
-        let pre = child(n, K::PackageInstantiationPreamble)?;
-        Some(PackageInst {
-            name: first_ident(&pre)?,
-            package: self.name(&child(&pre, K::Name)?)?,
-            generic_map: child(n, K::GenericMapAspect)
-                .map(|g| self.map_aspect(&g))
-                .unwrap_or_default(),
-            span: span(n),
-        })
-    }
-
-    // ---- interfaces ---------------------------------------------------------
-
-    fn interface_clause(&mut self, n: &N) -> Vec<InterfaceDecl> {
-        child(n, K::InterfaceList)
-            .or_else(|| {
-                child(n, K::ParenthesizedInterfaceList).and_then(|p| child(&p, K::InterfaceList))
-            })
-            .map(|l| self.interface_list(&l))
-            .unwrap_or_default()
-    }
-
-    fn interface_list(&mut self, n: &N) -> Vec<InterfaceDecl> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            match c.kind() {
-                K::InterfaceObjectDeclaration | K::InterfaceFileDeclaration => {
-                    if let Some(o) = self.interface_object(&c) {
-                        out.push(InterfaceDecl::Object(o));
-                    }
-                }
-                K::InterfaceIncompleteTypeDeclaration => {
-                    if let Some(i) = first_ident(&c) {
-                        out.push(InterfaceDecl::Type(i));
-                    }
-                }
-                K::InterfaceSubprogramDeclaration => {
-                    let spec = nodes(&c).into_iter().find(|x| {
-                        matches!(
-                            x.kind(),
-                            K::InterfaceFunctionSpecification | K::InterfaceProcedureSpecification
-                        )
-                    });
-                    if let Some(spec) = spec.and_then(|s| self.subprogram_spec(&s)) {
-                        let default = child(&c, K::InterfaceSubprogramDefaultBox)
-                            .map(|_| SubprogramDefault::Box)
-                            .or_else(|| {
-                                child(&c, K::InterfaceSubprogramDefaultName)
-                                    .and_then(|d| child(&d, K::Name))
-                                    .and_then(|d| self.name(&d))
-                                    .map(SubprogramDefault::Name)
-                            });
-                        out.push(InterfaceDecl::Subprogram { spec, default });
-                    }
-                }
-                K::InterfacePackageDeclaration => {
-                    let pre = child(&c, K::InterfacePackageDeclarationPreamble);
-                    let name = pre.as_ref().and_then(first_ident);
-                    let package = child(&c, K::Name).and_then(|p| self.name(&p));
-                    if let (Some(name), Some(package)) = (name, package) {
-                        out.push(InterfaceDecl::Package {
-                            name,
-                            package,
-                            generic_map: None,
-                            span: span(&c),
-                        });
-                    }
-                }
-                _ => self.unexpected(&c),
-            }
-        }
-        out
-    }
-
-    fn interface_object(&mut self, n: &N) -> Option<InterfaceObject> {
-        let mut class = None;
-        let mut mode = None;
-        let mut bus = false;
-        for t in toks(n) {
-            match kw(&t).as_deref() {
-                Some("constant") => class = Some(ObjClass::Constant),
-                Some("signal") => class = Some(ObjClass::Signal),
-                Some("variable") => class = Some(ObjClass::Variable),
-                Some("file") => class = Some(ObjClass::File),
-                Some("in") => mode = Some(Mode::In),
-                Some("out") => mode = Some(Mode::Out),
-                Some("inout") => mode = Some(Mode::InOut),
-                Some("buffer") => mode = Some(Mode::Buffer),
-                Some("linkage") => mode = Some(Mode::Linkage),
-                Some("bus") => bus = true,
-                _ => {}
-            }
-        }
-        Some(InterfaceObject {
-            class,
-            names: child(n, K::IdentifierList).map(|l| idents(&l))?,
-            mode,
-            ty: self.subtype_ind(&child(n, K::SubtypeIndication)?)?,
-            bus,
-            default: self.initial_value(n),
-            span: span(n),
-        })
-    }
-
-    fn initial_value(&mut self, n: &N) -> Option<Expr> {
-        let iv = child(n, K::InitialValue)?;
-        let e = nodes(&iv).into_iter().next()?;
-        self.expr(&e)
-    }
-
-    // ---- subtype indications and types ----------------------------------------
-
-    pub fn subtype_ind(&mut self, n: &N) -> Option<SubtypeInd> {
-        let mut resolution = None;
-        let mut mark = None;
-        let mut constraint = None;
-        for c in nodes(n) {
-            match c.kind() {
-                K::NameResolutionIndication => {
-                    resolution = child(&c, K::Name)
-                        .and_then(|x| self.name(&x))
-                        .map(Resolution::Function);
-                }
-                K::ParenthesizedElementResolution => {
-                    resolution = self.element_resolution(&c);
-                }
-                K::Name => {
-                    let full = self.name(&c)?;
-                    // Index/record constraints are parsed as call suffixes of
-                    // the type mark.
-                    let (m, groups) = split_paren_constraints(full);
-                    if !groups.is_empty() {
-                        constraint = Some(Constraint::Paren(groups));
-                    }
-                    if let Some(rc) = child(&c, K::RangeConstraint) {
-                        constraint = self.range_constraint(&rc).map(Constraint::Range);
-                    }
-                    mark = Some(m);
-                }
-                K::RangeConstraint => {
-                    constraint = self.range_constraint(&c).map(Constraint::Range);
-                }
-                _ => self.unexpected(&c),
-            }
-        }
-        Some(SubtypeInd {
-            resolution,
-            mark: mark?,
-            constraint,
-            span: span(n),
-        })
-    }
-
-    fn element_resolution(&mut self, n: &N) -> Option<Resolution> {
-        let inner = nodes(n).into_iter().next()?;
-        let r = match inner.kind() {
-            K::ElementResolutionResolutionIndication => {
-                let nr = child(&inner, K::NameResolutionIndication)?;
-                Resolution::Function(self.name(&child(&nr, K::Name)?)?)
-            }
-            _ => {
-                self.unsupported(&inner, "record element resolution");
-                return None;
-            }
-        };
-        Some(Resolution::Element(Box::new(r)))
-    }
-
-    fn range_constraint(&mut self, n: &N) -> Option<RangeExpr> {
-        let e = nodes(n).into_iter().next()?;
-        self.range_of(&e)
-    }
-
-    /// A range written as an expression: `a to b`, `a downto b`, or a
-    /// range attribute name.
-    fn range_of(&mut self, n: &N) -> Option<RangeExpr> {
-        let e = self.expr(n)?;
-        match e.kind {
-            ExprKind::Range(r) => Some(*r),
-            ExprKind::Name(nm) => Some(RangeExpr::Attr(nm)),
-            _ => {
-                self.err(e.span, "VHDL: a range was expected");
-                None
-            }
-        }
-    }
-
-    fn type_def(&mut self, n: &N) -> Option<TypeDef> {
-        Some(match n.kind() {
-            K::EnumerationTypeDefinition => {
-                let list = child(n, K::EnumerationList)?;
-                let lits = toks(&list)
-                    .iter()
-                    .filter_map(|t| match t.kind() {
-                        T::Identifier => Some(EnumLit::Ident(ident(t))),
-                        T::CharacterLiteral => Some(EnumLit::Char(bytes(t)[1], t.text_range())),
-                        _ => None,
-                    })
-                    .collect();
-                TypeDef::Enum(lits)
-            }
-            K::NumericTypeDefinition => {
-                let rc = child(n, K::RangeConstraint)?;
-                if let Some(e) = nodes(&rc).into_iter().next()
-                    && e.kind() == K::NameExpression
-                    && self
-                        .expr(&e)
-                        .is_some_and(|x| matches!(&x.kind, ExprKind::Name(Name { kind: NameKind::Simple(i), .. }) if i.name == "implementation_defined"))
-                {
-                    return Some(TypeDef::ImplementationDefined);
-                }
-                TypeDef::Range(self.range_constraint(&rc)?)
-            }
-            K::PhysicalTypeDefinition => {
-                let rc = child(n, K::RangeConstraint)?;
-                let range = if nodes(&rc)
-                    .first()
-                    .and_then(|e| self.expr(e))
-                    .is_some_and(|x| matches!(&x.kind, ExprKind::Name(Name { kind: NameKind::Simple(i), .. }) if i.name == "implementation_defined"))
-                {
-                    RangeExpr::Attr(Name {
-                        kind: NameKind::Simple(Ident {
-                            name: "implementation_defined".into(),
-                            span: span(&rc),
-                        }),
-                        span: span(&rc),
-                    })
-                } else {
-                    self.range_constraint(&rc)?
-                };
-                let units = child(n, K::UnitDeclarations)?;
-                let primary =
-                    child(&units, K::PrimaryUnitDeclaration).and_then(|p| first_ident(&p))?;
-                let mut secondary = Vec::new();
-                for s in childs(&units, K::SecondaryUnitDeclaration) {
-                    let name = first_ident(&s)?;
-                    let lit = child(&s, K::PhysicalLiteral)?;
-                    let value = self.physical_literal(&lit)?;
-                    secondary.push((name, value));
-                }
-                TypeDef::Physical {
-                    range,
-                    primary,
-                    secondary,
-                }
-            }
-            K::ConstrainedArrayDefinition => {
-                let ic = child(n, K::IndexConstraint)?;
-                let list = child(&ic, K::ExpressionList)?;
-                let mut ranges = Vec::new();
-                for e in nodes(&list) {
-                    ranges.push(self.discrete_range(&e)?);
-                }
-                TypeDef::Array {
-                    index: ArrayIndex::Constrained(ranges),
-                    elem: self.subtype_ind(&child(n, K::SubtypeIndication)?)?,
-                }
-            }
-            K::UnboundedArrayDefinition => {
-                let list = child(n, K::IndexSubtypeDefinitionList)?;
-                let mut marks = Vec::new();
-                for d in childs(&list, K::IndexSubtypeDefinition) {
-                    marks.push(self.name(&child(&d, K::Name)?)?);
-                }
-                TypeDef::Array {
-                    index: ArrayIndex::Unbounded(marks),
-                    elem: self.subtype_ind(&child(n, K::SubtypeIndication)?)?,
-                }
-            }
-            K::RecordTypeDefinition => {
-                let els = child(n, K::RecordElementDeclarations)?;
-                let mut fields = Vec::new();
-                for e in childs(&els, K::ElementDeclaration) {
-                    let names = child(&e, K::IdentifierList).map(|l| idents(&l))?;
-                    let ty = self.subtype_ind(&child(&e, K::SubtypeIndication)?)?;
-                    fields.push((names, ty));
-                }
-                TypeDef::Record(fields)
-            }
-            K::AccessTypeDefinition => {
-                TypeDef::Access(self.subtype_ind(&child(n, K::SubtypeIndication)?)?)
-            }
-            K::FileTypeDefinition => TypeDef::File(self.name(&child(n, K::Name)?)?),
-            K::ProtectedTypeDeclaration => TypeDef::Protected(
-                child(n, K::ProtectedTypeDeclarativePart)
-                    .map(|d| self.decls(&d))
-                    .unwrap_or_default(),
-            ),
-            K::ProtectedTypeBody => TypeDef::ProtectedBody(
-                child(n, K::ProtectedTypeBodyDeclarativePart)
-                    .map(|d| self.decls(&d))
-                    .unwrap_or_default(),
-            ),
-            _ => {
-                self.unsupported(n, "this type definition");
-                return None;
-            }
-        })
-    }
-
-    fn discrete_range(&mut self, n: &N) -> Option<DiscreteRange> {
-        // `integer range 0 to n - 1`: a subtype indication with its
-        // constraint.
-        let constrained = n.kind() == K::SubtypeIndication
-            || (n.kind() == K::NameExpression
-                && child(n, K::Name).is_some_and(|x| child(&x, K::RangeConstraint).is_some()));
-        if constrained
-            && let Some(ind) = self.subtype_ind(n)
-            && ind.constraint.is_some()
-        {
-            return Some(DiscreteRange::Subtype(ind));
-        }
-        let e = self.expr(n)?;
-        Some(match e.kind {
-            ExprKind::Range(r) => DiscreteRange::Range(*r),
-            // A name: a subtype mark or a range attribute; sema decides.
-            ExprKind::Name(nm) => match &nm.kind {
-                NameKind::Attribute(..) => DiscreteRange::Range(RangeExpr::Attr(nm)),
-                _ => DiscreteRange::Subtype(SubtypeInd {
-                    resolution: None,
-                    span: nm.span.clone(),
-                    mark: nm,
-                    constraint: None,
-                }),
-            },
-            _ => {
-                self.err(e.span, "VHDL: a discrete range was expected");
-                return None;
-            }
-        })
-    }
-
-    // ---- declarations -------------------------------------------------------
-
-    pub fn decls(&mut self, n: &N) -> Vec<Decl> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            if let Some(d) = self.decl(&c) {
-                out.push(d);
-            }
-        }
-        out
-    }
-
-    fn object_decl(&mut self, n: &N) -> Option<ObjectDecl> {
-        Some(ObjectDecl {
-            names: child(n, K::IdentifierList).map(|l| idents(&l))?,
-            ty: self.subtype_ind(&child(n, K::SubtypeIndication)?)?,
-            value: self.initial_value(n),
-            span: span(n),
-        })
-    }
-
-    fn decl(&mut self, n: &N) -> Option<Decl> {
-        Some(match n.kind() {
-            K::FullTypeDeclaration => {
-                let name = first_ident(n)?;
-                let defn = nodes(n).into_iter().next()?;
-                Decl::Type(TypeDecl {
-                    name,
-                    def: Some(self.type_def(&defn)?),
-                    span: span(n),
-                })
-            }
-            K::IncompleteTypeDeclaration => Decl::Type(TypeDecl {
-                name: first_ident(n)?,
-                def: None,
-                span: span(n),
-            }),
-            K::SubtypeDeclaration => Decl::Subtype {
-                name: first_ident(n)?,
-                ind: self.subtype_ind(&child(n, K::SubtypeIndication)?)?,
-                span: span(n),
-            },
-            K::ConstantDeclaration => Decl::Constant(self.object_decl(n)?),
-            K::SignalDeclaration => {
-                let kind = if has_kw(n, "register") {
-                    Some(SignalKind::Register)
-                } else if has_kw(n, "bus") {
-                    Some(SignalKind::Bus)
-                } else {
-                    None
-                };
-                Decl::Signal {
-                    obj: self.object_decl(n)?,
-                    kind,
-                }
-            }
-            K::VariableDeclaration => Decl::Variable {
-                shared: has_kw(n, "shared"),
-                obj: self.object_decl(n)?,
-            },
-            K::FileDeclaration => {
-                let open = match child(n, K::FileOpenInformation) {
-                    Some(fo) => {
-                        let kind = child(&fo, K::FileOpenKind)
-                            .and_then(|k| nodes(&k).into_iter().last())
-                            .and_then(|e| self.expr(&e));
-                        let name_e = nodes(&fo)
-                            .into_iter()
-                            .filter(|x| x.kind() != K::FileOpenKind)
-                            .last()?;
-                        Some(FileOpen {
-                            kind,
-                            name: self.expr(&name_e)?,
-                        })
-                    }
-                    None => None,
-                };
-                Decl::File {
-                    names: child(n, K::IdentifierList).map(|l| idents(&l))?,
-                    ty: self.subtype_ind(&child(n, K::SubtypeIndication)?)?,
-                    open,
-                    span: span(n),
-                }
-            }
-            K::AliasDeclaration => {
-                let name = match toks(n).into_iter().find(|t| {
-                    matches!(
-                        t.kind(),
-                        T::Identifier | T::CharacterLiteral | T::StringLiteral
-                    )
-                })? {
-                    t if t.kind() == T::Identifier => Designator::Ident(ident(&t)),
-                    t => Designator::Op(
-                        String::from_utf8_lossy(&string_value(&bytes(&t))).to_ascii_lowercase(),
-                        t.text_range(),
-                    ),
-                };
-                let ty = match child(n, K::AliasSubtype) {
-                    Some(a) => Some(self.subtype_ind(&child(&a, K::SubtypeIndication)?)?),
-                    None => None,
-                };
-                let signature = match child(n, K::Signature) {
-                    Some(sg) => {
-                        let params = child(&sg, K::TypeMarkList)
-                            .map(|l| {
-                                childs(&l, K::Name)
-                                    .iter()
-                                    .filter_map(|x| self.name(x))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let ret = child(&sg, K::ReturnType)
-                            .and_then(|r| child(&r, K::Name))
-                            .and_then(|x| self.name(&x));
-                        Some(Signature { params, ret })
-                    }
-                    None => None,
-                };
-                Decl::Alias {
-                    name,
-                    ty,
-                    target: self.name(&child(n, K::Name)?)?,
-                    signature,
-                    span: span(n),
-                }
-            }
-            K::ComponentDeclaration => {
-                let pre = child(n, K::ComponentDeclarationPreamble)?;
-                Decl::Component(ComponentDecl {
-                    name: first_ident(&pre)?,
-                    generics: child(n, K::GenericClause)
-                        .map(|g| self.interface_clause(&g))
-                        .unwrap_or_default(),
-                    ports: child(n, K::PortClause)
-                        .map(|g| self.interface_clause(&g))
-                        .unwrap_or_default(),
-                    span: span(n),
-                })
-            }
-            K::AttributeDeclaration => Decl::Attribute {
-                name: first_ident(n)?,
-                mark: self.name(&child(n, K::Name)?)?,
-                span: span(n),
-            },
-            K::AttributeSpecification => {
-                let es = child(n, K::EntitySpecification)?;
-                let mut entities = Vec::new();
-                let mut all_or_others = false;
-                if let Some(l) = child(&es, K::EntityDesignatorList) {
-                    for d in childs(&l, K::EntityDesignator) {
-                        if let Some(i) = first_ident(&d) {
-                            entities.push(i);
-                        }
-                    }
-                } else {
-                    all_or_others = true;
-                }
-                let class = toks(&es)
-                    .iter()
-                    .filter_map(kw)
-                    .next_back()
-                    .unwrap_or_default();
-                let value_n = nodes(n)
-                    .into_iter()
-                    .filter(|x| x.kind() != K::EntitySpecification)
-                    .last()?;
-                Decl::AttributeSpec(AttributeSpec {
-                    attr: first_ident(n)?,
-                    entities,
-                    all_or_others,
-                    class,
-                    value: self.expr(&value_n)?,
-                    span: span(n),
-                })
-            }
-            K::SubprogramDeclaration => {
-                let spec = nodes(n).into_iter().next()?;
-                Decl::SubprogramDecl(self.subprogram_spec(&spec)?)
-            }
-            K::SubprogramBody => {
-                let pre = child(n, K::SubprogramBodyPreamble)?;
-                let spec_n = nodes(&pre).into_iter().find(|x| {
-                    matches!(
-                        x.kind(),
-                        K::FunctionSpecification | K::ProcedureSpecification
-                    )
-                })?;
-                Decl::SubprogramBody(SubprogramBody {
-                    spec: self.subprogram_spec(&spec_n)?,
-                    decls: child(n, K::SubprogramDeclarativePart)
-                        .map(|d| self.decls(&d))
-                        .unwrap_or_default(),
-                    stmts: child(n, K::SubprogramStatementPart)
-                        .map(|s| self.seq_stmts(&s))
-                        .unwrap_or_default(),
-                    span: span(n),
-                })
-            }
-            K::SubprogramInstantiationDeclaration => {
-                let pre = child(n, K::SubprogramInstantiationDeclarationPreamble)?;
-                let spec_kind = if has_kw(&pre, "function") {
-                    SubprogramKind::Function {
-                        pure: true,
-                        ret: Name {
-                            kind: NameKind::Simple(Ident {
-                                name: String::new(),
-                                span: span(&pre),
-                            }),
-                            span: span(&pre),
-                        },
-                    }
-                } else {
-                    SubprogramKind::Procedure
-                };
-                Decl::SubprogramInst {
-                    spec_kind,
-                    name: first_ident(&pre)?,
-                    uninst: self.name(&child(&pre, K::Name)?)?,
-                    generic_map: child(n, K::GenericMapAspect)
-                        .map(|g| self.map_aspect(&g))
-                        .unwrap_or_default(),
-                    span: span(n),
-                }
-            }
-            K::UseClauseDeclaration => {
-                let u = child(n, K::UseClause)?;
-                Decl::Use(self.name_list(&u))
-            }
-            K::UseClause => Decl::Use(self.name_list(n)),
-            K::PackageDeclarationItem => {
-                let p = child(n, K::PackageDeclaration)?;
-                Decl::Package(Box::new(self.package(&p)?))
-            }
-            K::PackageDeclaration => Decl::Package(Box::new(self.package(n)?)),
-            K::PackageBodyDeclaration => {
-                let p = child(n, K::PackageBody)?;
-                Decl::PackageBody(Box::new(self.package_body(&p)?))
-            }
-            K::PackageBody => Decl::PackageBody(Box::new(self.package_body(n)?)),
-            K::PackageInstantiationDeclarationItem => {
-                let p = child(n, K::PackageInstantiationDeclaration)?;
-                Decl::PackageInst(Box::new(self.package_inst(&p)?))
-            }
-            K::PackageInstantiationDeclaration => {
-                Decl::PackageInst(Box::new(self.package_inst(n)?))
-            }
-            K::DisconnectionSpecification => {
-                let g = child(n, K::GuardedSignalSpecification)?;
-                let signals = if child(&g, K::SignalListAll).is_some() {
-                    SignalList::All
-                } else if child(&g, K::SignalListOthers).is_some() {
-                    SignalList::Others
-                } else {
-                    let mut v = Vec::new();
-                    for nm in childs(&child(&g, K::SignalListList)?, K::Name) {
-                        match self.name(&nm)?.kind {
-                            NameKind::Simple(i) => v.push(i),
-                            _ => {
-                                self.unexpected(&nm);
-                                return None;
-                            }
-                        }
-                    }
-                    SignalList::Names(v)
-                };
-                Decl::Disconnect(DisconnectSpec {
-                    signals,
-                    mark: self.name(&child(&g, K::Name)?)?,
-                    after: self.expr(nodes(n).get(1)?)?,
-                    span: span(n),
-                })
-            }
-            K::GroupDeclaration | K::GroupTemplateDeclaration => {
-                Decl::Unsupported("groups".into(), span(n))
-            }
-            K::SimpleConfigurationSpecification => {
-                let pre = child(n, K::ComponentConfigurationPreamble)?;
-                Decl::ConfigSpec(ConfigSpec {
-                    spec: self.component_spec(&child(&pre, K::ComponentSpecification)?)?,
-                    binding: self.binding(&child(n, K::BindingIndication)?)?,
-                    span: span(n),
-                })
-            }
-            K::CompoundConfigurationSpecification => {
-                Decl::Unsupported("compound configuration specifications".into(), span(n))
-            }
-            _ => {
-                self.unsupported(n, "this declaration");
-                return None;
-            }
-        })
-    }
-
-    fn subprogram_spec(&mut self, n: &N) -> Option<SubprogramSpec> {
-        let designator = match toks(n)
-            .into_iter()
-            .find(|t| matches!(t.kind(), T::Identifier | T::StringLiteral))?
-        {
-            t if t.kind() == T::Identifier => Designator::Ident(ident(&t)),
-            t => Designator::Op(
-                String::from_utf8_lossy(&string_value(&bytes(&t))).to_ascii_lowercase(),
-                t.text_range(),
-            ),
-        };
-        let generics = child(n, K::SubprogramHeader)
-            .and_then(|h| child(&h, K::SubprogramHeaderGenericClause))
-            .map(|g| self.interface_clause(&g))
-            .unwrap_or_default();
-        let params = child(n, K::ParameterList)
-            .and_then(|p| child(&p, K::ParenthesizedInterfaceList))
-            .and_then(|p| child(&p, K::InterfaceList))
-            .map(|l| self.interface_list(&l))
-            .unwrap_or_default();
-        let kind = if matches!(
-            n.kind(),
-            K::FunctionSpecification | K::InterfaceFunctionSpecification
-        ) {
-            let ret_n = child(n, K::Name)
-                .or_else(|| child(n, K::ReturnType).and_then(|r| child(&r, K::Name)))?;
-            SubprogramKind::Function {
-                pure: !has_kw(n, "impure"),
-                ret: self.name(&ret_n)?,
-            }
-        } else {
-            SubprogramKind::Procedure
-        };
-        Some(SubprogramSpec {
-            kind,
-            designator,
-            generics,
-            params,
-            span: span(n),
-        })
-    }
-
-    // ---- associations -------------------------------------------------------
-
-    // ---- configurations ------------------------------------------------------------
-
-    fn block_config(&mut self, n: &N) -> Option<BlockConfig> {
-        let pre = child(n, K::BlockConfigurationPreamble)?;
-        let mut items = Vec::new();
-        for c in nodes(n) {
-            match c.kind() {
-                K::BlockConfigurationPreamble | K::BlockConfigurationEpilogue => {}
-                K::BlockConfigurationItem => {
-                    if let Some(b) = child(&c, K::BlockConfiguration) {
-                        items.extend(self.block_config(&b).map(ConfigItem::Block));
-                    } else if let Some(cc) = child(&c, K::ComponentConfiguration) {
-                        items.extend(
-                            self.component_config(&cc)
-                                .map(|c| ConfigItem::Component(Box::new(c))),
-                        );
-                    } else {
-                        self.unsupported(&c, "this configuration item");
-                    }
-                }
-                K::BlockConfiguration => {
-                    items.extend(self.block_config(&c).map(ConfigItem::Block));
-                }
-                K::ComponentConfiguration => {
-                    items.extend(
-                        self.component_config(&c)
-                            .map(|c| ConfigItem::Component(Box::new(c))),
-                    );
-                }
-                _ => self.unsupported(&c, "this configuration item"),
-            }
-        }
-        Some(BlockConfig {
-            spec: self.name(&child(&pre, K::Name)?)?,
-            items,
-            span: span(n),
-        })
-    }
-
-    fn component_config(&mut self, n: &N) -> Option<ComponentConfig> {
-        let pre = child(n, K::ComponentConfigurationPreamble)?;
-        let binding = match child(n, K::Binding).and_then(|b| child(&b, K::BindingIndication)) {
-            Some(b) => Some(self.binding(&b)?),
-            None => None,
-        };
-        Some(ComponentConfig {
-            spec: self.component_spec(&child(&pre, K::ComponentSpecification)?)?,
-            binding,
-            block: child(n, K::BlockConfiguration).and_then(|b| self.block_config(&b)),
-            span: span(n),
-        })
-    }
-
-    fn component_spec(&mut self, n: &N) -> Option<ComponentSpec> {
-        let insts = if child(n, K::InstantiationListAll).is_some() {
-            InstList::All
-        } else if child(n, K::InstantiationListOthers).is_some() {
-            InstList::Others
-        } else {
-            InstList::Labels(idents(&child(n, K::InstantiationListList)?))
-        };
-        Some(ComponentSpec {
-            insts,
-            comp: self.name(&child(n, K::Name)?)?,
-        })
-    }
-
-    fn binding(&mut self, n: &N) -> Option<BindingInd> {
-        let aspect = match child(n, K::BindingUseClause) {
-            None => None,
-            Some(u) => {
-                if let Some(e) = child(&u, K::EntityEntityAspect) {
-                    let (name, arch) = self.entity_arch_name(&child(&e, K::Name)?)?;
-                    Some(EntityAspect::Entity(name, arch))
-                } else if let Some(c) = child(&u, K::EntityConfigurationAspect) {
-                    Some(EntityAspect::Configuration(
-                        self.name(&child(&c, K::Name)?)?,
-                    ))
-                } else if child(&u, K::EntityOpenAspect).is_some() {
-                    Some(EntityAspect::Open)
-                } else {
-                    self.unexpected(&u);
-                    return None;
-                }
-            }
-        };
-        Some(BindingInd {
-            aspect,
-            generic_map: child(n, K::GenericMapAspect)
-                .map(|g| self.map_aspect(&g))
-                .unwrap_or_default(),
-            port_map: child(n, K::PortMapAspect)
-                .map(|g| self.map_aspect(&g))
-                .unwrap_or_default(),
-            span: span(n),
-        })
-    }
-
-    /// `lib.e(arch)`: the entity name and the architecture.
-    fn entity_arch_name(&mut self, n: &N) -> Option<(Name, Option<Ident>)> {
-        let full = self.name(n)?;
-        Some(match full.kind {
-            NameKind::Call(prefix, args) => {
-                let arch = match args.as_slice() {
-                    [
-                        Assoc {
-                            formal: None,
-                            actual:
-                                Actual::Expr(Expr {
-                                    kind:
-                                        ExprKind::Name(Name {
-                                            kind: NameKind::Simple(i),
-                                            ..
-                                        }),
-                                    ..
-                                }),
-                            ..
-                        },
-                    ] => Some(i.clone()),
-                    _ => None,
-                };
-                (*prefix, arch)
-            }
-            _ => (full, None),
-        })
-    }
-
-    fn map_aspect(&mut self, n: &N) -> Vec<Assoc> {
-        child(n, K::AssociationList)
-            .map(|l| self.assoc_list(&l))
-            .unwrap_or_default()
-    }
-
-    fn assoc_list(&mut self, n: &N) -> Vec<Assoc> {
-        let mut out = Vec::new();
-        for a in childs(n, K::AssociationElement) {
-            let formal = child(&a, K::Formal)
-                .and_then(|f| child(&f, K::Name))
-                .and_then(|f| self.name(&f));
-            let Some(ap) = child(&a, K::ActualPart) else {
-                continue;
-            };
-            let Some(inner) = nodes(&ap).into_iter().next() else {
-                continue;
-            };
-            let actual = match inner.kind() {
-                K::ActualPartOpen => Actual::Open(span(&inner)),
-                K::ActualPartExpression => {
-                    let Some(e) = nodes(&inner).into_iter().next().and_then(|e| self.expr(&e))
-                    else {
-                        continue;
-                    };
-                    Actual::Expr(e)
-                }
-                K::ActualPartSubtypeIndication => {
-                    let Some(si) =
-                        child(&inner, K::SubtypeIndication).and_then(|s| self.subtype_ind(&s))
-                    else {
-                        continue;
-                    };
-                    // A subtype indication actual (for a generic type): carried
-                    // as a name expression of its mark; constraints are rare.
-                    Actual::Expr(Expr {
-                        span: si.span.clone(),
-                        kind: ExprKind::Name(si.mark),
-                    })
-                }
-                _ => {
-                    self.unexpected(&inner);
-                    continue;
-                }
-            };
-            out.push(Assoc {
-                formal,
-                actual,
-                span: span(&a),
-            });
-        }
-        out
-    }
-
-    // ---- names --------------------------------------------------------------
-
-    pub fn name(&mut self, n: &N) -> Option<Name> {
-        let mut cur: Option<Name> = None;
-        let parts = nodes(n);
-        let mut i = 0;
-        while i < parts.len() {
-            let p = &parts[i];
-            let start = cur.as_ref().map(|c| c.span.start).unwrap_or(span(p).start);
-            let sp = start..span(p).end;
-            match p.kind() {
-                K::NameDesignatorPrefix => {
-                    let t = toks(p).into_iter().next()?;
-                    let kind = match t.kind() {
-                        T::Identifier => NameKind::Simple(ident(&t)),
-                        T::CharacterLiteral => NameKind::Char(bytes(&t)[1]),
-                        // An operator symbol, or a string literal (`f("01")`):
-                        // kept as written; `expr` turns a bare one into a
-                        // string literal.
-                        T::StringLiteral => NameKind::Op(
-                            string_value(&bytes(&t))
-                                .iter()
-                                .map(|&b| b as char)
-                                .collect(),
-                        ),
-                        _ => {
-                            self.unexpected(p);
-                            return None;
-                        }
-                    };
-                    cur = Some(Name {
-                        kind,
-                        span: span(p),
-                    });
-                }
-                K::SelectedName => {
-                    let t = toks(p).into_iter().find(|t| t.kind() != T::Dot)?;
-                    let suffix = match t.kind() {
-                        T::Identifier => Suffix::Ident(ident(&t)),
-                        T::CharacterLiteral => Suffix::Char(bytes(&t)[1], t.text_range()),
-                        T::StringLiteral => Suffix::Op(
-                            String::from_utf8_lossy(&string_value(&bytes(&t))).to_ascii_lowercase(),
-                            t.text_range(),
-                        ),
-                        T::Keyword(_) if kw(&t).as_deref() == Some("all") => {
-                            Suffix::All(t.text_range())
-                        }
-                        _ => {
-                            self.unexpected(p);
-                            return None;
-                        }
-                    };
-                    cur = Some(Name {
-                        kind: NameKind::Selected(Box::new(cur?), suffix),
-                        span: sp,
-                    });
-                }
-                K::ParenthesizedName => {
-                    let assocs = child(p, K::AssociationList)
-                        .map(|l| self.assoc_list(&l))
-                        .unwrap_or_default();
-                    cur = Some(Name {
-                        kind: NameKind::Call(Box::new(cur?), assocs),
-                        span: sp,
-                    });
-                }
-                K::AttributeName => {
-                    let t = toks(p).into_iter().find(|t| t.kind() != T::Tick)?;
-                    let attr = Ident {
-                        name: fold(&text(&t)),
-                        span: t.text_range(),
-                    };
-                    // `t'image(x)`: a following parenthesized part is the
-                    // attribute's parameter for the attributes that take one.
-                    let mut param = None;
-                    let mut end = span(p).end;
-                    if takes_param(&attr.name)
-                        && let Some(next) = parts.get(i + 1)
-                        && next.kind() == K::ParenthesizedName
-                    {
-                        let assocs = child(next, K::AssociationList)
-                            .map(|l| self.assoc_list(&l))
-                            .unwrap_or_default();
-                        if let [
-                            Assoc {
-                                formal: None,
-                                actual: Actual::Expr(e),
-                                ..
-                            },
-                        ] = assocs.as_slice()
-                        {
-                            param = Some(Box::new(e.clone()));
-                            end = span(next).end;
-                            i += 1;
-                        }
-                    }
-                    cur = Some(Name {
-                        kind: NameKind::Attribute(Box::new(cur?), attr, param),
-                        span: start..end,
-                    });
-                }
-                K::ExternalConstantName | K::ExternalSignalName | K::ExternalVariableName => {
-                    let class = match p.kind() {
-                        K::ExternalConstantName => ObjClass::Constant,
-                        K::ExternalSignalName => ObjClass::Signal,
-                        _ => ObjClass::Variable,
-                    };
-                    let path_n = nodes(p)
-                        .into_iter()
-                        .find(|x| x.kind() != K::SubtypeIndication)?;
-                    let mut out = Vec::new();
-                    path_n.write_to(&mut out).ok();
-                    let path: String = out
-                        .iter()
-                        .map(|&b| b as char)
-                        .collect::<String>()
-                        .split_whitespace()
-                        .collect();
-                    let ty = self.subtype_ind(&child(p, K::SubtypeIndication)?)?;
-                    cur = Some(Name {
-                        kind: NameKind::External {
-                            class,
-                            path: path.to_ascii_lowercase(),
-                            ty: Box::new(ty),
-                        },
-                        span: span(p),
-                    });
-                }
-                // `integer range 0 to 9` in a subtype indication: the range
-                // constraint is read by `subtype_ind`.
-                K::RangeConstraint => {}
-                K::Signature => {
-                    // Signatures (`f[integer return bit]`) select an overload;
-                    // not modelled yet.
-                    self.unsupported(p, "signatures in names");
-                }
-                _ => {
-                    self.unexpected(p);
-                    return None;
-                }
-            }
-            i += 1;
-        }
-        cur
-    }
-
-    // ---- expressions ----------------------------------------------------------
-
-    pub fn expr(&mut self, n: &N) -> Option<Expr> {
-        let sp = span(n);
-        let kind = match n.kind() {
-            K::BinaryExpression => {
-                let els = elems(n);
-                let mut operands = Vec::new();
-                let mut op = None;
-                for e in els {
-                    match e {
-                        SyntaxElement::Node(x) => operands.push(x),
-                        SyntaxElement::Token(t) => op = Some(t),
-                    }
-                }
-                let [l, r] = operands.as_slice() else {
-                    self.unexpected(n);
-                    return None;
-                };
-                let op = op?;
-                let opk = kw(&op);
-                if let Some(d) = opk.as_deref().and_then(|k| match k {
-                    "to" => Some(Dir::To),
-                    "downto" => Some(Dir::Downto),
-                    _ => None,
-                }) {
-                    let left = self.expr(l)?;
-                    let right = self.expr(r)?;
-                    return Some(Expr {
-                        kind: ExprKind::Range(Box::new(RangeExpr::Explicit {
-                            left: Box::new(left),
-                            dir: d,
-                            right: Box::new(right),
-                            span: sp.clone(),
-                        })),
-                        span: sp,
-                    });
-                }
-                let bop = match (op.kind(), opk.as_deref()) {
-                    (T::Plus, _) => BinOp::Add,
-                    (T::Minus, _) => BinOp::Sub,
-                    (T::EQ, _) => BinOp::Eq,
-                    (T::NE, _) => BinOp::Ne,
-                    (T::LT, _) => BinOp::Lt,
-                    (T::LTE, _) => BinOp::Le,
-                    (T::GT, _) => BinOp::Gt,
-                    (T::GTE, _) => BinOp::Ge,
-                    (T::QueEQ, _) => BinOp::MatchEq,
-                    (T::QueNE, _) => BinOp::MatchNe,
-                    (T::QueLT, _) => BinOp::MatchLt,
-                    (T::QueLTE, _) => BinOp::MatchLe,
-                    (T::QueGT, _) => BinOp::MatchGt,
-                    (T::QueGTE, _) => BinOp::MatchGe,
-                    (T::Times, _) => BinOp::Mul,
-                    (T::Pow, _) => BinOp::Pow,
-                    (T::Div, _) => BinOp::Div,
-                    (T::Concat, _) => BinOp::Concat,
-                    (_, Some("and")) => BinOp::And,
-                    (_, Some("or")) => BinOp::Or,
-                    (_, Some("nand")) => BinOp::Nand,
-                    (_, Some("nor")) => BinOp::Nor,
-                    (_, Some("xor")) => BinOp::Xor,
-                    (_, Some("xnor")) => BinOp::Xnor,
-                    (_, Some("sll")) => BinOp::Sll,
-                    (_, Some("srl")) => BinOp::Srl,
-                    (_, Some("sla")) => BinOp::Sla,
-                    (_, Some("sra")) => BinOp::Sra,
-                    (_, Some("rol")) => BinOp::Rol,
-                    (_, Some("ror")) => BinOp::Ror,
-                    (_, Some("mod")) => BinOp::Mod,
-                    (_, Some("rem")) => BinOp::Rem,
-                    _ => {
-                        self.unexpected(n);
-                        return None;
-                    }
-                };
-                ExprKind::Binary(bop, Box::new(self.expr(l)?), Box::new(self.expr(r)?))
-            }
-            K::UnaryExpression => {
-                let op = toks(n).into_iter().next()?;
-                let operand = nodes(n).into_iter().next()?;
-                let uop = match (op.kind(), kw(&op).as_deref()) {
-                    (T::Plus, _) => UnOp::Plus,
-                    (T::Minus, _) => UnOp::Minus,
-                    (T::QueQue, _) => UnOp::Cond,
-                    (_, Some("abs")) => UnOp::Abs,
-                    (_, Some("not")) => UnOp::Not,
-                    (_, Some("and")) => UnOp::And,
-                    (_, Some("or")) => UnOp::Or,
-                    (_, Some("nand")) => UnOp::Nand,
-                    (_, Some("nor")) => UnOp::Nor,
-                    (_, Some("xor")) => UnOp::Xor,
-                    (_, Some("xnor")) => UnOp::Xnor,
-                    _ => {
-                        self.unexpected(n);
-                        return None;
-                    }
-                };
-                ExprKind::Unary(uop, Box::new(self.expr(&operand)?))
-            }
-            K::NameExpression => {
-                let nm = self.name(&child(n, K::Name)?)?;
-                match nm.kind {
-                    // A bare operator symbol in an expression is a string
-                    // literal (the grammar cannot tell them apart).
-                    NameKind::Op(s) => {
-                        ExprKind::Lit(Literal::Str(s.chars().map(|c| c as u32 as u8).collect()))
-                    }
-                    k => ExprKind::Name(Name {
-                        kind: k,
-                        span: nm.span,
-                    }),
-                }
-            }
-            K::Name => ExprKind::Name(self.name(n)?),
-            K::LiteralExpression => {
-                let t = toks(n).into_iter().next()?;
-                ExprKind::Lit(self.literal(&t)?)
-            }
-            K::PhysicalLiteralExpression => {
-                let pl = child(n, K::PhysicalLiteral)?;
-                return self.physical_literal(&pl);
-            }
-            K::ParenthesizedExpressionOrAggregate => {
-                let list = child(n, K::ElementAssociationList)?;
-                let assocs = self.elem_assocs(&list)?;
-                match assocs.as_slice() {
-                    [ElemAssoc { choices, value }] if choices.is_empty() => {
-                        ExprKind::Paren(Box::new(value.clone()))
-                    }
-                    _ => ExprKind::Aggregate(assocs),
-                }
-            }
-            K::QualifiedExpression => {
-                let mark = self.name(&child(n, K::Name)?)?;
-                let inner = child(n, K::ParenthesizedExpressionOrAggregate)?;
-                let e = self.expr(&inner)?;
-                ExprKind::Qualified(mark, Box::new(e))
-            }
-            K::Allocator => {
-                let inner = nodes(n).into_iter().next()?;
-                match inner.kind() {
-                    K::QualifiedExpression => ExprKind::New(Box::new(self.expr(&inner)?)),
-                    K::SubtypeIndication => {
-                        ExprKind::NewSubtype(Box::new(self.subtype_ind(&inner)?))
-                    }
-                    _ => {
-                        let e = self.expr(&inner)?;
-                        match e.kind {
-                            ExprKind::Name(nm) => {
-                                let (mark, groups) = split_paren_constraints(nm);
-                                ExprKind::NewSubtype(Box::new(SubtypeInd {
-                                    resolution: None,
-                                    span: e.span.clone(),
-                                    mark,
-                                    constraint: (!groups.is_empty())
-                                        .then_some(Constraint::Paren(groups)),
-                                }))
-                            }
-                            _ => {
-                                self.unexpected(&inner);
-                                return None;
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
-                self.unsupported(n, "this expression");
-                return None;
-            }
-        };
-        Some(Expr { kind, span: sp })
-    }
-
-    fn elem_assocs(&mut self, n: &N) -> Option<Vec<ElemAssoc>> {
-        let mut out = Vec::new();
-        for a in childs(n, K::ElementAssociation) {
-            let mut choices = Vec::new();
-            if let Some(ec) = child(&a, K::ElementChoices)
-                && let Some(cs) = child(&ec, K::Choices)
-            {
-                choices = self.choices(&cs)?;
-            }
-            let value_n = nodes(&a)
-                .into_iter()
-                .find(|x| x.kind() != K::ElementChoices)?;
-            out.push(ElemAssoc {
-                choices,
-                value: self.expr(&value_n)?,
-            });
-        }
-        Some(out)
-    }
-
-    fn choices(&mut self, n: &N) -> Option<Vec<Choice>> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            match c.kind() {
-                K::OthersChoice => out.push(Choice::Others(span(&c))),
-                K::ExpressionChoice => {
-                    let e = self.expr(&nodes(&c).into_iter().next()?)?;
-                    out.push(match e.kind {
-                        ExprKind::Range(r) => Choice::Range(DiscreteRange::Range(*r)),
-                        _ => Choice::Expr(e),
-                    });
-                }
-                _ => {
-                    // A discrete range or subtype indication choice.
-                    if let Some(d) = self.discrete_range(&c) {
-                        out.push(Choice::Range(d));
-                    }
-                }
-            }
-        }
-        Some(out)
-    }
-
-    fn literal(&mut self, t: &Tk) -> Option<Literal> {
-        let raw = bytes(t);
-        Some(match t.kind() {
-            T::AbstractLiteral => match parse_abstract(&text(t)) {
-                Some(l) => l,
-                None => {
-                    self.err(t.text_range(), "VHDL: invalid numeric literal");
-                    return None;
-                }
-            },
-            T::CharacterLiteral => Literal::Char(raw[1]),
-            T::StringLiteral => Literal::Str(string_value(&raw)),
-            T::BitStringLiteral => match expand_bit_string(&text(t)) {
-                Ok(v) => Literal::BitStr(v),
-                Err(m) => {
-                    self.err(t.text_range(), format!("VHDL: {}", m));
-                    return None;
-                }
-            },
-            T::Keyword(_) if kw(t).as_deref() == Some("null") => Literal::Null,
-            _ => {
-                self.err(t.text_range(), "VHDL: internal: unexpected literal");
-                return None;
-            }
-        })
-    }
-
-    fn physical_literal(&mut self, n: &N) -> Option<Expr> {
-        let sp = span(n);
-        let value = match tok(n, T::AbstractLiteral) {
-            Some(t) => self.literal(&t)?,
-            None => Literal::Int(1),
-        };
-        let unit = self.name(&child(n, K::Name)?)?;
-        Some(Expr {
-            kind: ExprKind::Lit(Literal::Physical(Box::new(value), unit)),
-            span: sp,
-        })
-    }
-
-    // ---- concurrent statements ------------------------------------------------
-
-    pub fn conc_stmts(&mut self, n: &N) -> Vec<ConcStmt> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            if let Some(s) = self.conc_stmt(&c) {
-                out.push(s);
-            }
-        }
-        out
-    }
-
-    fn label(&mut self, n: &N) -> Option<Ident> {
-        child(n, K::StmtLabel).and_then(|l| first_ident(&l))
-    }
-
-    fn waveform(&mut self, n: &N) -> Option<Waveform> {
-        if n.kind() == K::UnaffectedWaveform {
-            return Some(Waveform::Unaffected(span(n)));
-        }
-        let mut elems = Vec::new();
-        for we in childs(n, K::WaveformElement) {
-            let mut value = None;
-            let mut after = None;
-            for c in nodes(&we) {
-                if c.kind() == K::AfterClause {
-                    after = nodes(&c).into_iter().next().and_then(|e| self.expr(&e));
-                } else {
-                    let e = self.expr(&c)?;
-                    value = match e.kind {
-                        ExprKind::Lit(Literal::Null) => None,
-                        _ => Some(e),
-                    };
-                }
-            }
-            elems.push(WaveElem {
-                value,
-                after,
-                span: span(&we),
-            });
-        }
-        Some(Waveform::Elems(elems))
-    }
-
-    fn delay(&mut self, n: &N) -> Option<DelayMech> {
-        if let Some(_t) = child(n, K::TransportDelayMechanism) {
-            return Some(DelayMech::Transport);
-        }
-        let im = child(n, K::InertialDelayMechanism)?;
-        let reject = child(&im, K::RejectClause)
-            .and_then(|r| nodes(&r).into_iter().next())
-            .and_then(|e| self.expr(&e));
-        Some(DelayMech::Inertial(reject))
-    }
-
-    fn target(&mut self, n: &N) -> Option<Target> {
-        if let Some(t) = child(n, K::NameTarget) {
-            return Some(Target::Name(self.name(&child(&t, K::Name)?)?));
-        }
-        if let Some(t) = child(n, K::AggregateTarget) {
-            let agg = nodes(&t).into_iter().next()?;
-            let list = child(&agg, K::ElementAssociationList)?;
-            return Some(Target::Aggregate(self.elem_assocs(&list)?, span(&t)));
-        }
-        None
-    }
-
-    /// `a when c else b when d else e` (waveforms).
-    fn cond_waveforms(&mut self, n: &N) -> Option<Vec<(Waveform, Option<Expr>)>> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            match c.kind() {
-                K::WhenWaveform | K::ElseWhenWaveform => {
-                    let parts = nodes(&c);
-                    let w = parts.first()?;
-                    let cond = parts.get(1).and_then(|e| self.expr(e));
-                    out.push((self.waveform(w)?, cond));
-                }
-                K::ElseWaveform => {
-                    let w = nodes(&c).into_iter().next()?;
-                    out.push((self.waveform(&w)?, None));
-                }
-                _ => self.unexpected(&c),
-            }
-        }
-        Some(out)
-    }
-
-    fn selected_waveforms(&mut self, n: &N) -> Option<Vec<(Waveform, Vec<Choice>)>> {
-        let mut out = Vec::new();
-        for item in childs(n, K::SelectedWaveformItem) {
-            let parts = nodes(&item);
-            let w = self.waveform(parts.first()?)?;
-            let cs = child(&item, K::Choices).and_then(|c| self.choices(&c))?;
-            out.push((w, cs));
-        }
-        Some(out)
-    }
-
-    fn conc_stmt(&mut self, n: &N) -> Option<ConcStmt> {
-        let label = self.label(n);
-        let postponed = has_kw(n, "postponed");
-        let kind = match n.kind() {
-            K::ProcessStatement => {
-                let pre = child(n, K::ProcessPreamble)?;
-                let sens = child(&pre, K::ParenthesizedProcessSensitivityList).map(|p| {
-                    if child(&p, K::AllSensitivityList).is_some() {
-                        Sensitivity::All
-                    } else {
-                        Sensitivity::List(
-                            child(&p, K::SensitivityList)
-                                .map(|l| {
-                                    childs(&l, K::Name)
-                                        .iter()
-                                        .filter_map(|x| self.name(x))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        )
-                    }
-                });
-                ConcKind::Process {
-                    postponed: has_kw(&pre, "postponed") || postponed,
-                    sens,
-                    decls: child(n, K::ProcessDeclarativePart)
-                        .map(|d| self.decls(&d))
-                        .unwrap_or_default(),
-                    stmts: child(n, K::ProcessStatementPart)
-                        .map(|s| self.seq_stmts(&s))
-                        .unwrap_or_default(),
-                }
-            }
-            K::ConcurrentSimpleSignalAssignment => ConcKind::SignalAssign {
-                postponed,
-                guarded: has_kw(n, "guarded"),
-                target: self.target(n)?,
-                delay: self.delay(n),
-                rhs: AssignRhs::Simple(self.waveform(&child(n, K::WaveformElements)?)?),
-            },
-            K::ConcurrentConditionalSignalAssignment => ConcKind::SignalAssign {
-                postponed,
-                guarded: has_kw(n, "guarded"),
-                target: self.target(n)?,
-                delay: self.delay(n),
-                rhs: AssignRhs::Cond(self.cond_waveforms(&child(n, K::ConditionalWaveforms)?)?),
-            },
-            K::ConcurrentSelectedSignalAssignment => {
-                let pre = child(n, K::SelectedAssignmentPreamble)?;
-                let e = first_node(&pre)?;
-                ConcKind::SignalAssign {
-                    postponed,
-                    guarded: has_kw(n, "guarded"),
-                    target: self.target(n)?,
-                    delay: self.delay(n),
-                    rhs: AssignRhs::Select {
-                        expr: self.expr(&e)?,
-                        matching: tok(&pre, T::Que).is_some(),
-                        items: self.selected_waveforms(&child(n, K::SelectedWaveforms)?)?,
-                    },
-                }
-            }
-            K::ConcurrentAssertionStatement => {
-                let a = child(n, K::Assertion)?;
-                let (cond, report, severity) = self.assertion(&a)?;
-                ConcKind::Assert {
-                    postponed,
-                    cond,
-                    report,
-                    severity,
-                }
-            }
-            K::ConcurrentProcedureCallOrComponentInstantiationStatement => {
-                // `label: name;` / `name(args);` — a procedure call or a
-                // component instantiation without maps; sema decides.
-                ConcKind::ProcCall {
-                    postponed,
-                    call: self.name(&child(n, K::Name)?)?,
-                }
-            }
-            K::ComponentInstantiationStatement => {
-                let unit = if let Some(ie) = child(n, K::InstantiatedEntity) {
-                    let (name, arch) = self.entity_arch_name(&child(&ie, K::Name)?)?;
-                    InstUnit::Entity(name, arch)
-                } else if let Some(ic) = child(n, K::InstantiatedComponent) {
-                    InstUnit::Component(self.name(&child(&ic, K::Name)?)?)
-                } else if let Some(ic) = child(n, K::InstantiatedConfiguration) {
-                    InstUnit::Configuration(self.name(&child(&ic, K::Name)?)?)
-                } else {
-                    self.unexpected(n);
-                    return None;
-                };
-                ConcKind::Instance {
-                    unit,
-                    generic_map: child(n, K::GenericMapAspect)
-                        .map(|g| self.map_aspect(&g))
-                        .unwrap_or_default(),
-                    port_map: child(n, K::PortMapAspect)
-                        .map(|g| self.map_aspect(&g))
-                        .unwrap_or_default(),
-                }
-            }
-            K::BlockStatement => {
-                let pre = child(n, K::BlockPreamble)?;
-                let guard = child(&pre, K::ParenthesizedCondition)
-                    .and_then(|c| nodes(&c).into_iter().next())
-                    .and_then(|e| self.expr(&e));
-                let header = child(n, K::BlockHeader);
-                let (mut generics, mut generic_map, mut ports, mut port_map) =
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                if let Some(h) = &header {
-                    // BlockHeader → GenericPart (GenericClause, GenericMap →
-                    // GenericMapAspect) and PortPart (PortClause, PortMap →
-                    // PortMapAspect).
-                    if let Some(gp) = child(h, K::GenericPart) {
-                        if let Some(g) = child(&gp, K::GenericClause) {
-                            generics = self.interface_clause(&g);
-                        }
-                        if let Some(g) =
-                            child(&gp, K::GenericMap).and_then(|m| child(&m, K::GenericMapAspect))
-                        {
-                            generic_map = self.map_aspect(&g);
-                        }
-                    }
-                    if let Some(pp) = child(h, K::PortPart) {
-                        if let Some(g) = child(&pp, K::PortClause) {
-                            ports = self.interface_clause(&g);
-                        }
-                        if let Some(g) =
-                            child(&pp, K::PortMap).and_then(|m| child(&m, K::PortMapAspect))
-                        {
-                            port_map = self.map_aspect(&g);
-                        }
-                    }
-                }
-                ConcKind::Block {
-                    guard,
-                    generics,
-                    generic_map,
-                    ports,
-                    port_map,
-                    decls: child(n, K::BlockDeclarativePart)
-                        .map(|d| self.decls(&d))
-                        .unwrap_or_default(),
-                    stmts: child(n, K::BlockStatementPart)
-                        .map(|s| self.conc_stmts(&s))
-                        .unwrap_or_default(),
-                }
-            }
-            K::ForGenerateStatement => {
-                let pre = child(n, K::ForGeneratePreamble)?;
-                let ps = child(&pre, K::ParameterSpecification)?;
-                let range_n = nodes(&ps).into_iter().next()?;
-                let (decls, stmts) = self.generate_body(child(n, K::GenerateStatementBody));
-                ConcKind::ForGenerate {
-                    param: first_ident(&ps)?,
-                    range: self.discrete_range(&range_n)?,
-                    decls,
-                    stmts,
-                }
-            }
-            K::IfGenerateStatement => {
-                let mut branches = Vec::new();
-                for b in nodes(n) {
-                    match b.kind() {
-                        K::IfGenerateIf | K::IfGenerateElsif | K::IfGenerateElse => {
-                            let alt_label = self.label(&b);
-                            let cond = nodes(&b)
-                                .into_iter()
-                                .find(|x| {
-                                    !matches!(x.kind(), K::StmtLabel | K::GenerateStatementBody)
-                                })
-                                .and_then(|e| self.expr(&e));
-                            let (decls, stmts) =
-                                self.generate_body(child(&b, K::GenerateStatementBody));
-                            branches.push(GenerateBranch {
-                                alt_label,
-                                cond,
-                                choices: Vec::new(),
-                                decls,
-                                stmts,
-                            });
-                        }
-                        K::StmtLabel | K::GenerateEpilogue => {}
-                        _ => self.unexpected(&b),
-                    }
-                }
-                ConcKind::IfGenerate(branches)
-            }
-            K::CaseGenerateStatement => {
-                let pre = child(n, K::CaseGeneratePreamble)?;
-                let e = first_node(&pre)?;
-                let mut branches = Vec::new();
-                for b in childs(n, K::CaseGenerateAlternative) {
-                    let choices = child(&b, K::Choices).and_then(|c| self.choices(&c))?;
-                    let (decls, stmts) = self.generate_body(child(&b, K::GenerateStatementBody));
-                    branches.push(GenerateBranch {
-                        alt_label: self.label(&b),
-                        cond: None,
-                        choices,
-                        decls,
-                        stmts,
-                    });
-                }
-                ConcKind::CaseGenerate {
-                    expr: self.expr(&e)?,
-                    branches,
-                }
-            }
-            _ => {
-                self.unsupported(n, "this concurrent statement");
-                return None;
-            }
-        };
-        Some(ConcStmt {
-            label,
-            kind,
-            span: span(n),
-        })
-    }
-
-    /// A generate body; an empty one has no node.
-    fn generate_body(&mut self, n: Option<N>) -> (Vec<Decl>, Vec<ConcStmt>) {
-        let Some(n) = n else {
-            return (Vec::new(), Vec::new());
-        };
-        let n = &n;
-        let decls = child(n, K::GenerateBodyDeclarations)
-            .and_then(|d| child(&d, K::BlockDeclarativePart))
-            .map(|d| self.decls(&d))
-            .unwrap_or_default();
-        let mut stmts = Vec::new();
-        for c in nodes(n) {
-            match c.kind() {
-                K::GenerateBodyDeclarations
-                | K::DeclarationStatementSeparator
-                | K::GenerateBodyEpilogue => {}
-                _ => {
-                    if let Some(s) = self.conc_stmt(&c) {
-                        stmts.push(s);
-                    }
-                }
-            }
-        }
-        (decls, stmts)
-    }
-
-    fn assertion(&mut self, a: &N) -> Option<(Expr, Option<Expr>, Option<Expr>)> {
-        let cond_n = nodes(a)
-            .into_iter()
-            .find(|x| !matches!(x.kind(), K::ReportClause | K::SeverityClause))?;
-        let report = child(a, K::ReportClause)
-            .and_then(|r| nodes(&r).into_iter().next())
-            .and_then(|e| self.expr(&e));
-        let severity = child(a, K::SeverityClause)
-            .and_then(|r| nodes(&r).into_iter().next())
-            .and_then(|e| self.expr(&e));
-        Some((self.expr(&cond_n)?, report, severity))
-    }
-
-    // ---- sequential statements ----------------------------------------------
-
-    pub fn seq_stmts(&mut self, n: &N) -> Vec<SeqStmt> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            if let Some(s) = self.seq_stmt(&c) {
-                out.push(s);
-            }
-        }
-        out
-    }
-
-    fn seq_body(&mut self, n: &N) -> Vec<SeqStmt> {
-        child(n, K::SequenceOfStatements)
-            .map(|s| self.seq_stmts(&s))
-            .unwrap_or_default()
-    }
-
-    fn seq_stmt(&mut self, n: &N) -> Option<SeqStmt> {
-        let mut label = self.label(n);
-        let kind = match n.kind() {
-            K::WaitStatement => SeqKind::Wait {
-                on: child(n, K::SensitivityClause)
-                    .and_then(|c| child(&c, K::SensitivityList))
-                    .map(|l| {
-                        childs(&l, K::Name)
-                            .iter()
-                            .filter_map(|x| self.name(x))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                until: child(n, K::ConditionClause)
-                    .and_then(|c| nodes(&c).into_iter().next())
-                    .and_then(|e| self.expr(&e)),
-                timeout: child(n, K::TimeoutClause)
-                    .and_then(|c| nodes(&c).into_iter().next())
-                    .and_then(|e| self.expr(&e)),
-            },
-            K::AssertionStatement => {
-                let a = child(n, K::Assertion)?;
-                let (cond, report, severity) = self.assertion(&a)?;
-                SeqKind::Assert {
-                    cond,
-                    report,
-                    severity,
-                }
-            }
-            K::ReportStatement => {
-                let msg_n = nodes(n)
-                    .into_iter()
-                    .find(|x| x.kind() != K::SeverityClause && x.kind() != K::StmtLabel)?;
-                SeqKind::Report {
-                    msg: self.expr(&msg_n)?,
-                    severity: child(n, K::SeverityClause)
-                        .and_then(|r| nodes(&r).into_iter().next())
-                        .and_then(|e| self.expr(&e)),
-                }
-            }
-            K::SimpleWaveformAssignment => SeqKind::SignalAssign {
-                target: self.target(n)?,
-                delay: self.delay(n),
-                rhs: AssignRhs::Simple(self.waveform(&child(n, K::WaveformElements)?)?),
-            },
-            K::ConditionalWaveformAssignment => SeqKind::SignalAssign {
-                target: self.target(n)?,
-                delay: self.delay(n),
-                rhs: AssignRhs::Cond(self.cond_waveforms(&child(n, K::ConditionalWaveforms)?)?),
-            },
-            K::SelectedWaveformAssignment => {
-                let pre = child(n, K::SelectedAssignmentPreamble)?;
-                let e = first_node(&pre)?;
-                SeqKind::SignalAssign {
-                    target: self.target(n)?,
-                    delay: self.delay(n),
-                    rhs: AssignRhs::Select {
-                        expr: self.expr(&e)?,
-                        matching: tok(&pre, T::Que).is_some(),
-                        items: self.selected_waveforms(&child(n, K::SelectedWaveforms)?)?,
-                    },
-                }
-            }
-            K::SimpleVariableAssignment => {
-                let e = nodes(n).into_iter().find(|x| {
-                    !matches!(x.kind(), K::NameTarget | K::AggregateTarget | K::StmtLabel)
-                })?;
-                SeqKind::VarAssign {
-                    target: self.target(n)?,
-                    rhs: AssignRhs::Simple(self.expr(&e)?),
-                }
-            }
-            K::ConditionalVariableAssignment => {
-                let ce = child(n, K::ConditionalExpressions)?;
-                SeqKind::VarAssign {
-                    target: self.target(n)?,
-                    rhs: AssignRhs::Cond(self.cond_exprs(&ce)?),
-                }
-            }
-            K::SelectedVariableAssignment => {
-                let pre = child(n, K::SelectedAssignmentPreamble)?;
-                let e = first_node(&pre)?;
-                let se = child(n, K::SelectedExpressions)?;
-                SeqKind::VarAssign {
-                    target: self.target(n)?,
-                    rhs: AssignRhs::Select {
-                        expr: self.expr(&e)?,
-                        matching: tok(&pre, T::Que).is_some(),
-                        items: self.selected_exprs(&se)?,
-                    },
-                }
-            }
-            K::SimpleForceAssignment => {
-                let e = nodes(n).into_iter().find(|x| {
-                    !matches!(x.kind(), K::NameTarget | K::AggregateTarget | K::StmtLabel)
-                })?;
-                SeqKind::Force {
-                    target: self.target(n)?,
-                    mode: force_mode(n),
-                    rhs: AssignRhs::Simple(self.expr(&e)?),
-                }
-            }
-            K::ConditionalForceAssignment => {
-                let ce = child(n, K::ConditionalExpressions)?;
-                SeqKind::Force {
-                    target: self.target(n)?,
-                    mode: force_mode(n),
-                    rhs: AssignRhs::Cond(self.cond_exprs(&ce)?),
-                }
-            }
-            K::SelectedForceAssignment => {
-                let pre = child(n, K::SelectedAssignmentPreamble)?;
-                let e = first_node(&pre)?;
-                let se = child(n, K::SelectedExpressions)?;
-                SeqKind::Force {
-                    target: self.target(n)?,
-                    mode: force_mode(n),
-                    rhs: AssignRhs::Select {
-                        expr: self.expr(&e)?,
-                        matching: tok(&pre, T::Que).is_some(),
-                        items: self.selected_exprs(&se)?,
-                    },
-                }
-            }
-            K::SimpleReleaseAssignment => SeqKind::Release {
-                target: self.target(n)?,
-                mode: force_mode(n),
-            },
-            K::ProcedureCallStatement => SeqKind::ProcCall(self.name(&child(n, K::Name)?)?),
-            K::IfStatement => {
-                let pre = child(n, K::IfStatementPreamble)?;
-                if label.is_none() {
-                    label = self.label(&pre);
-                }
-                let cond = first_node(&pre)?;
-                let mut branches = vec![(self.expr(&cond)?, self.seq_body(n))];
-                for ei in childs(n, K::IfStatementElsif) {
-                    let c = nodes(&ei).into_iter().next()?;
-                    let body = self.seq_body(&ei);
-                    branches.push((self.expr(&c)?, body));
-                }
-                let else_branch = child(n, K::IfStatementElse).map(|e| self.seq_body(&e));
-                SeqKind::If {
-                    branches,
-                    else_branch,
-                }
-            }
-            K::CaseStatement => {
-                let pre = child(n, K::CaseStatementPreamble)?;
-                if label.is_none() {
-                    label = self.label(&pre);
-                }
-                let e = first_node(&pre)?;
-                let mut alts = Vec::new();
-                for alt in childs(n, K::CaseStatementAlternative) {
-                    let ap = child(&alt, K::CaseStatementAlternativePreamble)?;
-                    let cs = child(&ap, K::Choices).and_then(|c| self.choices(&c))?;
-                    alts.push((cs, self.seq_body(&alt)));
-                }
-                SeqKind::Case {
-                    matching: tok(&pre, T::Que).is_some(),
-                    expr: self.expr(&e)?,
-                    alts,
-                }
-            }
-            K::LoopStatement => {
-                let pre = child(n, K::LoopStatementPreamble)?;
-                if label.is_none() {
-                    label = self.label(&pre);
-                }
-                let scheme = if let Some(w) = child(&pre, K::WhileScheme) {
-                    LoopScheme::While(self.expr(&nodes(&w).into_iter().next()?)?)
-                } else if let Some(f) = child(&pre, K::ForScheme) {
-                    let ps = child(&f, K::ParameterSpecification)?;
-                    let r = nodes(&ps).into_iter().next()?;
-                    LoopScheme::For(first_ident(&ps)?, self.discrete_range(&r)?)
-                } else {
-                    LoopScheme::Plain
-                };
-                SeqKind::Loop {
-                    scheme,
-                    body: self.seq_body(n),
-                }
-            }
-            K::NextStatement | K::ExitStatement => {
-                let target_label = first_ident(n);
-                let cond = child(n, K::WhenClause)
-                    .and_then(|w| nodes(&w).into_iter().next())
-                    .and_then(|e| self.expr(&e));
-                if n.kind() == K::NextStatement {
-                    SeqKind::Next {
-                        label: target_label,
-                        cond,
-                    }
-                } else {
-                    SeqKind::Exit {
-                        label: target_label,
-                        cond,
-                    }
-                }
-            }
-            K::ReturnStatement => SeqKind::Return(
-                nodes(n)
-                    .into_iter()
-                    .find(|x| x.kind() != K::StmtLabel)
-                    .and_then(|e| self.expr(&e)),
-            ),
-            K::NullStatement => SeqKind::Null,
-            _ => {
-                self.unsupported(n, "this sequential statement");
-                return None;
-            }
-        };
-        Some(SeqStmt {
-            label,
-            kind,
-            span: span(n),
-        })
-    }
-
-    fn cond_exprs(&mut self, n: &N) -> Option<Vec<(Expr, Option<Expr>)>> {
-        let mut out = Vec::new();
-        for c in nodes(n) {
-            match c.kind() {
-                K::WhenExpression | K::ElseWhenExpression => {
-                    let parts = nodes(&c);
-                    let v = self.expr(parts.first()?)?;
-                    let cond = parts.get(1).and_then(|e| self.expr(e));
-                    out.push((v, cond));
-                }
-                K::ElseExpression => {
-                    let v = nodes(&c).into_iter().next()?;
-                    out.push((self.expr(&v)?, None));
-                }
-                _ => self.unexpected(&c),
-            }
-        }
-        Some(out)
-    }
-
-    fn selected_exprs(&mut self, n: &N) -> Option<Vec<(Expr, Vec<Choice>)>> {
-        let mut out = Vec::new();
-        for item in childs(n, K::SelectedExpressionItem) {
-            let v = nodes(&item).into_iter().next()?;
-            let cs = child(&item, K::Choices).and_then(|c| self.choices(&c))?;
-            out.push((self.expr(&v)?, cs));
-        }
-        Some(out)
-    }
-}
-
-fn force_mode(n: &N) -> Option<ForceMode> {
-    if has_kw(n, "in") {
-        Some(ForceMode::In)
-    } else if has_kw(n, "out") {
-        Some(ForceMode::Out)
-    } else {
-        None
+        .into(),
+        SimpleName => "simple_name".into(),
+        InstanceName => "instance_name".into(),
+        PathName => "path_name".into(),
+        Converse => "converse".into(),
     }
 }
 
 /// Attributes that take a parameter (`t'image(x)`, `a'length(2)`,
-/// `s'delayed(5 ns)`).
+/// `s'delayed(5 ns)`); `x'other(e)` is a call of the attribute's value.
 fn takes_param(attr: &str) -> bool {
     matches!(
         attr,
@@ -2262,68 +178,1757 @@ fn takes_param(attr: &str) -> bool {
     )
 }
 
-/// Split trailing call suffixes off a type mark: `bit_vector(7 downto 0)` →
-/// (`bit_vector`, [[7 downto 0]]).
-fn split_paren_constraints(mut n: Name) -> (Name, Vec<Vec<Assoc>>) {
-    let mut groups = Vec::new();
-    while let NameKind::Call(prefix, args) = n.kind {
-        groups.push(args);
-        n = *prefix;
+fn obj_class(c: v::ObjectClass) -> ObjClass {
+    match c {
+        v::ObjectClass::Signal => ObjClass::Signal,
+        v::ObjectClass::Constant => ObjClass::Constant,
+        v::ObjectClass::Variable | v::ObjectClass::SharedVariable => ObjClass::Variable,
     }
-    groups.reverse();
-    (n, groups)
 }
 
-/// Parse an abstract literal (§15.5): decimal or based, integer or real,
-/// with `_` separators and an optional exponent.
-pub fn parse_abstract(s: &str) -> Option<Literal> {
-    let s: String = s.chars().filter(|&c| c != '_').collect();
-    let lower = s.to_ascii_lowercase();
-    if let Some(h) = lower.find(['#', ':']) {
-        let delim = lower.as_bytes()[h] as char;
-        let base: u32 = lower[..h].parse().ok()?;
-        if !(2..=16).contains(&base) {
-            return None;
+fn mode(m: v::Mode) -> Mode {
+    match m {
+        v::Mode::In => Mode::In,
+        v::Mode::Out => Mode::Out,
+        v::Mode::InOut => Mode::InOut,
+        v::Mode::Buffer => Mode::Buffer,
+        v::Mode::Linkage => Mode::Linkage,
+    }
+}
+
+fn force_mode(m: &Option<v::ForceMode>) -> Option<ForceMode> {
+    m.as_ref().map(|m| match m {
+        v::ForceMode::In => ForceMode::In,
+        v::ForceMode::Out => ForceMode::Out,
+    })
+}
+
+/// The converter of one design unit (positions are per unit).
+pub struct Converter<'a> {
+    pub errors: Vec<Diagnostic>,
+    tokens: &'a [Token],
+    lines: &'a Lines,
+    text: &'a [u8],
+}
+
+impl<'a> Converter<'a> {
+    pub fn new(tokens: &'a [Token], lines: &'a Lines, text: &'a [u8]) -> Self {
+        Converter {
+            errors: Vec::new(),
+            tokens,
+            lines,
+            text,
         }
-        let rest = &lower[h + 1..];
-        let end = rest.find(delim)?;
-        let digits = &rest[..end];
-        let exp = match rest[end + 1..].strip_prefix('e') {
-            Some(e) => e.trim_start_matches('+').parse::<i32>().ok()?,
-            None => 0,
+    }
+
+    // ---- positions ------------------------------------------------------------
+
+    fn tok_span(&self, t: TokenId) -> Span {
+        let p = self.tokens.get_pos(t);
+        self.lines.offset(p.range.start)..self.lines.offset(p.range.end)
+    }
+
+    fn span(&self, s: TokenSpan) -> Span {
+        self.span2(s.start_token, s.end_token)
+    }
+
+    fn span2(&self, a: TokenId, b: TokenId) -> Span {
+        let (pa, pb) = (self.tokens.get_pos(a), self.tokens.get_pos(b));
+        self.lines.offset(pa.range.start)..self.lines.offset(pb.range.end)
+    }
+
+    fn has_span(&self, x: &dyn HasTokenSpan) -> Span {
+        self.span2(x.get_start_token(), x.get_end_token())
+    }
+
+    fn err(&mut self, s: Span, msg: impl Into<String>) {
+        self.errors.push(Diagnostic {
+            span: s,
+            message: msg.into(),
+        });
+    }
+
+    fn unsupported(&mut self, s: Span, what: &str) {
+        self.err(s, format!("VHDL: {} is not supported yet", what));
+    }
+
+    /// The source text of a span, one character per byte.
+    fn text_of(&self, s: &Span) -> String {
+        latin1(self.text.get(s.clone()).unwrap_or_default())
+    }
+
+    // ---- identifiers -------------------------------------------------------------
+
+    fn ident(&self, i: &v::Ident) -> Ident {
+        Ident {
+            name: fold(&latin1(&i.item.name().bytes)),
+            span: self.tok_span(i.token),
+        }
+    }
+
+    fn idents(&self, l: &[v::WithDecl<v::Ident>]) -> Vec<Ident> {
+        l.iter().map(|i| self.ident(&i.tree)).collect()
+    }
+
+    // ---- design units ------------------------------------------------------------
+
+    pub fn design_unit(&mut self, u: &v::AnyDesignUnit, span: Span) -> Option<DesignUnit> {
+        use v::{AnyDesignUnit as U, AnyPrimaryUnit as P, AnySecondaryUnit as S};
+        let (context, unit) = match u {
+            U::Primary(P::Entity(e)) => (
+                self.context_items(&e.context_clause),
+                LibraryUnit::Entity(EntityDecl {
+                    name: self.ident(&e.ident.tree),
+                    generics: self.interface_list(e.generic_clause.as_ref()),
+                    ports: self.interface_list(e.port_clause.as_ref()),
+                    decls: self.decls(&e.decl),
+                    stmts: self.conc_stmts(&e.statements),
+                }),
+            ),
+            U::Primary(P::Configuration(c)) => {
+                if let Some(d) = c.decl.first() {
+                    let s = self.span(d.span);
+                    self.unsupported(s, "a configuration declarative part");
+                }
+                (
+                    self.context_items(&c.context_clause),
+                    LibraryUnit::Configuration(ConfigDecl {
+                        name: self.ident(&c.ident.tree),
+                        entity: self.name(&c.entity_name)?,
+                        block: self.block_config(&c.block_config),
+                        span: span.clone(),
+                    }),
+                )
+            }
+            U::Primary(P::Package(p)) => (
+                self.context_items(&p.context_clause),
+                LibraryUnit::Package(PackageDecl {
+                    name: self.ident(&p.ident.tree),
+                    generics: self.interface_list(p.generic_clause.as_ref()),
+                    generic_map: None,
+                    decls: self.decls(&p.decl),
+                    span: span.clone(),
+                }),
+            ),
+            U::Primary(P::PackageInstance(p)) => (
+                self.context_items(&p.context_clause),
+                LibraryUnit::PackageInst(self.package_inst(p, span.clone())?),
+            ),
+            U::Primary(P::Context(c)) => (
+                Vec::new(),
+                LibraryUnit::Context(ContextDecl {
+                    name: self.ident(&c.ident.tree),
+                    items: self.context_items(&c.items),
+                }),
+            ),
+            U::Secondary(S::Architecture(a)) => (
+                self.context_items(&a.context_clause),
+                LibraryUnit::Architecture(ArchBody {
+                    name: self.ident(&a.ident.tree),
+                    entity: self.ident(&a.entity_name.item),
+                    decls: self.decls(&a.decl),
+                    stmts: self.conc_stmts(&a.statements),
+                }),
+            ),
+            U::Secondary(S::PackageBody(p)) => (
+                self.context_items(&p.context_clause),
+                LibraryUnit::PackageBody(PackageBody {
+                    name: self.ident(&p.ident.tree),
+                    decls: self.decls(&p.decl),
+                    span: span.clone(),
+                }),
+            ),
         };
-        if let Some(dot) = digits.find('.') {
-            let mut v = 0f64;
-            for c in digits[..dot].chars() {
-                v = v * base as f64 + c.to_digit(base)? as f64;
-            }
-            let mut scale = 1f64 / base as f64;
-            for c in digits[dot + 1..].chars() {
-                v += c.to_digit(base)? as f64 * scale;
-                scale /= base as f64;
-            }
-            return Some(Literal::Real(v * (base as f64).powi(exp)));
-        }
-        let mut v: i128 = 0;
-        for c in digits.chars() {
-            v = v
-                .checked_mul(base as i128)?
-                .checked_add(c.to_digit(base)? as i128)?;
-        }
-        return Some(Literal::Int(
-            v.checked_mul((base as i128).checked_pow(exp.max(0) as u32)?)?,
-        ));
+        Some(DesignUnit {
+            context,
+            unit,
+            span,
+        })
     }
-    if lower.contains('.') {
-        return lower.parse::<f64>().ok().map(Literal::Real);
-    }
-    match lower.split_once('e') {
-        Some((m, e)) => {
-            let m: i128 = m.parse().ok()?;
-            let e: u32 = e.trim_start_matches('+').parse().ok()?;
-            Some(Literal::Int(m.checked_mul(10i128.checked_pow(e)?)?))
+
+    fn context_items(&mut self, items: &[v::ContextItem]) -> Vec<ContextItem> {
+        let mut out = Vec::new();
+        for c in items {
+            match c {
+                v::ContextItem::Library(l) => out.push(ContextItem::Library(
+                    l.name_list.iter().map(|n| self.ident(&n.item)).collect(),
+                )),
+                v::ContextItem::Use(u) => out.push(ContextItem::Use(self.names(&u.name_list))),
+                v::ContextItem::Context(r) => {
+                    out.push(ContextItem::Context(self.names(&r.name_list)))
+                }
+            }
         }
-        None => lower.parse::<i128>().ok().map(Literal::Int),
+        out
+    }
+
+    fn names(&mut self, l: &[WithTokenSpan<v::Name>]) -> Vec<Name> {
+        l.iter().filter_map(|n| self.name(n)).collect()
+    }
+
+    fn package_inst(&mut self, p: &v::PackageInstantiation, span: Span) -> Option<PackageInst> {
+        Some(PackageInst {
+            name: self.ident(&p.ident.tree),
+            package: self.name(&p.package_name)?,
+            generic_map: self.map_aspect(p.generic_map.as_ref()),
+            span,
+        })
+    }
+
+    // ---- interfaces --------------------------------------------------------------
+
+    fn interface_list(&mut self, l: Option<&v::InterfaceList>) -> Vec<InterfaceDecl> {
+        let Some(l) = l else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for item in &l.items {
+            match item {
+                v::InterfaceDeclaration::Object(o) => {
+                    let span = self.has_span(o);
+                    let v::ModeIndication::Simple(m) = &o.mode else {
+                        self.unsupported(span, "a mode view");
+                        continue;
+                    };
+                    // The class as written (`signal x : bit`), or none: the
+                    // analysis applies the default of the interface list.
+                    let first = self
+                        .text_of(&span)
+                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let class = matches!(first.as_str(), "constant" | "signal" | "variable")
+                        .then(|| obj_class(m.class));
+                    let Some(ty) = self.subtype_ind(&m.subtype_indication) else {
+                        continue;
+                    };
+                    let default = m.expression.as_ref().and_then(|e| self.cond_expr(e));
+                    out.push(InterfaceDecl::Object(InterfaceObject {
+                        class,
+                        names: self.idents(&o.idents),
+                        mode: m.mode.as_ref().map(|m| mode(m.item)),
+                        ty,
+                        bus: m.bus,
+                        default,
+                        span,
+                    }));
+                }
+                v::InterfaceDeclaration::File(f) => {
+                    let span = self.has_span(f);
+                    let Some(ty) = self.subtype_ind(&f.subtype_indication) else {
+                        continue;
+                    };
+                    out.push(InterfaceDecl::Object(InterfaceObject {
+                        class: Some(ObjClass::File),
+                        names: self.idents(&f.idents),
+                        mode: None,
+                        ty,
+                        bus: false,
+                        default: None,
+                        span,
+                    }));
+                }
+                v::InterfaceDeclaration::Type(t) => out.push(InterfaceDecl::Type(self.ident(&t.tree))),
+                v::InterfaceDeclaration::Subprogram(s) => {
+                    let Some(spec) = self.subprogram_spec(&s.specification) else {
+                        continue;
+                    };
+                    let default = match &s.default {
+                        None => None,
+                        Some(v::SubprogramDefault::Box) => Some(SubprogramDefault::Box),
+                        Some(v::SubprogramDefault::Name(n)) => {
+                            self.name(n).map(SubprogramDefault::Name)
+                        }
+                    };
+                    out.push(InterfaceDecl::Subprogram { spec, default });
+                }
+                v::InterfaceDeclaration::Package(p) => {
+                    let span = self.has_span(p);
+                    if let Some(package) = self.name(&p.package_name) {
+                        out.push(InterfaceDecl::Package {
+                            name: self.ident(&p.ident.tree),
+                            package,
+                            generic_map: None,
+                            span,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn subprogram_spec(&mut self, s: &v::SubprogramSpecification) -> Option<SubprogramSpec> {
+        let span = self.has_span(s);
+        let (designator, header, params, kind) = match s {
+            v::SubprogramSpecification::Procedure(p) => (
+                &p.designator,
+                p.header.as_ref(),
+                p.parameter_list.as_ref(),
+                SubprogramKind::Procedure,
+            ),
+            v::SubprogramSpecification::Function(f) => {
+                if let Some(r) = &f.return_identifier {
+                    let s = self.tok_span(r.tree.token);
+                    self.unsupported(s, "a function return identifier");
+                }
+                (
+                    &f.designator,
+                    f.header.as_ref(),
+                    f.parameter_list.as_ref(),
+                    SubprogramKind::Function {
+                        pure: f.pure,
+                        ret: self.name(&f.return_type)?,
+                    },
+                )
+            }
+        };
+        let d = &designator.tree;
+        let designator = match &d.item {
+            v::SubprogramDesignator::Identifier(sym) => Designator::Ident(Ident {
+                name: fold(&latin1(&sym.name().bytes)),
+                span: self.tok_span(d.token),
+            }),
+            v::SubprogramDesignator::OperatorSymbol(op) => {
+                Designator::Op(op_text(*op).to_string(), self.tok_span(d.token))
+            }
+        };
+        Some(SubprogramSpec {
+            kind,
+            designator,
+            generics: self.interface_list(header.map(|h| &h.generic_list)),
+            params: self.interface_list(params),
+            span,
+        })
+    }
+
+    // ---- subtype indications and types ---------------------------------------------
+
+    pub fn subtype_ind(&mut self, s: &v::SubtypeIndication) -> Option<SubtypeInd> {
+        let resolution = match &s.resolution {
+            None => None,
+            Some(r) => Some(self.resolution(r)?),
+        };
+        let start = match &s.resolution {
+            Some(r) => r.get_start_token(),
+            None => s.type_mark.span.start_token,
+        };
+        let end = match &s.constraint {
+            Some(c) => c.span.end_token,
+            None => s.type_mark.span.end_token,
+        };
+        let constraint = match &s.constraint {
+            None => None,
+            Some(c) => Some(self.constraint(c)?),
+        };
+        Some(SubtypeInd {
+            resolution,
+            mark: self.name(&s.type_mark)?,
+            constraint,
+            span: self.span2(start, end),
+        })
+    }
+
+    fn resolution(&mut self, r: &v::ResolutionIndication) -> Option<Resolution> {
+        match r {
+            v::ResolutionIndication::FunctionName(n) => Some(Resolution::Function(self.name(n)?)),
+            v::ResolutionIndication::Element(e) => match &e.item {
+                v::ElementResolution::Array(inner) => {
+                    Some(Resolution::Element(Box::new(self.resolution(inner)?)))
+                }
+                v::ElementResolution::Record(_) => {
+                    let s = self.span(e.span);
+                    self.unsupported(s, "record element resolution");
+                    None
+                }
+            },
+        }
+    }
+
+    /// A constraint: a range, or the association lists the earlier parser
+    /// produced for index, element and record constraints
+    /// (`t(7 downto 0)(1 to 2)`, `rec(a(3 downto 0))`).
+    fn constraint(&mut self, c: &WithTokenSpan<v::SubtypeConstraint>) -> Option<Constraint> {
+        match &c.item {
+            v::SubtypeConstraint::Range(r) => Some(Constraint::Range(self.range(r)?)),
+            _ => Some(Constraint::Paren(self.constraint_groups(c)?)),
+        }
+    }
+
+    fn constraint_groups(
+        &mut self,
+        c: &WithTokenSpan<v::SubtypeConstraint>,
+    ) -> Option<Vec<Vec<Assoc>>> {
+        let span = self.span(c.span);
+        match &c.item {
+            v::SubtypeConstraint::Range(r) => {
+                // A range as an element constraint: one association.
+                let r = self.range(r)?;
+                Some(vec![vec![Assoc {
+                    formal: None,
+                    actual: Actual::Expr(range_expr(r, span.clone())),
+                    span,
+                }]])
+            }
+            v::SubtypeConstraint::Array(ranges, elem) => {
+                let mut group = Vec::new();
+                if ranges.is_empty() {
+                    group.push(Assoc {
+                        formal: None,
+                        actual: Actual::Open(span.clone()),
+                        span: span.clone(),
+                    });
+                }
+                for dr in ranges {
+                    let s = self.span(dr.span);
+                    let e = self.discrete_range_expr(&dr.item, s.clone())?;
+                    group.push(Assoc {
+                        formal: None,
+                        actual: Actual::Expr(e),
+                        span: s,
+                    });
+                }
+                let mut groups = vec![group];
+                if let Some(e) = elem {
+                    groups.extend(self.constraint_groups(e)?);
+                }
+                Some(groups)
+            }
+            v::SubtypeConstraint::Record(els) => {
+                let mut group = Vec::new();
+                for el in els {
+                    let id = self.ident(&el.ident);
+                    let mut n = Name {
+                        span: id.span.clone(),
+                        kind: NameKind::Simple(id),
+                    };
+                    let cs = self.span(el.constraint.span);
+                    for g in self.constraint_groups(&el.constraint)? {
+                        n = Name {
+                            span: n.span.start..cs.end,
+                            kind: NameKind::Call(Box::new(n), g),
+                        };
+                    }
+                    let s = n.span.clone();
+                    group.push(Assoc {
+                        formal: None,
+                        actual: Actual::Expr(Expr {
+                            span: s.clone(),
+                            kind: ExprKind::Name(n),
+                        }),
+                        span: s,
+                    });
+                }
+                Some(vec![group])
+            }
+        }
+    }
+
+    fn range(&mut self, r: &v::Range) -> Option<RangeExpr> {
+        match r {
+            v::Range::Range(rc) => {
+                let left = self.expr(&rc.left_expr)?;
+                let right = self.expr(&rc.right_expr)?;
+                let span = left.span.start..right.span.end;
+                Some(RangeExpr::Explicit {
+                    left: Box::new(left),
+                    dir: match rc.direction {
+                        v::Direction::Ascending => Dir::To,
+                        v::Direction::Descending => Dir::Downto,
+                    },
+                    right: Box::new(right),
+                    span,
+                })
+            }
+            v::Range::Attribute(a) => Some(RangeExpr::Attr(self.attribute_name(a)?)),
+        }
+    }
+
+    /// A discrete range where the earlier parser saw an expression (a slice
+    /// or an index constraint).
+    fn discrete_range_expr(&mut self, d: &v::DiscreteRange, span: Span) -> Option<Expr> {
+        Some(match d {
+            v::DiscreteRange::Range(v::Range::Attribute(a)) => Expr {
+                kind: ExprKind::Name(self.attribute_name(a)?),
+                span,
+            },
+            v::DiscreteRange::Range(r) => range_expr(self.range(r)?, span),
+            v::DiscreteRange::Discrete(mark, None) => Expr {
+                kind: ExprKind::Name(self.name(mark)?),
+                span,
+            },
+            v::DiscreteRange::Discrete(_, Some(r)) => range_expr(self.range(r)?, span),
+        })
+    }
+
+    fn discrete_range(&mut self, d: &v::DiscreteRange) -> Option<DiscreteRange> {
+        Some(match d {
+            v::DiscreteRange::Range(r) => DiscreteRange::Range(self.range(r)?),
+            v::DiscreteRange::Discrete(mark, r) => {
+                let constraint = match r {
+                    Some(r) => Some(Constraint::Range(self.range(r)?)),
+                    None => None,
+                };
+                let span = self.span(mark.span);
+                let span = match &constraint {
+                    Some(Constraint::Range(RangeExpr::Explicit { span: rs, .. })) => {
+                        span.start..rs.end
+                    }
+                    _ => span,
+                };
+                DiscreteRange::Subtype(SubtypeInd {
+                    resolution: None,
+                    mark: self.name(mark)?,
+                    constraint,
+                    span,
+                })
+            }
+        })
+    }
+
+    /// `range implementation_defined` (STD.STANDARD), carried by the parser
+    /// as `implementation_defined'range`.
+    fn is_implementation_defined(r: &v::Range) -> bool {
+        matches!(r, v::Range::Attribute(a)
+            if matches!(&a.name.item, v::Name::Designator(d)
+                if matches!(&d.item, v::Designator::Identifier(s)
+                    if s.name().bytes.eq_ignore_ascii_case(b"implementation_defined"))))
+    }
+
+    fn type_def(&mut self, d: &v::TypeDefinition, span: Span) -> Option<TypeDef> {
+        Some(match d {
+            v::TypeDefinition::Enumeration(lits) => TypeDef::Enum(
+                lits.iter()
+                    .map(|l| match &l.tree.item {
+                        v::EnumerationLiteral::Identifier(s) => EnumLit::Ident(Ident {
+                            name: fold(&latin1(&s.name().bytes)),
+                            span: self.tok_span(l.tree.token),
+                        }),
+                        v::EnumerationLiteral::Character(c) => {
+                            EnumLit::Char(*c, self.tok_span(l.tree.token))
+                        }
+                    })
+                    .collect(),
+            ),
+            v::TypeDefinition::Numeric(r) => {
+                if Self::is_implementation_defined(r) {
+                    TypeDef::ImplementationDefined
+                } else {
+                    TypeDef::Range(self.range(r)?)
+                }
+            }
+            v::TypeDefinition::Physical(p) => {
+                let range = if Self::is_implementation_defined(&p.range) {
+                    RangeExpr::Attr(Name {
+                        kind: NameKind::Simple(Ident {
+                            name: "implementation_defined".into(),
+                            span: span.clone(),
+                        }),
+                        span: span.clone(),
+                    })
+                } else {
+                    self.range(&p.range)?
+                };
+                let mut secondary = Vec::new();
+                for (name, lit) in &p.secondary_units {
+                    let s = self.span(lit.span);
+                    secondary.push((self.ident(&name.tree), self.physical_literal(&lit.item, s)));
+                }
+                TypeDef::Physical {
+                    range,
+                    primary: self.ident(&p.primary_unit.tree),
+                    secondary,
+                }
+            }
+            v::TypeDefinition::Array(indexes, _, elem) => {
+                let unbounded = indexes
+                    .iter()
+                    .all(|i| matches!(i, v::ArrayIndex::IndexSubtypeDefintion(_)));
+                let index = if unbounded {
+                    let mut marks = Vec::new();
+                    for i in indexes {
+                        if let v::ArrayIndex::IndexSubtypeDefintion(m) = i {
+                            marks.push(self.name(m)?);
+                        }
+                    }
+                    ArrayIndex::Unbounded(marks)
+                } else {
+                    let mut ranges = Vec::new();
+                    for i in indexes {
+                        match i {
+                            v::ArrayIndex::Discrete(dr) => ranges.push(self.discrete_range(&dr.item)?),
+                            v::ArrayIndex::IndexSubtypeDefintion(m) => {
+                                let s = self.span(m.span);
+                                self.unsupported(s, "a mix of constrained and unbounded indexes");
+                                return None;
+                            }
+                        }
+                    }
+                    ArrayIndex::Constrained(ranges)
+                };
+                TypeDef::Array {
+                    index,
+                    elem: self.subtype_ind(elem)?,
+                }
+            }
+            v::TypeDefinition::Record(els) => {
+                let mut fields = Vec::new();
+                for e in els {
+                    fields.push((self.idents(&e.idents), self.subtype_ind(&e.subtype)?));
+                }
+                TypeDef::Record(fields)
+            }
+            v::TypeDefinition::Access(s) => TypeDef::Access(self.subtype_ind(s)?),
+            v::TypeDefinition::File(n) => TypeDef::File(self.name(n)?),
+            v::TypeDefinition::Protected(p) => {
+                let mut decls = Vec::new();
+                for item in &p.items {
+                    match item {
+                        v::ProtectedTypeDeclarativeItem::Subprogram(s) => {
+                            if let Some(spec) = self.subprogram_spec(&s.specification) {
+                                decls.push(Decl::SubprogramDecl(spec));
+                            }
+                        }
+                    }
+                }
+                TypeDef::Protected(decls)
+            }
+            v::TypeDefinition::ProtectedBody(b) => TypeDef::ProtectedBody(self.decls(&b.decl)),
+            v::TypeDefinition::Incomplete(_) | v::TypeDefinition::Subtype(_) => {
+                self.err(span, "VHDL: internal: unexpected type definition");
+                return None;
+            }
+        })
+    }
+
+    // ---- declarations ------------------------------------------------------------
+
+    pub fn decls(&mut self, l: &[WithTokenSpan<v::Declaration>]) -> Vec<Decl> {
+        let mut out = Vec::new();
+        for d in l {
+            if let Some(d) = self.decl(d) {
+                out.push(d);
+            }
+        }
+        out
+    }
+
+    fn object_decl(&mut self, o: &v::ObjectDeclaration, span: Span) -> Option<ObjectDecl> {
+        let value = match &o.expression {
+            Some(e) => Some(self.cond_expr(e)?),
+            None => None,
+        };
+        Some(ObjectDecl {
+            names: self.idents(&o.idents),
+            ty: self.subtype_ind(&o.subtype_indication)?,
+            value,
+            span,
+        })
+    }
+
+    fn decl(&mut self, d: &WithTokenSpan<v::Declaration>) -> Option<Decl> {
+        let span = self.span(d.span);
+        Some(match &d.item {
+            v::Declaration::Object(o) => {
+                let obj = self.object_decl(o, span)?;
+                match o.class {
+                    v::ObjectClass::Constant => Decl::Constant(obj),
+                    v::ObjectClass::Signal => Decl::Signal {
+                        obj,
+                        kind: o.signal_kind.map(|k| match k {
+                            v::SignalKind::Register => SignalKind::Register,
+                            v::SignalKind::Bus => SignalKind::Bus,
+                        }),
+                    },
+                    v::ObjectClass::Variable => Decl::Variable { obj, shared: false },
+                    v::ObjectClass::SharedVariable => Decl::Variable { obj, shared: true },
+                }
+            }
+            v::Declaration::File(f) => {
+                let open = match &f.file_name {
+                    Some((_, name)) => Some(FileOpen {
+                        kind: match &f.open_info {
+                            Some((_, k)) => Some(self.expr(k)?),
+                            None => None,
+                        },
+                        name: self.expr(name)?,
+                    }),
+                    None => None,
+                };
+                Decl::File {
+                    names: self.idents(&f.idents),
+                    ty: self.subtype_ind(&f.subtype_indication)?,
+                    open,
+                    span,
+                }
+            }
+            v::Declaration::Type(t) => match &t.def {
+                v::TypeDefinition::Incomplete(_) => Decl::Type(TypeDecl {
+                    name: self.ident(&t.ident.tree),
+                    def: None,
+                    span,
+                }),
+                v::TypeDefinition::Subtype(s) => Decl::Subtype {
+                    name: self.ident(&t.ident.tree),
+                    ind: self.subtype_ind(s)?,
+                    span,
+                },
+                def => Decl::Type(TypeDecl {
+                    name: self.ident(&t.ident.tree),
+                    def: Some(self.type_def(def, span.clone())?),
+                    span,
+                }),
+            },
+            v::Declaration::Component(c) => Decl::Component(ComponentDecl {
+                name: self.ident(&c.ident.tree),
+                generics: self.interface_list(c.generic_list.as_ref()),
+                ports: self.interface_list(c.port_list.as_ref()),
+                span,
+            }),
+            v::Declaration::Attribute(v::Attribute::Declaration(a)) => Decl::Attribute {
+                name: self.ident(&a.ident.tree),
+                mark: self.name(&a.type_mark)?,
+                span,
+            },
+            v::Declaration::Attribute(v::Attribute::Specification(a)) => {
+                let (entities, all_or_others) = match &a.entity_name {
+                    v::EntityName::Name(tag) => {
+                        let mut v = Vec::new();
+                        if let v::Designator::Identifier(sym) = &tag.designator.item.item {
+                            v.push(Ident {
+                                name: fold(&latin1(&sym.name().bytes)),
+                                span: self.tok_span(tag.designator.token),
+                            });
+                        }
+                        (v, false)
+                    }
+                    v::EntityName::All | v::EntityName::Others => (Vec::new(), true),
+                };
+                Decl::AttributeSpec(AttributeSpec {
+                    attr: self.ident(&a.ident.item),
+                    entities,
+                    all_or_others,
+                    class: format!("{:?}", a.entity_class).to_ascii_lowercase(),
+                    value: self.cond_expr(&a.expr)?,
+                    span,
+                })
+            }
+            v::Declaration::Alias(a) => {
+                let d = &a.designator.tree;
+                let name = match &d.item {
+                    v::Designator::Identifier(sym) => Designator::Ident(Ident {
+                        name: fold(&latin1(&sym.name().bytes)),
+                        span: self.tok_span(d.token),
+                    }),
+                    v::Designator::OperatorSymbol(op) => {
+                        Designator::Op(op_text(*op).to_string(), self.tok_span(d.token))
+                    }
+                    v::Designator::Character(c) => {
+                        Designator::Op((*c as char).to_string(), self.tok_span(d.token))
+                    }
+                    v::Designator::Anonymous(_) => {
+                        self.err(span, "VHDL: internal: anonymous alias");
+                        return None;
+                    }
+                };
+                let ty = match &a.subtype_indication {
+                    Some(s) => Some(self.subtype_ind(s)?),
+                    None => None,
+                };
+                let signature = match &a.signature {
+                    Some(s) => Some(self.signature(&s.item)?),
+                    None => None,
+                };
+                Decl::Alias {
+                    name,
+                    ty,
+                    target: self.name(&a.name)?,
+                    signature,
+                    span,
+                }
+            }
+            v::Declaration::SubprogramDeclaration(s) => {
+                Decl::SubprogramDecl(self.subprogram_spec(&s.specification)?)
+            }
+            v::Declaration::SubprogramBody(b) => Decl::SubprogramBody(SubprogramBody {
+                spec: self.subprogram_spec(&b.specification)?,
+                decls: self.decls(&b.declarations),
+                stmts: self.seq_stmts(&b.statements),
+                span,
+            }),
+            v::Declaration::SubprogramInstantiation(i) => {
+                if let Some(s) = &i.signature {
+                    let ss = self.span(s.span);
+                    self.unsupported(ss, "signatures in subprogram instantiations");
+                }
+                let spec_kind = match i.kind {
+                    v::SubprogramKind::Function => SubprogramKind::Function {
+                        pure: true,
+                        ret: Name {
+                            kind: NameKind::Simple(Ident {
+                                name: String::new(),
+                                span: span.clone(),
+                            }),
+                            span: span.clone(),
+                        },
+                    },
+                    v::SubprogramKind::Procedure => SubprogramKind::Procedure,
+                };
+                Decl::SubprogramInst {
+                    spec_kind,
+                    name: self.ident(&i.ident.tree),
+                    uninst: self.name(&i.subprogram_name)?,
+                    generic_map: self.map_aspect(i.generic_map.as_ref()),
+                    span,
+                }
+            }
+            v::Declaration::Use(u) => Decl::Use(self.names(&u.name_list)),
+            v::Declaration::Package(p) => Decl::PackageInst(Box::new(self.package_inst(p, span)?)),
+            v::Declaration::Configuration(c) => Decl::ConfigSpec(ConfigSpec {
+                spec: self.component_spec(&c.spec)?,
+                binding: self.binding(&c.bind_ind)?,
+                span,
+            }),
+            v::Declaration::Disconnection(d) => {
+                let signals = match &d.signals {
+                    v::GuardedSignalList::All => SignalList::All,
+                    v::GuardedSignalList::Others => SignalList::Others,
+                    v::GuardedSignalList::Names(ns) => {
+                        let mut out = Vec::new();
+                        for n in ns {
+                            match self.name(n)?.kind {
+                                NameKind::Simple(i) => out.push(i),
+                                _ => {
+                                    let s = self.span(n.span);
+                                    self.err(s, "VHDL: a guarded signal name was expected");
+                                    return None;
+                                }
+                            }
+                        }
+                        SignalList::Names(out)
+                    }
+                };
+                Decl::Disconnect(DisconnectSpec {
+                    signals,
+                    mark: self.name(&d.type_mark)?,
+                    after: self.expr(&d.after)?,
+                    span,
+                })
+            }
+            v::Declaration::View(_) => {
+                self.unsupported(span, "a mode view declaration");
+                return None;
+            }
+        })
+    }
+
+    fn signature(&mut self, s: &v::Signature) -> Option<Signature> {
+        let (params, ret) = match s {
+            v::Signature::Function(p, r) => (p, Some(r)),
+            v::Signature::Procedure(p) => (p, None),
+        };
+        Some(Signature {
+            params: self.names(params),
+            ret: match ret {
+                Some(r) => Some(self.name(r)?),
+                None => None,
+            },
+        })
+    }
+
+    // ---- configurations --------------------------------------------------------------
+
+    fn block_config(&mut self, b: &v::BlockConfiguration) -> Option<BlockConfig> {
+        let span = self.has_span(b);
+        if !b.use_clauses.is_empty() {
+            self.unsupported(span.clone(), "this configuration item");
+        }
+        let mut items = Vec::new();
+        for i in &b.items {
+            match i {
+                v::ConfigurationItem::Block(b) => items.extend(self.block_config(b).map(ConfigItem::Block)),
+                v::ConfigurationItem::Component(c) => items.extend(
+                    self.component_config(c)
+                        .map(|c| ConfigItem::Component(Box::new(c))),
+                ),
+            }
+        }
+        Some(BlockConfig {
+            spec: self.name(&b.block_spec)?,
+            items,
+            span,
+        })
+    }
+
+    fn component_config(&mut self, c: &v::ComponentConfiguration) -> Option<ComponentConfig> {
+        let span = self.has_span(c);
+        let binding = match &c.bind_ind {
+            Some(b) => Some(self.binding(b)?),
+            None => None,
+        };
+        Some(ComponentConfig {
+            spec: self.component_spec(&c.spec)?,
+            binding,
+            block: c.block_config.as_ref().and_then(|b| self.block_config(b)),
+            span,
+        })
+    }
+
+    fn component_spec(&mut self, c: &v::ComponentSpecification) -> Option<ComponentSpec> {
+        let insts = match &c.instantiation_list {
+            v::InstantiationList::All => InstList::All,
+            v::InstantiationList::Others => InstList::Others,
+            v::InstantiationList::Labels(l) => {
+                InstList::Labels(l.iter().map(|i| self.ident(i)).collect())
+            }
+        };
+        Some(ComponentSpec {
+            insts,
+            comp: self.name(&c.component_name)?,
+        })
+    }
+
+    fn binding(&mut self, b: &v::BindingIndication) -> Option<BindingInd> {
+        let span = self.has_span(b);
+        let aspect = match &b.entity_aspect {
+            None => None,
+            Some(v::EntityAspect::Entity(n, arch)) => Some(EntityAspect::Entity(
+                self.name(n)?,
+                arch.as_ref().map(|a| self.ident(a)),
+            )),
+            Some(v::EntityAspect::Configuration(n)) => {
+                Some(EntityAspect::Configuration(self.name(n)?))
+            }
+            Some(v::EntityAspect::Open) => Some(EntityAspect::Open),
+        };
+        Some(BindingInd {
+            aspect,
+            generic_map: self.map_aspect(b.generic_map.as_ref()),
+            port_map: self.map_aspect(b.port_map.as_ref()),
+            span,
+        })
+    }
+
+    fn map_aspect(&mut self, m: Option<&v::MapAspect>) -> Vec<Assoc> {
+        match m {
+            Some(m) => self.assoc_list(&m.list.items),
+            None => Vec::new(),
+        }
+    }
+
+    fn assoc_list(&mut self, l: &[v::AssociationElement]) -> Vec<Assoc> {
+        let mut out = Vec::new();
+        for a in l {
+            let formal = a.formal.as_ref().and_then(|f| self.name(f));
+            let aspan = self.span(a.actual.span);
+            let actual = match &a.actual.item {
+                v::ActualPart::Open => Actual::Open(aspan.clone()),
+                v::ActualPart::Expression(e) => {
+                    let Some(e) = self.cond_expr_at(e, aspan.clone()) else {
+                        continue;
+                    };
+                    Actual::Expr(e)
+                }
+            };
+            let start = a.formal.as_ref().map_or(aspan.start, |f| self.span(f.span).start);
+            out.push(Assoc {
+                formal,
+                actual,
+                span: start..aspan.end,
+            });
+        }
+        out
+    }
+
+    // ---- names -------------------------------------------------------------------
+
+    pub fn name(&mut self, n: &WithTokenSpan<v::Name>) -> Option<Name> {
+        let span = self.span(n.span);
+        self.name_at(&n.item, span)
+    }
+
+    fn name_at(&mut self, n: &v::Name, span: Span) -> Option<Name> {
+        let kind = match n {
+            v::Name::Designator(d) => match &d.item {
+                v::Designator::Identifier(s) => NameKind::Simple(Ident {
+                    name: fold(&latin1(&s.name().bytes)),
+                    span: span.clone(),
+                }),
+                v::Designator::OperatorSymbol(op) => NameKind::Op(op_text(*op).to_string()),
+                v::Designator::Character(c) => NameKind::Char(*c),
+                v::Designator::Anonymous(_) => {
+                    self.err(span, "VHDL: internal: anonymous name");
+                    return None;
+                }
+            },
+            v::Name::Selected(prefix, suffix) => {
+                let p = self.name(prefix)?;
+                let ss = self.tok_span(suffix.token);
+                let s = match &suffix.item.item {
+                    v::Designator::Identifier(sym) => Suffix::Ident(Ident {
+                        name: fold(&latin1(&sym.name().bytes)),
+                        span: ss,
+                    }),
+                    v::Designator::Character(c) => Suffix::Char(*c, ss),
+                    v::Designator::OperatorSymbol(op) => Suffix::Op(op_text(*op).to_string(), ss),
+                    v::Designator::Anonymous(_) => {
+                        self.err(ss, "VHDL: internal: anonymous name");
+                        return None;
+                    }
+                };
+                NameKind::Selected(Box::new(p), s)
+            }
+            v::Name::SelectedAll(prefix) => {
+                let p = self.name(prefix)?;
+                let all = span.end.saturating_sub(3)..span.end;
+                NameKind::Selected(Box::new(p), Suffix::All(all))
+            }
+            v::Name::Slice(prefix, dr) => {
+                let p = self.name(prefix)?;
+                let rs = p.span.end..span.end;
+                let e = self.discrete_range_expr(dr, rs.clone())?;
+                NameKind::Call(
+                    Box::new(p),
+                    vec![Assoc {
+                        formal: None,
+                        actual: Actual::Expr(e),
+                        span: rs,
+                    }],
+                )
+            }
+            v::Name::Attribute(a) => return self.attribute_name(a).map(|mut x| {
+                x.span = span;
+                x
+            }),
+            v::Name::CallOrIndexed(c) => {
+                let p = self.name(&c.name)?;
+                NameKind::Call(Box::new(p), self.assoc_list(&c.parameters.items))
+            }
+            v::Name::External(x) => {
+                let class = match x.class {
+                    v::ExternalObjectClass::Constant => ObjClass::Constant,
+                    v::ExternalObjectClass::Signal => ObjClass::Signal,
+                    v::ExternalObjectClass::Variable => ObjClass::Variable,
+                };
+                let ps = self.span(x.path.span);
+                let path: String = self
+                    .text_of(&ps)
+                    .split_whitespace()
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                NameKind::External {
+                    class,
+                    path,
+                    ty: Box::new(self.subtype_ind(&x.subtype)?),
+                }
+            }
+        };
+        Some(Name { kind, span })
+    }
+
+    /// `p'attr` and `p'attr(e)`: the parameter of an attribute that takes
+    /// one, else a call of the attribute's value.
+    fn attribute_name(&mut self, a: &v::AttributeName) -> Option<Name> {
+        let prefix = self.name(&a.name)?;
+        if let Some(s) = &a.signature {
+            let ss = self.span(s.span);
+            self.unsupported(ss, "signatures in names");
+        }
+        let aspan = self.tok_span(a.attr.token);
+        let attr = Ident {
+            name: attr_text(&a.attr.item),
+            span: aspan.clone(),
+        };
+        let start = prefix.span.start;
+        match &a.expr {
+            None => Some(Name {
+                span: start..aspan.end,
+                kind: NameKind::Attribute(Box::new(prefix), attr, None),
+            }),
+            Some(e) => {
+                let ex = self.expr(e)?;
+                let end = ex.span.end + 1;
+                if takes_param(&attr.name) {
+                    Some(Name {
+                        span: start..end,
+                        kind: NameKind::Attribute(Box::new(prefix), attr, Some(Box::new(ex))),
+                    })
+                } else {
+                    let base = Name {
+                        span: start..aspan.end,
+                        kind: NameKind::Attribute(Box::new(prefix), attr, None),
+                    };
+                    let es = ex.span.clone();
+                    Some(Name {
+                        span: start..end,
+                        kind: NameKind::Call(
+                            Box::new(base),
+                            vec![Assoc {
+                                formal: None,
+                                actual: Actual::Expr(ex),
+                                span: es,
+                            }],
+                        ),
+                    })
+                }
+            }
+        }
+    }
+
+    // ---- expressions ---------------------------------------------------------------
+
+    /// A conditional expression (VHDL-2019) where a plain expression is
+    /// expected.
+    fn cond_expr(&mut self, e: &WithTokenSpan<v::ConditionalExpression>) -> Option<Expr> {
+        let span = self.span(e.span);
+        self.cond_expr_at(&e.item, span)
+    }
+
+    fn cond_expr_at(&mut self, e: &v::ConditionalExpression, span: Span) -> Option<Expr> {
+        match e {
+            v::ConditionalExpression::Simple(x) => self.expr_at(x, span),
+            v::ConditionalExpression::Conditional(_) => {
+                self.unsupported(span, "a conditional expression");
+                None
+            }
+        }
+    }
+
+    pub fn expr(&mut self, e: &WithTokenSpan<v::Expression>) -> Option<Expr> {
+        let span = self.span(e.span);
+        self.expr_at(&e.item, span)
+    }
+
+    fn expr_at(&mut self, e: &v::Expression, span: Span) -> Option<Expr> {
+        let kind = match e {
+            v::Expression::Binary(op, l, r) => {
+                use v::Operator::*;
+                let bop = match op.item.item {
+                    Plus => BinOp::Add,
+                    Minus => BinOp::Sub,
+                    EQ => BinOp::Eq,
+                    NE => BinOp::Ne,
+                    LT => BinOp::Lt,
+                    LTE => BinOp::Le,
+                    GT => BinOp::Gt,
+                    GTE => BinOp::Ge,
+                    QueEQ => BinOp::MatchEq,
+                    QueNE => BinOp::MatchNe,
+                    QueLT => BinOp::MatchLt,
+                    QueLTE => BinOp::MatchLe,
+                    QueGT => BinOp::MatchGt,
+                    QueGTE => BinOp::MatchGe,
+                    Times => BinOp::Mul,
+                    Pow => BinOp::Pow,
+                    Div => BinOp::Div,
+                    Concat => BinOp::Concat,
+                    And => BinOp::And,
+                    Or => BinOp::Or,
+                    Nand => BinOp::Nand,
+                    Nor => BinOp::Nor,
+                    Xor => BinOp::Xor,
+                    Xnor => BinOp::Xnor,
+                    SLL => BinOp::Sll,
+                    SRL => BinOp::Srl,
+                    SLA => BinOp::Sla,
+                    SRA => BinOp::Sra,
+                    ROL => BinOp::Rol,
+                    ROR => BinOp::Ror,
+                    Mod => BinOp::Mod,
+                    Rem => BinOp::Rem,
+                    Abs | Not | QueQue => {
+                        self.err(span, "VHDL: internal: unexpected binary operator");
+                        return None;
+                    }
+                };
+                ExprKind::Binary(bop, Box::new(self.expr(l)?), Box::new(self.expr(r)?))
+            }
+            v::Expression::Unary(op, x) => {
+                use v::Operator::*;
+                let uop = match op.item.item {
+                    Plus => UnOp::Plus,
+                    Minus => UnOp::Minus,
+                    QueQue => UnOp::Cond,
+                    Abs => UnOp::Abs,
+                    Not => UnOp::Not,
+                    And => UnOp::And,
+                    Or => UnOp::Or,
+                    Nand => UnOp::Nand,
+                    Nor => UnOp::Nor,
+                    Xor => UnOp::Xor,
+                    Xnor => UnOp::Xnor,
+                    _ => {
+                        self.err(span, "VHDL: internal: unexpected unary operator");
+                        return None;
+                    }
+                };
+                ExprKind::Unary(uop, Box::new(self.expr(x)?))
+            }
+            v::Expression::Aggregate(items) => {
+                let assocs = self.elem_assocs(items)?;
+                match assocs.as_slice() {
+                    [ElemAssoc { choices, value }] if choices.is_empty() => {
+                        ExprKind::Paren(Box::new(value.clone()))
+                    }
+                    _ => ExprKind::Aggregate(assocs),
+                }
+            }
+            v::Expression::Qualified(q) => {
+                let mark = self.name(&q.type_mark)?;
+                let inner = self.expr(&q.expr)?;
+                let inner = match inner.kind {
+                    ExprKind::Paren(_) | ExprKind::Aggregate(_) => inner,
+                    _ => Expr {
+                        span: inner.span.clone(),
+                        kind: ExprKind::Paren(Box::new(inner)),
+                    },
+                };
+                ExprKind::Qualified(mark, Box::new(inner))
+            }
+            v::Expression::Name(n) => {
+                let nm = self.name_at(n, span.clone())?;
+                match nm.kind {
+                    // A bare operator symbol in an expression is a string
+                    // literal.
+                    NameKind::Op(s) => ExprKind::Lit(Literal::Str(s.bytes().collect())),
+                    k => ExprKind::Name(Name {
+                        kind: k,
+                        span: nm.span,
+                    }),
+                }
+            }
+            v::Expression::Literal(l) => match l {
+                v::Literal::Physical(p) => return Some(self.physical_literal(p, span)),
+                l => ExprKind::Lit(self.literal(l, &span)?),
+            },
+            v::Expression::New(a) => match &a.item {
+                v::Allocator::Qualified(q) => {
+                    let qs = self.span(a.span);
+                    let mark = self.name(&q.type_mark)?;
+                    let inner = self.expr(&q.expr)?;
+                    let inner = match inner.kind {
+                        ExprKind::Paren(_) | ExprKind::Aggregate(_) => inner,
+                        _ => Expr {
+                            span: inner.span.clone(),
+                            kind: ExprKind::Paren(Box::new(inner)),
+                        },
+                    };
+                    ExprKind::New(Box::new(Expr {
+                        span: qs,
+                        kind: ExprKind::Qualified(mark, Box::new(inner)),
+                    }))
+                }
+                v::Allocator::Subtype(s) => ExprKind::NewSubtype(Box::new(self.subtype_ind(s)?)),
+            },
+            v::Expression::Parenthesized(c) => {
+                let cs = self.span(c.span);
+                let inner = self.cond_expr_at(&c.item, cs)?;
+                ExprKind::Paren(Box::new(inner))
+            }
+        };
+        Some(Expr { kind, span })
+    }
+
+    fn literal(&mut self, l: &v::Literal, span: &Span) -> Option<Literal> {
+        Some(match l {
+            v::Literal::String(s) => Literal::Str(s.bytes.clone()),
+            v::Literal::Character(c) => Literal::Char(*c),
+            v::Literal::AbstractLiteral(a) => abstract_literal(a),
+            v::Literal::BitString(b) => {
+                let base = match b.base {
+                    v::BaseSpecifier::B => "b",
+                    v::BaseSpecifier::O => "o",
+                    v::BaseSpecifier::X => "x",
+                    v::BaseSpecifier::UB => "ub",
+                    v::BaseSpecifier::UO => "uo",
+                    v::BaseSpecifier::UX => "ux",
+                    v::BaseSpecifier::SB => "sb",
+                    v::BaseSpecifier::SO => "so",
+                    v::BaseSpecifier::SX => "sx",
+                    v::BaseSpecifier::D => "d",
+                };
+                let text = format!(
+                    "{}{}\"{}\"",
+                    b.length.map(|n| n.to_string()).unwrap_or_default(),
+                    base,
+                    latin1(&b.value.bytes)
+                );
+                match expand_bit_string(&text) {
+                    Ok(v) => Literal::BitStr(v),
+                    Err(m) => {
+                        self.err(span.clone(), format!("VHDL: {}", m));
+                        return None;
+                    }
+                }
+            }
+            v::Literal::Null => Literal::Null,
+            v::Literal::Physical(_) => {
+                self.err(span.clone(), "VHDL: internal: unexpected literal");
+                return None;
+            }
+        })
+    }
+
+    fn physical_literal(&mut self, p: &v::PhysicalLiteral, span: Span) -> Expr {
+        let unit = self.ident(&p.unit.item);
+        Expr {
+            kind: ExprKind::Lit(Literal::Physical(
+                Box::new(abstract_literal(&p.value)),
+                Name {
+                    span: unit.span.clone(),
+                    kind: NameKind::Simple(unit),
+                },
+            )),
+            span,
+        }
+    }
+
+    fn elem_assocs(&mut self, items: &[WithTokenSpan<v::ElementAssociation>]) -> Option<Vec<ElemAssoc>> {
+        let mut out = Vec::new();
+        for a in items {
+            match &a.item {
+                v::ElementAssociation::Positional(e) => out.push(ElemAssoc {
+                    choices: Vec::new(),
+                    value: self.expr(e)?,
+                }),
+                v::ElementAssociation::Named(cs, e) => out.push(ElemAssoc {
+                    choices: self.choices(cs)?,
+                    value: self.expr(e)?,
+                }),
+            }
+        }
+        Some(out)
+    }
+
+    fn choices(&mut self, cs: &[WithTokenSpan<v::Choice>]) -> Option<Vec<Choice>> {
+        let mut out = Vec::new();
+        for c in cs {
+            let s = self.span(c.span);
+            out.push(match &c.item {
+                v::Choice::Others => Choice::Others(s),
+                v::Choice::Expression(e) => Choice::Expr(self.expr_at(e, s)?),
+                v::Choice::DiscreteRange(d) => Choice::Range(self.discrete_range(d)?),
+            });
+        }
+        Some(out)
+    }
+
+    // ---- concurrent statements --------------------------------------------------------
+
+    pub fn conc_stmts(&mut self, l: &[v::LabeledConcurrentStatement]) -> Vec<ConcStmt> {
+        let mut out = Vec::new();
+        for s in l {
+            if let Some(s) = self.conc_stmt(s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    fn label(&self, l: &v::WithDecl<Option<v::Ident>>) -> Option<Ident> {
+        l.tree.as_ref().map(|i| self.ident(i))
+    }
+
+    fn conc_stmt(&mut self, s: &v::LabeledConcurrentStatement) -> Option<ConcStmt> {
+        let label = self.label(&s.label);
+        let span = match &s.label.tree {
+            Some(l) => self.span2(l.token, s.statement.span.end_token),
+            None => self.span(s.statement.span),
+        };
+        let kind = match &s.statement.item {
+            v::ConcurrentStatement::Process(p) => ConcKind::Process {
+                postponed: p.postponed,
+                sens: p.sensitivity_list.as_ref().map(|l| match &l.item {
+                    v::SensitivityList::All => Sensitivity::All,
+                    v::SensitivityList::Names(ns) => Sensitivity::List(self.names(ns)),
+                }),
+                decls: self.decls(&p.decl),
+                stmts: self.seq_stmts(&p.statements),
+            },
+            v::ConcurrentStatement::Assignment(a) => ConcKind::SignalAssign {
+                postponed: a.postponed,
+                guarded: a.guarded,
+                target: self.target(&a.assignment.target)?,
+                delay: self.delay(a.assignment.delay_mechanism.as_ref()),
+                rhs: self.rhs_waveform(&a.assignment.rhs)?,
+            },
+            v::ConcurrentStatement::Assert(a) => {
+                let (cond, report, severity) = self.assertion(&a.statement)?;
+                ConcKind::Assert {
+                    postponed: a.postponed,
+                    cond,
+                    report,
+                    severity,
+                }
+            }
+            v::ConcurrentStatement::ProcedureCall(c) => ConcKind::ProcCall {
+                postponed: c.postponed,
+                call: self.call(&c.call)?,
+            },
+            v::ConcurrentStatement::Instance(i) => {
+                let unit = match &i.unit {
+                    v::InstantiatedUnit::Entity(n, arch) => {
+                        InstUnit::Entity(self.name(n)?, arch.as_ref().map(|a| self.ident(&a.item)))
+                    }
+                    v::InstantiatedUnit::Component(n) => InstUnit::Component(self.name(n)?),
+                    v::InstantiatedUnit::Configuration(n) => {
+                        InstUnit::Configuration(self.name(n)?)
+                    }
+                };
+                ConcKind::Instance {
+                    unit,
+                    generic_map: self.map_aspect(i.generic_map.as_ref()),
+                    port_map: self.map_aspect(i.port_map.as_ref()),
+                }
+            }
+            v::ConcurrentStatement::Block(b) => {
+                let guard = match &b.guard_condition {
+                    Some(g) => Some(self.expr(g)?),
+                    None => None,
+                };
+                ConcKind::Block {
+                    guard,
+                    generics: self.interface_list(b.header.generic_clause.as_ref()),
+                    generic_map: self.map_aspect(b.header.generic_map.as_ref()),
+                    ports: self.interface_list(b.header.port_clause.as_ref()),
+                    port_map: self.map_aspect(b.header.port_map.as_ref()),
+                    decls: self.decls(&b.decl),
+                    stmts: self.conc_stmts(&b.statements),
+                }
+            }
+            v::ConcurrentStatement::ForGenerate(g) => {
+                let (decls, stmts) = self.generate_body(&g.body);
+                ConcKind::ForGenerate {
+                    param: self.ident(&g.index_name.tree),
+                    range: self.discrete_range(&g.discrete_range)?,
+                    decls,
+                    stmts,
+                }
+            }
+            v::ConcurrentStatement::IfGenerate(g) => {
+                let mut branches = Vec::new();
+                for c in &g.conds.conditionals {
+                    let cond = self.expr(&c.condition);
+                    let (decls, stmts) = self.generate_body(&c.item);
+                    branches.push(GenerateBranch {
+                        alt_label: c.item.alternative_label.as_ref().map(|l| self.ident(&l.tree)),
+                        cond,
+                        choices: Vec::new(),
+                        decls,
+                        stmts,
+                    });
+                }
+                if let Some((body, _)) = &g.conds.else_item {
+                    let (decls, stmts) = self.generate_body(body);
+                    branches.push(GenerateBranch {
+                        alt_label: body.alternative_label.as_ref().map(|l| self.ident(&l.tree)),
+                        cond: None,
+                        choices: Vec::new(),
+                        decls,
+                        stmts,
+                    });
+                }
+                ConcKind::IfGenerate(branches)
+            }
+            v::ConcurrentStatement::CaseGenerate(g) => {
+                let mut branches = Vec::new();
+                for alt in &g.sels.alternatives {
+                    let choices = self.choices(&alt.choices)?;
+                    let (decls, stmts) = self.generate_body(&alt.item);
+                    branches.push(GenerateBranch {
+                        alt_label: alt.item.alternative_label.as_ref().map(|l| self.ident(&l.tree)),
+                        cond: None,
+                        choices,
+                        decls,
+                        stmts,
+                    });
+                }
+                ConcKind::CaseGenerate {
+                    expr: self.expr(&g.sels.expression)?,
+                    branches,
+                }
+            }
+        };
+        Some(ConcStmt { label, kind, span })
+    }
+
+    fn generate_body(&mut self, b: &v::GenerateBody) -> (Vec<Decl>, Vec<ConcStmt>) {
+        let decls = match &b.decl {
+            Some((d, _)) => self.decls(d),
+            None => Vec::new(),
+        };
+        (decls, self.conc_stmts(&b.statements))
+    }
+
+    /// A procedure call: the name, with its parameters when it has some.
+    fn call(&mut self, c: &WithTokenSpan<v::CallOrIndexed>) -> Option<Name> {
+        let span = self.span(c.span);
+        if c.item.parameters.items.is_empty() {
+            let mut n = self.name(&c.item.name)?;
+            n.span = span;
+            return Some(n);
+        }
+        let p = self.name(&c.item.name)?;
+        Some(Name {
+            kind: NameKind::Call(Box::new(p), self.assoc_list(&c.item.parameters.items)),
+            span,
+        })
+    }
+
+    fn target(&mut self, t: &WithTokenSpan<v::Target>) -> Option<Target> {
+        let span = self.span(t.span);
+        Some(match &t.item {
+            v::Target::Name(n) => Target::Name(self.name_at(n, span)?),
+            v::Target::Aggregate(a) => Target::Aggregate(self.elem_assocs(a)?, span),
+        })
+    }
+
+    fn delay(&mut self, d: Option<&WithTokenSpan<v::DelayMechanism>>) -> Option<DelayMech> {
+        match &d?.item {
+            v::DelayMechanism::Transport => Some(DelayMech::Transport),
+            v::DelayMechanism::Inertial { reject } => Some(DelayMech::Inertial(
+                reject.as_ref().and_then(|r| self.expr(r)),
+            )),
+        }
+    }
+
+    fn waveform(&mut self, w: &v::Waveform) -> Option<Waveform> {
+        Some(match w {
+            v::Waveform::Unaffected(t) => Waveform::Unaffected(self.tok_span(*t)),
+            v::Waveform::Elements(els) => {
+                let mut out = Vec::new();
+                for e in els {
+                    let value = self.expr(&e.value)?;
+                    let value = match value.kind {
+                        ExprKind::Lit(Literal::Null) => None,
+                        _ => Some(value),
+                    };
+                    let after = match &e.after {
+                        Some(a) => Some(self.expr(a)?),
+                        None => None,
+                    };
+                    out.push(WaveElem {
+                        value,
+                        after,
+                        span: self.has_span(e),
+                    });
+                }
+                Waveform::Elems(out)
+            }
+        })
+    }
+
+    fn rhs_waveform(&mut self, r: &v::AssignmentRightHand<v::Waveform>) -> Option<AssignRhs<Waveform>> {
+        Some(match r {
+            v::AssignmentRightHand::Simple(w) => AssignRhs::Simple(self.waveform(w)?),
+            v::AssignmentRightHand::Conditional(c) => {
+                let mut out = Vec::new();
+                for x in &c.conditionals {
+                    out.push((self.waveform(&x.item)?, self.expr(&x.condition)));
+                }
+                if let Some((w, _)) = &c.else_item {
+                    out.push((self.waveform(w)?, None));
+                }
+                AssignRhs::Cond(out)
+            }
+            v::AssignmentRightHand::Selected(s) => {
+                let mut items = Vec::new();
+                for alt in &s.alternatives {
+                    items.push((self.waveform(&alt.item)?, self.choices(&alt.choices)?));
+                }
+                AssignRhs::Select {
+                    expr: self.expr(&s.expression)?,
+                    matching: s.is_matching,
+                    items,
+                }
+            }
+        })
+    }
+
+    fn rhs_expr(
+        &mut self,
+        r: &v::AssignmentRightHand<WithTokenSpan<v::Expression>>,
+    ) -> Option<AssignRhs<Expr>> {
+        Some(match r {
+            v::AssignmentRightHand::Simple(e) => AssignRhs::Simple(self.expr(e)?),
+            v::AssignmentRightHand::Conditional(c) => {
+                let mut out = Vec::new();
+                for x in &c.conditionals {
+                    out.push((self.expr(&x.item)?, self.expr(&x.condition)));
+                }
+                if let Some((e, _)) = &c.else_item {
+                    out.push((self.expr(e)?, None));
+                }
+                AssignRhs::Cond(out)
+            }
+            v::AssignmentRightHand::Selected(s) => {
+                let mut items = Vec::new();
+                for alt in &s.alternatives {
+                    items.push((self.expr(&alt.item)?, self.choices(&alt.choices)?));
+                }
+                AssignRhs::Select {
+                    expr: self.expr(&s.expression)?,
+                    matching: s.is_matching,
+                    items,
+                }
+            }
+        })
+    }
+
+    fn assertion(&mut self, a: &v::AssertStatement) -> Option<(Expr, Option<Expr>, Option<Expr>)> {
+        let report = match &a.report {
+            Some(r) => Some(self.expr(r)?),
+            None => None,
+        };
+        let severity = match &a.severity {
+            Some(s) => Some(self.expr(s)?),
+            None => None,
+        };
+        Some((self.expr(&a.condition)?, report, severity))
+    }
+
+    // ---- sequential statements -----------------------------------------------------
+
+    pub fn seq_stmts(&mut self, l: &[v::LabeledSequentialStatement]) -> Vec<SeqStmt> {
+        let mut out = Vec::new();
+        for s in l {
+            if let Some(s) = self.seq_stmt(s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    fn seq_stmt(&mut self, s: &v::LabeledSequentialStatement) -> Option<SeqStmt> {
+        let label = self.label(&s.label);
+        let span = match &s.label.tree {
+            Some(l) => self.span2(l.token, s.statement.span.end_token),
+            None => self.span(s.statement.span),
+        };
+        let kind = match &s.statement.item {
+            v::SequentialStatement::Wait(w) => SeqKind::Wait {
+                on: w
+                    .sensitivity_clause
+                    .as_ref()
+                    .map(|l| self.names(l))
+                    .unwrap_or_default(),
+                until: match &w.condition_clause {
+                    Some(c) => Some(self.expr(c)?),
+                    None => None,
+                },
+                timeout: match &w.timeout_clause {
+                    Some(t) => Some(self.expr(t)?),
+                    None => None,
+                },
+            },
+            v::SequentialStatement::Assert(a) => {
+                let (cond, report, severity) = self.assertion(a)?;
+                SeqKind::Assert {
+                    cond,
+                    report,
+                    severity,
+                }
+            }
+            v::SequentialStatement::Report(r) => SeqKind::Report {
+                msg: self.expr(&r.report)?,
+                severity: match &r.severity {
+                    Some(x) => Some(self.expr(x)?),
+                    None => None,
+                },
+            },
+            v::SequentialStatement::VariableAssignment(a) => SeqKind::VarAssign {
+                target: self.target(&a.target)?,
+                rhs: self.rhs_expr(&a.rhs)?,
+            },
+            v::SequentialStatement::SignalAssignment(a) => SeqKind::SignalAssign {
+                target: self.target(&a.target)?,
+                delay: self.delay(a.delay_mechanism.as_ref()),
+                rhs: self.rhs_waveform(&a.rhs)?,
+            },
+            v::SequentialStatement::SignalForceAssignment(a) => SeqKind::Force {
+                target: self.target(&a.target)?,
+                mode: force_mode(&a.force_mode),
+                rhs: self.rhs_expr(&a.rhs)?,
+            },
+            v::SequentialStatement::SignalReleaseAssignment(a) => SeqKind::Release {
+                target: self.target(&a.target)?,
+                mode: force_mode(&a.force_mode),
+            },
+            v::SequentialStatement::ProcedureCall(c) => SeqKind::ProcCall(self.call(c)?),
+            v::SequentialStatement::If(i) => {
+                let mut branches = Vec::new();
+                for c in &i.conds.conditionals {
+                    branches.push((self.expr(&c.condition)?, self.seq_stmts(&c.item)));
+                }
+                SeqKind::If {
+                    branches,
+                    else_branch: i.conds.else_item.as_ref().map(|(b, _)| self.seq_stmts(b)),
+                }
+            }
+            v::SequentialStatement::Case(c) => {
+                let mut alts = Vec::new();
+                for alt in &c.alternatives {
+                    alts.push((self.choices(&alt.choices)?, self.seq_stmts(&alt.item)));
+                }
+                SeqKind::Case {
+                    matching: c.is_matching,
+                    expr: self.expr(&c.expression)?,
+                    alts,
+                }
+            }
+            v::SequentialStatement::Loop(l) => SeqKind::Loop {
+                scheme: match &l.iteration_scheme {
+                    None => LoopScheme::Plain,
+                    Some(v::IterationScheme::While(c)) => LoopScheme::While(self.expr(c)?),
+                    Some(v::IterationScheme::For(i, r)) => {
+                        LoopScheme::For(self.ident(&i.tree), self.discrete_range(r)?)
+                    }
+                },
+                body: self.seq_stmts(&l.statements),
+            },
+            v::SequentialStatement::Next(n) => SeqKind::Next {
+                label: n.loop_label.as_ref().map(|l| self.ident(&l.item)),
+                cond: match &n.condition {
+                    Some(c) => Some(self.expr(c)?),
+                    None => None,
+                },
+            },
+            v::SequentialStatement::Exit(n) => SeqKind::Exit {
+                label: n.loop_label.as_ref().map(|l| self.ident(&l.item)),
+                cond: match &n.condition {
+                    Some(c) => Some(self.expr(c)?),
+                    None => None,
+                },
+            },
+            v::SequentialStatement::Return(r) => SeqKind::Return(match &r.expression {
+                Some(e) => Some(self.expr(e)?),
+                None => None,
+            }),
+            v::SequentialStatement::Null => SeqKind::Null,
+        };
+        Some(SeqStmt { label, kind, span })
+    }
+}
+
+/// A range as an expression (a slice, an index constraint).
+fn range_expr(r: RangeExpr, span: Span) -> Expr {
+    match r {
+        RangeExpr::Attr(n) => Expr {
+            kind: ExprKind::Name(n),
+            span,
+        },
+        r => Expr {
+            kind: ExprKind::Range(Box::new(r)),
+            span,
+        },
+    }
+}
+
+fn abstract_literal(a: &v::AbstractLiteral) -> Literal {
+    match a {
+        v::AbstractLiteral::Integer(i) => Literal::Int(*i as i128),
+        v::AbstractLiteral::Real(r) => Literal::Real(*r),
     }
 }
 

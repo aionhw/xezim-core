@@ -1,0 +1,696 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at http://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
+
+use super::common::ParseResult;
+use super::names::{parse_selected_name, parse_type_mark, parse_type_mark_starting_with_name};
+use super::range::{parse_discrete_range, parse_range};
+use super::tokens::{kinds_error, Kind::*};
+use crate::ast::token_range::WithTokenSpan;
+/// LRM 6.3 Subtype declarations
+use crate::ast::*;
+use crate::syntax::names::parse_name;
+use crate::syntax::TokenId;
+use crate::TokenSpan;
+use vhdl_lang::syntax::parser::ParsingContext;
+
+fn parse_record_element_constraint(ctx: &mut ParsingContext<'_>) -> ParseResult<ElementConstraint> {
+    let ident = ctx.stream.expect_ident()?;
+    let constraint = Box::new(parse_composite_constraint(ctx)?);
+    Ok(ElementConstraint { ident, constraint })
+}
+
+fn parse_array_constraint(
+    ctx: &mut ParsingContext<'_>,
+    leftpar: TokenId,
+    // Open is None
+    initial: Option<WithTokenSpan<DiscreteRange>>,
+) -> ParseResult<WithTokenSpan<SubtypeConstraint>> {
+    let mut discrete_ranges: Vec<_> = initial.into_iter().collect();
+
+    let mut end_token = loop {
+        expect_token!(
+            ctx.stream, sep_token, sep_token_id,
+            RightPar => break sep_token_id,
+            Comma => {}
+        );
+        let start_token = ctx.stream.get_current_token_id();
+        let drange = parse_discrete_range(ctx)?;
+        let end_token = ctx.stream.get_last_token_id();
+
+        discrete_ranges.push(WithTokenSpan::new(
+            drange,
+            TokenSpan::new(start_token, end_token),
+        ));
+    };
+
+    // Array element constraint
+    let element_constraint = {
+        if let Some(elemement_constraint) = parse_subtype_constraint(ctx)? {
+            end_token = elemement_constraint.span.end_token;
+            Some(Box::new(elemement_constraint))
+        } else {
+            None
+        }
+    };
+
+    Ok(WithTokenSpan::from(
+        SubtypeConstraint::Array(discrete_ranges, element_constraint),
+        TokenSpan::new(leftpar, end_token),
+    ))
+}
+
+fn parse_composite_constraint(
+    ctx: &mut ParsingContext<'_>,
+) -> ParseResult<WithTokenSpan<SubtypeConstraint>> {
+    // There is no finite lookahead that can differentiate
+    // between array and record element constraint
+    let leftpar = ctx.stream.expect_kind(LeftPar)?;
+    let state = ctx.stream.state();
+
+    let mut initial = {
+        if ctx.stream.skip_if_kind(Open) {
+            // Array constraint open
+            Ok(None)
+        } else {
+            let start_token = ctx.stream.get_current_token_id();
+            let range = parse_discrete_range(ctx);
+            let end_token = ctx.stream.get_last_token_id();
+            range.map(|rng| {
+                Some(WithTokenSpan::new(
+                    rng,
+                    TokenSpan::new(start_token, end_token),
+                ))
+            })
+        }
+    };
+
+    if let Some(token) = ctx.stream.peek() {
+        match token.kind {
+            RightPar | Comma => {}
+            _ => {
+                initial = Err(
+                    kinds_error(ctx.stream.pos_before(token), &[RightPar, Comma])
+                        .when("parsing index constraint"),
+                );
+            }
+        }
+    }
+
+    if let Ok(initial) = initial {
+        // Array constraint
+        parse_array_constraint(ctx, leftpar, initial)
+    } else {
+        // Record constraint
+        ctx.stream.set_state(state);
+        let mut constraints = vec![parse_record_element_constraint(ctx)?];
+
+        let rightpar = loop {
+            expect_token!(
+                ctx.stream,
+                sep_token,
+                sep_token_id,
+                RightPar => break sep_token_id,
+                Comma => {}
+            );
+            constraints.push(parse_record_element_constraint(ctx)?);
+        };
+
+        Ok(WithTokenSpan::from(
+            SubtypeConstraint::Record(constraints),
+            TokenSpan::new(leftpar, rightpar),
+        ))
+    }
+}
+
+pub fn parse_subtype_constraint(
+    ctx: &mut ParsingContext<'_>,
+) -> ParseResult<Option<WithTokenSpan<SubtypeConstraint>>> {
+    if let Some(token) = ctx.stream.peek() {
+        let token_id = ctx.stream.get_current_token_id();
+        let constraint = match token.kind {
+            Range => {
+                ctx.stream.skip();
+                Some(
+                    parse_range(ctx)?
+                        .map_into(SubtypeConstraint::Range)
+                        .start_with(token_id),
+                )
+            }
+            LeftPar => Some(parse_composite_constraint(ctx)?),
+            _ => None,
+        };
+        Ok(constraint)
+    } else {
+        Ok(None)
+    }
+}
+
+// resolution_indication ::= name | ( element_resolution )
+pub fn parse_resolution_indication(
+    ctx: &mut ParsingContext<'_>,
+) -> ParseResult<ResolutionIndication> {
+    if ctx.stream.next_kind_is(LeftPar) {
+        parse_parenthesized_element_resolution(ctx)
+    } else {
+        parse_name(ctx).map(ResolutionIndication::FunctionName)
+    }
+}
+
+pub fn parse_parenthesized_element_resolution(
+    ctx: &mut ParsingContext<'_>,
+) -> ParseResult<ResolutionIndication> {
+    let start_token = ctx.stream.expect_kind(LeftPar)?;
+
+    let element = parse_element_resolution(ctx)?;
+
+    let end_token = ctx.stream.get_last_token_id();
+    Ok(ResolutionIndication::Element(WithTokenSpan::new(
+        element,
+        TokenSpan::new(start_token, end_token),
+    )))
+}
+
+pub fn parse_element_resolution(ctx: &mut ParsingContext<'_>) -> ParseResult<ElementResolution> {
+    Ok(
+        if ctx.stream.next_kind_is(Identifier)
+            && (ctx.stream.nth_kind_is(1, Identifier) || ctx.stream.nth_kind_is(1, LeftPar))
+        {
+            // record_resolution
+            let mut element_resolutions = Vec::new();
+            loop {
+                let ident = ctx.stream.expect_ident()?;
+                let resolution = parse_resolution_indication(ctx)?;
+                element_resolutions.push(RecordElementResolution {
+                    ident,
+                    resolution: Box::new(resolution),
+                });
+                expect_token!(
+                    ctx.stream,
+                    token,
+                    RightPar => break,
+                    Comma => {}
+                );
+            }
+            ElementResolution::Record(element_resolutions)
+        } else {
+            // array_element_resolution ::= resolution_indication
+            let resolution = parse_resolution_indication(ctx)?;
+            ctx.stream.expect_kind(RightPar)?;
+            ElementResolution::Array(Box::new(resolution))
+        },
+    )
+}
+
+pub fn parse_subtype_indication(ctx: &mut ParsingContext<'_>) -> ParseResult<SubtypeIndication> {
+    let (resolution, type_mark) = {
+        if ctx.stream.peek_kind() == Some(LeftPar) {
+            let resolution = parse_parenthesized_element_resolution(ctx)?;
+            let type_mark = parse_type_mark(ctx)?;
+            (Some(resolution), type_mark)
+        } else {
+            let selected_name = parse_selected_name(ctx)?;
+            match ctx.stream.peek_kind() {
+                Some(Identifier) => (
+                    Some(ResolutionIndication::FunctionName(selected_name)),
+                    parse_type_mark(ctx)?,
+                ),
+                _ => (
+                    None,
+                    parse_type_mark_starting_with_name(ctx, selected_name)?,
+                ),
+            }
+        }
+    };
+
+    let constraint = parse_subtype_constraint(ctx)?;
+
+    Ok(SubtypeIndication {
+        resolution,
+        type_mark,
+        constraint,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::syntax::test::Code;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parse_subtype_indication_without_constraint() {
+        let code = Code::new("std_logic");
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("std_logic").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_resolution_function() {
+        let code = Code::new("resolve std_logic");
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: Some(ResolutionIndication::FunctionName(
+                    code.s1("resolve").name()
+                )),
+                type_mark: code.s1("std_logic").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_array_element_resolution_function() {
+        let code = Code::new("(resolve) integer_vector");
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: Some(ResolutionIndication::Element(WithTokenSpan::new(
+                    ElementResolution::Array(Box::new(ResolutionIndication::FunctionName(
+                        code.s1("resolve").name()
+                    ))),
+                    code.s1("(resolve)").token_span()
+                ))),
+                type_mark: code.s1("integer_vector").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    // https://github.com/VHDL-LS/rust_hdl/issues/481
+    #[test]
+    fn parse_subtype_indication_with_nested_array_element_resolution_function() {
+        let code = Code::new("((resolved)) unresolved_slv_array");
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: Some(ResolutionIndication::Element(WithTokenSpan::new(
+                    ElementResolution::Array(Box::new(ResolutionIndication::Element(
+                        WithTokenSpan::new(
+                            ElementResolution::Array(Box::new(ResolutionIndication::FunctionName(
+                                code.s1("resolved").name()
+                            ))),
+                            code.s1("(resolved)").token_span()
+                        )
+                    ))),
+                    code.s1("((resolved))").token_span()
+                ))),
+                type_mark: code.s1("unresolved_slv_array").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_record_element_resolution_function() {
+        let code = Code::new("(elem resolve) rec_t");
+
+        let elem_resolution = RecordElementResolution {
+            ident: code.s1("elem").ident(),
+            resolution: Box::new(ResolutionIndication::FunctionName(
+                code.s1("resolve").name(),
+            )),
+        };
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: Some(ResolutionIndication::Element(WithTokenSpan::new(
+                    ElementResolution::Record(vec![elem_resolution]),
+                    code.s1("(elem resolve)").token_span()
+                ))),
+                type_mark: code.s1("rec_t").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_record_element_resolution_function_many() {
+        let code =
+            Code::new("(elem1 (resolve1), elem2 resolve2, elem3 (sub_elem sub_resolve)) rec_t");
+
+        let elem1_resolution = RecordElementResolution {
+            ident: code.s1("elem1").ident(),
+            resolution: Box::new(ResolutionIndication::Element(WithTokenSpan::new(
+                ElementResolution::Array(Box::new(ResolutionIndication::FunctionName(
+                    code.s1("resolve1").name(),
+                ))),
+                code.s1("(resolve1)").token_span(),
+            ))),
+        };
+
+        let elem2_resolution = RecordElementResolution {
+            ident: code.s1("elem2").ident(),
+            resolution: Box::new(ResolutionIndication::FunctionName(
+                code.s1("resolve2").name(),
+            )),
+        };
+
+        let sub_elem_resolution = RecordElementResolution {
+            ident: code.s1("sub_elem").ident(),
+            resolution: Box::new(ResolutionIndication::FunctionName(
+                code.s1("sub_resolve").name(),
+            )),
+        };
+
+        let elem3_resolution = RecordElementResolution {
+            ident: code.s1("elem3").ident(),
+            resolution: Box::new(ResolutionIndication::Element(WithTokenSpan::new(
+                ElementResolution::Record(vec![sub_elem_resolution]),
+                code.s1("(sub_elem sub_resolve)").token_span(),
+            ))),
+        };
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: Some(ResolutionIndication::Element(WithTokenSpan::new(
+                    ElementResolution::Record(vec![
+                        elem1_resolution,
+                        elem2_resolution,
+                        elem3_resolution
+                    ]),
+                    code.s1("(elem1 (resolve1), elem2 resolve2, elem3 (sub_elem sub_resolve))")
+                        .token_span()
+                ))),
+                type_mark: code.s1("rec_t").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_resolution_function_selected_name() {
+        let code = Code::new("lib.foo.resolve std_logic");
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: Some(ResolutionIndication::FunctionName(
+                    code.s1("lib.foo.resolve").name()
+                )),
+                type_mark: code.s1("std_logic").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    #[test]
+    /// LRM 8. Names
+    fn parse_subtype_indication_without_selected_name() {
+        let code = Code::new("lib.foo.bar");
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("lib.foo.bar").type_mark(),
+                constraint: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_range() {
+        let code = Code::new("integer range 0 to 2-1");
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Range(code.s1("0 to 2-1").range()),
+            code.s1("range 0 to 2-1").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_range_attribute() {
+        let code = Code::new("integer range lib.foo.bar'range");
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Range(code.s1("lib.foo.bar'range").range()),
+            code.s1("range lib.foo.bar'range").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_array_constraint_range() {
+        let code = Code::new("integer_vector(2-1 downto 0)");
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Array(
+                vec![WithTokenSpan::new(
+                    code.s1("2-1 downto 0").discrete_range(),
+                    code.s1("2-1 downto 0").token_span(),
+                )],
+                None,
+            ),
+            code.s1("(2-1 downto 0)").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer_vector").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_array_constraint_discrete() {
+        let code = Code::new("integer_vector(lib.foo.bar)");
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Array(
+                vec![WithTokenSpan::new(
+                    code.s1("lib.foo.bar").discrete_range(),
+                    code.s1("lib.foo.bar").token_span(),
+                )],
+                None,
+            ),
+            code.s1("(lib.foo.bar)").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer_vector").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_array_constraint_attribute() {
+        let code = Code::new("integer_vector(lib.pkg.bar'range)");
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Array(
+                vec![WithTokenSpan::new(
+                    code.s1("lib.pkg.bar'range").discrete_range(),
+                    code.s1("lib.pkg.bar'range").token_span(),
+                )],
+                None,
+            ),
+            code.s1("(lib.pkg.bar'range)").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer_vector").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_array_constraint_open() {
+        let code = Code::new("integer_vector(open)");
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Array(vec![], None),
+            code.s1("(open)").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer_vector").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_multi_dim_array_constraints() {
+        let code = Code::new("integer_vector(2-1 downto 0, 11 to 14)");
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Array(
+                vec![
+                    WithTokenSpan::new(
+                        code.s1("2-1 downto 0").discrete_range(),
+                        code.s1("2-1 downto 0").token_span(),
+                    ),
+                    WithTokenSpan::new(
+                        code.s1("11 to 14").discrete_range(),
+                        code.s1("11 to 14").token_span(),
+                    ),
+                ],
+                None,
+            ),
+            code.s1("(2-1 downto 0, 11 to 14)").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer_vector").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_array_element_constraint() {
+        let code = Code::new("integer_vector(2-1 downto 0, 11 to 14)(foo to bar)");
+
+        let element_constraint = WithTokenSpan::new(
+            SubtypeConstraint::Array(
+                vec![WithTokenSpan::new(
+                    code.s1("foo to bar").discrete_range(),
+                    code.s1("foo to bar").token_span(),
+                )],
+                None,
+            ),
+            code.s1("(foo to bar)").token_span(),
+        );
+
+        let constraint = WithTokenSpan::new(
+            SubtypeConstraint::Array(
+                vec![
+                    WithTokenSpan::new(
+                        code.s1("2-1 downto 0").discrete_range(),
+                        code.s1("2-1 downto 0").token_span(),
+                    ),
+                    WithTokenSpan::new(
+                        code.s1("11 to 14").discrete_range(),
+                        code.s1("11 to 14").token_span(),
+                    ),
+                ],
+                Some(Box::new(element_constraint)),
+            ),
+            code.s1("(2-1 downto 0, 11 to 14)(foo to bar)").token_span(),
+        );
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("integer_vector").type_mark(),
+                constraint: Some(constraint)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subtype_indication_with_record_constraint() {
+        let code = Code::new("axi_m2s_t(tdata(2-1 downto 0), tuser(3 to 5))");
+
+        let tdata_constraint = ElementConstraint {
+            ident: code.s1("tdata").ident(),
+            constraint: Box::new(WithTokenSpan::new(
+                SubtypeConstraint::Array(
+                    vec![WithTokenSpan::new(
+                        code.s1("2-1 downto 0").discrete_range(),
+                        code.s1("2-1 downto 0").token_span(),
+                    )],
+                    None,
+                ),
+                code.s1("(2-1 downto 0)").token_span(),
+            )),
+        };
+
+        let tuser_constraint = ElementConstraint {
+            ident: code.s1("tuser").ident(),
+            constraint: Box::new(WithTokenSpan::new(
+                SubtypeConstraint::Array(
+                    vec![WithTokenSpan::new(
+                        code.s1("3 to 5").discrete_range(),
+                        code.s1("3 to 5").token_span(),
+                    )],
+                    None,
+                ),
+                code.s1("(3 to 5)").token_span(),
+            )),
+        };
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("axi_m2s_t").type_mark(),
+                constraint: Some(WithTokenSpan::new(
+                    SubtypeConstraint::Record(vec![tdata_constraint, tuser_constraint]),
+                    code.s1("(tdata(2-1 downto 0), tuser(3 to 5))").token_span()
+                ))
+            }
+        );
+    }
+
+    #[test]
+    fn test_subtype_indication_with_subtype_attribute() {
+        let code = Code::new("obj'subtype");
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("obj'subtype").type_mark(),
+                constraint: None
+            }
+        );
+
+        let code = Code::new("obj.field'subtype");
+
+        assert_eq!(
+            code.with_stream(parse_subtype_indication),
+            SubtypeIndication {
+                resolution: None,
+                type_mark: code.s1("obj.field'subtype").type_mark(),
+                constraint: None
+            }
+        );
+    }
+}

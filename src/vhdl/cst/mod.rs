@@ -1,13 +1,13 @@
-//! The one module that touches `vhdl_syntax` (the parser). Everything else
-//! in `vhdl` works on what this module produces, so a change of the parser
-//! crate's API stays here.
+//! The one module that touches the parser (`vhdl_lang`, vendored in
+//! `vhdl-lang/`). Everything else in `vhdl` works on what this module
+//! produces, so a change of the parser crate's API stays here.
 
 use std::ops::Range;
+use std::sync::OnceLock;
 
 mod convert;
 
-use vhdl_syntax::parser;
-use vhdl_syntax::syntax::{AstNode, DesignFileSyntax};
+use vhdl_lang::{Severity, SeverityMap, Source, VHDLParser, VHDLStandard};
 
 use crate::vhdl::ast;
 
@@ -88,11 +88,11 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-/// A parsed file: the concrete syntax tree, its syntax errors, and (when
-/// there are none) the converted design (`ast`).
+/// A parsed file: its syntax errors, the byte ranges of its design units,
+/// and (when there are no errors) the converted design (`ast`).
 pub struct Parsed {
     pub file: SourceFile,
-    pub design: DesignFileSyntax,
+    pub units: Vec<Range<usize>>,
     pub errors: Vec<Diagnostic>,
     pub ast: Option<ast::DesignFile>,
 }
@@ -102,39 +102,68 @@ pub fn parse(file: SourceFile) -> Parsed {
     parse_std(file, super::VhdlStd::V2008)
 }
 
+/// The parser of a revision (its keyword tables are built once).
+fn parser(std: super::VhdlStd) -> &'static VHDLParser {
+    static P08: OnceLock<VHDLParser> = OnceLock::new();
+    static P19: OnceLock<VHDLParser> = OnceLock::new();
+    match std {
+        super::VhdlStd::V2008 => P08.get_or_init(|| VHDLParser::new(VHDLStandard::VHDL2008)),
+        super::VhdlStd::V2019 => P19.get_or_init(|| VHDLParser::new(VHDLStandard::VHDL2019)),
+    }
+}
+
 /// Parse a file of revision `std`. One syntax error makes the parser report
-/// many follow-on errors in the same design unit, so only the first error of
+/// follow-on errors in the same design unit, so only the first error of
 /// each design unit is kept.
 pub fn parse_std(file: SourceFile, std: super::VhdlStd) -> Parsed {
-    let standard = match std {
-        super::VhdlStd::V2008 => vhdl_syntax::standard::VHDLStandard::VHDL2008,
-        super::VhdlStd::V2019 => vhdl_syntax::standard::VHDLStandard::VHDL2019,
-    };
-    let (design, errs) = parser::parse_with_standard(standard, file.text.clone());
-    let units: Vec<Range<usize>> = design.design_units().map(|u| u.raw().range()).collect();
+    // Latin-1: each byte is the character of the same code, so a column the
+    // parser reports is a byte offset in its line.
+    let text: String = file.text.iter().map(|&b| b as char).collect();
+    let source = Source::inline(std::path::Path::new(&file.path), &text);
+    let mut diags: Vec<vhdl_lang::Diagnostic> = Vec::new();
+    let design = parser(std).parse_design_source(&source, &mut diags);
+    let lines = convert::Lines::new(&file.text);
+    let units: Vec<Range<usize>> = design
+        .design_units
+        .iter()
+        .map(|(tokens, _)| match (tokens.first(), tokens.last()) {
+            (Some(a), Some(b)) => lines.offset(a.pos.range.start)..lines.offset(b.pos.range.end),
+            _ => 0..0,
+        })
+        .collect();
+    let severities = SeverityMap::default();
     let mut seen = std::collections::BTreeSet::new();
     let mut errors = Vec::new();
-    for e in errs {
-        let span = e.span().clone();
+    for d in &diags {
+        if severities[d.code] != Some(Severity::Error) {
+            continue;
+        }
+        let r = d.pos.range();
+        let span = lines.offset(r.start)..lines.offset(r.end);
         let unit = units.iter().position(|u| u.contains(&span.start));
         if seen.insert(unit) {
             errors.push(Diagnostic {
                 span,
-                message: format!("VHDL: syntax error: {}", e.err()),
+                message: format!("VHDL: syntax error: {}", d.message),
             });
         }
     }
     let ast = if errors.is_empty() {
-        let mut cv = convert::Converter::new();
-        let df = cv.design_file(&design.raw());
-        errors.extend(cv.errors);
-        Some(df)
+        let mut out = Vec::new();
+        for ((tokens, unit), span) in design.design_units.iter().zip(&units) {
+            let mut cv = convert::Converter::new(tokens, &lines, &file.text);
+            if let Some(u) = cv.design_unit(unit, span.clone()) {
+                out.push(u);
+            }
+            errors.extend(cv.errors);
+        }
+        Some(ast::DesignFile { units: out })
     } else {
         None
     };
     Parsed {
         file,
-        design,
+        units,
         errors,
         ast,
     }
@@ -143,12 +172,10 @@ pub fn parse_std(file: SourceFile, std: super::VhdlStd) -> Parsed {
 /// The kind and name of each design unit (for `XEZIM_VHDL_DUMP`), e.g.
 /// `entity foo`, `architecture rtl of foo`, `package body bar`.
 pub fn unit_summary(p: &Parsed) -> Vec<String> {
-    p.design
-        .design_units()
+    p.units
+        .iter()
         .map(|u| {
-            let mut out = Vec::new();
-            u.raw().write_to(&mut out).ok();
-            let text: String = out.iter().map(|&b| b as char).collect();
+            let text: String = p.file.text[u.clone()].iter().map(|&b| b as char).collect();
             let words: Vec<&str> = text
                 .lines()
                 .map(|l| l.split("--").next().unwrap_or(""))
