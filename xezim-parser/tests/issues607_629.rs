@@ -231,6 +231,21 @@ fn token_paste_ends_a_macro_usage() {
     assert!(out.contains("int v = 7; string s = \"\u{1}\";"), "{out:?}");
 }
 
+/// §22.5.1: a paste that ends a macro name right before its argument list
+/// keeps the arguments with the usage. UVM's field macros build their packer
+/// calls this way (`` `uvm_pack_``TYPE``(ARG, __local_packer__) ``).
+#[test]
+fn token_paste_before_macro_arguments() {
+    let (out, errors, _) = preprocess(
+        "`define uvm_pack_da(VAR,P=packer) pk(VAR, P);\n\
+         `define FLD(ARG,TYPE) `uvm_pack_``TYPE``(ARG, lp)\n\
+         module m; initial begin `FLD(x, da) end\nendmodule\n",
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("begin pk(x, lp); end"), "{out}");
+}
+
 /// §8.24, §8.23: an out-of-block method of a nested class names every scope
 /// (`function int outer::inner::m(...)`), for a function and a task (#617).
 #[test]

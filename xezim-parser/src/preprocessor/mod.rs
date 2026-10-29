@@ -2533,8 +2533,11 @@ impl Preprocessor {
                 .bytes()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$')
                 .count();
+            // Nothing more to glue: the paste ends the name, so it is a
+            // usage of whatever `joined` names (`` `uvm_pack_``da``(x) `` is
+            // `uvm_pack_da(x)`, its arguments kept).
             if seg == 0 {
-                return false;
+                return self.defines.contains_key(&joined);
             }
             joined.push_str(&rest[..seg]);
             if self.defines.contains_key(&joined) {
