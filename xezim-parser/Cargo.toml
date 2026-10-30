@@ -2,15 +2,15 @@
 name = "sv-parser"
 version = "0.11.3"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.99.1"
 description = "SystemVerilog parser targeting IEEE 1800-2017/2023"
 license = "MIT OR Apache-2.0"
 keywords = ["systemverilog", "parser", "hdl", "verilog", "eda"]
 categories = ["parser-implementations", "development-tools"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+serde = { version = "=1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "=1.0.154", optional = true }
 
 [features]
 default = ["serde", "json-cli"]

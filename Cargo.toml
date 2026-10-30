@@ -2,22 +2,22 @@
 name = "xezim-core"
 version = "0.11.3"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.99.1"
 description = "Shared SystemVerilog elaboration and runtime primitives for xezim and xezim-b"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ahash = { version = "0.8", features = ["serde"] }
+ahash = { version = "0.8.12", features = ["serde"] }
 # Installed as the global allocator in src/lib.rs (see the `mimalloc-allocator`
 # feature below). A profile of a UVM run put ~41% of self time in glibc malloc
 # machinery. 0.1.52 bundles the mimalloc v3 C library (v3.3.2); pinned so a
 # fresh lockfile cannot resolve to an older v2-era release.
 mimalloc = { version = "0.1.52", optional = true }
-rand = "0.8"
+rand = "0.10.3"
 sv-parser = { path = "xezim-parser" }
-serde = { version = "1", features = ["derive", "rc"] }
-bincode = { version = "2", default-features = false, features = ["std", "serde"] }
-zstd = "0.14"
+serde = { version = "=1.0.229", features = ["derive", "rc"] }
+bincode = { version = "=2.0.1", default-features = false, features = ["std", "serde"] }
+zstd = "0.14.3"
 
 [features]
 # Fixed `Value` layout for native readers (see value.rs); off by default.
