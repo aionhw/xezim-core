@@ -623,6 +623,22 @@ fn fork_join() {
     assert_eq!(forks, [(2, false), (1, true)]);
 }
 
+/// §5.2.9: the process macros expand to a block in SystemC 2.3, so the
+/// `;` after `SC_METHOD(f)` is optional; §5.2.8 `SC_HAS_PROCESS(m);` may
+/// also stand at namespace scope before an out-of-class constructor.
+#[test]
+fn process_macro_without_semicolon_and_namespace_has_process() {
+    let r = parse_clean(
+        "SC_MODULE(m) { sc_in<bool> clk; void f(); void g();\n\
+         SC_CTOR(m) { SC_METHOD(f) sensitive << clk.pos(); SC_THREAD(g) } };\n\
+         class n : public sc_module { public: n(sc_module_name nm); void h(); };\n\
+         SC_HAS_PROCESS(n);\n\
+         n::n(sc_module_name nm) : sc_module(nm) { SC_THREAD(h); }",
+    );
+    let m = r.unit.modules()[0];
+    assert_eq!(r.unit.processes(m).len(), 2);
+}
+
 /// The main file is file 0 even with `-D` definitions, so spans of the
 /// top-level source never point into a command-line pseudo-file.
 #[test]

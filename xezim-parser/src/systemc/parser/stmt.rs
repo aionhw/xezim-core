@@ -162,7 +162,9 @@ impl Parser {
                     None
                 };
                 self.expect(")")?;
-                self.expect(";")?;
+                // The macros expand to a `{ … }` block (SystemC 2.3), so the
+                // `;` after them is optional.
+                self.eat(";");
                 Stmt::ScProcess {
                     kind,
                     func,

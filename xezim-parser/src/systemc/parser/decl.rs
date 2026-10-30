@@ -51,9 +51,11 @@ fn is_sc_module_base(q: &QualifiedName) -> bool {
         && q.qualifiers().all(|n| n == "sc_core")
 }
 
-/// Vendor macros that register a top module for a simulator and expand to
-/// nothing a parser needs (`SC_MODULE_EXPORT(top);`).
-const IGNORED_ITEM_MACROS: &[&str] = &["SC_MODULE_EXPORT", "NCSC_MODULE_EXPORT"];
+/// Macros at namespace scope that expand to nothing a parser needs: vendor
+/// top-module registrations (`SC_MODULE_EXPORT(top);`) and
+/// `SC_HAS_PROCESS(m);` before out-of-class constructors (a typedef of the
+/// module, §5.2.8).
+const IGNORED_ITEM_MACROS: &[&str] = &["SC_MODULE_EXPORT", "NCSC_MODULE_EXPORT", "SC_HAS_PROCESS"];
 
 fn function_skeleton(name: QualifiedName, span: ScSpan) -> FunctionDecl {
     FunctionDecl {
