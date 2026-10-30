@@ -51,6 +51,8 @@ pub enum SymKind {
     /// an object of the interface's port class (§5.12, §5.14).
     Port(String),
     Export(String),
+    /// A namespace-scope reference: the expression it is bound to.
+    Alias(Box<sc::Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,8 @@ pub struct FnSig {
     pub is_task: bool,
     /// Per parameter: passed by non-const reference.
     pub by_ref: Vec<bool>,
+    /// Per parameter: its default argument.
+    pub defaults: Vec<Option<sc::Expr>>,
 }
 
 /// One term of a process's static sensitivity: the event, and the C++
@@ -169,6 +173,9 @@ pub struct ModCtx {
     /// `next_trigger(...)` sites of method processes: (process, what its
     /// next activation waits for). The site's number is its index + 1.
     pub next_triggers: Vec<(usize, Statement)>,
+    /// Function names defined more than once in the module (overloads):
+    /// each is `name__<parameter count>`.
+    pub overloaded: BTreeSet<String>,
     /// `sc_buffer` channels (SV names): each write also bumps their
     /// `buffer_counter`.
     pub buffers: BTreeSet<String>,
@@ -260,6 +267,8 @@ pub struct Lw<'a> {
     tmp: usize,
     /// Widths of the resolved nets lowered so far (each needs its nettype).
     pub rv_widths: BTreeSet<u32>,
+    /// Namespace-scope variables (package `sc_glob`), by C++ name.
+    pub globals: BTreeMap<String, Sym>,
 }
 
 const TIME_UNITS: &[(&str, f64)] = &[
@@ -290,6 +299,37 @@ pub fn next_trigger_kind(p: usize) -> String {
 
 pub fn next_trigger_time(p: usize) -> String {
     format!("__sc_ntt{}", p)
+}
+
+/// Report severities, actions and verbosity levels (§8.2–§8.3).
+fn kernel_const(n: &str) -> Option<i64> {
+    Some(match n.trim_start_matches("sc_core::") {
+        "SC_INFO" => 0,
+        "SC_WARNING" => 1,
+        "SC_ERROR" => 2,
+        "SC_FATAL" => 3,
+        "SC_MAX_SEVERITY" => 4,
+        "SC_UNSPECIFIED" => 0,
+        "SC_DO_NOTHING" => 0x01,
+        "SC_THROW" => 0x02,
+        "SC_LOG" => 0x04,
+        "SC_DISPLAY" => 0x08,
+        "SC_CACHE_REPORT" => 0x10,
+        "SC_INTERRUPT" => 0x20,
+        "SC_STOP" => 0x40,
+        "SC_ABORT" => 0x80,
+        "SC_DEFAULT_INFO_ACTIONS" | "SC_DEFAULT_WARNING_ACTIONS" => 0x0c,
+        "SC_DEFAULT_ERROR_ACTIONS" => 0x16,
+        "SC_DEFAULT_FATAL_ACTIONS" => 0x9c,
+        "SC_DEFAULT_CATCH_ACTIONS" => 0x08,
+        "SC_NONE" => 0,
+        "SC_LOW" => 100,
+        "SC_MEDIUM" => 200,
+        "SC_HIGH" => 300,
+        "SC_FULL" => 400,
+        "SC_DEBUG" => 500,
+        _ => return None,
+    })
 }
 
 /// A C++ name expression.
@@ -496,6 +536,7 @@ impl<'a> Lw<'a> {
             pre: Vec::new(),
             tmp: 0,
             rv_widths: BTreeSet::new(),
+            globals: BTreeMap::new(),
         }
     }
 
@@ -609,6 +650,9 @@ impl<'a> Lw<'a> {
                 if let Some(v) = self.enum_consts.get(&path) {
                     return Some(*v);
                 }
+                if let Some(v) = kernel_const(&path) {
+                    return Some(v);
+                }
                 if q.segments.len() == 1 {
                     if let Some(sym) = self.lookup(q.last_name())
                         && let SymKind::Const(v) = sym.kind
@@ -650,7 +694,7 @@ impl<'a> Lw<'a> {
                 return Some(sym.clone());
             }
         }
-        self.m.syms.get(name).cloned()
+        self.m.syms.get(name).cloned().or_else(|| self.globals.get(name).cloned())
     }
 
     /// A unique SV name for a new local `name`.
@@ -923,6 +967,20 @@ impl<'a> Lw<'a> {
                 (method(b, "notify", vec![t]), Ty::Void)
             }
             ("scrt_event_queue", "cancel_all", 0) => (method(b, "cancel_all", vec![]), Ty::Void),
+            // §8.2 a report, as a handler sees it.
+            ("scrt_report", "get_msg_type", 0) => (member(b, "id"), Ty::Str),
+            ("scrt_report", "get_msg", 0) => (member(b, "msg"), Ty::Str),
+            ("scrt_report", "get_severity", 0) => (member(b, "sev"), Ty::int32()),
+            ("scrt_report", "get_file_name", 0) => (member(b, "file"), Ty::Str),
+            ("scrt_report", "get_line_number", 0) => (member(b, "line"), Ty::int32()),
+            ("scrt_report", "get_time", 0) => (member(b, "t"), Ty::Time),
+            ("scrt_report", "get_process_name", 0) => (member(b, "proc"), Ty::Str),
+            ("scrt_report", "get_verbosity", 0) => (member(b, "verb"), Ty::int32()),
+            ("scrt_report", "get_id", 0) => (member(b, "num_id"), Ty::int32()),
+            ("scrt_report", "what", 0) => (method(b, "compose", vec![]), Ty::Str),
+            ("scrt_report", _, _) => {
+                return self.err(span, format!("sc_report::{} is not supported in simulation", m));
+            }
             // §5.6 process handles of spawned threads.
             ("scrt_proc", "terminated", 0) => (member(b, "term"), Ty::Bool),
             ("scrt_proc", "terminated_event", 0) => (member(b, "done"), Ty::Event),
@@ -1317,6 +1375,9 @@ impl<'a> Lw<'a> {
         if !path.contains("::")
             && let Some(sym) = self.lookup(&path)
         {
+            if let SymKind::Alias(e) = &sym.kind {
+                return self.expr(e);
+            }
             return Ok((self.sym_read(&sym), sym.ty.clone()));
         }
         if let Some(v) = self.enum_consts.get(&path) {
@@ -1324,6 +1385,9 @@ impl<'a> Lw<'a> {
         }
         match path.as_str() {
             "SC_ZERO_TIME" => return Ok((u64_lit(0), Ty::Time)),
+            n if kernel_const(n).is_some() => {
+                return Ok((int(kernel_const(n).expect("checked")), Ty::int32()));
+            }
             // glibc's.
             "RAND_MAX" => return Ok((int(2147483647), Ty::int32())),
             "NULL" => return Ok((null(), Ty::Ptr { elem: 1 })),
@@ -1853,6 +1917,9 @@ impl<'a> Lw<'a> {
                 return Ok((convert(&t, x, &xt), t));
             }
         }
+        if let Some(f) = name.strip_prefix("sc_report_handler::") {
+            return self.report_handler_call(f, args, span);
+        }
         // `T::f(args)`: a static member function of a user class.
         if q.segments.len() >= 2 {
             let cls = super::classes::class_sv(&q.segments[q.segments.len() - 2].ident.name);
@@ -1867,15 +1934,27 @@ impl<'a> Lw<'a> {
                 return Ok((call(member(ident(&cls), &ms.sv), xs), ms.sig.ret.clone()));
             }
         }
-        // An overloaded member function, by its number of arguments.
-        let overload = format!("{}__{}", name, args.len());
-        let name = if !self.m.funcs.contains_key(name) && self.m.funcs.contains_key(&overload) {
+        // An overloaded function, by its number of arguments (default
+        // arguments fill a longer parameter list).
+        let overload = (args.len()..=args.len() + 8)
+            .map(|n| format!("{}__{}", name, n))
+            .find(|k| self.m.funcs.contains_key(k))
+            .unwrap_or_default();
+        let name = if !self.m.funcs.contains_key(name) && !overload.is_empty() {
             overload.as_str()
         } else {
             name
         };
         if let Some(sig) = self.m.funcs.get(name).cloned() {
             let mut lowered = Vec::new();
+            // Missing trailing arguments take their defaults.
+            let mut args = args.to_vec();
+            for d in sig.defaults.iter().skip(args.len()) {
+                match d {
+                    Some(e) => args.push(e.clone()),
+                    None => break,
+                }
+            }
             for (i, a) in args.iter().enumerate() {
                 if sig.by_ref.get(i).copied().unwrap_or(false) {
                     lowered.push(self.lvalue_ref(a)?);
@@ -2266,9 +2345,15 @@ impl<'a> Lw<'a> {
         }
         let _ = seg;
         let (b, bt) = self.expr(base)?;
+        // An event reached through an object or a child module (`u.go`).
+        if matches!(bt, Ty::Event) && m == "notify" {
+            let v = self.notify_target(b, args, span)?;
+            self.pre.extend(v);
+            return Ok((int(0), Ty::Void));
+        }
         // Library channels lower their own arguments (`notify(5, SC_NS)`).
         if let Ty::Class(c) | Ty::Handle(c) = &bt
-            && (is_lib_class(c) || c == "scrt_proc")
+            && (is_lib_class(c) || c == "scrt_proc" || c == "scrt_report")
         {
             let c = c.clone();
             return self.lib_channel_call(b, &c, m, args, span);
@@ -3498,12 +3583,16 @@ impl<'a> Lw<'a> {
                             expr_stmt(sys("$__sc_exit", vec![int(134)])),
                         ]
                     } else {
-                        self.report_stmts(
-                            "Fatal",
-                            string(&format!("(F4) assertion failed: {}", text)),
-                            None,
-                            span,
-                        )
+                        let loc_file = string(&loc.file);
+                        let loc_line = int(loc.line as i64);
+                        self.report_site(
+                            int(3),
+                            string("assertion failed"),
+                            string(&text),
+                            int(200),
+                            (loc_file, loc_line),
+                            Some(4),
+                        )?
                     };
                     return Ok(Some(vec![if_(
                         unary(UnaryOp::LogNot, paren(x)),
@@ -3511,19 +3600,24 @@ impl<'a> Lw<'a> {
                         None,
                     )]));
                 }
-                "SC_REPORT_INFO" | "SC_REPORT_WARNING" | "SC_REPORT_ERROR" | "SC_REPORT_FATAL" => {
-                    let [id_, msg] = args else {
-                        return self.err(span, format!("{}(id, message) expected", path));
+                "SC_REPORT_INFO" | "SC_REPORT_WARNING" | "SC_REPORT_ERROR" | "SC_REPORT_FATAL"
+                | "SC_REPORT_INFO_VERB" => {
+                    let (id_, msg, verb) = match args {
+                        [i, m] => (i, m, int(200)),
+                        [i, m, v] if path == "SC_REPORT_INFO_VERB" => (i, m, self.expr(v)?.0),
+                        _ => return self.err(span, format!("{}(id, message) expected", path)),
                     };
-                    let (i, _) = self.expr(id_)?;
-                    let (m, _) = self.expr(msg)?;
+                    let i = self.report_text(id_)?;
+                    let m = self.report_text(msg)?;
                     let sev = match path.as_str() {
-                        "SC_REPORT_INFO" => "Info",
-                        "SC_REPORT_WARNING" => "Warning",
-                        "SC_REPORT_ERROR" => "Error",
-                        _ => "Fatal",
+                        "SC_REPORT_INFO" | "SC_REPORT_INFO_VERB" => 0,
+                        "SC_REPORT_WARNING" => 1,
+                        "SC_REPORT_ERROR" => 2,
+                        _ => 3,
                     };
-                    return Ok(Some(self.report_stmts(sev, i, Some(m), span)));
+                    let loc = self.prog.results[self.tu].locate(span);
+                    let at = (string(&loc.file), int(loc.line as i64));
+                    return Ok(Some(self.report_site(int(sev), i, m, verb, at, None)?));
                 }
                 "sc_trace" => {
                     let Some(obj) = args.get(1) else {
@@ -3791,60 +3885,215 @@ impl<'a> Lw<'a> {
         Ok(at(self.event_list(e)?, null_stmt()))
     }
 
-    /// A SystemC report (`SC_REPORT_*`) in the 2.3 kernel's format: an error
-    /// ends the run with status 1, a fatal one aborts it (status 134).
-    /// `m` is the message after the id (`Error: <id>: <m>`); a kernel
-    /// report such as F4 has none (`Fatal: (F4) assertion failed: …`).
-    fn report_stmts(
-        &self,
-        sev: &str,
-        i: Expression,
-        m: Option<Expression>,
-        span: ScSpan,
-    ) -> Vec<Statement> {
-        let fin = matches!(sev, "Error" | "Fatal");
-        // SystemC 2.3's report format: warnings and errors name
-        // the C++ source line and, inside a process, the process.
-        let mut v = vec![expr_stmt(sys(
-            "$write",
-            match m {
-                Some(m) => vec![string(&format!("\n{}: %s: %s\n", sev)), i, m],
-                None => vec![string(&format!("\n{}: %s\n", sev)), i],
-            },
-        ))];
-        if sev != "Info" {
-            let loc = self.prog.results[self.tu].locate(span);
-            v.push(expr_stmt(sys(
-                "$write",
-                vec![string(&format!("In file: {}:{}\n", loc.file, loc.line))],
-            )));
-            if !self.m.tb {
-                v.push(expr_stmt(sys(
-                    "$write",
-                    vec![
-                        string("In process: %s @ %s\n"),
-                        call_fn(
-                            "scrt_name",
-                            vec![sys("$sformatf", vec![string("%m")])],
-                        ),
-                        call_fn("scrt_time_str", vec![sys("$time", vec![])]),
-                    ],
-                )));
+    /// A report (§8.3): made, its actions chosen and handled by the handler
+    /// installed (`set_handler`), the default one here or a user function;
+    /// a throw ends the run after the catch's display (status 1). `num_id`
+    /// is a kernel report's number (`Fatal: (F4) …`).
+    fn report_site(
+        &mut self,
+        sev: Expression,
+        id: Expression,
+        msg: Expression,
+        verb: Expression,
+        (file, line): (Expression, Expression),
+        num_id: Option<i64>,
+    ) -> R<Vec<Statement>> {
+        let proc = if self.m.tb {
+            string("")
+        } else {
+            call_fn("scrt_name", vec![sys("$sformatf", vec![string("%m")])])
+        };
+        let r = self.temp(&Ty::Handle("scrt_report".to_string()));
+        let mut v = vec![assign(
+            ident(&r),
+            call_fn("scrt_report_make", vec![sev, id, msg, verb, file, line, proc]),
+        )];
+        if let Some(n) = num_id {
+            v.push(if_(
+                bin(BinaryOp::Neq, ident(&r), null()),
+                assign(member(ident(&r), "num_id"), int(n)),
+                None,
+            ));
+        }
+        let tb = sized(1, self.m.tb as u64);
+        if self.prog.report_handlers.is_empty() {
+            v.push(expr_stmt(call_fn("scrt_report_default", vec![ident(&r), tb])));
+        } else {
+            let a = self.temp(&Ty::Int {
+                bits: 32,
+                signed: false,
+                ch: false,
+            });
+            let handle = vec![
+                assign(ident(&a), call_fn("scrt_report_actions", vec![ident(&r)])),
+                self.report_dispatch(ident(&r), ident(&a)),
+                if_(
+                    ident("scrt_thrown"),
+                    block(vec![
+                        assign(ident("scrt_thrown"), sized(1, 0)),
+                        self.report_dispatch(ident(&r), int(8)),
+                        expr_stmt(sys("$__sc_exit", vec![int(1)])),
+                    ]),
+                    None,
+                ),
+            ];
+            v.push(if_(bin(BinaryOp::Neq, ident(&r), null()), block(handle), None));
+        }
+        v.extend(self.end_of_simulation());
+        Ok(v)
+    }
+
+    /// Call the installed report handler.
+    fn report_dispatch(&self, r: Expression, a: Expression) -> Statement {
+        let arms = self
+            .prog
+            .report_handlers
+            .iter()
+            .enumerate()
+            .map(|(k, h)| (int(k as i64 + 1), expr_stmt(call_fn(h, vec![r.clone(), a.clone()]))))
+            .collect();
+        let tb = sized(1, self.m.tb as u64);
+        case_(
+            ident("scrt_handler"),
+            arms,
+            Some(expr_stmt(call_fn("scrt_default_handler", vec![r, a, tb]))),
+        )
+    }
+
+    /// A report's id or message: a C string (`0` is none).
+    fn report_text(&mut self, e: &sc::Expr) -> R<Expression> {
+        if self.const_eval(e) == Some(0) || matches!(e.kind, sc::ExprKind::Nullptr) {
+            return Ok(string(""));
+        }
+        Ok(self.expr(e)?.0)
+    }
+
+    /// `sc_report_handler::f(args)` (§8.3).
+    fn report_handler_call(&mut self, f: &str, args: &[sc::Expr], span: ScSpan) -> R<(Expression, Ty)> {
+        let u32t = Ty::Int {
+            bits: 32,
+            signed: false,
+            ch: false,
+        };
+        // The (severity, id) selector of set_actions/stop_after/get_count.
+        let sel = |lw: &mut Self, a: &[sc::Expr]| -> R<Vec<Expression>> {
+            let id_first = a
+                .first()
+                .is_some_and(|x| matches!(lw.peek_ty(x), Ok((_, Ty::Str))) || matches!(x.kind, sc::ExprKind::StringLit { .. }));
+            Ok(match (a.len(), id_first) {
+                (1, false) => vec![lw.expr(&a[0])?.0, string(""), sized(1, 1), sized(1, 0)],
+                (1, true) => vec![int(0), lw.expr(&a[0])?.0, sized(1, 0), sized(1, 1)],
+                _ => vec![lw.expr(&a[1])?.0, lw.expr(&a[0])?.0, sized(1, 1), sized(1, 1)],
+            })
+        };
+        let tb = sized(1, self.m.tb as u64);
+        Ok(match (f, args.len()) {
+            ("set_actions", 2 | 3) => {
+                let n = args.len();
+                let mut v = sel(self, &args[..n - 1])?;
+                v.push(self.expr(&args[n - 1])?.0);
+                (call_fn("scrt_set_actions", v), u32t)
             }
-        }
-        // An error report ends the run with exit status 1 (the
-        // kernel's exception); a fatal one aborts it (status 134,
-        // SIGABRT) after the kernel's own note.
-        if sev == "Fatal" {
-            v.push(expr_stmt(sys(
-                "$write",
-                vec![string("\nInfo: (I99) simulation aborted\n")],
-            )));
-            v.push(expr_stmt(sys("$__sc_exit", vec![int(134)])));
-        } else if fin {
-            v.push(expr_stmt(sys("$__sc_exit", vec![int(1)])));
-        }
-        v
+            ("stop_after", 2 | 3) => {
+                let n = args.len();
+                let mut v = sel(self, &args[..n - 1])?;
+                v.push(self.expr(&args[n - 1])?.0);
+                (call_fn("scrt_stop_after", v), Ty::int32())
+            }
+            ("get_count", 1 | 2) => (call_fn("scrt_get_count", sel(self, args)?), Ty::int32()),
+            ("suppress" | "force", 0 | 1) => {
+                let m = match args {
+                    [m] => self.expr(m)?.0,
+                    _ => int(0),
+                };
+                (call_fn(&format!("scrt_{}", f), vec![m]), u32t)
+            }
+            ("get_new_action_id", 0) => (call_fn("scrt_new_action_id", vec![]), u32t),
+            ("set_verbosity_level", 1) => {
+                (call_fn("scrt_set_verbosity", vec![self.expr(&args[0])?.0]), Ty::int32())
+            }
+            ("get_verbosity_level", 0) => (ident("scrt_verbosity"), Ty::int32()),
+            ("set_handler", 1) => {
+                let target = match &args[0].kind {
+                    sc::ExprKind::Unary {
+                        op: sc::UnaryOp::AddrOf,
+                        operand,
+                    } => operand.as_ref(),
+                    _ => &args[0],
+                };
+                let k = target
+                    .as_name()
+                    .filter(|q| q.segments.len() == 1)
+                    .and_then(|q| {
+                        self.prog
+                            .report_handlers
+                            .iter()
+                            .position(|h| h == q.last_name())
+                    })
+                    .map_or(0, |k| k as i64 + 1);
+                self.pre.push(assign(ident("scrt_handler"), int(k)));
+                (int(0), Ty::Void)
+            }
+            ("default_handler", 2) => {
+                let r = self.expr(&args[0])?.0;
+                let a = self.expr(&args[1])?.0;
+                (call_fn("scrt_default_handler", vec![r, a, tb]), Ty::Void)
+            }
+            ("report", 5 | 6) => {
+                let sev = self.expr(&args[0])?.0;
+                let id = self.report_text(&args[1])?;
+                let msg = self.report_text(&args[2])?;
+                let (verb, rest) = match args.len() {
+                    6 => (self.expr(&args[3])?.0, &args[4..]),
+                    _ => (int(200), &args[3..]),
+                };
+                let file = self.expr(&rest[0])?.0;
+                let line = self.expr(&rest[1])?.0;
+                let v = self.report_site(sev, id, msg, verb, (file, line), None)?;
+                self.pre.extend(v);
+                (int(0), Ty::Void)
+            }
+            _ => {
+                return self.err(
+                    span,
+                    format!("sc_report_handler::{} is not supported in simulation", f),
+                );
+            }
+        })
+    }
+
+    /// `e.notify(...)` on an event expression other than the module's own
+    /// events (which `notify` handles, with their interface mirrors).
+    fn notify_target(&mut self, ev: Expression, args: &[sc::Expr], span: ScSpan) -> R<Vec<Statement>> {
+        let fire = |nb: bool| {
+            st(StatementKind::EventTrigger {
+                nonblocking: nb,
+                name: id("__sc_ev"),
+                target: Some(Box::new(ev.clone())),
+                span: sp(),
+            })
+        };
+        let (t, c) = match args {
+            [] => return Ok(vec![fire(false)]),
+            [t] => (
+                self.expr(t)?.0,
+                if self.zero_time(t) { Some(0) } else { self.const_eval(t) },
+            ),
+            [v, u] => (self.time_value(v, u, span)?, self.const_eval(v)),
+            _ => return self.err(span, "notify() takes a time or (value, unit)"),
+        };
+        Ok(match c {
+            Some(0) => vec![fire(true)],
+            Some(_) => vec![fork(JoinType::JoinNone, vec![delay(t, fire(false))])],
+            None => vec![fork(
+                JoinType::JoinNone,
+                vec![if_(
+                    bin(BinaryOp::Eq, t.clone(), int(0)),
+                    fire(true),
+                    Some(delay(t, fire(false))),
+                )],
+            )],
+        })
     }
 
     /// `next_trigger(...)` (§5.2.17) in a method process: its next activation
@@ -4268,11 +4517,16 @@ impl<'a> Lw<'a> {
             first.push(cb("eoe"));
             first.push(cb("sos"));
         }
-        let mut v = vec![if_(
-            ident("scrt_started"),
-            delay(int(1), null_stmt()),
-            Some(block(first)),
-        )];
+        // A bounded sc_start paused 1 ps before its end time (scrt_lag).
+        let bounded = dur.is_some();
+        let mut v = vec![
+            if_(
+                ident("scrt_started"),
+                if_(ident("scrt_lag"), delay(int(1), null_stmt()), None),
+                Some(block(first)),
+            ),
+            assign(ident("scrt_lag"), sized(1, 0)),
+        ];
         v.push(expr_stmt(call_fn("__sc_apply_pending", vec![])));
         v.push(assign(ident("scrt_started"), sized(1, 1)));
         v.push(assign(ident("scrt_paused"), sized(1, 0)));
@@ -4305,10 +4559,18 @@ impl<'a> Lw<'a> {
                 ));
             }
             None => {
-                v.push(wait(ident("scrt_stop_req")));
+                v.push(if_(
+                    unary(UnaryOp::LogNot, ident("scrt_stop_req")),
+                    at(vec![event_expr(None, ident("scrt_idle_ev"))], null_stmt()),
+                    None,
+                ));
                 v.push(stop_at_delta_end());
                 v.push(assign(ident("scrt_tb_now"), sys("$time", vec![])));
             }
+        }
+        // The next sc_start resumes 1 ps on, after a bounded one (always).
+        if bounded {
+            v.push(assign(ident("scrt_lag"), sized(1, 1)));
         }
         v.extend(self.end_of_simulation());
         v.push(assign(ident("scrt_paused"), sized(1, 1)));

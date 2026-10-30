@@ -268,6 +268,7 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
             Err(e) => lw.record(e),
         }
     }
+    let glob_pkg = global_package(&mut lw);
     for (name, tu, class, tps, binds) in &modules {
         let Some(iface) = ifaces.get(name) else {
             continue;
@@ -328,6 +329,9 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
         for d in &out {
             eprintln!("{:#?}", d);
         }
+    }
+    if let Some(p) = glob_pkg {
+        out.insert(0, p);
     }
     if let Some(p) = user_pkg {
         out.insert(0, p);
@@ -435,4 +439,160 @@ mod tests {
         let r = package_items(&classes::port_class_for_test("sc_c_bus_if"));
         assert!(r.is_ok(), "{:?}", r.err());
     }
+}
+
+/// Namespace-scope variables (§ C++ globals): the package `sc_glob`, which
+/// every module imports, and each variable's symbol for the code using it.
+/// A namespace-scope reference names what it is bound to.
+fn global_package(lw: &mut lower::Lw) -> Option<Description> {
+    use crate::ast::decl::{DataDeclaration, PackageItem};
+    use crate::ast::module::PackageDeclaration;
+    use scfront::ast as sc;
+    let prog = lw.prog;
+    if prog.globals.is_empty() {
+        return None;
+    }
+    let import = |p: &str| {
+        PackageItem::Import(crate::ast::decl::ImportDeclaration {
+            items: vec![crate::ast::decl::ImportItem {
+                package: build::id(p),
+                item: None,
+                span: build::sp(),
+            }],
+            span: build::sp(),
+        })
+    };
+    let mut items = vec![import("sc_rt")];
+    if !prog.user_classes.borrow().is_empty() {
+        items.push(import("sc_user"));
+    }
+    lw.m = lower::ModCtx::default();
+    for (tu, v) in &prog.globals {
+        lw.tu = *tu;
+        for d in &v.declarators {
+            if prog.global_consts.contains_key(&d.name.name) {
+                continue;
+            }
+            lw.f = lower::FnCtx {
+                scopes: vec![std::collections::BTreeMap::new()],
+                ..Default::default()
+            };
+            let is_ref = d
+                .ptr_ops
+                .iter()
+                .chain(v.ty.ptr_ops.iter())
+                .any(|o| matches!(o, sc::PtrOp::LRef | sc::PtrOp::RRef));
+            let init_args: Vec<sc::Expr> = match &d.init {
+                // `T a[] = {…}`: the list's elements.
+                Some(sc::Initializer::Assign(sc::Expr {
+                    kind: sc::ExprKind::InitList(items),
+                    ..
+                })) => items.clone(),
+                Some(sc::Initializer::Assign(e)) => vec![e.clone()],
+                Some(sc::Initializer::Paren(a) | sc::Initializer::Brace(a)) => a.clone(),
+                None => Vec::new(),
+            };
+            if is_ref {
+                let ty = match lw.ty(&v.ty, d.span) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        lw.record(e);
+                        continue;
+                    }
+                };
+                let [target] = init_args.as_slice() else {
+                    lw.record(lower::LowerError {
+                        tu: *tu,
+                        span: d.span,
+                        msg: "a namespace-scope reference needs what it refers to".into(),
+                    });
+                    continue;
+                };
+                lw.globals.insert(
+                    d.name.name.clone(),
+                    lower::Sym {
+                        kind: lower::SymKind::Alias(Box::new(target.clone())),
+                        ty,
+                        sv: String::new(),
+                    },
+                );
+                continue;
+            }
+            // `T a[] = {…}`: the initializer gives the size.
+            let ty = if d.array_dims.len() == 1
+                && d.array_dims[0].is_none()
+                && matches!(d.init, Some(sc::Initializer::Brace(_)) | Some(sc::Initializer::Assign(_)))
+            {
+                let mut t = v.ty.clone();
+                t.ptr_ops.extend(d.ptr_ops.iter().copied());
+                lw.ty(&t, d.span).map(|e| {
+                    types::Ty::Array(Box::new(e), build::int(init_args.len() as i64))
+                })
+            } else {
+                lw.decl_ty(&v.ty, d)
+            };
+            let ty = match ty {
+                Ok(t) => t,
+                Err(e) => {
+                    lw.record(e);
+                    continue;
+                }
+            };
+            let init = if matches!(ty, types::Ty::Array(..)) && !init_args.is_empty() {
+                let list = sc::Expr {
+                    kind: sc::ExprKind::InitList(init_args.clone()),
+                    span: d.span,
+                };
+                lw.expr(&list).map(|x| Some(x.0))
+            } else {
+                match init_args.as_slice() {
+                    [e] => lw.expr(e).map(|x| Some(x.0)),
+                    _ => Ok(None),
+                }
+            };
+            let init = match init {
+                Ok(i) if lw.pre.is_empty() => i,
+                Ok(_) => {
+                    lw.pre.clear();
+                    lw.record(lower::LowerError {
+                        tu: *tu,
+                        span: d.span,
+                        msg: "this namespace-scope initializer is not supported".into(),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    lw.record(e);
+                    continue;
+                }
+            };
+            let sv = format!("__sc_g_{}", d.name.name);
+            let (dt, dims) = types::sv_type(&ty);
+            items.push(PackageItem::Data(DataDeclaration {
+                const_kw: false,
+                var_kw: false,
+                lifetime: None,
+                data_type: dt,
+                declarators: vec![build::var_declarator(&sv, dims, init)],
+                span: build::sp(),
+            }));
+            lw.globals.insert(
+                d.name.name.clone(),
+                lower::Sym {
+                    kind: lower::SymKind::Var,
+                    ty,
+                    sv,
+                },
+            );
+        }
+    }
+    lw.m = lower::ModCtx::default();
+    Some(Description::Package(PackageDeclaration {
+        attrs: Vec::new(),
+        lifetime: None,
+        name: build::id("sc_glob"),
+        items,
+        endlabel: None,
+        span: build::sp(),
+    }))
 }

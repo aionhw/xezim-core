@@ -637,6 +637,7 @@ fn fn_sig(lw: &Lw, f: &sc::FunctionDecl, blocks: bool) -> R<FnSig> {
         ret,
         is_task: blocks,
         by_ref,
+        defaults: Vec::new(),
     })
 }
 

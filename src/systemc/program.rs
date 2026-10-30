@@ -27,6 +27,8 @@ pub struct Program<'a> {
     pub out_of_class: BTreeMap<String, Vec<(usize, &'a FunctionDecl)>>,
     pub sc_main: Option<(usize, &'a FunctionDecl)>,
     pub free_fns: BTreeMap<String, (usize, &'a FunctionDecl)>,
+    /// Further overloads of the free functions (by parameter count).
+    pub free_overloads: BTreeMap<String, Vec<(usize, &'a FunctionDecl)>>,
     pub enums: Vec<(usize, &'a EnumDecl)>,
     pub typedefs: Vec<(usize, &'a TypedefDecl)>,
     /// Namespace-scope integer constants (`const int N = 4;`).
@@ -50,11 +52,64 @@ pub struct Program<'a> {
     /// through a parent's port): (module class, port). Such a port also
     /// carries the buffer's write count, so it sees every write (§6.9).
     pub buffer_ports: BTreeSet<(String, String)>,
+    /// The functions `sc_report_handler::set_handler(&f)` installs (§8.3):
+    /// a report dispatches to the k-th as handler k.
+    pub report_handlers: Vec<String>,
+    /// Namespace-scope variables (and constants that are not integers):
+    /// variables of the package `sc_glob`.
+    pub globals: Vec<(usize, &'a VarDecl)>,
 }
 
 impl<'a> Program<'a> {
     /// Whether some module defines an elaboration or simulation callback
     /// (§4.4: `before_end_of_elaboration`, …).
+    /// The free functions passed to `sc_report_handler::set_handler`.
+    fn scan_report_handlers(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut visit = |f: &FunctionDecl| {
+            let Some(b) = &f.body else { return };
+            for st in &b.stmts {
+                super::module::visit_stmt_exprs(st, &mut |e| {
+                    if let ExprKind::Call { callee, args } = &e.kind
+                        && callee.as_name().is_some_and(|q| q.last_name() == "set_handler")
+                        && let [a] = args.as_slice()
+                    {
+                        let target = match &a.kind {
+                            ExprKind::Unary {
+                                op: UnaryOp::AddrOf,
+                                operand,
+                            } => operand.as_ref(),
+                            _ => a,
+                        };
+                        if let Some(q) = target.as_name()
+                            && q.segments.len() == 1
+                            && !out.iter().any(|n| n == q.last_name())
+                        {
+                            out.push(q.last_name().to_string());
+                        }
+                    }
+                });
+            }
+        };
+        if let Some((_, f)) = self.sc_main {
+            visit(f);
+        }
+        for (_, f) in self.free_fns.values() {
+            visit(f);
+        }
+        for (n, (_, c, _)) in &self.classes {
+            for m in &c.members {
+                if let Member::Method(f) | Member::Constructor(f) = m {
+                    visit(f);
+                }
+            }
+            for (_, f) in self.out_of_class.get(n).into_iter().flatten() {
+                visit(f);
+            }
+        }
+        out
+    }
+
     pub fn has_callbacks(&self) -> bool {
         let is_cb = |n: &str| CALLBACKS.iter().any(|(_, c)| *c == n);
         self.classes.iter().any(|(n, (_, c, _))| {
@@ -74,6 +129,7 @@ impl<'a> Program<'a> {
             out_of_class: BTreeMap::new(),
             sc_main: None,
             free_fns: BTreeMap::new(),
+            free_overloads: BTreeMap::new(),
             enums: Vec::new(),
             typedefs: Vec::new(),
             global_consts: BTreeMap::new(),
@@ -85,6 +141,8 @@ impl<'a> Program<'a> {
             blocking_methods: RefCell::new(BTreeSet::new()),
             foreign: BTreeMap::new(),
             buffer_ports: BTreeSet::new(),
+            report_handlers: Vec::new(),
+            globals: Vec::new(),
         };
         for (tu, r) in results.iter().enumerate() {
             p.collect(tu, &r.unit.items, &[]);
@@ -108,6 +166,7 @@ impl<'a> Program<'a> {
             .collect();
         p.foreign.extend(foreign);
         p.scan_buffer_ports();
+        p.report_handlers = p.scan_report_handlers();
         p
     }
 
@@ -298,23 +357,46 @@ impl<'a> Program<'a> {
                     } else if f.base_name() == "sc_main" && f.body.is_some() {
                         self.sc_main = Some((tu, f));
                     } else if f.body.is_some() {
-                        self.free_fns
-                            .entry(f.base_name().to_string())
-                            .or_insert((tu, f));
+                        match self.free_fns.get(f.base_name()) {
+                            Some((_, g)) if g.params.len() != f.params.len() => self
+                                .free_overloads
+                                .entry(f.base_name().to_string())
+                                .or_default()
+                                .push((tu, f)),
+                            Some(_) => {}
+                            None => {
+                                self.free_fns.insert(f.base_name().to_string(), (tu, f));
+                            }
+                        }
                     }
                 }
                 Item::Enum(e) => self.enums.push((tu, e)),
                 Item::Typedef(t) => self.typedefs.push((tu, t)),
-                Item::Var(v) if v.ty.is_const || v.specifiers.is_constexpr => {
+                Item::Var(v) if (v.ty.is_const || v.specifiers.is_constexpr) && v.ty.ptr_ops.is_empty() => {
+                    let mut other = false;
                     for d in &v.declarators {
                         if let Some(Initializer::Assign(Expr {
                             kind: ExprKind::IntLit { value: Some(x), .. },
                             ..
                         })) = &d.init
+                            && d.ptr_ops.is_empty()
+                            && d.array_dims.is_empty()
                         {
                             self.global_consts.insert(d.name.name.clone(), *x as i64);
+                        } else {
+                            other = true;
                         }
                     }
+                    if other {
+                        self.globals.push((tu, v));
+                    }
+                }
+                // A definition of a class's static member is the class's.
+                Item::Var(v)
+                    if !v.specifiers.is_extern
+                        && v.declarators.iter().all(|d| !d.name.name.contains("::")) =>
+                {
+                    self.globals.push((tu, v));
                 }
                 _ => {}
             }
@@ -494,22 +576,6 @@ fn scan_expr(e: &Expr, out: &mut BTreeSet<String>) {
         }
         _ => {}
     }
-}
-
-/// Whether the statements call any of `names` (unqualified).
-pub fn calls_any(stmts: &[Stmt], names: &[&str]) -> bool {
-    let mut found = false;
-    for s in stmts {
-        visit_stmt(s, &mut |e| {
-            if let ExprKind::Call { callee, .. } = &e.kind
-                && let Some(q) = callee.as_name()
-                && names.contains(&q.last_name())
-            {
-                found = true;
-            }
-        });
-    }
-    found
 }
 
 /// Calls `f` on every expression of a statement, subexpressions included.

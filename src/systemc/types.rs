@@ -622,6 +622,9 @@ pub fn ty_of_name(
         "sc_semaphore" => Ty::Class("scrt_semaphore".to_string()),
         "sc_event_queue" => Ty::Class("scrt_event_queue".to_string()),
         "sc_spawn_options" => Ty::Class("scrt_spawn_opts".to_string()),
+        "sc_report" => Ty::Handle("scrt_report".to_string()),
+        "sc_actions" => u(32, false),
+        "sc_severity" | "sc_verbosity" => Ty::int32(),
         "sc_process_handle" => Ty::Handle("scrt_proc".to_string()),
         "tlm_command"
         | "tlm_response_status"

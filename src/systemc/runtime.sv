@@ -11,6 +11,13 @@ package sc_rt;
   // `scrt_stopped`, which ends a pending sc_start in sc_main.
   bit scrt_started;
   bit scrt_stopped;
+  // An unbounded sc_start() returns at sc_stop() or when no events are left
+  // (§4.5.7): sc_main waits on this event, which sc_stop triggers and the
+  // simulator resumes (instead of ending the run) once only blocked
+  // processes remain.
+  event scrt_idle_ev;
+  // The last sc_start was bounded (it pauses 1 ps before its end time).
+  bit scrt_lag;
   // The end_of_simulation callbacks have run (§4.4.4).
   bit scrt_eos_done;
 
@@ -83,6 +90,7 @@ package sc_rt;
 
   function automatic void scrt_stop_request();
     scrt_stop_req = 1;
+    -> scrt_idle_ev;
   endfunction
 
   // §6.4.4: a second process writing an SC_ONE_WRITER signal (E115), in the
@@ -162,6 +170,226 @@ package sc_rt;
         $__sc_exit(1);
         return;
       end
+  endfunction
+
+  // ---- report handler (§8.3) ------------------------------------------------
+  // The reference kernel's sc_report_handler: actions chosen per (id,
+  // severity), id, then severity rule; suppress/force masks; stop_after
+  // limits; counts; verbosity. A user handler (set_handler) is dispatched
+  // where the report is made (scrt_handler names it); the default handler
+  // is here. SC_THROW ends the run as the uncaught exception does: the
+  // handler then sees the report with the catch actions (SC_DISPLAY).
+  localparam int unsigned SCRT_DO_NOTHING = 'h01, SCRT_THROW = 'h02, SCRT_LOG = 'h04,
+      SCRT_DISPLAY = 'h08, SCRT_CACHE = 'h10, SCRT_INTERRUPT = 'h20, SCRT_STOP = 'h40,
+      SCRT_ABORT = 'h80;
+  localparam int unsigned SCRT_NO_LIMIT = 32'hffff_ffff;
+
+  class scrt_report;
+    int sev;
+    int num_id = -1;
+    string id;
+    string msg;
+    string file;
+    int line;
+    int verb;
+    longint unsigned t;
+    string proc;
+    function string compose();
+      string sevs[4] = '{"Info", "Warning", "Error", "Fatal"};
+      string sv = sevs[sev];
+      string iwef = "IWEF";
+      string str = {sv, ": "};
+      if (num_id >= 0) str = {str, $sformatf("(%s%0d) ", iwef.substr(sev, sev), num_id)};
+      str = {str, id};
+      if (msg != "") str = {str, ": ", msg};
+      if (sev > 0) begin
+        str = {str, $sformatf("\nIn file: %s:%0d", file, line)};
+        if (proc != "") str = {str, "\nIn process: ", proc, " @ ", scrt_time_str(t)};
+      end
+      return str;
+    endfunction
+  endclass
+
+  class scrt_msg_def;
+    int unsigned actions;
+    int unsigned sev_actions[4];
+    int unsigned limit_mask;
+    int unsigned limit;
+    int unsigned sev_limit[4];
+    int unsigned call_count;
+    int unsigned sev_call_count[4];
+  endclass
+
+  scrt_msg_def scrt_msgs[string];
+  int unsigned scrt_sev_actions[4] = '{'h0c, 'h0c, 'h16, 'h9c};
+  int unsigned scrt_sev_limit[4] = '{SCRT_NO_LIMIT, SCRT_NO_LIMIT, SCRT_NO_LIMIT, SCRT_NO_LIMIT};
+  int unsigned scrt_sev_count[4];
+  int unsigned scrt_suppress_mask;
+  int unsigned scrt_force_mask;
+  int unsigned scrt_available_actions = 'hff;
+  int scrt_verbosity = 200;
+  // The handler: 0 the default one, k > 0 the k-th function set_handler names.
+  int scrt_handler;
+  bit scrt_thrown;
+
+  function automatic scrt_msg_def scrt_md(string id);
+    if (!scrt_msgs.exists(id)) scrt_msgs[id] = new;
+    return scrt_msgs[id];
+  endfunction
+
+  function automatic int unsigned scrt_set_actions(int sev, string id, bit by_sev, bit by_id,
+                                                   int unsigned a);
+    int unsigned old;
+    scrt_msg_def md;
+    if (!by_id) begin
+      old = scrt_sev_actions[sev];
+      scrt_sev_actions[sev] = a;
+      return old;
+    end
+    md = scrt_md(id);
+    if (by_sev) begin
+      old = md.sev_actions[sev];
+      md.sev_actions[sev] = a;
+    end else begin
+      old = md.actions;
+      md.actions = a;
+    end
+    return old;
+  endfunction
+
+  function automatic int scrt_stop_after(int sev, string id, bit by_sev, bit by_id, int lim);
+    int old;
+    int unsigned mask;
+    scrt_msg_def md;
+    if (!by_id) begin
+      old = scrt_sev_limit[sev];
+      scrt_sev_limit[sev] = lim < 0 ? SCRT_NO_LIMIT : lim;
+      return old;
+    end
+    md = scrt_md(id);
+    mask = by_sev ? 1 << (sev + 1) : 1;
+    old = (md.limit_mask & mask) ? (by_sev ? md.sev_limit[sev] : md.limit) : SCRT_NO_LIMIT;
+    if (lim < 0) md.limit_mask &= ~mask;
+    else begin
+      md.limit_mask |= mask;
+      if (by_sev) md.sev_limit[sev] = lim;
+      else md.limit = lim;
+    end
+    return old;
+  endfunction
+
+  function automatic int scrt_get_count(int sev, string id, bit by_sev, bit by_id);
+    scrt_msg_def md;
+    if (!by_id) return scrt_sev_count[sev];
+    md = scrt_md(id);
+    return by_sev ? md.sev_call_count[sev] : md.call_count;
+  endfunction
+
+  function automatic int unsigned scrt_suppress(int unsigned mask);
+    int unsigned old = scrt_suppress_mask;
+    scrt_suppress_mask = mask;
+    return old;
+  endfunction
+
+  function automatic int unsigned scrt_force(int unsigned mask);
+    int unsigned old = scrt_force_mask;
+    scrt_force_mask = mask;
+    return old;
+  endfunction
+
+  function automatic int unsigned scrt_new_action_id();
+    for (int unsigned p = 1; p != 0; p <<= 1)
+      if (!(p & scrt_available_actions)) begin
+        scrt_available_actions |= p;
+        return p;
+      end
+    return 0;
+  endfunction
+
+  function automatic int scrt_set_verbosity(int v);
+    int old = scrt_verbosity;
+    scrt_verbosity = v;
+    return old;
+  endfunction
+
+  // A report, or null when an info report is above the verbosity level.
+  function automatic scrt_report scrt_report_make(int sev, string id, string msg, int verb,
+                                                  string file, int line, string proc);
+    scrt_report r;
+    if (sev == 0 && verb > scrt_verbosity) return null;
+    r = new;
+    r.sev = sev;
+    r.id = id;
+    r.msg = msg;
+    r.verb = verb;
+    r.file = file;
+    r.line = line;
+    r.t = scrt_now();
+    r.proc = proc;
+    return r;
+  endfunction
+
+  // The actions for a report (sc_report_handler::execute), counting it.
+  function automatic int unsigned scrt_report_actions(scrt_report r);
+    scrt_msg_def md = scrt_md(r.id);
+    int unsigned a = md.sev_actions[r.sev];
+    int unsigned lim, cnt;
+    bit have = 0;
+    if (a == 0) a = md.actions;
+    if (a == 0) a = scrt_sev_actions[r.sev];
+    a &= ~scrt_suppress_mask;
+    a |= scrt_force_mask;
+    if (md.sev_call_count[r.sev] != SCRT_NO_LIMIT) md.sev_call_count[r.sev]++;
+    if (md.call_count != SCRT_NO_LIMIT) md.call_count++;
+    if (scrt_sev_count[r.sev] != SCRT_NO_LIMIT) scrt_sev_count[r.sev]++;
+    if (md.limit_mask & (1 << (r.sev + 1))) begin
+      lim = md.sev_limit[r.sev];
+      cnt = md.sev_call_count[r.sev];
+      have = 1;
+    end
+    if (!have && (md.limit_mask & 1)) begin
+      lim = md.limit;
+      cnt = md.call_count;
+      have = 1;
+    end
+    if (!have) begin
+      lim = scrt_sev_limit[r.sev];
+      cnt = scrt_sev_count[r.sev];
+    end
+    if (lim != 0 && lim != SCRT_NO_LIMIT && cnt >= lim) a |= SCRT_STOP;
+    return a;
+  endfunction
+
+  function automatic void scrt_default_handler(scrt_report r, int unsigned a, bit tb);
+    if (a & SCRT_DISPLAY) $write("\n%s\n", r.compose());
+    if (a & SCRT_STOP) begin
+      if (tb) scrt_stop();
+      else scrt_stop_request();
+    end
+    if (a & SCRT_ABORT) scrt_abort(tb);
+    if (a & SCRT_THROW) scrt_thrown = 1;
+  endfunction
+
+  // sc_abort(): the kernel's info report I99, then abort (status 134).
+  function automatic void scrt_abort(bit tb);
+    scrt_report r = scrt_report_make(0, "simulation aborted", "", 200, "", 0, "");
+    if (r != null) begin
+      r.num_id = 99;
+      scrt_default_handler(r, scrt_report_actions(r), tb);
+    end
+    $__sc_exit(134);
+  endfunction
+
+  // A report through the default handler; a throw ends the run (status 1)
+  // after the catch's display.
+  function automatic void scrt_report_default(scrt_report r, bit tb);
+    if (r == null) return;
+    scrt_default_handler(r, scrt_report_actions(r), tb);
+    if (scrt_thrown) begin
+      scrt_thrown = 0;
+      scrt_default_handler(r, SCRT_DISPLAY, tb);
+      $__sc_exit(1);
+    end
   endfunction
 
   // ---- process handles (§5.6) -------------------------------------------------

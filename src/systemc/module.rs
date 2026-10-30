@@ -99,7 +99,6 @@ pub struct ModuleLowering<'l, 'a> {
     fifo_size: BTreeMap<String, Expression>,
     /// sc_main: the testbench statements from this index on follow the
     /// last, unbounded `sc_start()` and run in a `final` block.
-    tb_tail: Option<usize>,
     /// Names of the objects sc_main creates (top level, §5.17).
     tb_names: NameGen,
     /// The interfaces the module being lowered implements (a channel).
@@ -117,7 +116,6 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             async_resets: Vec::new(),
             clock_init: BTreeMap::new(),
             fifo_size: BTreeMap::new(),
-            tb_tail: None,
             tb_names: NameGen::default(),
             implements: Vec::new(),
         }
@@ -1843,6 +1841,15 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             .iter()
             .map(|(_, f)| f.base_name().to_string())
             .collect();
+        // Report handlers run where a report is made (§8.3).
+        for h in &self.lw.prog.report_handlers {
+            if !have.contains(h)
+                && let Some((t, f)) = self.lw.prog.free_fns.get(h)
+            {
+                have.insert(h.clone());
+                defs.push((*t, f));
+            }
+        }
         let mut i = 0;
         while i < defs.len() {
             let mut callees = BTreeSet::new();
@@ -1856,8 +1863,11 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     continue;
                 }
                 if let Some((t, f)) = self.lw.prog.free_fns.get(&c) {
-                    have.insert(c);
                     defs.push((*t, f));
+                    for (t, f) in self.lw.prog.free_overloads.get(&c).into_iter().flatten() {
+                        defs.push((*t, f));
+                    }
+                    have.insert(c);
                 }
             }
             i += 1;
@@ -1868,6 +1878,12 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
     fn register_sigs(&mut self, defs: &[(usize, &'a sc::FunctionDecl)]) -> R<()> {
         let tu = self.lw.tu;
         let blocking = blocking_functions(self.lw, defs);
+        let mut seen = BTreeSet::new();
+        for (_, f) in defs {
+            if !seen.insert(f.base_name()) {
+                self.lw.m.overloaded.insert(f.base_name().to_string());
+            }
+        }
         for (t, f) in defs {
             self.lw.tu = *t;
             let ret = match &f.return_type {
@@ -1891,16 +1907,26 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 })
                 .collect();
             self.lw.m.funcs.insert(
-                f.base_name().to_string(),
+                self.fn_key(f),
                 FnSig {
                     ret,
                     is_task: blocking.contains(f.base_name()),
                     by_ref,
+                    defaults: f.params.iter().map(|p| p.default.clone()).collect(),
                 },
             );
         }
         self.lw.tu = tu;
         Ok(())
+    }
+
+    /// A function's SV name: an overloaded one carries its parameter count.
+    fn fn_key(&self, f: &sc::FunctionDecl) -> String {
+        if self.lw.m.overloaded.contains(f.base_name()) {
+            format!("{}__{}", f.base_name(), f.params.len())
+        } else {
+            f.base_name().to_string()
+        }
     }
 
     fn lower_bodies(&mut self, defs: Vec<(usize, &'a sc::FunctionDecl)>) -> R<Vec<ModuleItem>> {
@@ -1918,7 +1944,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
     }
 
     fn lower_function(&mut self, f: &sc::FunctionDecl) -> R<ModuleItem> {
-        let name = f.base_name().to_string();
+        let name = self.fn_key(f);
         let sig = self
             .lw
             .m
@@ -2029,6 +2055,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let mut items = vec![import_all("sc_rt"), timeunits_ps()];
         if !self.lw.prog.user_classes.borrow().is_empty() {
             items.insert(1, import_all("sc_user"));
+        }
+        if !self.lw.globals.is_empty() {
+            items.insert(1, import_all("sc_glob"));
         }
         let mut ports = Vec::new();
         let mut clock_items = Vec::new();
@@ -2524,14 +2553,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         defs.remove(0);
         self.register_sigs(&defs)?;
         if let Some(b) = &f.body {
-            match unbounded_start_tail(&b.stmts) {
-                Some(i) => {
-                    self.walk(&b.stmts[..i], &mut s);
-                    self.tb_tail = Some(s.elab.len());
-                    self.walk(&b.stmts[i..], &mut s);
-                }
-                None => self.walk(&b.stmts, &mut s),
-            }
+            self.walk(&b.stmts, &mut s);
         }
         let decls = std::mem::take(&mut self.lw.f.decls);
         let stmts = std::mem::take(&mut s.elab);
@@ -2731,55 +2753,12 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             destroy,
         )));
         items.append(&mut self.lw.m.extra_items);
-        let (decls, mut stmts) = tb.unwrap_or_default();
-        let Some(at) = self.tb_tail.take() else {
-            let mut body = decls;
-            body.extend(stmts);
-            body.push(expr_stmt(call_fn("__sc_destroy", vec![])));
-            body.push(expr_stmt(sys("$finish", vec![])));
-            items.push(initial(block(body)));
-            return items;
-        };
-        // An unbounded sc_start() also returns when no events are left
-        // (IEEE 1666-2023 §4.5.7), where SystemVerilog simulation simply
-        // ends; the statements after it run in a `final` block, which
-        // both ends reach. sc_main's locals move to the module so the
-        // final block sees them.
-        let mut tail = vec![assign(ident("scrt_tb_now"), sys("$time", vec![]))];
-        tail.extend(stmts.split_off(at));
-        tail.push(expr_stmt(call_fn("__sc_destroy", vec![])));
-        let mut body = Vec::new();
-        for d in decls {
-            let StatementKind::VarDecl {
-                data_type,
-                declarators,
-                ..
-            } = d.kind
-            else {
-                body.push(d);
-                continue;
-            };
-            for v in declarators {
-                items.push(data_decl(
-                    data_type.clone(),
-                    &v.name.name,
-                    v.dimensions,
-                    None,
-                ));
-                if let Some(init) = v.init {
-                    body.push(assign(ident(&v.name.name), init));
-                }
-            }
-        }
+        let (decls, stmts) = tb.unwrap_or_default();
+        let mut body = decls;
         body.extend(stmts);
+        body.push(expr_stmt(call_fn("__sc_destroy", vec![])));
         body.push(expr_stmt(sys("$finish", vec![])));
         items.push(initial(block(body)));
-        items.push(ModuleItem::FinalConstruct(
-            crate::ast::decl::FinalConstruct {
-                stmt: block(tail),
-                span: sp(),
-            },
-        ));
         items
     }
 
@@ -3603,15 +3582,4 @@ fn fifo_size_arg(args: &[sc::Expr]) -> Option<&sc::Expr> {
         [_, size, ..] => Some(size),
         _ => None,
     }
-}
-
-/// The index after sc_main's last top-level unbounded `sc_start()`, when the
-/// statements after it need no simulation time.
-fn unbounded_start_tail(stmts: &[sc::Stmt]) -> Option<usize> {
-    let i = stmts.iter().rposition(|s| {
-        matches!(s, sc::Stmt::Expr(sc::Expr { kind: sc::ExprKind::Call { callee, args }, .. })
-            if args.is_empty() && callee.as_name().is_some_and(|q| q.last_name() == "sc_start"))
-    })?;
-    let tail = &stmts[i + 1..];
-    (!tail.is_empty() && !super::program::calls_any(tail, &["sc_start", "wait"])).then_some(i + 1)
 }
