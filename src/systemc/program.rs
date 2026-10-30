@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::types::Ty;
+use crate::sv_parser::systemc::classify::ScObjectKind;
 use crate::sv_parser::systemc::ScParseResult;
 use crate::sv_parser::systemc::ast::*;
 
@@ -25,9 +26,17 @@ pub struct Program<'a> {
     address_taken: BTreeSet<(usize, String)>,
     /// Lowered member types of each module (for `inst.member` references).
     pub module_members: RefCell<BTreeMap<String, BTreeMap<String, Ty>>>,
+    /// SystemC basenames of each module's member objects (`u.clk.name()`).
+    pub module_names: RefCell<BTreeMap<String, BTreeMap<String, String>>>,
+    /// Each module's resolved signals and ports (member → width).
+    pub module_resolved: RefCell<BTreeMap<String, BTreeMap<String, u32>>>,
     /// Classes deriving from `sc_foreign_module`: declarations of modules
     /// written in SystemVerilog, by C++ class → SV module name.
     pub foreign: BTreeMap<String, String>,
+    /// Input ports some instance binds to an `sc_buffer` (directly or
+    /// through a parent's port): (module class, port). Such a port also
+    /// carries the buffer's write count, so it sees every write (§6.9).
+    pub buffer_ports: BTreeSet<(String, String)>,
 }
 
 impl<'a> Program<'a> {
@@ -43,7 +52,10 @@ impl<'a> Program<'a> {
             global_consts: BTreeMap::new(),
             address_taken: BTreeSet::new(),
             module_members: RefCell::new(BTreeMap::new()),
+            module_names: RefCell::new(BTreeMap::new()),
+            module_resolved: RefCell::new(BTreeMap::new()),
             foreign: BTreeMap::new(),
+            buffer_ports: BTreeSet::new(),
         };
         for (tu, r) in results.iter().enumerate() {
             p.collect(tu, &r.unit.items, &[]);
@@ -66,7 +78,125 @@ impl<'a> Program<'a> {
             .map(|(n, (_, c, _))| (n.clone(), p.hdl_name(n, c)))
             .collect();
         p.foreign.extend(foreign);
+        p.scan_buffer_ports();
         p
+    }
+
+    /// Find the ports bound to an `sc_buffer`: `x.port(buf)`,
+    /// `x->port.bind(buf)`, or to a port of the parent that is itself one
+    /// (until no more are found).
+    fn scan_buffer_ports(&mut self) {
+        // Per binding scope: (own module class or None for sc_main, its
+        // object declarations, the statements that bind).
+        let mut scopes: Vec<(Option<String>, Vec<&'a VarDecl>, Vec<&'a Stmt>)> = Vec::new();
+        for (name, entry) in &self.classes {
+            let c: &'a ClassDecl = entry.1;
+            if !c.sc_module {
+                continue;
+            }
+            let decls: Vec<&VarDecl> = c
+                .members
+                .iter()
+                .filter_map(|m| match m {
+                    Member::Field(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            let mut stmts: Vec<&Stmt> = Vec::new();
+            for m in &c.members {
+                if let Member::Constructor(f) = m
+                    && let Some(b) = &f.body
+                {
+                    stmts.extend(b.stmts.iter());
+                }
+            }
+            for &(_, f) in self.out_of_class.get(name).into_iter().flatten() {
+                let f: &'a FunctionDecl = f;
+                if f.base_name() == name
+                    && let Some(b) = &f.body
+                {
+                    stmts.extend(b.stmts.iter());
+                }
+            }
+            scopes.push((Some(name.clone()), decls, stmts));
+        }
+        if let Some((_, f)) = self.sc_main
+            && let Some(b) = &f.body
+        {
+            let decls = b
+                .stmts
+                .iter()
+                .filter_map(|s| match s {
+                    Stmt::Decl(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            scopes.push((None, decls, b.stmts.iter().collect()));
+        }
+        loop {
+            let mut found = Vec::new();
+            for (own, decls, stmts) in &scopes {
+                let class_of = |n: &str| -> Option<String> {
+                    decls
+                        .iter()
+                        .find(|v| v.declarators.iter().any(|d| d.name.name == n))
+                        .and_then(|v| v.ty.name())
+                        .map(|q| q.last_name().to_string())
+                };
+                let is_buffer = |n: &str| {
+                    decls.iter().any(|v| {
+                        ScObjectKind::of(&v.ty) == ScObjectKind::Buffer
+                            && v.declarators.iter().any(|d| d.name.name == n)
+                    }) || own
+                        .as_ref()
+                        .is_some_and(|o| self.buffer_ports.contains(&(o.clone(), n.to_string())))
+                };
+                let inst = |e: &Expr| -> Option<String> {
+                    let e = match &e.kind {
+                        ExprKind::Unary {
+                            op: UnaryOp::Deref,
+                            operand,
+                        } => operand.as_ref(),
+                        _ => e,
+                    };
+                    class_of(e.as_name()?.last_name())
+                };
+                for s in stmts {
+                    visit_stmt(s, &mut |e| {
+                        let ExprKind::Call { callee, args } = &e.kind else {
+                            return;
+                        };
+                        let [a] = args.as_slice() else { return };
+                        let Some(arg) = a.as_name().map(|q| q.last_name().to_string()) else {
+                            return;
+                        };
+                        if !is_buffer(&arg) {
+                            return;
+                        }
+                        let ExprKind::Member { base, name, .. } = &callee.kind else {
+                            return;
+                        };
+                        let bound = if name.ident.name == "bind"
+                            && let ExprKind::Member {
+                                base: b2, name: port, ..
+                            } = &base.kind
+                        {
+                            inst(b2).map(|c| (c, port.ident.name.clone()))
+                        } else {
+                            inst(base).map(|c| (c, name.ident.name.clone()))
+                        };
+                        if let Some(b) = bound {
+                            found.push(b);
+                        }
+                    });
+                }
+            }
+            let before = self.buffer_ports.len();
+            self.buffer_ports.extend(found);
+            if self.buffer_ports.len() == before {
+                break;
+            }
+        }
     }
 
     /// The SV module a foreign-module class stands for: the name given to

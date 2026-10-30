@@ -14,7 +14,7 @@ use super::build::*;
 use super::lower::*;
 use super::types::*;
 use crate::ast::decl::{ClassItem, ModuleItem};
-use crate::ast::expr::{BinaryOp, Expression, UnaryOp};
+use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberLiteral, UnaryOp};
 use crate::ast::module::ModuleDeclaration;
 use crate::ast::stmt::{Edge, JoinType, Statement, StatementKind};
 use crate::ast::types::PortDirection;
@@ -34,6 +34,15 @@ pub struct ModIface {
     pub ctor_params: Vec<String>,
     /// Members that are `sc_buffer`s.
     pub buffers: BTreeSet<String>,
+    /// Resolved signals and the resolved out/inout ports: member → width.
+    pub resolved: BTreeMap<String, u32>,
+    /// SystemC basenames of the member objects (§5.17).
+    pub sc_names: BTreeMap<String, String>,
+    /// Ports some instance binds to an sc_buffer (§6.9): input port → the
+    /// hidden input that carries the buffer's write count, and output port
+    /// → the hidden output that counts the writes made through it.
+    pub port_counters: BTreeMap<String, String>,
+    pub port_wcounters: BTreeMap<String, String>,
 }
 
 /// A registered process before lowering.
@@ -41,7 +50,7 @@ struct ProcSpec {
     kind: sc::ProcessKind,
     func: String,
     span: ScSpan,
-    sens: Vec<(Option<Edge>, Expression, String)>,
+    sens: Vec<SensTerm>,
     clock: Option<(Edge, Expression)>,
     dont_init: bool,
     resets: Vec<(bool, Expression, Expression, String)>,
@@ -89,6 +98,8 @@ pub struct ModuleLowering<'l, 'a> {
     /// sc_main: the testbench statements from this index on follow the
     /// last, unbounded `sc_start()` and run in a `final` block.
     tb_tail: Option<usize>,
+    /// Names of the objects sc_main creates (top level, §5.17).
+    tb_names: NameGen,
 }
 
 impl<'l, 'a> ModuleLowering<'l, 'a> {
@@ -103,6 +114,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             clock_init: BTreeMap::new(),
             fifo_size: BTreeMap::new(),
             tb_tail: None,
+            tb_names: NameGen::default(),
         }
     }
 }
@@ -115,6 +127,57 @@ fn port_dir(kind: &SymKind) -> Option<PortDirection> {
         // also reads.
         SymKind::InOutPort => Some(PortDirection::Output),
         _ => None,
+    }
+}
+
+/// SystemC object names within one parent (§5.17): the name an object is
+/// constructed with — `s{"s"}`, `s("s")`, `SC_NAMED(s)`, or the
+/// constructor's initializer `s("s")` — else `sc_gen_unique_name`'s
+/// `<kind>_<n>`, numbered per kind in construction (declaration) order.
+#[derive(Default)]
+pub struct NameGen {
+    counters: BTreeMap<&'static str, u32>,
+}
+
+impl NameGen {
+    pub fn name(
+        &mut self,
+        v: &sc::VarDecl,
+        d: &sc::Declarator,
+        ctor_inits: &[&sc::MemInit],
+    ) -> Option<String> {
+        let q = v.ty.name()?;
+        let kind = default_basename(q)?;
+        let lit = |args: &[sc::Expr]| match args.first().map(|a| &a.kind) {
+            Some(sc::ExprKind::StringLit { value, .. }) => Some(value.clone()),
+            _ => None,
+        };
+        let given = match &d.init {
+            Some(sc::Initializer::Brace(a) | sc::Initializer::Paren(a)) => lit(a),
+            _ => None,
+        }
+        .or_else(|| {
+            ctor_inits
+                .iter()
+                .find(|mi| mi.name.last_name() == d.name.name)
+                .and_then(|mi| lit(&mi.args))
+        });
+        Some(given.unwrap_or_else(|| {
+            let n = self.counters.entry(kind).or_insert(0);
+            *n += 1;
+            format!("{}_{}", kind, *n - 1)
+        }))
+    }
+}
+
+/// The width of a resolved signal or port, which picks its nettype.
+fn resolved_width(lw: &Lw, ty: &Ty, span: ScSpan) -> R<u32> {
+    match ty {
+        Ty::Vec4 { w } => match w.n {
+            Some(n) => Ok(n),
+            None => lw.err(span, "the width of a resolved signal must be a constant"),
+        },
+        _ => lw.err(span, "a resolved signal carries sc_logic values"),
     }
 }
 
@@ -208,22 +271,61 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 }
             }
         }
+        let mut name_gen = NameGen::default();
         for m in &class.members {
             let sc::Member::Field(v) = m else { continue };
             if v.specifiers.is_static {
                 continue;
             }
             for d in &v.declarators {
+                if let Some(n) = name_gen.name(v, d, &self.ctor_inits) {
+                    iface.sc_names.insert(d.name.name.clone(), n);
+                }
                 let sym = self.member_sym(v, d)?;
                 if let Some(sym) = sym {
                     if matches!(ScObjectKind::of(&v.ty), ScObjectKind::Buffer) {
                         iface.buffers.insert(sym.sv.clone());
+                    }
+                    if v.ty.name().is_some_and(drives_resolved) {
+                        iface
+                            .resolved
+                            .insert(sym.sv.clone(), resolved_width(self.lw, &sym.ty, d.span)?);
                     }
                     if port_dir(&sym.kind).is_some() {
                         iface.ports.push((d.name.name.clone(), sym.kind.clone()));
                     }
                     iface.members.insert(d.name.name.clone(), sym);
                 }
+            }
+        }
+        // §6.9: a port bound to an sc_buffer passes on every write of it,
+        // not only value changes — a write count travels beside the value.
+        let int_t = Ty::int32();
+        for (p, kind) in iface.ports.clone() {
+            if !self.lw.prog.buffer_ports.contains(&(name.clone(), p.clone())) {
+                continue;
+            }
+            let mut hidden = Vec::new();
+            if matches!(kind, SymKind::InPort | SymKind::InOutPort) {
+                let c = format!("__sc_bc_{}", p);
+                iface.port_counters.insert(p.clone(), c.clone());
+                hidden.push((c, SymKind::InPort));
+            }
+            if matches!(kind, SymKind::OutPort | SymKind::InOutPort) {
+                let c = format!("__sc_bw_{}", p);
+                iface.port_wcounters.insert(p.clone(), c.clone());
+                hidden.push((c, SymKind::OutPort));
+            }
+            for (c, k) in hidden {
+                iface.members.insert(
+                    c.clone(),
+                    Sym {
+                        kind: k.clone(),
+                        ty: int_t.clone(),
+                        sv: c.clone(),
+                    },
+                );
+                iface.ports.push((c, k));
             }
         }
         Ok(iface)
@@ -365,6 +467,10 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         self.lw.m = ModCtx {
             name: name.to_string(),
             syms: iface.members.clone(),
+            resolved: iface.resolved.clone(),
+            sc_names: iface.sc_names.clone(),
+            port_counters: iface.port_counters.clone(),
+            port_wcounters: iface.port_wcounters.clone(),
             ..Default::default()
         };
         for b in &iface.buffers {
@@ -544,6 +650,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         };
         match &sym.kind {
             SymKind::Instance(module) => {
+                if let Some(sc::ExprKind::StringLit { value, .. }) = mi.args.first().map(|a| &a.kind) {
+                    self.lw.m.inst_names.insert(n.to_string(), value.clone());
+                }
                 let params =
                     self.ctor_args_params(module, mi.args.get(1..).unwrap_or(&[]), mi.span)?;
                 let mut params = params;
@@ -644,15 +753,15 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 Ok(())
             }
             S::Sensitive { edge, items, span } => {
+                let forced = match edge {
+                    sc::SensitivityEdge::Pos => Some(Edge::Posedge),
+                    sc::SensitivityEdge::Neg => Some(Edge::Negedge),
+                    sc::SensitivityEdge::Any => None,
+                };
                 for it in items {
-                    let mut entry = self.sens_item(it)?;
-                    match edge {
-                        sc::SensitivityEdge::Pos => entry.0 = Some(Edge::Posedge),
-                        sc::SensitivityEdge::Neg => entry.0 = Some(Edge::Negedge),
-                        sc::SensitivityEdge::Any => {}
-                    }
+                    let entries = self.sens_item(it, forced)?;
                     match s.procs.last_mut() {
-                        Some(p) => p.sens.push(entry),
+                        Some(p) => p.sens.extend(entries),
                         None => {
                             return self
                                 .lw
@@ -715,8 +824,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         }
     }
 
-    /// One `sensitive << x` item.
-    fn sens_item(&mut self, e: &sc::Expr) -> R<(Option<Edge>, Expression, String)> {
+    /// One `sensitive << x` item; `forced` is the edge of a
+    /// `sensitive_pos`/`sensitive_neg` list.
+    fn sens_item(&mut self, e: &sc::Expr, forced: Option<Edge>) -> R<Vec<SensTerm>> {
         let base_name = |e: &sc::Expr| -> String {
             match &e.kind {
                 sc::ExprKind::Name(q) => q.last_name().to_string(),
@@ -727,7 +837,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 _ => String::new(),
             }
         };
-        if let sc::ExprKind::Call { callee, args } = &e.kind
+        let (target, edge) = if let sc::ExprKind::Call { callee, args } = &e.kind
             && let sc::ExprKind::Member { base, name, .. } = &callee.kind
             && args.is_empty()
         {
@@ -744,19 +854,32 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                         .err(e.span, format!("'{}' is not a sensitivity", other));
                 }
             };
-            if edge.is_none()
-                && let Some(ev) = self.lw.buffer_counter_of(base)
-            {
-                return Ok((None, ident(&ev), base_name(base)));
-            }
-            let (x, _) = self.lw.expr(base)?;
-            return Ok((edge, x, base_name(base)));
+            (base.as_ref(), edge)
+        } else {
+            (e, None)
+        };
+        let edge = forced.or(edge);
+        let name = base_name(target);
+        let counter = if edge.is_none() {
+            self.lw.buffer_counter_of(target)
+        } else {
+            None
+        };
+        if let Some((ev, false)) = &counter {
+            return Ok(vec![SensTerm::new(None, ident(ev), name)]);
         }
-        if let Some(ev) = self.lw.buffer_counter_of(e) {
-            return Ok((None, ident(&ev), base_name(e)));
+        let (x, t) = self.lw.expr(target)?;
+        let mut v = vec![match edge {
+            // §6.8.4: an sc_logic's edge is a change to '1' / '0'.
+            Some(ed) if matches!(t, Ty::Vec4 { .. }) => SensTerm::logic_edge(ed, x, name.clone()),
+            _ => SensTerm::new(edge, x, name.clone()),
+        }];
+        // A port some instance binds to an sc_buffer also wakes on its
+        // writes (§6.9).
+        if let Some((ev, true)) = counter {
+            v.push(SensTerm::new(None, ident(&ev), name));
         }
-        let (x, _) = self.lw.expr(e)?;
-        Ok((None, x, base_name(e)))
+        Ok(v)
     }
 
     /// Instance creation and binding statements.
@@ -774,6 +897,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 && let SymKind::Instance(module) = &sym.kind
             {
                 let cargs = args.as_deref().unwrap_or(&[]);
+                if let Some(sc::ExprKind::StringLit { value, .. }) = cargs.first().map(|a| &a.kind) {
+                    self.lw.m.inst_names.insert(q.last_name().to_string(), value.clone());
+                }
                 let mut params =
                     self.ctor_args_params(module, cargs.get(1..).unwrap_or(&[]), e.span)?;
                 if let Some(tq) = ty.name() {
@@ -808,9 +934,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     let Some((p, _)) = ports.get(i) else {
                         return self.lw.err(e.span, "too many positional port bindings");
                     };
-                    self.check_not_buffer(a)?;
-                    let (x, _) = self.lw.expr(a)?;
+                    let x = self.port_actual(a, module, p)?;
                     self.connect(s, &sym.sv, p, x);
+                    self.bind_buffer_counts(s, &sym.sv, module, p, a)?;
                 }
                 return Ok(true);
             }
@@ -927,14 +1053,94 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         }
     }
 
-    /// A port sees its channel's value changes only, so an sc_buffer's
-    /// per-write events would be lost through it.
-    fn check_not_buffer(&mut self, a: &sc::Expr) -> R<()> {
-        if self.lw.buffer_counter_of(a).is_some() {
+    /// The actual of a port binding. A resolved out/inout port connects to
+    /// the resolved net itself (it drives it); any other port to the value.
+    fn port_actual(&mut self, a: &sc::Expr, module: &str, port: &str) -> R<Expression> {
+        let child_resolved = self
+            .ifaces
+            .get(module)
+            .is_some_and(|i| i.resolved.contains_key(port));
+        let net = a
+            .as_name()
+            .and_then(|q| self.lw.lookup(q.last_name()))
+            .filter(|sym| sym.is_signal_like() && self.lw.m.resolved.contains_key(&sym.sv));
+        match (child_resolved, net) {
+            (true, Some(sym)) => Ok(ident(&sym.sv)),
+            (true, None) => self.lw.err(
+                a.span,
+                format!(
+                    "port '{}' of '{}' drives a resolved signal: bind it to an sc_signal_resolved, an sc_signal_rv or a resolved port",
+                    port, module
+                ),
+            ),
+            (false, Some(_))
+                if self
+                    .ifaces
+                    .get(module)
+                    .and_then(|i| i.members.get(port))
+                    .is_some_and(|m| m.kind != SymKind::InPort) =>
+            {
+                self.lw.err(
+                    a.span,
+                    format!(
+                        "binding the output port '{}' of '{}' to a resolved signal is not supported in simulation; declare it sc_out_resolved or sc_out_rv",
+                        port, module
+                    ),
+                )
+            }
+            _ => Ok(self.lw.expr(a)?.0),
+        }
+    }
+
+    /// §6.9: binding a port to an sc_buffer (or to a parent port bound to
+    /// one) also connects its hidden write count — the buffer's event count
+    /// into an input port, the port's own write count out of an output.
+    fn bind_buffer_counts(
+        &mut self,
+        s: &mut Structure,
+        inst: &str,
+        module: &str,
+        port: &str,
+        a: &sc::Expr,
+    ) -> R<()> {
+        let Some((ev, value_too)) = self.lw.buffer_counter_of(a) else {
+            return Ok(());
+        };
+        let (cin, cout) = match self.ifaces.get(module) {
+            Some(i) => (i.port_counters.get(port).cloned(), i.port_wcounters.get(port).cloned()),
+            None => (None, None),
+        };
+        if cin.is_none() && cout.is_none() {
             return self.lw.err(
                 a.span,
-                "binding an sc_buffer to a port is not supported in simulation",
+                "binding an sc_buffer to a port this way is not supported in simulation",
             );
+        }
+        if let Some(c) = cin {
+            self.connect(s, inst, &c, ident(&ev));
+        }
+        if let Some(c) = cout {
+            // Only a buffer itself sums its writers; a parent's port passes
+            // its own write count up instead.
+            let Some(buf) = a
+                .as_name()
+                .map(|q| q.last_name().to_string())
+                .filter(|_| !value_too)
+            else {
+                return self.lw.err(
+                    a.span,
+                    "an output port bound to a port that leads to an sc_buffer is not supported in simulation",
+                );
+            };
+            let v = format!("__sc_bw_{}_{}", inst, port);
+            self.lw.m.extra_items.push(data_decl(
+                atom_t(crate::ast::types::IntegerAtomType::Int, false),
+                &v,
+                Vec::new(),
+                None,
+            ));
+            self.connect(s, inst, &c, ident(&v));
+            self.lw.m.buffer_sources.entry(buf).or_default().push(v);
         }
         Ok(())
     }
@@ -962,10 +1168,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             .map(|m| m.kind.clone());
         match kind {
             Some(SymKind::InPort | SymKind::OutPort | SymKind::InOutPort) => {
-                self.check_not_buffer(a)?;
-                let (x, _) = self.lw.expr(a)?;
+                let x = self.port_actual(a, module, port)?;
                 self.connect(s, inst, port, x);
-                Ok(())
+                self.bind_buffer_counts(s, inst, module, port, a)
             }
             Some(SymKind::FifoIn | SymKind::FifoOut) => {
                 let (x, _) = self.lw.expr(a)?;
@@ -1118,6 +1323,8 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         }
         // Every member function a process reaches runs in that process.
         let graph = call_graph(self.lw, class, name);
+        let writes = write_sets(self.lw, class, name);
+        let mut writers: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
         for (i, p) in s.procs.iter().enumerate() {
             let mut seen = BTreeSet::new();
             let mut stack = vec![p.func.clone()];
@@ -1129,11 +1336,41 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 if *e != Some(i) {
                     *e = None;
                 }
+                for w in writes.get(&f).into_iter().flatten() {
+                    writers.entry(w.clone()).or_default().insert(i);
+                }
                 if let Some(callees) = graph.get(&f) {
                     stack.extend(callees.iter().cloned());
                 }
             }
         }
+        // §6.4.4: the signals and ports two processes may write, with the
+        // default SC_ONE_WRITER policy, check their writer at every write.
+        let relaxed: BTreeSet<String> = class
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                sc::Member::Field(v) if many_writers(&v.ty) => Some(v),
+                _ => None,
+            })
+            .flat_map(|v| v.declarators.iter().map(|d| d.name.name.clone()))
+            .collect();
+        self.lw.m.one_writer = writers
+            .into_iter()
+            .filter(|(sig, ps)| {
+                ps.len() >= 2
+                    && !relaxed.contains(sig)
+                    && !self.lw.m.resolved.contains_key(sig)
+                    && self.lw.m.syms.get(sig).is_some_and(|s| {
+                        matches!(
+                            s.kind,
+                            SymKind::Signal | SymKind::OutPort | SymKind::InOutPort
+                        )
+                    })
+            })
+            .map(|(sig, _)| sig)
+            .collect();
+        self.lw.m.proc_names = s.procs.iter().map(|p| (p.func.clone(), p.kind)).collect();
         self.lw.m.procs = procs;
         self.lw.m.fn_proc = fn_proc;
         self.dont_init = s.procs.iter().map(|p| p.dont_init).collect();
@@ -1279,6 +1516,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         self.lw.f = FnCtx {
             scopes: vec![BTreeMap::new()],
             proc: self.lw.m.fn_proc.get(&name).copied().flatten(),
+            shared: matches!(self.lw.m.fn_proc.get(&name), Some(None)),
             ret: Some(sig.ret.clone()),
             is_task: sig.is_task,
             ..Default::default()
@@ -1370,8 +1608,20 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             clock_items.push(self.clock_gen(clk, args, *span)?);
         }
         let syms = self.lw.m.syms.clone();
+        let resolved = self.lw.m.resolved.clone();
         for (pname, kind) in port_order {
             let sym = &syms[pname];
+            // A resolved out/inout port is an inout net its processes drive.
+            if let Some(w) = resolved.get(pname) {
+                self.lw.rv_widths.insert(*w);
+                ports.push(ansi_port(
+                    PortDirection::Inout,
+                    named_t(&rv_nettype(*w), Vec::new()),
+                    pname,
+                    Vec::new(),
+                ));
+                continue;
+            }
             let (dt, dims) = sv_type(&sym.ty);
             ports.push(ansi_port(port_dir(kind).expect("port"), dt, pname, dims));
         }
@@ -1382,6 +1632,16 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 continue;
             }
             if self.is_ctor_param(n) {
+                continue;
+            }
+            if let Some(w) = resolved.get(n) {
+                self.lw.rv_widths.insert(*w);
+                items.push(data_decl(
+                    named_t(&rv_nettype(*w), Vec::new()),
+                    &sym.sv,
+                    Vec::new(),
+                    None,
+                ));
                 continue;
             }
             let (dt, dims, init) = match sym.kind {
@@ -1428,6 +1688,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             items.push(data_decl(dt, &sym.sv, dims, init));
         }
         items.append(&mut self.lw.m.extra_items);
+        items.extend(self.kernel_items());
         // Children.
         for inst in &s.insts {
             items.push(instance(
@@ -1550,6 +1811,173 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         Ok(module(name, params, ports, items))
     }
 
+    /// Module items the kernel model needs: the instance's SystemC name, the
+    /// drivers of resolved nets, the writer check of one-writer signals and
+    /// the running process's identity.
+    fn kernel_items(&mut self) -> Vec<ModuleItem> {
+        use crate::ast::types::{IntegerAtomType, SimpleType};
+        let mut items = Vec::new();
+        let int_t = || atom_t(IntegerAtomType::Int, false);
+        let str_t = || simple_t(SimpleType::String);
+        if !self.lw.m.tb {
+            // §5.17: `name()` is the instance path, sc_main's root removed.
+            items.push(data_decl(
+                str_t(),
+                "__sc_path",
+                Vec::new(),
+                Some(call_fn(
+                    "scrt_name",
+                    vec![sys("$sformatf", vec![string("%m")])],
+                )),
+            ));
+        }
+        // §6.13.4: every writer of a resolved net drives {written, value};
+        // the nettype resolves the written ones.
+        for ((net, _), drv) in self.lw.m.drivers.clone() {
+            let w = self.lw.m.resolved[&net];
+            items.push(data_decl(
+                sv_scalar_type(&Ty::Vec4 {
+                    w: Width::known(w + 1),
+                }),
+                &drv,
+                Vec::new(),
+                Some(concat(vec![
+                    sized(1, 0),
+                    size_cast(w, ex(ExprKind::Number(NumberLiteral::UnbasedUnsized('z')))),
+                ])),
+            ));
+            items.push(cont_assign(ident(&net), ident(&drv)));
+        }
+        // §6.9: an sc_buffer's event count — its own writes and those made
+        // through the output ports bound to it.
+        for b in self.lw.m.buffers.clone() {
+            let ev = buffer_event(&b);
+            let sum = self
+                .lw
+                .m
+                .buffer_sources
+                .get(&b)
+                .into_iter()
+                .flatten()
+                .fold(ident(&buffer_counter(&b)), |acc, v| {
+                    bin(BinaryOp::Add, acc, ident(v))
+                });
+            items.push(data_decl(int_t(), &ev, Vec::new(), None));
+            items.push(cont_assign(ident(&ev), sum));
+        }
+        let procs = self.lw.m.proc_names.clone();
+        if !self.lw.m.one_writer.is_empty() {
+            for sig in self.lw.m.one_writer.clone() {
+                items.push(data_decl(int_t(), &one_writer_var(&sig), Vec::new(), Some(int(0))));
+            }
+            let table = |f: &dyn Fn(&(String, sc::ProcessKind)) -> String| -> Vec<Statement> {
+                vec![case_(
+                    ident("p"),
+                    procs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (int(i as i64 + 1), ret(Some(string(&f(p))))))
+                        .collect(),
+                    Some(ret(Some(string("")))),
+                )]
+            };
+            items.push(ModuleItem::FunctionDeclaration(function_decl(
+                "__sc_proc_name",
+                str_t(),
+                vec![fport(PortDirection::Input, int_t(), "p")],
+                table(&|p| p.0.clone()),
+            )));
+            items.push(ModuleItem::FunctionDeclaration(function_decl(
+                "__sc_proc_kind",
+                str_t(),
+                vec![fport(PortDirection::Input, int_t(), "p")],
+                table(&|p| {
+                    match p.1 {
+                        sc::ProcessKind::Method => "sc_method_process",
+                        sc::ProcessKind::Thread => "sc_thread_process",
+                        sc::ProcessKind::CThread => "sc_cthread_process",
+                    }
+                    .to_string()
+                }),
+            )));
+            // The first process to write the signal owns it; another one
+            // writing it is E115 (writes outside processes are not checked).
+            let full = |p: &str| {
+                concat(vec![
+                    ident("__sc_path"),
+                    string("."),
+                    call_fn("__sc_proc_name", vec![ident(p)]),
+                ])
+            };
+            items.push(ModuleItem::FunctionDeclaration(function_decl(
+                "__sc_one_writer",
+                bit_t(1, false),
+                vec![
+                    fport(PortDirection::Inout, int_t(), "w"),
+                    fport(PortDirection::Input, int_t(), "pid"),
+                    fport(PortDirection::Input, str_t(), "sig"),
+                ],
+                vec![
+                    if_(
+                        bin(
+                            BinaryOp::LogOr,
+                            bin(BinaryOp::Eq, ident("pid"), int(0)),
+                            bin(BinaryOp::Eq, ident("w"), ident("pid")),
+                        ),
+                        ret(Some(sized(1, 1))),
+                        None,
+                    ),
+                    if_(
+                        bin(BinaryOp::Eq, ident("w"), int(0)),
+                        block(vec![assign(ident("w"), ident("pid")), ret(Some(sized(1, 1)))]),
+                        None,
+                    ),
+                    expr_stmt(call_fn(
+                        "scrt_e115",
+                        vec![
+                            ident("sig"),
+                            full("w"),
+                            call_fn("__sc_proc_kind", vec![ident("w")]),
+                            full("pid"),
+                            call_fn("__sc_proc_kind", vec![ident("pid")]),
+                        ],
+                    )),
+                    ret(Some(sized(1, 0))),
+                ],
+            )));
+        }
+        if self.lw.m.needs_pid {
+            // The process running a shared function: each process wrapper
+            // records its handle (§9.7 process::self()).
+            items.push(data_decl(
+                named_t("process", Vec::new()),
+                "__sc_ph",
+                vec![unpacked(int(procs.len().max(1) as i64))],
+                None,
+            ));
+            let mut body = Vec::new();
+            for i in 0..procs.len() {
+                body.push(if_(
+                    bin(
+                        BinaryOp::Eq,
+                        index(ident("__sc_ph"), int(i as i64)),
+                        process_self(),
+                    ),
+                    ret(Some(int(i as i64 + 1))),
+                    None,
+                ));
+            }
+            body.push(ret(Some(int(0))));
+            items.push(ModuleItem::FunctionDeclaration(function_decl(
+                "__sc_pid",
+                int_t(),
+                Vec::new(),
+                body,
+            )));
+        }
+        items
+    }
+
     // ---- sc_main ----------------------------------------------------------------
 
     /// `sc_main` → module `sc_main`: its channels, clocks and module objects
@@ -1628,9 +2056,16 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 _,
             ) => {
                 for d in &v.declarators {
+                    if let Some(n) = self.tb_names.name(v, d, &[]) {
+                        self.lw.m.sc_names.insert(d.name.name.clone(), n);
+                    }
                     let Some(sym) = self.member_sym(v, d)? else {
                         continue;
                     };
+                    if v.ty.name().is_some_and(drives_resolved) {
+                        let w = resolved_width(self.lw, &sym.ty, d.span)?;
+                        self.lw.m.resolved.insert(sym.sv.clone(), w);
+                    }
                     let args = match &d.init {
                         Some(sc::Initializer::Paren(a) | sc::Initializer::Brace(a)) => a.clone(),
                         _ => Vec::new(),
@@ -1666,6 +2101,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                         self.ctor_args_params(&module, args.get(1..).unwrap_or(&[]), d.span)?;
                     if let Some(q) = v.ty.name() {
                         params.extend(self.template_args(q, d.span)?);
+                    }
+                    if let Some(sc::ExprKind::StringLit { value, .. }) = args.first().map(|a| &a.kind) {
+                        self.lw.m.inst_names.insert(d.name.name.clone(), value.clone());
                     }
                     // The SystemC instance name, when it is a valid identifier.
                     let sv = match args.first().map(|a| &a.kind) {
@@ -1923,21 +2361,15 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         }
         let wait_sens = || -> Statement {
             if my_flags.is_empty() {
-                return at(
-                    p.sens
-                        .iter()
-                        .map(|(e, x, _)| event_expr(*e, x.clone()))
-                        .collect(),
-                    null_stmt(),
-                );
+                return at(p.sens.iter().map(SensTerm::event).collect(), null_stmt());
             }
             let branches = p
                 .sens
                 .iter()
-                .map(|(e, x, s)| {
-                    let mut v = vec![at(vec![event_expr(*e, x.clone())], null_stmt())];
-                    if my_flags.contains(s) {
-                        v.push(assign(ident(&edge_flag_name(p.index, s)), sized(1, 1)));
+                .map(|t| {
+                    let mut v = vec![at(vec![t.event()], null_stmt())];
+                    if my_flags.contains(&t.name) {
+                        v.push(assign(ident(&edge_flag_name(p.index, &t.name)), sized(1, 1)));
                     }
                     block(v)
                 })
@@ -1949,6 +2381,12 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             .map(|s| assign(ident(&edge_flag_name(p.index, s)), sized(1, 0)))
             .collect();
         let mut body = self.start_wait();
+        if self.lw.m.needs_pid {
+            body.insert(
+                0,
+                assign(index(ident("__sc_ph"), int(p.index as i64)), process_self()),
+            );
+        }
         match p.kind {
             sc::ProcessKind::Method => {
                 if !dont_init {
@@ -2061,6 +2499,73 @@ fn call_graph(lw: &Lw, class: &sc::ClassDecl, name: &str) -> BTreeMap<String, BT
         }
     }
     g
+}
+
+/// Member function → the member names it writes as signals or ports
+/// (`s.write(v)`, `s->write(v)`, `s[i].write(v)`, `s = v`).
+fn write_sets(lw: &Lw, class: &sc::ClassDecl, name: &str) -> BTreeMap<String, BTreeSet<String>> {
+    fn target(e: &sc::Expr) -> Option<String> {
+        let e = match &e.kind {
+            sc::ExprKind::Index { base, .. } => base.as_ref(),
+            _ => e,
+        };
+        e.as_name()
+            .filter(|q| q.segments.len() == 1)
+            .map(|q| q.last_name().to_string())
+    }
+    let mut g = BTreeMap::new();
+    let mut add = |f: &sc::FunctionDecl| {
+        let mut out = BTreeSet::new();
+        if let Some(b) = &f.body {
+            for s in &b.stmts {
+                visit_stmt_exprs(s, &mut |e| match &e.kind {
+                    sc::ExprKind::Call { callee, .. } => {
+                        if let sc::ExprKind::Member { base, name, .. } = &callee.kind
+                            && name.ident.name == "write"
+                            && let Some(t) = target(base)
+                        {
+                            out.insert(t);
+                        }
+                    }
+                    sc::ExprKind::Assign { lhs, .. } => {
+                        if let Some(t) = target(lhs) {
+                            out.insert(t);
+                        }
+                    }
+                    _ => {}
+                });
+            }
+        }
+        g.entry(f.base_name().to_string())
+            .or_insert_with(BTreeSet::new)
+            .extend(out);
+    };
+    for m in &class.members {
+        if let sc::Member::Method(f) = m {
+            add(f);
+        }
+    }
+    if let Some(ool) = lw.prog.out_of_class.get(name) {
+        for (_, f) in ool {
+            add(f);
+        }
+    }
+    g
+}
+
+/// Whether a signal type names a writer policy other than SC_ONE_WRITER
+/// (`sc_signal<T, SC_MANY_WRITERS>`, §6.4.4).
+fn many_writers(ty: &sc::Type) -> bool {
+    ty.name()
+        .and_then(|q| q.last_args())
+        .and_then(|a| a.get(1))
+        .is_some_and(|a| {
+            let n = match a {
+                sc::TemplateArg::Type(t) => t.name().map(|q| q.last_name().to_string()),
+                sc::TemplateArg::Expr(e) => e.as_name().map(|q| q.last_name().to_string()),
+            };
+            matches!(n.as_deref(), Some("SC_MANY_WRITERS" | "SC_UNCHECKED_WRITERS"))
+        })
 }
 
 fn stmt_calls(s: &sc::Stmt, out: &mut BTreeSet<String>) {

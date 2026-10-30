@@ -440,6 +440,43 @@ pub fn ty_of_name(
     })
 }
 
+/// Whether a signal or port type drives a resolved net (§6.13–§6.18): its
+/// writers are drivers whose values resolve bit by bit. An input port of
+/// one only reads it.
+pub fn drives_resolved(q: &sc::QualifiedName) -> bool {
+    matches!(
+        q.last_name(),
+        "sc_signal_resolved"
+            | "sc_signal_rv"
+            | "sc_out_resolved"
+            | "sc_inout_resolved"
+            | "sc_out_rv"
+            | "sc_inout_rv"
+    )
+}
+
+/// The basename SystemC generates for a library object constructed without
+/// a name (`sc_gen_unique_name`, §5.17): `signal_0`, `port_1`, ….
+pub fn default_basename(q: &sc::QualifiedName) -> Option<&'static str> {
+    Some(match q.last_name() {
+        "sc_signal" => "signal",
+        "sc_buffer" => "buffer",
+        "sc_signal_resolved" => "signal_resolved",
+        "sc_signal_rv" => "signal_rv",
+        "sc_in" | "sc_out" | "sc_inout" | "sc_in_clk" | "sc_out_clk" | "sc_inout_clk"
+        | "sc_in_rv" | "sc_out_rv" | "sc_inout_rv" | "sc_in_resolved" | "sc_out_resolved"
+        | "sc_inout_resolved" | "sc_fifo_in" | "sc_fifo_out" | "sc_port" => "port",
+        "sc_export" => "export",
+        "sc_clock" => "clock",
+        "sc_fifo" => "fifo",
+        "sc_mutex" => "mutex",
+        "sc_semaphore" => "semaphore",
+        "sc_event_queue" => "event_queue",
+        "sc_vector" => "vector",
+        _ => return None,
+    })
+}
+
 /// A port, channel or library object type's data type: `sc_in<T>` → `T`.
 pub fn payload_ty(
     q: &sc::QualifiedName,
@@ -447,8 +484,13 @@ pub fn payload_ty(
     consts: &dyn Fn(&sc::Expr) -> Option<i64>,
 ) -> Result<Ty, String> {
     match q.last_name() {
-        "sc_in_clk" | "sc_out_clk" | "sc_inout_clk" | "sc_clock" | "sc_in_resolved"
-        | "sc_out_resolved" | "sc_inout_resolved" | "sc_signal_resolved" => Ok(Ty::Bool),
+        "sc_in_clk" | "sc_out_clk" | "sc_inout_clk" | "sc_clock" => Ok(Ty::Bool),
+        // §6.13–§6.15: resolved signals carry an sc_logic.
+        "sc_in_resolved" | "sc_out_resolved" | "sc_inout_resolved" | "sc_signal_resolved" => {
+            Ok(Ty::Vec4 {
+                w: Width::known(1),
+            })
+        }
         "sc_in_rv" | "sc_out_rv" | "sc_inout_rv" | "sc_signal_rv" => Ok(Ty::Vec4 {
             w: width_arg(q.last_args(), env, consts)?,
         }),

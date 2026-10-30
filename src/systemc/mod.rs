@@ -130,10 +130,38 @@ pub fn cache_digest() -> Option<u64> {
     Some(h.finish())
 }
 
+/// The runtime package text, with a nettype per resolved-net width the
+/// design uses (`scrt_rv<W>_t`, §6.13.4): a driver is {written, value}, and
+/// only written drivers take part — a resolved signal reads X until one is.
+/// Bits resolve as sc_logic does: Z yields, differing values give X.
+fn runtime_text(rv_widths: &std::collections::BTreeSet<u32>) -> String {
+    let mut extra = String::new();
+    for w in rv_widths {
+        extra.push_str(&format!(
+            "  function automatic logic [{w}:0] scrt_rv{w}_res(input logic [{w}:0] d[]);
+    logic [{hi}:0] r = 'z;
+    bit any = 0;
+    foreach (d[k]) if (d[k][{w}] === 1'b1) begin
+      any = 1;
+      for (int i = 0; i < {w}; i++)
+        if (r[i] === 1'bz) r[i] = d[k][i];
+        else if (d[k][i] !== 1'bz && d[k][i] !== r[i]) r[i] = 1'bx;
+    end
+    return any ? {{1'b1, r}} : {{1'b0, {{{w}{{1'bx}}}}}};
+  endfunction
+  nettype logic [{w}:0] scrt_rv{w}_t with scrt_rv{w}_res;
+",
+            w = w,
+            hi = w - 1
+        ));
+    }
+    RUNTIME.replacen("endpackage", &format!("{}endpackage", extra), 1)
+}
+
 /// Parse the runtime package, its spans moved into the synthetic range.
-fn runtime_package() -> Result<Description, String> {
-    let mut tokens = crate::lexer::Lexer::new(RUNTIME).tokenize();
-    let base = build::reserve(RUNTIME.len());
+fn runtime_package(text: &str) -> Result<Description, String> {
+    let mut tokens = crate::lexer::Lexer::new(text).tokenize();
+    let base = build::reserve(text.len());
     for t in &mut tokens {
         t.span.start += base;
         t.span.end += base;
@@ -162,7 +190,7 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
     let prog = program::Program::new(&results);
     let (env, enum_consts) = global_env(&prog);
     let mut lw = lower::Lw::new(&prog, env, enum_consts);
-    let mut out = vec![runtime_package()?];
+    let mut out = Vec::new();
 
     // Module interfaces first (instantiation needs every child's ports).
     let modules: Vec<(
@@ -192,6 +220,12 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
                 prog.module_members
                     .borrow_mut()
                     .insert(name.clone(), members);
+                prog.module_names
+                    .borrow_mut()
+                    .insert(name.clone(), i.sc_names.clone());
+                prog.module_resolved
+                    .borrow_mut()
+                    .insert(name.clone(), i.resolved.clone());
                 ifaces.insert(name.clone(), i);
             }
             Err(e) => lw.record(e),
@@ -253,10 +287,11 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
         ));
     }
     if std::env::var_os("XEZIM_SYSTEMC_DUMP").is_some() {
-        for d in &out[1..] {
+        for d in &out {
             eprintln!("{:#?}", d);
         }
     }
+    out.insert(0, runtime_package(&runtime_text(&lw.rv_widths))?);
     descriptions.extend(out);
     Ok(top)
 }

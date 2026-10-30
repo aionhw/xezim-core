@@ -44,10 +44,25 @@ package sc_rt;
     scrt_stop_req = 1;
   endfunction
 
+  // §6.4.4: a second process writing an SC_ONE_WRITER signal (E115), in the
+  // reference kernel's words; the error ends the simulation.
+  function automatic void scrt_e115(string sig, string p1, string k1, string p2, string k2);
+    $write("\nError: (E115) sc_signal<T> cannot have more than one driver: \n signal `%s' (sc_signal)\n first driver `%s' (%s)\n second driver `%s' (%s)\nIn file: communication/sc_signal.cpp:67\nIn process: %s @ %s\n",
+           sig, p1, k1, p2, k2, p2, scrt_time_str($time));
+    $__sc_exit(1);
+  endfunction
+
   // sc_core::sc_module::name(): the instance path without the generated
   // `sc_main.` root.
   function automatic string scrt_name(string path);
     if (path.len() > 8 && path.substr(0, 7) == "sc_main.") return path.substr(8, path.len() - 1);
+    return path;
+  endfunction
+
+  // sc_object::basename(): the last part of a hierarchical name.
+  function automatic string scrt_basename(string path);
+    for (int i = path.len() - 1; i >= 0; i--)
+      if (path[i] == ".") return path.substr(i + 1, path.len() - 1);
     return path;
   endfunction
 

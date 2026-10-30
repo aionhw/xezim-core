@@ -80,13 +80,57 @@ pub struct FnSig {
     pub by_ref: Vec<bool>,
 }
 
+/// One term of a process's static sensitivity: the event, and the C++
+/// name of the signal it watches.
+#[derive(Debug, Clone)]
+pub struct SensTerm {
+    pub edge: Option<Edge>,
+    pub expr: Expression,
+    /// A guard on the event: SystemC's edge of an sc_logic is a change TO
+    /// '1' or '0' (§6.8.4), not SystemVerilog's 0→z or 1→x as well.
+    pub iff: Option<Expression>,
+    pub name: String,
+}
+
+impl SensTerm {
+    pub fn new(edge: Option<Edge>, expr: Expression, name: String) -> Self {
+        SensTerm {
+            edge,
+            expr,
+            iff: None,
+            name,
+        }
+    }
+
+    /// The edge of an sc_logic value: SystemC's posedge is any change to
+    /// '1', its negedge any change to '0'.
+    pub fn logic_edge(edge: Edge, expr: Expression, name: String) -> Self {
+        let lvl = sized(1, matches!(edge, Edge::Posedge) as u64);
+        SensTerm {
+            edge: None,
+            iff: Some(bin(BinaryOp::CaseEq, expr.clone(), lvl)),
+            expr,
+            name,
+        }
+    }
+
+    pub fn event(&self) -> EventExpr {
+        EventExpr {
+            edge: self.edge,
+            expr: self.expr.clone(),
+            iff: self.iff.clone(),
+            span: sp(),
+        }
+    }
+}
+
 /// A registered process, as the bodies it runs see it.
 #[derive(Debug, Clone)]
 pub struct ProcCtx {
     pub index: usize,
     pub kind: sc::ProcessKind,
     /// Static sensitivity (`wait()` waits on it).
-    pub sens: Vec<(Option<Edge>, Expression, String)>,
+    pub sens: Vec<SensTerm>,
     /// Clock edge of an SC_CTHREAD.
     pub clock: Option<(Edge, Expression)>,
     /// Synchronous reset condition (lowered), checked after every wait.
@@ -116,6 +160,42 @@ pub struct ModCtx {
     /// `sc_buffer` channels (SV names): each write also bumps their
     /// `buffer_counter`.
     pub buffers: BTreeSet<String>,
+    /// Resolved signals and the resolved ports the module drives (§6.13–
+    /// §6.18), SV name → width: nets of the `scrt_rv<W>_t` nettype whose
+    /// drivers are the writing processes.
+    pub resolved: BTreeMap<String, u32>,
+    /// Driver variables of resolved nets: (net, writer) → variable.
+    pub drivers: BTreeMap<(String, Writer), String>,
+    /// SystemC object names of the module's members (§5.17): the name given
+    /// at construction, else the generated `signal_0`, `port_0`, ….
+    pub sc_names: BTreeMap<String, String>,
+    /// Child instances: member → SystemC instance name.
+    pub inst_names: BTreeMap<String, String>,
+    /// Signals two or more of the module's processes write, with the
+    /// default writer policy (§6.4.4): each write checks its writer (E115).
+    pub one_writer: BTreeSet<String>,
+    /// Registered processes: (function name, kind).
+    pub proc_names: Vec<(String, sc::ProcessKind)>,
+    /// Whether a write site needed the running process's identity at run
+    /// time (a function several processes share).
+    pub needs_pid: bool,
+    /// Input ports some instance binds to an sc_buffer: port → the hidden
+    /// input carrying the buffer's write count (§6.9).
+    pub port_counters: BTreeMap<String, String>,
+    /// Output ports bound to an sc_buffer in some instance: port → the
+    /// hidden output counting the writes through it.
+    pub port_wcounters: BTreeMap<String, String>,
+    /// sc_buffer → the write counters of the child output ports bound to
+    /// it; with its own counter they make up its event count.
+    pub buffer_sources: BTreeMap<String, Vec<String>>,
+}
+
+/// Who writes a resolved net: a process of the module, or code outside any
+/// process (elaboration, sc_main).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Writer {
+    Process(usize),
+    Outside,
 }
 
 /// Per-function lowering state.
@@ -136,6 +216,9 @@ pub struct FnCtx {
     /// Statements to run before every return (copy-back of boxed
     /// reference parameters).
     pub epilogue: Vec<Statement>,
+    /// The function runs in several processes (its process is known only
+    /// at run time).
+    pub shared: bool,
 }
 
 pub struct Lw<'a> {
@@ -151,6 +234,8 @@ pub struct Lw<'a> {
     /// (a FIFO read becomes `get` into a temporary).
     pub pre: Vec<Statement>,
     tmp: usize,
+    /// Widths of the resolved nets lowered so far (each needs its nettype).
+    pub rv_widths: BTreeSet<u32>,
 }
 
 const TIME_UNITS: &[(&str, f64)] = &[
@@ -315,6 +400,7 @@ impl<'a> Lw<'a> {
             f: FnCtx::default(),
             pre: Vec::new(),
             tmp: 0,
+            rv_widths: BTreeSet::new(),
         }
     }
 
@@ -534,7 +620,152 @@ impl<'a> Lw<'a> {
         match sym.kind {
             SymKind::Boxed => member(ident(&sym.sv), "v"),
             SymKind::Const(v) => int(v),
+            // A resolved net is {written, value}: its value bits.
+            _ if sym.is_signal_like() && self.m.resolved.contains_key(&sym.sv) => {
+                match self.m.resolved[&sym.sv] {
+                    1 => index(ident(&sym.sv), int(0)),
+                    w => range(ident(&sym.sv), int(w as i64 - 1), int(0)),
+                }
+            }
             _ => ident(&sym.sv),
+        }
+    }
+
+    /// The SystemC name of a member object (`t.signal_0`), or of the module
+    /// itself: the instance path (`__sc_path`, empty in sc_main) and the
+    /// object's basename.
+    pub fn obj_name(&self, member: Option<&str>) -> Expression {
+        let base = member.map(|m| {
+            self.m
+                .sc_names
+                .get(m)
+                .cloned()
+                .unwrap_or_else(|| m.to_string())
+        });
+        match (base, self.m.tb) {
+            (Some(b), true) => string(&b),
+            (None, true) => string(""),
+            (Some(b), false) => concat(vec![ident("__sc_path"), string(&format!(".{}", b))]),
+            (None, false) => ident("__sc_path"),
+        }
+    }
+
+    /// `x.name()` / `x.basename()` (§5.17) of a member object, a child
+    /// instance or a child's member (`u.clk`): the hierarchical name, or the
+    /// last part of it.
+    fn object_name(&self, base: &sc::Expr, basename: bool) -> Option<Expression> {
+        let strip = |e: &sc::Expr| -> sc::Expr {
+            match &e.kind {
+                sc::ExprKind::Unary {
+                    op: sc::UnaryOp::Deref,
+                    operand,
+                } => (**operand).clone(),
+                _ => e.clone(),
+            }
+        };
+        let base = strip(base);
+        let inst_path = |lw: &Self, inst: &str| -> Option<Expression> {
+            let n = lw.m.inst_names.get(inst)?;
+            Some(if lw.m.tb {
+                string(n)
+            } else {
+                concat(vec![ident("__sc_path"), string(&format!(".{}", n))])
+            })
+        };
+        match &base.kind {
+            sc::ExprKind::Name(q) if q.segments.len() == 1 => {
+                let sym = self.lookup(q.last_name())?;
+                match &sym.kind {
+                    SymKind::Instance(_) => {
+                        if basename {
+                            return self.m.inst_names.get(&sym.sv).map(|n| string(n));
+                        }
+                        inst_path(self, q.last_name())
+                    }
+                    _ => {
+                        let b = self.m.sc_names.get(q.last_name())?;
+                        Some(if basename {
+                            string(b)
+                        } else {
+                            self.obj_name(Some(q.last_name()))
+                        })
+                    }
+                }
+            }
+            sc::ExprKind::Member { base: inner, name, .. } => {
+                let inner = strip(inner);
+                let q = inner.as_name()?;
+                let sym = self.lookup(q.last_name())?;
+                let SymKind::Instance(module) = &sym.kind else {
+                    return None;
+                };
+                let b = self
+                    .prog
+                    .module_names
+                    .borrow()
+                    .get(module)?
+                    .get(&name.ident.name)?
+                    .clone();
+                if basename {
+                    return Some(string(&b));
+                }
+                let p = inst_path(self, q.last_name())?;
+                Some(concat(vec![p, string(&format!(".{}", b))]))
+            }
+            _ => None,
+        }
+    }
+
+    /// The writer a write site stands for: the process running this
+    /// function, code outside processes, or — in a function several
+    /// processes share — whichever runs it (`None`: decided at run time).
+    pub fn writer(&self) -> Option<Writer> {
+        match (self.f.proc, self.f.shared) {
+            (Some(p), _) => Some(Writer::Process(p)),
+            (None, true) => None,
+            (None, false) => Some(Writer::Outside),
+        }
+    }
+
+    /// The driver variable of `writer` on the resolved net `net`.
+    pub fn driver_var(&mut self, net: &str, writer: Writer) -> String {
+        let key = (net.to_string(), writer);
+        if let Some(v) = self.m.drivers.get(&key) {
+            return v.clone();
+        }
+        let v = match writer {
+            Writer::Process(p) => format!("__sc_drv{}_{}", p, net),
+            Writer::Outside => format!("__sc_drvx_{}", net),
+        };
+        self.m.drivers.insert(key, v.clone());
+        v
+    }
+
+    /// A write of `value` to the resolved net `net` (width `w`): the writer's
+    /// driver becomes {written, value} in the update phase (§6.13.4).
+    fn resolved_write(&mut self, net: &str, w: u32, value: Expression) -> Statement {
+        let word = concat(vec![sized(1, 1), size_cast(w, paren(value))]);
+        match self.writer() {
+            Some(wr) => nba(ident(&self.driver_var(net, wr)), word),
+            None => {
+                // The writing process is known only at run time.
+                self.m.needs_pid = true;
+                let n = self.m.procs.len();
+                let mut stmt = None;
+                for p in (0..n).rev() {
+                    let d = self.driver_var(net, Writer::Process(p));
+                    let w_ = nba(ident(&d), word.clone());
+                    stmt = Some(match stmt {
+                        None => w_,
+                        Some(rest) => if_(
+                            bin(BinaryOp::Eq, call_fn("__sc_pid", vec![]), int(p as i64 + 1)),
+                            w_,
+                            Some(rest),
+                        ),
+                    });
+                }
+                stmt.unwrap_or_else(null_stmt)
+            }
         }
     }
 
@@ -1020,8 +1251,23 @@ impl<'a> Lw<'a> {
             && let SymKind::Instance(module) = &sym.kind
         {
             let child = self.prog.module_member_ty(module, field);
+            let resolved = self
+                .prog
+                .module_resolved
+                .borrow()
+                .get(module)
+                .and_then(|r| r.get(field).copied());
+            let x = member(ident(&sym.sv), field);
             return match child {
-                Some(t) => Ok((member(ident(&sym.sv), field), t)),
+                // A child's resolved net reads its value bits.
+                Some(t) => Ok((
+                    match resolved {
+                        Some(1) => index(x, int(0)),
+                        Some(w) => range(x, int(w as i64 - 1), int(0)),
+                        None => x,
+                    },
+                    t,
+                )),
                 None => self.err(span, format!("'{}' has no member '{}'", module, field)),
             };
         }
@@ -1189,6 +1435,12 @@ impl<'a> Lw<'a> {
         let a = self.args(args)?;
         let first = |i: usize| a.get(i).map(|x| x.0.clone());
         Ok(match (name, a.len()) {
+            // §5.17 the module's own name.
+            ("name", 0) if !self.m.tb => (ident("__sc_path"), Ty::Str),
+            ("basename", 0) if !self.m.tb => (
+                call_fn("scrt_basename", vec![ident("__sc_path")]),
+                Ty::Str,
+            ),
             ("sc_time_stamp", 0) => {
                 if self.m.tb {
                     (ident("scrt_tb_now"), Ty::Time)
@@ -1371,6 +1623,23 @@ impl<'a> Lw<'a> {
         args: &[sc::Expr],
         span: ScSpan,
     ) -> R<(Expression, Ty)> {
+        if matches!(m, "name" | "basename")
+            && args.is_empty()
+            && let Some(n) = self.object_name(base, m == "basename")
+        {
+            return Ok((n, Ty::Str));
+        }
+        // `inst.sig.read()`: a child's signal or port, read from its parent.
+        if matches!(m, "read" | "get_new_value")
+            && args.is_empty()
+            && let sc::ExprKind::Member { base: inner, .. } = &base.kind
+            && inner
+                .as_name()
+                .and_then(|q| self.lookup(q.last_name()))
+                .is_some_and(|s| matches!(s.kind, SymKind::Instance(_)))
+        {
+            return self.expr(base);
+        }
         // Objects by symbol kind first.
         let sym = base.as_name().and_then(|q| {
             if q.segments.len() == 1 {
@@ -1607,7 +1876,7 @@ impl<'a> Lw<'a> {
                 "posedge()/negedge()/event() is supported only in a process body",
             );
         };
-        let in_sens = self.m.procs[p].sens.iter().any(|(_, _, s)| s == sig);
+        let in_sens = self.m.procs[p].sens.iter().any(|t| t.name == sig);
         if !in_sens {
             return self.err(
                 span,
@@ -1810,8 +2079,13 @@ impl<'a> Lw<'a> {
             }
             S::Continue(_) => vec![st(StatementKind::Continue)],
             S::Return(v, span) => {
-                if self.m.tb {
-                    return Ok(vec![expr_stmt(sys("$finish", vec![]))]);
+                // `return n;` in sc_main ends the program with status n.
+                if self.m.tb && self.f.ret.is_none() {
+                    let code = match v {
+                        Some(e) => self.expr(e)?.0,
+                        None => int(0),
+                    };
+                    return Ok(vec![expr_stmt(sys("$__sc_exit", vec![code]))]);
                 }
                 let _ = span;
                 let mut out = match v {
@@ -2273,12 +2547,28 @@ impl<'a> Lw<'a> {
         };
         match sym.kind {
             SymKind::Signal | SymKind::OutPort | SymKind::InOutPort | SymKind::Clock => {
+                let resolved = self.m.resolved.get(&sym.sv).copied();
+                if resolved.is_some() && elem.is_some() {
+                    return self.err(span, "an element of a resolved signal cannot be written");
+                }
                 if self.m.tb && self.f.proc.is_none() {
-                    let elem_ty = match (&sym.ty, &elem) {
+                    let mut elem_ty = match (&sym.ty, &elem) {
                         (Ty::Array(e, _), Some(_)) => (**e).clone(),
                         (t, _) => t.clone(),
                     };
-                    let _ = span;
+                    // sc_main drives a resolved net through its own driver.
+                    let (target_sig, value) = match resolved {
+                        Some(w) => {
+                            elem_ty = Ty::Vec4 {
+                                w: Width::known(w + 1),
+                            };
+                            (
+                                self.driver_var(&sym.sv, Writer::Outside),
+                                concat(vec![sized(1, 1), size_cast(w, paren(value))]),
+                            )
+                        }
+                        None => (sym.sv.clone(), value),
+                    };
                     // Queued (value, element index) per write site, applied
                     // in order at the next sc_start.
                     let slot = self.module_var("__sc_pw", &Ty::Queue(Box::new(elem_ty)));
@@ -2294,7 +2584,7 @@ impl<'a> Lw<'a> {
                     ));
                     self.m
                         .pending
-                        .push((sym.sv.clone(), slot.clone(), elem.is_some()));
+                        .push((target_sig, slot.clone(), elem.is_some()));
                     return Ok(block(vec![
                         expr_stmt(method(ident(&slot), "push_back", vec![value])),
                         expr_stmt(method(
@@ -2304,11 +2594,48 @@ impl<'a> Lw<'a> {
                         )),
                     ]));
                 }
+                if let Some(w) = resolved {
+                    return Ok(self.resolved_write(&sym.sv, w, value));
+                }
                 let w = nba(target(ident(&sym.sv)), value);
+                // §6.4.4 SC_ONE_WRITER: a second process writing the signal is
+                // an error at that write (E115), and the write does not happen.
+                let w = if self.m.one_writer.contains(&sym.sv) {
+                    let pid = match self.writer() {
+                        Some(Writer::Process(p)) => int(p as i64 + 1),
+                        Some(Writer::Outside) => int(0),
+                        None => {
+                            self.m.needs_pid = true;
+                            call_fn("__sc_pid", vec![])
+                        }
+                    };
+                    if_(
+                        call_fn(
+                            "__sc_one_writer",
+                            vec![
+                                ident(&one_writer_var(&sym.sv)),
+                                pid,
+                                self.obj_name(Some(&sym.sv)),
+                            ],
+                        ),
+                        w,
+                        None,
+                    )
+                } else {
+                    w
+                };
                 if self.m.buffers.contains(&sym.sv) {
                     // §6.9: an sc_buffer notifies on every write, changed or
                     // not; its write counter changes in the same update.
                     let n = buffer_counter(&sym.sv);
+                    return Ok(block(vec![
+                        w,
+                        nba(ident(&n), bin(BinaryOp::Add, ident(&n), int(1))),
+                    ]));
+                }
+                if let Some(n) = self.m.port_wcounters.get(&sym.sv).cloned() {
+                    // A write through a port bound to an sc_buffer is a write
+                    // of the buffer, counted beside the value.
                     return Ok(block(vec![
                         w,
                         nba(ident(&n), bin(BinaryOp::Add, ident(&n), int(1))),
@@ -2400,8 +2727,17 @@ impl<'a> Lw<'a> {
                             )));
                         }
                     }
-                    if fin {
-                        v.push(expr_stmt(sys("$finish", vec![])));
+                    // An error report ends the run with exit status 1 (the
+                    // kernel's exception); a fatal one aborts it (status 134,
+                    // SIGABRT) after the kernel's own note.
+                    if sev == "Fatal" {
+                        v.push(expr_stmt(sys(
+                            "$write",
+                            vec![string("\nInfo: (I99) simulation aborted\n")],
+                        )));
+                        v.push(expr_stmt(sys("$__sc_exit", vec![int(134)])));
+                    } else if fin {
+                        v.push(expr_stmt(sys("$__sc_exit", vec![int(1)])));
                     }
                     return Ok(Some(v));
                 }
@@ -2557,11 +2893,7 @@ impl<'a> Lw<'a> {
                 };
                 let events: Vec<EventExpr> = match &p.clock {
                     Some((edge, clk)) => vec![event_expr(Some(*edge), clk.clone())],
-                    None => p
-                        .sens
-                        .iter()
-                        .map(|(e, x, _)| event_expr(*e, x.clone()))
-                        .collect(),
+                    None => p.sens.iter().map(SensTerm::event).collect(),
                 };
                 if events.is_empty() {
                     return self.err(
@@ -2668,7 +3000,7 @@ impl<'a> Lw<'a> {
             } => self.err(e.span, "waiting on an event AND-list is not supported"),
             K::Call { callee, args } if args.is_empty() => {
                 if let K::Member { base, name, .. } = &callee.kind {
-                    let (x, _) = self.expr(base)?;
+                    let (x, t) = self.expr(base)?;
                     let edge = match name.ident.name.as_str() {
                         "posedge_event" | "pos" => Some(Edge::Posedge),
                         "negedge_event" | "neg" => Some(Edge::Negedge),
@@ -2676,30 +3008,50 @@ impl<'a> Lw<'a> {
                         other => return self.err(e.span, format!("'{}' is not an event", other)),
                     };
                     if edge.is_none()
-                        && let Some(ev) = self.buffer_counter_of(base)
+                        && let Some((ev, value_too)) = self.buffer_counter_of(base)
                     {
-                        return Ok(vec![event_expr(None, ident(&ev))]);
+                        let mut v = vec![event_expr(None, ident(&ev))];
+                        if value_too {
+                            v.push(event_expr(None, x));
+                        }
+                        return Ok(v);
                     }
-                    return Ok(vec![event_expr(edge, x)]);
+                    return Ok(vec![match edge {
+                        // §6.8.4: an sc_logic's edge is a change to '1' / '0'.
+                        Some(ed) if matches!(t, Ty::Vec4 { .. }) => {
+                            SensTerm::logic_edge(ed, x, String::new()).event()
+                        }
+                        _ => event_expr(edge, x),
+                    }]);
                 }
                 self.err(e.span, "expected an event")
             }
             _ => {
-                if let Some(ev) = self.buffer_counter_of(e) {
-                    return Ok(vec![event_expr(None, ident(&ev))]);
+                let counter = self.buffer_counter_of(e);
+                if let Some((ev, false)) = &counter {
+                    return Ok(vec![event_expr(None, ident(ev))]);
                 }
                 let (x, _) = self.expr(e)?;
-                Ok(vec![event_expr(None, x)])
+                let mut v = vec![event_expr(None, x)];
+                if let Some((ev, true)) = counter {
+                    v.push(event_expr(None, ident(&ev)));
+                }
+                Ok(v)
             }
         }
     }
 
     /// The write counter of the `sc_buffer` `e` names.
-    pub fn buffer_counter_of(&self, e: &sc::Expr) -> Option<String> {
+    /// A port bound to a buffer in some instances (`true`): its events are
+    /// value changes or writes, as the instance's channel decides.
+    pub fn buffer_counter_of(&self, e: &sc::Expr) -> Option<(String, bool)> {
         let q = e.as_name()?;
         let sym = self.lookup(q.last_name())?;
+        if let Some(c) = self.m.port_counters.get(&sym.sv) {
+            return Some((c.clone(), true));
+        }
         (sym.kind == SymKind::Signal && self.m.buffers.contains(&sym.sv))
-            .then(|| buffer_counter(&sym.sv))
+            .then(|| (buffer_event(&sym.sv), false))
     }
 
     /// `sc_start(...)` in sc_main (see mod.rs: the testbench pauses 1 ps
@@ -2894,6 +3246,23 @@ fn math1(f: &str) -> Option<&'static str> {
 
 /// The write counter of an `sc_buffer`: it changes on every write, so a
 /// process sensitive to it wakes like one sensitive to a changed signal.
+/// The writer-process slot of a one-writer signal (E115 check).
+pub fn one_writer_var(sig: &str) -> String {
+    format!("__sc_w_{}", sig)
+}
+
+/// The nettype of a resolved net of width `w` (runtime package): a driver
+/// word {written, value[w-1:0]}.
+pub fn rv_nettype(w: u32) -> String {
+    format!("scrt_rv{}_t", w)
+}
+
+/// The event count of an sc_buffer: its own writes plus those made through
+/// the output ports bound to it (a continuous sum).
+pub fn buffer_event(buffer: &str) -> String {
+    format!("__sc_be_{}", buffer)
+}
+
 pub fn buffer_counter(buffer: &str) -> String {
     format!("__sc_wr_{}", buffer)
 }

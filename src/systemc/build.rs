@@ -61,6 +61,22 @@ pub fn ident(name: &str) -> Expression {
     }))
 }
 
+/// `process::self()` (§9.7): the running process.
+pub fn process_self() -> Expression {
+    let seg = |n: &str| HierPathSegment {
+        name: id(n),
+        selects: Vec::new(),
+    };
+    let callee = ex(ExprKind::Ident(HierarchicalIdentifier {
+        root: None,
+        path: vec![seg("process"), seg("self")],
+        span: sp(),
+        cached_signal_id: Cell::new(None),
+        cached_resolved_name: OnceCell::new(),
+    }));
+    call(callee, Vec::new())
+}
+
 pub fn member(base: Expression, name: &str) -> Expression {
     ex(ExprKind::MemberAccess {
         expr: Box::new(base),
@@ -520,6 +536,49 @@ pub fn task_decl(name: &str, ports: Vec<FunctionPort>, body: Vec<Statement>) -> 
         strict_body_ports: Vec::new(),
         span: sp(),
     }
+}
+
+/// `assign lhs = rhs;`
+pub fn cont_assign(lhs: Expression, rhs: Expression) -> ModuleItem {
+    ModuleItem::ContinuousAssign(ContinuousAssign {
+        strength: None,
+        delay: None,
+        delay_fall: None,
+        delay_off: None,
+        assignments: vec![(lhs, rhs)],
+        span: sp(),
+    })
+}
+
+/// `case (e) k0: s0; k1: s1; … default: d; endcase`
+pub fn case_(e: Expression, arms: Vec<(Expression, Statement)>, default: Option<Statement>) -> Statement {
+    let mut items: Vec<CaseItem> = arms
+        .into_iter()
+        .map(|(k, s)| CaseItem {
+            patterns: vec![k],
+            is_default: false,
+            stmt: s,
+            span: sp(),
+            pattern: None,
+            guard: None,
+        })
+        .collect();
+    if let Some(d) = default {
+        items.push(CaseItem {
+            patterns: Vec::new(),
+            is_default: true,
+            stmt: d,
+            span: sp(),
+            pattern: None,
+            guard: None,
+        });
+    }
+    st(StatementKind::Case {
+        unique_priority: None,
+        kind: CaseKind::Case,
+        expr: e,
+        items,
+    })
 }
 
 pub fn function_decl(
