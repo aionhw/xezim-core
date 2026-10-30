@@ -621,6 +621,8 @@ pub fn ty_of_name(
         "sc_mutex" => Ty::Class("scrt_mutex".to_string()),
         "sc_semaphore" => Ty::Class("scrt_semaphore".to_string()),
         "sc_event_queue" => Ty::Class("scrt_event_queue".to_string()),
+        "sc_spawn_options" => Ty::Class("scrt_spawn_opts".to_string()),
+        "sc_process_handle" => Ty::Handle("scrt_proc".to_string()),
         "tlm_command"
         | "tlm_response_status"
         | "tlm_sync_enum"
@@ -741,4 +743,13 @@ mod tests {
         assert!(matches!(ty("tlm::tlm_generic_payload"), Ty::Class(c) if c == "scrt_tlm_gp"));
         assert!(matches!(ty("std::vector<int>"), Ty::Queue(_)));
     }
+}
+
+/// The runtime's library objects: SystemC kernel channels and helpers that
+/// a module or a function constructs and calls (`lib_channel_call`).
+pub fn is_lib_class(c: &str) -> bool {
+    matches!(
+        c,
+        "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue" | "scrt_spawn_opts"
+    )
 }

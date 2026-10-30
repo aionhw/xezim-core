@@ -166,6 +166,9 @@ pub struct ModCtx {
     pub pending: Vec<(String, String, bool)>,
     /// Extra module items the bodies needed (temporaries, flags).
     pub extra_items: Vec<crate::ast::decl::ModuleItem>,
+    /// `next_trigger(...)` sites of method processes: (process, what its
+    /// next activation waits for). The site's number is its index + 1.
+    pub next_triggers: Vec<(usize, Statement)>,
     /// `sc_buffer` channels (SV names): each write also bumps their
     /// `buffer_counter`.
     pub buffers: BTreeSet<String>,
@@ -267,6 +270,38 @@ const TIME_UNITS: &[(&str, f64)] = &[
     ("SC_MS", 1e9),
     ("SC_SEC", 1e12),
 ];
+
+/// A functional conversion `T(x)`: C++ converts floating to integer by
+/// truncation, where an SV cast rounds.
+fn convert(t: &Ty, x: Expression, xt: &Ty) -> Expression {
+    let x = if matches!(xt, Ty::Real { .. }) && !matches!(t, Ty::Real { .. }) {
+        sys("$rtoi", vec![x])
+    } else {
+        x
+    };
+    type_cast(sv_scalar_type(t), x)
+}
+
+/// A method process's pending `next_trigger` site (0: its static
+/// sensitivity) and time.
+pub fn next_trigger_kind(p: usize) -> String {
+    format!("__sc_ntk{}", p)
+}
+
+pub fn next_trigger_time(p: usize) -> String {
+    format!("__sc_ntt{}", p)
+}
+
+/// A C++ name expression.
+fn name_expr(n: &str, span: ScSpan) -> sc::Expr {
+    sc::Expr {
+        kind: sc::ExprKind::Name(sc::QualifiedName::simple(sc::Ident {
+            name: n.to_string(),
+            span,
+        })),
+        span,
+    }
+}
 
 /// The operands of an event AND-list `e1 & e2 & …` (at least two).
 fn and_list(e: &sc::Expr) -> Option<Vec<&sc::Expr>> {
@@ -685,9 +720,21 @@ impl<'a> Lw<'a> {
 
     // ---- expressions --------------------------------------------------------
 
+    /// A symbol as an assignment target.
+    pub fn sym_target(&self, sym: &Sym) -> Expression {
+        match sym.kind {
+            SymKind::Boxed => member(ident(&sym.sv), "v"),
+            _ => self.sym_read(sym),
+        }
+    }
+
     /// Read access to a symbol.
     pub fn sym_read(&self, sym: &Sym) -> Expression {
         match sym.kind {
+            // The box holds the bits: a signed variable reads them signed.
+            SymKind::Boxed if matches!(sym.ty, Ty::Int { signed: true, .. }) => {
+                sys("$signed", vec![member(ident(&sym.sv), "v")])
+            }
             SymKind::Boxed => member(ident(&sym.sv), "v"),
             SymKind::Const(v) => int(v),
             // A resolved net is {written, value}: its value bits.
@@ -828,7 +875,7 @@ impl<'a> Lw<'a> {
     pub fn lib_object_new(&mut self, ty: &Ty, args: &[sc::Expr]) -> R<Option<Expression>> {
         let Ty::Class(c) = ty else { return Ok(None) };
         match c.as_str() {
-            "scrt_mutex" | "scrt_event_queue" => Ok(Some(new_obj(None))),
+            "scrt_mutex" | "scrt_event_queue" | "scrt_spawn_opts" => Ok(Some(new_obj(None))),
             "scrt_semaphore" => {
                 let n = args
                     .iter()
@@ -876,6 +923,24 @@ impl<'a> Lw<'a> {
                 (method(b, "notify", vec![t]), Ty::Void)
             }
             ("scrt_event_queue", "cancel_all", 0) => (method(b, "cancel_all", vec![]), Ty::Void),
+            // §5.6 process handles of spawned threads.
+            ("scrt_proc", "terminated", 0) => (member(b, "term"), Ty::Bool),
+            ("scrt_proc", "terminated_event", 0) => (member(b, "done"), Ty::Event),
+            ("scrt_proc", "valid", 0) => (bin(BinaryOp::Neq, b, ex(ExprKind::Null)), Ty::Bool),
+            ("scrt_proc", _, _) => {
+                return self.err(
+                    span,
+                    format!("sc_process_handle::{} is not supported in simulation", m),
+                );
+            }
+            // §5.5.6: the stack size of a spawned thread means nothing here.
+            ("scrt_spawn_opts", "set_stack_size", 1) => (int(0), Ty::Void),
+            ("scrt_spawn_opts", _, _) => {
+                return self.err(
+                    span,
+                    format!("sc_spawn_options::{} is not supported in simulation", m),
+                );
+            }
             ("scrt_event_queue", "default_event", 0) => (member(b, "ev"), Ty::Event),
             _ => return self.err(span, format!("'{}' is not a member function of this channel", m)),
         })
@@ -1137,8 +1202,8 @@ impl<'a> Lw<'a> {
                 match args.as_slice() {
                     [] => Ok((int(0), t)),
                     [a] => {
-                        let (x, _) = self.expr(a)?;
-                        Ok((type_cast(sv_scalar_type(&t), x), t))
+                        let (x, xt) = self.expr(a)?;
+                        Ok((convert(&t, x, &xt), t))
                     }
                     _ => self.err(
                         span,
@@ -1710,10 +1775,7 @@ impl<'a> Lw<'a> {
     ) -> R<(Expression, Ty)> {
         use sc::ExprKind as K;
         match &callee.kind {
-            K::Name(q) if matches!(q.last_name(), "sc_spawn" | "sc_spawn_options") => self.err(
-                span,
-                "dynamic processes (sc_spawn) are not supported in simulation",
-            ),
+            K::Name(q) if q.last_name() == "sc_spawn" => self.spawn(args, span),
             K::Name(q) => self.call_name(q, args, span),
             K::Member { base, name, .. } => {
                 self.call_method(base, &name.ident.name, name, args, span)
@@ -1787,8 +1849,8 @@ impl<'a> Lw<'a> {
                 let [a] = args else {
                     return self.err(span, "a conversion takes one argument");
                 };
-                let (x, _) = self.expr(a)?;
-                return Ok((type_cast(sv_scalar_type(&t), x), t));
+                let (x, xt) = self.expr(a)?;
+                return Ok((convert(&t, x, &xt), t));
             }
         }
         // `T::f(args)`: a static member function of a user class.
@@ -1920,6 +1982,13 @@ impl<'a> Lw<'a> {
                 ),
                 Ty::int32(),
             ),
+            // <cstdlib> conversions of a string (`atoi(argv[1])`).
+            ("atoi" | "atol" | "atoll", 1) if matches!(a[0].1, Ty::Str) => {
+                (method(a[0].0.clone(), "atoi", vec![]), Ty::int32())
+            }
+            ("atof", 1) if matches!(a[0].1, Ty::Str) => {
+                (method(a[0].0.clone(), "atoreal", vec![]), Ty::Real { single: false })
+            }
             // C's rand()/srand(): glibc's sequence, as the C program has.
             ("rand", 0) => (call_fn("scrt_rand", vec![]), Ty::int32()),
             ("srand", 1) => (call_fn("scrt_srand", vec![a[0].0.clone()]), Ty::Void),
@@ -2199,7 +2268,7 @@ impl<'a> Lw<'a> {
         let (b, bt) = self.expr(base)?;
         // Library channels lower their own arguments (`notify(5, SC_NS)`).
         if let Ty::Class(c) | Ty::Handle(c) = &bt
-            && matches!(c.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue")
+            && (is_lib_class(c) || c == "scrt_proc")
         {
             let c = c.clone();
             return self.lib_channel_call(b, &c, m, args, span);
@@ -2617,8 +2686,31 @@ impl<'a> Lw<'a> {
             S::Labeled { span, .. } => {
                 return self.err(*span, "labels are not supported in simulation");
             }
-            S::ScFork { span, .. } => {
-                return self.err(*span, "SC_FORK/SC_JOIN is not supported in simulation yet");
+            S::ScFork {
+                spawns,
+                clocked,
+                span,
+            } => {
+                if *clocked {
+                    return self.err(*span, "SC_CJOIN is not supported in simulation");
+                }
+                // §5.6: spawn each thread and wait until all have finished.
+                self.f.is_task = true;
+                let mut items = Vec::new();
+                let mut bodies = Vec::new();
+                for e in spawns {
+                    let sc::ExprKind::Call { callee, args } = &e.kind else {
+                        return self.err(e.span, "SC_FORK lists sc_spawn(...) calls");
+                    };
+                    if callee.as_name().is_none_or(|q| q.last_name() != "sc_spawn") {
+                        return self.err(e.span, "SC_FORK lists sc_spawn(...) calls");
+                    }
+                    let (decls, body) = self.spawn_branch(args, None, e.span)?;
+                    items.extend(decls);
+                    bodies.push(body);
+                }
+                items.extend(bodies);
+                vec![fork(JoinType::Join, items)]
             }
             S::ScProcess { span, .. }
             | S::Sensitive { span, .. }
@@ -2768,8 +2860,23 @@ impl<'a> Lw<'a> {
                 );
                 continue;
             }
+            // A local event (§5.10): its own, per call.
+            if matches!(ty, Ty::Event) {
+                self.tmp += 1;
+                let sv = format!("__sc_lev{}_{}", self.tmp, d.name.name);
+                self.f.decls.push(var_decl(simple_t(crate::ast::types::SimpleType::Event), &sv, None));
+                self.f.scopes.last_mut().expect("scope").insert(
+                    d.name.name.clone(),
+                    Sym {
+                        kind: SymKind::Event,
+                        ty,
+                        sv,
+                    },
+                );
+                continue;
+            }
             // A library channel object.
-            if matches!(&ty, Ty::Class(c) if matches!(c.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue"))
+            if matches!(&ty, Ty::Class(c) if is_lib_class(c))
             {
                 let args: Vec<sc::Expr> = match &d.init {
                     Some(sc::Initializer::Paren(a) | sc::Initializer::Brace(a)) => a.clone(),
@@ -3339,12 +3446,12 @@ impl<'a> Lw<'a> {
                 "wait" => return Ok(Some(self.wait(args, span)?)),
                 "sc_start" => return Ok(Some(self.sc_start(args, span)?)),
                 "sc_stop" => {
-                    let f = if self.m.tb {
-                        "scrt_stop"
-                    } else {
-                        "scrt_stop_request"
-                    };
-                    return Ok(Some(vec![expr_stmt(call_fn(f, vec![]))]));
+                    if self.m.tb {
+                        let mut v = vec![expr_stmt(call_fn("scrt_stop", vec![]))];
+                        v.extend(self.end_of_simulation());
+                        return Ok(Some(v));
+                    }
+                    return Ok(Some(vec![expr_stmt(call_fn("scrt_stop_request", vec![]))]));
                 }
                 "printf" => {
                     let Some((fmt, rest)) = args.split_first() else {
@@ -3359,57 +3466,64 @@ impl<'a> Lw<'a> {
                     }
                     return Ok(Some(vec![expr_stmt(sys("$write", a))]));
                 }
+                // `assert(c)` (<cassert>): the C library's message on stderr,
+                // then abort (status 134). `sc_assert(c)` reports SystemC's
+                // fatal error F4.
+                "assert" | "sc_assert" => {
+                    let [c] = args else {
+                        return self.err(span, format!("{}(condition) expected", path));
+                    };
+                    let (x, _) = self.expr(c)?;
+                    let r = &self.prog.results[self.tu];
+                    let text = r
+                        .files
+                        .get(c.span.file as usize)
+                        .and_then(|f| f.text.get(c.span.start as usize..c.span.end as usize))
+                        .unwrap_or("?")
+                        .trim()
+                        .to_string();
+                    let loc = r.locate(span);
+                    let fail = if path == "assert" {
+                        vec![
+                            expr_stmt(sys(
+                                "$fwrite",
+                                vec![
+                                    sized(32, 0x8000_0002),
+                                    string(&format!(
+                                        "{}:{}: Assertion `{}' failed.\n",
+                                        loc.file, loc.line, text
+                                    )),
+                                ],
+                            )),
+                            expr_stmt(sys("$__sc_exit", vec![int(134)])),
+                        ]
+                    } else {
+                        self.report_stmts(
+                            "Fatal",
+                            string(&format!("(F4) assertion failed: {}", text)),
+                            None,
+                            span,
+                        )
+                    };
+                    return Ok(Some(vec![if_(
+                        unary(UnaryOp::LogNot, paren(x)),
+                        block(fail),
+                        None,
+                    )]));
+                }
                 "SC_REPORT_INFO" | "SC_REPORT_WARNING" | "SC_REPORT_ERROR" | "SC_REPORT_FATAL" => {
                     let [id_, msg] = args else {
                         return self.err(span, format!("{}(id, message) expected", path));
                     };
                     let (i, _) = self.expr(id_)?;
                     let (m, _) = self.expr(msg)?;
-                    let (sev, fin) = match path.as_str() {
-                        "SC_REPORT_INFO" => ("Info", false),
-                        "SC_REPORT_WARNING" => ("Warning", false),
-                        "SC_REPORT_ERROR" => ("Error", true),
-                        _ => ("Fatal", true),
+                    let sev = match path.as_str() {
+                        "SC_REPORT_INFO" => "Info",
+                        "SC_REPORT_WARNING" => "Warning",
+                        "SC_REPORT_ERROR" => "Error",
+                        _ => "Fatal",
                     };
-                    // SystemC 2.3's report format: warnings and errors name
-                    // the C++ source line and, inside a process, the process.
-                    let mut v = vec![expr_stmt(sys(
-                        "$write",
-                        vec![string(&format!("\n{}: %s: %s\n", sev)), i, m],
-                    ))];
-                    if sev != "Info" {
-                        let loc = self.prog.results[self.tu].locate(span);
-                        v.push(expr_stmt(sys(
-                            "$write",
-                            vec![string(&format!("In file: {}:{}\n", loc.file, loc.line))],
-                        )));
-                        if !self.m.tb {
-                            v.push(expr_stmt(sys(
-                                "$write",
-                                vec![
-                                    string("In process: %s @ %s\n"),
-                                    call_fn(
-                                        "scrt_name",
-                                        vec![sys("$sformatf", vec![string("%m")])],
-                                    ),
-                                    call_fn("scrt_time_str", vec![sys("$time", vec![])]),
-                                ],
-                            )));
-                        }
-                    }
-                    // An error report ends the run with exit status 1 (the
-                    // kernel's exception); a fatal one aborts it (status 134,
-                    // SIGABRT) after the kernel's own note.
-                    if sev == "Fatal" {
-                        v.push(expr_stmt(sys(
-                            "$write",
-                            vec![string("\nInfo: (I99) simulation aborted\n")],
-                        )));
-                        v.push(expr_stmt(sys("$__sc_exit", vec![int(134)])));
-                    } else if fin {
-                        v.push(expr_stmt(sys("$__sc_exit", vec![int(1)])));
-                    }
-                    return Ok(Some(v));
+                    return Ok(Some(self.report_stmts(sev, i, Some(m), span)));
                 }
                 "sc_trace" => {
                     let Some(obj) = args.get(1) else {
@@ -3427,9 +3541,7 @@ impl<'a> Lw<'a> {
                     self.m.uses_update = true;
                     return Ok(Some(vec![expr_stmt(call_fn("__sc_request_update", vec![]))]));
                 }
-                "next_trigger" => {
-                    return self.err(span, "next_trigger() is not supported in simulation");
-                }
+                "next_trigger" => return Ok(Some(self.next_trigger(args, span)?)),
                 _ => return Ok(None),
             }
         }
@@ -3679,6 +3791,292 @@ impl<'a> Lw<'a> {
         Ok(at(self.event_list(e)?, null_stmt()))
     }
 
+    /// A SystemC report (`SC_REPORT_*`) in the 2.3 kernel's format: an error
+    /// ends the run with status 1, a fatal one aborts it (status 134).
+    /// `m` is the message after the id (`Error: <id>: <m>`); a kernel
+    /// report such as F4 has none (`Fatal: (F4) assertion failed: …`).
+    fn report_stmts(
+        &self,
+        sev: &str,
+        i: Expression,
+        m: Option<Expression>,
+        span: ScSpan,
+    ) -> Vec<Statement> {
+        let fin = matches!(sev, "Error" | "Fatal");
+        // SystemC 2.3's report format: warnings and errors name
+        // the C++ source line and, inside a process, the process.
+        let mut v = vec![expr_stmt(sys(
+            "$write",
+            match m {
+                Some(m) => vec![string(&format!("\n{}: %s: %s\n", sev)), i, m],
+                None => vec![string(&format!("\n{}: %s\n", sev)), i],
+            },
+        ))];
+        if sev != "Info" {
+            let loc = self.prog.results[self.tu].locate(span);
+            v.push(expr_stmt(sys(
+                "$write",
+                vec![string(&format!("In file: {}:{}\n", loc.file, loc.line))],
+            )));
+            if !self.m.tb {
+                v.push(expr_stmt(sys(
+                    "$write",
+                    vec![
+                        string("In process: %s @ %s\n"),
+                        call_fn(
+                            "scrt_name",
+                            vec![sys("$sformatf", vec![string("%m")])],
+                        ),
+                        call_fn("scrt_time_str", vec![sys("$time", vec![])]),
+                    ],
+                )));
+            }
+        }
+        // An error report ends the run with exit status 1 (the
+        // kernel's exception); a fatal one aborts it (status 134,
+        // SIGABRT) after the kernel's own note.
+        if sev == "Fatal" {
+            v.push(expr_stmt(sys(
+                "$write",
+                vec![string("\nInfo: (I99) simulation aborted\n")],
+            )));
+            v.push(expr_stmt(sys("$__sc_exit", vec![int(134)])));
+        } else if fin {
+            v.push(expr_stmt(sys("$__sc_exit", vec![int(1)])));
+        }
+        v
+    }
+
+    /// `next_trigger(...)` (§5.2.17) in a method process: its next activation
+    /// waits for this instead of its static sensitivity. The call records
+    /// the site (and a time); the method's wrapper waits accordingly.
+    fn next_trigger(&mut self, args: &[sc::Expr], span: ScSpan) -> R<Vec<Statement>> {
+        let p = match self.f.proc {
+            Some(p) if self.m.procs[p].kind == sc::ProcessKind::Method => p,
+            _ => {
+                return self.err(
+                    span,
+                    "next_trigger() is supported in a member function only one SC_METHOD runs",
+                );
+            }
+        };
+        let site = |lw: &Self| lw.m.next_triggers.len() as i64 + 1;
+        let kind = ident(&next_trigger_kind(p));
+        let time_v = ident(&next_trigger_time(p));
+        let mut out = Vec::new();
+        let saved = std::mem::take(&mut self.pre);
+        let wait_stmt = match args {
+            [] => {
+                self.pre = saved;
+                return Ok(vec![assign(kind, int(0))]);
+            }
+            [x] if !self.is_event_expr(x) && and_list(x).is_none() && {
+                let (_, t) = self.peek_ty(x)?;
+                matches!(t, Ty::Time | Ty::Int { .. })
+            } =>
+            {
+                let (t, _) = self.expr(x)?;
+                out.push(assign(time_v.clone(), t));
+                expr_stmt(call_fn("scrt_wait", vec![time_v]))
+            }
+            [v, u] if time_unit(u).is_some() => {
+                let t = self.time_value(v, u, span)?;
+                out.push(assign(time_v.clone(), t));
+                expr_stmt(call_fn("scrt_wait", vec![time_v]))
+            }
+            [x] => self.event_wait(x)?,
+            [t, e] | [t, _, e] => {
+                let t = match args {
+                    [v, u, _] => self.time_value(v, u, span)?,
+                    _ => self.expr(t)?.0,
+                };
+                out.push(assign(time_v.clone(), t));
+                let on_events = self.event_wait(e)?;
+                block(vec![
+                    fork(
+                        JoinType::JoinAny,
+                        vec![delay(time_v, null_stmt()), on_events],
+                    ),
+                    disable_fork(),
+                ])
+            }
+            _ => {
+                self.pre = saved;
+                return self.err(span, "this form of next_trigger() is not supported");
+            }
+        };
+        // The wait runs in the wrapper: what the call site computes for it
+        // (a port's channel) would not be there.
+        if self.pre.len() > out.len() {
+            self.pre = saved;
+            return self.err(span, "next_trigger() on this event is not supported in simulation");
+        }
+        let mut pre = std::mem::replace(&mut self.pre, saved);
+        pre.append(&mut out);
+        let k = site(self);
+        self.m.next_triggers.push((p, wait_stmt));
+        pre.push(assign(kind, int(k)));
+        Ok(pre)
+    }
+
+    /// `sc_spawn([&ret,] f, [name,] [&options])` (§5.5): a thread spawned
+    /// as a `fork … join_none` child. Its value is the process handle.
+    fn spawn(&mut self, args: &[sc::Expr], span: ScSpan) -> R<(Expression, Ty)> {
+        let hty = Ty::Handle("scrt_proc".to_string());
+        let h = self.temp(&hty);
+        self.pre.push(assign(ident(&h), new_obj(None)));
+        let (mut items, body) = self.spawn_branch(args, Some(&h), span)?;
+        items.push(body);
+        self.pre.push(fork(JoinType::JoinNone, items));
+        Ok((ident(&h), hty))
+    }
+
+    /// A spawned thread: the declarations of a fork that capture its bound
+    /// arguments (`sc_bind` copies them at the spawn; `sc_ref`/`sc_cref`
+    /// pass the object itself), and its body, which marks `handle`
+    /// terminated at the end.
+    fn spawn_branch(
+        &mut self,
+        args: &[sc::Expr],
+        handle: Option<&str>,
+        span: ScSpan,
+    ) -> R<(Vec<Statement>, Statement)> {
+        use sc::ExprKind as K;
+        let addr_of = |e: &sc::Expr| match &e.kind {
+            K::Unary {
+                op: sc::UnaryOp::AddrOf,
+                operand,
+            } => Some(operand.as_ref().clone()),
+            _ => None,
+        };
+        let (ret, rest) = match args {
+            [first, rest @ ..] if !rest.is_empty() && addr_of(first).is_some() => {
+                (addr_of(first), rest)
+            }
+            _ => (None, args),
+        };
+        let Some(callable) = rest.first() else {
+            return self.err(span, "sc_spawn needs a function to run");
+        };
+        // The name and the options (`&o`): options with an effect are
+        // rejected where they are set.
+        let (fname, bound) = match &callable.kind {
+            K::Call { callee, args: bargs }
+                if callee.as_name().is_some_and(|q| q.last_name() == "sc_bind") =>
+            {
+                let Some((f, rest)) = bargs.split_first() else {
+                    return self.err(callable.span, "sc_bind needs a function");
+                };
+                let target = addr_of(f).unwrap_or_else(|| f.clone());
+                let Some(q) = target.as_name() else {
+                    return self.err(f.span, "sc_bind of this callable is not supported");
+                };
+                // `sc_bind(&module::f, this, args…)`: a member function.
+                let rest = match rest.first() {
+                    Some(sc::Expr { kind: K::This, .. }) => &rest[1..],
+                    _ => rest,
+                };
+                (q.last_name().to_string(), rest.to_vec())
+            }
+            K::Lambda(_) => {
+                return self.err(callable.span, "sc_spawn of a lambda is not supported in simulation");
+            }
+            _ => {
+                return self.err(
+                    callable.span,
+                    "sc_spawn takes sc_bind(&f, args…) in simulation",
+                );
+            }
+        };
+        if bound.iter().any(|a| {
+            a.as_name()
+                .is_some_and(|q| q.last_name().starts_with('_') && q.segments.len() > 1)
+        }) {
+            return self.err(callable.span, "sc_bind placeholders are not supported in simulation");
+        }
+        self.f.scopes.push(BTreeMap::new());
+        let mut decls = Vec::new();
+        let mut call_args = Vec::new();
+        for a in &bound {
+            if let K::Call { callee, args: ra } = &a.kind
+                && callee
+                    .as_name()
+                    .is_some_and(|q| matches!(q.last_name(), "sc_ref" | "sc_cref"))
+                && ra.len() == 1
+            {
+                call_args.push(ra[0].clone());
+                continue;
+            }
+            if matches!(
+                a.kind,
+                K::IntLit { .. }
+                    | K::FloatLit { .. }
+                    | K::StringLit { .. }
+                    | K::CharLit { .. }
+                    | K::BoolLit(_)
+            ) {
+                call_args.push(a.clone());
+                continue;
+            }
+            let (x, t) = self.expr(a)?;
+            self.tmp += 1;
+            let cap = format!("__sc_cap{}", self.tmp);
+            let (dt, dims) = sv_type(&t);
+            decls.push(st(StatementKind::VarDecl {
+                data_type: dt,
+                lifetime: Some(crate::ast::types::Lifetime::Automatic),
+                declarators: vec![var_declarator(&cap, dims, Some(x))],
+            }));
+            self.f.scopes.last_mut().expect("scope").insert(
+                cap.clone(),
+                Sym {
+                    kind: SymKind::Var,
+                    ty: t,
+                    sv: cap.clone(),
+                },
+            );
+            call_args.push(name_expr(&cap, a.span));
+        }
+        let call = sc::Expr {
+            kind: K::Call {
+                callee: Box::new(name_expr(&fname, callable.span)),
+                args: call_args,
+            },
+            span: callable.span,
+        };
+        let e = match ret {
+            Some(r) => sc::Expr {
+                kind: K::Assign {
+                    op: sc::AssignOp::Assign,
+                    lhs: Box::new(r),
+                    rhs: Box::new(call),
+                },
+                span,
+            },
+            None => call,
+        };
+        // A blocking call's temporaries come with the body, not before the fork.
+        let outer = std::mem::take(&mut self.pre);
+        let lowered = self.stmt(&sc::Stmt::Expr(e));
+        self.pre = outer;
+        self.f.scopes.pop();
+        self.f.is_task = true;
+        // A process spawned during elaboration starts with the simulation.
+        let mut body = vec![wait(ident("scrt_started"))];
+        body.extend(lowered?);
+        if let Some(h) = handle {
+            self.tmp += 1;
+            let hv = format!("__sc_h{}", self.tmp);
+            decls.push(st(StatementKind::VarDecl {
+                data_type: named_t("scrt_proc", Vec::new()),
+                lifetime: Some(crate::ast::types::Lifetime::Automatic),
+                declarators: vec![var_declarator(&hv, Vec::new(), Some(ident(h)))],
+            }));
+            body.push(expr_stmt(method(ident(&hv), "finish", vec![])));
+        }
+        Ok((decls, block(body)))
+    }
+
     /// A wait for time `t` (`c` when constant): zero is the next delta
     /// cycle, after the update phase (§4.2.1.3), as `scrt_wait` does it.
     fn wait_time(&mut self, t: Expression, c: Option<i64>) -> Vec<Statement> {
@@ -3771,9 +4169,14 @@ impl<'a> Lw<'a> {
                     let edge = match name.ident.name.as_str() {
                         "posedge_event" | "pos" => Some(Edge::Posedge),
                         "negedge_event" | "neg" => Some(Edge::Negedge),
-                        "value_changed_event" | "default_event" | "value_changed" => None,
+                        "value_changed_event" | "default_event" | "value_changed"
+                        | "terminated_event" => None,
                         other => return self.err(e.span, format!("'{}' is not an event", other)),
                     };
+                    // A spawned process's termination (§5.6.4).
+                    if matches!(&t, Ty::Handle(c) if c == "scrt_proc") {
+                        return Ok(vec![event_expr(None, member(x, "done"))]);
+                    }
                     // An sc_event_queue's event.
                     if matches!(&t, Ty::Class(c) if c == "scrt_event_queue") {
                         return Ok(vec![event_expr(None, member(x, "ev"))]);
@@ -3851,18 +4254,25 @@ impl<'a> Lw<'a> {
                 );
             }
         };
-        // §5.12.7: the end of elaboration checks every port and export is
-        // bound (before the first sc_start runs anything).
+        // The first sc_start ends elaboration once the modules are built
+        // (#0): §4.4 callbacks in hierarchy order, with the binding check
+        // (§5.12.7) after before_end_of_elaboration, which may still bind.
+        let cbs = self.prog.has_callbacks();
+        let cb = |k: &str| expr_stmt(call_fn(&format!("__sc_cb_{}", k), vec![]));
+        let mut first = vec![delay(int(0), null_stmt())];
+        if cbs {
+            first.push(cb("bee"));
+        }
+        first.push(expr_stmt(call_fn("scrt_check_bindings", vec![])));
+        if cbs {
+            first.push(cb("eoe"));
+            first.push(cb("sos"));
+        }
         let mut v = vec![if_(
-            unary(UnaryOp::LogNot, ident("scrt_started")),
-            expr_stmt(call_fn("scrt_check_bindings", vec![])),
-            None,
-        )];
-        v.push(if_(
             ident("scrt_started"),
             delay(int(1), null_stmt()),
-            Some(delay(int(0), null_stmt())),
-        ));
+            Some(block(first)),
+        )];
         v.push(expr_stmt(call_fn("__sc_apply_pending", vec![])));
         v.push(assign(ident("scrt_started"), sized(1, 1)));
         v.push(assign(ident("scrt_paused"), sized(1, 0)));
@@ -3900,8 +4310,29 @@ impl<'a> Lw<'a> {
                 v.push(assign(ident("scrt_tb_now"), sys("$time", vec![])));
             }
         }
+        v.extend(self.end_of_simulation());
         v.push(assign(ident("scrt_paused"), sized(1, 1)));
         Ok(v)
+    }
+
+    /// §4.4.4: once the simulation has stopped (sc_stop), the
+    /// end_of_simulation callbacks run, once.
+    fn end_of_simulation(&self) -> Vec<Statement> {
+        if !self.prog.has_callbacks() {
+            return Vec::new();
+        }
+        vec![if_(
+            bin(
+                BinaryOp::LogAnd,
+                ident("scrt_stopped"),
+                unary(UnaryOp::LogNot, ident("scrt_eos_done")),
+            ),
+            block(vec![
+                assign(ident("scrt_eos_done"), sized(1, 1)),
+                expr_stmt(call_fn("__sc_cb_eos", vec![])),
+            ]),
+            None,
+        )]
     }
 
     /// `std::cout << a << b << std::endl;` → `$write(fmt, …)`.

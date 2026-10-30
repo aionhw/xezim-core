@@ -10,6 +10,15 @@ use crate::sv_parser::systemc::classify::ScObjectKind;
 use crate::sv_parser::systemc::ScParseResult;
 use crate::sv_parser::systemc::ast::*;
 
+/// The elaboration and simulation callbacks (§4.4), in the order the
+/// kernel calls them: (suffix of the hierarchy function, member function).
+pub const CALLBACKS: [(&str, &str); 4] = [
+    ("bee", "before_end_of_elaboration"),
+    ("eoe", "end_of_elaboration"),
+    ("sos", "start_of_simulation"),
+    ("eos", "end_of_simulation"),
+];
+
 pub struct Program<'a> {
     pub results: &'a [ScParseResult],
     /// Classes by name: (translation unit, declaration, template parameters).
@@ -44,6 +53,20 @@ pub struct Program<'a> {
 }
 
 impl<'a> Program<'a> {
+    /// Whether some module defines an elaboration or simulation callback
+    /// (§4.4: `before_end_of_elaboration`, …).
+    pub fn has_callbacks(&self) -> bool {
+        let is_cb = |n: &str| CALLBACKS.iter().any(|(_, c)| *c == n);
+        self.classes.iter().any(|(n, (_, c, _))| {
+            c.members.iter().any(|m| {
+                matches!(m, Member::Method(fd) if fd.body.is_some() && is_cb(fd.base_name()))
+            }) || self
+                .out_of_class
+                .get(n)
+                .is_some_and(|v| v.iter().any(|(_, fd)| is_cb(fd.base_name())))
+        })
+    }
+
     pub fn new(results: &'a [ScParseResult]) -> Self {
         let mut p = Program {
             results,

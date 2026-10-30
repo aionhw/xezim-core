@@ -11,6 +11,29 @@ package sc_rt;
   // `scrt_stopped`, which ends a pending sc_start in sc_main.
   bit scrt_started;
   bit scrt_stopped;
+  // The end_of_simulation callbacks have run (§4.4.4).
+  bit scrt_eos_done;
+
+  // sc_main's argv: the program name, then the comma-separated values of
+  // the plusarg `+sc_args=a,b,…`.
+  typedef string scrt_strq_t[$];
+  function automatic scrt_strq_t scrt_args();
+    string v;
+    string q[$];
+    int st = 0;
+    q.push_back("sc_main");
+    if ($value$plusargs("sc_args=%s", v))
+      for (int i = 0; i <= v.len(); i++)
+        if (i == v.len() || v[i] == ",") begin
+          q.push_back(v.substr(st, i - 1));
+          st = i + 1;
+        end
+    return q;
+  endfunction
+  function automatic int scrt_argc();
+    scrt_strq_t q = scrt_args();
+    return q.size();
+  endfunction
   // A zero-time wait or notification (§4.2.1.3) takes effect in the next
   // delta cycle, after the update phase: the NBA region, where `->>`
   // triggers follow the signal updates.
@@ -140,6 +163,21 @@ package sc_rt;
         return;
       end
   endfunction
+
+  // ---- process handles (§5.6) -------------------------------------------------
+  // A spawned thread's handle: `finish()` at its end makes it terminated.
+  class scrt_proc;
+    event done;
+    bit term;
+    function void finish();
+      term = 1;
+      -> done;
+    endfunction
+  endclass
+
+  // sc_spawn_options: nothing to set that has an effect here.
+  class scrt_spawn_opts;
+  endclass
 
   // ---- sc_fifo (§6.23) -------------------------------------------------------
   // As the reference kernel: a value written becomes readable, and the space

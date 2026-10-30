@@ -662,6 +662,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         self.event_mirrors()?;
         let mut funcs = self.lower_bodies(defs)?;
         funcs.push(self.destructor(class, name)?);
+        funcs.extend(self.callback_functions(&s, false));
         self.finish_module(
             name,
             params,
@@ -696,7 +697,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 if sym.kind != SymKind::Var {
                     continue;
                 }
-                let is_lib = matches!(cls.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue");
+                let is_lib = is_lib_class(cls);
                 if self.lw.user_class(&sym.ty).is_none() && !is_lib {
                     continue;
                 }
@@ -816,11 +817,11 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             // Member objects were constructed by construct_members.
             SymKind::Var
                 if self.lw.user_class(&sym.ty).is_some()
-                    || matches!(&sym.ty, Ty::Class(c) if matches!(c.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue")) => {}
+                    || matches!(&sym.ty, Ty::Class(c) if is_lib_class(c)) => {}
             SymKind::Var | SymKind::Boxed => {
                 if let [a] = mi.args.as_slice() {
                     let (x, _) = self.lw.expr(a)?;
-                    let target = self.lw.sym_read(&sym);
+                    let target = self.lw.sym_target(&sym);
                     s.elab.push(assign(target, x));
                 }
             }
@@ -859,9 +860,46 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     format!("too many constructor arguments for '{}'", module),
                 );
             };
+            if let Some(n) = self.runtime_name_in(a) {
+                return self.lw.err(
+                    a.span,
+                    format!(
+                        "a module constructor argument must be known before simulation ('{}' is computed at run time)",
+                        n
+                    ),
+                );
+            }
             out.push((p.clone(), self.lw.expr(a)?.0));
         }
         Ok(out)
+    }
+
+    /// A name in a module constructor argument whose value only exists at
+    /// run time (the arguments become SystemVerilog parameters): anything
+    /// but a constant, the enclosing module's own constructor parameters and
+    /// template parameters.
+    fn runtime_name_in(&self, a: &sc::Expr) -> Option<String> {
+        let own = self
+            .ifaces
+            .get(&self.lw.m.name)
+            .map(|i| i.ctor_params.clone())
+            .unwrap_or_default();
+        let mut bad = None;
+        visit_expr(a, &mut |x| {
+            if let sc::ExprKind::Name(q) = &x.kind
+                && bad.is_none()
+            {
+                let n = q.last_name();
+                let known = self.lw.const_eval(x).is_some()
+                    || (!self.lw.m.tb && own.iter().any(|p| p == n))
+                    || self.lw.env.tparams.contains_key(n)
+                    || self.lw.lookup(n).is_none();
+                if !known {
+                    bad = Some(n.to_string());
+                }
+            }
+        });
+        bad
     }
 
     /// Walk constructor (or sc_main) statements, separating structure from
@@ -1844,9 +1882,12 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 .params
                 .iter()
                 .map(|p| {
-                    p.ty.ptr_ops.contains(&sc::PtrOp::LRef)
-                        && !p.ty.is_const
-                        && !matches!(self.lw.ty(&p.ty, p.span), Ok(Ty::Class(_)))
+                    let ty = self.lw.ty(&p.ty, p.span);
+                    // An event is always the caller's (`sc_event&`, const too).
+                    matches!(ty, Ok(Ty::Event))
+                        || p.ty.ptr_ops.contains(&sc::PtrOp::LRef)
+                            && !p.ty.is_const
+                            && !matches!(ty, Ok(Ty::Class(_)))
                 })
                 .collect();
             self.lw.m.funcs.insert(
@@ -1939,7 +1980,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             self.lw.f.scopes[0].insert(
                 pname.clone(),
                 Sym {
-                    kind: SymKind::Var,
+                    kind: if matches!(ty, Ty::Event) { SymKind::Event } else { SymKind::Var },
                     ty: ty.clone(),
                     sv: pname.clone(),
                 },
@@ -2461,16 +2502,20 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             ..Default::default()
         };
         let mut s = Structure::default();
-        // `argc` is 1 (no command-line arguments reach sc_main).
+        // `argc`/`argv`: the program name, then the values of
+        // `+sc_args=a,b,…` (scrt_args).
         for p in &f.params {
-            if let Some(n) = &p.name
-                && p.ty.ptr_ops.is_empty()
-                && p.array_dims.is_empty()
-            {
-                let sv = self
-                    .lw
-                    .declare_local(&n.name, Ty::int32(), SymKind::Var, Some(int(1)));
-                let _ = sv;
+            let Some(n) = &p.name else { continue };
+            if p.ty.ptr_ops.is_empty() && p.array_dims.is_empty() {
+                self.lw
+                    .declare_local(&n.name, Ty::int32(), SymKind::Var, Some(call_fn("scrt_argc", vec![])));
+            } else {
+                self.lw.declare_local(
+                    &n.name,
+                    Ty::Queue(Box::new(Ty::Str)),
+                    SymKind::Var,
+                    Some(call_fn("scrt_args", vec![])),
+                );
             }
         }
         // Free functions sc_main calls, lowered into the testbench module.
@@ -2492,7 +2537,8 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let stmts = std::mem::take(&mut s.elab);
         self.lw.m.procs.clear();
         let saved = std::mem::take(&mut self.lw.f);
-        let funcs = self.lower_bodies(defs)?;
+        let mut funcs = self.lower_bodies(defs)?;
+        funcs.extend(self.callback_functions(&s, true));
         self.lw.f = saved;
         self.finish_module(
             "sc_main",
@@ -2848,6 +2894,35 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         Ok(())
     }
 
+    /// §4.4 callbacks: `__sc_cb_<k>()` calls the module's own callback, then
+    /// those of its child modules in construction order (sc_main's calls
+    /// its top modules'): the kernel's hierarchy order.
+    fn callback_functions(&self, s: &Structure, tb: bool) -> Vec<ModuleItem> {
+        if !self.lw.prog.has_callbacks() {
+            return Vec::new();
+        }
+        let foreign: BTreeSet<&String> = self.lw.prog.foreign.values().collect();
+        let mut out = Vec::new();
+        for (k, cb) in super::program::CALLBACKS {
+            let mut body = Vec::new();
+            if !tb && self.defines_member_function(cb) {
+                body.push(expr_stmt(call_fn(cb, vec![])));
+            }
+            for i in &s.insts {
+                if !foreign.contains(&i.module) {
+                    body.push(expr_stmt(call(member(ident(&i.sv), &format!("__sc_cb_{}", k)), Vec::new())));
+                }
+            }
+            out.push(ModuleItem::FunctionDeclaration(function_decl(
+                &format!("__sc_cb_{}", k),
+                void_t(),
+                Vec::new(),
+                body,
+            )));
+        }
+        out
+    }
+
     /// Whether the module being lowered defines member function `f`.
     fn defines_member_function(&self, f: &str) -> bool {
         let in_class = self.lw.prog.classes.get(&self.lw.m.name).is_some_and(|(_, c, _)| {
@@ -3070,6 +3145,42 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             );
         }
         match p.kind {
+            sc::ProcessKind::Method if self.lw.m.next_triggers.iter().any(|(i, _)| *i == p.index) => {
+                // §5.2.17: each activation waits for what next_trigger()
+                // set during the previous one, else the static sensitivity.
+                let kind = next_trigger_kind(p.index);
+                items.push(data_decl(atom_t(crate::ast::types::IntegerAtomType::Int, false), &kind, Vec::new(), None));
+                items.push(data_decl(
+                    atom_t(crate::ast::types::IntegerAtomType::LongInt, true),
+                    &next_trigger_time(p.index),
+                    Vec::new(),
+                    None,
+                ));
+                if !dont_init {
+                    body.push(call.clone());
+                }
+                let arms: Vec<(Expression, Statement)> = self
+                    .lw
+                    .m
+                    .next_triggers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (i, _))| *i == p.index)
+                    .map(|(k, (_, w))| (int(k as i64 + 1), w.clone()))
+                    .collect();
+                let fallback = if p.sens.is_empty() {
+                    wait(sized(1, 0))
+                } else {
+                    wait_sens()
+                };
+                let mut lp = vec![
+                    case_(ident(&kind), arms, Some(fallback)),
+                    assign(ident(&kind), int(0)),
+                    call,
+                ];
+                lp.extend(clear_flags);
+                body.push(forever(block(lp)));
+            }
             sc::ProcessKind::Method => {
                 if !dont_init {
                     body.push(call.clone());
@@ -3257,11 +3368,28 @@ fn many_writers(ty: &sc::Type) -> bool {
 
 fn stmt_calls(s: &sc::Stmt, out: &mut BTreeSet<String>) {
     visit_stmt_exprs(s, &mut |e| {
-        if let sc::ExprKind::Call { callee, .. } = &e.kind
+        if let sc::ExprKind::Call { callee, args } = &e.kind
             && let Some(q) = callee.as_name()
             && q.segments.len() == 1
         {
             out.insert(q.last_name().to_string());
+            // `sc_bind(&f, …)` (§5.5) calls `f` in the spawned thread.
+            if q.last_name() == "sc_bind"
+                && let Some(f) = args.first()
+            {
+                let f = match &f.kind {
+                    sc::ExprKind::Unary {
+                        op: sc::UnaryOp::AddrOf,
+                        operand,
+                    } => operand.as_ref(),
+                    _ => f,
+                };
+                if let Some(q) = f.as_name()
+                    && q.segments.len() == 1
+                {
+                    out.insert(q.last_name().to_string());
+                }
+            }
         }
     });
 }
@@ -3277,6 +3405,7 @@ pub fn visit_stmt_exprs(s: &sc::Stmt, f: &mut dyn FnMut(&sc::Expr)) {
     match s {
         S::Block(b) => b.stmts.iter().for_each(|s| visit_stmt_exprs(s, f)),
         S::Expr(e) | S::Return(Some(e), _) => visit_expr(e, f),
+        S::ScFork { spawns, .. } => spawns.iter().for_each(|e| visit_expr(e, f)),
         S::Decl(v) => {
             for d in &v.declarators {
                 match &d.init {
