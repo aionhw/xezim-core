@@ -88,6 +88,7 @@ impl Design {
                 }
             }
             ast::Decl::Disconnect(ds) => self.disconnect_spec(r, ds, objs),
+            ast::Decl::View(vd) => self.view_decl(r, vd),
             ast::Decl::Variable { obj, shared } => {
                 let k = if *shared {
                     ObjKind::SharedVariable
@@ -1451,17 +1452,34 @@ impl Design {
         for d in list {
             match d {
                 ast::InterfaceDecl::Object(o) => {
-                    let Some(ty) = self.subtype_ind(r, &o.ty) else {
-                        continue;
+                    // A mode view (VHDL-2019): the type and the view.
+                    let (ty, view) = match &o.view {
+                        Some(vi) => match self.view_indication(r, vi, &o.ty, kind, o) {
+                            Some((t, v)) => (t, Some(v)),
+                            None => continue,
+                        },
+                        None => match self.subtype_ind(r, &o.ty) {
+                            Some(t) => (t, None),
+                            None => continue,
+                        },
                     };
                     let default = o.default.as_ref().and_then(|v| self.expr(r, v, Some(ty)));
-                    let mode = o.mode.unwrap_or(Mode::In);
+                    // A port or parameter with a view is driven and read
+                    // through its elements: it associates as `inout`, and
+                    // an element's own mode applies where a formal part
+                    // names it (`map_ports`).
+                    let mode = if view.is_some() {
+                        Mode::InOut
+                    } else {
+                        o.mode.unwrap_or(Mode::In)
+                    };
                     let okind = match kind {
                         IfaceKind::Generic => ObjKind::Generic,
                         IfaceKind::Port => ObjKind::Port(mode),
                         IfaceKind::Param { function } => {
                             let class = match o.class {
                                 Some(c) => c,
+                                None if view.is_some() => ObjClass::Signal,
                                 None if mode == Mode::In || function => ObjClass::Constant,
                                 None => ObjClass::Variable,
                             };
@@ -1483,6 +1501,9 @@ impl Design {
                             },
                         });
                         self.declare(r, &n.name, Sym::Obj(id));
+                        if let Some(v) = view {
+                            self.port_views.insert(id, v);
+                        }
                         out.push(id);
                     }
                 }

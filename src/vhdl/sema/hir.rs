@@ -406,6 +406,33 @@ pub struct Instance {
     pub loc: Loc,
 }
 
+/// A mode view (VHDL-2019 §6.5.2): a record type and the modes of its
+/// elements, by element position.
+#[derive(Clone, Debug)]
+pub struct ViewInfo {
+    pub name: String,
+    pub ty: TypeId,
+    pub elems: Vec<ElemView>,
+}
+
+/// The mode of an element in a mode view.
+#[derive(Clone, Copy, Debug)]
+pub enum ElemView {
+    Mode(Mode),
+    /// A record element with a view, or an array element whose elements
+    /// have it (`array`); `converse` for `v'converse`.
+    View(PortView),
+}
+
+/// A mode view applied to a port, a signal parameter or an element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortView {
+    pub view: usize,
+    pub converse: bool,
+    /// `view (v)`: the view of each element of an array.
+    pub array: bool,
+}
+
 /// A port association with a conversion function, a type conversion or
 /// a partial formal (§6.5.7.1). Values pass without a delta (§14.7.3.4).
 #[derive(Clone, Debug)]

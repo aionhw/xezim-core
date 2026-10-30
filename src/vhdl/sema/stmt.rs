@@ -1296,10 +1296,17 @@ impl Design {
                 }
                 continue;
             };
-            let mode = match self.objects[f].kind {
+            let mut mode = match self.objects[f].kind {
                 ObjKind::Port(m) => m,
                 _ => ast::Mode::In,
             };
+            // A part of a port with a mode view (VHDL-2019): the mode of
+            // the element it names.
+            if let (Some(pv), Some(fh)) = (self.port_views.get(&f).copied(), &fpart)
+                && let Some(m) = self.view_mode_at(pv, fh)
+            {
+                mode = m;
+            }
             let ft = fpart.as_ref().map(|h| h.ty).unwrap_or(self.objects[f].ty);
             let Some(ah) = self.expr(r, e, Some(ft)) else {
                 continue;

@@ -285,7 +285,41 @@ pub struct InterfaceObject {
     pub ty: SubtypeInd,
     pub bus: bool,
     pub default: Option<Expr>,
+    /// A mode view (VHDL-2019 §6.5.2), `view v [of t]` or `view (v) of t`.
+    /// Without `of`, `ty` is a mark naming the view (its type is the view's).
+    pub view: Option<ViewInd>,
     pub span: Span,
+}
+
+/// The mode view indication of an interface object.
+#[derive(Clone, Debug)]
+pub struct ViewInd {
+    /// The view, possibly `v'converse`.
+    pub name: Name,
+    /// `view (v)`: each element of an array has the view.
+    pub array: bool,
+    /// The subtype was given with `of`.
+    pub of: bool,
+}
+
+/// A mode view declaration (VHDL-2019 §6.5.2): the modes of the elements of
+/// a record type.
+#[derive(Clone, Debug)]
+pub struct ViewDecl {
+    pub name: Ident,
+    pub ty: SubtypeInd,
+    pub elems: Vec<(Vec<Ident>, ElemMode)>,
+    pub span: Span,
+}
+
+/// The mode of an element in a mode view.
+#[derive(Clone, Debug)]
+pub enum ElemMode {
+    Mode(Mode),
+    /// `view v` (a record element), possibly `v'converse`.
+    View(Name),
+    /// `view (v)` (an array element of records).
+    ArrayView(Name),
 }
 
 #[derive(Clone, Debug)]
@@ -543,6 +577,8 @@ pub enum Decl {
     Component(ComponentDecl),
     ConfigSpec(ConfigSpec),
     Disconnect(DisconnectSpec),
+    /// A mode view declaration (VHDL-2019).
+    View(ViewDecl),
     Attribute {
         name: Ident,
         mark: Name,

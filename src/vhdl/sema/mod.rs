@@ -15,6 +15,7 @@ pub mod hir;
 mod mixed;
 mod predefined;
 mod stmt;
+mod views;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -45,6 +46,8 @@ pub enum Sym {
     /// An uninstantiated generic subprogram (index into
     /// `Design::generic_subs`).
     GenericSub(usize),
+    /// A mode view (VHDL-2019, index into `Design::views`).
+    View(usize),
 }
 
 impl Sym {
@@ -179,6 +182,10 @@ pub struct Design {
     cur_prot: Option<TypeId>,
     /// The names alias declarations stand for.
     pub aliases: Vec<HExpr>,
+    /// Mode views (VHDL-2019 §6.5.2).
+    pub views: Vec<ViewInfo>,
+    /// The mode views of ports and signal parameters.
+    pub port_views: BTreeMap<ObjId, PortView>,
     /// Labels of loops (by `Sym::Label` id) — names only, for diagnostics.
     pub labels: Vec<String>,
     /// Library → unit name → sources (primary units; later wins).
@@ -288,6 +295,8 @@ impl Design {
             guards: BTreeMap::new(),
             cur_cfg: None,
             aliases: Vec::new(),
+            views: Vec::new(),
+            port_views: BTreeMap::new(),
             labels: Vec::new(),
             units: BTreeMap::new(),
             bodies: BTreeMap::new(),

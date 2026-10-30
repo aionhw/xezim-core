@@ -166,6 +166,41 @@ pub(super) const GLOBAL: usize = usize::MAX;
 /// formal conversion or partial formal (`Link`), not processes.
 pub(super) const PSEUDO: usize = 1 << 30;
 
+/// A step of the update phase (`Lw::update_order`).
+#[derive(Clone, Copy, Debug)]
+enum UpdStep {
+    /// A signal's update by its drivers.
+    Sig(usize),
+    /// An in-port link (index into `links`).
+    In(usize),
+}
+
+/// Whether two parts of one signal may overlap: `false` only when their
+/// paths provably select different elements.
+fn parts_overlap(a: &Part, b: &Part) -> bool {
+    let (Part::Path(x), Part::Path(y)) = (a, b) else {
+        return true;
+    };
+    for (p, q) in x.iter().zip(y) {
+        let disjoint = match (p, q) {
+            (Sel::Field(i), Sel::Field(j)) => i != j,
+            (Sel::Elem(i), Sel::Elem(j)) => i != j,
+            (Sel::Elem(i), Sel::Slice(o, n)) | (Sel::Slice(o, n), Sel::Elem(i)) => {
+                *i < *o || *i >= o + n
+            }
+            (Sel::Slice(o1, n1), Sel::Slice(o2, n2)) => o1 + n1 <= *o2 || o2 + n2 <= *o1,
+            _ => return true,
+        };
+        if disjoint {
+            return false;
+        }
+        if p != q {
+            return true;
+        }
+    }
+    true
+}
+
 /// A port association through a conversion or a partial formal: a
 /// signal (part) computed from others without a delta (§14.7.3.4). Mode
 /// `in` writes the formal's effective value; mode `out` the driving value
@@ -581,24 +616,59 @@ impl<'a> Lw<'a> {
         }
     }
 
-    /// The order signals are updated in (§14.7.3): a link's target after
-    /// its sources, otherwise by elaboration order.
-    fn update_order(&self) -> Vec<usize> {
-        let n = self.sigs.len();
+    /// The order of the update phase (§14.7.3): each signal's update by
+    /// its drivers (`UpdStep::Sig`, with the out-port links that drive it)
+    /// and each in-port link (`UpdStep::In`, writing a part of its formal
+    /// after the formal's update). A step follows the updates of the
+    /// signals it reads and the in-port links that write a part of them it
+    /// reads: a port with a mode view (VHDL-2019) has links both ways, and
+    /// only parts tell `m.req` (driven inside, read out) from `m.ack`
+    /// (written by a link from outside). Otherwise elaboration order.
+    fn update_order(&self) -> Vec<UpdStep> {
+        let nsig = self.sigs.len();
+        let n = nsig + self.links.len();
+        let node = |l: usize| {
+            if self.links[l].inn {
+                nsig + l
+            } else {
+                self.links[l].target.sig
+            }
+        };
         let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut indeg = vec![0usize; n];
-        for l in &self.links {
+        let mut edge = |a: usize, b: usize, deps: &mut Vec<Vec<usize>>| {
+            if a != b && !deps[a].contains(&b) {
+                deps[a].push(b);
+                indeg[b] += 1;
+            }
+        };
+        for (li, l) in self.links.iter().enumerate() {
+            if l.inn {
+                edge(l.target.sig, nsig + li, &mut deps);
+            }
+            let read = self.actual_ref(l.ctx, &l.value);
             for &src in &l.sources {
-                if src != l.target.sig {
-                    deps[src].push(l.target.sig);
-                    indeg[l.target.sig] += 1;
+                if src == l.target.sig {
+                    continue;
+                }
+                edge(src, node(li), &mut deps);
+                let part = match &read {
+                    Some(r) if r.sig == src => r.part.clone(),
+                    _ => Part::Whole,
+                };
+                for (mi, m) in self.links.iter().enumerate() {
+                    if m.inn && mi != li && m.target.sig == src && parts_overlap(&part, &m.target.part) {
+                        edge(nsig + mi, node(li), &mut deps);
+                    }
                 }
             }
         }
         let mut ready: BTreeSet<usize> = (0..n).filter(|&s| indeg[s] == 0).collect();
         let mut order = Vec::with_capacity(n);
+        let mut done = vec![false; n];
         while let Some(s) = ready.pop_first() {
             order.push(s);
+            done[s] = true;
             for &t in &deps[s] {
                 indeg[t] -= 1;
                 if indeg[t] == 0 {
@@ -606,13 +676,19 @@ impl<'a> Lw<'a> {
                 }
             }
         }
-        // A cycle (not expected from port associations): the rest in order.
-        for s in 0..n {
-            if !order.contains(&s) {
-                order.push(s);
-            }
-        }
+        // A cycle (a link computed from its own target): the rest in order.
+        order.extend((0..n).filter(|&s| !done[s]));
+        // Out-port links are part of their targets' updates: no steps.
         order
+            .into_iter()
+            .filter_map(|s| {
+                if s < nsig {
+                    Some(UpdStep::Sig(s))
+                } else {
+                    self.links[s - nsig].inn.then_some(UpdStep::In(s - nsig))
+                }
+            })
+            .collect()
     }
 
     pub(super) fn lookup_sig(&self, mut inst: usize, o: ObjId) -> Option<SigRef> {
@@ -2343,34 +2419,36 @@ impl<'a> Lw<'a> {
                 );
             }
         }
-        for &s in &order {
-            // Links into this signal: the driving values from converted or
-            // partial out ports first, the in ports after its update.
-            let link_cond = |l: &Link| {
-                if let Some(f) = l.foreign {
-                    format!("vh_fx{}", f)
-                } else if l.sources.is_empty() {
-                    "0".to_string()
-                } else {
-                    l.sources
-                        .iter()
-                        .map(|x| format!("vh_s{}_act", x))
-                        .collect::<Vec<_>>()
-                        .join(" || ")
+        let link_cond = |l: &Link| {
+            if let Some(f) = l.foreign {
+                format!("vh_fx{}", f)
+            } else if l.sources.is_empty() {
+                "0".to_string()
+            } else {
+                l.sources
+                    .iter()
+                    .map(|x| format!("vh_s{}_act", x))
+                    .collect::<Vec<_>>()
+                    .join(" || ")
+            }
+        };
+        for &step in &order {
+            // An in-port link: a part of its formal, after the formal's
+            // update and the updates of what it reads.
+            let s = match step {
+                UpdStep::In(n) => {
+                    let _ = writeln!(ub, "    if ({}) vh_lnk{}(0);", link_cond(&self.links[n]), n);
+                    continue;
                 }
+                UpdStep::Sig(s) => s,
             };
+            // Links into this signal: the driving values from converted or
+            // partial out ports, before its update.
             for (n, l) in self.links.iter().enumerate() {
                 if !l.inn && l.target.sig == s {
                     let _ = writeln!(ub, "    if ({}) vh_lnk{}();", link_cond(l), n);
                 }
             }
-            let ins: Vec<String> = self
-                .links
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.inn && l.target.sig == s)
-                .map(|(n, l)| format!("    if ({}) vh_lnk{}(0);\n", link_cond(l), n))
-                .collect();
             let ds = self.sig_drivers(s);
             // A forced signal keeps its forced value (§14.7.3.1).
             let unforced = if self.forced.contains(&s) {
@@ -2405,7 +2483,6 @@ impl<'a> Lw<'a> {
                 String::new()
             };
             if ds.is_empty() {
-                ub.push_str(&ins.concat());
                 continue;
             }
             if upd_sigs.contains(&s) {
@@ -2415,7 +2492,6 @@ impl<'a> Lw<'a> {
                     s = s,
                     u = unforced
                 );
-                ub.push_str(&ins.concat());
                 continue;
             }
             let sig = self.sigs[s].clone();
@@ -2455,7 +2531,6 @@ impl<'a> Lw<'a> {
                 u = unforced,
                 set = set
             );
-            ub.push_str(&ins.concat());
         }
         // Implicit signals (§14.7.5.3 c).
         for &n in &imp_order {
@@ -2697,7 +2772,14 @@ impl<'a> Lw<'a> {
         let _ = writeln!(k, "    vh_elab();\n    vh_now = $time;");
         k.push_str(&self.boundary_sample_init());
         // Initial effective values (§14.7.5.2), in update order.
-        for &s in &order {
+        for &step in &order {
+            let s = match step {
+                UpdStep::In(n) => {
+                    let _ = writeln!(k, "    vh_lnk{}(1);", n);
+                    continue;
+                }
+                UpdStep::Sig(s) => s,
+            };
             for (n, l) in self.links.iter().enumerate() {
                 if !l.inn && l.target.sig == s {
                     let _ = writeln!(k, "    vh_lnk{}();", n);
@@ -2714,11 +2796,6 @@ impl<'a> Lw<'a> {
                     s = s,
                     p = p
                 );
-            }
-            for (n, l) in self.links.iter().enumerate() {
-                if l.inn && l.target.sig == s {
-                    let _ = writeln!(k, "    vh_lnk{}(1);", n);
-                }
             }
         }
         // Implicit signals: their initial values (after those they read).

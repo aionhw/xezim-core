@@ -122,6 +122,16 @@ impl<'a> Lw<'a> {
             let ObjKind::Port(mode) = info.kind else {
                 continue;
             };
+            if self.d.port_views.contains_key(&p) {
+                self.err(
+                    &info.loc,
+                    format!(
+                        "port '{}' has a mode view (VHDL-2019), which cannot be connected to SystemVerilog",
+                        info.name
+                    ),
+                );
+                continue;
+            }
             let Some(bnd) = self.bnd(info.ty) else {
                 self.err(
                     &info.loc,

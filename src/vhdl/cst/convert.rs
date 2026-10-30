@@ -386,10 +386,6 @@ impl<'a> Converter<'a> {
             match item {
                 v::InterfaceDeclaration::Object(o) => {
                     let span = self.has_span(o);
-                    let v::ModeIndication::Simple(m) = &o.mode else {
-                        self.unsupported(span, "a mode view");
-                        continue;
-                    };
                     // The class as written (`signal x : bit`), or none: the
                     // analysis applies the default of the interface list.
                     let first = self
@@ -398,8 +394,44 @@ impl<'a> Converter<'a> {
                         .next()
                         .unwrap_or_default()
                         .to_ascii_lowercase();
-                    let class = matches!(first.as_str(), "constant" | "signal" | "variable")
-                        .then(|| obj_class(m.class));
+                    let explicit = matches!(first.as_str(), "constant" | "signal" | "variable");
+                    let m = match &o.mode {
+                        v::ModeIndication::Simple(m) => m,
+                        // A mode view (VHDL-2019 §6.5.2): a signal.
+                        v::ModeIndication::View(vi) => {
+                            let Some(name) = self.name(&vi.name) else {
+                                continue;
+                            };
+                            let ty = match &vi.subtype_indication {
+                                Some((_, st)) => match self.subtype_ind(st) {
+                                    Some(t) => t,
+                                    None => continue,
+                                },
+                                None => SubtypeInd {
+                                    resolution: None,
+                                    span: name.span.clone(),
+                                    mark: name.clone(),
+                                    constraint: None,
+                                },
+                            };
+                            out.push(InterfaceDecl::Object(InterfaceObject {
+                                class: explicit.then_some(ObjClass::Signal),
+                                names: self.idents(&o.idents),
+                                mode: None,
+                                ty,
+                                bus: false,
+                                default: None,
+                                view: Some(ViewInd {
+                                    name,
+                                    array: matches!(vi.kind, v::ModeViewIndicationKind::Array),
+                                    of: vi.subtype_indication.is_some(),
+                                }),
+                                span,
+                            }));
+                            continue;
+                        }
+                    };
+                    let class = explicit.then(|| obj_class(m.class));
                     let Some(ty) = self.subtype_ind(&m.subtype_indication) else {
                         continue;
                     };
@@ -411,6 +443,7 @@ impl<'a> Converter<'a> {
                         ty,
                         bus: m.bus,
                         default,
+                        view: None,
                         span,
                     }));
                 }
@@ -426,6 +459,7 @@ impl<'a> Converter<'a> {
                         ty,
                         bus: false,
                         default: None,
+                        view: None,
                         span,
                     }));
                 }
@@ -1081,9 +1115,23 @@ impl<'a> Converter<'a> {
                     span,
                 })
             }
-            v::Declaration::View(_) => {
-                self.unsupported(span, "a mode view declaration");
-                return None;
+            // VHDL-2019 §6.5.2 mode view declaration.
+            v::Declaration::View(vd) => {
+                let mut elems = Vec::new();
+                for e in &vd.elements {
+                    let m = match &e.mode {
+                        v::ElementMode::Simple(m) => ElemMode::Mode(mode(m.item)),
+                        v::ElementMode::Record(n) => ElemMode::View(self.name(n)?),
+                        v::ElementMode::Array(n) => ElemMode::ArrayView(self.name(n)?),
+                    };
+                    elems.push((self.idents(&e.names), m));
+                }
+                Decl::View(ViewDecl {
+                    name: self.ident(&vd.ident.tree),
+                    ty: self.subtype_ind(&vd.typ)?,
+                    elems,
+                    span,
+                })
             }
         })
     }

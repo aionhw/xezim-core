@@ -350,3 +350,65 @@ fn vhdl2019_forms_rejected_in_2008() {
         assert!(!errs.is_empty(), "{src}");
     }
 }
+
+/// VHDL-2019 §6.5.2 mode views: every element of the record has exactly one
+/// mode, the view's subtype is a record type, views apply to ports and
+/// procedures' signal parameters, an array view names its array subtype,
+/// and the port's subtype is of the view's type. Each is a located error.
+#[test]
+fn mode_view_errors() {
+    let pkg = |view: &str, rest: &str| {
+        format!(
+            "package p is\n  type r_t is record\n    a, b : bit;\n  end record;\n  type v_t is array (0 to 1) of r_t;\n{view}{rest}end package;\nuse work.p.all;\nentity e is end entity;\narchitecture a of e is\nbegin\nend architecture;\n"
+        )
+    };
+    let good = "  view v of r_t is\n    a : in;\n    b : out;\n  end view;\n";
+    for (src, at, what) in [
+        (
+            pkg("  view v of r_t is\n    a : in;\n  end view;\n", ""),
+            "t19.vhd:6:8:",
+            "element 'b' has no mode in the view",
+        ),
+        (
+            pkg("  view v of r_t is\n    a, b : in;\n    c : out;\n  end view;\n", ""),
+            "t19.vhd:8:5:",
+            "'c' is not an element",
+        ),
+        (
+            pkg("  view v of r_t is\n    a, b : in;\n    a : out;\n  end view;\n", ""),
+            "t19.vhd:8:5:",
+            "has a mode in the view already",
+        ),
+        (
+            pkg("  view w of bit is\n    a : in;\n  end view;\n", ""),
+            "t19.vhd:6:13:",
+            "must be a record type",
+        ),
+        (
+            pkg(good, "  function f(signal x : view v) return bit;\n"),
+            "t19.vhd:10:14:",
+            "ports and signal parameters of procedures only",
+        ),
+        (
+            pkg(good, "  procedure q(signal x : view (v));\n"),
+            "t19.vhd:10:15:",
+            "array mode view needs the subtype",
+        ),
+        (
+            pkg(good, "  procedure q(signal x : view v of v_t);\n"),
+            "t19.vhd:10:36:",
+            "not of the type of the mode view",
+        ),
+    ] {
+        let errs =
+            vhdl::check_design_std(&[("work", "t19.vhd", src.as_bytes())], vhdl::VhdlStd::V2019);
+        assert!(
+            errs.iter().any(|e| e.starts_with(at) && e.contains(what)),
+            "{at} {what}:\n{}\n{src}",
+            errs.join("\n")
+        );
+    }
+    let ok = pkg(good, "  procedure q(signal x : view v; signal y : view (v'converse) of v_t);\n");
+    let errs = vhdl::check_design_std(&[("work", "t19.vhd", ok.as_bytes())], vhdl::VhdlStd::V2019);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
