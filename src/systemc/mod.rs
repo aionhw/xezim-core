@@ -28,6 +28,7 @@
 //! is the `sc_rt` package in `runtime.sv`.
 
 mod build;
+mod classes;
 mod lower;
 mod module;
 mod program;
@@ -191,6 +192,11 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
     let (env, enum_consts) = global_env(&prog);
     let mut lw = lower::Lw::new(&prog, env, enum_consts);
     let mut out = Vec::new();
+    // User classes first: modules use them as types.
+    let user = classes::user_classes(&prog);
+    if let Err(e) = classes::signatures(&mut lw, &user) {
+        lw.record(e);
+    }
 
     // Module interfaces first (instantiation needs every child's ports).
     let modules: Vec<(
@@ -254,6 +260,7 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
             Err(e) => lw.record(e),
         }
     }
+    let user_pkg = classes::package(&mut lw, &user);
     let mut top = None;
     if let Some((tu, f)) = prog.sc_main {
         lw.tu = tu;
@@ -290,6 +297,9 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
         for d in &out {
             eprintln!("{:#?}", d);
         }
+    }
+    if let Some(p) = user_pkg {
+        out.insert(0, p);
     }
     out.insert(0, runtime_package(&runtime_text(&lw.rv_widths))?);
     descriptions.extend(out);

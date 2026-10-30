@@ -179,6 +179,8 @@ pub struct ModCtx {
     /// Whether a write site needed the running process's identity at run
     /// time (a function several processes share).
     pub needs_pid: bool,
+    /// Lowering a user class's member functions: its SV name (`this`).
+    pub class: Option<String>,
     /// Input ports some instance binds to an sc_buffer: port → the hidden
     /// input carrying the buffer's write count (§6.9).
     pub port_counters: BTreeMap<String, String>,
@@ -219,6 +221,8 @@ pub struct FnCtx {
     /// The function runs in several processes (its process is known only
     /// at run time).
     pub shared: bool,
+    /// The function returns an object by value: `return x;` returns a copy.
+    pub ret_copy: bool,
 }
 
 pub struct Lw<'a> {
@@ -301,6 +305,25 @@ fn signed_shift(op: BinaryOp, lhs: &Ty) -> BinaryOp {
             BinaryOp::ArithShiftRight
         }
         _ => op,
+    }
+}
+
+/// The binary operator of a compound assignment (`+=` → `+`).
+fn compound_binop(op: sc::AssignOp) -> sc::BinaryOp {
+    use sc::AssignOp as A;
+    use sc::BinaryOp as B;
+    match op {
+        A::Add => B::Add,
+        A::Sub => B::Sub,
+        A::Mul => B::Mul,
+        A::Div => B::Div,
+        A::Rem => B::Rem,
+        A::And => B::BitAnd,
+        A::Or => B::BitOr,
+        A::Xor => B::BitXor,
+        A::Shl => B::Shl,
+        A::Shr => B::Shr,
+        A::Assign => B::Comma,
     }
 }
 
@@ -716,6 +739,48 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// Whether the class `a` (SV name) is `b` or derives from it.
+    pub fn is_same_or_derived(&self, a: &str, b: &str) -> bool {
+        let classes = self.prog.user_classes.borrow();
+        let mut cur = Some(a.to_string());
+        while let Some(c) = cur {
+            if c == b {
+                return true;
+            }
+            cur = classes.get(&c).and_then(|s| s.base.clone());
+        }
+        false
+    }
+
+    /// The user class (SV name) of an object or pointer type.
+    pub fn user_class(&self, t: &Ty) -> Option<String> {
+        match t {
+            Ty::Class(c) | Ty::Handle(c) if self.prog.user_classes.borrow().contains_key(c) => {
+                Some(c.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// `T::__sc_make<k>(args)`: a new object of the user class `cls`.
+    pub fn make_object(&mut self, cls: &str, args: &[sc::Expr], span: ScSpan) -> R<Expression> {
+        let sig = self.prog.user_classes.borrow().get(cls).cloned();
+        let Some(sig) = sig else {
+            return self.err(span, "not a class");
+        };
+        let Some(k) = sig.ctor(args.len()) else {
+            return self.err(
+                span,
+                format!("'{}' has no constructor taking {} arguments", sig.cpp, args.len()),
+            );
+        };
+        let mut xs = Vec::new();
+        for a in args {
+            xs.push(self.expr(a)?.0);
+        }
+        Ok(call(member(ident(cls), &format!("__sc_make{}", k)), xs))
+    }
+
     /// The writer a write site stands for: the process running this
     /// function, code outside processes, or — in a function several
     /// processes share — whichever runs it (`None`: decided at run time).
@@ -826,10 +891,14 @@ impl<'a> Lw<'a> {
             K::StringLit { value, .. } => Ok((string(value), Ty::Str)),
             K::BoolLit(b) => Ok((sized(1, *b as u64), Ty::Bool)),
             K::Nullptr => Ok((null(), Ty::Ptr { elem: 1 })),
-            K::This => self.err(
-                span,
-                "'this' is only supported in register_b_transport and socket binding",
-            ),
+            // In a user class's member function `this` points to the object.
+            K::This => match &self.m.class {
+                Some(c) => Ok((ex(ExprKind::This), Ty::Handle(c.clone()))),
+                None => self.err(
+                    span,
+                    "'this' is only supported in member functions of classes, register_b_transport and socket binding",
+                ),
+            },
             K::Name(q) => self.name(q, span),
             K::Paren(inner) => {
                 if let K::Binary {
@@ -923,6 +992,38 @@ impl<'a> Lw<'a> {
                 }
                 Ok((ex(ExprKind::AssignmentPattern(parts)), Ty::int32()))
             }
+            // `new T(args)`: a new object of a user class (a pointer to it).
+            K::New {
+                ty,
+                args,
+                array_size: None,
+                ..
+            } if self
+                .ty(ty, span)
+                .ok()
+                .and_then(|t| self.user_class(&t))
+                .is_some() =>
+            {
+                let cls = self
+                    .ty(ty, span)
+                    .ok()
+                    .and_then(|t| self.user_class(&t))
+                    .expect("checked");
+                let x = self.make_object(&cls, args.as_deref().unwrap_or(&[]), span)?;
+                Ok((x, Ty::Handle(cls)))
+            }
+            // `new tlm_generic_payload`: an object of a runtime class.
+            K::New {
+                ty,
+                args: None | Some(_),
+                array_size: None,
+                ..
+            } if matches!(self.ty(ty, span), Ok(Ty::Class(_))) => {
+                let Ok(Ty::Class(c)) = self.ty(ty, span) else {
+                    unreachable!("checked")
+                };
+                Ok((new_obj(None), Ty::Handle(c)))
+            }
             K::New { .. } => self.err(
                 span,
                 "'new' is supported only to create a child module or initialize a declared object",
@@ -966,6 +1067,13 @@ impl<'a> Lw<'a> {
             _ => {}
         }
         let last = q.last_name();
+        // `T::m`: a static member of a user class.
+        if q.segments.len() >= 2 {
+            let cls = super::classes::class_sv(&q.segments[q.segments.len() - 2].ident.name);
+            if let Some(t) = self.prog.class_field_ty(&cls, last) {
+                return Ok((member(ident(&cls), &super::classes::escape_sv(last)), t));
+            }
+        }
         if last.starts_with("TLM_")
             || matches!(
                 last,
@@ -1021,6 +1129,8 @@ impl<'a> Lw<'a> {
                 let (p, t) = self.expr(operand)?;
                 match t {
                     Ty::Ptr { elem } => Ok((ptr_get(p, int(0), elem), ptr_elem_ty(elem))),
+                    // `*p` is the object the pointer points to.
+                    Ty::Handle(c) => Ok((p, Ty::Class(c))),
                     Ty::Class(_) => Ok((p, t)),
                     _ => self.err(span, "dereferencing this pointer is not supported"),
                 }
@@ -1044,6 +1154,12 @@ impl<'a> Lw<'a> {
     /// `&x` / `&arr[i]`: a data pointer into a boxed object.
     fn address_of(&mut self, operand: &sc::Expr, span: ScSpan) -> R<(Expression, Ty)> {
         use sc::ExprKind as K;
+        // The address of an object is a pointer to it: its handle.
+        let saved = self.pre.len();
+        if let Ok((x, Ty::Class(c))) = self.expr(operand) {
+            return Ok((x, Ty::Handle(c)));
+        }
+        self.pre.truncate(saved);
         match &operand.kind {
             K::Name(q) if q.segments.len() == 1 => {
                 let Some(sym) = self.lookup(q.last_name()) else {
@@ -1111,6 +1227,25 @@ impl<'a> Lw<'a> {
         }
         let (l, lt) = self.expr(lhs)?;
         let (r, rt) = self.expr(rhs)?;
+        // Operators on objects are the class's operator functions; `!=`
+        // without one is the negated `==`.
+        if let Ty::Class(c) = &lt
+            && self.user_class(&lt).is_some()
+        {
+            let spelling = super::classes::op_spelling(op);
+            if let Some(e) = super::classes::object_op(self, c, spelling, l.clone(), r.clone()) {
+                return Ok(e);
+            }
+            if op == sc::BinaryOp::Ne
+                && let Some((e, _)) = super::classes::object_op(self, c, "==", l, r)
+            {
+                return Ok((super::classes::not(e), Ty::Bool));
+            }
+            return self.err(
+                span,
+                format!("this class has no operator{}", spelling),
+            );
+        }
         // Pointer arithmetic and null tests.
         if let Ty::Ptr { elem } = lt {
             match op {
@@ -1138,7 +1273,11 @@ impl<'a> Lw<'a> {
                 _ => {}
             }
         }
-        if let (Ty::Ptr { .. } | Ty::Class(_), sc::BinaryOp::Eq | sc::BinaryOp::Ne) = (&rt, op) {
+        if let (
+            Ty::Ptr { .. } | Ty::Class(_) | Ty::Handle(_),
+            sc::BinaryOp::Eq | sc::BinaryOp::Ne,
+        ) = (&rt, op)
+        {
             let op = if op == sc::BinaryOp::Eq {
                 BinaryOp::Eq
             } else {
@@ -1273,10 +1412,10 @@ impl<'a> Lw<'a> {
         }
         let (b, bt) = self.expr(base)?;
         match bt {
-            Ty::Class(c) => {
+            Ty::Class(c) | Ty::Handle(c) => {
                 let t = self.prog.class_field_ty(&c, field);
                 match t {
-                    Some(t) => Ok((member(b, field), t)),
+                    Some(t) => Ok((member(b, &super::classes::escape_sv(field)), t)),
                     None => self.err(span, format!("unknown member '{}'", field)),
                 }
             }
@@ -1300,7 +1439,9 @@ impl<'a> Lw<'a> {
             (Ty::Void, _) => Ok((x, Ty::Void)),
             // Reinterpreting a data pointer only changes its element size.
             (Ty::Ptr { elem }, Ty::Ptr { .. }) => Ok((x, Ty::Ptr { elem: *elem })),
-            (Ty::Class(_), Ty::Class(_)) => Ok((x, t)),
+            // Casts between objects or pointers of related classes keep
+            // the handle (`static_cast<T*>(p)`, `dynamic_cast<T&>(o)`).
+            (Ty::Class(_) | Ty::Handle(_), Ty::Class(_) | Ty::Handle(_)) => Ok((x, t)),
             _ if kind == sc::CastKind::Reinterpret => {
                 self.err(span, "this reinterpret_cast is not supported")
             }
@@ -1392,6 +1533,35 @@ impl<'a> Lw<'a> {
                 return Ok((type_cast(sv_scalar_type(&t), x), t));
             }
         }
+        // `T(args)`: a temporary object of a user class.
+        if q.last_args().is_none() {
+            let cls = super::classes::class_sv(q.last_name());
+            if self.prog.user_classes.borrow().contains_key(&cls) {
+                let x = self.make_object(&cls, args, span)?;
+                return Ok((x, Ty::Class(cls)));
+            }
+        }
+        // `T::f(args)`: a static member function of a user class.
+        if q.segments.len() >= 2 {
+            let cls = super::classes::class_sv(&q.segments[q.segments.len() - 2].ident.name);
+            let ms = self
+                .prog
+                .user_classes
+                .borrow()
+                .get(&cls)
+                .and_then(|s| s.method(q.last_name(), args.len()).cloned());
+            if let Some(ms) = ms {
+                let xs = self.args(args)?.into_iter().map(|a| a.0).collect();
+                return Ok((call(member(ident(&cls), &ms.sv), xs), ms.sig.ret.clone()));
+            }
+        }
+        // An overloaded member function, by its number of arguments.
+        let overload = format!("{}__{}", name, args.len());
+        let name = if !self.m.funcs.contains_key(name) && self.m.funcs.contains_key(&overload) {
+            overload.as_str()
+        } else {
+            name
+        };
         if let Some(sig) = self.m.funcs.get(name).cloned() {
             let mut lowered = Vec::new();
             for (i, a) in args.iter().enumerate() {
@@ -1842,7 +2012,42 @@ impl<'a> Lw<'a> {
             }),
             Ty::Array(_, n) if m == "size" => Ok((n.clone(), Ty::int32())),
             Ty::Ptr { .. } => self.err(span, "methods on a data pointer are not supported"),
-            Ty::Class(c) => {
+            // `os.str()`: what an output string stream holds.
+            Ty::OStream if m == "str" && a.is_empty() => Ok((b, Ty::Str)),
+            Ty::Class(c) | Ty::Handle(c) if self.user_class(&bt).is_some() => {
+                let sig = self
+                    .prog
+                    .user_classes
+                    .borrow()
+                    .get(c)
+                    .cloned()
+                    .expect("user class");
+                let Some(ms) = sig.method(m, a.len()).cloned() else {
+                    return self.err(
+                        span,
+                        format!(
+                            "'{}' has no member function '{}' taking {} arguments",
+                            sig.cpp,
+                            m,
+                            a.len()
+                        ),
+                    );
+                };
+                let mut xs: Vec<Expression> = a.iter().map(|x| x.0.clone()).collect();
+                if ms.sig.is_task {
+                    self.f.is_task = true;
+                    if !matches!(ms.sig.ret, Ty::Void) {
+                        // A blocking member function returns through an
+                        // output argument.
+                        let t = self.temp(&ms.sig.ret);
+                        xs.push(ident(&t));
+                        self.pre.push(expr_stmt(method(b, &ms.sv, xs)));
+                        return Ok((ident(&t), ms.sig.ret.clone()));
+                    }
+                }
+                Ok((method(b, &ms.sv, xs), ms.sig.ret.clone()))
+            }
+            Ty::Class(c) | Ty::Handle(c) => {
                 let sv_m = if m == "release" { "release_" } else { m };
                 let ret = self.prog.class_method_ret(c, m);
                 let mut xs = Vec::new();
@@ -2090,7 +2295,13 @@ impl<'a> Lw<'a> {
                 let _ = span;
                 let mut out = match v {
                     Some(e) if !matches!(self.f.ret, Some(Ty::Void) | None) => {
-                        let (x, _) = self.expr(e)?;
+                        let (x, t) = self.expr(e)?;
+                        // An object returned by value is a copy of it.
+                        let x = if self.f.ret_copy && matches!(t, Ty::Class(_)) {
+                            method(x, "__sc_copy", vec![])
+                        } else {
+                            x
+                        };
                         match self.f.ret_var.clone() {
                             Some(rv) => vec![assign(ident(&rv), x)],
                             None => {
@@ -2273,6 +2484,74 @@ impl<'a> Lw<'a> {
                 );
                 continue;
             }
+            // A user-class object: allocated where declared and built by
+            // its constructor, a copy, or a temporary (a reference names
+            // the object it is bound to).
+            if let Some(cls) = self.user_class(&ty).filter(|_| matches!(ty, Ty::Class(_))) {
+                let is_ref = d
+                    .ptr_ops
+                    .iter()
+                    .chain(v.ty.ptr_ops.iter())
+                    .any(|o| matches!(o, sc::PtrOp::LRef | sc::PtrOp::RRef));
+                let sv = self.declare_local(&d.name.name, ty.clone(), SymKind::Var, None);
+                let init_args: Vec<sc::Expr> = match &d.init {
+                    Some(sc::Initializer::Paren(a) | sc::Initializer::Brace(a)) => a.clone(),
+                    Some(sc::Initializer::Assign(e)) => vec![e.clone()],
+                    None => Vec::new(),
+                };
+                if is_ref {
+                    if let [e] = init_args.as_slice() {
+                        let (x, _) = self.expr(e)?;
+                        out.push(assign(ident(&sv), x));
+                    }
+                    continue;
+                }
+                // A temporary (`T x = T(1, 2);`) is the object itself.
+                if let [e] = init_args.as_slice()
+                    && let sc::ExprKind::Call { callee, .. } = &e.kind
+                    && callee
+                        .as_name()
+                        .is_some_and(|q| super::classes::class_sv(q.last_name()) == cls)
+                {
+                    let (x, _) = self.expr(e)?;
+                    out.push(assign(ident(&sv), x));
+                    continue;
+                }
+                out.push(assign(ident(&sv), new_obj(None)));
+                out.extend(super::classes::construct_into(
+                    self,
+                    ident(&sv),
+                    &cls,
+                    &init_args,
+                    d.span,
+                )?);
+                continue;
+            }
+            if let Ty::Array(elem, _) = &ty
+                && let Some(cls) = self.user_class(elem)
+                && matches!(**elem, Ty::Class(_))
+            {
+                // An array of objects: each element default-constructed.
+                let sv = self.declare_local(&d.name.name, ty.clone(), SymKind::Var, None);
+                let k = self
+                    .prog
+                    .user_classes
+                    .borrow()
+                    .get(&cls)
+                    .and_then(|s| s.ctor(0));
+                let Some(k) = k else {
+                    return self.err(d.span, "an array of objects needs a default constructor");
+                };
+                out.push(st(StatementKind::Foreach {
+                    array: ident(&sv),
+                    vars: vec![Some(id("__sc_i"))],
+                    body: Box::new(assign(
+                        index(ident(&sv), ident("__sc_i")),
+                        call(member(ident(&cls), &format!("__sc_make{}", k)), Vec::new()),
+                    )),
+                }));
+                continue;
+            }
             let boxed = self.prog.address_taken(&d.name.name, self.tu);
             let kind = match (&ty, boxed) {
                 (Ty::Array(..), true) => SymKind::BoxedArr,
@@ -2354,6 +2633,19 @@ impl<'a> Lw<'a> {
     pub fn expr_stmt(&mut self, e: &sc::Expr) -> R<Vec<Statement>> {
         use sc::ExprKind as K;
         let span = e.span;
+        // `os << …` into a string stream (an `operator<<`'s ostream, an
+        // ostringstream): the text is appended to it.
+        if let K::Binary {
+            op: sc::BinaryOp::Shl,
+            ..
+        } = &e.kind
+            && let Some(sym) = leftmost_shl(e)
+                .as_name()
+                .and_then(|q| self.lookup(q.last_name()))
+            && matches!(sym.ty, Ty::OStream)
+        {
+            return self.stream_out(e, Some(sym.sv.clone()));
+        }
         match &e.kind {
             K::Assign { op, lhs, rhs } => return self.assign_stmt(*op, lhs, rhs, span),
             K::Binary {
@@ -2430,10 +2722,44 @@ impl<'a> Lw<'a> {
         // `x = new T` for a class handle.
         if let K::New { .. } = &rhs.kind {
             let (l, lt) = self.expr(lhs)?;
-            if matches!(lt, Ty::Class(_)) {
+            if self.user_class(&lt).is_some() {
+                let (r, _) = self.expr(rhs)?;
+                return Ok(vec![assign(l, r)]);
+            }
+            if matches!(lt, Ty::Class(_) | Ty::Handle(_)) {
                 return Ok(vec![assign(l, new_obj(None))]);
             }
             return self.err(span, "'new' of this type is not supported");
+        }
+        // An object (not a signal of one): C++ copies into it, or applies
+        // the class's compound operator.
+        let lhs_signal = lhs
+            .as_name()
+            .and_then(|q| self.lookup(q.last_name()))
+            .is_some_and(|s| s.is_signal_like());
+        if !lhs_signal {
+            let saved = self.pre.len();
+            let peek = self.expr(lhs);
+            if let Ok((l, Ty::Class(c))) = peek
+                && self.prog.user_classes.borrow().contains_key(&c)
+            {
+                let (r, _) = self.expr(rhs)?;
+                if op == sc::AssignOp::Assign {
+                    return Ok(vec![expr_stmt(method(l, "__sc_set", vec![r]))]);
+                }
+                let spelling = format!("{}=", super::classes::op_spelling(compound_binop(op)));
+                let m = self
+                    .prog
+                    .user_classes
+                    .borrow()
+                    .get(&c)
+                    .and_then(|s| s.method(&format!("operator{}", spelling), 1).cloned());
+                return match m {
+                    Some(m) => Ok(vec![expr_stmt(method(l, &m.sv, vec![r]))]),
+                    None => self.err(span, format!("this class has no operator{}", spelling)),
+                };
+            }
+            self.pre.truncate(saved);
         }
         let (mut r, _) = if let K::StringLit { .. } = &rhs.kind {
             let (_, lt) = self.expr(lhs)?;
@@ -2557,6 +2883,12 @@ impl<'a> Lw<'a> {
                         (t, _) => t.clone(),
                     };
                     // sc_main drives a resolved net through its own driver.
+                    // sc_main writes an object signal a copy.
+                    let value = if matches!(elem_ty, Ty::Class(_)) && self.user_class(&elem_ty).is_some() {
+                        method(value, "__sc_copy", vec![])
+                    } else {
+                        value
+                    };
                     let (target_sig, value) = match resolved {
                         Some(w) => {
                             elem_ty = Ty::Vec4 {
@@ -2596,6 +2928,28 @@ impl<'a> Lw<'a> {
                 }
                 if let Some(w) = resolved {
                     return Ok(self.resolved_write(&sym.sv, w, value));
+                }
+                // A signal of objects takes a copy, and changes only when
+                // the class's operator== says the value differs (§6.4.4).
+                let elem_ty = match (&sym.ty, &elem) {
+                    (Ty::Array(e, _), Some(_)) => (**e).clone(),
+                    (t, _) => t.clone(),
+                };
+                if let Some(cls) = self.user_class(&elem_ty).filter(|_| matches!(elem_ty, Ty::Class(_))) {
+                    let t = self.temp(&elem_ty);
+                    let cur = target(ident(&sym.sv));
+                    let changed = match super::classes::object_op(self, &cls, "==", cur.clone(), ident(&t)) {
+                        Some((eq, _)) => super::classes::not(eq),
+                        None => sized(1, 1),
+                    };
+                    return Ok(block(vec![
+                        assign(ident(&t), value),
+                        if_(
+                            changed,
+                            nba(cur, method(ident(&t), "__sc_copy", vec![])),
+                            None,
+                        ),
+                    ]));
                 }
                 let w = nba(target(ident(&sym.sv)), value);
                 // §6.4.4 SC_ONE_WRITER: a second process writing the signal is
@@ -2801,7 +3155,13 @@ impl<'a> Lw<'a> {
                 Ok(Some(vec![self.store_sym(&sym, elem, x, span)?]))
             }
             SymKind::Fifo | SymKind::FifoOut if m == "write" => {
-                let (x, _) = self.expr(&args[0])?;
+                let (x, xt) = self.expr(&args[0])?;
+                // A FIFO of objects holds copies.
+                let x = if matches!(xt, Ty::Class(_)) && self.user_class(&xt).is_some() {
+                    method(x, "__sc_copy", vec![])
+                } else {
+                    x
+                };
                 self.f.is_task = true;
                 Ok(Some(vec![expr_stmt(method(
                     ident(&sym.sv),
@@ -3118,6 +3478,12 @@ impl<'a> Lw<'a> {
 
     /// `std::cout << a << b << std::endl;` → `$write(fmt, …)`.
     fn cout(&mut self, e: &sc::Expr) -> R<Vec<Statement>> {
+        self.stream_out(e, None)
+    }
+
+    /// `stream << a << b …`: to standard output, or appended to the string
+    /// `sink`.
+    fn stream_out(&mut self, e: &sc::Expr, sink: Option<String>) -> R<Vec<Statement>> {
         let mut items = Vec::new();
         flatten_shl(e, &mut items);
         let mut fmt = String::new();
@@ -3167,6 +3533,19 @@ impl<'a> Lw<'a> {
                 continue;
             }
             let (x, t) = self.expr(it)?;
+            // An object prints with its class's `operator<<`.
+            if let Ty::Class(c) = &t
+                && let Some(f) = self
+                    .prog
+                    .user_classes
+                    .borrow()
+                    .get(c)
+                    .and_then(|s| s.fmt.clone())
+            {
+                args.push(call_fn(&f, vec![x]));
+                fmt.push_str("%s");
+                continue;
+            }
             let w = width
                 .take()
                 .map(|w| format!("{}{}", if fill_zero { "0" } else { "" }, w));
@@ -3209,7 +3588,8 @@ impl<'a> Lw<'a> {
                         format!("%{}d", pad)
                     }
                 }
-                Ty::Ptr { .. } | Ty::Class(_) => {
+                Ty::OStream => "%s".to_string(),
+                Ty::Ptr { .. } | Ty::Class(_) | Ty::Handle(_) => {
                     return self.err(it.span, "printing this object is not supported");
                 }
                 _ => return self.err(it.span, "printing this value is not supported"),
@@ -3219,7 +3599,10 @@ impl<'a> Lw<'a> {
         }
         let mut a = vec![string(&fmt)];
         a.extend(args);
-        Ok(vec![expr_stmt(sys("$write", a))])
+        Ok(vec![match sink {
+            None => expr_stmt(sys("$write", a)),
+            Some(v) => assign(ident(&v), concat(vec![ident(&v), sys("$sformatf", a)])),
+        }])
     }
 }
 
@@ -3408,6 +3791,18 @@ fn flatten_shl<'e>(e: &'e sc::Expr, out: &mut Vec<&'e sc::Expr>) {
 }
 
 /// Whether a `<<` chain starts at a stream (`std::cout << …`).
+/// The first operand of a `<<` chain (the stream).
+fn leftmost_shl(e: &sc::Expr) -> &sc::Expr {
+    match &e.kind {
+        sc::ExprKind::Binary {
+            op: sc::BinaryOp::Shl,
+            lhs,
+            ..
+        } => leftmost_shl(lhs),
+        _ => e,
+    }
+}
+
 fn stream_base(e: &sc::Expr) -> bool {
     match &e.kind {
         sc::ExprKind::Binary {

@@ -30,6 +30,10 @@ pub struct Program<'a> {
     pub module_names: RefCell<BTreeMap<String, BTreeMap<String, String>>>,
     /// Each module's resolved signals and ports (member → width).
     pub module_resolved: RefCell<BTreeMap<String, BTreeMap<String, u32>>>,
+    /// The user classes lowered to SV classes, by SV name (`sc_c_T`).
+    pub user_classes: RefCell<BTreeMap<String, super::classes::ClassSig>>,
+    /// Names of the user-class member functions that may block (tasks).
+    pub blocking_methods: RefCell<BTreeSet<String>>,
     /// Classes deriving from `sc_foreign_module`: declarations of modules
     /// written in SystemVerilog, by C++ class → SV module name.
     pub foreign: BTreeMap<String, String>,
@@ -54,6 +58,8 @@ impl<'a> Program<'a> {
             module_members: RefCell::new(BTreeMap::new()),
             module_names: RefCell::new(BTreeMap::new()),
             module_resolved: RefCell::new(BTreeMap::new()),
+            user_classes: RefCell::new(BTreeMap::new()),
+            blocking_methods: RefCell::new(BTreeSet::new()),
             foreign: BTreeMap::new(),
             buffer_ports: BTreeSet::new(),
         };
@@ -362,8 +368,14 @@ impl<'a> Program<'a> {
         })
     }
 
-    pub fn class_field_ty(&self, _class: &str, _field: &str) -> Option<Ty> {
-        None
+    /// The type of a user class's member.
+    pub fn class_field_ty(&self, class: &str, field: &str) -> Option<Ty> {
+        self.user_classes
+            .borrow()
+            .get(class)?
+            .fields
+            .get(field)
+            .map(|f| f.ty.clone())
     }
 
     pub fn free_fn_sig(&self, _name: &str) -> Option<Ty> {

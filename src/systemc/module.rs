@@ -521,6 +521,10 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     .unwrap_or(0);
                 params.push(param_decl(sv_scalar_type(&ty), &n.name, int(default)));
             }
+            let inits: Vec<&sc::MemInit> = c.initializers.iter().collect();
+            if let Err(e) = self.construct_members(class, &inits, &mut s) {
+                self.lw.record(e);
+            }
             for mi in &c.initializers {
                 if let Err(e) = self.mem_init(mi, &mut s) {
                     self.lw.record(e);
@@ -530,6 +534,8 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 self.walk(&b.stmts, &mut s);
             }
             self.lw.tu = saved_tu;
+        } else if let Err(e) = self.construct_members(class, &[], &mut s) {
+            self.lw.record(e);
         }
         // Value members never created explicitly are default-constructed.
         for (n, sym) in &iface.members {
@@ -579,6 +585,52 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             funcs,
             None,
         )
+    }
+
+    /// Construct the module's member objects of user classes, in
+    /// declaration order, from the constructor's initializer list or their
+    /// own initializer (C++ builds members before the constructor body).
+    fn construct_members(
+        &mut self,
+        class: &sc::ClassDecl,
+        inits: &[&sc::MemInit],
+        s: &mut Structure,
+    ) -> R<()> {
+        for m in &class.members {
+            let sc::Member::Field(v) = m else { continue };
+            if v.specifiers.is_static {
+                continue;
+            }
+            for d in &v.declarators {
+                let Some(sym) = self.lw.lookup(&d.name.name) else {
+                    continue;
+                };
+                let Ty::Class(cls) = &sym.ty else { continue };
+                if sym.kind != SymKind::Var || self.lw.user_class(&sym.ty).is_none() {
+                    continue;
+                }
+                let args: Vec<sc::Expr> = match inits
+                    .iter()
+                    .find(|mi| mi.name.last_name() == d.name.name)
+                {
+                    Some(mi) => mi.args.clone(),
+                    None => match &d.init {
+                        Some(sc::Initializer::Assign(e)) => vec![e.clone()],
+                        Some(sc::Initializer::Paren(a) | sc::Initializer::Brace(a)) => a.clone(),
+                        None => Vec::new(),
+                    },
+                };
+                let stmts = super::classes::construct_into(
+                    self.lw,
+                    ident(&sym.sv),
+                    cls,
+                    &args,
+                    d.span,
+                )?;
+                s.elab.extend(stmts);
+            }
+        }
+        Ok(())
     }
 
     fn type_template_params(
@@ -665,6 +717,8 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 });
             }
             SymKind::Clock => s.clocks.push((sym.sv.clone(), mi.args.clone(), mi.span)),
+            // Member objects were constructed by construct_members.
+            SymKind::Var if self.lw.user_class(&sym.ty).is_some() => {}
             SymKind::Var | SymKind::Boxed => {
                 if let [a] = mi.args.as_slice() {
                     let (x, _) = self.lw.expr(a)?;
@@ -1517,6 +1571,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             scopes: vec![BTreeMap::new()],
             proc: self.lw.m.fn_proc.get(&name).copied().flatten(),
             shared: matches!(self.lw.m.fn_proc.get(&name), Some(None)),
+            ret_copy: super::classes::returns_copy(f, &sig.ret),
             ret: Some(sig.ret.clone()),
             is_task: sig.is_task,
             ..Default::default()
@@ -1536,6 +1591,17 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 PortDirection::Input
             };
             ports.push(fport(dir, sv_scalar_type(&ty), &pname));
+            // An object passed by value is the callee's own copy.
+            if self.lw.user_class(&ty).is_some()
+                && matches!(ty, Ty::Class(_))
+                && !p
+                    .ty
+                    .ptr_ops
+                    .iter()
+                    .any(|o| matches!(o, sc::PtrOp::LRef | sc::PtrOp::RRef))
+            {
+                prologue.push(assign(ident(&pname), method(ident(&pname), "__sc_copy", vec![])));
+            }
             // A parameter whose address is taken lives in a box; a reference
             // parameter is copied back on every return.
             if self.lw.prog.address_taken(&pname, self.lw.tu) && ty.is_scalar_bits() {
@@ -1602,6 +1668,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         elab_tb: Option<(Vec<Statement>, Vec<Statement>)>,
     ) -> R<ModuleDeclaration> {
         let mut items = vec![import_all("sc_rt"), timeunits_ps()];
+        if !self.lw.prog.user_classes.borrow().is_empty() {
+            items.insert(1, import_all("sc_user"));
+        }
         let mut ports = Vec::new();
         let mut clock_items = Vec::new();
         for (clk, args, span) in &s.clocks {
@@ -1680,6 +1749,16 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     Vec::new(),
                     Some(sized(1, self.clock_init.get(n).copied().unwrap_or(0))),
                 ),
+                // A member object of a user class (constructed at
+                // elaboration); a signal of one holds a default-built value.
+                _ if matches!(sym.ty, Ty::Class(_)) && self.lw.user_class(&sym.ty).is_some() => {
+                    let (dt, dims) = sv_type(&sym.ty);
+                    let init = match sym.kind {
+                        SymKind::Var => new_obj(None),
+                        _ => self.default_object(&sym.ty)?,
+                    };
+                    (dt, dims, Some(init))
+                }
                 _ => {
                     let (dt, dims) = sv_type(&sym.ty);
                     (dt, dims, None)
@@ -1789,8 +1868,18 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             fw_assigns.push(assign(member(ident(sock), "fw"), ident(&obj)));
         }
         items.extend(aliases);
-        // Elaboration code.
+        // Elaboration code: output ports of a user class start with a
+        // default-built value (the bound signal's), as SystemC's.
         let mut elab = elab_decls;
+        for (pname, kind) in port_order {
+            let sym = &syms[pname];
+            if matches!(kind, SymKind::OutPort | SymKind::InOutPort)
+                && matches!(sym.ty, Ty::Class(_))
+                && self.lw.user_class(&sym.ty).is_some()
+            {
+                elab.push(assign(ident(pname), self.default_object(&sym.ty)?));
+            }
+        }
         elab.extend(fw_assigns);
         elab.extend(elab_stmts);
         if !elab.is_empty() && !self.lw.m.tb {
@@ -2239,6 +2328,28 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             },
         ));
         items
+    }
+
+    /// A default-constructed object of a user class (a signal's or port's
+    /// initial value: `sc_signal<T>` default-constructs its `T`).
+    fn default_object(&self, ty: &Ty) -> R<Expression> {
+        let Ty::Class(cls) = ty else {
+            unreachable!("an object type")
+        };
+        let k = self
+            .lw
+            .prog
+            .user_classes
+            .borrow()
+            .get(cls)
+            .and_then(|s| s.ctor(0));
+        match k {
+            Some(k) => Ok(call(member(ident(cls), &format!("__sc_make{}", k)), Vec::new())),
+            None => self.lw.err(
+                ScSpan::default(),
+                format!("'{}' needs a default constructor to be a signal or port value", cls.trim_start_matches("sc_c_")),
+            ),
+        }
     }
 
     fn is_ctor_param(&self, n: &str) -> bool {

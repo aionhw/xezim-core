@@ -54,8 +54,16 @@ pub enum Ty {
     /// `sc_time`, in picoseconds.
     Time,
     Void,
-    /// A class handle: a user class or a runtime class (`scrt_tlm_gp`).
+    /// A C++ object of a class (a user class `sc_c_<name>` or a runtime
+    /// class such as `scrt_tlm_gp`), by value or by reference: an SV class
+    /// handle to the object itself. C++ copies a value on assignment and
+    /// initialization (`__sc_set`, `__sc_copy`); a reference names it.
     Class(String),
+    /// A C++ pointer to an object of the class: a handle, shared.
+    Handle(String),
+    /// A C++ output stream other than `std::cout` (`std::ostream&` in an
+    /// `operator<<`, `std::ostringstream`): the text written so far.
+    OStream,
     /// A C++ data pointer (`scrt_ptr`); `elem` is the pointee size in bytes.
     Ptr {
         elem: u32,
@@ -172,10 +180,10 @@ pub fn sv_scalar_type(ty: &Ty) -> DataType {
         } else {
             RealType::Real
         }),
-        Ty::Str => simple_t(SimpleType::String),
+        Ty::Str | Ty::OStream => simple_t(SimpleType::String),
         Ty::Time => atom_t(IntegerAtomType::LongInt, true),
         Ty::Void => void_t(),
-        Ty::Class(n) => named_t(n, Vec::new()),
+        Ty::Class(n) | Ty::Handle(n) => named_t(n, Vec::new()),
         Ty::Ptr { .. } => named_t("scrt_ptr", Vec::new()),
         Ty::Mailbox(elem) => named_t("mailbox", vec![type_arg(&sv_scalar_type(elem))]),
         Ty::Event => simple_t(SimpleType::Event),
@@ -338,8 +346,8 @@ pub fn ty_of(
 }
 
 /// `base` seen through declarator pointer/reference parts: references are
-/// transparent, a pointer to bytes is a data pointer, a pointer to a class
-/// is its handle, and `const char*` is a string.
+/// transparent, a pointer to bytes is a data pointer, a pointer to an object
+/// is a handle, and `const char*` is a string.
 pub fn apply_ptr(base: Ty, ops: &[sc::PtrOp]) -> Result<Ty, String> {
     let ptrs = ops
         .iter()
@@ -351,7 +359,7 @@ pub fn apply_ptr(base: Ty, ops: &[sc::PtrOp]) -> Result<Ty, String> {
             Ty::Int { bits, .. } => Ty::Ptr { elem: bits / 8 },
             Ty::Bool => Ty::Ptr { elem: 1 },
             Ty::Void => Ty::Ptr { elem: 1 },
-            Ty::Class(c) => Ty::Class(c),
+            Ty::Class(c) => Ty::Handle(c),
             Ty::Vec2 { .. } | Ty::Vec4 { .. } | Ty::Real { .. } | Ty::Time => Ty::Ptr {
                 elem: base.byte_size().unwrap_or(1) as u32,
             },
@@ -426,6 +434,7 @@ pub fn ty_of_name(
         "int64_t" | "int64" | "ssize_t" | "ptrdiff_t" | "intptr_t" => u(64, true),
         "uint64_t" | "uint64" | "size_t" | "uintptr_t" => u(64, false),
         "string" => Ty::Str,
+        "ostringstream" | "stringstream" | "ostream" => Ty::OStream,
         "sc_time" => Ty::Time,
         "sc_event" => Ty::Event,
         "tlm_generic_payload" => Ty::Class("scrt_tlm_gp".to_string()),
