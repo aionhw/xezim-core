@@ -1352,7 +1352,7 @@ pub fn params(
         } else {
             PortDirection::Input
         };
-        ports.push(fport(dir, sv_scalar_type(&ty), &pname));
+        ports.push(fport_dims(dir, sv_type(&ty), &pname));
         if matches!(ty, Ty::Class(_))
             && !p.ty.ptr_ops.iter().any(|o| matches!(o, sc::PtrOp::LRef | sc::PtrOp::RRef))
         {

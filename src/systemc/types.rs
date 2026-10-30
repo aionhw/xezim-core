@@ -534,6 +534,8 @@ pub fn apply_ptr(base: Ty, ops: &[sc::PtrOp]) -> Result<Ty, String> {
             Ty::Bool => Ty::Ptr { elem: 1 },
             Ty::Void => Ty::Ptr { elem: 1 },
             Ty::Class(c) => Ty::Handle(c),
+            // A pointer to a handle type (`sc_process_handle*`) is the handle.
+            Ty::Handle(c) => Ty::Handle(c),
             Ty::Vec2 { .. } | Ty::Vec4 { .. } | Ty::Real { .. } | Ty::Time => Ty::Ptr {
                 elem: base.byte_size().unwrap_or(1) as u32,
             },
@@ -623,6 +625,8 @@ pub fn ty_of_name(
         "sc_event_queue" => Ty::Class("scrt_event_queue".to_string()),
         "sc_spawn_options" => Ty::Class("scrt_spawn_opts".to_string()),
         "sc_report" => Ty::Handle("scrt_report".to_string()),
+        "sc_object" => Ty::Class("scrt_object".to_string()),
+        "sc_status" => Ty::Str,
         "sc_actions" => u(32, false),
         "sc_severity" | "sc_verbosity" => Ty::int32(),
         "sc_process_handle" => Ty::Handle("scrt_proc".to_string()),

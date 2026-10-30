@@ -535,6 +535,18 @@ pub fn fport(dir: PortDirection, dt: DataType, name: &str) -> FunctionPort {
     }
 }
 
+/// A subroutine port of a type with unpacked dimensions (a queue, an array).
+pub fn fport_dims(
+    dir: PortDirection,
+    (dt, dims): (DataType, Vec<UnpackedDimension>),
+    name: &str,
+) -> FunctionPort {
+    FunctionPort {
+        dimensions: dims,
+        ..fport(dir, dt, name)
+    }
+}
+
 pub fn task_decl(name: &str, ports: Vec<FunctionPort>, body: Vec<Statement>) -> TaskDeclaration {
     TaskDeclaration {
         lifetime: Some(Lifetime::Automatic),

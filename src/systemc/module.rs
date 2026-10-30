@@ -661,6 +661,16 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let mut funcs = self.lower_bodies(defs)?;
         funcs.push(self.destructor(class, name)?);
         funcs.extend(self.callback_functions(&s, false));
+        let members: Vec<String> = class
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                sc::Member::Field(v) => Some(v.declarators.iter().map(|d| d.name.name.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        funcs.extend(self.object_registration(&members, false));
         self.finish_module(
             name,
             params,
@@ -938,6 +948,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     dont_init: false,
                     resets: Vec::new(),
                 });
+                self.lw.m.last_proc = Some(s.procs.len() - 1);
                 Ok(())
             }
             S::Sensitive { edge, items, span } => {
@@ -1975,7 +1986,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             } else {
                 PortDirection::Input
             };
-            ports.push(fport(dir, sv_scalar_type(&ty), &pname));
+            ports.push(fport_dims(dir, sv_type(&ty), &pname));
             // An object passed by value is the callee's own copy.
             if self.lw.user_class(&ty).is_some()
                 && matches!(ty, Ty::Class(_))
@@ -2562,6 +2573,18 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let mut funcs = self.lower_bodies(defs)?;
         funcs.extend(self.callback_functions(&s, true));
         self.lw.f = saved;
+        let members: Vec<String> = f
+            .body
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|st| match st {
+                sc::Stmt::Decl(v) => Some(v.declarators.iter().map(|d| d.name.name.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        self.lw.m.proc_names.clear();
+        funcs.extend(self.object_registration(&members, true));
         self.finish_module(
             "sc_main",
             Vec::new(),
@@ -2902,6 +2925,88 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         out
     }
 
+    /// §5.16 the object hierarchy: `__sc_register()` adds the module's child
+    /// objects, members in declaration order and then its processes (as
+    /// the kernel creates them), under the module's name; sc_main's adds
+    /// the top-level objects. A variable initializer calls it, so the tree
+    /// is complete before any process (or sc_main) runs.
+    fn object_registration(&self, members: &[String], tb: bool) -> Vec<ModuleItem> {
+        if !self.lw.prog.uses_hierarchy() {
+            return Vec::new();
+        }
+        let parent = if tb { string("") } else { ident("__sc_path") };
+        let mut body = Vec::new();
+        for n in members {
+            let Some(sym) = self.lw.lookup(n) else { continue };
+            let Some(kind) = self.object_kind(&sym) else { continue };
+            let base = self
+                .lw
+                .m
+                .sc_names
+                .get(n)
+                .or_else(|| self.lw.m.inst_names.get(n))
+                .cloned()
+                .unwrap_or_else(|| n.clone());
+            body.push(expr_stmt(call_fn(
+                "scrt_add_object",
+                vec![parent.clone(), string(&base), string(&kind)],
+            )));
+        }
+        for (f, k) in &self.lw.m.proc_names {
+            let kind = match k {
+                sc::ProcessKind::Method => "sc_method_process",
+                sc::ProcessKind::Thread => "sc_thread_process",
+                sc::ProcessKind::CThread => "sc_cthread_process",
+            };
+            body.push(expr_stmt(call_fn(
+                "scrt_add_object",
+                vec![parent.clone(), string(f), string(kind)],
+            )));
+        }
+        body.push(ret(Some(sized(1, 1))));
+        vec![
+            ModuleItem::FunctionDeclaration(function_decl(
+                "__sc_register",
+                bit_t(1, false),
+                Vec::new(),
+                body,
+            )),
+            data_decl(bit_t(1, false), "__sc_registered", Vec::new(), Some(call_fn("__sc_register", vec![]))),
+        ]
+    }
+
+    /// The `kind()` of a member that is an sc_object.
+    fn object_kind(&self, sym: &Sym) -> Option<String> {
+        let resolved = self.lw.m.resolved.contains_key(&sym.sv);
+        Some(
+            match &sym.kind {
+                SymKind::Signal if self.lw.m.buffers.contains(&sym.sv) => "sc_buffer",
+                SymKind::Signal if resolved => "sc_signal_resolved",
+                SymKind::Signal => "sc_signal",
+                SymKind::InPort => "sc_in",
+                SymKind::OutPort => "sc_out",
+                SymKind::InOutPort => "sc_inout",
+                SymKind::Clock => "sc_clock",
+                SymKind::Fifo => "sc_fifo",
+                SymKind::FifoIn => "sc_fifo_in",
+                SymKind::FifoOut => "sc_fifo_out",
+                SymKind::Instance(_) => "sc_module",
+                SymKind::Port(_) => "sc_port",
+                SymKind::Export(_) => "sc_export",
+                SymKind::InitSocket => "tlm_initiator_socket",
+                SymKind::TargetSocket => "tlm_target_socket",
+                SymKind::Var => match &sym.ty {
+                    Ty::Class(c) if c == "scrt_mutex" => "sc_mutex",
+                    Ty::Class(c) if c == "scrt_semaphore" => "sc_semaphore",
+                    Ty::Class(c) if c == "scrt_event_queue" => "sc_event_queue",
+                    _ => return None,
+                },
+                _ => return None,
+            }
+            .to_string(),
+        )
+    }
+
     /// Whether the module being lowered defines member function `f`.
     fn defines_member_function(&self, f: &str) -> bool {
         let in_class = self.lw.prog.classes.get(&self.lw.m.name).is_some_and(|(_, c, _)| {
@@ -3115,6 +3220,34 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             .map(|s| assign(ident(&edge_flag_name(p.index, s)), sized(1, 0)))
             .collect();
         let mut body = self.start_wait();
+        // §5.6 the process's handle (sc_get_current_process_handle).
+        let handle = self.lw.prog.uses_process_handles().then(|| proc_handle_name(p.index));
+        if let Some(h) = &handle {
+            let kind = match p.kind {
+                sc::ProcessKind::Method => 1,
+                sc::ProcessKind::Thread => 2,
+                sc::ProcessKind::CThread => 3,
+            };
+            let cpp = self
+                .lw
+                .m
+                .proc_names
+                .get(p.index)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| func.to_string());
+            items.push(data_decl(named_t("scrt_proc", Vec::new()), h, Vec::new(), Some(new_obj(None))));
+            body.splice(
+                0..0,
+                [
+                    assign(member(ident(h), "p"), process_self()),
+                    assign(
+                        member(ident(h), "name"),
+                        concat(vec![ident("__sc_path"), string(&format!(".{}", cpp))]),
+                    ),
+                    assign(member(ident(h), "kind"), int(kind)),
+                ],
+            );
+        }
         // Port sensitivities find their channel's event.
         body.extend(p.sens.iter().filter_map(|t| t.setup.clone()));
         if self.lw.m.needs_pid {
@@ -3214,11 +3347,19 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 } else {
                     body.push(call);
                 }
+                if let Some(h) = &handle {
+                    body.push(expr_stmt(method(ident(h), "finish", vec![])));
+                }
             }
         }
         items.push(initial(block(body)));
         items
     }
+}
+
+/// The handle object of a module's process (`scrt_proc`).
+pub fn proc_handle_name(p: usize) -> String {
+    format!("__sc_proc{}", p)
 }
 
 /// The adapter object a channel holds for interface `ifc` (SV class).

@@ -199,6 +199,9 @@ pub struct ModCtx {
     pub ev_mirrors: BTreeMap<String, Vec<Expression>>,
     /// Registered processes: (function name, kind).
     pub proc_names: Vec<(String, sc::ProcessKind)>,
+    /// The process registered last in the constructor being walked (what
+    /// `sc_get_current_process_handle()` returns there).
+    pub last_proc: Option<usize>,
     /// Whether a write site needed the running process's identity at run
     /// time (a function several processes share).
     pub needs_pid: bool,
@@ -984,6 +987,22 @@ impl<'a> Lw<'a> {
             // §5.6 process handles of spawned threads.
             ("scrt_proc", "terminated", 0) => (member(b, "term"), Ty::Bool),
             ("scrt_proc", "terminated_event", 0) => (member(b, "done"), Ty::Event),
+            ("scrt_proc", "kill" | "suspend" | "resume", 0) => {
+                (method(b, &format!("{}_", m), vec![]), Ty::Void)
+            }
+            ("scrt_proc", "name", 0) => (member(b, "name"), Ty::Str),
+            ("scrt_proc", "proc_kind", 0) => (member(b, "kind"), Ty::int32()),
+            ("scrt_object", "name" | "basename" | "kind", 0) => (member(b, m), Ty::Str),
+            ("scrt_object", "get_child_objects", 0) => (
+                member(b, "kids"),
+                Ty::Queue(Box::new(Ty::Handle("scrt_object".to_string()))),
+            ),
+            ("scrt_object", "get_parent_object", 0) => {
+                (member(b, "parent"), Ty::Handle("scrt_object".to_string()))
+            }
+            ("scrt_object", _, _) => {
+                return self.err(span, format!("sc_object::{} is not supported in simulation", m));
+            }
             ("scrt_proc", "valid", 0) => (bin(BinaryOp::Neq, b, ex(ExprKind::Null)), Ty::Bool),
             ("scrt_proc", _, _) => {
                 return self.err(
@@ -1385,6 +1404,9 @@ impl<'a> Lw<'a> {
         }
         match path.as_str() {
             "SC_ZERO_TIME" => return Ok((u64_lit(0), Ty::Time)),
+            "SC_ELABORATION" | "SC_BEFORE_END_OF_ELABORATION" | "SC_END_OF_ELABORATION"
+            | "SC_START_OF_SIMULATION" | "SC_RUNNING" | "SC_PAUSED" | "SC_STOPPED"
+            | "SC_END_OF_SIMULATION" => return Ok((string(&path), Ty::Str)),
             n if kernel_const(n).is_some() => {
                 return Ok((int(kernel_const(n).expect("checked")), Ty::int32()));
             }
@@ -2002,6 +2024,44 @@ impl<'a> Lw<'a> {
                 call_fn("scrt_basename", vec![ident("__sc_path")]),
                 Ty::Str,
             ),
+            // §5.6.5 the running process (in a constructor: the one just
+            // registered).
+            ("sc_get_current_process_handle", 0) => {
+                let h = Ty::Handle("scrt_proc".to_string());
+                if self.m.tb {
+                    (null(), h)
+                } else if let Some(p) = self.f.proc {
+                    (ident(&super::module::proc_handle_name(p)), h)
+                } else if !self.f.shared && let Some(p) = self.m.last_proc {
+                    (ident(&super::module::proc_handle_name(p)), h)
+                } else {
+                    return self.err(
+                        span,
+                        "sc_get_current_process_handle() in a function several processes run is not supported",
+                    );
+                }
+            }
+            // §4.5.8 and §5.16.
+            ("sc_is_running", 0) => (
+                bin(
+                    BinaryOp::LogAnd,
+                    ident("scrt_started"),
+                    unary(UnaryOp::LogNot, ident("scrt_stopped")),
+                ),
+                Ty::Bool,
+            ),
+            ("sc_get_status", 0) => (
+                call_fn("scrt_status_str", vec![call_fn("scrt_status", vec![])]),
+                Ty::Str,
+            ),
+            ("sc_find_object", 1) => (
+                call_fn("scrt_find_object", vec![a[0].0.clone()]),
+                Ty::Handle("scrt_object".to_string()),
+            ),
+            ("sc_get_top_level_objects", 0) => (
+                ident("scrt_tops"),
+                Ty::Queue(Box::new(Ty::Handle("scrt_object".to_string()))),
+            ),
             ("sc_time_stamp", 0) => {
                 if self.m.tb {
                     (ident("scrt_tb_now"), Ty::Time)
@@ -2353,7 +2413,7 @@ impl<'a> Lw<'a> {
         }
         // Library channels lower their own arguments (`notify(5, SC_NS)`).
         if let Ty::Class(c) | Ty::Handle(c) = &bt
-            && (is_lib_class(c) || c == "scrt_proc" || c == "scrt_report")
+            && (is_lib_class(c) || matches!(c.as_str(), "scrt_proc" | "scrt_report" | "scrt_object"))
         {
             let c = c.clone();
             return self.lib_channel_call(b, &c, m, args, span);

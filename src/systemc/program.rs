@@ -55,6 +55,9 @@ pub struct Program<'a> {
     /// The functions `sc_report_handler::set_handler(&f)` installs (§8.3):
     /// a report dispatches to the k-th as handler k.
     pub report_handlers: Vec<String>,
+    /// The names of every function the program calls (member functions by
+    /// their own name): what kernel features the lowering must provide.
+    pub called: BTreeSet<String>,
     /// Namespace-scope variables (and constants that are not integers):
     /// variables of the package `sc_glob`.
     pub globals: Vec<(usize, &'a VarDecl)>,
@@ -63,13 +66,26 @@ pub struct Program<'a> {
 impl<'a> Program<'a> {
     /// Whether some module defines an elaboration or simulation callback
     /// (§4.4: `before_end_of_elaboration`, …).
-    /// The free functions passed to `sc_report_handler::set_handler`.
-    fn scan_report_handlers(&self) -> Vec<String> {
+    /// The free functions passed to `sc_report_handler::set_handler`, and
+    /// the names of all functions called.
+    fn scan_calls(&self) -> (Vec<String>, BTreeSet<String>) {
         let mut out: Vec<String> = Vec::new();
+        let mut called = BTreeSet::new();
         let mut visit = |f: &FunctionDecl| {
             let Some(b) = &f.body else { return };
             for st in &b.stmts {
                 super::module::visit_stmt_exprs(st, &mut |e| {
+                    if let ExprKind::Call { callee, .. } = &e.kind {
+                        match &callee.kind {
+                            ExprKind::Name(q) => {
+                                called.insert(q.last_name().to_string());
+                            }
+                            ExprKind::Member { name, .. } => {
+                                called.insert(name.ident.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
                     if let ExprKind::Call { callee, args } = &e.kind
                         && callee.as_name().is_some_and(|q| q.last_name() == "set_handler")
                         && let [a] = args.as_slice()
@@ -107,7 +123,19 @@ impl<'a> Program<'a> {
                 visit(f);
             }
         }
-        out
+        (out, called)
+    }
+
+    /// Whether some code takes a process handle of a static process.
+    pub fn uses_process_handles(&self) -> bool {
+        self.called.contains("sc_get_current_process_handle")
+    }
+
+    /// Whether some code queries the object hierarchy (§5.16).
+    pub fn uses_hierarchy(&self) -> bool {
+        ["sc_find_object", "sc_get_top_level_objects", "get_child_objects", "get_parent_object"]
+            .iter()
+            .any(|n| self.called.contains(*n))
     }
 
     pub fn has_callbacks(&self) -> bool {
@@ -142,6 +170,7 @@ impl<'a> Program<'a> {
             foreign: BTreeMap::new(),
             buffer_ports: BTreeSet::new(),
             report_handlers: Vec::new(),
+            called: BTreeSet::new(),
             globals: Vec::new(),
         };
         for (tu, r) in results.iter().enumerate() {
@@ -166,7 +195,9 @@ impl<'a> Program<'a> {
             .collect();
         p.foreign.extend(foreign);
         p.scan_buffer_ports();
-        p.report_handlers = p.scan_report_handlers();
+        let (handlers, called) = p.scan_calls();
+        p.report_handlers = handlers;
+        p.called = called;
         p
     }
 

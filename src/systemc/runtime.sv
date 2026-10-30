@@ -393,15 +393,95 @@ package sc_rt;
   endfunction
 
   // ---- process handles (§5.6) -------------------------------------------------
-  // A spawned thread's handle: `finish()` at its end makes it terminated.
+  // A process's handle (static or spawned): `finish()` at its end makes it
+  // terminated. kill/suspend/resume act on the SV process (§5.6.6): one due
+  // to wake while suspended runs when resumed, as SystemC's.
   class scrt_proc;
     event done;
     bit term;
+    process p;
+    string name;
+    int kind;
     function void finish();
+      if (term) return;
       term = 1;
       -> done;
     endfunction
+    function void kill_();
+      process q = p;
+      finish();
+      if (q != null) q.kill();
+    endfunction
+    function void suspend_();
+      if (p != null && !term) p.suspend();
+    endfunction
+    function void resume_();
+      if (p != null && !term) p.resume();
+    endfunction
   endclass
+
+  // ---- kernel status (§4.5.8) ---------------------------------------------
+  function automatic int scrt_status();
+    if (scrt_stopped) return 'h40;
+    if (!scrt_started) return 'h01;
+    if (scrt_paused) return 'h20;
+    return 'h10;
+  endfunction
+
+  function automatic string scrt_status_str(int s);
+    case (s)
+      'h01: return "SC_ELABORATION";
+      'h02: return "SC_BEFORE_END_OF_ELABORATION";
+      'h04: return "SC_END_OF_ELABORATION";
+      'h08: return "SC_START_OF_SIMULATION";
+      'h10: return "SC_RUNNING";
+      'h20: return "SC_PAUSED";
+      'h40: return "SC_STOPPED";
+      'h80: return "SC_END_OF_SIMULATION";
+      default: return $sformatf("%0d", s);
+    endcase
+  endfunction
+
+  // ---- object hierarchy (§5.16) ---------------------------------------------
+  // Every module registers its child objects (ports, channels, modules, then
+  // processes) in creation order, sc_main its top-level ones; the tree links
+  // by name, whatever order the modules register in.
+  class scrt_object;
+    string name;
+    string basename;
+    string kind;
+    scrt_object kids[$];
+    scrt_object parent;
+  endclass
+
+  scrt_object scrt_objects[string];
+  scrt_object scrt_tops[$];
+
+  function automatic scrt_object scrt_object_of(string name);
+    if (!scrt_objects.exists(name)) begin
+      scrt_objects[name] = new;
+      scrt_objects[name].name = name;
+    end
+    return scrt_objects[name];
+  endfunction
+
+  function automatic bit scrt_add_object(string parent, string base, string kind);
+    string name = parent == "" ? base : {parent, ".", base};
+    scrt_object o = scrt_object_of(name);
+    o.basename = base;
+    o.kind = kind;
+    if (parent == "") scrt_tops.push_back(o);
+    else begin
+      o.parent = scrt_object_of(parent);
+      o.parent.kids.push_back(o);
+    end
+    return 1;
+  endfunction
+
+  function automatic scrt_object scrt_find_object(string name);
+    if (scrt_objects.exists(name) && scrt_objects[name].kind != "") return scrt_objects[name];
+    return null;
+  endfunction
 
   // sc_spawn_options: nothing to set that has an effect here.
   class scrt_spawn_opts;
