@@ -48,6 +48,23 @@ pub struct ArrayValue {
 }
 
 impl Value {
+    /// An enumeration value's position.
+    pub fn as_enum(&self) -> Option<i64> {
+        match self {
+            Value::Enum(p) => Some(*p as i64),
+            _ => None,
+        }
+    }
+
+    /// A real (or integer) value as a real.
+    pub fn as_real(&self) -> Option<f64> {
+        match self {
+            Value::Real(r) => Some(*r),
+            Value::Int(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int(v) | Value::Phys(v) => Some(*v),

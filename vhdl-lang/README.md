@@ -62,6 +62,10 @@ files here stay under the MPL-2.0; changes are marked with a comment starting
   clauses, alias declarations and attribute specifications 2008 already
   allows (`ProtectedTypeDeclarativeItem::Other`, `Private`);
   `syntax/type_declaration.rs`.
+- `syntax/names.rs` `parse_type_mark_starting_with_name`: the attributes
+  that denote a subtype besides `'subtype` and `'element` are type marks too:
+  `t'base` and VHDL-2019's `p'designated_subtype` and `a'index[(n)]`
+  (`AttributeDesignator::Ident`, with the dimension as the expression).
 - The matches over the new variants in `ast/display.rs`, `ast/search.rs`,
   `ast/util.rs`, `analysis/*.rs`, `lint/sensitivity_list.rs` and
   `formatting/*.rs` (the formatter writes the new forms as in the source;

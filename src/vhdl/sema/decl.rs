@@ -430,6 +430,9 @@ impl Design {
 
     /// A type mark: a name denoting a type or subtype.
     pub fn type_mark(&mut self, r: RegionId, n: &ast::Name) -> Option<TypeId> {
+        if let ast::NameKind::Attribute(prefix, attr, param) = &n.kind {
+            return self.type_attribute(r, prefix, &attr.name, param.as_deref(), n.span.clone());
+        }
         match self.name_sym(r, n) {
             Some(Sym::Type(t)) => Some(t),
             Some(_) => {
@@ -438,6 +441,82 @@ impl Design {
             }
             None => {
                 self.error(n.span.clone(), format!("unknown type '{}'", name_text(n)));
+                None
+            }
+        }
+    }
+
+    /// A type mark that is an attribute: `x'subtype` (§16.2.2, of an object
+    /// or a type), `t'base`, `a'element`, and VHDL-2019's
+    /// `p'designated_subtype` (an access type's) and `a'index(n)` (the
+    /// index subtype of dimension n, 1 by default).
+    fn type_attribute(
+        &mut self,
+        r: RegionId,
+        prefix: &ast::Name,
+        attr: &str,
+        param: Option<&ast::Expr>,
+        span: ast::Span,
+    ) -> Option<TypeId> {
+        // The prefix: a type or subtype, else an object (its subtype).
+        let n = self.errors.len();
+        let t = match self.name_sym(r, prefix) {
+            Some(Sym::Type(t)) => t,
+            _ => {
+                self.errors.truncate(n);
+                let e = ast::Expr {
+                    kind: ast::ExprKind::Name(prefix.clone()),
+                    span: prefix.span.clone(),
+                };
+                self.expr(r, &e, None)?.ty
+            }
+        };
+        let base = self.base(t);
+        match attr {
+            "subtype" => Some(t),
+            "base" => Some(base),
+            "element" => match self.element_subtype(t) {
+                Some(e) => Some(e),
+                None => {
+                    self.error(span, "'element needs an array type");
+                    None
+                }
+            },
+            "designated_subtype" => match self.types[base].kind {
+                TypeKind::Access(d) => Some(d),
+                _ => {
+                    self.error(span, "'designated_subtype needs an access type");
+                    None
+                }
+            },
+            "index" => {
+                let TypeKind::Array { index, .. } = self.types[base].kind.clone() else {
+                    self.error(span, "'index needs an array type");
+                    return None;
+                };
+                let dim = match param {
+                    None => 1,
+                    Some(p) => {
+                        let h = self.expr(r, p, Some(self.std.integer))?;
+                        match self.eval(&h).and_then(|v| v.as_i64()) {
+                            Some(d) => d,
+                            None => {
+                                self.error(p.span.clone(), "the dimension of 'index must be static");
+                                return None;
+                            }
+                        }
+                    }
+                };
+                match usize::try_from(dim - 1).ok().and_then(|i| index.get(i)) {
+                    Some(t) => Some(*t),
+                    None => {
+                        self.error(span, format!("the array has no dimension {}", dim));
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.error(span, format!("'{} is not a type", attr));
                 None
             }
         }
@@ -1161,6 +1240,33 @@ impl Design {
                 Builtin::EndFile,
             ),
         ];
+        // VHDL-2019 §5.5.2: the state, mode, position and size of a file,
+        // and moving in it (positions in bytes).
+        if self.revision == crate::vhdl::VhdlStd::V2019 && std.file_open_state != 0 {
+            let native = |n: &str| Builtin::Native(format!("file.{}", n));
+            let origin = (
+                "origin",
+                ObjClass::Constant,
+                Mode::In,
+                std.file_origin_kind,
+                Some(lit_expr(Value::Enum(0), std.file_origin_kind, loc.clone())),
+            );
+            let offset = ("offset", ObjClass::Constant, Mode::In, std.integer, None);
+            let size = ("size", ObjClass::Constant, Mode::In, std.integer, None);
+            subs.push(("file_state", vec![f.clone()], Some(std.file_open_state), native("state")));
+            subs.push(("file_mode", vec![f.clone()], Some(std.file_open_kind), native("mode")));
+            subs.push(("file_position", vec![f.clone()], Some(std.natural), native("position")));
+            subs.push(("file_size", vec![f.clone()], Some(std.natural), native("size")));
+            subs.push(("file_canseek", vec![f.clone()], Some(std.boolean), native("canseek")));
+            subs.push(("file_rewind", vec![f.clone()], None, native("rewind")));
+            subs.push((
+                "file_seek",
+                vec![f.clone(), offset, origin.clone()],
+                None,
+                native("seek"),
+            ));
+            subs.push(("file_truncate", vec![f.clone(), size, origin], None, native("truncate")));
+        }
         if self.constrained(elem) {
             subs.push(("read", vec![f, value_out], None, Builtin::Read));
         } else {
@@ -2039,6 +2145,11 @@ impl Design {
         let stmts = self.seq_stmts(body_r, &b.stmts, &stmt_ctx_fn(ret));
         locals.extend(std::mem::replace(&mut self.block_locals, saved_blocks));
         self.subprograms[target].body = Some(Body { locals, stmts });
+        // A std subprogram with a VHDL body (STD.ENV's calendar functions,
+        // libraries/std/env-body.vhdl) runs it rather than a native.
+        if matches!(self.subprograms[target].builtin, Some(Builtin::Native(_))) {
+            self.subprograms[target].builtin = None;
+        }
     }
 
     // ---- architectures -------------------------------------------------------------

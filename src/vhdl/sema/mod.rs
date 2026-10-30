@@ -110,6 +110,9 @@ pub struct StdTypes {
     pub boolean_vector: TypeId,
     pub file_open_kind: TypeId,
     pub file_open_status: TypeId,
+    /// VHDL-2019 FILE_OPEN_STATE and FILE_ORIGIN_KIND (§16.3).
+    pub file_open_state: TypeId,
+    pub file_origin_kind: TypeId,
     pub universal_integer: TypeId,
     pub universal_real: TypeId,
     /// IEEE.STD_LOGIC_1164.STD_ULOGIC, once that package is analysed (the
@@ -934,6 +937,8 @@ impl Design {
         self.std.boolean_vector = ty(self, "boolean_vector");
         self.std.file_open_kind = ty(self, "file_open_kind");
         self.std.file_open_status = ty(self, "file_open_status");
+        self.std.file_open_state = ty(self, "file_open_state");
+        self.std.file_origin_kind = ty(self, "file_origin_kind");
     }
 
     /// Analyse an entity (on demand).

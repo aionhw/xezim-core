@@ -1230,6 +1230,21 @@ impl<'a> Lw<'a> {
                 let a: Vec<String> = args.iter().map(|x| self.ex(x)).collect();
                 format!("vh_tio_justify({}, {}, {})", a[0], a[1], a[2])
             }
+            Some(Builtin::Native(n)) if n.starts_with("env.") => {
+                self.env_func(&n["env.".len()..], args, h)
+            }
+            // VHDL-2019 §5.5.2 file operations.
+            Some(Builtin::Native(n)) if n.starts_with("file.") => {
+                self.files = true;
+                let f = self.ex(&args[0]);
+                match &n["file.".len()..] {
+                    "state" => format!("vh_fstate({})", f),
+                    "mode" => format!("vh_fmodeof({})", f),
+                    "position" => format!("vh_fpos({})", f),
+                    "size" => format!("vh_fsize({})", f),
+                    _ => format!("vh_fcanseek({})", f),
+                }
+            }
             Some(Builtin::Native(n)) => {
                 self.err(&h.loc, format!("'{}' is not supported yet", n));
                 "0".into()
@@ -1255,6 +1270,189 @@ impl<'a> Lw<'a> {
                 format!("{}({})", self.sub_name(s), a.join(", "))
             }
         }
+    }
+
+    /// A STD.ENV function without a VHDL body (VHDL-2019 §16.5): the tool's
+    /// identity, the call's source location, the environment, time, the
+    /// file system (through `$__vh_os`) and the assertion state.
+    fn env_func(&mut self, name: &str, args: &[HExpr], h: &HExpr) -> String {
+        let string = self.ndims(h.ty) == 1;
+        let line = matches!(self.d.types[self.base(h.ty)].kind, TypeKind::Access(_));
+        // A string result, or a LINE (an allocated string; null for "").
+        let text = |lw: &mut Self, v: String| -> String {
+            if line {
+                let k = lw.heap(h.ty, &h.loc);
+                format!("((vh_sv({v}) == \"\") ? 64'sd0 : vh_new_{k}({v}))", v = v, k = k)
+            } else {
+                v
+            }
+        };
+        let arg = |lw: &mut Self, i: usize| -> String {
+            let a = lw.ex_fat(&args[i]);
+            format!("vh_sv({})", a)
+        };
+        let lit = |v: &str| format!("vh_str({})", sv_string(v));
+        match name {
+            "vhdl_version" => lit(match self.d.revision {
+                crate::vhdl::VhdlStd::V2008 => "2008",
+                crate::vhdl::VhdlStd::V2019 => "2019",
+            }),
+            "tool_type" => lit(crate::vhdl::TOOL_TYPE),
+            "tool_vendor" => lit(crate::vhdl::TOOL_VENDOR),
+            "tool_name" => lit(crate::vhdl::TOOL_NAME),
+            "tool_edition" => lit(crate::vhdl::TOOL_EDITION),
+            "tool_version" => lit(crate::vhdl::TOOL_VERSION),
+            "resolution_limit" => "64'sd1".into(),
+            "file_name" | "file_path" | "file_line" => {
+                let path = self.d.files[h.loc.file].path.clone();
+                let p = std::path::Path::new(&path);
+                let v = match name {
+                    "file_name" => p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    "file_path" => {
+                        let dir = match p.parent() {
+                            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                            _ => std::path::PathBuf::from("."),
+                        };
+                        std::fs::canonicalize(&dir)
+                            .unwrap_or(dir)
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                    _ => {
+                        let (_, l, _) = self.file_line(&h.loc);
+                        if !string && !line {
+                            return format!("{}", l);
+                        }
+                        l.to_string()
+                    }
+                };
+                let v = lit(&v);
+                text(self, v)
+            }
+            "getenv" => {
+                let a = arg(self, 0);
+                let v = format!("vh_str($__vh_os(\"getenv\", {}))", a);
+                text(self, v)
+            }
+            "epoch" => "vh_os_real(\"epoch\", \"\")".into(),
+            "xezim_tz_offset" => {
+                let t = self.ex(&args[0]);
+                format!("vh_os_real(\"tzoffset\", $sformatf(\"%0f\", {}))", t)
+            }
+            "dir_itemexists" | "dir_itemisdir" | "dir_itemisfile" => {
+                let a = arg(self, 0);
+                let op = &name["dir_item".len()..];
+                format!("vh_os_int({}, {})", sv_string(op), a)
+            }
+            "dir_workingdir" if args.is_empty() => "vh_str($__vh_os(\"cwd\", \"\"))".into(),
+            "dir_workingdir" => {
+                let a = arg(self, 0);
+                format!("vh_os_status(\"chdir\", {}, \"ok,notfound,notdir,denied,error\")", a)
+            }
+            "dir_createdir" => {
+                let a = arg(self, 0);
+                let parents = args.get(1).map(|p| self.ex(p)).unwrap_or_else(|| "0".into());
+                format!(
+                    "vh_os_status(({}) ? \"mkdirs\" : \"mkdir\", {}, \"ok,exists,denied,error\")",
+                    parents, a
+                )
+            }
+            "dir_deletedir" => {
+                let a = arg(self, 0);
+                let rec = args.get(1).map(|p| self.ex(p)).unwrap_or_else(|| "0".into());
+                format!(
+                    "vh_os_status(({}) ? \"rmdirs\" : \"rmdir\", {}, \"ok,notdir,notempty,denied,error\")",
+                    rec, a
+                )
+            }
+            "dir_deletefile" => {
+                let a = arg(self, 0);
+                format!("vh_os_status(\"rm\", {}, \"ok,notfound,denied,error\")", a)
+            }
+            // Assertion violations: with a level, of that severity; without,
+            // of any (failed: of severity error or failure).
+            "isvhdlassertfailed" if args.is_empty() => "((vh_acnt[2] + vh_acnt[3]) > 0)".into(),
+            "isvhdlassertfailed" => format!("(vh_acnt[{}] > 0)", self.ex(&args[0])),
+            "getvhdlassertcount" if args.is_empty() => {
+                "(vh_acnt[0] + vh_acnt[1] + vh_acnt[2] + vh_acnt[3])".into()
+            }
+            "getvhdlassertcount" => format!("vh_acnt[{}]", self.ex(&args[0])),
+            "getvhdlassertenable" => format!("(!vh_adis[{}])", self.ex(&args[0])),
+            "getvhdlreadseverity" => "vh_rdsev".into(),
+            // No PSL: nothing failed or was covered.
+            "pslassertfailed" | "psliscovered" | "pslisassertcovered" => "0".into(),
+            "getpslcoverassert" => "1".into(),
+            _ => {
+                self.err(&h.loc, format!("'std.env.{}' is not supported yet", name));
+                "0".into()
+            }
+        }
+    }
+
+    /// A STD.ENV procedure without a VHDL body (VHDL-2019 §16.5); `None`
+    /// when it is not supported.
+    fn env_proc(&mut self, name: &str, args: &[HExpr], ind: usize, _loc: &Loc) -> Option<String> {
+        let pad = " ".repeat(ind);
+        let arg = |lw: &mut Self, i: usize| -> String {
+            let a = lw.ex_fat(&args[i]);
+            format!("vh_sv({})", a)
+        };
+        Some(match name {
+            "clearvhdlassert" => format!("{}for (int i = 0; i < 4; i++) vh_acnt[i] = 0;\n", pad),
+            "setvhdlassertenable" if args.len() == 1 => {
+                let e = self.ex(&args[0]);
+                format!("{}for (int i = 0; i < 4; i++) vh_adis[i] = !({});\n", pad, e)
+            }
+            "setvhdlassertenable" => {
+                let (l, e) = (self.ex(&args[0]), self.ex(&args[1]));
+                format!("{}vh_adis[{}] = !({});\n", pad, l, e)
+            }
+            "setvhdlreadseverity" => {
+                let l = self.ex(&args[0]);
+                format!("{}vh_rdsev = {};\n", pad, l)
+            }
+            "setpslcoverassert" | "clearpslstate" => String::new(),
+            "dir_workingdir" => {
+                let a = arg(self, 0);
+                let v = format!("vh_os_status(\"chdir\", {}, \"ok,notfound,notdir,denied,error\")", a);
+                self.assign_to(&args[1], v, ind)
+            }
+            "dir_createdir" => {
+                let a = arg(self, 0);
+                let (parents, st) = if args.len() == 3 {
+                    (self.ex(&args[1]), &args[2])
+                } else {
+                    ("0".to_string(), &args[1])
+                };
+                let v = format!(
+                    "vh_os_status(({}) ? \"mkdirs\" : \"mkdir\", {}, \"ok,exists,denied,error\")",
+                    parents, a
+                );
+                self.assign_to(st, v, ind)
+            }
+            "dir_deletedir" => {
+                let a = arg(self, 0);
+                let (rec, st) = if args.len() == 3 {
+                    (self.ex(&args[1]), &args[2])
+                } else {
+                    ("0".to_string(), &args[1])
+                };
+                let v = format!(
+                    "vh_os_status(({}) ? \"rmdirs\" : \"rmdir\", {}, \"ok,notdir,notempty,denied,error\")",
+                    rec, a
+                );
+                self.assign_to(st, v, ind)
+            }
+            "dir_deletefile" => {
+                let a = arg(self, 0);
+                let v = format!("vh_os_status(\"rm\", {}, \"ok,notfound,denied,error\")", a);
+                self.assign_to(&args[1], v, ind)
+            }
+            _ => return None,
+        })
     }
 
     fn need_sub(&mut self, s: SubId) {
@@ -1587,12 +1785,18 @@ impl<'a> Lw<'a> {
     /// The text of a scalar value: as 'IMAGE (`quote`), or as TO_STRING,
     /// which gives a character literal without its quotes (§5.7).
     fn image(&mut self, x: &HExpr, t: TypeId, quote: bool) -> String {
-        let b = self.base(t);
         let v = if self.ndims(t) == 1 {
             self.ex_fat(x)
         } else {
             self.ex(x)
         };
+        self.image_sv(v, t, quote, &x.loc)
+    }
+
+    /// The image (a `vh_a_u8`) of SV value `v` of type `t` (an array as
+    /// its struct): `'IMAGE` (`quote`) or `TO_STRING`.
+    fn image_sv(&mut self, v: String, t: TypeId, quote: bool, loc: &Loc) -> String {
+        let b = self.base(t);
         match self.d.types[b].kind.clone() {
             TypeKind::Integer | TypeKind::UniversalInteger => {
                 format!("vh_str($sformatf(\"%0d\", {}))", v)
@@ -1622,18 +1826,29 @@ impl<'a> Lw<'a> {
                 }
                 format!("vh_str({}({}))", f, v)
             }
-            TypeKind::Array { elem, .. } => {
+            TypeKind::Array { elem, index } => {
                 // TO_STRING of an array of a character enumeration type
                 // (§5.7): its elements' characters.
                 let eb = self.base(elem);
-                if eb == self.d.std.character {
+                if eb == self.d.std.character && !quote {
                     return v;
                 }
+                let chars = matches!(&self.d.types[eb].kind,
+                    TypeKind::Enum(l) if l.iter().all(|x| x.starts_with('\'')));
+                if index.len() != 1 || !chars {
+                    // VHDL-2019 §16.2.2: the image of a composite value, an
+                    // aggregate of its elements' images.
+                    if index.len() != 1 {
+                        self.err(loc, "'image of a multi-dimensional array is not supported yet");
+                        return "vh_str(\"\")".into();
+                    }
+                    let f = self.composite_image(t, loc);
+                    return format!("{}({})", f, v);
+                }
                 let TypeKind::Enum(lits) = self.d.types[eb].kind.clone() else {
-                    self.err(&x.loc, "TO_STRING of this array type is not supported yet");
-                    return "vh_str(\"\")".into();
+                    unreachable!()
                 };
-                let name = self.arr_name(t, &x.loc);
+                let name = self.arr_name(t, loc);
                 let f = format!("vh_tostr{}", eb);
                 if !self.lits.contains_key(&f) {
                     let mut s = format!(
@@ -1648,13 +1863,257 @@ impl<'a> Lw<'a> {
                     self.lit_items.push_str(&s);
                     self.lits.insert(f.clone(), f.clone());
                 }
+                // 'IMAGE of an array of character literals: a string literal
+                // (VHDL-2019 §16.2.2), quoted.
+                if quote {
+                    format!("vh_str({{\"\\\"\", vh_sv({}({})), \"\\\"\"}})", f, v)
+                } else {
+                    format!("{}({})", f, v)
+                }
+            }
+            TypeKind::Record(_) => {
+                let f = self.composite_image(t, loc);
                 format!("{}({})", f, v)
             }
             _ => {
-                self.err(&x.loc, "'image of this type is not supported yet");
+                self.err(loc, "'image of this type is not supported yet");
                 "vh_str(\"\")".into()
             }
         }
+    }
+
+    /// The SV function giving the value of type `t` a string denotes
+    /// (`'VALUE`, §16.2.2): `f(string s, string file, int line)`, an array
+    /// as its struct; text that is no such value fails as GHDL does.
+    fn value_fn(&mut self, t: TypeId, loc: &Loc) -> String {
+        let f = format!("vh_val{}", t);
+        if self.lits.contains_key(&f) {
+            return f;
+        }
+        self.lits.insert(f.clone(), f.clone());
+        let b = self.base(t);
+        let range = self.d.scalar_range(t);
+        let lo_hi = |r: &Option<StaticRange>| -> Option<(String, String)> {
+            let r = r.as_ref()?;
+            let (a, z) = (r.left.as_i64().or(r.left.as_enum())?, r.right.as_i64().or(r.right.as_enum())?);
+            let (a, z) = if r.dir == Dir::To { (a, z) } else { (z, a) };
+            Some((format!("64'sd{}", a).replace("64'sd-", "-64'sd"), format!("64'sd{}", z).replace("64'sd-", "-64'sd")))
+        };
+        let ret = if self.ndims(t) == 1 {
+            self.fat_repr(t, loc).sv()
+        } else {
+            self.repr(t, loc).sv()
+        };
+        let head = format!(
+            "  function automatic {} {}(string s, string file, int line);\n",
+            ret, f
+        );
+        let body = match self.d.types[b].kind.clone() {
+            TypeKind::Integer | TypeKind::UniversalInteger => match lo_hi(&range) {
+                Some((lo, hi)) => format!(
+                    "    return vh_chk(vh_vint(s, file, line), {}, {}, file, line);\n",
+                    lo, hi
+                ),
+                None => "    return vh_vint(s, file, line);\n".into(),
+            },
+            TypeKind::Real | TypeKind::UniversalReal => match &range {
+                Some(r) => {
+                    let (a, z) = (r.left.as_real().unwrap_or(0.0), r.right.as_real().unwrap_or(0.0));
+                    let (a, z) = if r.dir == Dir::To { (a, z) } else { (z, a) };
+                    format!(
+                        "    return vh_chk_r(vh_vreal(s, file, line), {:?}, {:?}, file, line);\n",
+                        a, z
+                    )
+                }
+                None => "    return vh_vreal(s, file, line);\n".into(),
+            },
+            TypeKind::Enum(lits) => {
+                let mut out = String::from("    string x;\n    int p;\n    x = vh_vtrim(s);\n    p = -1;\n");
+                out.push_str("    if (x.len() == 3 && x.getc(0) == 39 && x.getc(2) == 39) begin\n      case (x.getc(1))\n");
+                for (i, l) in lits.iter().enumerate() {
+                    if let Some(c) = l.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+                        let _ = writeln!(out, "        {}: p = {};", c.as_bytes()[0], i);
+                    }
+                }
+                out.push_str("        default: p = -1;\n      endcase\n    end else begin\n      x = x.tolower();\n");
+                for (i, l) in lits.iter().enumerate() {
+                    if !l.starts_with('\'') {
+                        let _ = writeln!(out, "      if (x == {}) p = {};", sv_string(l), i);
+                    }
+                }
+                out.push_str("    end\n    if (p < 0) begin\n      vh_vbad(file, line);\n      return 0;\n    end\n");
+                match lo_hi(&range) {
+                    Some((lo, hi)) => {
+                        let _ = writeln!(out, "    return vh_chk(p, {}, {}, file, line);", lo, hi);
+                    }
+                    None => out.push_str("    return p;\n"),
+                }
+                out
+            }
+            TypeKind::Physical(units) => {
+                // `<abstract literal> <unit>` or a unit alone.
+                let mut out = String::from(
+                    "    string x, u, n;\n    int k;\n    longint m;\n    real v;\n    x = vh_vtrim(s);\n    k = x.len() - 1;\n    while (k >= 0 && x.getc(k) != 32 && x.getc(k) != 9) k--;\n    u = vh_vtrim(x.substr(k + 1, x.len() - 1));\n    u = u.tolower();\n    n = k < 0 ? \"1\" : x.substr(0, k - 1);\n    m = 0;\n",
+                );
+                for (name, mult) in &units {
+                    let _ = writeln!(out, "    if (u == {}) m = 64'sd{};", sv_string(name), mult);
+                }
+                out.push_str("    if (m == 0) begin\n      vh_vbad(file, line);\n      return 0;\n    end\n");
+                out.push_str("    v = vh_vreal(n, file, line);\n");
+                match lo_hi(&range) {
+                    Some((lo, hi)) => {
+                        let _ = writeln!(
+                            out,
+                            "    return vh_chk(longint'(v * m), {}, {}, file, line);",
+                            lo, hi
+                        );
+                    }
+                    None => out.push_str("    return longint'(v * m);\n"),
+                }
+                out
+            }
+            TypeKind::Record(_) => {
+                let storage = self.field_storage(t);
+                let mut out = format!("    string p[$];\n    {} r;\n", ret);
+                let _ = writeln!(
+                    out,
+                    "    if (!vh_vsplit(s, p) || p.size() != {}) begin\n      vh_vbad(file, line);\n      return r;\n    end",
+                    storage.len()
+                );
+                for (i, st) in storage.iter().enumerate() {
+                    let ef = self.value_fn(*st, loc);
+                    let mut v = format!("{}(p[{}], file, line)", ef, i);
+                    if self.ndims(*st) == 1 {
+                        let fat = self.fat_repr(*st, loc);
+                        let er = self.repr(*st, loc);
+                        v = self.coerce(v, &fat, &er, None, loc);
+                    }
+                    let _ = writeln!(out, "    r.f{} = {};", i, v);
+                }
+                out.push_str("    return r;\n");
+                out
+            }
+            TypeKind::Array { index, elem } if index.len() == 1 => {
+                let er = self.repr(elem, loc);
+                let name = self.arr_name(t, loc);
+                let eb = self.base(elem);
+                let chars = matches!(&self.d.types[eb].kind,
+                    TypeKind::Enum(l) if l.iter().all(|x| x.starts_with('\'')));
+                let ef = self.value_fn(elem, loc);
+                let mut ev = format!("{}(p[i], file, line)", ef);
+                if self.ndims(elem) == 1 {
+                    let fat = self.fat_repr(elem, loc);
+                    ev = self.coerce(ev, &fat, &er, None, loc);
+                }
+                let (left, dn, len) = match self.static_bounds(t) {
+                    Some((l, d, r)) => (
+                        l,
+                        d == Dir::Downto,
+                        Some(if d == Dir::To { r - l + 1 } else { l - r + 1 }.max(0)),
+                    ),
+                    None => {
+                        let ir = self.d.scalar_range(index[0]);
+                        let l = ir
+                            .as_ref()
+                            .and_then(|r| r.left.as_i64().or(r.left.as_enum()))
+                            .unwrap_or(0);
+                        (l, ir.is_some_and(|r| r.dir == Dir::Downto), None)
+                    }
+                };
+                let mut out = format!("    string p[$];\n    string x;\n    {} t[];\n    x = vh_vtrim(s);\n", er.sv());
+                if chars {
+                    // A string literal of the element characters.
+                    out.push_str("    if (x.len() >= 2 && x.getc(0) == 34 && x.getc(x.len() - 1) == 34) begin\n      p.delete();\n      for (int i = 1; i < x.len() - 1; i++) p.push_back({\"'\", string'(byte'(x.getc(i))), \"'\"});\n    end else ");
+                } else {
+                    out.push_str("    ");
+                }
+                let _ = writeln!(
+                    out,
+                    "if (!vh_vsplit(x, p)) begin\n      vh_vbad(file, line);\n      return {}_from(64'sd0, 0, t);\n    end",
+                    name
+                );
+                if let Some(n) = len {
+                    let _ = writeln!(
+                        out,
+                        "    if (p.size() != {}) begin\n      vh_vbad(file, line);\n      return {}_from(64'sd0, 0, t);\n    end",
+                        n, name
+                    );
+                }
+                let _ = write!(
+                    out,
+                    "    t = new[p.size()];\n    foreach (p[i]) t[i] = {};\n    return {}_from({}, {}, t);\n",
+                    ev,
+                    name,
+                    format!("64'sd{}", left).replace("64'sd-", "-64'sd"),
+                    dn as u8
+                );
+                out
+            }
+            _ => {
+                self.err(loc, "'value of this type is not supported yet");
+                "    return 0;\n".into()
+            }
+        };
+        let _ = write!(self.lit_items, "{}{}  endfunction\n", head, body);
+        f
+    }
+
+    /// The SV function giving the image of a value of record or
+    /// one-dimensional array type `t` (VHDL-2019 §16.2.2): `(e1,e2,...)` of
+    /// its elements' images, defined on first use.
+    fn composite_image(&mut self, t: TypeId, loc: &Loc) -> String {
+        let b = self.base(t);
+        let f = format!("vh_cimg{}", b);
+        if self.lits.contains_key(&f) {
+            return f;
+        }
+        self.lits.insert(f.clone(), f.clone());
+        // Each element: its SV value (an array as its struct) and type.
+        let elem_img = |lw: &mut Self, v: String, et: TypeId| {
+            let er = lw.repr(et, loc);
+            let v = if lw.ndims(et) == 1 {
+                let fat = lw.fat_repr(et, loc);
+                let bnd = lw.static_bounds(et).map(|b| lw.bounds_sv(b));
+                lw.coerce(v, &er, &fat, bnd, loc)
+            } else {
+                v
+            };
+            let img = lw.image_sv(v, et, true, loc);
+            format!("vh_sv({})", img)
+        };
+        let body = match self.d.types[b].kind.clone() {
+            TypeKind::Record(_) => {
+                let storage = self.field_storage(t);
+                let mut parts = Vec::new();
+                for (i, st) in storage.iter().enumerate() {
+                    parts.push(elem_img(self, format!("a.f{}", i), *st));
+                }
+                let ty = self.repr(t, loc).sv();
+                format!(
+                    "  function automatic vh_a_u8 {f}({ty} a);\n    return vh_str({{\"(\", {parts}\")\"}});\n  endfunction\n",
+                    f = f,
+                    ty = ty,
+                    parts = parts
+                        .iter()
+                        .map(|p| format!("{}, ", p))
+                        .collect::<Vec<_>>()
+                        .join("\",\", ")
+                )
+            }
+            TypeKind::Array { elem, .. } => {
+                let e = elem_img(self, "a.d[i]".into(), elem);
+                let ty = self.arr_name(t, loc);
+                format!(
+                    "  function automatic vh_a_u8 {f}({ty} a);\n    string s;\n    s = \"(\";\n    foreach (a.d[i]) begin\n      if (i > 0) s = {{s, \",\"}};\n      s = {{s, {e}}};\n    end\n    return vh_str({{s, \")\"}});\n  endfunction\n",
+                    f = f,
+                    ty = ty,
+                    e = e
+                )
+            }
+            _ => return f,
+        };
+        self.lit_items.push_str(&body);
+        f
     }
 
     fn attr(
@@ -1688,9 +2147,21 @@ impl<'a> Lw<'a> {
                     let e = format!("(longint'({}) {} 1)", v, if up { "+" } else { "-" });
                     self.checked_int(e, *t, &h.loc)
                 }
+                // §16.2.2: the value a string denotes (VHDL-2019: also of a
+                // composite type, its aggregate).
                 "value" => {
-                    self.err(&h.loc, "'value is not supported yet");
-                    "0".into()
+                    let x = param.unwrap();
+                    let sv = self.ex_fat(x);
+                    let (f, line, _) = self.file_line(&h.loc);
+                    let func = self.value_fn(h.ty, &h.loc);
+                    let call = format!("{}(vh_sv({}), {}, {})", func, sv, sv_string(&f), line);
+                    if self.ndims(h.ty) == 1 {
+                        let fat = self.fat_repr(h.ty, &h.loc);
+                        let to = self.erepr(h);
+                        self.coerce(call, &fat, &to, None, &h.loc)
+                    } else {
+                        call
+                    }
                 }
                 _ => {
                     self.err(
@@ -2689,6 +3160,23 @@ impl<'a> Lw<'a> {
                 }
                 n if n.starts_with("textio.") => {
                     self.textio_call(&n["textio.".len()..], &info, args, ind, loc)
+                }
+                "file.rewind" | "file.seek" => {
+                    self.files = true;
+                    let f = self.ex(&args[0]);
+                    let (off, origin) = if n == "file.seek" {
+                        (self.ex(&args[1]), self.ex(&args[2]))
+                    } else {
+                        ("0".to_string(), "0".to_string())
+                    };
+                    format!("{}vh_fseekto({}, {}, {});\n", pad, f, off, origin)
+                }
+                n if n.starts_with("env.") && n != "env.get_call_path" => {
+                    if let Some(code) = self.env_proc(&n["env.".len()..], args, ind, loc) {
+                        return code;
+                    }
+                    self.err(loc, format!("'{}' is not supported yet", n.replace("env.", "std.env.")));
+                    String::new()
                 }
                 _ => {
                     self.err(

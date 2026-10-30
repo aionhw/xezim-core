@@ -80,6 +80,30 @@ pub fn parse_type_mark_starting_with_name(
                     span: name_span.end_with(token),
                 });
             }
+            // xezim: the other attributes that denote a subtype, `t'base`
+            // (VHDL-2008 16.2.2), `p'designated_subtype` and `a'index[(n)]`
+            // (VHDL-2019 16.2.2).
+            if let AttributeDesignator::Ident(sym) = &attr.item {
+                let n = sym.item.name().bytes.to_ascii_lowercase();
+                if n == b"base" || n == b"designated_subtype" || n == b"index" {
+                    let mut end = token;
+                    let mut expr = None;
+                    if n == b"index" && ctx.stream.next_kind_is(LeftPar) {
+                        ctx.stream.skip();
+                        expr = Some(Box::new(super::expression::parse_expression(ctx)?));
+                        end = ctx.stream.expect_kind(RightPar)?;
+                    }
+                    return Ok(WithTokenSpan {
+                        item: Name::Attribute(Box::new(AttributeName {
+                            name,
+                            attr,
+                            signature: None,
+                            expr,
+                        })),
+                        span: name_span.end_with(end),
+                    });
+                }
+            }
         }
 
         ctx.stream.set_state(state);

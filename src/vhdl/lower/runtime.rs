@@ -23,9 +23,19 @@ pub const COMMON: &str = r#"
   function automatic bit vh_ieee_file(string f);
     return f.len() > 19 && (f.substr(0, 17) == "../../src/ieee2008" || f.substr(0, 17) == "../../src/synopsys");
   endfunction
+  // STD.ENV's assertion state (VHDL-2019 §16.5): the number of assertion
+  // violations of each severity, which severities are disabled (neither
+  // reported nor counted), and the read severity.
+  int vh_acnt[4];
+  bit vh_adis[4];
+  int vh_rdsev = 3;
   function automatic void vh_report(string file, int line, int col, int sev, string msg, bit is_assert);
     string sv_s;
     if (is_assert && VH_IEEE_ASSERTS != 0 && (VH_IEEE_ASSERTS == 1 || $time == 0) && vh_ieee_file(file)) return;
+    if (is_assert) begin
+      if (vh_adis[sev > 3 ? 3 : sev]) return;
+      vh_acnt[sev > 3 ? 3 : sev]++;
+    end
     case (sev)
       0: sv_s = "note";
       1: sv_s = "warning";
@@ -52,6 +62,174 @@ pub const COMMON: &str = r#"
   function automatic real vh_chk_r(real v, real lo, real hi, string file, int line);
     if (v < lo || v > hi) vh_fatal($sformatf("bound check failure at %s:%0d", file, line));
     return v;
+  endfunction
+  // ---- STD.ENV services of the operating system ($__vh_os, xezim's
+  // xezim_core::vhdl::os_call): results as a real, an integer, or the
+  // position of a status word in a status type's comma-separated words
+  // (the last, its error, when the word is not there).
+  function automatic real vh_os_real(string op, string arg);
+    string s;
+    s = $__vh_os(op, arg);
+    return s.atoreal();
+  endfunction
+  function automatic int vh_os_int(string op, string arg);
+    string s;
+    s = $__vh_os(op, arg);
+    return s.atoi();
+  endfunction
+  function automatic int vh_os_status(string op, string arg, string names);
+    string r;
+    int k, st;
+    r = $__vh_os(op, arg);
+    k = 0;
+    st = 0;
+    for (int i = 0; i <= names.len(); i++) begin
+      if (i == names.len() || names.getc(i) == 44) begin
+        if (names.substr(st, i - 1) == r) return k;
+        k++;
+        st = i + 1;
+      end
+    end
+    return k - 1;
+  endfunction
+  // ---- 'VALUE (§16.2.2): the text of a value, blanks around it ignored.
+  function automatic string vh_vtrim(string s);
+    int i, j;
+    i = 0;
+    j = s.len() - 1;
+    while (i <= j && (s.getc(i) == 32 || s.getc(i) == 9 || s.getc(i) == 160)) i++;
+    while (j >= i && (s.getc(j) == 32 || s.getc(j) == 9 || s.getc(j) == 160)) j--;
+    return i > j ? "" : s.substr(i, j);
+  endfunction
+  // Text that is no value of the type: GHDL's bound check failure.
+  function automatic void vh_vbad(string file, int line);
+    vh_fatal($sformatf("bound check failure at %s:%0d", file, line));
+  endfunction
+  // An integer literal (§15.5): decimal or based, with an exponent.
+  function automatic longint vh_vint(string s0, string file, int line);
+    string s;
+    longint v, base, d, e;
+    int i, n, c;
+    bit neg, any;
+    s = vh_vtrim(s0);
+    n = s.len();
+    i = 0;
+    neg = 0;
+    v = 0;
+    any = 0;
+    base = 10;
+    if (n > 0 && (s.getc(0) == 45 || s.getc(0) == 43)) begin
+      neg = s.getc(0) == 45;
+      i = 1;
+    end
+    for (; i < n; i++) begin
+      c = s.getc(i);
+      if (c == 95) continue;
+      if (c < 48 || c > 57) break;
+      v = v * 10 + (c - 48);
+      any = 1;
+    end
+    if (i < n && (s.getc(i) == 35 || s.getc(i) == 58)) begin
+      base = v;
+      v = 0;
+      any = 0;
+      i++;
+      for (; i < n; i++) begin
+        c = s.getc(i);
+        if (c == 95) continue;
+        if (c == 35 || c == 58) break;
+        if (c >= 48 && c <= 57) d = c - 48;
+        else if (c >= 97 && c <= 122) d = c - 87;
+        else if (c >= 65 && c <= 90) d = c - 55;
+        else d = 99;
+        if (d >= base) begin
+          vh_vbad(file, line);
+          return 0;
+        end
+        v = v * base + d;
+        any = 1;
+      end
+      if (i >= n) begin
+        vh_vbad(file, line);
+        return 0;
+      end
+      i++;
+    end
+    if (i < n && (s.getc(i) == 69 || s.getc(i) == 101)) begin
+      i++;
+      e = 0;
+      if (i < n && s.getc(i) == 43) i++;
+      for (; i < n; i++) begin
+        c = s.getc(i);
+        if (c == 95) continue;
+        if (c < 48 || c > 57) break;
+        e = e * 10 + (c - 48);
+      end
+      repeat (e) v = v * base;
+    end
+    if (!any || i != n) begin
+      vh_vbad(file, line);
+      return 0;
+    end
+    return neg ? -v : v;
+  endfunction
+  // A real (or integer) literal.
+  function automatic real vh_vreal(string s0, string file, int line);
+    string s, t;
+    int c;
+    s = vh_vtrim(s0);
+    t = "";
+    for (int i = 0; i < s.len(); i++) begin
+      c = s.getc(i);
+      if (c == 95) continue;
+      if (!((c >= 48 && c <= 57) || c == 46 || c == 43 || c == 45 || c == 69 || c == 101)) begin
+        vh_vbad(file, line);
+        return 0.0;
+      end
+      t = {t, string'(byte'(c))};
+    end
+    if (t.len() == 0) begin
+      vh_vbad(file, line);
+      return 0.0;
+    end
+    return t.atoreal();
+  endfunction
+  // The element texts of a composite value's aggregate `(a, b, ...)`
+  // (VHDL-2019 §16.2.2); 0 when the text is no aggregate.
+  function automatic int vh_vsplit(string s0, output string parts[$]);
+    string s, cur;
+    int depth, c;
+    bit q;
+    s = vh_vtrim(s0);
+    parts.delete();
+    if (s.len() < 2 || s.getc(0) != 40 || s.getc(s.len() - 1) != 41) return 0;
+    depth = 0;
+    cur = "";
+    q = 0;
+    for (int i = 1; i < s.len() - 1; i++) begin
+      c = s.getc(i);
+      if (q) begin
+        cur = {cur, string'(byte'(c))};
+        if (c == 34) q = 0;
+        continue;
+      end
+      if (c == 34) q = 1;
+      if (c == 39 && i + 2 < s.len() && s.getc(i + 2) == 39) begin
+        cur = {cur, s.substr(i, i + 2)};
+        i += 2;
+        continue;
+      end
+      if (c == 40) depth++;
+      if (c == 41) depth--;
+      if (c == 44 && depth == 0) begin
+        parts.push_back(cur);
+        cur = "";
+        continue;
+      end
+      cur = {cur, string'(byte'(c))};
+    end
+    if (vh_vtrim(cur) != "" || parts.size() > 0) parts.push_back(cur);
+    return 1;
   endfunction
   // Integer arithmetic outside the base type's range.
   function automatic longint vh_ovf(longint v, longint lo, longint hi);

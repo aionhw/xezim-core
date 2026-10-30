@@ -22,6 +22,10 @@ serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1.3"
 zstd = "0.13"
 
+# The local time zone of STD.ENV.LOCALTIME (src/vhdl/mod.rs, localtime_r).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Fixed `Value` layout for native readers (see value.rs); off by default.
 native-layout = []

@@ -19,6 +19,49 @@ use crate::vhdl::sema::hir::*;
 const FILES: &str = r#"
   // ---- files (§5.5.2) ---------------------------------------------------
   byte unsigned vh_fmode[int];
+  // The header length of each open binary file: positions count after it.
+  int vh_fhdr[int];
+  // VHDL-2019 §5.5.2 FILE_STATE, FILE_MODE, FILE_POSITION, FILE_SIZE,
+  // FILE_CANSEEK, FILE_SEEK (origins 0 begin, 1 current, 2 end).
+  function automatic byte unsigned vh_fstate(int f);
+    return f == 0 ? 1 : 0;
+  endfunction
+  function automatic byte unsigned vh_fmodeof(int f);
+    if (f == 0) begin
+      vh_ffail("file_mode called on a non-open file");
+      return 0;
+    end
+    return vh_fmode[f];
+  endfunction
+  function automatic bit vh_fcanseek(int f);
+    return f > 0 || f < -2;
+  endfunction
+  function automatic longint vh_fpos(int f);
+    if (f == 0) vh_ffail("file_position called on a non-open file");
+    if (!vh_fcanseek(f)) return 0;
+    return $ftell(f) - vh_fhdr[f];
+  endfunction
+  function automatic longint vh_fsize(int f);
+    longint p, n;
+    int c;
+    if (f == 0) vh_ffail("file_size called on a non-open file");
+    if (!vh_fcanseek(f)) return 0;
+    p = $ftell(f);
+    c = $fseek(f, 0, 2);
+    n = $ftell(f);
+    c = $fseek(f, p, 0);
+    return n - vh_fhdr[f];
+  endfunction
+  function automatic void vh_fseekto(int f, longint off, byte unsigned origin);
+    int c;
+    if (!vh_fcanseek(f)) begin
+      vh_ffail("file_seek called on a file that cannot seek");
+      return;
+    end
+    if (origin == 0) c = $fseek(f, off + vh_fhdr[f], 0);
+    else if (origin == 1) c = $fseek(f, off, 1);
+    else c = $fseek(f, off, 2);
+  endfunction
   // A failure GHDL reports without its "ghdl:error:" prefix.
   function automatic void vh_ffail(string msg);
     $display("%s", msg);
@@ -58,6 +101,7 @@ const FILES: &str = r#"
     end
     f = fd;
     vh_fmode[fd] = kind;
+    vh_fhdr[fd] = hdr.len();
     return 0;
   endfunction
   function automatic void vh_fopen_chk(inout int f, input string name, input byte unsigned kind, input string hdr);
@@ -74,6 +118,7 @@ const FILES: &str = r#"
   function automatic void vh_fclose(inout int f);
     if (f > 0 || f < -2) $fclose(f);
     if (f != 0) vh_fmode.delete(f);
+    if (f != 0) vh_fhdr.delete(f);
     f = 0;
   endfunction
   // The file must be open for reading (rd) or for writing.

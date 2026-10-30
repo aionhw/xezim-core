@@ -503,7 +503,13 @@ impl Design {
                         .array1d_elem(t)
                         .and_then(|e| self.enum_lits(e))
                         .is_some_and(|l| l.iter().all(|x| x.starts_with('\'')));
-                    if self.is_scalar(t) || chars {
+                    // VHDL-2019 §5.7: also of every record and array type.
+                    let composite = self.revision == crate::vhdl::VhdlStd::V2019
+                        && matches!(
+                            self.types[self.base(t)].kind,
+                            TypeKind::Record(_) | TypeKind::Array { .. }
+                        );
+                    if self.is_scalar(t) || chars || composite {
                         out.push(self.pre_sub(name, &[t], Some(string), Builtin::ToString));
                     }
                 }

@@ -42,6 +42,120 @@ pub const TOOL_NAME: &str = "xezim";
 pub const TOOL_EDITION: &str = "";
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The operating-system services of STD.ENV (VHDL-2019 §16.5), for the
+/// simulator's `$__vh_os(op, arg)`: each result is a string (numbers and
+/// booleans in decimal). Unknown operations give "".
+pub fn os_call(op: &str, arg: &str) -> String {
+    use std::path::Path;
+    let b = |x: bool| (x as u8).to_string();
+    match op {
+        "getenv" => std::env::var(arg).unwrap_or_default(),
+        // Seconds since the epoch, with a fraction.
+        "epoch" => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| format!("{:.6}", d.as_secs_f64()))
+            .unwrap_or_else(|_| "0".into()),
+        // The local time's offset from UTC in seconds at time `arg`.
+        "tzoffset" => tz_offset(arg.trim().parse::<f64>().unwrap_or(0.0) as i64).to_string(),
+        "cwd" => std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "chdir" => {
+            let p = Path::new(arg);
+            if !p.exists() {
+                return "notfound".into();
+            }
+            if !p.is_dir() {
+                return "notdir".into();
+            }
+            io_status(std::env::set_current_dir(p))
+        }
+        "exists" => b(Path::new(arg).exists()),
+        "isdir" => b(Path::new(arg).is_dir()),
+        "isfile" => b(Path::new(arg).is_file()),
+        "canonical" => std::fs::canonicalize(arg)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        // The names in a directory, sorted (with "." and ".."), one per line.
+        "list" => match std::fs::read_dir(arg) {
+            Ok(rd) => {
+                let mut names: Vec<String> = rd
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.push(".".into());
+                names.push("..".into());
+                names.sort();
+                names.join("\n")
+            }
+            Err(_) => String::new(),
+        },
+        // Statuses: "ok", "exists", "notfound", "notdir", "notempty",
+        // "denied", "error" (each STD.ENV status type has some of them).
+        "mkdir" | "mkdirs" => {
+            let p = Path::new(arg);
+            if p.exists() {
+                return "exists".into();
+            }
+            let r = if op == "mkdirs" {
+                std::fs::create_dir_all(p)
+            } else {
+                std::fs::create_dir(p)
+            };
+            io_status(r)
+        }
+        "rmdir" | "rmdirs" => {
+            let p = Path::new(arg);
+            if !p.is_dir() {
+                return "notdir".into();
+            }
+            if op == "rmdir" && std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_some()) {
+                return "notempty".into();
+            }
+            let r = if op == "rmdirs" {
+                std::fs::remove_dir_all(p)
+            } else {
+                std::fs::remove_dir(p)
+            };
+            io_status(r)
+        }
+        "rm" => {
+            let p = Path::new(arg);
+            if !p.is_file() {
+                return "notfound".into();
+            }
+            io_status(std::fs::remove_file(p))
+        }
+        _ => String::new(),
+    }
+}
+
+fn io_status(r: std::io::Result<()>) -> String {
+    match r {
+        Ok(()) => "ok".into(),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => "denied".into(),
+        Err(_) => "error".into(),
+    }
+}
+
+/// The local time zone's offset from UTC in seconds at Unix time `t`
+/// (`localtime_r`'s `tm_gmtoff`; 0 where it is not known).
+fn tz_offset(t: i64) -> i64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: localtime_r writes only the `tm` it is given.
+        unsafe {
+            let tt = t as libc::time_t;
+            let mut tm: libc::tm = std::mem::zeroed();
+            if !libc::localtime_r(&tt, &mut tm).is_null() {
+                return tm.tm_gmtoff as i64;
+            }
+        }
+    }
+    let _ = t;
+    0
+}
+
 /// The VHDL revision a design is analysed as (`--std=08`, `--std=19`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VhdlStd {

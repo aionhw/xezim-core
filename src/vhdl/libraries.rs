@@ -18,6 +18,12 @@ pub static SOURCES: &[LibSource] = &[
         file: "env.vhdl",
         text: include_bytes!("libraries/std/env.vhdl"),
     },
+    // xezim's body of ENV: its calendar functions (the others are native).
+    LibSource {
+        library: "std",
+        file: "env-body.vhdl",
+        text: include_bytes!("libraries/std/env-body.vhdl"),
+    },
     LibSource {
         library: "std",
         file: "standard.vhdl",
