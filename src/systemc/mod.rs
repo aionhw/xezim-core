@@ -32,6 +32,7 @@ mod classes;
 mod lower;
 mod module;
 mod program;
+mod templates;
 mod types;
 
 use std::collections::BTreeMap;
@@ -192,29 +193,52 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
     let (env, enum_consts) = global_env(&prog);
     let mut lw = lower::Lw::new(&prog, env, enum_consts);
     let mut out = Vec::new();
-    // User classes first: modules use them as types.
-    let user = classes::user_classes(&prog);
+    // Templates are instantiated per argument list; every instantiation
+    // is found first (types name them everywhere).
+    lw.env.templates = templates::templates(&lw);
+    for (n, (_, c, tps)) in &prog.classes {
+        if tps.is_empty() && classes::is_plain(c) {
+            lw.env.classes.insert(n.clone());
+        }
+    }
+    templates::discover(&mut lw);
+    // User classes next: modules use them as types.
+    let user = classes::user_classes(&mut lw);
     if let Err(e) = classes::signatures(&mut lw, &user) {
         lw.record(e);
     }
 
     // Module interfaces first (instantiation needs every child's ports).
-    let modules: Vec<(
+    // A module template with a type parameter is one module per
+    // instantiation, its parameters bound.
+    type Bindings = BTreeMap<String, types::TParam>;
+    let mut modules: Vec<(
         String,
         usize,
         &scfront::ast::ClassDecl,
         Vec<scfront::ast::TemplateParam>,
+        Bindings,
     )> = prog
         .classes
         .iter()
-        .filter(|(n, (_, c, _))| c.sc_module || prog.foreign.contains_key(*n))
-        .map(|(n, (tu, c, tp))| (n.clone(), *tu, *c, tp.clone()))
+        .filter(|(n, (_, c, _))| {
+            (c.sc_module || prog.foreign.contains_key(*n)) && !lw.env.templates.contains_key(*n)
+        })
+        .map(|(n, (tu, c, tp))| (n.clone(), *tu, *c, tp.clone(), Bindings::new()))
         .collect();
+    let instances = lw.env.instances.borrow().clone();
+    for (inst, i) in &instances {
+        if let Some((tu, c, _)) = prog.classes.get(&i.template)
+            && c.sc_module
+        {
+            modules.push((inst.clone(), *tu, *c, Vec::new(), templates::bindings(&lw, inst)));
+        }
+    }
     let mut ifaces = BTreeMap::new();
     let no_ifaces = BTreeMap::new();
-    for (name, tu, class, tps) in &modules {
+    for (name, tu, class, tps, binds) in &modules {
         lw.tu = *tu;
-        lw.env.tparams.clear();
+        lw.env.tparams = binds.clone();
         let mut ml = module::ModuleLowering::new(&mut lw, &no_ifaces);
         match ml.iface(class, tps) {
             Ok(i) => {
@@ -237,7 +261,7 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
             Err(e) => lw.record(e),
         }
     }
-    for (name, tu, class, tps) in &modules {
+    for (name, tu, class, tps, binds) in &modules {
         let Some(iface) = ifaces.get(name) else {
             continue;
         };
@@ -246,7 +270,7 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
             continue;
         }
         lw.tu = *tu;
-        lw.env.tparams.clear();
+        lw.env.tparams = binds.clone();
         for tp in tps {
             if let scfront::ast::TemplateParam::Value { name: Some(n), .. } = tp {
                 lw.env

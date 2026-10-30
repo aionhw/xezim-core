@@ -141,29 +141,86 @@ fn library_class(n: &str) -> bool {
     n.starts_with("sc_") || n.starts_with("tlm_") || n.starts_with("peq_")
 }
 
-/// The user classes to lower: classes and structs that are not modules,
-/// foreign modules, templates, or derived from library classes; bases
-/// come before the classes deriving from them.
-pub fn user_classes<'a>(prog: &Program<'a>) -> Vec<(String, usize, &'a sc::ClassDecl)> {
-    let plain = |c: &sc::ClassDecl| -> bool {
-        !c.sc_module
-            && !c.bases.iter().any(|b| library_class(b.name.last_name()))
-    };
-    let mut cands: BTreeMap<String, (usize, &'a sc::ClassDecl)> = BTreeMap::new();
+/// A user class to lower: a plain class, or an instantiation of a class
+/// template.
+#[derive(Debug, Clone)]
+pub struct UserClass<'a> {
+    /// The lowered name: the class's, or the instantiation's
+    /// (`box__int32`); the SV class is `sc_c_<name>`.
+    pub name: String,
+    /// The C++ class (template) as declared.
+    pub cpp: String,
+    pub tu: usize,
+    pub decl: &'a sc::ClassDecl,
+    /// The template parameters' bindings (empty for a plain class).
+    pub bindings: BTreeMap<String, TParam>,
+    /// The base class's lowered name.
+    pub base: Option<String>,
+}
+
+/// Whether a class is plain data or behaviour: not a module, and not
+/// derived from a library class.
+pub fn is_plain(c: &sc::ClassDecl) -> bool {
+    !c.sc_module && !c.bases.iter().any(|b| library_class(b.name.last_name()))
+}
+
+/// The user classes to lower: plain classes and structs (not foreign
+/// modules), and the instantiations of plain class templates; bases come
+/// before the classes deriving from them.
+pub fn user_classes<'a>(lw: &mut Lw<'a>) -> Vec<UserClass<'a>> {
+    let prog = lw.prog;
+    let plain = is_plain;
+    let mut cands: BTreeMap<String, UserClass<'a>> = BTreeMap::new();
     for (n, (tu, c, tps)) in &prog.classes {
         if tps.is_empty() && !prog.foreign.contains_key(n) && plain(c) {
-            cands.insert(n.clone(), (*tu, *c));
+            cands.insert(
+                n.clone(),
+                UserClass {
+                    name: n.clone(),
+                    cpp: n.clone(),
+                    tu: *tu,
+                    decl: c,
+                    bindings: BTreeMap::new(),
+                    base: None,
+                },
+            );
         }
     }
+    let instances = lw.env.instances.borrow().clone();
+    for (inst, i) in instances {
+        if let Some((tu, c, _)) = prog.classes.get(&i.template)
+            && plain(c)
+        {
+            cands.insert(
+                inst.clone(),
+                UserClass {
+                    name: inst.clone(),
+                    cpp: i.template.clone(),
+                    tu: *tu,
+                    decl: c,
+                    bindings: super::templates::bindings(lw, &inst),
+                    base: None,
+                },
+            );
+        }
+    }
+    // Base classes, resolved in each class's own bindings.
+    let saved = std::mem::take(&mut lw.env.tparams);
+    for uc in cands.values_mut() {
+        lw.env.tparams = uc.bindings.clone();
+        uc.base = uc.decl.bases.first().map(|b| {
+            instantiate(&b.name, &lw.env, &|e| lw.const_eval(e))
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| b.name.last_name().to_string())
+        });
+    }
+    lw.env.tparams = saved;
     // Drop classes whose bases are not lowered themselves.
     loop {
         let drop: Vec<String> = cands
             .iter()
-            .filter(|(_, (_, c))| {
-                c.bases
-                    .iter()
-                    .any(|b| !cands.contains_key(b.name.last_name()))
-            })
+            .filter(|(_, uc)| uc.base.as_ref().is_some_and(|b| !cands.contains_key(b)))
             .map(|(n, _)| n.clone())
             .collect();
         if drop.is_empty() {
@@ -177,13 +234,13 @@ pub fn user_classes<'a>(prog: &Program<'a>) -> Vec<(String, usize, &'a sc::Class
     let mut done: BTreeSet<String> = BTreeSet::new();
     while out.len() < cands.len() {
         let before = out.len();
-        for (n, (tu, c)) in &cands {
+        for (n, uc) in &cands {
             if done.contains(n) {
                 continue;
             }
-            if c.bases.iter().all(|b| done.contains(b.name.last_name())) {
+            if uc.base.as_ref().is_none_or(|b| done.contains(b)) {
                 done.insert(n.clone());
-                out.push((n.clone(), *tu, *c));
+                out.push(uc.clone());
             }
         }
         if out.len() == before {
@@ -312,34 +369,40 @@ fn is_ostream(t: &sc::Type) -> bool {
 
 /// Compute every user class's signature (members, methods, constructors,
 /// operators) and record it in the program; the names become types.
-pub fn signatures(lw: &mut Lw, classes: &[(String, usize, &sc::ClassDecl)]) -> R<()> {
-    for (n, _, _) in classes {
-        lw.env.classes.insert(n.clone());
+pub fn signatures(lw: &mut Lw, classes: &[UserClass]) -> R<()> {
+    for uc in classes {
+        lw.env.classes.insert(uc.name.clone());
     }
-    let names: BTreeSet<String> = classes.iter().map(|(n, _, _)| n.clone()).collect();
+    // Free operator functions of the plain classes.
+    let names: BTreeSet<String> = classes
+        .iter()
+        .filter(|uc| uc.bindings.is_empty())
+        .map(|uc| uc.cpp.clone())
+        .collect();
     let blocking = blocking_methods(lw, classes);
     let ops = free_operators(lw.prog, &names);
-    for (name, tu, c) in classes {
-        if let Err(e) = class_signature(lw, name, *tu, c, &blocking, &ops) {
+    let saved = std::mem::take(&mut lw.env.tparams);
+    for uc in classes {
+        lw.env.tparams = uc.bindings.clone();
+        if let Err(e) = class_signature(lw, uc, &blocking, &ops) {
             lw.record(e);
         }
     }
+    lw.env.tparams = saved;
     Ok(())
 }
 
 fn class_signature(
     lw: &mut Lw,
-    name: &String,
-    tu: usize,
-    c: &sc::ClassDecl,
+    uc: &UserClass,
     blocking: &BTreeSet<(String, String)>,
     ops: &[(String, String, usize, &sc::FunctionDecl)],
 ) -> R<()> {
     {
-        let tu = &tu;
+        let (name, tu, c) = (&uc.name, &uc.tu, uc.decl);
         lw.tu = *tu;
         let sv = class_sv(name);
-        let base = c.bases.first().map(|b| b.name.last_name().to_string());
+        let base = uc.base.clone();
         let mut sig = match &base {
             Some(b) => {
                 let inherited = lw
@@ -377,7 +440,7 @@ fn class_signature(
             }
         }
         // Member functions, overloads told apart by arity.
-        let defs = member_defs(lw.prog, name, *tu, c);
+        let defs = member_defs(lw.prog, &uc.cpp, *tu, c);
         let mut by_name: BTreeMap<String, Vec<&sc::FunctionDecl>> = BTreeMap::new();
         for (_, f) in &defs {
             let entry = by_name.entry(f.base_name().to_string()).or_default();
@@ -422,7 +485,7 @@ fn class_signature(
             }
             sig.methods.insert(mname, overloads);
         }
-        let ctors = ctor_defs(lw.prog, name, *tu, c);
+        let ctors = ctor_defs(lw.prog, &uc.cpp, *tu, c);
         sig.ctors = if ctors.is_empty() {
             vec![(0, 0)]
         } else {
@@ -437,7 +500,7 @@ fn class_signature(
                 .collect()
         };
         for (cls, op, _, f) in ops {
-            if cls != name {
+            if !uc.bindings.is_empty() || cls != &uc.cpp {
                 continue;
             }
             let spelling = op.trim_start_matches("operator").trim().to_string();
@@ -520,16 +583,13 @@ fn fn_sig(lw: &Lw, f: &sc::FunctionDecl, blocks: bool) -> R<FnSig> {
 
 /// The member functions that may block (`wait`, a blocking FIFO access, or
 /// a call of one): they become tasks. Calls on other objects count by name.
-fn blocking_methods(
-    lw: &Lw,
-    classes: &[(String, usize, &sc::ClassDecl)],
-) -> BTreeSet<(String, String)> {
+fn blocking_methods(lw: &Lw, classes: &[UserClass]) -> BTreeSet<(String, String)> {
     let mut direct = BTreeSet::new();
     let mut calls: BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<String>)> =
         BTreeMap::new();
-    for (name, tu, c) in classes {
-        for (_, f) in member_defs(lw.prog, name, *tu, c) {
-            let key = (name.clone(), f.base_name().to_string());
+    for uc in classes {
+        for (_, f) in member_defs(lw.prog, &uc.cpp, uc.tu, uc.decl) {
+            let key = (uc.name.clone(), f.base_name().to_string());
             let mut own = BTreeSet::new();
             let mut other = BTreeSet::new();
             let mut blocks = false;
@@ -584,7 +644,7 @@ fn blocking_methods(
 
 /// The package `sc_user` holding the lowered user classes (`None` when the
 /// design has none).
-pub fn package(lw: &mut Lw, classes: &[(String, usize, &sc::ClassDecl)]) -> Option<Description> {
+pub fn package(lw: &mut Lw, classes: &[UserClass]) -> Option<Description> {
     if classes.is_empty() {
         return None;
     }
@@ -597,28 +657,35 @@ pub fn package(lw: &mut Lw, classes: &[(String, usize, &sc::ClassDecl)]) -> Opti
         span: sp(),
     })];
     // Forward declarations: classes refer to each other freely.
-    for (n, _, _) in classes {
+    for uc in classes {
         items.push(PackageItem::Typedef(TypedefDeclaration {
             data_type: void_t(),
-            name: id(&class_sv(n)),
+            name: id(&class_sv(&uc.name)),
             dimensions: Vec::new(),
             span: sp(),
             forward: false,
         }));
     }
     let statics = static_definitions(lw);
-    let names: BTreeSet<String> = classes.iter().map(|(n, _, _)| n.clone()).collect();
-    for (name, tu, c) in classes {
+    let names: BTreeSet<String> = classes
+        .iter()
+        .filter(|uc| uc.bindings.is_empty())
+        .map(|uc| uc.cpp.clone())
+        .collect();
+    let saved = std::mem::take(&mut lw.env.tparams);
+    for uc in classes {
         // A class whose signature failed was reported already.
-        if !lw.prog.user_classes.borrow().contains_key(&class_sv(name)) {
+        if !lw.prog.user_classes.borrow().contains_key(&class_sv(&uc.name)) {
             continue;
         }
-        lw.tu = *tu;
-        match lower_class(lw, name, *tu, c, &statics) {
+        lw.tu = uc.tu;
+        lw.env.tparams = uc.bindings.clone();
+        match lower_class(lw, uc, &statics) {
             Ok(cd) => items.push(PackageItem::Class(cd)),
             Err(e) => lw.record(e),
         }
     }
+    lw.env.tparams = saved;
     for (cls, op, tu, f) in free_operators(lw.prog, &names) {
         lw.tu = tu;
         let r = if op.trim_start_matches("operator").trim() == "<<"
@@ -717,11 +784,10 @@ fn enter_class(lw: &mut Lw, sig: &ClassSig) {
 
 fn lower_class(
     lw: &mut Lw,
-    name: &str,
-    tu: usize,
-    c: &sc::ClassDecl,
+    uc: &UserClass,
     statics: &BTreeMap<(String, String), sc::Expr>,
 ) -> R<crate::ast::decl::ClassDeclaration> {
+    let (name, cpp, tu, c) = (uc.name.as_str(), uc.cpp.as_str(), uc.tu, uc.decl);
     // C++ runs destructors at `delete` and at the end of every object's
     // lifetime; only one that does nothing can be left out.
     let dtors = c
@@ -734,7 +800,7 @@ fn lower_class(
         .chain(
             lw.prog
                 .out_of_class
-                .get(name)
+                .get(cpp)
                 .into_iter()
                 .flatten()
                 .filter(|(_, f)| f.base_name().starts_with('~'))
@@ -761,7 +827,7 @@ fn lower_class(
         let fs = &sig.fields[f];
         let (dt, dims) = sv_type(&fs.ty);
         let init = if fs.is_static {
-            match statics.get(&(name.to_string(), f.clone())) {
+            match statics.get(&(cpp.to_string(), f.clone())) {
                 Some(e) => Some(lw.expr_for(e, &fs.ty)?),
                 None => {
                     // `static const int N = 4;` in the class body.
@@ -795,7 +861,7 @@ fn lower_class(
     }
     items.push(class_function(function_decl("new", void_t(), Vec::new(), alloc), false));
     // Constructors.
-    let ctors = ctor_defs(lw.prog, name, tu, c);
+    let ctors = ctor_defs(lw.prog, cpp, tu, c);
     if ctors.is_empty() {
         items.push(class_function(lower_ctor(lw, &sig, c, 0, None)?, false));
     }
@@ -830,7 +896,7 @@ fn lower_class(
         false,
     ));
     // Member functions.
-    for (t, f) in member_defs(lw.prog, name, tu, c) {
+    for (t, f) in member_defs(lw.prog, cpp, tu, c) {
         if f.body.is_none() {
             // Pure virtual or declared only: a virtual method that does
             // nothing (C++ cannot call it).

@@ -356,9 +356,12 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let kind = ScObjectKind::of(&v.ty);
         let consts = |e: &sc::Expr| self.lw.const_eval(e);
         let q = v.ty.name();
+        // An array of signals or ports (`sc_signal<T> s[N]`) is an array
+        // of their values.
         let payload = |lw: &Lw| -> R<Ty> {
             let q = q.expect("library object has a name");
-            payload_ty(q, &lw.env, &consts).or_else(|m| lw.err(d.span, m))
+            let t = payload_ty(q, &lw.env, &consts).or_else(|m| lw.err(d.span, m))?;
+            lw.with_dims(t, d)
         };
         let (k, ty) = match &kind {
             ScObjectKind::InPort => (SymKind::InPort, payload(self.lw)?),
@@ -414,9 +417,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             }
             ScObjectKind::Other => {
                 if let Some(q) = q {
-                    if self.lw.prog.is_module(q.last_name()) {
+                    if let Some(module) = self.lw.module_of(q) {
                         return Ok(Some(Sym {
-                            kind: SymKind::Instance(q.last_name().to_string()),
+                            kind: SymKind::Instance(module),
                             ty: Ty::Void,
                             sv: name,
                         }));
@@ -2130,10 +2133,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
     /// A declaration in sc_main: channels and module objects are structure.
     fn tb_decl(&mut self, v: &sc::VarDecl, stmt: &sc::Stmt, s: &mut Structure) -> R<()> {
         let kind = ScObjectKind::of(&v.ty);
-        let module =
-            v.ty.name()
-                .map(|q| q.last_name().to_string())
-                .filter(|n| self.lw.prog.is_module(n));
+        let module = v.ty.name().and_then(|q| self.lw.module_of(q));
         match (&kind, module) {
             (
                 ScObjectKind::Signal

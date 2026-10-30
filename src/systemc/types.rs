@@ -191,21 +191,185 @@ pub fn sv_scalar_type(ty: &Ty) -> DataType {
     }
 }
 
-/// What a template parameter of the module being lowered stands for.
+/// What a template parameter of the module or class being lowered stands
+/// for.
 #[derive(Debug, Clone)]
 pub enum TParam {
-    /// A value parameter: its SV parameter name.
+    /// A value parameter of a module kept generic: its SV parameter name.
     Value(String),
+    /// A value parameter of an instantiated template: its value.
+    Const(i64),
+    /// A type parameter of an instantiated template: its type.
+    Type(Ty),
 }
 
-/// Names the type mapping resolves: typedefs, enums, template parameters and
-/// the user's (non-module) classes.
+/// A template argument, resolved.
+#[derive(Debug, Clone)]
+pub enum TArg {
+    Ty(Ty),
+    Val(i64),
+}
+
+/// One instantiation of a class or module template.
+#[derive(Debug, Clone)]
+pub struct Instantiation {
+    pub template: String,
+    pub args: Vec<TArg>,
+}
+
+/// Names the type mapping resolves: typedefs, enums, template parameters,
+/// the user's (non-module) classes and the class and module templates.
 #[derive(Debug, Default, Clone)]
 pub struct TyEnv {
     pub typedefs: BTreeMap<String, sc::Type>,
     pub enums: std::collections::BTreeSet<String>,
     pub classes: std::collections::BTreeSet<String>,
     pub tparams: BTreeMap<String, TParam>,
+    /// Templates instantiated per argument list (those with a type
+    /// parameter, and non-module classes): name → parameters.
+    pub templates: BTreeMap<String, Vec<sc::TemplateParam>>,
+    /// The instantiations found so far, by their (mangled) name.
+    pub instances: std::rc::Rc<std::cell::RefCell<BTreeMap<String, Instantiation>>>,
+}
+
+/// A type in an instantiation's name: `sc_uint<8>` → `sc_uint8`.
+pub fn mangle_ty(t: &Ty) -> String {
+    match t {
+        Ty::Bool => "bool".into(),
+        Ty::Vec2 { w, signed, bv } => format!(
+            "{}{}",
+            if *bv {
+                "sc_bv"
+            } else if *signed {
+                "sc_int"
+            } else {
+                "sc_uint"
+            },
+            w.n.map_or_else(|| "W".to_string(), |n| n.to_string())
+        ),
+        Ty::Vec4 { w } => format!("sc_lv{}", w.n.map_or_else(|| "W".to_string(), |n| n.to_string())),
+        Ty::Int { bits, signed, ch } => match (bits, signed, ch) {
+            (8, _, true) => "char".into(),
+            (_, true, _) => format!("int{}", bits),
+            (_, false, _) => format!("uint{}", bits),
+        },
+        Ty::Real { single: true } => "float".into(),
+        Ty::Real { single: false } => "double".into(),
+        Ty::Str => "string".into(),
+        Ty::Time => "sc_time".into(),
+        Ty::Class(c) | Ty::Handle(c) => c.trim_start_matches("sc_c_").to_string(),
+        Ty::Ptr { elem } => format!("ptr{}", elem),
+        Ty::Queue(e) => format!("vector_{}", mangle_ty(e)),
+        Ty::Array(e, _) => format!("array_{}", mangle_ty(e)),
+        Ty::Mailbox(e) => format!("fifo_{}", mangle_ty(e)),
+        Ty::Event => "event".into(),
+        Ty::OStream => "ostream".into(),
+        Ty::Void => "void".into(),
+    }
+}
+
+/// The name of an instantiation: `dpipe<atom, 4>` → `dpipe__sc_uint121__4`.
+pub fn instance_name(template: &str, args: &[TArg]) -> String {
+    let mut n = template.to_string();
+    for a in args {
+        n.push_str("__");
+        match a {
+            TArg::Ty(t) => n.push_str(&mangle_ty(t)),
+            TArg::Val(v) if *v < 0 => n.push_str(&format!("m{}", -v)),
+            TArg::Val(v) => n.push_str(&v.to_string()),
+        }
+    }
+    n
+}
+
+/// Resolve the arguments of `q` for a template with `params` (defaults
+/// filling the missing ones).
+pub fn template_args(
+    q: &sc::QualifiedName,
+    params: &[sc::TemplateParam],
+    env: &TyEnv,
+    consts: &dyn Fn(&sc::Expr) -> Option<i64>,
+) -> Result<Vec<TArg>, String> {
+    let given = q.last_args().unwrap_or(&[]);
+    let mut out = Vec::new();
+    for (i, p) in params.iter().enumerate() {
+        let arg = given.get(i);
+        match p {
+            sc::TemplateParam::Type { default, .. } => {
+                let t = match arg {
+                    Some(TemplateArg::Type(t)) => ty_of(t, env, consts)?,
+                    Some(TemplateArg::Expr(e)) => match &e.kind {
+                        sc::ExprKind::Name(n) => ty_of_name(n, env, consts)?,
+                        _ => return Err(format!("'{}' needs a type argument", q.last_name())),
+                    },
+                    None => match default {
+                        Some(d) => ty_of(d, env, consts)?,
+                        None => return Err(format!("too few template arguments for '{}'", q.last_name())),
+                    },
+                };
+                out.push(TArg::Ty(t));
+            }
+            sc::TemplateParam::Value { default, .. } => {
+                let v = match arg {
+                    Some(TemplateArg::Expr(e)) => const_arg(e, env, consts),
+                    Some(TemplateArg::Type(t)) => t.name().and_then(|n| match env.tparams.get(n.last_name()) {
+                        Some(TParam::Const(v)) => Some(*v),
+                        _ => None,
+                    }),
+                    None => default.as_ref().and_then(|d| const_arg(d, env, consts)),
+                };
+                match v {
+                    Some(v) => out.push(TArg::Val(v)),
+                    None => return Err(format!("a template argument of '{}' is not a constant", q.last_name())),
+                }
+            }
+        }
+    }
+    if given.len() > params.len() {
+        return Err(format!("too many template arguments for '{}'", q.last_name()));
+    }
+    Ok(out)
+}
+
+/// A constant template argument: a literal, a constant, or a value
+/// parameter of the template being instantiated.
+fn const_arg(e: &sc::Expr, env: &TyEnv, consts: &dyn Fn(&sc::Expr) -> Option<i64>) -> Option<i64> {
+    consts(e).or_else(|| match &e.kind {
+        sc::ExprKind::Name(q) if q.segments.len() == 1 => match env.tparams.get(q.last_name()) {
+            Some(TParam::Const(v)) => Some(*v),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// The instantiation `q` names, if `q` is a template with arguments (or a
+/// template's own name inside it): registered, and its name returned.
+pub fn instantiate(
+    q: &sc::QualifiedName,
+    env: &TyEnv,
+    consts: &dyn Fn(&sc::Expr) -> Option<i64>,
+) -> Result<Option<String>, String> {
+    let name = q.last_name();
+    let Some(params) = env.templates.get(name) else {
+        return Ok(None);
+    };
+    if q.last_args().is_none() && !params.iter().all(|p| match p {
+        sc::TemplateParam::Type { default, .. } => default.is_some(),
+        sc::TemplateParam::Value { default, .. } => default.is_some(),
+    }) {
+        return Ok(None);
+    }
+    let args = template_args(q, params, env, consts)?;
+    let n = instance_name(name, &args);
+    env.instances
+        .borrow_mut()
+        .entry(n.clone())
+        .or_insert_with(|| Instantiation {
+            template: name.to_string(),
+            args,
+        });
+    Ok(Some(n))
 }
 
 /// Library namespaces a qualified name may carry; they are dropped.
@@ -229,24 +393,33 @@ fn width_arg(
             }
             if let sc::ExprKind::Name(q) = &e.kind
                 && q.segments.len() == 1
-                && let Some(TParam::Value(sv)) = env.tparams.get(q.last_name())
             {
-                return Ok(Width {
-                    n: None,
-                    expr: ident(sv),
-                });
+                match env.tparams.get(q.last_name()) {
+                    Some(TParam::Value(sv)) => {
+                        return Ok(Width {
+                            n: None,
+                            expr: ident(sv),
+                        });
+                    }
+                    Some(TParam::Const(v)) => return Ok(Width::known(*v as u32)),
+                    _ => {}
+                }
             }
             Err("width is not a constant".to_string())
         }
         TemplateArg::Type(t) => {
             // A bare name parsed as a type: a template value parameter.
-            if let Some(q) = t.name()
-                && let Some(TParam::Value(sv)) = env.tparams.get(q.last_name())
-            {
-                return Ok(Width {
-                    n: None,
-                    expr: ident(sv),
-                });
+            if let Some(q) = t.name() {
+                match env.tparams.get(q.last_name()) {
+                    Some(TParam::Value(sv)) => {
+                        return Ok(Width {
+                            n: None,
+                            expr: ident(sv),
+                        });
+                    }
+                    Some(TParam::Const(v)) => return Ok(Width::known(*v as u32)),
+                    _ => {}
+                }
             }
             Err("width is not a constant".to_string())
         }
@@ -378,8 +551,14 @@ pub fn ty_of_name(
     if q.segments.len() == 1
         && let Some(tp) = env.tparams.get(name)
     {
-        let TParam::Value(_) = tp;
-        return Err(format!("'{}' is a value, not a type", name));
+        return match tp {
+            TParam::Type(t) => Ok(t.clone()),
+            TParam::Value(_) | TParam::Const(_) => Err(format!("'{}' is a value, not a type", name)),
+        };
+    }
+    // A class template's instantiation.
+    if let Some(inst) = instantiate(q, env, consts)? {
+        return Ok(Ty::Class(format!("sc_c_{}", inst)));
     }
     if let Some(t) = env.typedefs.get(name) {
         return ty_of(t, env, consts);

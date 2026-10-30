@@ -450,7 +450,12 @@ impl<'a> Lw<'a> {
     pub fn decl_ty(&self, base: &sc::Type, d: &sc::Declarator) -> R<Ty> {
         let mut t = base.clone();
         t.ptr_ops.extend(d.ptr_ops.iter().copied());
-        let mut ty = self.ty(&t, d.span)?;
+        let ty = self.ty(&t, d.span)?;
+        self.with_dims(ty, d)
+    }
+
+    /// `ty` as the type of declarator `d`, with its array dimensions.
+    pub fn with_dims(&self, mut ty: Ty, d: &sc::Declarator) -> R<Ty> {
         for dim in d.array_dims.iter().rev() {
             let n = match dim {
                 Some(e) => self.const_eval(e).map(int).or_else(|| self.tparam_value(e)),
@@ -468,6 +473,8 @@ impl<'a> Lw<'a> {
         let q = e.as_name()?;
         match self.env.tparams.get(q.last_name())? {
             TParam::Value(sv) => Some(ident(sv)),
+            TParam::Const(v) => Some(int(*v)),
+            TParam::Type(_) => None,
         }
     }
 
@@ -537,6 +544,9 @@ impl<'a> Lw<'a> {
                         return Some(v);
                     }
                     if let Some(v) = self.prog.global_consts.get(q.last_name()) {
+                        return Some(*v);
+                    }
+                    if let Some(TParam::Const(v)) = self.env.tparams.get(q.last_name()) {
                         return Some(*v);
                     }
                 }
@@ -750,6 +760,19 @@ impl<'a> Lw<'a> {
             cur = classes.get(&c).and_then(|s| s.base.clone());
         }
         false
+    }
+
+    /// The module a type names: its class, or for a module template with
+    /// a type parameter, the instantiation.
+    pub fn module_of(&self, q: &sc::QualifiedName) -> Option<String> {
+        let n = q.last_name();
+        if !self.prog.is_module(n) {
+            return None;
+        }
+        if self.env.templates.contains_key(n) {
+            return instantiate(q, &self.env, &|e| self.const_eval(e)).ok().flatten();
+        }
+        Some(n.to_string())
     }
 
     /// The user class (SV name) of an object or pointer type.
@@ -1085,8 +1108,10 @@ impl<'a> Lw<'a> {
         if let Some(v) = self.prog.global_consts.get(last) {
             return Ok((int(*v), Ty::int32()));
         }
-        if let Some(TParam::Value(sv)) = self.env.tparams.get(last) {
-            return Ok((ident(sv), Ty::int32()));
+        match self.env.tparams.get(last) {
+            Some(TParam::Value(sv)) => return Ok((ident(sv), Ty::int32())),
+            Some(TParam::Const(v)) => return Ok((int(*v), Ty::int32())),
+            _ => {}
         }
         self.err(span, format!("unknown name '{}'", path))
     }
@@ -1515,6 +1540,16 @@ impl<'a> Lw<'a> {
     ) -> R<(Expression, Ty)> {
         let path = short_path(q);
         let name = path.as_str();
+        // `T(args)` / `box<int>(args)`: a temporary object of a user class.
+        {
+            let consts = |e: &sc::Expr| self.const_eval(e);
+            if let Ok(t @ Ty::Class(_)) = ty_of_name(q, &self.env, &consts)
+                && let Some(cls) = self.user_class(&t)
+            {
+                let x = self.make_object(&cls, args, span)?;
+                return Ok((x, Ty::Class(cls)));
+            }
+        }
         // Template-id constructors: `sc_uint<8>(x)`.
         if q.last_args().is_some() || matches!(name, "sc_time" | "int" | "unsigned") {
             if name == "sc_time" {
@@ -1531,14 +1566,6 @@ impl<'a> Lw<'a> {
                 };
                 let (x, _) = self.expr(a)?;
                 return Ok((type_cast(sv_scalar_type(&t), x), t));
-            }
-        }
-        // `T(args)`: a temporary object of a user class.
-        if q.last_args().is_none() {
-            let cls = super::classes::class_sv(q.last_name());
-            if self.prog.user_classes.borrow().contains_key(&cls) {
-                let x = self.make_object(&cls, args, span)?;
-                return Ok((x, Ty::Class(cls)));
             }
         }
         // `T::f(args)`: a static member function of a user class.
