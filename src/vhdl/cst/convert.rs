@@ -896,6 +896,10 @@ impl<'a> Converter<'a> {
                 }
             }
             v::TypeDefinition::ProtectedBody(b) => TypeDef::ProtectedBody(self.decls(&b.decl)),
+            v::TypeDefinition::ProtectedInstance(n, gm) => TypeDef::ProtectedInst {
+                base: self.name(n)?,
+                generic_map: self.map_aspect(gm.as_ref()),
+            },
             v::TypeDefinition::Incomplete(_) | v::TypeDefinition::Subtype(_) => {
                 self.err(span, "VHDL: internal: unexpected type definition");
                 return None;

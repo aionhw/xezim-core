@@ -808,6 +808,10 @@ impl Search for TypeDeclaration {
             TypeDefinition::ProtectedBody(ref body) => {
                 return_if_found!(body.decl.search(ctx, searcher));
             }
+            // xezim
+            TypeDefinition::ProtectedInstance(ref name, _) => {
+                return_if_found!(name.search(ctx, searcher));
+            }
             TypeDefinition::Protected(ref prot_decl) => {
                 for item in prot_decl.items.iter() {
                     match item {

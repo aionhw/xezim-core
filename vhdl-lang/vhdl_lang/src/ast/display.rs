@@ -752,6 +752,8 @@ impl Display for TypeDefinition {
                 // Not used: type_reference, decl
                 write!(f, " is protected body")
             }
+            // xezim
+            TypeDefinition::ProtectedInstance(ref name, _) => write!(f, " is new {name}"),
             TypeDefinition::Subtype(ref subtype_indication) => {
                 write!(f, " is {subtype_indication};")
             }

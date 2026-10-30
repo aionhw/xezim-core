@@ -119,6 +119,15 @@ pub fn os_call(op: &str, arg: &str) -> String {
             };
             io_status(r)
         }
+        // `<path>\n<length>`: the file cut (or extended) to length bytes.
+        "truncate" => {
+            let (path, len) = arg.split_once('\n').unwrap_or((arg, "0"));
+            let len: u64 = len.trim().parse().unwrap_or(0);
+            match std::fs::OpenOptions::new().write(true).open(path) {
+                Ok(f) => io_status(f.set_len(len)),
+                Err(e) => io_status(Err(e)),
+            }
+        }
         "rm" => {
             let p = Path::new(arg);
             if !p.is_file() {

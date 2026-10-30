@@ -231,6 +231,10 @@ impl VHDLFormatter<'_> {
             Incomplete(_) => {
                 // nothing to do
             }
+            // xezim: written as in the source (after `is`).
+            ProtectedInstance(..) => {
+                self.format_token_span(TokenSpan::new(span.start_token, span.end_token - 1), buffer);
+            }
             File(name) => {
                 // file of
                 self.format_token_span(

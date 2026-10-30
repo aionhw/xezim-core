@@ -441,6 +441,8 @@ impl<'a> AnalyzeContext<'a, '_> {
             TypeDefinition::Incomplete(..) => {
                 unreachable!("Handled elsewhere");
             }
+            // xezim: not analysed (xezim uses the parser only).
+            TypeDefinition::ProtectedInstance(..) => {}
 
             TypeDefinition::Numeric(ref mut range) => {
                 self.range_unknown_typ(scope, range, diagnostics)?;

@@ -288,21 +288,15 @@ fn missing_generic_actual() {
     );
 }
 
-/// VHDL-2019 forms the analysis does not handle yet are located errors,
-/// never silently dropped: generics of protected types (§5.6.2; nvc 1.23 has
-/// none to compare with). The parser accepts them
-/// (vhdl-lang/vhdl_lang/src/syntax/xezim_tests.rs).
+/// VHDL-2019 §5.6.2, §5.6.4 generic protected types: instances analyse
+/// with their generics bound (previously a "not supported yet" error, the
+/// last of the VHDL-2019 forms the parser accepted that the analysis did
+/// not handle; xezim tests/vhdl/designs19/protgen19 runs one).
 #[test]
-fn vhdl2019_forms_not_supported_yet() {
-    let src = "entity e is end entity;\narchitecture a of e is\n  type pt is protected\n    generic (n : natural);\n    procedure put(x : integer);\n  end protected;\nbegin\nend architecture;\n";
+fn vhdl2019_generic_protected_types() {
+    let src = "package p is\n  type pt is protected\n    generic (n : natural);\n    impure function get return natural;\n  end protected;\n  type p3 is new pt generic map (n => 3);\nend package;\npackage body p is\n  type pt is protected body\n    impure function get return natural is\n    begin\n      return n;\n    end function;\n  end protected body;\nend package body;\nuse work.p.all;\nentity e is end entity;\narchitecture a of e is\n  shared variable v : p3;\nbegin\nend architecture;\n";
     let errs = vhdl::check_design_std(&[("work", "t19.vhd", src.as_bytes())], vhdl::VhdlStd::V2019);
-    assert!(
-        errs.iter().any(|e| e.starts_with("t19.vhd:3:8:")
-            && e.contains("generics of protected types")
-            && e.contains("not supported yet")),
-        "{}",
-        errs.join("\n")
-    );
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
 }
 
 /// The VHDL-2019 forms are syntax errors in VHDL-2008.

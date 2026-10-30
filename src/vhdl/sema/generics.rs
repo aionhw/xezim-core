@@ -46,6 +46,22 @@ pub struct GenericSub {
     pub pending: Vec<(ast::Ident, RegionId, String)>,
 }
 
+/// A generic protected type (VHDL-2019 §5.6.2): its declaration, where it
+/// was declared, and its body once seen; instances made before the body
+/// (their type and generics region) get theirs with it.
+#[derive(Clone, Debug)]
+pub struct GenericProt {
+    pub name: String,
+    pub region: RegionId,
+    pub generics: Vec<ast::InterfaceDecl>,
+    pub decls: Vec<ast::Decl>,
+    pub lib: String,
+    pub file: FileId,
+    /// The body: the region it is in (a package body's), its declarations.
+    pub body: Option<(RegionId, Vec<ast::Decl>)>,
+    pub pending: Vec<(TypeId, RegionId, String)>,
+}
+
 /// Where the actuals of a generic map are analysed.
 #[derive(Clone)]
 pub struct ActualCtx {

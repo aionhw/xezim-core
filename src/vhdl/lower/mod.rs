@@ -1398,7 +1398,7 @@ impl<'a> Lw<'a> {
 
     /// A STD.ENV procedure without a VHDL body (VHDL-2019 §16.5); `None`
     /// when it is not supported.
-    fn env_proc(&mut self, name: &str, args: &[HExpr], ind: usize, _loc: &Loc) -> Option<String> {
+    fn env_proc(&mut self, name: &str, args: &[HExpr], ind: usize, loc: &Loc) -> Option<String> {
         let pad = " ".repeat(ind);
         let arg = |lw: &mut Self, i: usize| -> String {
             let a = lw.ex_fat(&args[i]);
@@ -1419,6 +1419,16 @@ impl<'a> Lw<'a> {
                 format!("{}vh_rdsev = {};\n", pad, l)
             }
             "setpslcoverassert" | "clearpslstate" => String::new(),
+            // DIR_OPEN(Dir, Path, Status): the directory's canonical name and
+            // its items (sorted, with "." and ".."). DIR_CLOSE leaves Dir.
+            "dir_open" => {
+                let f = self.dir_open_fn(args[0].ty, loc);
+                let a = arg(self, 1);
+                let d = self.ex(&args[0]);
+                let v = format!("{}({}, {})", f, a, d);
+                self.assign_to(&args[2], v, ind)
+            }
+            "dir_close" => String::new(),
             "dir_workingdir" => {
                 let a = arg(self, 0);
                 let v = format!("vh_os_status(\"chdir\", {}, \"ok,notfound,notdir,denied,error\")", a);
@@ -1457,6 +1467,42 @@ impl<'a> Lw<'a> {
             }
             _ => return None,
         })
+    }
+
+    /// The SV function of DIR_OPEN for record type `t` (DIRECTORY): fills
+    /// it and returns the DIR_OPEN_STATUS position.
+    fn dir_open_fn(&mut self, t: TypeId, loc: &Loc) -> String {
+        let f = "vh_diropen".to_string();
+        if self.lits.contains_key(&f) {
+            return f;
+        }
+        self.lits.insert(f.clone(), f.clone());
+        let storage = self.field_storage(t);
+        let (Some(line_t), Some(items_t)) = (storage.first().copied(), storage.get(1).copied()) else {
+            self.err(loc, "DIR_OPEN of this type is not supported");
+            return f;
+        };
+        let k0 = self.heap(line_t, loc);
+        let k1 = self.heap(items_t, loc);
+        let lv = self.d.designated(items_t).unwrap_or(items_t);
+        let arr = self.arr_name(lv, loc);
+        let elem = match &self.d.types[self.base(lv)].kind {
+            TypeKind::Array { elem, .. } => *elem,
+            _ => line_t,
+        };
+        let er = self.repr(elem, loc).sv();
+        let rec = self.repr(t, loc).sv();
+        let _ = write!(
+            self.lit_items,
+            "  function automatic int {f}(string path, output {rec} d);\n    string names, cur, q[$];\n    {er} t[];\n    if ($__vh_os(\"exists\", path) != \"1\") return 1;\n    if ($__vh_os(\"isdir\", path) != \"1\") return 2;\n    names = $__vh_os(\"list\", path);\n    cur = \"\";\n    for (int i = 0; i <= names.len(); i++) begin\n      if (i == names.len() || names.getc(i) == 10) begin\n        if (cur != \"\") q.push_back(cur);\n        cur = \"\";\n      end else cur = {{cur, string'(byte'(names.getc(i)))}};\n    end\n    t = new[q.size()];\n    foreach (q[i]) t[i] = vh_new_{k0}(vh_str(q[i]));\n    d.f0 = vh_new_{k0}(vh_str($__vh_os(\"canonical\", path)));\n    d.f1 = vh_new_{k1}({arr}_from(0, 0, t));\n    return 0;\n  endfunction\n",
+            f = f,
+            rec = rec,
+            er = er,
+            k0 = k0,
+            k1 = k1,
+            arr = arr
+        );
+        f
     }
 
     fn need_sub(&mut self, s: SubId) {
@@ -1843,8 +1889,8 @@ impl<'a> Lw<'a> {
                     // VHDL-2019 §16.2.2: the image of a composite value, an
                     // aggregate of its elements' images.
                     if index.len() != 1 {
-                        self.err(loc, "'image of a multi-dimensional array is not supported yet");
-                        return "vh_str(\"\")".into();
+                        let f = self.composite_image_nd(t, loc);
+                        return format!("{}({})", f, v);
                     }
                     let f = self.composite_image(t, loc);
                     return format!("{}({})", f, v);
@@ -2053,6 +2099,66 @@ impl<'a> Lw<'a> {
                 );
                 out
             }
+            TypeKind::Array { index, elem } => {
+                // A multi-dimensional array (VHDL-2019): the aggregate of
+                // the rows' aggregates, a level function per dimension.
+                let ranges = self.d.array_index_ranges(t);
+                let mut levels = Vec::new();
+                let mut r = self.fat_repr(t, loc);
+                while let Repr::Arr(name, inner) = r {
+                    levels.push((name, (*inner).clone()));
+                    r = *inner;
+                }
+                let ef = self.value_fn(elem, loc);
+                let n = levels.len();
+                for (k, (name, er)) in levels.iter().enumerate() {
+                    let fk = format!("{}_{}", f, k);
+                    let ev = if k + 1 < n {
+                        format!("{}_{}(p[i], file, line)", f, k + 1)
+                    } else {
+                        format!("{}(p[i], file, line)", ef)
+                    };
+                    let constrained = ranges.as_ref().and_then(|v| v.get(k).cloned().flatten());
+                    let sr = constrained.clone().or_else(|| self.d.scalar_range(index[k]));
+                    let (left, dn) = match &sr {
+                        Some(sr) => (sr.left.as_i64().unwrap_or(0), sr.dir == Dir::Downto),
+                        None => (0, false),
+                    };
+                    let check = match &constrained {
+                        Some(c) => {
+                            let (l, rr) = (c.left.as_i64().unwrap_or(0), c.right.as_i64().unwrap_or(0));
+                            let len = if c.dir == Dir::To { rr - l + 1 } else { l - rr + 1 }.max(0);
+                            format!(" || p.size() != {}", len)
+                        }
+                        None => String::new(),
+                    };
+                    // The last dimension of character literals: also a string
+                    // literal.
+                    let eb = self.base(elem);
+                    let chars = k + 1 == n
+                        && matches!(&self.d.types[eb].kind,
+                            TypeKind::Enum(l) if l.iter().all(|x| x.starts_with('\'')));
+                    let split = if chars {
+                        "x = vh_vtrim(s);\n    if (x.len() >= 2 && x.getc(0) == 34 && x.getc(x.len() - 1) == 34) begin\n      p.delete();\n      for (int i = 1; i < x.len() - 1; i++) p.push_back({\"'\", string'(byte'(x.getc(i))), \"'\"});\n    end else if (!vh_vsplit(x, p)) p.delete();\n    if (p.size() == 0"
+                            .to_string()
+                    } else {
+                        "x = s;\n    if (!vh_vsplit(x, p)".to_string()
+                    };
+                    let _ = writeln!(
+                        self.lit_items,
+                        "  function automatic {name} {fk}(string s, string file, int line);\n    string p[$];\n    string x;\n    {et} t[];\n    {split}{check}) begin\n      vh_vbad(file, line);\n      return {name}_from(64'sd0, 0, t);\n    end\n    t = new[p.size()];\n    foreach (p[i]) t[i] = {ev};\n    return {name}_from({left}, {dn}, t);\n  endfunction",
+                        name = name,
+                        fk = fk,
+                        et = er.sv(),
+                        split = split,
+                        check = check,
+                        ev = ev,
+                        left = format!("64'sd{}", left).replace("64'sd-", "-64'sd"),
+                        dn = dn as u8
+                    );
+                }
+                format!("    return {}_0(s, file, line);\n", f)
+            }
             _ => {
                 self.err(loc, "'value of this type is not supported yet");
                 "    return 0;\n".into()
@@ -2060,6 +2166,62 @@ impl<'a> Lw<'a> {
         };
         let _ = writeln!(self.lit_items, "{}{}  endfunction", head, body);
         f
+    }
+
+    /// The SV function giving the image of a multi-dimensional array value
+    /// (VHDL-2019 §16.2.2): an aggregate of the aggregates of each
+    /// dimension, the last dimension's elements by their images (a string
+    /// literal for character literals): `((1,2),(3,4))`, `("01","10")`.
+    fn composite_image_nd(&mut self, t: TypeId, loc: &Loc) -> String {
+        let b = self.base(t);
+        let f0 = format!("vh_cimg{}_0", b);
+        if self.lits.contains_key(&f0) {
+            return f0;
+        }
+        self.lits.insert(f0.clone(), f0.clone());
+        let TypeKind::Array { elem, .. } = self.d.types[b].kind.clone() else {
+            return f0;
+        };
+        // The struct of each level (a multi-dimensional array is an array
+        // of arrays of the remaining dimensions).
+        let mut levels = Vec::new();
+        let mut r = self.fat_repr(t, loc);
+        while let Repr::Arr(name, inner) = r {
+            levels.push(name);
+            r = *inner;
+        }
+        let eb = self.base(elem);
+        let chars = matches!(&self.d.types[eb].kind,
+            TypeKind::Enum(l) if l.iter().all(|x| x.starts_with('\'')));
+        let n = levels.len();
+        for (k, name) in levels.iter().enumerate() {
+            let f = format!("vh_cimg{}_{}", b, k);
+            let body = if k + 1 < n {
+                format!(
+                    "    string s;\n    s = \"(\";\n    foreach (a.d[i]) begin\n      if (i > 0) s = {{s, \",\"}};\n      s = {{s, vh_sv(vh_cimg{b}_{k1}(a.d[i]))}};\n    end\n    return vh_str({{s, \")\"}});\n",
+                    b = b,
+                    k1 = k + 1
+                )
+            } else if chars {
+                let e = self.image_sv("a.d[i]".into(), elem, false, loc);
+                format!(
+                    "    string s;\n    s = \"\\\"\";\n    foreach (a.d[i]) s = {{s, vh_sv({})}};\n    return vh_str({{s, \"\\\"\"}});\n",
+                    e
+                )
+            } else {
+                let e = self.image_sv("a.d[i]".into(), elem, true, loc);
+                format!(
+                    "    string s;\n    s = \"(\";\n    foreach (a.d[i]) begin\n      if (i > 0) s = {{s, \",\"}};\n      s = {{s, vh_sv({})}};\n    end\n    return vh_str({{s, \")\"}});\n",
+                    e
+                )
+            };
+            let _ = write!(
+                self.lit_items,
+                "  function automatic vh_a_u8 {}({} a);\n{}  endfunction\n",
+                f, name, body
+            );
+        }
+        f0
     }
 
     /// The SV function giving the image of a value of record or
@@ -3167,6 +3329,12 @@ impl<'a> Lw<'a> {
                 }
                 n if n.starts_with("textio.") => {
                     self.textio_call(&n["textio.".len()..], &info, args, ind, loc)
+                }
+                "file.truncate" => {
+                    self.files = true;
+                    let f = self.ex(&args[0]);
+                    let (size, origin) = (self.ex(&args[1]), self.ex(&args[2]));
+                    format!("{}vh_ftrunc({}, {}, {});\n", pad, f, size, origin)
                 }
                 "file.rewind" | "file.seek" => {
                     self.files = true;

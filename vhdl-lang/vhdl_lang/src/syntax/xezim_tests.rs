@@ -355,3 +355,21 @@ fn protected_type_header_and_items() {
         .collect();
     assert_eq!(kinds, ["other", "private", "other", "other", "sub", "other"]);
 }
+
+/// VHDL-2019 §5.6.4 protected type instantiation; an error before 2019.
+#[test]
+fn protected_type_instance() {
+    let code = "package p is
+           type q is new work.g.queue_pt generic map (elem => integer, n => 4);
+           type r is new queue_pt;
+         end package;";
+    let (file, diags) = parse19(code);
+    assert!(diags.is_empty(), "{diags:?}");
+    let decls = package_decls(&file);
+    assert!(matches!(&decls[0].item, Declaration::Type(t)
+        if matches!(&t.def, TypeDefinition::ProtectedInstance(_, Some(_)))));
+    assert!(matches!(&decls[1].item, Declaration::Type(t)
+        if matches!(&t.def, TypeDefinition::ProtectedInstance(_, None))));
+    let (_, diags) = parse(code);
+    assert!(!diags.is_empty());
+}

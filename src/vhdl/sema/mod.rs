@@ -188,6 +188,8 @@ pub struct Design {
     /// The objects declared by the sequential block statements (VHDL-2019)
     /// of the process or subprogram body being analysed: its locals too.
     pub(super) block_locals: Vec<ObjId>,
+    /// Generic protected types (VHDL-2019).
+    generic_prots: BTreeMap<TypeId, generics::GenericProt>,
     /// The bodies of the methods a protected type declaration's aliases of
     /// its private variables' methods stand for (VHDL-2019), for its body.
     prot_forwards: BTreeMap<TypeId, Vec<ast::Decl>>,
@@ -312,6 +314,7 @@ impl Design {
             aliases: Vec::new(),
             views: Vec::new(),
             block_locals: Vec::new(),
+            generic_prots: BTreeMap::new(),
             prot_forwards: BTreeMap::new(),
             ret_params: BTreeMap::new(),
             block_objs: BTreeSet::new(),

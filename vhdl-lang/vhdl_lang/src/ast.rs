@@ -647,6 +647,9 @@ pub enum TypeDefinition {
     /// LRM 5.6 Protected types
     Protected(ProtectedTypeDeclaration),
     ProtectedBody(ProtectedTypeBody),
+    /// xezim: VHDL-2019 protected type instantiation,
+    /// `type t is new generic_protected_type [generic map (...)]`.
+    ProtectedInstance(WithTokenSpan<Name>, Option<MapAspect>),
     /// LRM 6.3 Subtype declarations
     Subtype(SubtypeIndication),
 }

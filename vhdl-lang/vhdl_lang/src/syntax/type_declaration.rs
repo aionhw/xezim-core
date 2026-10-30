@@ -15,6 +15,7 @@ use crate::ast::token_range::WithToken;
 use crate::ast::token_range::WithTokenSpan;
 use crate::ast::*;
 use crate::ast::{AbstractLiteral, Range};
+use crate::data::Diagnostic;
 use crate::named_entity::Reference;
 use crate::syntax::names::parse_type_mark;
 use crate::syntax::recover::{expect_semicolon, expect_semicolon_or_last};
@@ -338,6 +339,18 @@ pub fn parse_type_declaration(ctx: &mut ParsingContext<'_>) -> ParseResult<TypeD
         Access => {
             let subtype_indication = parse_subtype_indication(ctx)?;
             TypeDefinition::Access(subtype_indication)
+        },
+        // xezim: VHDL-2019 protected type instantiation.
+        New => {
+            if ctx.standard < crate::VHDLStandard::VHDL2019 {
+                return Err(Diagnostic::syntax_error(
+                    &token.pos,
+                    "A protected type instantiation requires VHDL-2019",
+                ));
+            }
+            let name = parse_type_mark(ctx)?;
+            let generic_map = super::concurrent_statement::parse_map_aspect(ctx, Generic)?;
+            TypeDefinition::ProtectedInstance(name, generic_map)
         },
 
         Protected => {

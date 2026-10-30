@@ -439,6 +439,12 @@ pub enum TypeDef {
         decls: Vec<Decl>,
     },
     ProtectedBody(Vec<Decl>),
+    /// A protected type instantiation (VHDL-2019 §5.6.4),
+    /// `type t is new generic_protected_type generic map (...)`.
+    ProtectedInst {
+        base: Name,
+        generic_map: Vec<Assoc>,
+    },
     /// `type t is range implementation_defined` (std.standard only).
     ImplementationDefined,
 }

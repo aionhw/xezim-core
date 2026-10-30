@@ -19,8 +19,10 @@ use crate::vhdl::sema::hir::*;
 const FILES: &str = r#"
   // ---- files (§5.5.2) ---------------------------------------------------
   byte unsigned vh_fmode[int];
-  // The header length of each open binary file: positions count after it.
+  // The header length of each open binary file: positions count after it;
+  // and its name (FILE_TRUNCATE).
   int vh_fhdr[int];
+  string vh_fname[int];
   // VHDL-2019 §5.5.2 FILE_STATE, FILE_MODE, FILE_POSITION, FILE_SIZE,
   // FILE_CANSEEK, FILE_SEEK (origins 0 begin, 1 current, 2 end).
   function automatic byte unsigned vh_fstate(int f);
@@ -51,6 +53,26 @@ const FILES: &str = r#"
     n = $ftell(f);
     c = $fseek(f, p, 0);
     return n - vh_fhdr[f];
+  endfunction
+  // VHDL-2019 FILE_TRUNCATE: the file's length becomes the position size
+  // bytes from the origin; the file position stays (at most the end).
+  function automatic void vh_ftrunc(int f, longint size, byte unsigned origin);
+    longint p, n;
+    int c;
+    string r;
+    if (!vh_fcanseek(f)) begin
+      vh_ffail("file_truncate called on a file that cannot seek");
+      return;
+    end
+    $fflush(f);
+    p = $ftell(f);
+    if (origin == 0) n = vh_fhdr[f] + size;
+    else if (origin == 1) n = p + size;
+    else n = vh_fsize(f) + vh_fhdr[f] + size;
+    if (n < vh_fhdr[f]) n = vh_fhdr[f];
+    r = $__vh_os("truncate", $sformatf("%s\n%0d", vh_fname[f], n));
+    if (r != "ok") vh_ffail($sformatf("file_truncate failed: %s", r));
+    if (p > n) c = $fseek(f, n, 0);
   endfunction
   function automatic void vh_fseekto(int f, longint off, byte unsigned origin);
     int c;
@@ -102,6 +124,7 @@ const FILES: &str = r#"
     f = fd;
     vh_fmode[fd] = kind;
     vh_fhdr[fd] = hdr.len();
+    vh_fname[fd] = name;
     return 0;
   endfunction
   function automatic void vh_fopen_chk(inout int f, input string name, input byte unsigned kind, input string hdr);
@@ -119,6 +142,7 @@ const FILES: &str = r#"
     if (f > 0 || f < -2) $fclose(f);
     if (f != 0) vh_fmode.delete(f);
     if (f != 0) vh_fhdr.delete(f);
+    if (f != 0) vh_fname.delete(f);
     f = 0;
   endfunction
   // The file must be open for reading (rd) or for writing.

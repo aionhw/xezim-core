@@ -667,18 +667,49 @@ impl Design {
         let name = td.name.name.clone();
         let loc = Some(self.loc(td.name.span.clone()));
         match &td.def {
+            // A generic protected type (VHDL-2019 §5.6.2): its declaration is
+            // analysed for each instance, with the generics bound; with a
+            // generic map it is its own instance.
             Some(ast::TypeDef::Protected {
                 generics,
                 generic_map,
                 decls,
-            }) => {
-                if !generics.is_empty() || generic_map.is_some() {
-                    self.error(
-                        td.name.span.clone(),
-                        "generics of protected types (VHDL-2019) are not supported yet",
-                    );
+            }) if !generics.is_empty() => {
+                let g = self.add_type(&name, TypeKind::Protected, None, loc.clone());
+                self.generic_prots.insert(
+                    g,
+                    super::generics::GenericProt {
+                        name: name.clone(),
+                        region: r,
+                        generics: generics.clone(),
+                        decls: decls.clone(),
+                        lib: self.cur_lib.clone(),
+                        file: self.cur_file,
+                        body: None,
+                        pending: Vec::new(),
+                    },
+                );
+                match generic_map {
+                    Some(gm) => {
+                        self.protected_instance(r, &name, g, gm, loc, path);
+                    }
+                    None => self.declare(r, &name, Sym::Type(g)),
                 }
+                return;
+            }
+            Some(ast::TypeDef::Protected { decls, .. }) => {
                 self.protected_decl(r, &name, decls, loc, path);
+                return;
+            }
+            Some(ast::TypeDef::ProtectedInst { base, generic_map }) => {
+                let Some(g) = self.type_mark(r, base) else {
+                    return;
+                };
+                if !self.generic_prots.contains_key(&g) {
+                    self.error(base.span.clone(), "not a generic protected type");
+                    return;
+                }
+                self.protected_instance(r, &name, g, generic_map, loc, path);
                 return;
             }
             Some(ast::TypeDef::ProtectedBody(decls)) => {
@@ -911,7 +942,9 @@ impl Design {
                 };
                 self.add_type(&name, TypeKind::File(ft), None, loc)
             }
-            ast::TypeDef::Protected { .. } | ast::TypeDef::ProtectedBody(_) => return,
+            ast::TypeDef::Protected { .. }
+            | ast::TypeDef::ProtectedBody(_)
+            | ast::TypeDef::ProtectedInst { .. } => return,
         };
         // Completing an incomplete type declaration: reuse its id.
         if let Some(Sym::Type(prev)) = self.regions[r]
@@ -1155,11 +1188,41 @@ impl Design {
                 return;
             }
         };
+        // The body of a generic protected type (VHDL-2019): kept for its
+        // instances, and given to those made before it.
+        if let Some(gp) = self.generic_prots.get_mut(&t) {
+            gp.body = Some((r, decls.to_vec()));
+            let pending = std::mem::take(&mut gp.pending);
+            for (inst, ir, ipath) in pending {
+                self.instance_body(t, inst, ir, &ipath);
+            }
+            return;
+        }
+        self.protected_body_in(t, r, decls, &format!("{}.{}", path, name), &[]);
+    }
+
+    /// Analyse the body of protected type `t` in region `r`: the variables
+    /// each object has and its methods' bodies. `extra` are symbols the
+    /// body sees besides `r`'s (a generic body's package body, for an
+    /// instance).
+    fn protected_body_in(
+        &mut self,
+        t: TypeId,
+        r: RegionId,
+        decls: &[ast::Decl],
+        path: &str,
+        extra: &[(String, Vec<Sym>)],
+    ) {
         let Some(info) = self.protected.get(&t).cloned() else {
             return;
         };
         // The body sees its own context and the declaration's methods.
         let br = self.new_region(Some(r));
+        for (k, v) in extra {
+            for sym in v {
+                self.declare(br, k, sym.clone());
+            }
+        }
         let methods: Vec<(String, Vec<Sym>)> = self.regions[info.decl_region]
             .syms
             .iter()
@@ -1175,13 +1238,7 @@ impl Design {
         let mut subs = Vec::new();
         let mut decls = decls.to_vec();
         decls.extend(self.prot_forwards.remove(&t).unwrap_or_default());
-        self.decls(
-            br,
-            &decls,
-            &mut objs,
-            &mut subs,
-            &format!("{}.{}", path, name),
-        );
+        self.decls(br, &decls, &mut objs, &mut subs, path);
         self.cur_prot = saved;
         let vars: Vec<ObjId> = objs
             .into_iter()
@@ -1194,6 +1251,89 @@ impl Design {
             p.vars.extend(vars);
             p.has_body = true;
         }
+    }
+
+    /// An instance of generic protected type `g` named `name` (VHDL-2019
+    /// §5.6.4): its declaration analysed with the generics bound to the
+    /// actuals of `gmap` (in a region of the generic's context); the
+    /// generic constants are variables of each object, set to the actuals.
+    fn protected_instance(
+        &mut self,
+        r: RegionId,
+        name: &str,
+        g: TypeId,
+        gmap: &[ast::Assoc],
+        loc: Option<Loc>,
+        path: &str,
+    ) {
+        let Some(gp) = self.generic_prots.get(&g).cloned() else {
+            return;
+        };
+        let actx = super::generics::ActualCtx {
+            region: r,
+            lib: self.cur_lib.clone(),
+            file: self.cur_file,
+        };
+        let ipath = format!("{}.{}", path, name);
+        let saved = (
+            std::mem::replace(&mut self.cur_lib, gp.lib.clone()),
+            self.cur_file,
+        );
+        self.cur_file = gp.file;
+        let ir = self.new_region(Some(gp.region));
+        let consts = self.bind_generics(ir, &gp.generics, gmap, &actx, &ipath);
+        self.protected_decl(ir, &gp.name, &gp.decls, loc, &ipath);
+        self.cur_lib = saved.0;
+        self.cur_file = saved.1;
+        let Some(Sym::Type(t)) = self.regions[ir].syms.get(&gp.name).and_then(|v| v.first()).cloned()
+        else {
+            return;
+        };
+        self.types[t].name = name.to_string();
+        for c in &consts {
+            self.objects[*c].kind = ObjKind::Variable;
+            self.prot_vars.insert(*c, t);
+        }
+        if let Some(p) = self.protected.get_mut(&t) {
+            let mut vars = consts;
+            vars.append(&mut p.vars);
+            p.vars = vars;
+        }
+        self.declare(r, name, Sym::Type(t));
+        match &gp.body {
+            Some(_) => self.instance_body(g, t, ir, &ipath),
+            None => {
+                if let Some(gp) = self.generic_prots.get_mut(&g) {
+                    gp.pending.push((t, ir, ipath));
+                }
+            }
+        }
+    }
+
+    /// The body of instance `t` of generic protected type `g`: the
+    /// generic's body analysed with the instance's generics (region `ir`),
+    /// seeing the declarations of the package body it is written in.
+    fn instance_body(&mut self, g: TypeId, t: TypeId, ir: RegionId, path: &str) {
+        let Some(gp) = self.generic_prots.get(&g).cloned() else {
+            return;
+        };
+        let Some((rb, decls)) = gp.body else {
+            return;
+        };
+        let extra: Vec<(String, Vec<Sym>)> = self.regions[rb]
+            .syms
+            .iter()
+            .filter(|(k, _)| **k != gp.name)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let saved = (
+            std::mem::replace(&mut self.cur_lib, gp.lib.clone()),
+            self.cur_file,
+        );
+        self.cur_file = gp.file;
+        self.protected_body_in(t, ir, &decls, path, &extra);
+        self.cur_lib = saved.0;
+        self.cur_file = saved.1;
     }
 
     /// The operations a file type declaration implicitly declares (§5.5.2):
