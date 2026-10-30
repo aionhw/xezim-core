@@ -9,7 +9,11 @@ copied unmodified. They are licensed under the Apache License 2.0
 `std/standard.vhdl`, `std/textio.vhdl` and `std/env.vhdl` declare the
 packages only; their bodies are implementation-defined and are provided
 natively by xezim, except for `std/env-body.vhdl`, written for xezim: the
-calendar and time conversions of ENV in VHDL. The 2019-only `std.reflection` package is not included.
+calendar and time conversions of ENV in VHDL. `std/reflection.vhdl`, the
+VHDL-2019 REFLECTION package (not in that repository), is the IEEE P1076
+Working Group's file as nvc 1.23.1 distributes it (`lib/std.19/
+reflection.vhdl`, Apache-2.0, unmodified); its mirrors are provided
+natively by xezim.
 
 `ieee/ieee_std_context.vhdl` and `ieee/ieee_bit_context.vhdl` (the IEEE
 1076-2008 context declarations) are not in that repository and were written

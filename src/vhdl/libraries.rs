@@ -26,6 +26,11 @@ pub static SOURCES: &[LibSource] = &[
     },
     LibSource {
         library: "std",
+        file: "reflection.vhdl",
+        text: include_bytes!("libraries/std/reflection.vhdl"),
+    },
+    LibSource {
+        library: "std",
         file: "standard.vhdl",
         text: include_bytes!("libraries/std/standard.vhdl"),
     },

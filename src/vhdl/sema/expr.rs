@@ -920,7 +920,7 @@ impl Design {
             NameKind::Call(p, a) => (p, a),
             _ => (n, &[]),
         };
-        let (t, m, obj) = match &prefix.kind {
+        let (mut t, m, mut obj) = match &prefix.kind {
             NameKind::Selected(p, ast::Suffix::Ident(m)) => {
                 if self.static_prefix(r, p).is_some() {
                     return None;
@@ -957,6 +957,19 @@ impl Design {
             }
             _ => return None,
         };
+        // An access value of a protected type: the object it designates
+        // (`p.m` is `p.all.m`, §8.3).
+        if let TypeKind::Access(d) = self.types[t].kind {
+            let db = self.base(d);
+            if matches!(self.types[db].kind, TypeKind::Protected) {
+                t = db;
+                let span = obj.span.clone();
+                obj = ast::Name {
+                    kind: NameKind::Selected(Box::new(obj), ast::Suffix::All(span.clone())),
+                    span,
+                };
+            }
+        }
         if !matches!(self.types[t].kind, TypeKind::Protected) {
             return None;
         }
@@ -1812,6 +1825,18 @@ impl Design {
         })
     }
 
+    /// A type of STD.REFLECTION (VHDL-2019), for 'REFLECT.
+    fn reflection_type(&mut self, name: &str, span: ast::Span) -> Option<TypeId> {
+        let pkg = ("std".to_string(), "reflection".to_string());
+        match self.pkg_syms_pub(&pkg, name).first() {
+            Some(Sym::Type(t)) => Some(*t),
+            _ => {
+                self.error(span, "'reflect needs package STD.REFLECTION (VHDL-2019)");
+                None
+            }
+        }
+    }
+
     // ---- attributes ------------------------------------------------------------------
 
     fn attribute(
@@ -1871,6 +1896,11 @@ impl Design {
                     let e = param?;
                     let x = self.expr(r, e, Some(t))?;
                     Some(mk(self, string, Some(x)))
+                }
+                // VHDL-2019 §16.2.2: the subtype mirror of a subtype.
+                "reflect" => {
+                    let mt = self.reflection_type("subtype_mirror", attr.span.clone())?;
+                    Some(mk(self, mt, None))
                 }
                 "value" => {
                     let e = param?;
@@ -1995,6 +2025,11 @@ impl Design {
                 // VHDL-2019 object'image; GHDL accepts it in 2008 mode too.
                 let _ = expect;
                 Some(mk(self, string, None, px))
+            }
+            // VHDL-2019 §16.2.2: a value mirror of the object's value.
+            "reflect" => {
+                let mt = self.reflection_type("value_mirror", attr.span.clone())?;
+                Some(mk(self, mt, None, px))
             }
             "simple_name" | "path_name" | "instance_name" => Some(mk(self, string, None, px)),
             _ => {

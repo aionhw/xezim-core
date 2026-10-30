@@ -148,7 +148,7 @@ fn tz_offset(t: i64) -> i64 {
             let tt = t as libc::time_t;
             let mut tm: libc::tm = std::mem::zeroed();
             if !libc::localtime_r(&tt, &mut tm).is_null() {
-                return tm.tm_gmtoff as i64;
+                return i64::from(tm.tm_gmtoff);
             }
         }
     }

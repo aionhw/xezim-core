@@ -940,8 +940,22 @@ impl Design {
         loc: Option<Loc>,
         path: &str,
     ) {
-        let t = self.add_type(name, TypeKind::Protected, None, loc);
-        self.declare(r, name, Sym::Type(t));
+        // Completing an incomplete type declaration (§5.4.2): its id.
+        let prev = match self.regions[r].syms.get(name).and_then(|v| v.first()) {
+            Some(Sym::Type(p)) if matches!(self.types[*p].kind, TypeKind::Incomplete) => Some(*p),
+            _ => None,
+        };
+        let t = match prev {
+            Some(p) => {
+                self.types[p].kind = TypeKind::Protected;
+                p
+            }
+            None => {
+                let t = self.add_type(name, TypeKind::Protected, None, loc);
+                self.declare(r, name, Sym::Type(t));
+                t
+            }
+        };
         let pr = self.new_region(Some(r));
         self.protected.insert(
             t,

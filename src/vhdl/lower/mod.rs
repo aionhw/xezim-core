@@ -17,6 +17,7 @@ mod intrinsics;
 mod leaves;
 mod mixed;
 mod packed;
+mod reflect;
 mod runtime;
 mod spec;
 mod textio;
@@ -1233,6 +1234,9 @@ impl<'a> Lw<'a> {
             Some(Builtin::Native(n)) if n.starts_with("env.") => {
                 self.env_func(&n["env.".len()..], args, h)
             }
+            Some(Builtin::Native(n)) if n.starts_with("reflection.") => {
+                self.rf_method(&n["reflection.".len()..], args, h)
+            }
             // VHDL-2019 §5.5.2 file operations.
             Some(Builtin::Native(n)) if n.starts_with("file.") => {
                 self.files = true;
@@ -2054,7 +2058,7 @@ impl<'a> Lw<'a> {
                 "    return 0;\n".into()
             }
         };
-        let _ = write!(self.lit_items, "{}{}  endfunction\n", head, body);
+        let _ = writeln!(self.lit_items, "{}{}  endfunction", head, body);
         f
     }
 
@@ -2126,6 +2130,8 @@ impl<'a> Lw<'a> {
         match prefix {
             AttrPrefix::Type(t) => match name {
                 "image" => self.image(param.unwrap(), *t, true),
+                // VHDL-2019 STD.REFLECTION mirrors.
+                "reflect" => format!("{}()", self.rf_subtype(*t, &h.loc)),
                 "pos" => format!("longint'({})", self.ex(param.unwrap())),
                 "val" => {
                     let v = self.ex(param.unwrap());
@@ -2226,6 +2232,7 @@ impl<'a> Lw<'a> {
                     "length" => format!("longint'({}.d.size())", b),
                     "ascending" => format!("!{}.dn", b),
                     "image" => self.image(x, x.ty, true),
+                    "reflect" => self.rf_reflect_value(x),
                     _ => {
                         self.err(&h.loc, format!("attribute '{} is not supported yet", name));
                         "0".into()

@@ -564,6 +564,13 @@ pub fn native_builtin(path: &str, name: &str) -> Option<Builtin> {
     match (path, name) {
         ("std.standard", "now") => Some(Builtin::Now),
         ("std.env", n) => Some(Builtin::Native(format!("env.{}", n))),
+        // The methods of STD.REFLECTION's mirrors (VHDL-2019), by protected
+        // type: `reflection.<type>.<method>`.
+        (p, n) if p.starts_with("std.reflection.") => Some(Builtin::Native(format!(
+            "reflection.{}.{}",
+            &p["std.reflection.".len()..],
+            n
+        ))),
         ("std.textio", n) => Some(Builtin::Native(format!("textio.{}", n))),
         _ => None,
     }

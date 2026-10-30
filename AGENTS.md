@@ -72,7 +72,8 @@ src/vhdl/                 VHDL (IEEE 1076-2008; 1076-2019 with --std=19, in deve
                           lowered per calling process, postponed processes, kernel;
                           leaves.rs: drivers of parts of signals by scalar leaf;
                           mixed.rs: the SystemVerilog boundary of a mixed design;
-                          textio.rs: TEXTIO as GHDL reads and writes; files.rs: file
+                          textio.rs: TEXTIO as GHDL reads and writes; reflect.rs:
+                          VHDL-2019 STD.REFLECTION mirrors as ids into SV tables; files.rs: file
                           objects in GHDL's binary format; runtime.rs: SV support
                           code; protected types are handles with per-type variable
                           arrays); vendored
