@@ -314,6 +314,26 @@ impl<'a> Program<'a> {
     pub fn is_module(&self, name: &str) -> bool {
         self.classes.get(name).is_some_and(|(_, c, _)| c.sc_module)
             || self.foreign.contains_key(name)
+            || self.is_prim_channel(name)
+    }
+
+    /// A primitive channel (§5.15): derived from `sc_prim_channel`, lowered
+    /// like a module (it has members, an update phase and is bound to).
+    pub fn is_prim_channel(&self, name: &str) -> bool {
+        let mut cur = name.to_string();
+        for _ in 0..32 {
+            let Some((_, c, _)) = self.classes.get(&cur) else {
+                return false;
+            };
+            if c.bases.iter().any(|b| b.name.last_name() == "sc_prim_channel") {
+                return true;
+            }
+            match c.bases.first() {
+                Some(b) => cur = b.name.last_name().to_string(),
+                None => return false,
+            }
+        }
+        false
     }
 
     pub fn address_taken(&self, name: &str, tu: usize) -> bool {

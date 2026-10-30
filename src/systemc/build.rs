@@ -351,6 +351,16 @@ pub fn trigger(name: &str) -> Statement {
     })
 }
 
+/// `->> name;` (the trigger happens in the NBA region).
+pub fn trigger_nb(name: &str) -> Statement {
+    st(StatementKind::EventTrigger {
+        nonblocking: true,
+        name: id(name),
+        target: Some(Box::new(ident(name))),
+        span: sp(),
+    })
+}
+
 pub fn var_decl(dt: DataType, name: &str, init: Option<Expression>) -> Statement {
     st(StatementKind::VarDecl {
         data_type: dt,

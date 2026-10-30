@@ -185,7 +185,8 @@ pub fn sv_scalar_type(ty: &Ty) -> DataType {
         Ty::Void => void_t(),
         Ty::Class(n) | Ty::Handle(n) => named_t(n, Vec::new()),
         Ty::Ptr { .. } => named_t("scrt_ptr", Vec::new()),
-        Ty::Mailbox(elem) => named_t("mailbox", vec![type_arg(&sv_scalar_type(elem))]),
+        // sc_fifo (§6.23): the runtime's update-phase FIFO.
+        Ty::Mailbox(elem) => named_t("scrt_fifo", vec![type_arg(&sv_scalar_type(elem))]),
         Ty::Event => simple_t(SimpleType::Event),
         Ty::Array(elem, _) | Ty::Queue(elem) => sv_scalar_type(elem),
     }
@@ -617,6 +618,9 @@ pub fn ty_of_name(
         "sc_time" => Ty::Time,
         "sc_event" => Ty::Event,
         "tlm_generic_payload" => Ty::Class("scrt_tlm_gp".to_string()),
+        "sc_mutex" => Ty::Class("scrt_mutex".to_string()),
+        "sc_semaphore" => Ty::Class("scrt_semaphore".to_string()),
+        "sc_event_queue" => Ty::Class("scrt_event_queue".to_string()),
         "tlm_command"
         | "tlm_response_status"
         | "tlm_sync_enum"

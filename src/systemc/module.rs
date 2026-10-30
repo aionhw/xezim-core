@@ -43,6 +43,8 @@ pub struct ModIface {
     /// → the hidden output that counts the writes made through it.
     pub port_counters: BTreeMap<String, String>,
     pub port_wcounters: BTreeMap<String, String>,
+    /// The interfaces a channel implements (their SV classes, §5.15).
+    pub implements: Vec<String>,
 }
 
 /// A registered process before lowering.
@@ -100,6 +102,8 @@ pub struct ModuleLowering<'l, 'a> {
     tb_tail: Option<usize>,
     /// Names of the objects sc_main creates (top level, §5.17).
     tb_names: NameGen,
+    /// The interfaces the module being lowered implements (a channel).
+    implements: Vec<String>,
 }
 
 impl<'l, 'a> ModuleLowering<'l, 'a> {
@@ -115,6 +119,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             fifo_size: BTreeMap::new(),
             tb_tail: None,
             tb_names: NameGen::default(),
+            implements: Vec::new(),
         }
     }
 }
@@ -271,6 +276,23 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 }
             }
         }
+        // A channel: the interfaces it implements (its bases deriving from
+        // sc_interface).
+        for b in &class.bases {
+            let consts = |e: &sc::Expr| self.lw.const_eval(e);
+            let t = ty_of_name(&b.name, &self.lw.env, &consts).ok();
+            if let Some(c) = t.as_ref().and_then(|t| self.lw.user_class(t))
+                && self
+                    .lw
+                    .prog
+                    .user_classes
+                    .borrow()
+                    .get(&c)
+                    .is_some_and(|s| s.is_interface)
+            {
+                iface.implements.push(c);
+            }
+        }
         let mut name_gen = NameGen::default();
         for m in &class.members {
             let sc::Member::Field(v) = m else { continue };
@@ -409,10 +431,69 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 };
                 (elem_kind, Ty::Array(Box::new(ety), size))
             }
-            ScObjectKind::Port | ScObjectKind::Export | ScObjectKind::AnalysisPort => {
+            ScObjectKind::Port | ScObjectKind::Export => {
+                let is_export = kind == ScObjectKind::Export;
+                let arg = q
+                    .and_then(|q| q.last_args())
+                    .and_then(|a| a.first())
+                    .and_then(|a| match a {
+                        sc::TemplateArg::Type(t) => t.name().cloned(),
+                        _ => None,
+                    });
+                let Some(iq) = arg else {
+                    return self.lw.err(d.span, "the interface of a port is missing");
+                };
+                // The standard signal and FIFO interfaces: the port is the
+                // matching specialized port (§6.8–§6.11, §6.24, §6.25).
+                let std_kind = match iq.last_name() {
+                    "sc_signal_in_if" => Some(SymKind::InPort),
+                    "sc_signal_inout_if" | "sc_signal_write_if" => Some(SymKind::InOutPort),
+                    "sc_fifo_in_if" => Some(SymKind::FifoIn),
+                    "sc_fifo_out_if" => Some(SymKind::FifoOut),
+                    _ => None,
+                };
+                if let Some(k) = std_kind {
+                    if is_export {
+                        return self.lw.err(
+                            d.span,
+                            "an sc_export of a signal or FIFO interface is not supported in simulation",
+                        );
+                    }
+                    let t = payload_ty(&iq, &self.lw.env, &consts).or_else(|m| self.lw.err(d.span, m))?;
+                    let t = match k {
+                        SymKind::FifoIn | SymKind::FifoOut => Ty::Mailbox(Box::new(t)),
+                        _ => t,
+                    };
+                    let t = self.lw.with_dims(t, d)?;
+                    return Ok(Some(Sym { kind: k, ty: t, sv: name }));
+                }
+                let t = ty_of_name(&iq, &self.lw.env, &consts).ok();
+                let iface = t.as_ref().and_then(|t| self.lw.user_class(t)).filter(|c| {
+                    self.lw
+                        .prog
+                        .user_classes
+                        .borrow()
+                        .get(c)
+                        .is_some_and(|s| s.is_interface)
+                });
+                let Some(iface) = iface else {
+                    return self.lw.err(
+                        d.span,
+                        format!("'{}' is not an interface (a class derived from sc_interface)", iq.last_name()),
+                    );
+                };
+                let pc = super::classes::port_class_name(&iface);
+                let k = if is_export {
+                    SymKind::Export(iface)
+                } else {
+                    SymKind::Port(iface)
+                };
+                (k, Ty::Class(pc))
+            }
+            ScObjectKind::AnalysisPort => {
                 return self.lw.err(
                     d.span,
-                    "sc_port/sc_export/analysis ports are not supported in simulation yet",
+                    "analysis ports are not supported in simulation yet",
                 );
             }
             ScObjectKind::Other => {
@@ -479,6 +560,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         for b in &iface.buffers {
             self.add_buffer(b);
         }
+        self.implements = iface.implements.clone();
         let ctor = find_ctor(self.lw, class, name);
         let mut s = Structure::default();
         let mut params = Vec::new();
@@ -577,7 +659,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let elab_decls = std::mem::take(&mut self.lw.f.decls);
         let elab_stmts = std::mem::take(&mut s.elab);
         self.register_procs(&s, class, name)?;
-        let funcs = self.lower_bodies(defs)?;
+        self.event_mirrors()?;
+        let mut funcs = self.lower_bodies(defs)?;
+        funcs.push(self.destructor(class, name)?);
         self.finish_module(
             name,
             params,
@@ -609,7 +693,11 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     continue;
                 };
                 let Ty::Class(cls) = &sym.ty else { continue };
-                if sym.kind != SymKind::Var || self.lw.user_class(&sym.ty).is_none() {
+                if sym.kind != SymKind::Var {
+                    continue;
+                }
+                let is_lib = matches!(cls.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue");
+                if self.lw.user_class(&sym.ty).is_none() && !is_lib {
                     continue;
                 }
                 let args: Vec<sc::Expr> = match inits
@@ -623,6 +711,11 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                         None => Vec::new(),
                     },
                 };
+                if is_lib {
+                    let x = self.lw.lib_object_new(&sym.ty, &args)?.expect("library object");
+                    s.elab.push(assign(ident(&sym.sv), x));
+                    continue;
+                }
                 let stmts = super::classes::construct_into(
                     self.lw,
                     ident(&sym.sv),
@@ -694,7 +787,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
 
     fn mem_init(&mut self, mi: &sc::MemInit, s: &mut Structure) -> R<()> {
         let n = mi.name.last_name();
-        if n == "sc_module" || n == "sc_channel" || n == "sc_behavior" {
+        if matches!(n, "sc_module" | "sc_channel" | "sc_behavior" | "sc_prim_channel") {
             return Ok(());
         }
         let Some(sym) = self.lw.lookup(n) else {
@@ -721,7 +814,9 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             }
             SymKind::Clock => s.clocks.push((sym.sv.clone(), mi.args.clone(), mi.span)),
             // Member objects were constructed by construct_members.
-            SymKind::Var if self.lw.user_class(&sym.ty).is_some() => {}
+            SymKind::Var
+                if self.lw.user_class(&sym.ty).is_some()
+                    || matches!(&sym.ty, Ty::Class(c) if matches!(c.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue")) => {}
             SymKind::Var | SymKind::Boxed => {
                 if let [a] = mi.args.as_slice() {
                     let (x, _) = self.lw.expr(a)?;
@@ -894,6 +989,39 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 _ => String::new(),
             }
         };
+        // A port or export of a user interface: the channel's default event,
+        // or the event function named (`p->data_written_event()`).
+        let (pt, pev) = match &e.kind {
+            sc::ExprKind::Call { callee, args } if args.is_empty() => match &callee.kind {
+                sc::ExprKind::Member { base, name, .. } => (base.as_ref(), name.ident.name.clone()),
+                _ => (e, "default_event".to_string()),
+            },
+            _ => (e, "default_event".to_string()),
+        };
+        if let Some((obj, ifc, idx)) = self.lw.port_ref(pt) {
+            let has = self
+                .lw
+                .prog
+                .user_classes
+                .borrow()
+                .get(&ifc)
+                .is_some_and(|s| s.events.contains(&pev));
+            if !has {
+                return self.lw.err(
+                    e.span,
+                    format!("the port's interface has no event function '{}'", pev),
+                );
+            }
+            let snap = self.lw.module_var("__sc_ps", &Ty::Handle(ifc));
+            let ch = self.lw.port_channel(&obj, idx.as_ref())?;
+            let mut t = SensTerm::new(
+                None,
+                member(ident(&snap), &format!("__sc_ev_{}", pev)),
+                base_name(pt),
+            );
+            t.setup = Some(assign(ident(&snap), ch));
+            return Ok(vec![t]);
+        }
         let (target, edge) = if let sc::ExprKind::Call { callee, args } = &e.kind
             && let sc::ExprKind::Member { base, name, .. } = &callee.kind
             && args.is_empty()
@@ -926,6 +1054,22 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             return Ok(vec![SensTerm::new(None, ident(ev), name)]);
         }
         let (x, t) = self.lw.expr(target)?;
+        // An sc_fifo's data events (§6.23.4): written by default.
+        if let Ty::Mailbox(_) = t {
+            let ev = match &e.kind {
+                sc::ExprKind::Call { callee, .. }
+                    if matches!(&callee.kind, sc::ExprKind::Member { name, .. } if name.ident.name == "data_read_event") =>
+                {
+                    "read_ev"
+                }
+                _ => "written_ev",
+            };
+            return Ok(vec![SensTerm::new(None, member(x, ev), name)]);
+        }
+        // An sc_event_queue's event (§5.11).
+        if matches!(&t, Ty::Class(c) if c == "scrt_event_queue") {
+            return Ok(vec![SensTerm::new(None, member(x, "ev"), name)]);
+        }
         let mut v = vec![match edge {
             // §6.8.4: an sc_logic's edge is a change to '1' / '0'.
             Some(ed) if matches!(t, Ty::Vec4 { .. }) => SensTerm::logic_edge(ed, x, name.clone()),
@@ -977,6 +1121,23 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let K::Call { callee, args } = &e.kind else {
             return Ok(false);
         };
+        // The module's own port or export: `exp(chan)`, `p.bind(x)`.
+        let own = match &callee.kind {
+            K::Name(q) if q.segments.len() == 1 => self.lw.lookup(q.last_name()),
+            K::Member { base, name, .. } if name.ident.name == "bind" => base
+                .as_name()
+                .filter(|q| q.segments.len() == 1)
+                .and_then(|q| self.lw.lookup(q.last_name())),
+            _ => None,
+        };
+        if let Some(sym) = own
+            && let SymKind::Port(ifc) | SymKind::Export(ifc) = &sym.kind
+            && let [a] = args.as_slice()
+        {
+            let stmt = self.bind_port_object(ident(&sym.sv), ifc, a, e.span)?;
+            s.elab.push(stmt);
+            return Ok(true);
+        }
         // Positional binding `child(a, b, c)`.
         if let Some(q) = callee.as_name() {
             if let Some(sym) = self.lw.lookup(q.last_name())
@@ -1110,6 +1271,80 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         }
     }
 
+    /// Bind the port or export object `target` of interface `ifc` (§5.12.7,
+    /// §5.14.5): to a channel (its adapter for the interface), to `*this`
+    /// (the channel being lowered), or to another port or export, which the
+    /// port then follows.
+    fn bind_port_object(
+        &mut self,
+        target: Expression,
+        ifc: &str,
+        a: &sc::Expr,
+        span: ScSpan,
+    ) -> R<Statement> {
+        let a = match &a.kind {
+            sc::ExprKind::Unary {
+                op: sc::UnaryOp::Deref,
+                operand,
+            } => operand.as_ref(),
+            _ => a,
+        };
+        let compatible = |lw: &Lw, impls: &[String]| -> Option<String> {
+            impls.iter().find(|x| lw.is_same_or_derived(x, ifc)).cloned()
+        };
+        let bind_ch = |x: Expression| expr_stmt(method(target.clone(), "bind_ch", vec![x]));
+        let bind_up = |x: Expression| expr_stmt(method(target.clone(), "bind_up", vec![x]));
+        match &a.kind {
+            sc::ExprKind::This => {
+                let Some(x) = compatible(self.lw, &self.implements) else {
+                    return self.lw.err(span, "this module does not implement the port's interface");
+                };
+                return Ok(bind_ch(ident(&adapter_object(&x))));
+            }
+            sc::ExprKind::Name(q) if q.segments.len() == 1 => {
+                if let Some(sym) = self.lw.lookup(q.last_name()) {
+                    match &sym.kind {
+                        SymKind::Instance(module) => {
+                            let impls = self
+                                .ifaces
+                                .get(module)
+                                .map(|i| i.implements.clone())
+                                .unwrap_or_default();
+                            let Some(x) = compatible(self.lw, &impls) else {
+                                return self.lw.err(
+                                    span,
+                                    format!("'{}' does not implement the port's interface", q.last_name()),
+                                );
+                            };
+                            return Ok(bind_ch(member(ident(&sym.sv), &adapter_object(&x))));
+                        }
+                        SymKind::Port(_) | SymKind::Export(_) => {
+                            return Ok(bind_up(ident(&sym.sv)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            sc::ExprKind::Member { base, name, .. } => {
+                if let Some((inst, module)) = self.instance_of(base) {
+                    let kind = self
+                        .ifaces
+                        .get(&module)
+                        .and_then(|i| i.members.get(&name.ident.name))
+                        .map(|m| m.kind.clone());
+                    if matches!(kind, Some(SymKind::Port(_) | SymKind::Export(_))) {
+                        return Ok(bind_up(member(ident(&inst), &name.ident.name)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.lw.err(
+            span,
+            "a port or export binds to a channel, `*this`, or another port or export",
+        )
+    }
+
     /// The actual of a port binding. A resolved out/inout port connects to
     /// the resolved net itself (it drives it); any other port to the value.
     fn port_actual(&mut self, a: &sc::Expr, module: &str, port: &str) -> R<Expression> {
@@ -1232,6 +1467,11 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             Some(SymKind::FifoIn | SymKind::FifoOut) => {
                 let (x, _) = self.lw.expr(a)?;
                 s.elab.push(assign(member(ident(inst), port), x));
+                Ok(())
+            }
+            Some(SymKind::Port(ifc) | SymKind::Export(ifc)) => {
+                let stmt = self.bind_port_object(member(ident(inst), port), &ifc, a, span)?;
+                s.elab.push(stmt);
                 Ok(())
             }
             Some(SymKind::InitSocket) => {
@@ -1454,6 +1694,81 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             }
         }
         Ok(())
+    }
+
+    /// `function void __sc_dtor()`: the module's destructor body, then its
+    /// child modules held by value, in reverse declaration order (C++
+    /// destroys members after the body, last first). sc_main destroys its
+    /// modules when it returns.
+    fn destructor(&mut self, class: &'a sc::ClassDecl, name: &str) -> R<ModuleItem> {
+        let cpp = class.name_str().unwrap_or(name).to_string();
+        let def = class
+            .members
+            .iter()
+            .find_map(|m| match m {
+                sc::Member::Destructor(f) if f.body.is_some() => Some((self.lw.tu, f)),
+                _ => None,
+            })
+            .or_else(|| {
+                self.lw
+                    .prog
+                    .out_of_class
+                    .get(&cpp)
+                    .and_then(|v| v.iter().find(|(_, f)| f.base_name().starts_with('~')))
+                    .map(|(t, f)| (*t, *f))
+            });
+        let mut body = Vec::new();
+        if let Some((tu, f)) = def
+            && let Some(b) = &f.body
+        {
+            let saved = self.lw.tu;
+            self.lw.tu = tu;
+            self.lw.f = FnCtx {
+                scopes: vec![BTreeMap::new()],
+                ret: Some(Ty::Void),
+                ..Default::default()
+            };
+            let stmts = self.lw.block(&b.stmts);
+            if self.lw.f.is_task {
+                let span = f.span;
+                self.lw.tu = saved;
+                return self.lw.err(span, "a destructor cannot wait");
+            }
+            body.extend(std::mem::take(&mut self.lw.f.decls));
+            body.extend(stmts);
+            self.lw.tu = saved;
+        }
+        let children = self.value_children(class);
+        for c in children.into_iter().rev() {
+            body.push(expr_stmt(call(member(ident(&c), "__sc_dtor"), Vec::new())));
+        }
+        Ok(ModuleItem::FunctionDeclaration(function_decl(
+            "__sc_dtor",
+            void_t(),
+            Vec::new(),
+            body,
+        )))
+    }
+
+    /// The child modules a module holds by value (not through a pointer),
+    /// in declaration order, that are SystemC modules (with `__sc_dtor`).
+    fn value_children(&self, class: &sc::ClassDecl) -> Vec<String> {
+        let mut out = Vec::new();
+        for m in &class.members {
+            let sc::Member::Field(v) = m else { continue };
+            for d in &v.declarators {
+                if !d.ptr_ops.is_empty() || !v.ty.ptr_ops.is_empty() {
+                    continue;
+                }
+                if let Some(sym) = self.lw.lookup(&d.name.name)
+                    && let SymKind::Instance(module) = &sym.kind
+                    && !self.lw.prog.foreign.contains_key(module)
+                {
+                    out.push(sym.sv);
+                }
+            }
+        }
+        out
     }
 
     /// Signatures and bodies of the member functions.
@@ -1747,6 +2062,24 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     Vec::new(),
                     Some(new_obj(None)),
                 ),
+                // A port or export of a user interface: an object of its
+                // port class, named for diagnostics.
+                SymKind::Port(_) | SymKind::Export(_) => {
+                    let (dt, dims) = sv_type(&sym.ty);
+                    let base = self
+                        .lw
+                        .m
+                        .sc_names
+                        .get(n)
+                        .cloned()
+                        .unwrap_or_else(|| n.clone());
+                    let is_export = matches!(sym.kind, SymKind::Export(_));
+                    (
+                        dt,
+                        dims,
+                        Some(new_obj(Some(vec![string(&base), sized(1, is_export as u64)]))),
+                    )
+                }
                 SymKind::Clock => (
                     bit_t(1, false),
                     Vec::new(),
@@ -1871,9 +2204,24 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             fw_assigns.push(assign(member(ident(sock), "fw"), ident(&obj)));
         }
         items.extend(aliases);
+        // A channel: an adapter object per interface it implements.
+        let (chan_items, chan_elab) = self.channel_items()?;
+        items.extend(chan_items);
         // Elaboration code: output ports of a user class start with a
         // default-built value (the bound signal's), as SystemC's.
         let mut elab = elab_decls;
+        // Port and export objects learn their hierarchical names.
+        if !self.lw.m.tb {
+            for (n, sym) in &syms {
+                if matches!(sym.kind, SymKind::Port(_) | SymKind::Export(_)) {
+                    let base = self.lw.m.sc_names.get(n).cloned().unwrap_or_else(|| n.clone());
+                    elab.push(assign(
+                        member(ident(&sym.sv), "name"),
+                        concat(vec![ident("__sc_path"), string(&format!(".{}", base))]),
+                    ));
+                }
+            }
+        }
         for (pname, kind) in port_order {
             let sym = &syms[pname];
             if matches!(kind, SymKind::OutPort | SymKind::InOutPort)
@@ -1884,6 +2232,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             }
         }
         elab.extend(fw_assigns);
+        elab.extend(chan_elab);
         elab.extend(elab_stmts);
         if !elab.is_empty() && !self.lw.m.tb {
             items.push(initial(block(elab)));
@@ -1956,6 +2305,33 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 });
             items.push(data_decl(int_t(), &ev, Vec::new(), None));
             items.push(cont_assign(ident(&ev), sum));
+        }
+        // §5.15.6 update phase of a primitive channel: request_update() arms
+        // a nonblocking trigger (the NBA region, SystemC's update phase);
+        // update() then runs once.
+        if self.lw.m.uses_update {
+            items.push(data_decl(bit_t(1, false), "__sc_upd", Vec::new(), None));
+            items.push(data_decl(
+                simple_t(crate::ast::types::SimpleType::Event),
+                "__sc_upd_ev",
+                Vec::new(),
+                None,
+            ));
+            items.push(ModuleItem::FunctionDeclaration(function_decl(
+                "__sc_request_update",
+                void_t(),
+                Vec::new(),
+                vec![if_(
+                    unary(UnaryOp::LogNot, ident("__sc_upd")),
+                    block(vec![assign(ident("__sc_upd"), sized(1, 1)), trigger_nb("__sc_upd_ev")]),
+                    None,
+                )],
+            )));
+            items.push(initial(forever(block(vec![
+                at(vec![event_expr(None, ident("__sc_upd_ev"))], null_stmt()),
+                assign(ident("__sc_upd"), sized(1, 0)),
+                expr_stmt(call_fn("update", vec![])),
+            ]))));
         }
         let procs = self.lw.m.proc_names.clone();
         if !self.lw.m.one_writer.is_empty() {
@@ -2211,6 +2587,14 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                             sv: sv.clone(),
                         },
                     );
+                    // A module object of sc_main (not one made with `new`)
+                    // is destroyed when sc_main returns.
+                    let by_value = d.ptr_ops.is_empty()
+                        && !matches!(&d.init, Some(sc::Initializer::Assign(sc::Expr { kind: sc::ExprKind::New { .. }, .. })))
+                        && !self.lw.prog.foreign.contains_key(&module);
+                    if by_value {
+                        self.lw.m.tb_values.push(sv.clone());
+                    }
                     s.insts.push(Inst {
                         module: module.clone(),
                         sv,
@@ -2279,11 +2663,33 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             Vec::new(),
             apply,
         )));
+        // sc_main's module objects are destroyed when it returns, last
+        // declared first.
+        let mut destroy: Vec<Statement> = vec![
+            if_(ident("__sc_destroyed"), ret(None), None),
+            assign(ident("__sc_destroyed"), sized(1, 1)),
+        ];
+        destroy.extend(
+            self.lw
+                .m
+                .tb_values
+                .iter()
+                .rev()
+                .map(|v| expr_stmt(call(member(ident(v), "__sc_dtor"), Vec::new()))),
+        );
+        items.push(data_decl(bit_t(1, false), "__sc_destroyed", Vec::new(), None));
+        items.push(ModuleItem::FunctionDeclaration(function_decl(
+            "__sc_destroy",
+            void_t(),
+            Vec::new(),
+            destroy,
+        )));
         items.append(&mut self.lw.m.extra_items);
         let (decls, mut stmts) = tb.unwrap_or_default();
         let Some(at) = self.tb_tail.take() else {
             let mut body = decls;
             body.extend(stmts);
+            body.push(expr_stmt(call_fn("__sc_destroy", vec![])));
             body.push(expr_stmt(sys("$finish", vec![])));
             items.push(initial(block(body)));
             return items;
@@ -2295,6 +2701,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         // final block sees them.
         let mut tail = vec![assign(ident("scrt_tb_now"), sys("$time", vec![]))];
         tail.extend(stmts.split_off(at));
+        tail.push(expr_stmt(call_fn("__sc_destroy", vec![])));
         let mut body = Vec::new();
         for d in decls {
             let StatementKind::VarDecl {
@@ -2328,6 +2735,168 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             },
         ));
         items
+    }
+
+    /// The adapters of a channel (§5.15): for each interface it implements,
+    /// a class extending the interface whose methods call the channel's
+    /// member functions (through module-level aliases: inside the class a
+    /// method's own name would name itself), and an object of it that the
+    /// ports bound to the channel hold. The interface's events alias the
+    /// events the channel's event functions return.
+    fn channel_items(&mut self) -> R<(Vec<ModuleItem>, Vec<Statement>)> {
+        let mut items = Vec::new();
+        let elab = Vec::new();
+        for ifc in self.implements.clone() {
+            let Some(isig) = self.lw.prog.user_classes.borrow().get(&ifc).cloned() else {
+                continue;
+            };
+            let cls = format!("__sc_ifc_{}", ifc.trim_start_matches("sc_c_"));
+            let obj = adapter_object(&ifc);
+            let mut citems = Vec::new();
+            for (mname, overloads) in &isig.methods {
+                if isig.events.contains(mname) {
+                    continue;
+                }
+                for ms in overloads {
+                    let Some(fsig) = self.lw.m.funcs.get(mname).cloned() else {
+                        return self.lw.err(
+                            ScSpan::default(),
+                            format!(
+                                "channel '{}' does not implement '{}' of '{}'",
+                                self.lw.m.name,
+                                mname,
+                                isig.cpp
+                            ),
+                        );
+                    };
+                    let alias = format!("__sc_chm_{}_{}", ifc.trim_start_matches("sc_c_"), ms.sv);
+                    let mut ports = Vec::new();
+                    let mut args = Vec::new();
+                    for (i, t) in ms.params.iter().enumerate() {
+                        let by_ref = ms.sig.by_ref.get(i).copied().unwrap_or(false);
+                        let dir = if by_ref {
+                            PortDirection::Ref
+                        } else {
+                            PortDirection::Input
+                        };
+                        // An override keeps the interface's argument names.
+                        let n = &ms.pnames[i];
+                        ports.push(fport(dir, sv_scalar_type(t), n));
+                        args.push(ident(n));
+                    }
+                    let returns = !matches!(ms.sig.ret, Ty::Void);
+                    if returns {
+                        ports.push(fport(PortDirection::Output, sv_scalar_type(&ms.sig.ret), "__sc_ret"));
+                    }
+                    // The class method calls the module alias.
+                    let mut call_args = args.clone();
+                    if returns {
+                        call_args.push(ident("__sc_ret"));
+                    }
+                    citems.push(class_task(
+                        task_decl(&ms.sv, ports.clone(), vec![expr_stmt(call_fn(&alias, call_args))]),
+                        true,
+                    ));
+                    // The alias calls the member function.
+                    let body = if fsig.is_task && returns {
+                        let mut a = args.clone();
+                        a.push(ident("__sc_ret"));
+                        vec![expr_stmt(call_fn(mname, a))]
+                    } else if returns {
+                        vec![assign(ident("__sc_ret"), call_fn(mname, args.clone()))]
+                    } else {
+                        vec![expr_stmt(call_fn(mname, args.clone()))]
+                    };
+                    items.push(ModuleItem::TaskDeclaration(task_decl(&alias, ports, body)));
+                }
+            }
+            items.push(ModuleItem::ClassDeclaration(class_decl(&cls, Some(&ifc), citems)));
+            items.push(data_decl(named_t(&cls, Vec::new()), &obj, Vec::new(), Some(new_obj(None))));
+            // Its events are triggered with the channel's (event_mirrors).
+        }
+        Ok((items, elab))
+    }
+
+    /// The interface objects' events to trigger with each channel event an
+    /// interface event function returns (`ModCtx::ev_mirrors`).
+    fn event_mirrors(&mut self) -> R<()> {
+        for ifc in self.implements.clone() {
+            let Some(isig) = self.lw.prog.user_classes.borrow().get(&ifc).cloned() else {
+                continue;
+            };
+            let obj = adapter_object(&ifc);
+            for e in &isig.events {
+                if e == "default_event" && !self.defines_member_function(e) {
+                    continue;
+                }
+                let ev = self.event_function_target(e)?;
+                let ExprKind::Ident(h) = &ev.kind else {
+                    return self.lw.err(
+                        ScSpan::default(),
+                        format!("'{}' must return an sc_event member of the channel", e),
+                    );
+                };
+                let Some(seg) = h.path.last() else { continue };
+                self.lw
+                    .m
+                    .ev_mirrors
+                    .entry(seg.name.name.clone())
+                    .or_default()
+                    .push(member(ident(&obj), &format!("__sc_ev_{}", e)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the module being lowered defines member function `f`.
+    fn defines_member_function(&self, f: &str) -> bool {
+        let in_class = self.lw.prog.classes.get(&self.lw.m.name).is_some_and(|(_, c, _)| {
+            c.members
+                .iter()
+                .any(|m| matches!(m, sc::Member::Method(fd) if fd.base_name() == f && fd.body.is_some()))
+        });
+        in_class
+            || self
+                .lw
+                .prog
+                .out_of_class
+                .get(&self.lw.m.name)
+                .is_some_and(|v| v.iter().any(|(_, fd)| fd.base_name() == f))
+    }
+
+    /// The event a channel's `const sc_event& f() const { return ev; }`
+    /// returns.
+    fn event_function_target(&mut self, f: &str) -> R<Expression> {
+        let class = self.lw.prog.classes.get(&self.lw.m.name).map(|(_, c, _)| *c);
+        let def = class.and_then(|c| {
+            c.members.iter().find_map(|m| match m {
+                sc::Member::Method(fd) if fd.base_name() == f && fd.body.is_some() => Some(fd),
+                _ => None,
+            })
+        });
+        let def = def.or_else(|| {
+            self.lw
+                .prog
+                .out_of_class
+                .get(&self.lw.m.name)
+                .and_then(|v| v.iter().find(|(_, fd)| fd.base_name() == f).map(|(_, fd)| *fd))
+        });
+        let ret_expr = def
+            .and_then(|fd| fd.body.as_ref())
+            .and_then(|b| match b.stmts.as_slice() {
+                [sc::Stmt::Return(Some(e), _)] => Some(e.clone()),
+                _ => None,
+            });
+        match ret_expr {
+            Some(e) => match self.lw.expr(&e)? {
+                (x, Ty::Event) => Ok(x),
+                _ => self.lw.err(e.span, format!("'{}' must return an sc_event of the channel", f)),
+            },
+            None => self.lw.err(
+                ScSpan::default(),
+                format!("'{}' of channel '{}' must be `return <event>;`", f, self.lw.m.name),
+            ),
+        }
     }
 
     /// A default-constructed object of a user class (a signal's or port's
@@ -2492,6 +3061,8 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             .map(|s| assign(ident(&edge_flag_name(p.index, s)), sized(1, 0)))
             .collect();
         let mut body = self.start_wait();
+        // Port sensitivities find their channel's event.
+        body.extend(p.sens.iter().filter_map(|t| t.setup.clone()));
         if self.lw.m.needs_pid {
             body.insert(
                 0,
@@ -2558,6 +3129,11 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         items.push(initial(block(body)));
         items
     }
+}
+
+/// The adapter object a channel holds for interface `ifc` (SV class).
+pub fn adapter_object(ifc: &str) -> String {
+    format!("__sc_ifo_{}", ifc.trim_start_matches("sc_c_"))
 }
 
 fn is_time_unit(e: &sc::Expr) -> bool {
@@ -2825,7 +3401,11 @@ fn blocking_functions(lw: &Lw, defs: &[(usize, &sc::FunctionDecl)]) -> BTreeSet<
                         }
                         sc::ExprKind::Member { base, name, .. } => {
                             let m = name.ident.name.as_str();
-                            let sym = base.as_name().and_then(|q| lw.m.syms.get(q.last_name()));
+                            let target = match &base.kind {
+                                sc::ExprKind::Index { base: b, .. } => b.as_ref(),
+                                _ => base.as_ref(),
+                            };
+                            let sym = target.as_name().and_then(|q| lw.m.syms.get(q.last_name()));
                             match sym.map(|s| &s.kind) {
                                 Some(SymKind::Fifo | SymKind::FifoIn | SymKind::FifoOut)
                                     if matches!(m, "read" | "write") =>
@@ -2833,7 +3413,25 @@ fn blocking_functions(lw: &Lw, defs: &[(usize, &sc::FunctionDecl)]) -> BTreeSet<
                                     blocks = true
                                 }
                                 Some(SymKind::InitSocket) if m == "b_transport" => blocks = true,
+                                // Interface methods are tasks (§5.12).
+                                Some(SymKind::Port(_) | SymKind::Export(_))
+                                    if !matches!(m, "size" | "bind") =>
+                                {
+                                    blocks = true
+                                }
                                 _ => {}
+                            }
+                            // sc_mutex::lock, sc_semaphore::wait.
+                            if let Some(sym) = sym
+                                && matches!((&sym.ty, m), (Ty::Class(c), "lock") if c == "scrt_mutex")
+                                    | matches!((&sym.ty, m), (Ty::Class(c), "wait") if c == "scrt_semaphore")
+                            {
+                                blocks = true;
+                            }
+                            // A member function of a user-class object that
+                            // may block.
+                            if lw.prog.blocking_methods.borrow().contains(m) {
+                                blocks = true;
                             }
                             let _ = args;
                         }

@@ -182,6 +182,15 @@ fn runtime_package(text: &str) -> Result<Description, String> {
         .ok_or_else(|| "SystemC runtime is empty".to_string())
 }
 
+/// The items of a package written as text (generated runtime support), its
+/// spans moved into the synthetic range.
+pub(super) fn package_items(text: &str) -> Result<Vec<crate::ast::decl::PackageItem>, String> {
+    match runtime_package(&format!("package __sc_text;\n{}\nendpackage\n", text))? {
+        Description::Package(p) => Ok(p.items),
+        _ => Err("generated SystemC support is not a package".to_string()),
+    }
+}
+
 /// Lower the configured SystemC sources and append them to `descriptions`.
 /// Returns the top module to use when none was named (`sc_main`).
 pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, String> {
@@ -221,9 +230,7 @@ pub fn inject(descriptions: &mut Vec<Description>) -> Result<Option<String>, Str
     )> = prog
         .classes
         .iter()
-        .filter(|(n, (_, c, _))| {
-            (c.sc_module || prog.foreign.contains_key(*n)) && !lw.env.templates.contains_key(*n)
-        })
+        .filter(|(n, _)| prog.is_module(n) && !lw.env.templates.contains_key(*n))
         .map(|(n, (tu, c, tp))| (n.clone(), *tu, *c, tp.clone(), Bindings::new()))
         .collect();
     let instances = lw.env.instances.borrow().clone();
@@ -406,5 +413,26 @@ fn const_int(e: &scfront::ast::Expr, consts: &BTreeMap<String, i64>) -> Option<i
         }
         K::Paren(x) => const_int(x, consts),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime package, with generated nettypes, parses as
+    /// SystemVerilog (a keyword used as a name breaks every design).
+    #[test]
+    fn runtime_package_parses() {
+        let widths = [1u32, 4].into_iter().collect();
+        let r = runtime_package(&runtime_text(&widths));
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+
+    /// A generated port class parses.
+    #[test]
+    fn port_class_parses() {
+        let r = package_items(&classes::port_class_for_test("sc_c_bus_if"));
+        assert!(r.is_ok(), "{:?}", r.err());
     }
 }

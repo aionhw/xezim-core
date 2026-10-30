@@ -11,11 +11,29 @@ package sc_rt;
   // `scrt_stopped`, which ends a pending sc_start in sc_main.
   bit scrt_started;
   bit scrt_stopped;
+  // A zero-time wait or notification (§4.2.1.3) takes effect in the next
+  // delta cycle, after the update phase: the NBA region, where `->>`
+  // triggers follow the signal updates.
+  event scrt_delta_ev;
+  task automatic scrt_wait(longint unsigned t);
+    if (t == 0) begin
+      ->> scrt_delta_ev;
+      @(scrt_delta_ev);
+    end else
+      #(t);
+  endtask
   // sc_stop() from a process: the kernel stops (and reports it) at the end
   // of the current delta cycle.
   bit scrt_stop_req;
   // sc_time_stamp() as seen by sc_main while the simulation is paused.
   longint unsigned scrt_tb_now;
+  // sc_main runs between two sc_start calls (a bounded sc_start pauses
+  // 1 ps before its end time): module code it calls sees scrt_tb_now.
+  bit scrt_paused;
+
+  function automatic longint unsigned scrt_now();
+    return scrt_paused ? scrt_tb_now : $time;
+  endfunction
 
   // sc_time::to_string(): the value in the largest unit in which it is an
   // integer, "0 s" for zero (SystemC 2.3, resolution 1 ps).
@@ -65,6 +83,186 @@ package sc_rt;
       if (path[i] == ".") return path.substr(i + 1, path.len() - 1);
     return path;
   endfunction
+
+  // ---- C rand()/srand(): glibc's generator, so runs match the C program ---
+  // The additive feedback generator glibc's random_r uses (TYPE_3, degree
+  // 31, separation 3): 34 values of state, seeded through 16807 * x mod
+  // 2^31 - 1 and stepped 310 times; each rand() is the next sum >> 1.
+  int scrt_rand_r[34];
+  int scrt_rand_k;
+  bit scrt_rand_seeded;
+
+  function automatic void scrt_srand(int unsigned seed);
+    int t[344];
+    longint w;
+    if (seed == 0) seed = 1;
+    t[0] = seed;
+    for (int i = 1; i < 31; i++) begin
+      w = (64'sd16807 * t[i - 1]) % 64'sd2147483647;
+      if (w < 0) w += 64'sd2147483647;
+      t[i] = int'(w);
+    end
+    for (int i = 31; i < 34; i++) t[i] = t[i - 31];
+    for (int i = 34; i < 344; i++) t[i] = t[i - 31] + t[i - 3];
+    for (int i = 0; i < 34; i++) scrt_rand_r[i] = t[310 + i];
+    scrt_rand_k = 0;
+    scrt_rand_seeded = 1;
+  endfunction
+
+  function automatic int scrt_rand();
+    int v;
+    if (!scrt_rand_seeded) scrt_srand(1);
+    v = scrt_rand_r[(scrt_rand_k + 3) % 34] + scrt_rand_r[(scrt_rand_k + 31) % 34];
+    scrt_rand_r[scrt_rand_k] = v;
+    scrt_rand_k = (scrt_rand_k + 1) % 34;
+    return int'(int unsigned'(v) >> 1);
+  endfunction
+
+  // ---- ports and exports of user interfaces (§5.12, §5.14) ----------------
+  // Every port and export object registers here; at the end of elaboration
+  // (the first sc_start) one bound to nothing is error E109, as the
+  // reference kernel reports it.
+  virtual class scrt_port_base;
+    string name;
+    bit is_export;
+    pure virtual function int nbound();
+  endclass
+
+  scrt_port_base scrt_ports[$];
+
+  function automatic void scrt_check_bindings();
+    foreach (scrt_ports[i])
+      if (scrt_ports[i].nbound() == 0) begin
+        string k = scrt_ports[i].is_export ? "export" : "port";
+        $write("\nError: (E109) complete binding failed: %s not bound: %s '%s' (sc_%s)\nIn file: communication/sc_%s.cpp:%0d\n",
+               k, k, scrt_ports[i].name, k, k, scrt_ports[i].is_export ? 137 : 235);
+        $__sc_exit(1);
+        return;
+      end
+  endfunction
+
+  // ---- sc_fifo (§6.23) -------------------------------------------------------
+  // As the reference kernel: a value written becomes readable, and the space
+  // a read frees writable, only in the update phase. `readable` is the count
+  // of the last update; `nread`/`nwritten` count this delta's accesses. Each
+  // access schedules the update as nonblocking assignments (the update phase
+  // is the NBA region): the last one of the delta sets the final count, and
+  // the data events trigger after it.
+  class scrt_fifo #(type T = int);
+    T items[$];
+    int size;
+    int readable;
+    int nread;
+    int nwritten;
+    event written_ev;
+    event read_ev;
+    function new(int n = 16); size = n; endfunction
+    function void request_update(bit wrote);
+      readable <= items.size();
+      nread <= 0;
+      nwritten <= 0;
+      if (wrote) ->> written_ev;
+      else ->> read_ev;
+    endfunction
+    function int num(); return readable - nread; endfunction
+    function int num_free(); return size - readable - nwritten; endfunction
+    task put(T v);
+      while (num_free() == 0) @(read_ev);
+      items.push_back(v);
+      nwritten++;
+      request_update(1);
+    endtask
+    task get(output T v);
+      while (num() == 0) @(written_ev);
+      v = items.pop_front();
+      nread++;
+      request_update(0);
+    endtask
+    function bit try_put(T v);
+      if (num_free() == 0) return 0;
+      items.push_back(v);
+      nwritten++;
+      request_update(1);
+      return 1;
+    endfunction
+    function bit try_get(output T v);
+      if (num() == 0) return 0;
+      v = items.pop_front();
+      nread++;
+      request_update(0);
+      return 1;
+    endfunction
+  endclass
+
+  // ---- sc_mutex, sc_semaphore, sc_event_queue (§6.27–§6.29) ----------------
+  // As the reference kernel: a mutex belongs to the process that locked it
+  // (locking it again returns at once), unlock by another process fails,
+  // and releasing notifies the waiters immediately.
+  class scrt_mutex;
+    process owner;
+    event free_ev;
+    task lock(output int r);
+      if (owner != null && owner == process::self()) begin r = 0; return; end
+      while (owner != null) @(free_ev);
+      owner = process::self();
+      r = 0;
+    endtask
+    function int trylock();
+      if (owner != null && owner == process::self()) return 0;
+      if (owner != null) return -1;
+      owner = process::self();
+      return 0;
+    endfunction
+    function int unlock();
+      if (owner == null || owner != process::self()) return -1;
+      owner = null;
+      -> free_ev;
+      return 0;
+    endfunction
+  endclass
+
+  class scrt_semaphore;
+    int value;
+    event free_ev;
+    function new(int n = 1); value = n; endfunction
+    task wait_(output int r);
+      while (value <= 0) @(free_ev);
+      value--;
+      r = 0;
+    endtask
+    function int trywait();
+      if (value <= 0) return -1;
+      value--;
+      return 0;
+    endfunction
+    function int post();
+      value++;
+      -> free_ev;
+      return 0;
+    endfunction
+    function int get_value(); return value; endfunction
+  endclass
+
+  // Every notify() is an event of its own at its time; cancel_all() drops
+  // the pending ones.
+  class scrt_event_queue;
+    event ev;
+    int gen;
+    function void notify(longint unsigned t);
+      int g = gen;
+      if (t == 0) begin
+        ->> ev;
+        return;
+      end
+      fork
+        begin
+          #(t);
+          if (g == gen) -> ev;
+        end
+      join_none
+    endfunction
+    function void cancel_all(); gen++; endfunction
+  endclass
 
   // ---- byte-addressable memory for C++ pointers ----------------------------
   // An object whose address the C++ code takes is "boxed": stored in one of
@@ -151,6 +349,16 @@ package sc_rt;
       for (int k = 0; k < 8; k++) set8(i + k, v[k*8 +: 8]);
     endfunction
   endclass
+
+  // `new T[n]` of a scalar type: an array of n elements of `bytes` bytes.
+  function automatic scrt_ptr scrt_new_array(int unsigned bytes, longint n);
+    case (bytes)
+      1: begin scrt_arr8 a = new(n); return scrt_ptr::mk(a, 0); end
+      2: begin scrt_arr16 a = new(n); return scrt_ptr::mk(a, 0); end
+      4: begin scrt_arr32 a = new(n); return scrt_ptr::mk(a, 0); end
+      default: begin scrt_arr64 a = new(n); return scrt_ptr::mk(a, 0); end
+    endcase
+  endfunction
 
   function automatic void scrt_memcpy(scrt_ptr d, scrt_ptr s, longint n);
     byte unsigned tmp[];

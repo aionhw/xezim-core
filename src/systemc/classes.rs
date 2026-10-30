@@ -54,6 +54,11 @@ pub struct MethodSig {
     /// The SV method name (overloads are told apart by arity).
     pub sv: String,
     pub sig: FnSig,
+    /// The parameter types and whether each is passed by (non-const)
+    /// reference.
+    pub params: Vec<Ty>,
+    /// Their SV names (as the lowered method declares them).
+    pub pnames: Vec<String>,
     /// Parameters without and with their defaults.
     pub min_args: usize,
     pub max_args: usize,
@@ -90,6 +95,14 @@ pub struct ClassSig {
     pub ops: BTreeMap<String, OpImpl>,
     /// `operator<<(ostream&, const T&)`: the package function formatting it.
     pub fmt: Option<String>,
+    /// An interface (§5.13, derived from `sc_interface`): its methods are
+    /// tasks (an implementation may block), and ports of it are objects of
+    /// the class `__sc_port__<name>`.
+    pub is_interface: bool,
+    /// Member functions returning an event (`const sc_event&
+    /// default_event()`): an interface holds each as an event property
+    /// (`__sc_ev_<name>`) its channel aliases to the event it returns.
+    pub events: BTreeSet<String>,
 }
 
 impl ClassSig {
@@ -141,6 +154,12 @@ fn library_class(n: &str) -> bool {
     n.starts_with("sc_") || n.starts_with("tlm_") || n.starts_with("peq_")
 }
 
+/// `sc_interface`, the root of every interface (§5.13): an interface class
+/// derives from it (virtually).
+fn is_sc_interface(n: &str) -> bool {
+    n == "sc_interface"
+}
+
 /// A user class to lower: a plain class, or an instantiation of a class
 /// template.
 #[derive(Debug, Clone)]
@@ -161,7 +180,10 @@ pub struct UserClass<'a> {
 /// Whether a class is plain data or behaviour: not a module, and not
 /// derived from a library class.
 pub fn is_plain(c: &sc::ClassDecl) -> bool {
-    !c.sc_module && !c.bases.iter().any(|b| library_class(b.name.last_name()))
+    !c.sc_module
+        && !c.bases.iter().any(|b| {
+            library_class(b.name.last_name()) && !is_sc_interface(b.name.last_name())
+        })
 }
 
 /// The user classes to lower: plain classes and structs (not foreign
@@ -208,12 +230,18 @@ pub fn user_classes<'a>(lw: &mut Lw<'a>) -> Vec<UserClass<'a>> {
     let saved = std::mem::take(&mut lw.env.tparams);
     for uc in cands.values_mut() {
         lw.env.tparams = uc.bindings.clone();
-        uc.base = uc.decl.bases.first().map(|b| {
-            instantiate(&b.name, &lw.env, &|e| lw.const_eval(e))
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| b.name.last_name().to_string())
-        });
+        // `sc_interface` is no base of the SV class.
+        uc.base = uc
+            .decl
+            .bases
+            .iter()
+            .find(|b| !is_sc_interface(b.name.last_name()))
+            .map(|b| {
+                instantiate(&b.name, &lw.env, &|e| lw.const_eval(e))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| b.name.last_name().to_string())
+            });
     }
     lw.env.tparams = saved;
     // Drop classes whose bases are not lowered themselves.
@@ -417,11 +445,19 @@ fn class_signature(
                     methods: inherited.methods,
                     ops: inherited.ops,
                     fmt: inherited.fmt,
+                    is_interface: inherited.is_interface,
+                    events: inherited.events,
                     ..Default::default()
                 }
             }
             None => ClassSig::default(),
         };
+        sig.is_interface |= c.bases.iter().any(|b| is_sc_interface(b.name.last_name()));
+        // sc_interface::default_event() (§5.13): every interface has it; a
+        // channel defining it sets the event.
+        if sig.is_interface {
+            sig.events.insert("default_event".to_string());
+        }
         sig.cpp = name.clone();
         sig.sv = sv.clone();
         sig.base = base.as_deref().map(class_sv);
@@ -460,10 +496,33 @@ fn class_signature(
                 } else {
                     base_sv
                 };
-                let fsig = fn_sig(lw, f, blocking.contains(&(name.clone(), mname.clone())))?;
+                let mut fsig =
+                    fn_sig(lw, f, blocking.contains(&(name.clone(), mname.clone())))?;
+                if sig.is_interface {
+                    // An implementation may block: interface methods are
+                    // tasks; one returning an event is an event property.
+                    fsig.is_task = true;
+                    if matches!(fsig.ret, Ty::Event) {
+                        sig.events.insert(mname.clone());
+                    }
+                }
+                let mut ptys = Vec::new();
+                let mut pnames = Vec::new();
+                for (i, p) in f.params.iter().enumerate() {
+                    if !is_ostream(&p.ty) {
+                        ptys.push(lw.ty(&p.ty, p.span)?);
+                        pnames.push(
+                            p.name
+                                .as_ref()
+                                .map_or_else(|| format!("__sc_arg{}", i), |n| escape_sv(&n.name)),
+                        );
+                    }
+                }
                 overloads.push(MethodSig {
                     sv: sv_name,
                     sig: fsig,
+                    params: ptys,
+                    pnames,
                     min_args: f.params.iter().filter(|p| p.default.is_none()).count(),
                     max_args: f.params.len(),
                     is_static: f.specifiers.is_static,
@@ -681,7 +740,25 @@ pub fn package(lw: &mut Lw, classes: &[UserClass]) -> Option<Description> {
         lw.tu = uc.tu;
         lw.env.tparams = uc.bindings.clone();
         match lower_class(lw, uc, &statics) {
-            Ok(cd) => items.push(PackageItem::Class(cd)),
+            Ok(cd) => {
+                items.push(PackageItem::Class(cd));
+                let is_if = lw
+                    .prog
+                    .user_classes
+                    .borrow()
+                    .get(&class_sv(&uc.name))
+                    .is_some_and(|s| s.is_interface);
+                if is_if {
+                    match super::package_items(&port_class(&class_sv(&uc.name))) {
+                        Ok(v) => items.extend(v),
+                        Err(m) => lw.record(LowerError {
+                            tu: uc.tu,
+                            span: uc.decl.span,
+                            msg: m,
+                        }),
+                    }
+                }
+            }
             Err(e) => lw.record(e),
         }
     }
@@ -711,6 +788,55 @@ pub fn package(lw: &mut Lw, classes: &[UserClass]) -> Option<Description> {
         endlabel: None,
         span: sp(),
     }))
+}
+
+/// The port class of an interface: `sc_port<IF, N>` and `sc_export<IF>`
+/// are objects of it (§5.12, §5.14). A binding names a channel (its
+/// adapter object for the interface) or another port or export, followed
+/// when the port is used, so bindings may be made in any order.
+pub fn port_class_name(iface: &str) -> String {
+    format!("__sc_port__{}", iface.trim_start_matches("sc_c_"))
+}
+
+#[cfg(test)]
+pub fn port_class_for_test(iface: &str) -> String {
+    port_class(iface)
+}
+
+fn port_class(iface: &str) -> String {
+    let p = port_class_name(iface);
+    format!(
+        "class {p} extends scrt_port_base;
+  {iface} ch[$];
+  {p} up[$];
+  int order[$];
+  {iface} res[$];
+  bit done;
+  function new(string n = \"\", bit ex = 0); name = n; is_export = ex; scrt_ports.push_back(this); endfunction
+  virtual function int nbound(); return order.size(); endfunction
+  function void bind_ch({iface} c); order.push_back(ch.size()); ch.push_back(c); done = 0; endfunction
+  function void bind_up({p} q); order.push_back(-(up.size() + 1)); up.push_back(q); done = 0; endfunction
+  function void all(ref {iface} out[$]);
+    foreach (order[k])
+      if (order[k] >= 0) out.push_back(ch[order[k]]);
+      else up[-order[k] - 1].all(out);
+  endfunction
+  function {iface} get(int i = 0);
+    if (!done) begin res.delete(); all(res); done = 1; end
+    if (i < 0 || i >= res.size()) begin
+      $write(\"\\nError: (E112) get interface failed: port is not bound: port '%s' (sc_port)\\n\", name);
+      $__sc_exit(1);
+      return null;
+    end
+    return res[i];
+  endfunction
+  function int size();
+    if (!done) begin res.delete(); all(res); done = 1; end
+    return res.size();
+  endfunction
+endclass
+"
+    )
 }
 
 /// `int T::count = 0;` — the initial values of static members.
@@ -758,7 +884,12 @@ fn enter_class(lw: &mut Lw, sig: &ClassSig) {
         syms.insert(
             n.clone(),
             Sym {
-                kind: SymKind::Var,
+                // An sc_event member is an event (notify, wait).
+                kind: if matches!(f.ty, Ty::Event) {
+                    SymKind::Event
+                } else {
+                    SymKind::Var
+                },
                 ty: f.ty.clone(),
                 sv: escape_sv(n),
             },
@@ -848,6 +979,22 @@ fn lower_class(
             span: sp(),
         }));
     }
+    // An interface's events, aliased by the channel implementing it.
+    for e in &sig.events {
+        let inherited = sig
+            .base
+            .as_ref()
+            .and_then(|b| lw.prog.user_classes.borrow().get(b).map(|bs| bs.events.contains(e)))
+            .unwrap_or(false);
+        if !inherited {
+            items.push(ClassItem::Property(ClassProperty {
+                qualifiers: Vec::new(),
+                data_type: simple_t(crate::ast::types::SimpleType::Event),
+                declarators: vec![var_declarator(&format!("__sc_ev_{}", e), Vec::new(), None)],
+                span: sp(),
+            }));
+        }
+    }
     // `new` allocates the member objects (construction is __sc_init).
     let mut alloc = Vec::new();
     for f in &sig.own_fields {
@@ -897,6 +1044,9 @@ fn lower_class(
     ));
     // Member functions.
     for (t, f) in member_defs(lw.prog, cpp, tu, c) {
+        if sig.events.contains(f.base_name()) {
+            continue;
+        }
         if f.body.is_none() {
             // Pure virtual or declared only: a virtual method that does
             // nothing (C++ cannot call it).

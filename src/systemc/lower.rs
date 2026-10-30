@@ -47,6 +47,10 @@ pub enum SymKind {
     Const(i64),
     /// A `sc_trace_file*`: tracing maps onto `$dumpvars`.
     TraceFile,
+    /// `sc_port<IF>` / `sc_export<IF>` of a user interface (its SV class):
+    /// an object of the interface's port class (§5.12, §5.14).
+    Port(String),
+    Export(String),
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +94,9 @@ pub struct SensTerm {
     /// '1' or '0' (§6.8.4), not SystemVerilog's 0→z or 1→x as well.
     pub iff: Option<Expression>,
     pub name: String,
+    /// Run when the process starts, before it first waits: a port's
+    /// channel is known once the bindings are made.
+    pub setup: Option<Statement>,
 }
 
 impl SensTerm {
@@ -99,6 +106,7 @@ impl SensTerm {
             expr,
             iff: None,
             name,
+            setup: None,
         }
     }
 
@@ -111,6 +119,7 @@ impl SensTerm {
             iff: Some(bin(BinaryOp::CaseEq, expr.clone(), lvl)),
             expr,
             name,
+            setup: None,
         }
     }
 
@@ -174,6 +183,10 @@ pub struct ModCtx {
     /// Signals two or more of the module's processes write, with the
     /// default writer policy (§6.4.4): each write checks its writer (E115).
     pub one_writer: BTreeSet<String>,
+    /// A channel's events that an interface event function returns: the
+    /// interface objects' events triggered with each (an event property
+    /// cannot alias a module event).
+    pub ev_mirrors: BTreeMap<String, Vec<Expression>>,
     /// Registered processes: (function name, kind).
     pub proc_names: Vec<(String, sc::ProcessKind)>,
     /// Whether a write site needed the running process's identity at run
@@ -181,6 +194,10 @@ pub struct ModCtx {
     pub needs_pid: bool,
     /// Lowering a user class's member functions: its SV name (`this`).
     pub class: Option<String>,
+    /// sc_main's module objects held by value (destroyed when it returns).
+    pub tb_values: Vec<String>,
+    /// A primitive channel requested its update phase (`request_update()`).
+    pub uses_update: bool,
     /// Input ports some instance binds to an sc_buffer: port → the hidden
     /// input carrying the buffer's write count (§6.9).
     pub port_counters: BTreeMap<String, String>,
@@ -250,6 +267,26 @@ const TIME_UNITS: &[(&str, f64)] = &[
     ("SC_MS", 1e9),
     ("SC_SEC", 1e12),
 ];
+
+/// The operands of an event AND-list `e1 & e2 & …` (at least two).
+fn and_list(e: &sc::Expr) -> Option<Vec<&sc::Expr>> {
+    fn flat<'a>(e: &'a sc::Expr, out: &mut Vec<&'a sc::Expr>) {
+        match &e.kind {
+            sc::ExprKind::Binary {
+                op: sc::BinaryOp::BitAnd,
+                lhs,
+                rhs,
+            } => {
+                flat(lhs, out);
+                flat(rhs, out);
+            }
+            _ => out.push(e),
+        }
+    }
+    let mut v = Vec::new();
+    flat(e, &mut v);
+    (v.len() > 1).then_some(v)
+}
 
 fn time_unit(e: &sc::Expr) -> Option<f64> {
     let q = e.as_name()?;
@@ -785,6 +822,143 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// A library channel object (`sc_mutex`, `sc_semaphore`,
+    /// `sc_event_queue`, §6.27–§6.29) built from its declaration's
+    /// arguments: a name, and a semaphore's count.
+    pub fn lib_object_new(&mut self, ty: &Ty, args: &[sc::Expr]) -> R<Option<Expression>> {
+        let Ty::Class(c) = ty else { return Ok(None) };
+        match c.as_str() {
+            "scrt_mutex" | "scrt_event_queue" => Ok(Some(new_obj(None))),
+            "scrt_semaphore" => {
+                let n = args
+                    .iter()
+                    .rev()
+                    .find(|a| !matches!(a.kind, sc::ExprKind::StringLit { .. }));
+                let Some(n) = n else {
+                    return self.err(
+                        args.first().map_or(ScSpan::default(), |a| a.span),
+                        "an sc_semaphore needs its initial count",
+                    );
+                };
+                let x = self.expr(n)?.0;
+                Ok(Some(new_obj(Some(vec![x]))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Member functions of the library channels.
+    fn lib_channel_call(
+        &mut self,
+        b: Expression,
+        c: &str,
+        m: &str,
+        args: &[sc::Expr],
+        span: ScSpan,
+    ) -> R<(Expression, Ty)> {
+        let task = |lw: &mut Self, sv: &str| -> (Expression, Ty) {
+            lw.f.is_task = true;
+            let t = lw.temp(&Ty::int32());
+            lw.pre.push(expr_stmt(method(b.clone(), sv, vec![ident(&t)])));
+            (ident(&t), Ty::int32())
+        };
+        Ok(match (c, m, args.len()) {
+            ("scrt_mutex", "lock", 0) => task(self, "lock"),
+            ("scrt_mutex", "trylock" | "unlock", 0) => (method(b, m, vec![]), Ty::int32()),
+            ("scrt_semaphore", "wait", 0) => task(self, "wait_"),
+            ("scrt_semaphore", "trywait" | "post" | "get_value", 0) => (method(b, m, vec![]), Ty::int32()),
+            ("scrt_event_queue", "notify", _) => {
+                let t = match args {
+                    [t] => self.expr(t)?.0,
+                    [v, u] => self.time_value(v, u, span)?,
+                    _ => return self.err(span, "notify(time) or notify(value, unit) expected"),
+                };
+                (method(b, "notify", vec![t]), Ty::Void)
+            }
+            ("scrt_event_queue", "cancel_all", 0) => (method(b, "cancel_all", vec![]), Ty::Void),
+            ("scrt_event_queue", "default_event", 0) => (member(b, "ev"), Ty::Event),
+            _ => return self.err(span, format!("'{}' is not a member function of this channel", m)),
+        })
+    }
+
+    /// `obj.m(args)` on an object of the user class `cls`; a member function
+    /// that may block is a task returning through an output argument.
+    pub fn object_call(
+        &mut self,
+        obj: Expression,
+        cls: &str,
+        m: &str,
+        mut xs: Vec<Expression>,
+        span: ScSpan,
+    ) -> R<(Expression, Ty)> {
+        let sig = self.prog.user_classes.borrow().get(cls).cloned();
+        let Some(sig) = sig else {
+            return self.err(span, "not a class");
+        };
+        let Some(ms) = sig.method(m, xs.len()).cloned() else {
+            return self.err(
+                span,
+                format!(
+                    "'{}' has no member function '{}' taking {} arguments",
+                    sig.cpp,
+                    m,
+                    xs.len()
+                ),
+            );
+        };
+        if ms.sig.is_task {
+            self.f.is_task = true;
+            if !matches!(ms.sig.ret, Ty::Void) {
+                let t = self.temp(&ms.sig.ret);
+                xs.push(ident(&t));
+                self.pre.push(expr_stmt(method(obj, &ms.sv, xs)));
+                return Ok((ident(&t), ms.sig.ret.clone()));
+            }
+        }
+        Ok((method(obj, &ms.sv, xs), ms.sig.ret.clone()))
+    }
+
+    /// A port or export of a user interface `e` names (`p`, `p[i]`): the
+    /// SV object, the interface and the index of the channel.
+    pub fn port_ref(&self, e: &sc::Expr) -> Option<(Expression, String, Option<sc::Expr>)> {
+        let (e, idx) = match &e.kind {
+            sc::ExprKind::Index { base, index } => (base.as_ref(), Some((**index).clone())),
+            _ => (e, None),
+        };
+        match &e.kind {
+            sc::ExprKind::Name(q) if q.segments.len() == 1 => {
+                let sym = self.lookup(q.last_name())?;
+                match sym.kind {
+                    SymKind::Port(i) | SymKind::Export(i) => Some((ident(&sym.sv), i, idx)),
+                    _ => None,
+                }
+            }
+            // A child's port or export (`top.exp->f()` in sc_main).
+            sc::ExprKind::Member { base, name, .. } => {
+                let q = base.as_name()?;
+                let sym = self.lookup(q.last_name())?;
+                let SymKind::Instance(module) = &sym.kind else {
+                    return None;
+                };
+                let Some(Ty::Class(pc)) = self.prog.module_member_ty(module, &name.ident.name) else {
+                    return None;
+                };
+                let ifc = format!("sc_c_{}", pc.strip_prefix("__sc_port__")?);
+                Some((member(ident(&sym.sv), &name.ident.name), ifc, idx))
+            }
+            _ => None,
+        }
+    }
+
+    /// The channel interface a port or export reaches: `p.get(i)`.
+    pub fn port_channel(&mut self, obj: &Expression, idx: Option<&sc::Expr>) -> R<Expression> {
+        let i = match idx {
+            Some(e) => self.expr(e)?.0,
+            None => int(0),
+        };
+        Ok(method(obj.clone(), "get", vec![i]))
+    }
+
     /// `T::__sc_make<k>(args)`: a new object of the user class `cls`.
     pub fn make_object(&mut self, cls: &str, args: &[sc::Expr], span: ScSpan) -> R<Expression> {
         let sig = self.prog.user_classes.borrow().get(cls).cloned();
@@ -1035,6 +1209,22 @@ impl<'a> Lw<'a> {
                 let x = self.make_object(&cls, args.as_deref().unwrap_or(&[]), span)?;
                 Ok((x, Ty::Handle(cls)))
             }
+            // `new T[n]` of a scalar type: a data pointer to a new array.
+            K::New {
+                ty,
+                array_size: Some(n),
+                ..
+            } => {
+                let elem = self.ty(ty, span)?;
+                let Some(bytes) = elem.byte_size().filter(|_| elem.is_scalar_bits() || matches!(elem, Ty::Bool)) else {
+                    return self.err(span, "'new[]' of this type is not supported");
+                };
+                let (n, _) = self.expr(n)?;
+                Ok((
+                    call_fn("scrt_new_array", vec![int(bytes as i64), n]),
+                    Ty::Ptr { elem: bytes as u32 },
+                ))
+            }
             // `new tlm_generic_payload`: an object of a runtime class.
             K::New {
                 ty,
@@ -1069,6 +1259,9 @@ impl<'a> Lw<'a> {
         }
         match path.as_str() {
             "SC_ZERO_TIME" => return Ok((u64_lit(0), Ty::Time)),
+            // glibc's.
+            "RAND_MAX" => return Ok((int(2147483647), Ty::int32())),
+            "NULL" => return Ok((null(), Ty::Ptr { elem: 1 })),
             "SC_LOGIC_0" => return Ok((sized(1, 0), Ty::Vec4 { w: Width::known(1) })),
             "SC_LOGIC_1" => return Ok((sized(1, 1), Ty::Vec4 { w: Width::known(1) })),
             "SC_LOGIC_X" => {
@@ -1150,8 +1343,38 @@ impl<'a> Lw<'a> {
         match op {
             U::AddrOf => self.address_of(operand, span),
             U::Deref => {
+                // `*s++` on a C string (`const char*`): its first character,
+                // and the string then starts one later.
+                let ch = Ty::Int {
+                    bits: 8,
+                    signed: true,
+                    ch: true,
+                };
+                if let sc::ExprKind::Postfix {
+                    op: sc::PostfixOp::Inc,
+                    operand: inner,
+                } = &operand.kind
+                {
+                    let saved = self.pre.len();
+                    if let Ok((sx, Ty::Str)) = self.expr(inner) {
+                        let t = self.temp(&ch);
+                        self.pre.push(assign(ident(&t), index(sx.clone(), int(0))));
+                        let rest = method(
+                            sx.clone(),
+                            "substr",
+                            vec![int(1), bin(BinaryOp::Sub, method(sx, "len", vec![]), int(1))],
+                        );
+                        let store = self.store(inner, rest, span)?;
+                        self.pre.extend(store);
+                        return Ok((ident(&t), ch));
+                    }
+                    self.pre.truncate(saved);
+                }
                 // `*reinterpret_cast<T*>(p)` / `*p`: read through a data pointer.
                 let (p, t) = self.expr(operand)?;
+                if matches!(t, Ty::Str) {
+                    return Ok((index(p, int(0)), ch));
+                }
                 match t {
                     Ty::Ptr { elem } => Ok((ptr_get(p, int(0), elem), ptr_elem_ty(elem))),
                     // `*p` is the object the pointer points to.
@@ -1642,7 +1865,7 @@ impl<'a> Lw<'a> {
                 if self.m.tb {
                     (ident("scrt_tb_now"), Ty::Time)
                 } else {
-                    (sys("$time", vec![]), Ty::Time)
+                    (call_fn("scrt_now", vec![]), Ty::Time)
                 }
             }
             ("sc_simulation_time", 0) => (
@@ -1697,11 +1920,9 @@ impl<'a> Lw<'a> {
                 ),
                 Ty::int32(),
             ),
-            ("rand", 0) => (
-                bin(BinaryOp::BitAnd, sys("$urandom", vec![]), int(0x7fff_ffff)),
-                Ty::int32(),
-            ),
-            ("srand", 1) => (sys("$urandom", vec![a[0].0.clone()]), Ty::Void),
+            // C's rand()/srand(): glibc's sequence, as the C program has.
+            ("rand", 0) => (call_fn("scrt_rand", vec![]), Ty::int32()),
+            ("srand", 1) => (call_fn("scrt_srand", vec![a[0].0.clone()]), Ty::Void),
             ("abs" | "labs" | "llabs", 1) => {
                 let x = first(0).expect("one arg");
                 (
@@ -1826,6 +2047,33 @@ impl<'a> Lw<'a> {
         {
             return Ok((n, Ty::Str));
         }
+        // A port or export of a user interface (§5.12): `p->m(args)` calls
+        // the channel; `size()` and `get_interface()` are the port's own.
+        if let Some((obj, ifc, idx)) = self.port_ref(base) {
+            match (m, args.len()) {
+                ("size", 0) => return Ok((method(obj, "size", vec![]), Ty::int32())),
+                ("get_interface", 0) | ("operator->", 0) => {
+                    let ch = self.port_channel(&obj, idx.as_ref())?;
+                    return Ok((ch, Ty::Handle(ifc)));
+                }
+                _ => {}
+            }
+            let ch = self.port_channel(&obj, idx.as_ref())?;
+            let is_event = self
+                .prog
+                .user_classes
+                .borrow()
+                .get(&ifc)
+                .is_some_and(|s| s.events.contains(m));
+            if is_event {
+                return Ok((member(ch, &format!("__sc_ev_{}", m)), Ty::Event));
+            }
+            let mut xs = Vec::new();
+            for a in args {
+                xs.push(self.expr(a)?.0);
+            }
+            return self.object_call(ch, &ifc, m, xs, span);
+        }
         // `inst.sig.read()`: a child's signal or port, read from its parent.
         if matches!(m, "read" | "get_new_value")
             && args.is_empty()
@@ -1903,6 +2151,9 @@ impl<'a> Lw<'a> {
                             Ok((ident(&t), elem))
                         }
                         "num_available" => Ok((method(h, "num", vec![]), Ty::int32())),
+                        "num_free" => Ok((method(h, "num_free", vec![]), Ty::int32())),
+                        "data_written_event" | "default_event" => Ok((member(h, "written_ev"), Ty::Event)),
+                        "data_read_event" => Ok((member(h, "read_ev"), Ty::Event)),
                         "nb_read" => {
                             let target = self.lvalue_ref(&args[0])?;
                             Ok((method(h, "try_get", vec![target]), Ty::Bool))
@@ -1946,6 +2197,13 @@ impl<'a> Lw<'a> {
         }
         let _ = seg;
         let (b, bt) = self.expr(base)?;
+        // Library channels lower their own arguments (`notify(5, SC_NS)`).
+        if let Ty::Class(c) | Ty::Handle(c) = &bt
+            && matches!(c.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue")
+        {
+            let c = c.clone();
+            return self.lib_channel_call(b, &c, m, args, span);
+        }
         let a = self.args(args)?;
         let arg = |i: usize| a[i].0.clone();
         match &bt {
@@ -2042,37 +2300,8 @@ impl<'a> Lw<'a> {
             // `os.str()`: what an output string stream holds.
             Ty::OStream if m == "str" && a.is_empty() => Ok((b, Ty::Str)),
             Ty::Class(c) | Ty::Handle(c) if self.user_class(&bt).is_some() => {
-                let sig = self
-                    .prog
-                    .user_classes
-                    .borrow()
-                    .get(c)
-                    .cloned()
-                    .expect("user class");
-                let Some(ms) = sig.method(m, a.len()).cloned() else {
-                    return self.err(
-                        span,
-                        format!(
-                            "'{}' has no member function '{}' taking {} arguments",
-                            sig.cpp,
-                            m,
-                            a.len()
-                        ),
-                    );
-                };
-                let mut xs: Vec<Expression> = a.iter().map(|x| x.0.clone()).collect();
-                if ms.sig.is_task {
-                    self.f.is_task = true;
-                    if !matches!(ms.sig.ret, Ty::Void) {
-                        // A blocking member function returns through an
-                        // output argument.
-                        let t = self.temp(&ms.sig.ret);
-                        xs.push(ident(&t));
-                        self.pre.push(expr_stmt(method(b, &ms.sv, xs)));
-                        return Ok((ident(&t), ms.sig.ret.clone()));
-                    }
-                }
-                Ok((method(b, &ms.sv, xs), ms.sig.ret.clone()))
+                let xs: Vec<Expression> = a.iter().map(|x| x.0.clone()).collect();
+                self.object_call(b, c, m, xs, span)
             }
             Ty::Class(c) | Ty::Handle(c) => {
                 let sv_m = if m == "release" { "release_" } else { m };
@@ -2173,7 +2402,10 @@ impl<'a> Lw<'a> {
                 if let Some(i) = init {
                     v.extend(self.stmt(i)?);
                 }
+                // What the condition needs computed first (a blocking call's
+                // result) comes before the `if`, not inside a branch.
                 let c = self.condition(c)?;
+                v.append(&mut self.pre);
                 let t = self.sub(then_branch)?;
                 let f = match else_branch {
                     Some(e) => Some(self.sub(e)?),
@@ -2184,18 +2416,29 @@ impl<'a> Lw<'a> {
             }
             S::While { cond: c, body, .. } => {
                 let c = self.condition(c)?;
-                if !self.pre.is_empty() {
-                    return self.err(
-                        stmt_span(s),
-                        "a blocking FIFO read in a loop condition is not supported",
-                    );
+                let pre = std::mem::take(&mut self.pre);
+                if pre.is_empty() {
+                    vec![while_(c, self.sub(body)?)]
+                } else {
+                    // A condition with statements to run first is tested at
+                    // the top of each iteration.
+                    let mut b = pre;
+                    b.push(if_(unary(UnaryOp::LogNot, paren(c)), st(StatementKind::Break), None));
+                    b.push(self.sub(body)?);
+                    vec![while_(sized(1, 1), block(b))]
                 }
-                vec![while_(c, self.sub(body)?)]
             }
             S::DoWhile { body, cond: c, .. } => {
                 let b = self.sub(body)?;
                 let (c, _) = self.expr(c)?;
-                vec![do_while(b, c)]
+                let pre = std::mem::take(&mut self.pre);
+                if pre.is_empty() {
+                    vec![do_while(b, c)]
+                } else {
+                    let mut bb = vec![b];
+                    bb.extend(pre);
+                    vec![do_while(block(bb), c)]
+                }
             }
             S::For {
                 init,
@@ -2210,15 +2453,26 @@ impl<'a> Lw<'a> {
                     if let Some(i) = init {
                         v.extend(self.stmt(i)?);
                     }
-                    let c = match c {
+                    let mut c = match c {
                         Some(c) => Some(self.condition(c)?),
                         None => None,
                     };
+                    // A condition with statements to run first is tested at
+                    // the top of the body.
+                    let cpre = std::mem::take(&mut self.pre);
                     let steps = match step {
                         Some(e) => self.step_exprs(e)?,
                         None => Vec::new(),
                     };
-                    let b = self.sub(body)?;
+                    let mut b = self.sub(body)?;
+                    if !cpre.is_empty() {
+                        let mut bb = cpre;
+                        if let Some(cc) = c.take() {
+                            bb.push(if_(unary(UnaryOp::LogNot, paren(cc)), st(StatementKind::Break), None));
+                        }
+                        bb.push(b);
+                        b = block(bb);
+                    }
                     v.push(st(StatementKind::For {
                         init: Vec::new(),
                         condition: c,
@@ -2317,7 +2571,10 @@ impl<'a> Lw<'a> {
                         Some(e) => self.expr(e)?.0,
                         None => int(0),
                     };
-                    return Ok(vec![expr_stmt(sys("$__sc_exit", vec![code]))]);
+                    return Ok(vec![
+                        expr_stmt(call_fn("__sc_destroy", vec![])),
+                        expr_stmt(sys("$__sc_exit", vec![code])),
+                    ]);
                 }
                 let _ = span;
                 let mut out = match v {
@@ -2509,6 +2766,18 @@ impl<'a> Lw<'a> {
                         sv,
                     },
                 );
+                continue;
+            }
+            // A library channel object.
+            if matches!(&ty, Ty::Class(c) if matches!(c.as_str(), "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue"))
+            {
+                let args: Vec<sc::Expr> = match &d.init {
+                    Some(sc::Initializer::Paren(a) | sc::Initializer::Brace(a)) => a.clone(),
+                    _ => Vec::new(),
+                };
+                let init = self.lib_object_new(&ty, &args)?.expect("library object");
+                let sv = self.declare_local(&d.name.name, ty.clone(), SymKind::Var, None);
+                out.push(assign(ident(&sv), init));
                 continue;
             }
             // A user-class object: allocated where declared and built by
@@ -2746,6 +3015,26 @@ impl<'a> Lw<'a> {
         span: ScSpan,
     ) -> R<Vec<Statement>> {
         use sc::ExprKind as K;
+        // `a = b = v;`: the inner assignment, then the outer from its target.
+        if let K::Assign {
+            op: inner_op,
+            lhs: inner_lhs,
+            rhs: inner_rhs,
+        } = &rhs.kind
+        {
+            let mut v = self.assign_stmt(*inner_op, inner_lhs, inner_rhs, span)?;
+            v.extend(self.assign_stmt(op, lhs, inner_lhs, span)?);
+            return Ok(v);
+        }
+        // `p = new T[n]`: a data pointer to a new array.
+        if let K::New {
+            array_size: Some(_),
+            ..
+        } = &rhs.kind
+        {
+            let (r, _) = self.expr(rhs)?;
+            return self.store(lhs, r, span);
+        }
         // `x = new T` for a class handle.
         if let K::New { .. } = &rhs.kind {
             let (l, lt) = self.expr(lhs)?;
@@ -3132,6 +3421,12 @@ impl<'a> Lw<'a> {
                 "sc_close_vcd_trace_file" => {
                     return Ok(Some(vec![expr_stmt(sys("$dumpflush", vec![]))]));
                 }
+                // §5.15.6: the channel's update() runs in the update phase,
+                // once however often it was requested.
+                "request_update" | "async_request_update" if args.is_empty() => {
+                    self.m.uses_update = true;
+                    return Ok(Some(vec![expr_stmt(call_fn("__sc_request_update", vec![]))]));
+                }
                 "next_trigger" => {
                     return self.err(span, "next_trigger() is not supported in simulation");
                 }
@@ -3247,13 +3542,42 @@ impl<'a> Lw<'a> {
     /// `e.notify()` (immediate), `e.notify(t)` / `e.notify(v, unit)` (timed;
     /// `SC_ZERO_TIME` is a delta notification).
     fn notify(&mut self, ev: &str, args: &[sc::Expr], span: ScSpan) -> R<Vec<Statement>> {
-        let t = match args {
-            [] => return Ok(vec![trigger(ev)]),
-            [t] => self.expr(t)?.0,
-            [v, u] => self.time_value(v, u, span)?,
+        let mirrors = self.m.ev_mirrors.get(ev).cloned().unwrap_or_default();
+        let fire = |nb: bool| -> Statement {
+            let mut v = vec![if nb { trigger_nb(ev) } else { trigger(ev) }];
+            for m in &mirrors {
+                v.push(st(StatementKind::EventTrigger {
+                    nonblocking: nb,
+                    name: id(ev),
+                    target: Some(Box::new(m.clone())),
+                    span: sp(),
+                }));
+            }
+            if v.len() == 1 { v.pop().expect("one") } else { block(v) }
+        };
+        let (t, c) = match args {
+            [] => return Ok(vec![fire(false)]),
+            [t] => (
+                self.expr(t)?.0,
+                if self.zero_time(t) { Some(0) } else { self.const_eval(t) },
+            ),
+            [v, u] => (self.time_value(v, u, span)?, self.const_eval(v)),
             _ => return self.err(span, "notify() takes a time or (value, unit)"),
         };
-        Ok(vec![fork(JoinType::JoinNone, vec![delay(t, trigger(ev))])])
+        // §4.2.1.3: a delta notification triggers after the update phase.
+        match c {
+            Some(0) => return Ok(vec![fire(true)]),
+            Some(_) => return Ok(vec![fork(JoinType::JoinNone, vec![delay(t, fire(false))])]),
+            None => {}
+        }
+        Ok(vec![fork(
+            JoinType::JoinNone,
+            vec![if_(
+                bin(BinaryOp::Eq, t.clone(), int(0)),
+                fire(true),
+                Some(delay(t, fire(false))),
+            )],
+        )])
     }
 
     /// `wait(...)` in a thread (IEEE 1666-2023 §5.2.17).
@@ -3303,25 +3627,33 @@ impl<'a> Lw<'a> {
                 return Ok(vec![repeat(n, block(body))]);
             }
             [v, u] if time_unit(u).is_some() => {
-                vec![delay(self.time_value(v, u, span)?, null_stmt())]
+                let t = self.time_value(v, u, span)?;
+                self.wait_time(t, self.const_eval(v))
+            }
+            [v, u, e] if time_unit(u).is_some() => {
+                let t = self.time_value(v, u, span)?;
+                let on_events = self.event_wait(e)?;
+                vec![
+                    fork(JoinType::JoinAny, vec![delay(t, null_stmt()), on_events]),
+                    disable_fork(),
+                ]
             }
             [t, e] => {
                 // wait(timeout, event): whichever comes first.
                 let (t, _) = self.expr(t)?;
-                let ev = self.event_list(e)?;
+                let on_events = self.event_wait(e)?;
                 vec![
-                    fork(
-                        JoinType::JoinAny,
-                        vec![delay(t, null_stmt()), at(ev, null_stmt())],
-                    ),
+                    fork(JoinType::JoinAny, vec![delay(t, null_stmt()), on_events]),
                     disable_fork(),
                 ]
             }
+            [x] if and_list(x).is_some() => vec![self.event_wait(x)?],
             [x] => {
                 let (_, t) = self.peek_ty(x)?;
                 if matches!(t, Ty::Time | Ty::Int { .. }) && !self.is_event_expr(x) {
                     let (d, _) = self.expr(x)?;
-                    vec![delay(d, null_stmt())]
+                    let c = if self.zero_time(x) { Some(0) } else { self.const_eval(x) };
+                    self.wait_time(d, c)
                 } else {
                     let ev = self.event_list(x)?;
                     vec![at(ev, null_stmt())]
@@ -3331,6 +3663,35 @@ impl<'a> Lw<'a> {
         };
         out.extend(reset_check(&proc));
         Ok(out)
+    }
+
+    /// Waiting on an event list: `e1 | e2` resumes on any of them; `e1 & e2`
+    /// (§5.10.7) once each has been notified, in any order (a fork of one
+    /// event control per event, joined).
+    fn event_wait(&mut self, e: &sc::Expr) -> R<Statement> {
+        if let Some(evs) = and_list(e) {
+            let mut branches = Vec::new();
+            for x in evs {
+                branches.push(at(self.event_list(x)?, null_stmt()));
+            }
+            return Ok(fork(JoinType::Join, branches));
+        }
+        Ok(at(self.event_list(e)?, null_stmt()))
+    }
+
+    /// A wait for time `t` (`c` when constant): zero is the next delta
+    /// cycle, after the update phase (§4.2.1.3), as `scrt_wait` does it.
+    fn wait_time(&mut self, t: Expression, c: Option<i64>) -> Vec<Statement> {
+        match c {
+            Some(0) => vec![trigger_nb("scrt_delta_ev"), at(vec![event_expr(None, ident("scrt_delta_ev"))], null_stmt())],
+            Some(_) => vec![delay(t, null_stmt())],
+            None => vec![expr_stmt(call_fn("scrt_wait", vec![t]))],
+        }
+    }
+
+    /// `SC_ZERO_TIME`.
+    fn zero_time(&self, e: &sc::Expr) -> bool {
+        matches!(&e.kind, sc::ExprKind::Name(q) if q.last_name() == "SC_ZERO_TIME")
     }
 
     fn expr_is_int(&self, e: &sc::Expr) -> bool {
@@ -3384,8 +3745,27 @@ impl<'a> Lw<'a> {
             K::Binary {
                 op: sc::BinaryOp::BitAnd,
                 ..
-            } => self.err(e.span, "waiting on an event AND-list is not supported"),
+            } => self.err(e.span, "an event AND-list cannot be mixed with '|'"),
             K::Call { callee, args } if args.is_empty() => {
+                // An event function of a port's channel (§5.12).
+                if let K::Member { base, name, .. } = &callee.kind
+                    && let Some((obj, ifc, idx)) = self.port_ref(base)
+                {
+                    let ev = name.ident.name.clone();
+                    let has = self
+                        .prog
+                        .user_classes
+                        .borrow()
+                        .get(&ifc)
+                        .is_some_and(|s| s.events.contains(&ev));
+                    if !has {
+                        return self.err(e.span, format!("the port's interface has no event function '{}'", ev));
+                    }
+                    let ch = self.port_channel(&obj, idx.as_ref())?;
+                    let t = self.temp(&Ty::Handle(ifc));
+                    self.pre.push(assign(ident(&t), ch));
+                    return Ok(vec![event_expr(None, member(ident(&t), &format!("__sc_ev_{}", ev)))]);
+                }
                 if let K::Member { base, name, .. } = &callee.kind {
                     let (x, t) = self.expr(base)?;
                     let edge = match name.ident.name.as_str() {
@@ -3394,6 +3774,18 @@ impl<'a> Lw<'a> {
                         "value_changed_event" | "default_event" | "value_changed" => None,
                         other => return self.err(e.span, format!("'{}' is not an event", other)),
                     };
+                    // An sc_event_queue's event.
+                    if matches!(&t, Ty::Class(c) if c == "scrt_event_queue") {
+                        return Ok(vec![event_expr(None, member(x, "ev"))]);
+                    }
+                    // An sc_fifo's data events (§6.23.4).
+                    if matches!(t, Ty::Mailbox(_)) {
+                        let ev = match name.ident.name.as_str() {
+                            "data_read_event" => "read_ev",
+                            _ => "written_ev",
+                        };
+                        return Ok(vec![event_expr(None, member(x, ev))]);
+                    }
                     if edge.is_none()
                         && let Some((ev, value_too)) = self.buffer_counter_of(base)
                     {
@@ -3459,13 +3851,21 @@ impl<'a> Lw<'a> {
                 );
             }
         };
+        // §5.12.7: the end of elaboration checks every port and export is
+        // bound (before the first sc_start runs anything).
         let mut v = vec![if_(
+            unary(UnaryOp::LogNot, ident("scrt_started")),
+            expr_stmt(call_fn("scrt_check_bindings", vec![])),
+            None,
+        )];
+        v.push(if_(
             ident("scrt_started"),
             delay(int(1), null_stmt()),
             Some(delay(int(0), null_stmt())),
-        )];
+        ));
         v.push(expr_stmt(call_fn("__sc_apply_pending", vec![])));
         v.push(assign(ident("scrt_started"), sized(1, 1)));
+        v.push(assign(ident("scrt_paused"), sized(1, 0)));
         match dur {
             Some(d) => {
                 let d_var = "__sc_dur";
@@ -3500,6 +3900,7 @@ impl<'a> Lw<'a> {
                 v.push(assign(ident("scrt_tb_now"), sys("$time", vec![])));
             }
         }
+        v.push(assign(ident("scrt_paused"), sized(1, 1)));
         Ok(v)
     }
 
