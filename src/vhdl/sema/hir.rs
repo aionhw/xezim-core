@@ -243,6 +243,10 @@ pub enum HExprKind {
     New(Option<Box<HExpr>>),
     /// `new T`: an object of subtype T with its default value.
     NewOf(TypeId),
+    /// A conditional expression (VHDL-2019 §9.1): the (condition, value)
+    /// arms in order and the value when no condition holds. Only the
+    /// selected value is evaluated.
+    Cond(Vec<(HExpr, HExpr)>, Box<HExpr>),
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +324,9 @@ pub enum HStmtKind {
     Exit(usize, Option<HExpr>),
     Return(Option<HExpr>),
     Null,
+    /// Initialise a variable or constant declared by a sequential block
+    /// (VHDL-2019) with its initial value, each time the block runs.
+    InitObj(ObjId),
 }
 
 #[derive(Clone, Debug)]

@@ -306,12 +306,39 @@ impl Design {
                 }
             },
             ast::SeqKind::Null => HStmtKind::Null,
-            ast::SeqKind::Block { .. } => {
-                self.error(
-                    s.span.clone(),
-                    "sequential block statements (VHDL-2019) are not supported yet",
-                );
-                return None;
+            // VHDL-2019 sequential block: its declarations in a scope of
+            // their own, elaborated each time the block runs (the objects are
+            // locals of the enclosing process or subprogram, initialised on
+            // entry); the statements run as `if true`.
+            ast::SeqKind::Block { decls, stmts } => {
+                let br = self.new_region(Some(r));
+                let saved = std::mem::take(&mut self.block_locals);
+                let mut objs = Vec::new();
+                let mut subs = Vec::new();
+                let path = format!("<block{}>", self.objects.len());
+                self.decls(br, decls, &mut objs, &mut subs, &path);
+                let mut body: Vec<HStmt> = objs
+                    .iter()
+                    .filter(|o| {
+                        matches!(self.objects[**o].kind, ObjKind::Variable | ObjKind::Constant)
+                    })
+                    .map(|o| HStmt {
+                        kind: HStmtKind::InitObj(*o),
+                        loc: loc.clone(),
+                    })
+                    .collect();
+                body.extend(self.seq_stmts(br, stmts, ctx));
+                let inner = std::mem::take(&mut self.block_locals);
+                self.block_objs.extend(objs.iter().copied());
+                self.block_locals = saved;
+                self.block_locals.extend(objs);
+                self.block_locals.extend(inner);
+                let t = HExpr {
+                    kind: HExprKind::Lit(Value::Enum(1)),
+                    ty: boolean,
+                    loc: loc.clone(),
+                };
+                HStmtKind::If(vec![(t, body)], None)
             }
             ast::SeqKind::Unsupported(what) => {
                 self.error(s.span.clone(), format!("{} is not supported yet", what));
@@ -546,6 +573,13 @@ impl Design {
                     self.signals_read(x, out);
                 }
             }
+            HExprKind::Cond(arms, last) => {
+                for (c, v) in arms {
+                    self.signals_read(c, out);
+                    self.signals_read(v, out);
+                }
+                self.signals_read(last, out);
+            }
             HExprKind::Attr(name, p, _)
                 if matches!(
                     name.as_str(),
@@ -621,7 +655,9 @@ impl Design {
                     sensitized: sens.is_some(),
                     ..pctx.clone()
                 };
+                let saved = std::mem::take(&mut self.block_locals);
                 let body = self.seq_stmts(pr, stmts, &ctx);
+                locals.extend(std::mem::replace(&mut self.block_locals, saved));
                 let sens = match sens {
                     None => None,
                     Some(ast::Sensitivity::List(names)) => {

@@ -491,6 +491,13 @@ impl<'a> Lw<'a> {
                     self.sig_sources(inst, x, out);
                 }
             }
+            HExprKind::Cond(arms, last) => {
+                for (c, v) in arms {
+                    self.sig_sources(inst, c, out);
+                    self.sig_sources(inst, v, out);
+                }
+                self.sig_sources(inst, last, out);
+            }
             HExprKind::Index(b, i) => {
                 self.sig_sources(inst, b, out);
                 for x in i {
@@ -1550,6 +1557,10 @@ impl<'a> Lw<'a> {
                 continue;
             }
             let _ = writeln!(decls, "  {} {};", r.sv(), name);
+            // A sequential block's object: initialised when the block runs.
+            if d.block_objs.contains(&o) {
+                continue;
+            }
             // A generic: the instance's actual, else its default.
             let init = match info.kind {
                 ObjKind::Generic => match self.insts[self.inst].generics.get(&o).cloned() {

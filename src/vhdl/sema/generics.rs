@@ -18,7 +18,7 @@ use crate::vhdl::ast;
 /// names gives one per name).
 enum Formal<'a> {
     Obj(&'a ast::Ident, &'a ast::InterfaceObject),
-    Type(&'a ast::Ident),
+    Type(&'a ast::Ident, &'a Option<ast::TypeClass>),
     Sub(&'a ast::SubprogramSpec, &'a Option<ast::SubprogramDefault>),
     Package(&'a ast::Ident),
 }
@@ -26,7 +26,7 @@ enum Formal<'a> {
 impl Formal<'_> {
     fn name(&self) -> String {
         match self {
-            Formal::Obj(i, _) | Formal::Type(i) | Formal::Package(i) => i.name.clone(),
+            Formal::Obj(i, _) | Formal::Type(i, _) | Formal::Package(i) => i.name.clone(),
             Formal::Sub(spec, _) => Design::designator_key(&spec.designator),
         }
     }
@@ -87,7 +87,7 @@ impl Design {
                         flat.push(Formal::Obj(n, o));
                     }
                 }
-                ast::InterfaceDecl::Type(i, _) => flat.push(Formal::Type(i)),
+                ast::InterfaceDecl::Type(i, c) => flat.push(Formal::Type(i, c)),
                 ast::InterfaceDecl::Subprogram { spec, default } => {
                     flat.push(Formal::Sub(spec, default))
                 }
@@ -156,7 +156,7 @@ impl Design {
                     self.declare(ir, &n.name, Sym::Obj(id));
                     objs.push(id);
                 }
-                Formal::Type(i) => {
+                Formal::Type(i, class) => {
                     let t = match actual {
                         Some(ast::Expr {
                             kind: ast::ExprKind::Name(nm),
@@ -178,6 +178,9 @@ impl Design {
                         }
                     };
                     if let Some(t) = t {
+                        if let Some(c) = class {
+                            self.check_type_class(t, c, i);
+                        }
                         self.declare(ir, &i.name, Sym::Type(t));
                     }
                 }
@@ -428,5 +431,53 @@ impl Design {
         });
         self.inst_of.insert(key, gk);
         Some(ir)
+    }
+}
+
+impl Design {
+    /// VHDL-2019 §6.5.3: the actual of a generic type with a class is a
+    /// type of that class (a located error otherwise).
+    pub(super) fn check_type_class(&mut self, t: TypeId, class: &ast::TypeClass, formal: &ast::Ident) {
+        if !self.type_has_class(t, class) {
+            let what = match class {
+                ast::TypeClass::Private => "a type other than a file or protected type",
+                ast::TypeClass::Scalar => "a scalar type",
+                ast::TypeClass::Discrete => "a discrete type",
+                ast::TypeClass::Integer => "an integer type",
+                ast::TypeClass::Physical => "a physical type",
+                ast::TypeClass::Floating => "a floating-point type",
+                ast::TypeClass::Array(..) => "an array type",
+                ast::TypeClass::Access(..) => "an access type",
+                ast::TypeClass::File(..) => "a file type",
+            };
+            self.error(
+                formal.span.clone(),
+                format!(
+                    "the actual of generic type '{}' must be {} (VHDL-2019 §6.5.3)",
+                    formal.name, what
+                ),
+            );
+        }
+    }
+
+    fn type_has_class(&self, t: TypeId, class: &ast::TypeClass) -> bool {
+        let k = &self.types[self.base(t)].kind;
+        let int = matches!(k, TypeKind::Integer | TypeKind::UniversalInteger);
+        let real = matches!(k, TypeKind::Real | TypeKind::UniversalReal);
+        match class {
+            ast::TypeClass::Private => !matches!(k, TypeKind::File(_) | TypeKind::Protected),
+            ast::TypeClass::Scalar => {
+                int || real || matches!(k, TypeKind::Enum(_) | TypeKind::Physical(_))
+            }
+            ast::TypeClass::Discrete => int || matches!(k, TypeKind::Enum(_)),
+            ast::TypeClass::Integer => int,
+            ast::TypeClass::Physical => matches!(k, TypeKind::Physical(_)),
+            ast::TypeClass::Floating => real,
+            ast::TypeClass::Array(index, _) => {
+                matches!(k, TypeKind::Array { index: ix, .. } if ix.len() == index.len())
+            }
+            ast::TypeClass::Access(_) => matches!(k, TypeKind::Access(_)),
+            ast::TypeClass::File(_) => matches!(k, TypeKind::File(_)),
+        }
     }
 }

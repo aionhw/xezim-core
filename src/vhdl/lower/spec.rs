@@ -63,6 +63,13 @@ fn objs_in(h: &HExpr, out: &mut BTreeSet<ObjId>) {
                 objs_in(a, out);
             }
         }
+        HExprKind::Cond(arms, last) => {
+            for (c, v) in arms {
+                objs_in(c, out);
+                objs_in(v, out);
+            }
+            objs_in(last, out);
+        }
         HExprKind::Index(b, idx) => {
             objs_in(b, out);
             for i in idx {
@@ -437,6 +444,12 @@ impl<'a> Lw<'a> {
             HExprKind::Convert(b) => HExprKind::Convert(Box::new(self.subst_attrs(b))),
             HExprKind::Qualified(b) => HExprKind::Qualified(Box::new(self.subst_attrs(b))),
             HExprKind::Field(b, i) => HExprKind::Field(Box::new(self.subst_attrs(b)), *i),
+            HExprKind::Cond(arms, last) => HExprKind::Cond(
+                arms.iter()
+                    .map(|(c, v)| (self.subst_attrs(c), self.subst_attrs(v)))
+                    .collect(),
+                Box::new(self.subst_attrs(last)),
+            ),
             _ => h.kind.clone(),
         };
         HExpr {

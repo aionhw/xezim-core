@@ -911,6 +911,33 @@ impl<'a> Lw<'a> {
                 self.obj_name(*o)
             }
             HExprKind::Qualified(x) => self.ex(x),
+            // VHDL-2019 §9.1: `c1 ? v1 : (c2 ? v2 : last)`, only the
+            // selected value evaluated; each value in the result's
+            // representation.
+            HExprKind::Cond(arms, last) => {
+                let to = self.erepr(h);
+                let mut out = String::new();
+                let mut open = 0;
+                for (c, v) in arms {
+                    match self.static_cond(c) {
+                        Some(false) => continue,
+                        Some(true) => {
+                            out.push_str(&self.ex_as(v, &to));
+                            out.push_str(&")".repeat(open));
+                            return out;
+                        }
+                        None => {
+                            let cv = self.ex(c);
+                            let vv = self.ex_as(v, &to);
+                            let _ = write!(out, "(({}) ? ({}) : ", cv, vv);
+                            open += 1;
+                        }
+                    }
+                }
+                out.push_str(&self.ex_as(last, &to));
+                out.push_str(&")".repeat(open));
+                out
+            }
             HExprKind::Convert(x) => self.convert(x, h.ty, &h.loc),
             HExprKind::Call(s, args) => self.call(*s, args, h),
             HExprKind::Index(b, idx) => {
@@ -2334,6 +2361,29 @@ impl<'a> Lw<'a> {
         let pad = " ".repeat(ind);
         match &s.kind {
             HStmtKind::Null => String::new(),
+            // A sequential block's object (VHDL-2019), initialised as a
+            // subprogram's locals are, each time the block runs.
+            HStmtKind::InitObj(l) => {
+                let o = self.d.objects[*l].clone();
+                if o.kind == ObjKind::Constant && o.static_val.is_some() {
+                    return String::new();
+                }
+                let target = HExpr {
+                    kind: HExprKind::Obj(*l),
+                    ty: o.ty,
+                    loc: o.loc.clone(),
+                };
+                if self.struct_root(&target) {
+                    self.proc_slow = true;
+                }
+                let r = self.obj_repr(*l, &o.loc);
+                let v = match (&o.init, &r) {
+                    (Some(i), _) => self.store_value_init(&target, i),
+                    (None, Repr::Pk(w, n)) => self.pk_default(o.ty, *w, *n),
+                    (None, _) => self.default_value(o.ty, &o.loc),
+                };
+                self.assign_to(&target, v, ind)
+            }
             HStmtKind::VarAssign { target, value } => {
                 if self.struct_root(target) {
                     self.proc_slow = true;
@@ -2832,6 +2882,10 @@ impl<'a> Lw<'a> {
             let o = self.d.objects[*l].clone();
             let r = self.obj_repr(*l, &o.loc);
             let _ = writeln!(locals, "    {} {};", r.sv(), self.obj_name(*l));
+            // A sequential block's object: initialised when the block runs.
+            if self.d.block_objs.contains(l) {
+                continue;
+            }
             let v = match (&o.init, &r) {
                 (Some(i), _) => {
                     let target = HExpr {

@@ -149,6 +149,16 @@ impl<'a> Lw<'a> {
             }
             HExprKind::Slice(_, r) => self.range_bounds(r),
             HExprKind::Call(s, args) => self.call_shape(*s, args, h),
+            // The values' bounds, when they all have the same.
+            HExprKind::Cond(arms, last) => {
+                let b = self.shape(last)?;
+                for (_, v) in arms {
+                    if self.shape(v) != Some(b) {
+                        return None;
+                    }
+                }
+                Some(b)
+            }
             HExprKind::ArrayAgg(items) => {
                 if let Some(b) = self.type_bounds(h.ty) {
                     return Some(b);
@@ -354,6 +364,7 @@ impl<'a> Lw<'a> {
                 r => r,
             },
             HExprKind::Call(s, args) => self.call_repr(*s, args, h),
+            HExprKind::Cond(..) => self.cond_repr(h),
             HExprKind::ArrayAgg(_) => self.shape_repr(h),
             // A field: the struct member's representation.
             HExprKind::Field(b, i) => match self.field_storage(b.ty).get(*i) {
@@ -453,6 +464,28 @@ impl<'a> Lw<'a> {
             }
             _ => self.repr(h.ty, &h.loc),
         }
+    }
+
+    /// The representation of a conditional expression (VHDL-2019): its
+    /// values', when they all have the same (and packed ones the same
+    /// bounds), else the struct of its type, which every value converts to.
+    fn cond_repr(&mut self, h: &HExpr) -> Repr {
+        let HExprKind::Cond(arms, last) = &h.kind else {
+            return self.repr(h.ty, &h.loc);
+        };
+        let r0 = self.erepr(last);
+        let s0 = self.shape(last);
+        for (_, v) in arms {
+            let r = self.erepr(v);
+            if r != r0 || matches!(r0, Repr::Pk(..)) && self.shape(v) != s0 {
+                return if self.ndims(h.ty) == 0 {
+                    self.repr(h.ty, &h.loc)
+                } else {
+                    self.fat_repr(h.ty, &h.loc)
+                };
+            }
+        }
+        r0
     }
 
     // ---- conversions -----------------------------------------------------------------

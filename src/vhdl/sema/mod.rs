@@ -17,7 +17,7 @@ mod predefined;
 mod stmt;
 mod views;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::ast::{self, Ident, LibraryUnit, Name, NameKind, Span};
 use super::cst::{self, SourceFile};
@@ -182,6 +182,18 @@ pub struct Design {
     cur_prot: Option<TypeId>,
     /// The names alias declarations stand for.
     pub aliases: Vec<HExpr>,
+    /// The objects declared by the sequential block statements (VHDL-2019)
+    /// of the process or subprogram body being analysed: its locals too.
+    pub(super) block_locals: Vec<ObjId>,
+    /// The bodies of the methods a protected type declaration's aliases of
+    /// its private variables' methods stand for (VHDL-2019), for its body.
+    prot_forwards: BTreeMap<TypeId, Vec<ast::Decl>>,
+    /// Functions with a return identifier (VHDL-2019): the hidden
+    /// parameter giving the expected result subtype.
+    pub ret_params: BTreeMap<SubId, ObjId>,
+    /// All objects of sequential blocks: initialised when the block runs
+    /// (`HStmtKind::InitObj`), not with the other locals.
+    pub block_objs: BTreeSet<ObjId>,
     /// Mode views (VHDL-2019 §6.5.2).
     pub views: Vec<ViewInfo>,
     /// The mode views of ports and signal parameters.
@@ -296,6 +308,10 @@ impl Design {
             cur_cfg: None,
             aliases: Vec::new(),
             views: Vec::new(),
+            block_locals: Vec::new(),
+            prot_forwards: BTreeMap::new(),
+            ret_params: BTreeMap::new(),
+            block_objs: BTreeSet::new(),
             port_views: BTreeMap::new(),
             labels: Vec::new(),
             units: BTreeMap::new(),
@@ -1545,6 +1561,13 @@ pub fn calls_in_expr(e: &HExpr, out: &mut Vec<SubId>) {
             for x in v {
                 calls_in_expr(x, out);
             }
+        }
+        HExprKind::Cond(arms, last) => {
+            for (c, v) in arms {
+                calls_in_expr(c, out);
+                calls_in_expr(v, out);
+            }
+            calls_in_expr(last, out);
         }
         HExprKind::Attr(_, p, param) => {
             if let AttrPrefix::Expr(x) = p.as_ref() {

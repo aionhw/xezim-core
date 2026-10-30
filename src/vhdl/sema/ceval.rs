@@ -59,6 +59,15 @@ impl<'a> Interp<'a> {
                 }
             }
             HExprKind::Qualified(x) => self.expr(x),
+            // Only the selected value is evaluated (VHDL-2019 §9.1).
+            HExprKind::Cond(arms, last) => {
+                for (c, v) in arms {
+                    if self.expr(c)? == Value::Enum(1) {
+                        return self.expr(v);
+                    }
+                }
+                self.expr(last)
+            }
             HExprKind::RecordAgg(vals) => Some(Value::Record(
                 vals.iter()
                     .map(|v| self.expr(v))

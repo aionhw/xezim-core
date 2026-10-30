@@ -64,12 +64,25 @@ impl Design {
         match &e.kind {
             ast::ExprKind::Lit(l) => self.literal(r, l, expect, e.span.clone()),
             ast::ExprKind::Paren(x) => self.expr_inner(r, x, expect),
-            ast::ExprKind::Cond(..) => {
-                self.error(
-                    e.span.clone(),
-                    "conditional expressions (VHDL-2019) are not supported yet",
-                );
-                None
+            // VHDL-2019 §9.1: `a when c1 else b when c2 else d`. The values
+            // have the type the context expects, else the type of the last.
+            ast::ExprKind::Cond(arms, last) => {
+                let t = match expect {
+                    Some(t) => t,
+                    None => self.expr(r, last, None)?.ty,
+                };
+                let mut harms = Vec::new();
+                for (v, c) in arms {
+                    let hc = self.condition(r, c);
+                    let hv = self.expr(r, v, Some(t));
+                    harms.push((hc?, hv?));
+                }
+                let hl = self.expr(r, last, Some(t))?;
+                Some(HExpr {
+                    kind: HExprKind::Cond(harms, Box::new(hl)),
+                    ty: t,
+                    loc,
+                })
             }
             ast::ExprKind::Name(n) => self.name_expr(r, n, expect),
             ast::ExprKind::Qualified(mark, x) => {
@@ -529,6 +542,7 @@ impl Design {
                 Literal::Null => s.null = true,
             },
             ast::ExprKind::Paren(x) => return self.possible_types(r, x),
+            ast::ExprKind::Cond(_, last) => return self.possible_types(r, last),
             ast::ExprKind::Aggregate(_) => s.aggregate = true,
             ast::ExprKind::Qualified(mark, _) => {
                 let n = self.errors.len();
@@ -1191,7 +1205,7 @@ impl Design {
                 return self.pick_enum_lit(&lits, expect, &name_text(n), n.span.clone());
             }
         }
-        self.call_expr(r, picked, args, loc)
+        self.call_expr(r, picked, args, expect, loc)
     }
 
     pub fn same_profile_pub(&self, a: SubId, b: SubId) -> bool {
@@ -1409,10 +1423,32 @@ impl Design {
         r: RegionId,
         id: SubId,
         args: &[ast::Assoc],
+        expect: Option<TypeId>,
         loc: Loc,
     ) -> Option<HExpr> {
-        let actuals = self.actuals(r, id, args)?;
+        let mut actuals = self.actuals(r, id, args)?;
         let ret = self.subprograms[id].ret?;
+        // A function with a return identifier (VHDL-2019): a value of the
+        // subtype the context expects, for the hidden parameter.
+        if self.ret_params.contains_key(&id)
+            && let Some(t) = expect
+            && self.constrained(t)
+            && let TypeKind::Array { index, elem } = self.types[self.base(t)].kind.clone()
+            && index.len() == 1
+            && let Some(er) = self.scalar_range(elem)
+            && let Some(last) = actuals.last_mut()
+        {
+            let left = HExpr {
+                kind: HExprKind::Lit(er.left),
+                ty: elem,
+                loc: loc.clone(),
+            };
+            *last = HExpr {
+                kind: HExprKind::ArrayAgg(vec![(vec![HChoice::Others], left)]),
+                ty: t,
+                loc: loc.clone(),
+            };
+        }
         Some(HExpr {
             kind: HExprKind::Call(id, actuals),
             ty: ret,
@@ -1517,7 +1553,7 @@ impl Design {
         }
         let id = self.resolve(r, &cands, &args, expect, true, span.clone())?;
         let loc = self.loc(span);
-        self.call_expr(r, id, &args, loc)
+        self.call_expr(r, id, &args, expect, loc)
     }
 
     /// `t(x)`: a type conversion (§9.3.6).

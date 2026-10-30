@@ -289,53 +289,20 @@ fn missing_generic_actual() {
 }
 
 /// VHDL-2019 forms the analysis does not handle yet are located errors,
-/// never silently dropped: conditional expressions (§9.1), sequential block
-/// statements, and protected-type generics and private variables (§5.6.2).
-/// The parser accepts them (vhdl-lang/vhdl_lang/src/syntax/xezim_tests.rs).
+/// never silently dropped: generics of protected types (§5.6.2; nvc 1.23 has
+/// none to compare with). The parser accepts them
+/// (vhdl-lang/vhdl_lang/src/syntax/xezim_tests.rs).
 #[test]
 fn vhdl2019_forms_not_supported_yet() {
-    let arch = |decls: &str, stmts: &str| {
-        format!(
-            "entity e is end entity;\narchitecture a of e is\n{decls}begin\n  process\n  begin\n{stmts}    wait;\n  end process;\nend architecture;\n"
-        )
-    };
-    for (src, at, what) in [
-        (
-            arch("  constant c : integer := 1 when true else 2;\n", ""),
-            "t19.vhd:3:27:",
-            "conditional expressions",
-        ),
-        (
-            arch("", "    block\n    begin\n      null;\n    end block;\n"),
-            "t19.vhd:6:5:",
-            "sequential block statements",
-        ),
-        (
-            arch(
-                "  type pt is protected\n    generic (n : natural);\n    procedure put(x : integer);\n  end protected;\n",
-                "",
-            ),
-            "t19.vhd:3:8:",
-            "generics of protected types",
-        ),
-        (
-            arch(
-                "  type pt is protected\n    private variable v : integer;\n    procedure put(x : integer);\n  end protected;\n",
-                "",
-            ),
-            "t19.vhd:4:",
-            "private variables",
-        ),
-    ] {
-        let errs =
-            vhdl::check_design_std(&[("work", "t19.vhd", src.as_bytes())], vhdl::VhdlStd::V2019);
-        assert!(
-            errs.iter()
-                .any(|e| e.starts_with(at) && e.contains(what) && e.contains("not supported yet")),
-            "{at} {what}:\n{}\n{src}",
-            errs.join("\n")
-        );
-    }
+    let src = "entity e is end entity;\narchitecture a of e is\n  type pt is protected\n    generic (n : natural);\n    procedure put(x : integer);\n  end protected;\nbegin\nend architecture;\n";
+    let errs = vhdl::check_design_std(&[("work", "t19.vhd", src.as_bytes())], vhdl::VhdlStd::V2019);
+    assert!(
+        errs.iter().any(|e| e.starts_with("t19.vhd:3:8:")
+            && e.contains("generics of protected types")
+            && e.contains("not supported yet")),
+        "{}",
+        errs.join("\n")
+    );
 }
 
 /// The VHDL-2019 forms are syntax errors in VHDL-2008.
@@ -411,4 +378,45 @@ fn mode_view_errors() {
     let ok = pkg(good, "  procedure q(signal x : view v; signal y : view (v'converse) of v_t);\n");
     let errs = vhdl::check_design_std(&[("work", "t19.vhd", ok.as_bytes())], vhdl::VhdlStd::V2019);
     assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+/// VHDL-2019 §6.5.3: the actual of a generic type with a class is of that
+/// class, for generic subprograms and entities (a located error at the
+/// generic type otherwise).
+#[test]
+fn generic_type_class_of_actual() {
+    let src = |class: &str, actual: &str| {
+        format!(
+            "entity e is\n  generic (type t is {class});\nend entity;\narchitecture a of e is\nbegin\nend architecture;\nentity top is end entity;\narchitecture a of top is\n  function f generic (type u is {class}) parameter (x : u) return u is\n  begin\n    return x;\n  end function;\n  function g is new f generic map (u => {actual});\nbegin\n  i : entity work.e generic map (t => {actual});\nend architecture;\n"
+        )
+    };
+    for (class, actual, ok) in [
+        ("(<>)", "integer", true),
+        ("(<>)", "character", true),
+        ("(<>)", "real", false),
+        ("range <>", "natural", true),
+        ("range <>", "bit", false),
+        ("range <> . <>", "real", true),
+        ("units <>", "time", true),
+        ("units <>", "integer", false),
+        ("<>", "time", true),
+        ("<>", "bit_vector", false),
+        ("private", "string", true),
+        ("array (natural range <>) of type is private", "bit_vector", true),
+        ("array (natural range <>) of type is private", "integer", false),
+        ("access type is private", "integer", false),
+    ] {
+        let s = src(class, actual);
+        let errs = vhdl::check_design_std(&[("work", "c19.vhd", s.as_bytes())], vhdl::VhdlStd::V2019);
+        if ok {
+            assert!(errs.is_empty(), "{class} / {actual}:\n{}", errs.join("\n"));
+        } else {
+            assert!(
+                errs.iter().any(|e| e.starts_with("c19.vhd:2:") && e.contains("the actual of generic type 't'"))
+                    && errs.iter().any(|e| e.starts_with("c19.vhd:9:") && e.contains("the actual of generic type 'u'")),
+                "{class} / {actual}:\n{}",
+                errs.join("\n")
+            );
+        }
+    }
 }

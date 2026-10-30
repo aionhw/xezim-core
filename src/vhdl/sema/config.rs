@@ -602,6 +602,10 @@ pub fn map_objs(h: &HExpr, f: &mut dyn FnMut(ObjId) -> Option<HExpr>) -> HExpr {
                 .collect(),
         ),
         HExprKind::RecordAgg(v) => HExprKind::RecordAgg(v.iter().map(|a| map_objs(a, f)).collect()),
+        HExprKind::Cond(arms, last) => HExprKind::Cond(
+            arms.iter().map(|(c, v)| (map_objs(c, f), map_objs(v, f))).collect(),
+            Box::new(map_objs(last, f)),
+        ),
         HExprKind::Convert(x) => HExprKind::Convert(Box::new(map_objs(x, f))),
         HExprKind::Qualified(x) => HExprKind::Qualified(Box::new(map_objs(x, f))),
         HExprKind::Deref(x) => HExprKind::Deref(Box::new(map_objs(x, f))),

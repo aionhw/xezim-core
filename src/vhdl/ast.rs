@@ -500,6 +500,9 @@ pub struct SubprogramSpec {
     pub designator: Designator,
     pub generics: Vec<InterfaceDecl>,
     pub params: Vec<InterfaceDecl>,
+    /// A function's return identifier (VHDL-2019 §4.2.1, `return r of t`):
+    /// the subtype of the value the call's context expects.
+    pub ret_id: Option<Ident>,
     pub span: Span,
 }
 

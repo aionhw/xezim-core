@@ -547,10 +547,6 @@ impl<'a> Converter<'a> {
                 SubprogramKind::Procedure,
             ),
             v::SubprogramSpecification::Function(f) => {
-                if let Some(r) = &f.return_identifier {
-                    let s = self.tok_span(r.tree.token);
-                    self.unsupported(s, "a function return identifier");
-                }
                 (
                     &f.designator,
                     f.header.as_ref(),
@@ -577,6 +573,12 @@ impl<'a> Converter<'a> {
             designator,
             generics: self.interface_list(header.map(|h| &h.generic_list)),
             params: self.interface_list(params),
+            ret_id: match s {
+                v::SubprogramSpecification::Function(f) => {
+                    f.return_identifier.as_ref().map(|r| self.ident(&r.tree))
+                }
+                _ => None,
+            },
             span,
         })
     }

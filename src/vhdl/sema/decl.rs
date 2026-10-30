@@ -524,7 +524,11 @@ impl Design {
         let Some(sig) = sig else { return true };
         match s {
             Sym::Sub(id) => {
-                let params = self.subprograms[*id].params.clone();
+                let mut params = self.subprograms[*id].params.clone();
+                // A method's hidden object parameter is not in a signature.
+                if self.method_of.contains_key(id) && !params.is_empty() {
+                    params.remove(0);
+                }
                 if params.len() != sig.params.len() {
                     return false;
                 }
@@ -594,14 +598,6 @@ impl Design {
                         td.name.span.clone(),
                         "generics of protected types (VHDL-2019) are not supported yet",
                     );
-                }
-                for d in decls {
-                    if let ast::Decl::Variable { obj, .. } = d {
-                        self.error(
-                            obj.span.clone(),
-                            "private variables of protected types (VHDL-2019) are not supported yet",
-                        );
-                    }
                 }
                 self.protected_decl(r, &name, decls, loc, path);
                 return;
@@ -879,14 +875,177 @@ impl Design {
         let saved = self.cur_prot.replace(t);
         let mut objs = Vec::new();
         let mut subs = Vec::new();
+        let decls = self.private_method_aliases(r, t, decls);
         self.decls(
             pr,
-            decls,
+            &decls,
             &mut objs,
             &mut subs,
             &format!("{}.{}", path, name),
         );
         self.cur_prot = saved;
+        // Private variables (VHDL-2019 §5.6.2): variables of each object of
+        // the type, like the body's, visible to the body and to the
+        // declaration's aliases but not outside.
+        let private: Vec<ObjId> = objs
+            .into_iter()
+            .filter(|o| matches!(self.objects[*o].kind, ObjKind::Variable))
+            .collect();
+        for v in &private {
+            self.prot_vars.insert(*v, t);
+        }
+        if let Some(p) = self.protected.get_mut(&t) {
+            p.vars = private;
+        }
+    }
+
+    /// The declarations of a protected type declaration with each alias of
+    /// a method of one of its private variables (`alias get is v.get
+    /// [return integer]`, VHDL-2019) as a method of the type that calls it
+    /// (its body goes to `prot_forwards`, for the type's body): calling the
+    /// alias on an object calls the method of that object's variable.
+    fn private_method_aliases(&mut self, r: RegionId, t: TypeId, decls: &[ast::Decl]) -> Vec<ast::Decl> {
+        let mut out = Vec::new();
+        for d in decls {
+            let ast::Decl::Alias {
+                name,
+                target,
+                signature: Some(sig),
+                span,
+                ..
+            } = d
+            else {
+                out.push(d.clone());
+                continue;
+            };
+            let ast::NameKind::Selected(prefix, ast::Suffix::Ident(method)) = &target.kind else {
+                out.push(d.clone());
+                continue;
+            };
+            let ast::NameKind::Simple(var) = &prefix.kind else {
+                out.push(d.clone());
+                continue;
+            };
+            let var_ty = decls.iter().find_map(|x| match x {
+                ast::Decl::Variable { obj, .. } if obj.names.iter().any(|n| n.name == var.name) => {
+                    Some(obj.ty.mark.clone())
+                }
+                _ => None,
+            });
+            let Some(mark) = var_ty else {
+                out.push(d.clone());
+                continue;
+            };
+            let Some(vt) = self.type_mark(r, &mark) else {
+                continue;
+            };
+            let Some(info) = self.protected.get(&vt).cloned() else {
+                out.push(d.clone());
+                continue;
+            };
+            let cands: Vec<Sym> = self.regions[info.decl_region]
+                .syms
+                .get(&method.name)
+                .cloned()
+                .unwrap_or_default();
+            let mut chosen = None;
+            for c in cands {
+                if self.signature_matches(r, &c, Some(sig)) {
+                    chosen = Some(c);
+                    break;
+                }
+            }
+            let Some(Sym::Sub(target_sub)) = chosen else {
+                self.error(span.clone(), "no method matches the alias signature");
+                continue;
+            };
+            // Without the method's hidden object parameter.
+            let params = self.subprograms[target_sub].params[1..].to_vec();
+            let mut formals = Vec::new();
+            let mut actuals = Vec::new();
+            for (i, (p, mark)) in params.iter().zip(&sig.params).enumerate() {
+                let (class, mode) = match self.objects[*p].kind {
+                    ObjKind::Param(c, m) => (c, m),
+                    _ => (ast::ObjClass::Constant, Mode::In),
+                };
+                let pname = ast::Ident {
+                    name: format!("vh_fwd{}", i),
+                    span: span.clone(),
+                };
+                formals.push(ast::InterfaceDecl::Object(ast::InterfaceObject {
+                    class: Some(class),
+                    names: vec![pname.clone()],
+                    mode: Some(mode),
+                    ty: ast::SubtypeInd {
+                        resolution: None,
+                        mark: mark.clone(),
+                        constraint: None,
+                        span: span.clone(),
+                    },
+                    bus: false,
+                    default: None,
+                    view: None,
+                    span: span.clone(),
+                }));
+                actuals.push(ast::Assoc {
+                    formal: None,
+                    actual: ast::Actual::Expr(ast::Expr {
+                        kind: ast::ExprKind::Name(ast::Name {
+                            kind: ast::NameKind::Simple(pname),
+                            span: span.clone(),
+                        }),
+                        span: span.clone(),
+                    }),
+                    span: span.clone(),
+                });
+            }
+            let kind = match &sig.ret {
+                Some(ret) => ast::SubprogramKind::Function {
+                    pure: false,
+                    ret: ret.clone(),
+                },
+                None => ast::SubprogramKind::Procedure,
+            };
+            let spec = ast::SubprogramSpec {
+                kind,
+                designator: name.clone(),
+                generics: Vec::new(),
+                params: formals,
+                ret_id: None,
+                span: span.clone(),
+            };
+            let callee = if actuals.is_empty() {
+                target.clone()
+            } else {
+                ast::Name {
+                    kind: ast::NameKind::Call(Box::new(target.clone()), actuals),
+                    span: span.clone(),
+                }
+            };
+            let stmt = if sig.ret.is_some() {
+                ast::SeqKind::Return(Some(ast::Expr {
+                    kind: ast::ExprKind::Name(callee),
+                    span: span.clone(),
+                }))
+            } else {
+                ast::SeqKind::ProcCall(callee)
+            };
+            self.prot_forwards
+                .entry(t)
+                .or_default()
+                .push(ast::Decl::SubprogramBody(ast::SubprogramBody {
+                    spec: spec.clone(),
+                    decls: Vec::new(),
+                    stmts: vec![ast::SeqStmt {
+                        label: None,
+                        kind: stmt,
+                        span: span.clone(),
+                    }],
+                    span: span.clone(),
+                }));
+            out.push(ast::Decl::SubprogramDecl(spec));
+        }
+        out
     }
 
     /// A protected type body (§5.6.3): the variables each object of the
@@ -921,9 +1080,11 @@ impl Design {
         let saved = self.cur_prot.replace(t);
         let mut objs = Vec::new();
         let mut subs = Vec::new();
+        let mut decls = decls.to_vec();
+        decls.extend(self.prot_forwards.remove(&t).unwrap_or_default());
         self.decls(
             br,
-            decls,
+            &decls,
             &mut objs,
             &mut subs,
             &format!("{}.{}", path, name),
@@ -937,7 +1098,7 @@ impl Design {
             self.prot_vars.insert(*v, t);
         }
         if let Some(p) = self.protected.get_mut(&t) {
-            p.vars = vars;
+            p.vars.extend(vars);
             p.has_body = true;
         }
     }
@@ -1401,6 +1562,20 @@ impl Design {
             (ObjKind::Constant, Some(i)) => self.eval_static(i),
             _ => None,
         };
+        // VHDL-2019 (§6.4.2.3, §6.4.2.4): a variable or signal of an
+        // unconstrained array subtype takes the bounds of its initial value.
+        let ty = match &init {
+            Some(i)
+                if self.revision == crate::vhdl::VhdlStd::V2019
+                    && matches!(
+                        kind,
+                        ObjKind::Variable | ObjKind::SharedVariable | ObjKind::Signal
+                    ) =>
+            {
+                self.inferred_subtype(ty, i).unwrap_or(ty)
+            }
+            _ => ty,
+        };
         let mut out = Vec::new();
         for n in &o.names {
             // A deferred constant's full declaration (package body).
@@ -1424,6 +1599,59 @@ impl Design {
             out.push(id);
         }
         out
+    }
+
+    /// The subtype an unconstrained one-dimensional array subtype `ty` takes
+    /// from a static initial value: its bounds (`None` when `ty` is
+    /// constrained or the value is not static).
+    fn inferred_subtype(&mut self, ty: TypeId, init: &HExpr) -> Option<TypeId> {
+        if self.constrained(ty) {
+            return None;
+        }
+        let TypeKind::Array { index, elem } = self.types[self.base(ty)].kind.clone() else {
+            return None;
+        };
+        if index.len() != 1 || !self.constrained(elem) {
+            return None;
+        }
+        let Some(Value::Array(av)) = self.eval_static(init) else {
+            return None;
+        };
+        let it = index[0];
+        let is_enum = matches!(self.types[self.base(it)].kind, TypeKind::Enum(_));
+        let val = |v: i64| {
+            if is_enum {
+                Value::Enum(v as u32)
+            } else {
+                Value::Int(v)
+            }
+        };
+        let lit = |v: i64| HExpr {
+            kind: HExprKind::Lit(val(v)),
+            ty: it,
+            loc: init.loc.clone(),
+        };
+        let hr = HRange {
+            left: Box::new(lit(av.left)),
+            dir: av.dir,
+            right: Box::new(lit(av.right)),
+            static_val: Some(StaticRange {
+                left: val(av.left),
+                dir: av.dir,
+                right: val(av.right),
+            }),
+            of_obj: None,
+        };
+        Some(self.add_type(
+            "",
+            TypeKind::Subtype {
+                base: ty,
+                constraint: Some(HConstraint::Index(vec![Some(hr)], None)),
+                resolution: None,
+            },
+            None,
+            None,
+        ))
     }
 
     /// A constant declared without a value in the enclosing package.
@@ -1507,14 +1735,20 @@ impl Design {
                         out.push(id);
                     }
                 }
-                // The class of a generic type (VHDL-2019) is not checked
-                // against the actual yet; operations on the type resolve
-                // when the unit is analysed with its actual bound.
-                ast::InterfaceDecl::Type(i, _) => {
+                // Operations on a generic type resolve when the unit is
+                // analysed with its actual bound; the actual must be of the
+                // type's class (VHDL-2019).
+                ast::InterfaceDecl::Type(i, class) => {
                     // A generic type (§6.5.3): the instance's actual type, or
                     // an incomplete type while there is none.
                     let t = match self.type_binding.iter().find(|(n, _)| *n == i.name) {
-                        Some((_, t)) => *t,
+                        Some((_, t)) => {
+                            let t = *t;
+                            if let Some(c) = class {
+                                self.check_type_class(t, c, i);
+                            }
+                            t
+                        }
                         None => self.add_type(
                             &i.name,
                             TypeKind::Incomplete,
@@ -1604,6 +1838,71 @@ impl Design {
             self.declare(pr, "self_", Sym::Obj(o));
             params.insert(0, o);
         }
+        // A return identifier (VHDL-2019 §4.2.1): the subtype of the result
+        // the call's context expects, given by a hidden last parameter
+        // whose value has that subtype (a null array without one).
+        let mut ret_param = None;
+        if let (Some(rid), Some(rt)) = (&spec.ret_id, ret) {
+            let TypeKind::Array { index, .. } = self.types[self.base(rt)].kind.clone() else {
+                self.error(rid.span.clone(), "a return identifier of a non-array type is not supported yet");
+                return None;
+            };
+            let loc = self.loc(rid.span.clone());
+            let it = index[0];
+            let null = HExpr {
+                kind: HExprKind::Lit(Value::Array(Box::new(ArrayValue {
+                    left: 0,
+                    dir: Dir::To,
+                    right: -1,
+                    elems: Vec::new(),
+                }))),
+                ty: rt,
+                loc: loc.clone(),
+            };
+            let o = self.add_obj(ObjInfo {
+                name: "ret_".into(),
+                kind: ObjKind::Param(ObjClass::Constant, Mode::In),
+                ty: rt,
+                init: Some(null),
+                loc: loc.clone(),
+                static_val: None,
+            });
+            params.push(o);
+            let obj = HExpr {
+                kind: HExprKind::Obj(o),
+                ty: rt,
+                loc: loc.clone(),
+            };
+            let ranges = (0..index.len())
+                .map(|dim| {
+                    let t = index.get(dim).copied().unwrap_or(it);
+                    let placeholder = Box::new(HExpr {
+                        kind: HExprKind::Lit(Value::Int(0)),
+                        ty: t,
+                        loc: loc.clone(),
+                    });
+                    Some(HRange {
+                        left: placeholder.clone(),
+                        dir: Dir::To,
+                        right: placeholder,
+                        static_val: None,
+                        of_obj: Some((Box::new(obj.clone()), dim, false)),
+                    })
+                })
+                .collect();
+            let st = self.add_type(
+                &rid.name,
+                TypeKind::Subtype {
+                    base: rt,
+                    constraint: Some(HConstraint::Index(ranges, None)),
+                    resolution: None,
+                },
+                None,
+                Some(loc),
+            );
+            self.declare(pr, &rid.name, Sym::Type(st));
+            ret_param = Some(o);
+        }
         let id = self.add_sub(SubInfo {
             name: name.clone(),
             is_function,
@@ -1619,6 +1918,9 @@ impl Design {
         // are native.
         if path.starts_with("std.") {
             self.subprograms[id].builtin = super::predefined::native_builtin(path, &name);
+        }
+        if let Some(o) = ret_param {
+            self.ret_params.insert(id, o);
         }
         if let Some(t) = method {
             self.method_of.insert(id, t);
@@ -1733,7 +2035,9 @@ impl Design {
         self.decls(body_r, &b.decls, &mut locals, &mut subs, sub_path);
         self.cur_prot = saved;
         let ret = self.subprograms[target].ret;
+        let saved_blocks = std::mem::take(&mut self.block_locals);
         let stmts = self.seq_stmts(body_r, &b.stmts, &stmt_ctx_fn(ret));
+        locals.extend(std::mem::replace(&mut self.block_locals, saved_blocks));
         self.subprograms[target].body = Some(Body { locals, stmts });
     }
 
