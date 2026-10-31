@@ -31170,8 +31170,16 @@ fn rename_item_decls(
                         ParamConnection::Ordered(v) => v,
                         ParamConnection::Named { value, .. } => value,
                     };
-                    if let Some(ParamValue::Expr(e)) = value {
-                        *e = rewrite_expr(e, "", port_map, local_names, interface_map);
+                    match value {
+                        Some(ParamValue::Expr(e)) => {
+                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
+                        }
+                        // A TYPE override's dimensions too (`.T(logic [W-1:0])`).
+                        Some(ParamValue::Type(dt)) => {
+                            *dt =
+                                rewrite_data_type_genvar(dt, port_map, local_names, interface_map);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -31660,6 +31668,17 @@ fn substitute_in_module_item(
                         }
                         | ParamConnection::Ordered(Some(ParamValue::Expr(e))) => {
                             *e = rewrite_expr(e, "", port_map, local_names, interface_map);
+                        }
+                        // §27.4: a genvar in a TYPE override's dimensions
+                        // (`.T(logic [g*2-1:0])`) kept the bare ident, so
+                        // every iteration bound the same wrong width.
+                        ParamConnection::Named {
+                            value: Some(ParamValue::Type(dt)),
+                            ..
+                        }
+                        | ParamConnection::Ordered(Some(ParamValue::Type(dt))) => {
+                            *dt =
+                                rewrite_data_type_genvar(dt, port_map, local_names, interface_map);
                         }
                         _ => {}
                     }
@@ -36110,15 +36129,34 @@ fn inline_module_items(
                     }
                 });
                 let mut inst_types: HashMap<String, DataType> = HashMap::default();
+                // §6.20.3 / §20.6.2: a header default `parameter int H =
+                // $bits(T)` folds through TYPEDEFS_TLS, which was only synced
+                // with this instance's type parameters at step 1b, after the
+                // header. H read the PREVIOUS instance's T (0 for the first
+                // one). Bind each type parameter as the header reaches it, so
+                // a default that depends on an earlier value parameter
+                // (`type T = logic [W-1:0]`) sizes with this instance's W; an
+                // overridden one is already in the table. Restored before 1b.
+                let mut header_type_saves: HashMap<String, Option<u32>> = HashMap::default();
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
                             if let Some(def_dt) = &a.init {
                                 if !type_overrides.iter().any(|(n, _)| *n == a.name.name) {
                                     inst_types.insert(a.name.name.clone(), def_dt.clone());
+                                    let w = resolve_type_width(
+                                        def_dt,
+                                        Some(&sub_local_params),
+                                        Some(&elab.typedefs),
+                                    );
+                                    header_type_saves.entry(a.name.name.clone()).or_insert_with(
+                                        || elab.typedefs.get(&a.name.name).copied(),
+                                    );
+                                    elab.typedefs.insert(a.name.name.clone(), w);
                                 }
                             }
                         }
+                        sync_typedefs_tls(&elab.typedefs);
                     }
                     if let ParameterKind::Data {
                         data_type,
@@ -36597,6 +36635,19 @@ fn inline_module_items(
                                 t,
                             );
                             sub_local_params.insert(a.name.name.clone(), v);
+                        }
+                    }
+                }
+
+                // The header's type-parameter bindings: step 1b installs its
+                // own per-round overlay and must see the design's table.
+                for (name, old) in header_type_saves {
+                    match old {
+                        Some(width) => {
+                            elab.typedefs.insert(name, width);
+                        }
+                        None => {
+                            elab.typedefs.remove(&name);
                         }
                     }
                 }
