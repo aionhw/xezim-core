@@ -41405,7 +41405,7 @@ fn eval_const_user_function(
         elab: &ElaboratedModule,
         depth: u32,
     ) -> Option<Value> {
-        let resolved = resolve_const_fn_cast_targets(e, elab);
+        let resolved = resolve_const_fn_cast_targets(e, locals, elab);
         let e = &resolved;
         if !const_fn_expr_supported(e) {
             return None;
@@ -41779,9 +41779,15 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
 /// (`dir_e'(d)` lowers to `$__xz_named_cast`, `T'(e)` with a type operand to
 /// `$__xz_type_cast` of a type reference) with a `$__xz_type_cast` of the
 /// typedef's declared type, so `const_fn_expr_supported` can judge the cast
-/// from the type itself. Other expressions are rebuilt unchanged.
-fn resolve_const_fn_cast_targets(e: &Expression, elab: &ElaboratedModule) -> Expression {
-    let rec = |x: &Expression| resolve_const_fn_cast_targets(x, elab);
+/// from the type itself. A named positive integral value in the call's
+/// parameter/local scope is a size cast instead (§6.24.1, §13.4.3).
+/// Other expressions are rebuilt unchanged.
+fn resolve_const_fn_cast_targets(
+    e: &Expression,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+) -> Expression {
+    let rec = |x: &Expression| resolve_const_fn_cast_targets(x, params, elab);
     let rebuild = |k: ExprKind| Expression::new(k, e.span);
     match &e.kind {
         ExprKind::SystemCall { name, args }
@@ -41795,6 +41801,21 @@ fn resolve_const_fn_cast_targets(e: &Expression, elab: &ElaboratedModule) -> Exp
                         rec(&args[1]),
                     ],
                 }),
+                // `W'(x)` is parsed as a named cast too. The instance's
+                // value parameters are already in `params`; leaving this as
+                // a named cast made the support check reject the whole call.
+                // Only admit a known positive integral size, so an unresolved
+                // type/name still takes the prior deferral path.
+                None if name == "$__xz_named_cast" && is_const_expr(&args[0], params) && {
+                    let size = eval_const_expr_val(&args[0], params);
+                    !size.is_real && size.to_i64().is_some_and(|n| n > 0)
+                } =>
+                {
+                    rebuild(ExprKind::SystemCall {
+                        name: "$__xz_size_cast".to_string(),
+                        args: vec![args[0].clone(), rec(&args[1])],
+                    })
+                }
                 None => rebuild(ExprKind::SystemCall {
                     name: name.clone(),
                     args: vec![args[0].clone(), rec(&args[1])],
@@ -41914,7 +41935,7 @@ fn substitute_const_fn_calls(
                 // operand count, and every width derived from it. Resolve the
                 // cast to its declared type first, the same way the function
                 // body does, and then judge the converted expression.
-                let a = resolve_const_fn_cast_targets(a, elab);
+                let a = resolve_const_fn_cast_targets(a, params, elab);
                 // §10.9.2, §13.5: a pattern actual of a packed-struct formal
                 // is packed by the formal's members, by name or position
                 // (#680); the support check below admits no pattern.
