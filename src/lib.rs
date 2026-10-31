@@ -70,6 +70,7 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
 
 pub mod bits2;
 pub mod elaborate;
+pub mod navigation;
 pub mod packed_value;
 mod body_type_params;
 mod unit_subroutine_usage;
@@ -288,6 +289,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
             .map_err(|e| format!("write '{}': {}", path, e))?;
         bincode::serde::encode_into_std_write(elab, &mut w, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
+        navigation::write(elab, &mut w)?;
         return w.flush().map_err(|e| format!("flush '{}': {}", path, e));
     }
 
@@ -310,6 +312,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
         let mut uncompressed = Vec::new();
         bincode::serde::encode_into_std_write(elab, &mut uncompressed, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
+        navigation::write(elab, &mut uncompressed)?;
         let uncompressed_size = uncompressed.len();
 
         // Now compress and write
@@ -349,6 +352,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
         let mut buffered = std::io::BufWriter::with_capacity(1 << 20, enc);
         bincode::serde::encode_into_std_write(elab, &mut buffered, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
+        navigation::write(elab, &mut buffered)?;
         let enc = buffered
             .into_inner()
             .map_err(|e| format!("flush '{}': {}", path, e))?;
@@ -399,18 +403,10 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
     // bincode pulls every field through `read_exact`; buffer the decoder's
     // output so those are memory copies, not one decompression call each.
     let elab = if got == 4 && head == [0x28, 0xB5, 0x2F, 0xFD] {
-        let dec = zstd::stream::Decoder::new(chained).map_err(|e| format!("zstd init: {}", e))?;
-        bincode::serde::decode_from_std_read(
-            &mut std::io::BufReader::with_capacity(1 << 20, dec),
-            xez_bincode_config(),
-        )
-        .map_err(|e| format!("deserialize: {}", e))?
+        let dec = zstd::stream::Decoder::new(chained).map_err(|e| format!("zstd init: {e}"))?;
+        decode_with_navigation(&mut std::io::BufReader::with_capacity(1 << 20, dec))?
     } else {
-        bincode::serde::decode_from_std_read(
-            &mut std::io::BufReader::with_capacity(1 << 16, chained),
-            xez_bincode_config(),
-        )
-        .map_err(|e| format!("deserialize: {}", e))?
+        decode_with_navigation(&mut std::io::BufReader::with_capacity(1 << 16, chained))?
     };
     Ok(Some(elab))
 }
@@ -431,19 +427,21 @@ pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, 
         return Err("xezim artifact: missing magic header".to_string());
     }
     // Same compressed/uncompressed sniff as `read_compiled`.
-    if body.len() >= 4 && body[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-        let dec = zstd::stream::Decoder::new(body).map_err(|e| format!("zstd init: {}", e))?;
-        bincode::serde::decode_from_std_read(
-            &mut std::io::BufReader::with_capacity(1 << 20, dec),
-            xez_bincode_config(),
-        )
-        .map_err(|e| format!("deserialize: {}", e))
+    if body.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        let dec = zstd::stream::Decoder::new(body).map_err(|e| format!("zstd init: {e}"))?;
+        decode_with_navigation(&mut std::io::BufReader::with_capacity(1 << 20, dec))
     } else {
-        bincode::serde::decode_from_slice(body, xez_bincode_config())
-            .map(|(elab, _)| elab)
-            .map_err(|e| format!("deserialize: {}", e))
+        decode_with_navigation(&mut std::io::Cursor::new(body))
     }
 }
+
+fn decode_with_navigation<R: std::io::Read>(reader: &mut R) -> Result<elaborate::ElaboratedModule, String> {
+    let mut elab: elaborate::ElaboratedModule = bincode::serde::decode_from_std_read(reader, xez_bincode_config())
+        .map_err(|e| format!("deserialize: {e}"))?;
+    elab.navigation = navigation::read(reader)?;
+    Ok(elab)
+}
+
 
 use std::rc::Rc;
 
@@ -1325,6 +1323,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     let (texts, files) = elaborate::take_elab_sources();
     let maps = elaborate::take_elab_line_maps();
     let (defs, mut elab) = elaborated?;
+    navigation::finish(&mut elab);
     elab.source_texts = texts;
     elab.source_files = files;
     elab.source_line_maps = maps;

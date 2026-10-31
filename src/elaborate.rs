@@ -3753,6 +3753,9 @@ pub struct ElaboratedModule {
     /// `source_texts`.
     #[serde(skip)]
     pub source_line_maps: Vec<Option<sv_parser::source_map::LineMap>>,
+    /// Versioned optional trailer, deliberately outside the simulation bincode layout.
+    #[serde(skip)]
+    pub navigation: crate::navigation::NavigationInfo,
 }
 
 /// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
@@ -4035,6 +4038,7 @@ impl ElaboratedModule {
             src_file_of_module: HashMap::default(),
             source_orig_lines: Vec::new(),
             source_line_maps: Vec::new(),
+            navigation: crate::navigation::NavigationInfo::default(),
         }
     }
 
@@ -34289,6 +34293,7 @@ fn inline_module_items(
     let _decl_shapes = install_decl_shapes(source_def);
     let mut prepared_source =
         prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
+    crate::navigation::record_body(elab, source_def, prefix, &prepared_source.effective_items);
     // §23.11/§27: only active generate branches contribute declarations.
     for item in &prepared_source.effective_items {
         if let ModuleItem::Bind(b) = item {
@@ -48526,4 +48531,21 @@ mod package_net_tests {
             assert_eq!(elab.supply_nets.contains("s"), bare_is_net, "{source}");
         }
     }
+}
+
+/// Exact original locations only; never claim preprocessed coordinates are original.
+pub(crate) fn navigation_location(elab: &ElaboratedModule, owner: &str, span: Span) -> Option<sv_parser::diagnostics::Location> {
+    match span_locate_owned(elab, span, true, Some(owner))? {
+        SpanLoc::Mapped(loc) => Some(loc),
+        SpanLoc::Plain(_) => None,
+    }
+}
+
+pub(crate) fn navigation_identifier(elab: &ElaboratedModule, owner: &str, span: Span) -> Option<String> {
+    let extract = |texts: &[String], files: &HashMap<String, u32>| {
+        let text = texts.get(*files.get(owner)? as usize)?.get(span.start..span.end)?;
+        Some(text.trim().trim_start_matches('\\').to_owned())
+    };
+    if !elab.source_texts.is_empty() { return extract(&elab.source_texts, &elab.src_file_of_module); }
+    ELAB_SOURCES_TLS.with(|s| ELAB_MODULE_FILES_TLS.with(|m| extract(&s.borrow().0, &m.borrow())))
 }
