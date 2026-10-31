@@ -5779,6 +5779,27 @@ impl Value {
         let num_bytes = self.width.div_ceil(8) as usize;
         let mut out: Vec<u8> = Vec::with_capacity(num_bytes);
         let mut started = false;
+        // String values carry no X/Z bits: read each byte straight from its
+        // value word. String building (`s = {s, x}`) converts the whole
+        // accumulated value on every append, so this runs per character.
+        if let ValueStorage::Wide(planes) = &self.storage
+            && planes.xz.iter().all(|&w| w == 0)
+        {
+            for bi in (0..num_bytes).rev() {
+                let mut byte = (planes.val[bi / 8] >> ((bi % 8) * 8)) as u8;
+                let w = self.width as usize - bi * 8;
+                if w < 8 {
+                    byte &= ((1u16 << w) - 1) as u8;
+                }
+                if byte != 0 {
+                    started = true;
+                }
+                if started {
+                    out.push(byte);
+                }
+            }
+            return out;
+        }
         // Whole bytes via the SWAR slice reader (word extraction) instead of
         // eight get_bit calls per byte — string values are wide (one byte per
         // char) and this ran per formatted UVM message.
@@ -5803,10 +5824,12 @@ impl Value {
     /// to one char (Latin-1, the inverse of `from_string`), so raw bytes
     /// above 0x7F survive a round-trip instead of becoming U+FFFD.
     pub fn to_sv_string(&self) -> String {
-        self.sv_string_bytes()
-            .into_iter()
-            .map(|b| b as char)
-            .collect()
+        let bytes = self.sv_string_bytes();
+        if bytes.is_ascii() {
+            // ASCII is already valid UTF-8 with one byte per char.
+            return String::from_utf8(bytes).unwrap_or_default();
+        }
+        bytes.into_iter().map(|b| b as char).collect()
     }
 
     /// Hex string representation
