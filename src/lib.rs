@@ -184,7 +184,10 @@ pub use value::Value;
 /// \x33 = \x32 + ElaboratedClass.assoc_key_decl_types (§8.25).
 /// \x34 = \x33 + ElaboratedModule.coll_shapes and
 /// ElaboratedClass.prop_coll_shapes (§7.4.5).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x34";
+/// \x35 = \x34 − ElaboratedModule.{assoc_row_dims, assoc_coll_elems,
+/// assoc_inner_string_keys} and ElaboratedClass.{assoc_coll_properties,
+/// assoc_row_property_dims}, superseded by the collection shapes.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x35";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

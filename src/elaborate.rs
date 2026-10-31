@@ -1255,16 +1255,6 @@ pub struct ElaboratedClass {
     /// tail the way a module-scope declaration of the same shape is shaped.
     #[serde(default)]
     pub dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>>,
-    /// §7.8: associative-array members whose elements are themselves
-    /// unpacked collections (`int m [C][int]`, `int q [int][$]`); see
-    /// `ElaboratedModule::assoc_coll_elems`.
-    #[serde(default)]
-    pub assoc_coll_properties: HashSet<String>,
-    /// The row dimensions of each member in `assoc_coll_properties` (every
-    /// dimension after the key); the class counterpart of
-    /// `ElaboratedModule::assoc_row_dims`.
-    #[serde(default)]
-    pub assoc_row_property_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// §7.4.5: the declared [`CollShape`] of each collection property; the
     /// class counterpart of `ElaboratedModule::coll_shapes`. Keyed by the
     /// bare property name (statics too). §8.25: a key typed by a class
@@ -2154,8 +2144,6 @@ fn elaborate_class_in_scope(
         HashMap::default();
     let mut dynamic_assoc_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
-    let mut assoc_coll_properties: HashSet<String> = HashSet::default();
-    let mut assoc_row_property_dims: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut prop_coll_shapes: HashMap<String, CollShape> = HashMap::default();
     let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
@@ -2441,15 +2429,6 @@ fn elaborate_class_in_scope(
                             })
                         {
                             dynamic_tail_properties
-                                .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
-                        }
-                        if matches!(
-                            effective_dims.first(),
-                            Some(UnpackedDimension::Associative { .. })
-                        ) && effective_dims.len() > 1
-                        {
-                            assoc_coll_properties.insert(decl.name.name.clone());
-                            assoc_row_property_dims
                                 .insert(decl.name.name.clone(), effective_dims[1..].to_vec());
                         }
                         // §8.25: a fixed array sized by a header VALUE
@@ -3229,8 +3208,6 @@ fn elaborate_class_in_scope(
         array_of_coll_properties,
         dynamic_assoc_properties,
         dynamic_tail_properties,
-        assoc_coll_properties,
-        assoc_row_property_dims,
         prop_coll_shapes,
         array_prop_decl_dims,
     }
@@ -3595,25 +3572,6 @@ pub struct ElaboratedModule {
     /// unrelated enum (UVM's report summary showed `UVM_NORADIX` where a
     /// severity belonged).
     pub assoc_key_type_names: HashMap<String, String>,
-    /// §7.8: for an associative array of associative arrays
-    /// (`int m[int][string]`), whether each INNER level is string-keyed, in
-    /// declaration order after the first dimension. A multi-variable
-    /// `foreach` binds those index variables with the key type.
-    #[serde(default)]
-    pub assoc_inner_string_keys: HashMap<String, Vec<bool>>,
-    /// §7.8/§7.4.5: associative arrays whose elements are themselves
-    /// unpacked collections (`int aq[int][$]`, `int aa[int][int]`,
-    /// `int ad[int][4]`). `m[k][j]` on one of these selects an element of the
-    /// row; on any other associative array of an integral type it is a bit of
-    /// the element.
-    #[serde(default)]
-    pub assoc_coll_elems: HashSet<String>,
-    /// §7.8/§7.10: the dimensions of each ROW of an associative array in
-    /// `assoc_coll_elems` (every dimension after the key, outermost first):
-    /// `int aq[int][$]` has a queue row. A write to an absent row
-    /// (`aq[6][0] = 9`) creates it as that kind of collection.
-    #[serde(default)]
-    pub assoc_row_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// §7.4.5: the declared [`CollShape`] of every collection of collections
     /// (see [`CollShape::of`]), by storage name.
     #[serde(default)]
@@ -4084,10 +4042,7 @@ impl ElaboratedModule {
             property_params: HashMap::default(),
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
-            assoc_inner_string_keys: HashMap::default(),
-            assoc_row_dims: HashMap::default(),
             coll_shapes: HashMap::default(),
-            assoc_coll_elems: HashSet::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
@@ -9742,11 +9697,6 @@ pub fn elaborate_module_with_defs(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
-                        if let Some(lv) = assoc_inner_string_levels(&effective_dims) {
-                            elab.assoc_inner_string_keys
-                                .insert(decl.name.name.clone(), lv);
-                        }
-                        record_assoc_rows(&mut elab, &decl.name.name, &effective_dims);
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -17125,11 +17075,6 @@ fn elaborate_items_numbered(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
-                        if let Some(lv) = assoc_inner_string_levels(&decl.dimensions) {
-                            elab.assoc_inner_string_keys
-                                .insert(decl.name.name.clone(), lv);
-                        }
-                        record_assoc_rows(elab, &decl.name.name, &decl.dimensions);
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -20076,40 +20021,6 @@ fn record_coll_shape(
     }
 }
 
-/// Records an associative array whose elements are collections
-/// (`assoc_coll_elems`) and the dimensions of its rows (`assoc_row_dims`).
-fn record_assoc_rows(elab: &mut ElaboratedModule, name: &str, dims: &[UnpackedDimension]) {
-    if dims.len() > 1 {
-        elab.assoc_coll_elems.insert(name.to_string());
-        elab.assoc_row_dims
-            .insert(name.to_string(), dims[1..].to_vec());
-    }
-}
-
-/// §7.8: the inner-level string-key flags of an associative array of
-/// associative arrays (see `assoc_inner_string_keys`); `None` when `dims`
-/// has no associative dimension after the first.
-pub fn assoc_inner_string_levels(dims: &[UnpackedDimension]) -> Option<Vec<bool>> {
-    let inner = dims.get(1..)?;
-    if !inner
-        .iter()
-        .any(|d| matches!(d, UnpackedDimension::Associative { .. }))
-    {
-        return None;
-    }
-    Some(
-        inner
-            .iter()
-            .map(|d| {
-                matches!(
-                    d,
-                    UnpackedDimension::Associative { data_type: Some(dt), .. }
-                        if matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
-                )
-            })
-            .collect(),
-    )
-}
 
 /// §7.8.2: what the runtime needs about an associative array's KEY type —
 /// its (width, signedness) for an integral key, and the typedef name a
@@ -25944,10 +25855,6 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
                     elab.associative_arrays
                         .entry(mbase.clone())
                         .or_insert(is_str);
-                    if let Some(lv) = assoc_inner_string_levels(&mdims) {
-                        elab.assoc_inner_string_keys.insert(mbase.clone(), lv);
-                    }
-                    record_assoc_rows(elab, &mbase, &mdims);
                     elab.var_decl_types
                         .insert(mbase.clone(), member.data_type.clone());
                     continue;
@@ -30300,11 +30207,6 @@ fn inline_instantiations_inner(
                                             scope: String::new(),
                                         });
                                     }
-                                    if let Some(lv) = assoc_inner_string_levels(&decl.dimensions) {
-                                        elab.assoc_inner_string_keys
-                                            .insert(decl.name.name.clone(), lv);
-                                    }
-                                    record_assoc_rows(elab, &decl.name.name, &decl.dimensions);
                                     continue;
                                 }
                                 // §7.4.2/§7.4.5: a fixed MULTI-dimensional
@@ -38488,13 +38390,6 @@ fn inline_module_items(
                                             )
                                         });
                                         elab.associative_arrays.insert(sig_name.clone(), is_str);
-                                        if let Some(lv) =
-                                            assoc_inner_string_levels(&effective_decl_dims)
-                                        {
-                                            elab.assoc_inner_string_keys
-                                                .insert(sig_name.clone(), lv);
-                                        }
-                                        record_assoc_rows(elab, &sig_name, &effective_decl_dims);
                                         // §10.7: the element width, under the SCOPED name — the runtime
                                         // looks it up by resolved signal name, and a bare leaf would
                                         // collide with a same-named array in another module.
