@@ -173,6 +173,8 @@ pub struct ModCtx {
     /// `next_trigger(...)` sites of method processes: (process, what its
     /// next activation waits for). The site's number is its index + 1.
     pub next_triggers: Vec<(usize, Statement)>,
+    /// The module's TLM sockets: (multi-passthrough, target) by member.
+    pub sockets: BTreeMap<String, (bool, bool)>,
     /// Function names defined more than once in the module (overloads):
     /// each is `name__<parameter count>`.
     pub overloaded: BTreeSet<String>,
@@ -1177,6 +1179,13 @@ impl<'a> Lw<'a> {
         use sc::ExprKind as K;
         let span = e.span;
         match &e.kind {
+            // An assignment's value is its target, assigned first
+            // (`while ((p = q.next()) != 0)`).
+            K::Assign { op, lhs, rhs } => {
+                let stmts = self.assign_stmt(*op, lhs, rhs, span)?;
+                self.pre.extend(stmts);
+                self.expr(lhs)
+            }
             K::IntLit { text, value } => {
                 let v = value.ok_or(()).or_else(|_| {
                     self.err(span, format!("integer literal '{}' is too large", text))
@@ -1377,6 +1386,20 @@ impl<'a> Lw<'a> {
                 let Ok(Ty::Class(c)) = self.ty(ty, span) else {
                     unreachable!("checked")
                 };
+                // `new tlm_generic_payload(&mm)`: with its memory manager.
+                if let (Some([mm]), "scrt_tlm_gp") = (
+                    match &e.kind {
+                        K::New { args, .. } => args.as_deref(),
+                        _ => None,
+                    },
+                    c.as_str(),
+                ) {
+                    let (m, _) = self.expr(mm)?;
+                    let tmp = self.temp(&Ty::Handle(c.clone()));
+                    self.pre.push(assign(ident(&tmp), new_obj(None)));
+                    self.pre.push(expr_stmt(method(ident(&tmp), "set_mm", vec![m])));
+                    return Ok((ident(&tmp), Ty::Handle(c)));
+                }
                 Ok((new_obj(None), Ty::Handle(c)))
             }
             K::New { .. } => self.err(
@@ -1441,12 +1464,13 @@ impl<'a> Lw<'a> {
                 return Ok((member(ident(&cls), &super::classes::escape_sv(last)), t));
             }
         }
-        if last.starts_with("TLM_")
-            || matches!(
-                last,
-                "BEGIN_REQ" | "END_REQ" | "BEGIN_RESP" | "END_RESP" | "UNINITIALIZED_PHASE"
-            )
-        {
+        if matches!(
+            last,
+            "BEGIN_REQ" | "END_REQ" | "BEGIN_RESP" | "END_RESP" | "UNINITIALIZED_PHASE"
+        ) {
+            return Ok((ident(last), Ty::Phase));
+        }
+        if last.starts_with("TLM_") || last.starts_with("DMI_ACCESS_") {
             return Ok((ident(last), Ty::int32()));
         }
         if let Some(v) = self.prog.global_consts.get(last) {
@@ -1671,6 +1695,16 @@ impl<'a> Lw<'a> {
                 }
                 _ => {}
             }
+        }
+        // An object handle against 0 / nullptr, or another handle.
+        if let (Ty::Class(_) | Ty::Handle(_), sc::BinaryOp::Eq | sc::BinaryOp::Ne) = (&lt, op) {
+            let op = if op == sc::BinaryOp::Eq {
+                BinaryOp::Eq
+            } else {
+                BinaryOp::Neq
+            };
+            let r = if matches!(rt, Ty::Class(_) | Ty::Handle(_)) { r } else { null() };
+            return Ok((bin(op, l, r), Ty::Bool));
         }
         if let (
             Ty::Ptr { .. } | Ty::Class(_) | Ty::Handle(_),
@@ -1941,6 +1975,10 @@ impl<'a> Lw<'a> {
         }
         if let Some(f) = name.strip_prefix("sc_report_handler::") {
             return self.report_handler_call(f, args, span);
+        }
+        // §12.2.4 the global quantum.
+        if name == "tlm_global_quantum::instance" && args.is_empty() {
+            return Ok((ident("scrt_gq"), Ty::Handle("scrt_global_quantum".to_string())));
         }
         // `T::f(args)`: a static member function of a user class.
         if q.segments.len() >= 2 {
@@ -2376,35 +2414,24 @@ impl<'a> Lw<'a> {
                         ),
                     };
                 }
-                SymKind::InitSocket => {
-                    let s = ident(&sym.sv);
-                    return match m {
-                        "transport_dbg" => {
-                            let (t, _) = self.expr(&args[0])?;
-                            Ok((
-                                method(s, "transport_dbg", vec![t]),
-                                Ty::Int {
-                                    bits: 32,
-                                    signed: false,
-                                    ch: false,
-                                },
-                            ))
-                        }
-                        "get_direct_mem_ptr" => {
-                            let (t, _) = self.expr(&args[0])?;
-                            Ok((method(s, "get_direct_mem_ptr", vec![t]), Ty::Bool))
-                        }
-                        _ => self.err(
-                            span,
-                            format!("'{}' on a socket is supported only as a statement", m),
-                        ),
-                    };
-                }
                 _ => {}
             }
         }
         let _ = seg;
+        // A multi-passthrough socket (§16.1.4): `s[i]->…` uses binding i.
+        if let sc::ExprKind::Index { base: ib, index: ii } = &base.kind
+            && let Some(q) = ib.as_name()
+            && self.m.sockets.get(q.last_name()).is_some_and(|(multi, _)| *multi)
+            && let Some(sym) = self.lookup(q.last_name())
+        {
+            let (i, _) = self.expr(ii)?;
+            return self.socket_call(ident(&sym.sv), i, m, args, span);
+        }
         let (b, bt) = self.expr(base)?;
+        // A socket (§13): calls go out on its (first) binding.
+        if matches!(&bt, Ty::Class(c) if c == "scrt_socket") {
+            return self.socket_call(b, int(0), m, args, span);
+        }
         // An event reached through an object or a child module (`u.go`).
         if matches!(bt, Ty::Event) && m == "notify" {
             let v = self.notify_target(b, args, span)?;
@@ -2517,13 +2544,68 @@ impl<'a> Lw<'a> {
                 let xs: Vec<Expression> = a.iter().map(|x| x.0.clone()).collect();
                 self.object_call(b, c, m, xs, span)
             }
+            // A PEQ's event (§16.3).
+            Ty::Class(c) | Ty::Handle(c) if c == "scrt_peq_get" && m == "get_event" => {
+                Ok((member(b, "ev"), Ty::Event))
+            }
+            // §17 an analysis port: subscribers, and writes to all of them.
+            Ty::Class(c) | Ty::Handle(c) if c.starts_with("__sc_ap_") && matches!(m, "bind" | "write") => {
+                let sv_m = if m == "bind" { "bind_" } else { "write" };
+                let xs: Vec<Expression> = a.iter().map(|x| x.0.clone()).collect();
+                self.pre.push(expr_stmt(method(b, sv_m, xs)));
+                Ok((int(0), Ty::Void))
+            }
+            // §14.21 `t.get_extension(p)` / `t.get_extension<T>()`: the
+            // extension of p's class (null when absent).
+            Ty::Class(c) | Ty::Handle(c) if c == "scrt_tlm_gp" && m == "get_extension" => {
+                let (target, cls) = match args {
+                    [p] => {
+                        let target = self.lvalue_ref(p)?;
+                        let (Ty::Handle(cls) | Ty::Class(cls)) = &a[0].1 else {
+                            return self.err(span, "get_extension needs an extension pointer");
+                        };
+                        (target, cls.clone())
+                    }
+                    [] => {
+                        let targ = seg.template_args.as_ref().and_then(|v| v.first()).cloned();
+                        let Some(sc::TemplateArg::Type(t)) = targ else {
+                            return self.err(span, "get_extension<T>() needs the extension type");
+                        };
+                        let Ty::Class(cls) = self.ty(&t, span)? else {
+                            return self.err(span, "get_extension<T>() needs an extension class");
+                        };
+                        let tmp = self.temp(&Ty::Handle(cls.clone()));
+                        (ident(&tmp), cls)
+                    }
+                    _ => return self.err(span, "get_extension(p) or get_extension<T>() expected"),
+                };
+                let key = string(cls.trim_start_matches("sc_c_"));
+                let found = method(b, "get_ext", vec![key]);
+                self.pre.push(if_(
+                    unary(UnaryOp::LogNot, sys("$cast", vec![target.clone(), found])),
+                    assign(target.clone(), null()),
+                    None,
+                ));
+                Ok((target, Ty::Handle(cls)))
+            }
             Ty::Class(c) | Ty::Handle(c) => {
-                let sv_m = if m == "release" { "release_" } else { m };
+                let sv_m = match (c.as_str(), m, args.len()) {
+                    ("scrt_peq_get", "notify", 1) | ("scrt_peq_cb", "notify", 2) => "notify_now",
+                    (_, "release", _) => "release_",
+                    _ => m,
+                };
+                // The quantum keeper's synchronization waits.
+                if c == "scrt_qk" && matches!(m, "sync" | "set_and_sync") {
+                    self.f.is_task = true;
+                    let xs = a.iter().map(|x| x.0.clone()).collect();
+                    self.pre.push(expr_stmt(method(b, sv_m, xs)));
+                    return Ok((int(0), Ty::Void));
+                }
                 let ret = self.prog.class_method_ret(c, m);
                 let mut xs = Vec::new();
                 for (e, x) in args.iter().zip(&a) {
                     // A data pointer argument may be an array (it decays).
-                    let decays = matches!(m, "set_data_ptr" | "set_byte_enable_ptr")
+                    let decays = matches!(m, "set_data_ptr" | "set_byte_enable_ptr" | "set_dmi_ptr")
                         && e.as_name()
                             .and_then(|q| self.lookup(q.last_name()))
                             .is_some_and(|sym| sym.kind == SymKind::BoxedArr);
@@ -3771,19 +3853,6 @@ impl<'a> Lw<'a> {
                 "cancel" => Ok(Some(Vec::new())),
                 _ => self.err(span, format!("'{}' on sc_event is not supported", m)),
             },
-            SymKind::InitSocket if m == "b_transport" => {
-                let [t, d] = args else {
-                    return self.err(span, "b_transport(trans, delay) expected");
-                };
-                let (t, _) = self.expr(&deref_inner(t).clone())?;
-                let d = self.lvalue_ref(d)?;
-                self.f.is_task = true;
-                Ok(Some(vec![expr_stmt(method(
-                    ident(&sym.sv),
-                    "b_transport",
-                    vec![t, d],
-                ))]))
-            }
             SymKind::Var if matches!(sym.ty, Ty::Queue(_)) => {
                 Ok(Some(self.queue_op(ident(&sym.sv), m, args)?))
             }
@@ -4119,6 +4188,57 @@ impl<'a> Lw<'a> {
                     format!("sc_report_handler::{} is not supported in simulation", f),
                 );
             }
+        })
+    }
+
+    /// A transport call through a socket (§11–§13), on binding `i`.
+    fn socket_call(
+        &mut self,
+        sock: Expression,
+        i: Expression,
+        m: &str,
+        args: &[sc::Expr],
+        span: ScSpan,
+    ) -> R<(Expression, Ty)> {
+        let trans = |lw: &mut Self, t: &sc::Expr| -> R<Expression> { Ok(lw.expr(deref_inner(t))?.0) };
+        Ok(match (m, args) {
+            ("b_transport", [t, d]) => {
+                let t = trans(self, t)?;
+                let d = self.lvalue_ref(d)?;
+                self.f.is_task = true;
+                self.pre.push(expr_stmt(method(sock, "b_transport", vec![i, t, d])));
+                (int(0), Ty::Void)
+            }
+            ("nb_transport_fw" | "nb_transport_bw", [t, ph, d]) => {
+                let t = trans(self, t)?;
+                let ph = self.lvalue_ref(ph)?;
+                let d = self.lvalue_ref(d)?;
+                (method(sock, m, vec![i, t, ph, d]), Ty::int32())
+            }
+            ("get_direct_mem_ptr", [t, dmi]) => {
+                let t = trans(self, t)?;
+                let dmi = trans(self, dmi)?;
+                (method(sock, m, vec![i, t, dmi]), Ty::Bool)
+            }
+            ("transport_dbg", [t]) => {
+                let t = trans(self, t)?;
+                (
+                    method(sock, m, vec![i, t]),
+                    Ty::Int {
+                        bits: 32,
+                        signed: false,
+                        ch: false,
+                    },
+                )
+            }
+            ("invalidate_direct_mem_ptr", [a, e]) => {
+                let (a, _) = self.expr(a)?;
+                let (e, _) = self.expr(e)?;
+                self.pre.push(expr_stmt(method(sock, m, vec![i, a, e])));
+                (int(0), Ty::Void)
+            }
+            ("size", []) => (method(sock, "size", vec![]), Ty::int32()),
+            _ => return self.err(span, format!("'{}' on a socket is not supported in simulation", m)),
         })
     }
 
@@ -4479,12 +4599,16 @@ impl<'a> Lw<'a> {
                         "posedge_event" | "pos" => Some(Edge::Posedge),
                         "negedge_event" | "neg" => Some(Edge::Negedge),
                         "value_changed_event" | "default_event" | "value_changed"
-                        | "terminated_event" => None,
+                        | "terminated_event" | "get_event" => None,
                         other => return self.err(e.span, format!("'{}' is not an event", other)),
                     };
                     // A spawned process's termination (§5.6.4).
                     if matches!(&t, Ty::Handle(c) if c == "scrt_proc") {
                         return Ok(vec![event_expr(None, member(x, "done"))]);
+                    }
+                    // A PEQ's event (§16.3).
+                    if matches!(&t, Ty::Class(c) | Ty::Handle(c) if c == "scrt_peq_get") {
+                        return Ok(vec![event_expr(None, member(x, "ev"))]);
                     }
                     // An sc_event_queue's event.
                     if matches!(&t, Ty::Class(c) if c == "scrt_event_queue") {
@@ -4737,6 +4861,11 @@ impl<'a> Lw<'a> {
                 Ty::Real { .. } => "%g".to_string(),
                 Ty::Time => {
                     args.push(call_fn("scrt_time_str", vec![x]));
+                    fmt.push_str("%s");
+                    continue;
+                }
+                Ty::Phase => {
+                    args.push(call_fn("scrt_phase_str", vec![x]));
                     fmt.push_str("%s");
                     continue;
                 }
@@ -5005,7 +5134,7 @@ fn is_incdec(k: &sc::ExprKind) -> bool {
     )
 }
 
-fn deref_inner(e: &sc::Expr) -> &sc::Expr {
+pub fn deref_inner(e: &sc::Expr) -> &sc::Expr {
     match &e.kind {
         sc::ExprKind::Unary {
             op: sc::UnaryOp::Deref,

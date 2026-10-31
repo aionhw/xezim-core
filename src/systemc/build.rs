@@ -168,6 +168,23 @@ pub fn index(base: Expression, i: Expression) -> Expression {
     })
 }
 
+/// A stable text for a simple lvalue (`a`, `a.b`, `a[2]`): a key for the
+/// object it names (spans are synthetic, so `{:?}` differs per build).
+pub fn expr_key(e: &Expression) -> String {
+    match &e.kind {
+        ExprKind::Ident(h) => h
+            .path
+            .iter()
+            .map(|s| s.name.name.clone())
+            .collect::<Vec<_>>()
+            .join("."),
+        ExprKind::MemberAccess { expr, member } => format!("{}.{}", expr_key(expr), member.name),
+        ExprKind::Index { expr, index } => format!("{}[{}]", expr_key(expr), expr_key(index)),
+        ExprKind::Number(NumberLiteral::Integer { value, .. }) => format!("{}", value),
+        _ => "?".to_string(),
+    }
+}
+
 /// `base[left:right]`.
 pub fn range(base: Expression, left: Expression, right: Expression) -> Expression {
     ex(ExprKind::RangeSelect {

@@ -74,6 +74,8 @@ pub enum Ty {
     Array(Box<Ty>, Expression),
     /// `std::vector<T>`, a queue.
     Queue(Box<Ty>),
+    /// `tlm::tlm_phase`: an int that prints its name (`BEGIN_REQ`).
+    Phase,
 }
 
 impl Ty {
@@ -88,7 +90,7 @@ impl Ty {
     pub fn is_scalar_bits(&self) -> bool {
         matches!(
             self,
-            Ty::Bool | Ty::Vec2 { .. } | Ty::Vec4 { .. } | Ty::Int { .. }
+            Ty::Bool | Ty::Vec2 { .. } | Ty::Vec4 { .. } | Ty::Int { .. } | Ty::Phase
         )
     }
 
@@ -100,6 +102,7 @@ impl Ty {
             Ty::Real { single: true } => 4,
             Ty::Real { single: false } => 8,
             Ty::Time => 8,
+            Ty::Phase => 4,
             Ty::Vec2 { w, .. } | Ty::Vec4 { w, .. } => {
                 let n = w.n?;
                 if n <= 64 {
@@ -182,6 +185,7 @@ pub fn sv_scalar_type(ty: &Ty) -> DataType {
         }),
         Ty::Str | Ty::OStream => simple_t(SimpleType::String),
         Ty::Time => atom_t(IntegerAtomType::LongInt, true),
+        Ty::Phase => atom_t(IntegerAtomType::Int, false),
         Ty::Void => void_t(),
         Ty::Class(n) | Ty::Handle(n) => named_t(n, Vec::new()),
         Ty::Ptr { .. } => named_t("scrt_ptr", Vec::new()),
@@ -231,6 +235,9 @@ pub struct TyEnv {
     pub templates: BTreeMap<String, Vec<sc::TemplateParam>>,
     /// The instantiations found so far, by their (mangled) name.
     pub instances: std::rc::Rc<std::cell::RefCell<BTreeMap<String, Instantiation>>>,
+    /// The payload types of analysis ports and interfaces (§17), by their
+    /// mangled names: each gets its classes in the package `sc_user`.
+    pub analysis: std::rc::Rc<std::cell::RefCell<BTreeMap<String, Ty>>>,
 }
 
 /// A type in an instantiation's name: `sc_uint<8>` → `sc_uint8`.
@@ -258,6 +265,7 @@ pub fn mangle_ty(t: &Ty) -> String {
         Ty::Real { single: false } => "double".into(),
         Ty::Str => "string".into(),
         Ty::Time => "sc_time".into(),
+        Ty::Phase => "tlm_phase".into(),
         Ty::Class(c) | Ty::Handle(c) => c.trim_start_matches("sc_c_").to_string(),
         Ty::Ptr { elem } => format!("ptr{}", elem),
         Ty::Queue(e) => format!("vector_{}", mangle_ty(e)),
@@ -630,11 +638,22 @@ pub fn ty_of_name(
         "sc_actions" => u(32, false),
         "sc_severity" | "sc_verbosity" => Ty::int32(),
         "sc_process_handle" => Ty::Handle("scrt_proc".to_string()),
-        "tlm_command"
-        | "tlm_response_status"
-        | "tlm_sync_enum"
-        | "tlm_phase"
-        | "tlm_phase_enum" => Ty::int32(),
+        "tlm_command" | "tlm_response_status" | "tlm_sync_enum" => Ty::int32(),
+        "tlm_phase" | "tlm_phase_enum" => Ty::Phase,
+        "tlm_dmi" => Ty::Class("scrt_tlm_dmi".to_string()),
+        "peq_with_get" => Ty::Class("scrt_peq_get".to_string()),
+        "peq_with_cb_and_phase" => Ty::Class("scrt_peq_cb".to_string()),
+        "tlm_quantumkeeper" => Ty::Class("scrt_qk".to_string()),
+        "tlm_extension_base" => Ty::Class("scrt_ext".to_string()),
+        "tlm_mm_interface" => Ty::Class("scrt_mm_if".to_string()),
+        // §17 analysis ports and interfaces: classes per payload type.
+        "tlm_analysis_port" | "tlm_analysis_if" => {
+            let t = first_type_arg(q, env, consts)?;
+            let m = mangle_ty(&t);
+            env.analysis.borrow_mut().insert(m.clone(), t);
+            let k = if name == "tlm_analysis_port" { "ap" } else { "aif" };
+            Ty::Class(format!("__sc_{}_{}", k, m))
+        }
         "vector" => Ty::Queue(Box::new(first_type_arg(q, env, consts)?)),
         "sc_fifo" | "tlm_fifo" => Ty::Mailbox(Box::new(first_type_arg(q, env, consts)?)),
         other => return Err(format!("unsupported type '{}'", other)),
@@ -759,4 +778,10 @@ pub fn is_lib_class(c: &str) -> bool {
         c,
         "scrt_mutex" | "scrt_semaphore" | "scrt_event_queue" | "scrt_spawn_opts"
     )
+}
+
+/// The runtime's value classes a C++ object of which is a default-built
+/// SV object: the generic payload and the DMI descriptor.
+pub fn is_runtime_value_class(c: &str) -> bool {
+    matches!(c, "scrt_tlm_gp" | "scrt_tlm_dmi" | "scrt_peq_get" | "scrt_qk") || c.starts_with("__sc_ap_")
 }

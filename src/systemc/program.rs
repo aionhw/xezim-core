@@ -486,14 +486,47 @@ impl<'a> Program<'a> {
 
     /// The return type of a runtime class method (`scrt_tlm_gp`).
     pub fn class_method_ret(&self, class: &str, m: &str) -> Option<Ty> {
-        if class != "scrt_tlm_gp" {
-            return None;
-        }
         let u32_ = Ty::Int {
             bits: 32,
             signed: false,
             ch: false,
         };
+        let u64_ = Ty::Int {
+            bits: 64,
+            signed: false,
+            ch: false,
+        };
+        // §16.3 payload event queues, §12.2 temporal decoupling.
+        match (class, m) {
+            ("scrt_peq_get", "notify") | ("scrt_peq_cb", "notify") => return Some(Ty::Void),
+            ("scrt_peq_get", "get_next_transaction") => {
+                return Some(Ty::Handle("scrt_tlm_gp".to_string()));
+            }
+            ("scrt_qk", "inc" | "set" | "reset" | "sync" | "set_and_sync")
+            | ("scrt_global_quantum", "set") => return Some(Ty::Void),
+            ("scrt_qk", "get_local_time" | "get_current_time" | "compute_local_quantum")
+            | ("scrt_global_quantum", "get" | "compute_local_quantum") => return Some(Ty::Time),
+            ("scrt_qk", "need_sync") => return Some(Ty::Bool),
+            _ => {}
+        }
+        // §11.2.5 tlm_dmi.
+        if class == "scrt_tlm_dmi" {
+            return Some(match m {
+                "get_dmi_ptr" => Ty::Ptr { elem: 1 },
+                "get_start_address" | "get_end_address" => u64_,
+                "get_read_latency" | "get_write_latency" => Ty::Time,
+                "get_granted_access" => Ty::int32(),
+                "is_none_allowed" | "is_read_allowed" | "is_write_allowed"
+                | "is_read_write_allowed" => Ty::Bool,
+                "init" | "set_dmi_ptr" | "set_start_address" | "set_end_address"
+                | "set_read_latency" | "set_write_latency" | "set_granted_access" | "allow_none"
+                | "allow_read" | "allow_write" | "allow_read_write" => Ty::Void,
+                _ => return None,
+            });
+        }
+        if class != "scrt_tlm_gp" {
+            return None;
+        }
         Some(match m {
             "get_command" | "get_response_status" => Ty::int32(),
             "get_address" => Ty::Int {
@@ -519,7 +552,12 @@ impl<'a> Program<'a> {
             | "set_write"
             | "acquire"
             | "release"
-            | "reset" => Ty::Void,
+            | "reset"
+            | "clear_extension"
+            | "deep_copy_from"
+            | "set_mm" => Ty::Void,
+            "set_extension" => Ty::Handle("scrt_ext".to_string()),
+            "get_ref_count" => Ty::int32(),
             _ => return None,
         })
     }
@@ -594,6 +632,17 @@ fn scan_expr(e: &Expr, out: &mut BTreeSet<String>) {
             _ => {}
         },
         K::Call { callee, args } => {
+            // An array a TLM payload or DMI descriptor points at (§14, §11.2).
+            if let K::Member { name, .. } = &callee.kind
+                && matches!(
+                    name.ident.name.as_str(),
+                    "set_data_ptr" | "set_byte_enable_ptr" | "set_dmi_ptr"
+                )
+                && let [a] = args.as_slice()
+                && let Some(n) = a.as_name()
+            {
+                out.insert(n.last_name().to_string());
+            }
             // Arrays passed to the C memory functions decay to pointers.
             if let Some(q) = callee.as_name()
                 && matches!(q.last_name(), "memcpy" | "memset" | "memcmp")

@@ -178,12 +178,45 @@ pub struct UserClass<'a> {
 }
 
 /// Whether a class is plain data or behaviour: not a module, and not
-/// derived from a library class.
+/// derived from a library class (other than an interface or a TLM class
+/// the runtime provides as a base).
 pub fn is_plain(c: &sc::ClassDecl) -> bool {
     !c.sc_module
         && !c.bases.iter().any(|b| {
-            library_class(b.name.last_name()) && !is_sc_interface(b.name.last_name())
+            let n = b.name.last_name();
+            library_class(n) && !is_sc_interface(n) && !is_runtime_base(n)
         })
+}
+
+/// TLM-2.0 library classes a user class may derive from, as runtime
+/// classes: an extension (§14.21), a memory manager (§14.5), an analysis
+/// subscriber (§17, one class per payload type).
+fn is_runtime_base(n: &str) -> bool {
+    matches!(n, "tlm_extension" | "tlm_extension_base" | "tlm_mm_interface" | "tlm_analysis_if")
+}
+
+/// The SV class a runtime base names (`tlm_analysis_if<int>` →
+/// `__sc_aif_int32`).
+fn runtime_base(lw: &Lw, q: &sc::QualifiedName) -> Option<String> {
+    match q.last_name() {
+        "tlm_extension" | "tlm_extension_base" => Some("scrt_ext".to_string()),
+        "tlm_mm_interface" => Some("scrt_mm_if".to_string()),
+        "tlm_analysis_if" => match ty_of_name(q, &lw.env, &|e| lw.const_eval(e)) {
+            Ok(Ty::Class(c)) => Some(c),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `b` is a runtime class (not a user class) as a base.
+fn is_runtime_sv_base(b: &str) -> bool {
+    b.starts_with("scrt_") || b.starts_with("__sc_aif_")
+}
+
+/// The SV name of a base class.
+fn sv_base(b: &str) -> String {
+    if is_runtime_sv_base(b) { b.to_string() } else { class_sv(b) }
 }
 
 /// The user classes to lower: plain classes and structs (not foreign
@@ -237,10 +270,12 @@ pub fn user_classes<'a>(lw: &mut Lw<'a>) -> Vec<UserClass<'a>> {
             .iter()
             .find(|b| !is_sc_interface(b.name.last_name()))
             .map(|b| {
-                instantiate(&b.name, &lw.env, &|e| lw.const_eval(e))
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| b.name.last_name().to_string())
+                runtime_base(lw, &b.name).unwrap_or_else(|| {
+                    instantiate(&b.name, &lw.env, &|e| lw.const_eval(e))
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| b.name.last_name().to_string())
+                })
             });
     }
     lw.env.tparams = saved;
@@ -248,7 +283,11 @@ pub fn user_classes<'a>(lw: &mut Lw<'a>) -> Vec<UserClass<'a>> {
     loop {
         let drop: Vec<String> = cands
             .iter()
-            .filter(|(_, uc)| uc.base.as_ref().is_some_and(|b| !cands.contains_key(b)))
+            .filter(|(_, uc)| {
+                uc.base
+                    .as_ref()
+                    .is_some_and(|b| !cands.contains_key(b) && !is_runtime_sv_base(b))
+            })
             .map(|(n, _)| n.clone())
             .collect();
         if drop.is_empty() {
@@ -266,7 +305,7 @@ pub fn user_classes<'a>(lw: &mut Lw<'a>) -> Vec<UserClass<'a>> {
             if done.contains(n) {
                 continue;
             }
-            if uc.base.as_ref().is_none_or(|b| done.contains(b)) {
+            if uc.base.as_ref().is_none_or(|b| done.contains(b) || is_runtime_sv_base(b)) {
                 done.insert(n.clone());
                 out.push(uc.clone());
             }
@@ -460,7 +499,7 @@ fn class_signature(
         }
         sig.cpp = name.clone();
         sig.sv = sv.clone();
-        sig.base = base.as_deref().map(class_sv);
+        sig.base = base.as_deref().map(sv_base);
         for m in &c.members {
             let sc::Member::Field(v) = m else { continue };
             for d in &v.declarators {
@@ -708,6 +747,7 @@ pub fn package(lw: &mut Lw, classes: &[UserClass]) -> Option<Description> {
     if classes.is_empty() {
         return None;
     }
+    let analysis = analysis_classes(lw);
     let mut items: Vec<PackageItem> = vec![PackageItem::Import(ImportDeclaration {
         items: vec![ImportItem {
             package: id("sc_rt"),
@@ -726,6 +766,8 @@ pub fn package(lw: &mut Lw, classes: &[UserClass]) -> Option<Description> {
             forward: false,
         }));
     }
+    // §17 analysis interfaces and ports, before the subscribers.
+    items.extend(analysis.into_iter().map(PackageItem::Class));
     let statics = static_definitions(lw);
     let names: BTreeSet<String> = classes
         .iter()
@@ -789,6 +831,56 @@ pub fn package(lw: &mut Lw, classes: &[UserClass]) -> Option<Description> {
         endlabel: None,
         span: sp(),
     }))
+}
+
+/// §17 for each analysis payload type `T`: the subscriber interface
+/// `__sc_aif_T` (`write(T)`, which a subscriber overrides) and the port
+/// `__sc_ap_T` (writes reach every bound subscriber, in binding order).
+fn analysis_classes(lw: &Lw) -> Vec<crate::ast::decl::ClassDeclaration> {
+    let mut out = Vec::new();
+    for (m, t) in lw.env.analysis.borrow().iter() {
+        let aif = format!("__sc_aif_{}", m);
+        let (dt, _) = sv_type(t);
+        let write = |body: Vec<Statement>| {
+            class_function(
+                function_decl(
+                    "write",
+                    void_t(),
+                    vec![fport(crate::ast::types::PortDirection::Input, dt.clone(), "v")],
+                    body,
+                ),
+                true,
+            )
+        };
+        out.push(class_decl(&aif, None, vec![write(Vec::new())]));
+        let (qdt, qdims) = sv_type(&Ty::Queue(Box::new(Ty::Class(aif.clone()))));
+        let subs = ClassItem::Property(ClassProperty {
+            qualifiers: Vec::new(),
+            data_type: qdt,
+            declarators: vec![var_declarator("subs", qdims, None)],
+            span: sp(),
+        });
+        let bind = class_function(
+            function_decl(
+                "bind_",
+                void_t(),
+                vec![fport(
+                    crate::ast::types::PortDirection::Input,
+                    named_t(&aif, Vec::new()),
+                    "s",
+                )],
+                vec![expr_stmt(method(ident("subs"), "push_back", vec![ident("s")]))],
+            ),
+            false,
+        );
+        let fanout = st(crate::ast::stmt::StatementKind::Foreach {
+            array: ident("subs"),
+            vars: vec![Some(id("i"))],
+            body: Box::new(expr_stmt(method(index(ident("subs"), ident("i")), "write", vec![ident("v")]))),
+        });
+        out.push(class_decl(&format!("__sc_ap_{}", m), None, vec![subs, bind, write(vec![fanout])]));
+    }
+    out
 }
 
 /// The port class of an interface: `sc_port<IF, N>` and `sc_export<IF>`
@@ -1075,6 +1167,18 @@ fn lower_class(
             Err(e) => lw.record(e),
         }
     }
+    // An extension's key: its class (§14.21, one extension per class).
+    if sig.base.as_deref() == Some("scrt_ext") {
+        items.push(class_function(
+            function_decl(
+                "ext_key",
+                simple_t(crate::ast::types::SimpleType::String),
+                Vec::new(),
+                vec![ret(Some(string(cpp)))],
+            ),
+            true,
+        ));
+    }
     Ok(class_decl(&sig.sv, sig.base.as_deref(), items))
 }
 
@@ -1130,8 +1234,8 @@ fn lower_ctor(
     }
     let inits: &[sc::MemInit] = f.map(|f| f.initializers.as_slice()).unwrap_or(&[]);
     let mut body = Vec::new();
-    // The base class first.
-    if let Some(b) = &sig.base {
+    // The base class first (a runtime base has nothing to construct).
+    if let Some(b) = sig.base.as_ref().filter(|b| !is_runtime_sv_base(b)) {
         let base_cpp = b.trim_start_matches("sc_c_");
         let mi = inits.iter().find(|mi| mi.name.last_name() == base_cpp);
         let args = mi.map(|m| m.args.as_slice()).unwrap_or(&[]);

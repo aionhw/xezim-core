@@ -477,6 +477,41 @@ impl Parser {
         Ok(Some(f))
     }
 
+    /// `[virtual] [access] name, …` after a class head's `:`.
+    fn parse_base_list(&mut self) -> PResult<Vec<BaseSpec>> {
+        let mut bases = Vec::new();
+        loop {
+            let bstart = self.cur_span();
+            let mut access = None;
+            let mut is_virtual = false;
+            loop {
+                if self.eat_kw("virtual") {
+                    is_virtual = true;
+                } else if self.eat_kw("public") {
+                    access = Some(Access::Public);
+                } else if self.eat_kw("protected") {
+                    access = Some(Access::Protected);
+                } else if self.eat_kw("private") {
+                    access = Some(Access::Private);
+                } else {
+                    break;
+                }
+            }
+            let bname = self.parse_qualified_name(true)?;
+            self.eat("...");
+            bases.push(BaseSpec {
+                access,
+                is_virtual,
+                name: bname,
+                span: self.span_from(bstart),
+            });
+            if !self.eat(",") {
+                break;
+            }
+        }
+        Ok(bases)
+    }
+
     // ---- SystemC module macros -------------------------------------------
 
     /// `SC_MODULE(name) { … };` — a struct publicly derived from
@@ -506,17 +541,23 @@ impl Parser {
                 .collect(),
             span: macro_span,
         };
+        // The macro expands to the class head `struct name : sc_module`, so
+        // more bases may follow (`SC_MODULE(m), public tlm_fw_transport_if<>`).
+        let mut bases = vec![BaseSpec {
+            access: Some(Access::Public),
+            is_virtual: false,
+            name: base_name,
+            span: macro_span,
+        }];
+        if self.eat(",") {
+            bases.extend(self.parse_base_list()?);
+        }
         let members = self.parse_class_body(&name.name)?;
         self.expect(";")?;
         Ok(ClassDecl {
             key: ClassKey::Struct,
             name: Some(name),
-            bases: vec![BaseSpec {
-                access: Some(Access::Public),
-                is_virtual: false,
-                name: base_name,
-                span: macro_span,
-            }],
+            bases,
             members,
             is_final: false,
             sc_module: true,
@@ -665,38 +706,11 @@ impl Parser {
             name = Some(last);
         }
         let is_final = self.eat_contextual("final");
-        let mut bases = Vec::new();
-        if self.eat(":") {
-            loop {
-                let bstart = self.cur_span();
-                let mut access = None;
-                let mut is_virtual = false;
-                loop {
-                    if self.eat_kw("virtual") {
-                        is_virtual = true;
-                    } else if self.eat_kw("public") {
-                        access = Some(Access::Public);
-                    } else if self.eat_kw("protected") {
-                        access = Some(Access::Protected);
-                    } else if self.eat_kw("private") {
-                        access = Some(Access::Private);
-                    } else {
-                        break;
-                    }
-                }
-                let bname = self.parse_qualified_name(true)?;
-                self.eat("...");
-                bases.push(BaseSpec {
-                    access,
-                    is_virtual,
-                    name: bname,
-                    span: self.span_from(bstart),
-                });
-                if !self.eat(",") {
-                    break;
-                }
-            }
-        }
+        let bases = if self.eat(":") {
+            self.parse_base_list()?
+        } else {
+            Vec::new()
+        };
         let class_name = name.as_ref().map_or(String::new(), |n| n.name.clone());
         let members = self.parse_class_body(&class_name)?;
         let sc_module = bases.iter().any(|b| is_sc_module_base(&b.name));

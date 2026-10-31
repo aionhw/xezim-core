@@ -749,6 +749,19 @@ package sc_rt;
   localparam int TLM_BYTE_DISABLED = 0;
   localparam int TLM_BYTE_ENABLED = 255;
 
+  // A payload extension (§14.21; a user class extends it) and a memory
+  // manager (§14.5; a user class implements free).
+  typedef class scrt_tlm_gp;
+  virtual class scrt_ext;
+    pure virtual function scrt_ext clone();
+    pure virtual function void copy_from(scrt_ext o);
+    pure virtual function string ext_key();
+  endclass
+
+  virtual class scrt_mm_if;
+    pure virtual function void free(scrt_tlm_gp t);
+  endclass
+
   class scrt_tlm_gp;
     int m_command = TLM_IGNORE_COMMAND;
     longint unsigned m_address;
@@ -796,55 +809,359 @@ package sc_rt;
         default: return "TLM_UNKNOWN_RESPONSE";
       endcase
     endfunction
-    // Memory management (§14.5) has nothing to free here.
-    function void acquire(); endfunction
-    function void release_(); endfunction  // C++ `release()`; `release` is an SV keyword
-    function bit has_mm(); return 0; endfunction
+    // Memory management (§14.5): a payload with a manager is freed when
+    // its reference count falls to zero.
+    scrt_mm_if mm;
+    int refs;
+    function void set_mm(scrt_mm_if m); mm = m; endfunction
+    function bit has_mm(); return mm != null; endfunction
+    function int get_ref_count(); return refs; endfunction
+    function void acquire(); refs++; endfunction
+    function void release_();  // C++ `release()`; `release` is an SV keyword
+      refs--;
+      if (refs == 0 && mm != null) mm.free(this);
+    endfunction
+    // Extensions (§14.21), one per extension class.
+    scrt_ext exts[string];
+    function scrt_ext set_extension(scrt_ext e);
+      string k = e.ext_key();
+      scrt_ext old = exts.exists(k) ? exts[k] : null;
+      exts[k] = e;
+      return old;
+    endfunction
+    function scrt_ext get_ext(string k);
+      return exts.exists(k) ? exts[k] : null;
+    endfunction
+    function void clear_extension(scrt_ext e);
+      if (e != null) exts.delete(e.ext_key());
+    endfunction
+    // §14.13: the attributes, the data and byte enables (when both have
+    // them), and the extensions (copied into existing ones, else cloned).
+    function void deep_copy_from(scrt_tlm_gp o);
+      m_command = o.m_command;
+      m_address = o.m_address;
+      m_length = o.m_length;
+      m_response_status = o.m_response_status;
+      m_dmi = o.m_dmi;
+      m_byte_enable_length = o.m_byte_enable_length;
+      m_streaming_width = o.m_streaming_width;
+      if (m_data != null && o.m_data != null) scrt_memcpy(m_data, o.m_data, m_length);
+      if (m_byte_enable != null && o.m_byte_enable != null)
+        scrt_memcpy(m_byte_enable, o.m_byte_enable, m_byte_enable_length);
+      foreach (o.exts[k])
+        if (exts.exists(k)) exts[k].copy_from(o.exts[k]);
+        else exts[k] = o.exts[k].clone();
+    endfunction
     function void reset(); m_command = TLM_IGNORE_COMMAND; m_response_status = TLM_INCOMPLETE_RESPONSE; endfunction
   endclass
 
-  // ---- sockets (§13, §16.1) ------------------------------------------------
-  // A target registers its transport methods as an scrt_fw_if object (a
-  // class generated inside the target module that calls the module's task);
-  // an initiator socket holds the target socket it is bound to.
-  virtual class scrt_fw_if;
-    virtual task b_transport(scrt_tlm_gp trans, inout longint unsigned delay);
-      $display("Error: (E) b_transport: no b_transport registered on the target socket");
-      $finish;
+  function automatic string scrt_phase_str(int p);
+    case (p)
+      UNINITIALIZED_PHASE: return "UNINITIALIZED_PHASE";
+      BEGIN_REQ: return "BEGIN_REQ";
+      END_REQ: return "END_REQ";
+      BEGIN_RESP: return "BEGIN_RESP";
+      END_RESP: return "END_RESP";
+      default: return $sformatf("%0d", p);
+    endcase
+  endfunction
+
+  // ---- direct memory interface (§11.2) --------------------------------------
+  localparam int DMI_ACCESS_NONE = 0;
+  localparam int DMI_ACCESS_READ = 1;
+  localparam int DMI_ACCESS_WRITE = 2;
+  localparam int DMI_ACCESS_READ_WRITE = 3;
+
+  class scrt_tlm_dmi;
+    scrt_ptr ptr;
+    longint unsigned start_addr;
+    longint unsigned end_addr = 64'hffff_ffff_ffff_ffff;
+    int access;
+    longint unsigned rlat;
+    longint unsigned wlat;
+    function void init();
+      ptr = null;
+      start_addr = 0;
+      end_addr = 64'hffff_ffff_ffff_ffff;
+      access = DMI_ACCESS_NONE;
+      rlat = 0;
+      wlat = 0;
+    endfunction
+    function scrt_ptr get_dmi_ptr(); return ptr; endfunction
+    function void set_dmi_ptr(scrt_ptr p); ptr = p; endfunction
+    function longint unsigned get_start_address(); return start_addr; endfunction
+    function void set_start_address(longint unsigned a); start_addr = a; endfunction
+    function longint unsigned get_end_address(); return end_addr; endfunction
+    function void set_end_address(longint unsigned a); end_addr = a; endfunction
+    function longint unsigned get_read_latency(); return rlat; endfunction
+    function void set_read_latency(longint unsigned t); rlat = t; endfunction
+    function longint unsigned get_write_latency(); return wlat; endfunction
+    function void set_write_latency(longint unsigned t); wlat = t; endfunction
+    function int get_granted_access(); return access; endfunction
+    function void set_granted_access(int a); access = a; endfunction
+    function void allow_none(); access = DMI_ACCESS_NONE; endfunction
+    function void allow_read(); access = DMI_ACCESS_READ; endfunction
+    function void allow_write(); access = DMI_ACCESS_WRITE; endfunction
+    function void allow_read_write(); access = DMI_ACCESS_READ_WRITE; endfunction
+    function bit is_none_allowed(); return access == DMI_ACCESS_NONE; endfunction
+    function bit is_read_allowed(); return (access & DMI_ACCESS_READ) != 0; endfunction
+    function bit is_write_allowed(); return (access & DMI_ACCESS_WRITE) != 0; endfunction
+    function bit is_read_write_allowed(); return access == DMI_ACCESS_READ_WRITE; endfunction
+  endclass
+
+  // ---- sockets (§13, §16) ---------------------------------------------------
+  // The forward interface a target socket's owner implements (registered
+  // callbacks, or the module itself with `bind(*this)`) and the backward one
+  // an initiator's owner implements. `id` is the socket's tag (tagged
+  // sockets) or the binding's index (multi-passthrough sockets).
+  virtual class scrt_tlm_fw_if;
+    virtual task b_transport(int id, scrt_tlm_gp t, inout longint unsigned d);
+      $display("\nError: (E) b_transport: no b_transport registered on the target socket");
+      $__sc_exit(1);
     endtask
-    virtual function int unsigned transport_dbg(scrt_tlm_gp trans);
+    virtual function int nb_transport_fw(int id, scrt_tlm_gp t, inout int ph,
+                                         inout longint unsigned d);
+      $display("\nError: (E) nb_transport_fw: no nb_transport_fw registered on the target socket");
+      $__sc_exit(1);
+      return TLM_COMPLETED;
+    endfunction
+    virtual function bit get_direct_mem_ptr(int id, scrt_tlm_gp t, scrt_tlm_dmi dmi);
+      dmi.allow_read_write();
+      dmi.set_start_address(0);
+      dmi.set_end_address(64'hffff_ffff_ffff_ffff);
       return 0;
     endfunction
-    virtual function bit get_direct_mem_ptr(scrt_tlm_gp trans);
+    virtual function int unsigned transport_dbg(int id, scrt_tlm_gp t);
       return 0;
     endfunction
   endclass
 
-  class scrt_target_socket;
-    scrt_fw_if fw;
+  virtual class scrt_tlm_bw_if;
+    virtual function int nb_transport_bw(int id, scrt_tlm_gp t, inout int ph,
+                                         inout longint unsigned d);
+      $display("\nError: (E) nb_transport_bw: no nb_transport_bw registered on the initiator socket");
+      $__sc_exit(1);
+      return TLM_COMPLETED;
+    endfunction
+    virtual function void invalidate_direct_mem_ptr(int id, longint unsigned s,
+                                                    longint unsigned e);
+    endfunction
   endclass
 
-  class scrt_initiator_socket;
-    scrt_target_socket peer;
+  // A socket: calls its owner makes go out along `fw_next` (initiator) or
+  // `bw_next` (target); calls arriving reach the owner's implementation, or
+  // pass on down a hierarchical binding. `a.bind(b)` sends a's forward calls
+  // to b and b's backward calls to a; a socket bound several times (a
+  // multi-passthrough socket) keeps each binding with its index.
+  class scrt_socket;
     string name;
-    function new(string n = ""); name = n; endfunction
-    function void check();
-      if (peer == null || peer.fw == null) begin
-        $display("Error: (E) socket '%s' is not bound to a target", name);
-        $finish;
-      end
+    bit multi;
+    bit target;
+    scrt_tlm_fw_if fw_impl;
+    int fw_id;
+    scrt_tlm_bw_if bw_impl;
+    int bw_id;
+    scrt_socket fw_next[$];
+    int fw_idx[$];
+    scrt_socket bw_next[$];
+    int bw_idx[$];
+
+    function new(string n = "", bit m = 0, bit t = 0);
+      name = n;
+      multi = m;
+      target = t;
     endfunction
-    task b_transport(scrt_tlm_gp trans, inout longint unsigned delay);
-      check();
-      peer.fw.b_transport(trans, delay);
+
+    function void bind_(scrt_socket b);
+      fw_next.push_back(b);
+      fw_idx.push_back(b.bw_next.size());
+      b.bw_next.push_back(this);
+      b.bw_idx.push_back(fw_next.size() - 1);
+    endfunction
+
+    function int size();
+      return target ? bw_next.size() : fw_next.size();
+    endfunction
+
+    function void unbound(string dir);
+      $display("\nError: (E) socket '%s' is not bound (%s path)", name, dir);
+      $__sc_exit(1);
+    endfunction
+
+    // Arriving forward calls (`from`: the binding they came in on).
+    task fw_b(int from, scrt_tlm_gp t, inout longint unsigned d);
+      if (fw_impl != null) fw_impl.b_transport(multi ? from : fw_id, t, d);
+      else if (fw_next.size() > 0) fw_next[0].fw_b(fw_idx[0], t, d);
+      else unbound("forward");
     endtask
-    function int unsigned transport_dbg(scrt_tlm_gp trans);
-      check();
-      return peer.fw.transport_dbg(trans);
+    function int fw_nb(int from, scrt_tlm_gp t, inout int ph, inout longint unsigned d);
+      if (fw_impl != null) return fw_impl.nb_transport_fw(multi ? from : fw_id, t, ph, d);
+      if (fw_next.size() > 0) return fw_next[0].fw_nb(fw_idx[0], t, ph, d);
+      unbound("forward");
+      return TLM_COMPLETED;
     endfunction
-    function bit get_direct_mem_ptr(scrt_tlm_gp trans);
-      check();
-      return peer.fw.get_direct_mem_ptr(trans);
+    function bit fw_dmi(int from, scrt_tlm_gp t, scrt_tlm_dmi dmi);
+      if (fw_impl != null) return fw_impl.get_direct_mem_ptr(multi ? from : fw_id, t, dmi);
+      if (fw_next.size() > 0) return fw_next[0].fw_dmi(fw_idx[0], t, dmi);
+      unbound("forward");
+      return 0;
+    endfunction
+    function int unsigned fw_dbg(int from, scrt_tlm_gp t);
+      if (fw_impl != null) return fw_impl.transport_dbg(multi ? from : fw_id, t);
+      if (fw_next.size() > 0) return fw_next[0].fw_dbg(fw_idx[0], t);
+      unbound("forward");
+      return 0;
+    endfunction
+    // Arriving backward calls.
+    function int bw_nb(int from, scrt_tlm_gp t, inout int ph, inout longint unsigned d);
+      if (bw_impl != null) return bw_impl.nb_transport_bw(multi ? from : bw_id, t, ph, d);
+      if (bw_next.size() > 0) return bw_next[0].bw_nb(bw_idx[0], t, ph, d);
+      unbound("backward");
+      return TLM_COMPLETED;
+    endfunction
+    function void bw_inv(int from, longint unsigned s, longint unsigned e);
+      if (bw_impl != null) bw_impl.invalidate_direct_mem_ptr(multi ? from : bw_id, s, e);
+      else if (bw_next.size() > 0) bw_next[0].bw_inv(bw_idx[0], s, e);
+    endfunction
+
+    // The owner's calls, on binding `i` (0 unless multi).
+    function void need_fw(int i);
+      if (i >= fw_next.size()) unbound("forward");
+    endfunction
+    function void need_bw(int i);
+      if (i >= bw_next.size()) unbound("backward");
+    endfunction
+    task b_transport(int i, scrt_tlm_gp t, inout longint unsigned d);
+      need_fw(i);
+      fw_next[i].fw_b(fw_idx[i], t, d);
+    endtask
+    function int nb_transport_fw(int i, scrt_tlm_gp t, inout int ph, inout longint unsigned d);
+      need_fw(i);
+      return fw_next[i].fw_nb(fw_idx[i], t, ph, d);
+    endfunction
+    function bit get_direct_mem_ptr(int i, scrt_tlm_gp t, scrt_tlm_dmi dmi);
+      need_fw(i);
+      return fw_next[i].fw_dmi(fw_idx[i], t, dmi);
+    endfunction
+    function int unsigned transport_dbg(int i, scrt_tlm_gp t);
+      need_fw(i);
+      return fw_next[i].fw_dbg(fw_idx[i], t);
+    endfunction
+    function int nb_transport_bw(int i, scrt_tlm_gp t, inout int ph, inout longint unsigned d);
+      need_bw(i);
+      return bw_next[i].bw_nb(bw_idx[i], t, ph, d);
+    endfunction
+    function void invalidate_direct_mem_ptr(int i, longint unsigned s, longint unsigned e);
+      need_bw(i);
+      bw_next[i].bw_inv(bw_idx[i], s, e);
     endfunction
   endclass
+
+  // ---- payload event queues (§16.3) -----------------------------------------
+  // peq_with_get: transactions come out at their notified times, in that
+  // order (equal times: notification order), through get_next_transaction;
+  // the event fires at each of those times.
+  class scrt_peq_get;
+    scrt_tlm_gp items[$];
+    longint unsigned times[$];
+    event ev;
+    function void insert(scrt_tlm_gp t, longint unsigned at);
+      int k = 0;
+      while (k < times.size() && times[k] <= at) k++;
+      items.insert(k, t);
+      times.insert(k, at);
+    endfunction
+    function void notify(scrt_tlm_gp t, longint unsigned d);
+      insert(t, $time + d);
+      fork
+        begin
+          scrt_wait(d);
+          -> ev;
+        end
+      join_none
+    endfunction
+    function void notify_now(scrt_tlm_gp t);
+      insert(t, $time);
+      -> ev;
+    endfunction
+    function scrt_tlm_gp get_next_transaction();
+      scrt_tlm_gp t;
+      if (times.size() == 0 || times[0] > $time) return null;
+      t = items.pop_front();
+      void'(times.pop_front());
+      return t;
+    endfunction
+  endclass
+
+  // peq_with_cb_and_phase: the owner's callback, with the phase, at the
+  // notified time (immediately: once the notifying process yields).
+  virtual class scrt_peq_cb_if;
+    pure virtual function void call(scrt_tlm_gp t, int ph);
+  endclass
+
+  class scrt_peq_cb;
+    scrt_peq_cb_if cb;
+    function void notify(scrt_tlm_gp t, int ph, longint unsigned d);
+      fork
+        begin
+          scrt_wait(d);
+          cb.call(t, ph);
+        end
+      join_none
+    endfunction
+    function void notify_now(scrt_tlm_gp t, int ph);
+      fork
+        cb.call(t, ph);
+      join_none
+    endfunction
+  endclass
+
+  // ---- temporal decoupling (§12.2) --------------------------------------------
+  longint unsigned scrt_quantum;
+
+  class scrt_global_quantum;
+    function void set(longint unsigned t); scrt_quantum = t; endfunction
+    function longint unsigned get(); return scrt_quantum; endfunction
+    function longint unsigned compute_local_quantum();
+      if (scrt_quantum == 0) return 0;
+      return scrt_quantum - (scrt_now() % scrt_quantum);
+    endfunction
+  endclass
+  scrt_global_quantum scrt_gq = new;
+
+  // tlm_quantumkeeper: local time ahead of the kernel's, synchronized when
+  // it reaches the end of the current quantum.
+  class scrt_qk;
+    longint unsigned local_time;
+    longint unsigned next_sync;
+    function void reset();
+      local_time = 0;
+      next_sync = scrt_now() + scrt_gq.compute_local_quantum();
+    endfunction
+    function void inc(longint unsigned t); local_time += t; endfunction
+    function void set(longint unsigned t); local_time = t; endfunction
+    function longint unsigned get_local_time(); return local_time; endfunction
+    function longint unsigned get_current_time(); return scrt_now() + local_time; endfunction
+    function longint unsigned compute_local_quantum(); return scrt_gq.compute_local_quantum(); endfunction
+    function bit need_sync(); return scrt_now() + local_time >= next_sync; endfunction
+    task sync();
+      scrt_wait(local_time);
+      reset();
+    endtask
+    task set_and_sync(longint unsigned t);
+      set(t);
+      if (need_sync()) sync();
+    endtask
+  endclass
+
+  // An array of sockets (`simple_target_socket_tagged<M> s[N]`).
+  typedef scrt_socket scrt_socket_q[$];
+  function automatic scrt_socket_q scrt_sockets(int n, string name, bit m, bit t);
+    scrt_socket q[$];
+    for (int i = 0; i < n; i++) begin
+      scrt_socket s = new($sformatf("%s_%0d", name, i), m, t);
+      q.push_back(s);
+    end
+    return q;
+  endfunction
 endpackage

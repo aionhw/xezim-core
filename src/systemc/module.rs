@@ -17,7 +17,7 @@ use crate::ast::decl::{ClassItem, ModuleItem};
 use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberLiteral, UnaryOp};
 use crate::ast::module::ModuleDeclaration;
 use crate::ast::stmt::{Edge, JoinType, Statement, StatementKind};
-use crate::ast::types::PortDirection;
+use crate::ast::types::{DataType, PortDirection};
 use crate::sv_parser::systemc::ast as sc;
 use crate::sv_parser::systemc::classify::ScObjectKind;
 use crate::sv_parser::systemc::token::ScSpan;
@@ -45,6 +45,8 @@ pub struct ModIface {
     pub port_wcounters: BTreeMap<String, String>,
     /// The interfaces a channel implements (their SV classes, §5.15).
     pub implements: Vec<String>,
+    /// TLM sockets: (multi-passthrough, target) by member.
+    pub sockets: BTreeMap<String, (bool, bool)>,
 }
 
 /// A registered process before lowering.
@@ -66,12 +68,21 @@ struct Inst {
     conns: Vec<(String, Expression)>,
 }
 
-/// Transport methods registered on a target socket.
-#[derive(Default)]
-struct TargetReg {
-    b_transport: Option<String>,
-    transport_dbg: Option<String>,
-    get_direct_mem_ptr: Option<String>,
+/// The implementation a module gives one of its sockets (§13, §16):
+/// registered callbacks (`register_b_transport(this, &M::f[, id])`) or the
+/// module itself (`socket.bind(*this)`).
+struct SockReg {
+    /// The socket (or socket element) as an SV expression.
+    target: Expression,
+    /// Interface method → the module function that implements it.
+    fw: BTreeMap<String, String>,
+    bw: BTreeMap<String, String>,
+    /// The tag of a tagged socket.
+    id: Option<Expression>,
+    /// `bind(*this)`: the module implements the forward (a target socket)
+    /// or backward (an initiator socket) interface.
+    this_fw: bool,
+    this_bw: bool,
 }
 
 #[derive(Default)]
@@ -80,7 +91,9 @@ struct Structure {
     insts: Vec<Inst>,
     /// Elaboration statements (time 0, before processes start).
     elab: Vec<Statement>,
-    targets: BTreeMap<String, TargetReg>,
+    targets: BTreeMap<String, SockReg>,
+    /// `peq_with_cb_and_phase` members and their callbacks.
+    peq_cbs: Vec<(String, String)>,
     clocks: Vec<(String, Vec<sc::Expr>, ScSpan)>,
 }
 
@@ -238,6 +251,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         tparams: &[sc::TemplateParam],
     ) -> R<ModIface> {
         let mut iface = ModIface::default();
+        self.lw.m.sockets.clear();
         for tp in tparams {
             match tp {
                 sc::TemplateParam::Value { name: Some(n), .. } => {
@@ -348,6 +362,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 iface.ports.push((c, k));
             }
         }
+        iface.sockets = self.lw.m.sockets.clone();
         Ok(iface)
     }
 
@@ -393,14 +408,16 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             ScObjectKind::Fifo => (SymKind::Fifo, Ty::Mailbox(Box::new(payload(self.lw)?))),
             ScObjectKind::FifoIn => (SymKind::FifoIn, Ty::Mailbox(Box::new(payload(self.lw)?))),
             ScObjectKind::FifoOut => (SymKind::FifoOut, Ty::Mailbox(Box::new(payload(self.lw)?))),
-            ScObjectKind::InitiatorSocket => (
-                SymKind::InitSocket,
-                Ty::Class("scrt_initiator_socket".into()),
-            ),
-            ScObjectKind::TargetSocket => (
-                SymKind::TargetSocket,
-                Ty::Class("scrt_target_socket".into()),
-            ),
+            ScObjectKind::InitiatorSocket | ScObjectKind::TargetSocket => {
+                let target = kind == ScObjectKind::TargetSocket;
+                let tname = q.map(|q| q.last_name()).unwrap_or("");
+                self.lw
+                    .m
+                    .sockets
+                    .insert(name.clone(), (tname.starts_with("multi_passthrough"), target));
+                let k = if target { SymKind::TargetSocket } else { SymKind::InitSocket };
+                (k, self.lw.with_dims(Ty::Class("scrt_socket".into()), d)?)
+            }
             ScObjectKind::Vector(inner) => {
                 let elem_kind = match inner.as_ref() {
                     ScObjectKind::InPort => SymKind::InPort,
@@ -488,12 +505,8 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 };
                 (k, Ty::Class(pc))
             }
-            ScObjectKind::AnalysisPort => {
-                return self.lw.err(
-                    d.span,
-                    "analysis ports are not supported in simulation yet",
-                );
-            }
+            // §17 an analysis port: an object of its payload type's class.
+            ScObjectKind::AnalysisPort => (SymKind::Var, self.lw.decl_ty(&v.ty, d)?),
             ScObjectKind::Other => {
                 if let Some(q) = q {
                     if let Some(module) = self.lw.module_of(q) {
@@ -509,12 +522,6 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                             ty: Ty::Void,
                             sv: name,
                         }));
-                    }
-                    if matches!(q.last_name(), "peq_with_get" | "peq_with_cb_and_phase") {
-                        return self.lw.err(
-                            d.span,
-                            "payload event queues (AT TLM) are not supported in simulation",
-                        );
                     }
                 }
                 let ty = self.lw.decl_ty(&v.ty, d)?;
@@ -553,6 +560,7 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             sc_names: iface.sc_names.clone(),
             port_counters: iface.port_counters.clone(),
             port_wcounters: iface.port_wcounters.clone(),
+            sockets: iface.sockets.clone(),
             ..Default::default()
         };
         for b in &iface.buffers {
@@ -701,8 +709,48 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 let Some(sym) = self.lw.lookup(&d.name.name) else {
                     continue;
                 };
-                let Ty::Class(cls) = &sym.ty else { continue };
                 if sym.kind != SymKind::Var {
+                    continue;
+                }
+                // The runtime's value classes (a payload, a DMI descriptor),
+                // also in arrays, are default-constructed.
+                let value_class = |t: &Ty| matches!(t, Ty::Class(c) if is_runtime_value_class(c));
+                if value_class(&sym.ty) {
+                    s.elab.push(assign(ident(&sym.sv), new_obj(None)));
+                    continue;
+                }
+                if let Ty::Array(elem, _) = &sym.ty
+                    && value_class(elem)
+                {
+                    s.elab.push(st(StatementKind::Foreach {
+                        array: ident(&sym.sv),
+                        vars: vec![Some(id("__sc_i"))],
+                        body: Box::new(assign(
+                            super::build::index(ident(&sym.sv), ident("__sc_i")),
+                            new_obj(None),
+                        )),
+                    }));
+                    continue;
+                }
+                let Ty::Class(cls) = &sym.ty else { continue };
+                // `peq(this, &M::cb)`: the callback through an adapter.
+                if cls == "scrt_peq_cb" {
+                    let cb = inits
+                        .iter()
+                        .find(|mi| mi.name.last_name() == d.name.name)
+                        .and_then(|mi| mi.args.get(1))
+                        .and_then(|a| match &a.kind {
+                            sc::ExprKind::Unary {
+                                op: sc::UnaryOp::AddrOf,
+                                operand,
+                            } => operand.as_name().map(|q| q.last_name().to_string()),
+                            _ => None,
+                        });
+                    let Some(cb) = cb else {
+                        return self.lw.err(d.span, "construct a peq_with_cb_and_phase with (this, &Module::callback)");
+                    };
+                    // Created with its callback (socket_adapters).
+                    s.peq_cbs.push((sym.sv.clone(), cb));
                     continue;
                 }
                 let is_lib = is_lib_class(cls);
@@ -825,7 +873,8 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             // Member objects were constructed by construct_members.
             SymKind::Var
                 if self.lw.user_class(&sym.ty).is_some()
-                    || matches!(&sym.ty, Ty::Class(c) if is_lib_class(c)) => {}
+                    || matches!(&sym.ty, Ty::Class(c)
+                        if is_lib_class(c) || is_runtime_value_class(c) || c == "scrt_peq_cb") => {}
             SymKind::Var | SymKind::Boxed => {
                 if let [a] = mi.args.as_slice() {
                     let (x, _) = self.lw.expr(a)?;
@@ -1168,6 +1217,10 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
         let K::Call { callee, args } = &e.kind else {
             return Ok(false);
         };
+        // TLM sockets: bindings and registrations.
+        if let Some(done) = self.socket_structural(callee, args, s, e.span)? {
+            return Ok(done);
+        }
         // The module's own port or export: `exp(chan)`, `p.bind(x)`.
         let own = match &callee.kind {
             K::Name(q) if q.segments.len() == 1 => self.lw.lookup(q.last_name()),
@@ -1234,48 +1287,351 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                 .bind_child(s, &inst, &module, &port.ident.name, a, e.span)
                 .map(|_| true);
         }
-        // Own target socket registrations.
-        if let Some(q) = base.as_name()
-            && let Some(sym) = self.lw.lookup(q.last_name())
-            && sym.kind == SymKind::TargetSocket
-        {
-            let reg = s.targets.entry(sym.sv.clone()).or_default();
-            let method_of = |a: &sc::Expr| -> Option<String> {
-                match &a.kind {
-                    sc::ExprKind::Unary {
-                        op: sc::UnaryOp::AddrOf,
-                        operand,
-                    } => operand.as_name().map(|q| q.last_name().to_string()),
-                    _ => None,
-                }
-            };
-            match (m, args.as_slice()) {
-                ("register_b_transport", [_, f]) => reg.b_transport = method_of(f),
-                ("register_transport_dbg", [_, f]) => reg.transport_dbg = method_of(f),
-                ("register_get_direct_mem_ptr", [_, f]) => reg.get_direct_mem_ptr = method_of(f),
-                ("register_nb_transport_fw", _) => {
-                    return self.lw.err(
-                        e.span,
-                        "non-blocking transport (AT TLM) is not supported in simulation",
-                    );
-                }
-                ("bind", [a]) if matches!(&a.kind, sc::ExprKind::Unary { op: sc::UnaryOp::Deref, operand } if matches!(operand.kind, sc::ExprKind::This)) =>
-                {
-                    // The module implements the forward interface itself.
-                    reg.b_transport = Some("b_transport".to_string());
-                    reg.transport_dbg = self
-                        .lw
-                        .m
-                        .funcs
-                        .contains_key("transport_dbg")
-                        .then(|| "transport_dbg".to_string());
-                    reg.get_direct_mem_ptr = None;
-                }
-                _ => return Ok(false),
-            }
-            return Ok(true);
-        }
         Ok(false)
+    }
+
+    /// The adapters of the module's socket registrations (§13, §16): for
+    /// each, classes implementing the forward or backward interface with the
+    /// registered functions (or the module's own, for `bind(*this)`), the
+    /// module-level aliases they call, and the elaboration statements that
+    /// install them in the socket.
+    fn socket_adapters(&mut self, s: &Structure) -> R<(Vec<ModuleItem>, Vec<Statement>)> {
+        use crate::ast::types::IntegerAtomType as A;
+        let gp = || named_t("scrt_tlm_gp", Vec::new());
+        let u64t = || atom_t(A::LongInt, true);
+        let int_t = || atom_t(A::Int, false);
+        // (method, is a task, return type, ports after the id)
+        type Spec = (&'static str, bool, Option<DataType>, Vec<(PortDirection, DataType, &'static str)>);
+        let specs = |fw: bool| -> Vec<Spec> {
+            use PortDirection::{Inout, Input};
+            if fw {
+                vec![
+                    ("b_transport", true, None, vec![(Input, gp(), "t"), (Inout, u64t(), "d")]),
+                    (
+                        "nb_transport_fw",
+                        false,
+                        Some(int_t()),
+                        vec![(Input, gp(), "t"), (Inout, int_t(), "ph"), (Inout, u64t(), "d")],
+                    ),
+                    (
+                        "get_direct_mem_ptr",
+                        false,
+                        Some(bit_t(1, false)),
+                        vec![(Input, gp(), "t"), (Input, named_t("scrt_tlm_dmi", Vec::new()), "dmi")],
+                    ),
+                    ("transport_dbg", false, Some(atom_t(A::Int, true)), vec![(Input, gp(), "t")]),
+                ]
+            } else {
+                vec![
+                    (
+                        "nb_transport_bw",
+                        false,
+                        Some(int_t()),
+                        vec![(Input, gp(), "t"), (Inout, int_t(), "ph"), (Inout, u64t(), "d")],
+                    ),
+                    (
+                        "invalidate_direct_mem_ptr",
+                        false,
+                        None,
+                        vec![(Input, u64t(), "s"), (Input, u64t(), "e")],
+                    ),
+                ]
+            }
+        };
+        let mut items = Vec::new();
+        let mut assigns = Vec::new();
+        let mut aliases: BTreeSet<String> = BTreeSet::new();
+        let mut alias_items = Vec::new();
+        for (key, reg) in &s.targets {
+            let kname: String = key
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            for fw in [true, false] {
+                let mut impls = if fw { reg.fw.clone() } else { reg.bw.clone() };
+                if (fw && reg.this_fw) || (!fw && reg.this_bw) {
+                    for (m, ..) in specs(fw) {
+                        if self.fn_sig_of(m).is_some() {
+                            impls.entry(m.to_string()).or_insert_with(|| m.to_string());
+                        }
+                    }
+                }
+                if impls.is_empty() {
+                    continue;
+                }
+                let mut citems: Vec<ClassItem> = Vec::new();
+                for (m, is_task, rty, ports) in specs(fw) {
+                    let Some(f) = impls.get(m) else { continue };
+                    let Some((fkey, sig)) = self.fn_sig_of(f) else {
+                        return self.lw.err(
+                            ScSpan::default(),
+                            format!("'{}' registered on socket '{}' is not a member function", f, key),
+                        );
+                    };
+                    if sig.is_task && !is_task {
+                        return self.lw.err(
+                            ScSpan::default(),
+                            format!("'{}' ({}) must not wait: it is called without a process to suspend", f, m),
+                        );
+                    }
+                    // A tagged or multi-passthrough callback takes the id first.
+                    let with_id = sig.by_ref.len() == ports.len() + 1;
+                    let mut fports = vec![fport(PortDirection::Input, atom_t(A::Int, false), "id")];
+                    let mut actuals = Vec::new();
+                    if with_id {
+                        actuals.push(ident("id"));
+                    }
+                    for (dir, dt, n) in &ports {
+                        fports.push(fport(*dir, dt.clone(), n));
+                        actuals.push(ident(n));
+                    }
+                    let alias = format!("__sc_call_{}", fkey);
+                    if aliases.insert(alias.clone()) {
+                        let mut aports = Vec::new();
+                        if with_id {
+                            aports.push(fport(PortDirection::Input, atom_t(A::Int, false), "id"));
+                        }
+                        for (dir, dt, n) in &ports {
+                            aports.push(fport(*dir, dt.clone(), n));
+                        }
+                        let call = call_fn(&fkey, actuals.clone());
+                        alias_items.push(if is_task {
+                            ModuleItem::TaskDeclaration(task_decl(&alias, aports, vec![expr_stmt(call)]))
+                        } else {
+                            let body = match &rty {
+                                Some(_) => vec![ret(Some(call))],
+                                None => vec![expr_stmt(call)],
+                            };
+                            ModuleItem::FunctionDeclaration(function_decl(
+                                &alias,
+                                rty.clone().unwrap_or_else(void_t),
+                                aports,
+                                body,
+                            ))
+                        });
+                    }
+                    let call = call_fn(&alias, actuals);
+                    citems.push(if is_task {
+                        class_task(task_decl(m, fports, vec![expr_stmt(call)]), true)
+                    } else {
+                        let body = match &rty {
+                            Some(_) => vec![ret(Some(call))],
+                            None => vec![expr_stmt(call)],
+                        };
+                        class_function(
+                            function_decl(m, rty.clone().unwrap_or_else(void_t), fports, body),
+                            true,
+                        )
+                    });
+                }
+                let dir = if fw { "fw" } else { "bw" };
+                let cname = format!("__sc_{}_{}", dir, kname);
+                let base = if fw { "scrt_tlm_fw_if" } else { "scrt_tlm_bw_if" };
+                items.push(ModuleItem::ClassDeclaration(class_decl(&cname, Some(base), citems)));
+                let obj = format!("{}_obj", cname);
+                items.push(data_decl(named_t(&cname, Vec::new()), &obj, Vec::new(), Some(new_obj(None))));
+                // Through a handle: xezim drops `q[i].m = v` on a queue
+                // element inside a module instance.
+                let h = "__sc_sock_h";
+                if !items.iter().any(|i| matches!(i, ModuleItem::DataDeclaration(d) if d.declarators.iter().any(|v| v.name.name == h))) {
+                    items.push(data_decl(named_t("scrt_socket", Vec::new()), h, Vec::new(), None));
+                }
+                assigns.push(assign(ident(h), reg.target.clone()));
+                assigns.push(assign(member(ident(h), &format!("{}_impl", dir)), ident(&obj)));
+                if let Some(id) = &reg.id {
+                    assigns.push(assign(member(ident(h), &format!("{}_id", dir)), id.clone()));
+                }
+            }
+        }
+        // §16.3.2 the callbacks of peq_with_cb_and_phase members.
+        for (peq, f) in &s.peq_cbs {
+            let Some((fkey, sig)) = self.fn_sig_of(f) else {
+                return self.lw.err(ScSpan::default(), format!("'{}' is not a member function", f));
+            };
+            if sig.is_task {
+                return self.lw.err(
+                    ScSpan::default(),
+                    format!("'{}' must not wait: a PEQ callback has no process to suspend", f),
+                );
+            }
+            let ports = || {
+                vec![
+                    fport(PortDirection::Input, gp(), "t"),
+                    fport(PortDirection::Input, int_t(), "ph"),
+                ]
+            };
+            let alias = format!("__sc_call_{}", fkey);
+            if aliases.insert(alias.clone()) {
+                items.push(ModuleItem::FunctionDeclaration(function_decl(
+                    &alias,
+                    void_t(),
+                    ports(),
+                    vec![expr_stmt(call_fn(&fkey, vec![ident("t"), ident("ph")]))],
+                )));
+            }
+            let cname = format!("__sc_peqcb_{}", peq);
+            items.push(ModuleItem::ClassDeclaration(class_decl(
+                &cname,
+                Some("scrt_peq_cb_if"),
+                vec![class_function(
+                    function_decl(
+                        "call",
+                        void_t(),
+                        ports(),
+                        vec![expr_stmt(call_fn(&alias, vec![ident("t"), ident("ph")]))],
+                    ),
+                    true,
+                )],
+            )));
+            let obj = format!("{}_obj", cname);
+            items.push(data_decl(named_t(&cname, Vec::new()), &obj, Vec::new(), Some(new_obj(None))));
+            assigns.push(assign(ident(peq), new_obj(None)));
+            assigns.push(assign(member(ident(peq), "cb"), ident(&obj)));
+        }
+        items.extend(alias_items);
+        Ok((items, assigns))
+    }
+
+    /// A member function's SV name and signature, by its C++ name (an
+    /// overloaded one by its first overload).
+    fn fn_sig_of(&self, f: &str) -> Option<(String, FnSig)> {
+        if let Some(sig) = self.lw.m.funcs.get(f) {
+            return Some((f.to_string(), sig.clone()));
+        }
+        self.lw
+            .m
+            .funcs
+            .iter()
+            .find(|(k, _)| k.rsplit_once("__").is_some_and(|(b, n)| b == f && n.parse::<u32>().is_ok()))
+            .map(|(k, s)| (k.clone(), s.clone()))
+    }
+
+    /// A socket of this module or of a child (`socket`, `tsock[i]`,
+    /// `child.socket`, `child.isock[0]`) as an SV expression, with the
+    /// module's own socket's member name.
+    fn socket_ref(&mut self, e: &sc::Expr) -> R<Option<(Expression, Option<String>)>> {
+        use sc::ExprKind as K;
+        let e = deref_inner(e);
+        let is_sock = |k: &SymKind| matches!(k, SymKind::InitSocket | SymKind::TargetSocket);
+        Ok(match &e.kind {
+            K::Name(q) if q.segments.len() == 1 => self
+                .lw
+                .lookup(q.last_name())
+                .filter(|s| is_sock(&s.kind))
+                .map(|s| (ident(&s.sv), Some(q.last_name().to_string()))),
+            K::Index { base, index } => match self.socket_ref(base)? {
+                Some((b, own)) => {
+                    let (i, _) = self.lw.expr(index)?;
+                    Some((super::build::index(b, i), own))
+                }
+                None => None,
+            },
+            K::Member { base, name, .. } => match self.instance_of(base) {
+                Some((inst, module)) => {
+                    let child_sock = self
+                        .ifaces
+                        .get(&module)
+                        .and_then(|i| i.members.get(&name.ident.name))
+                        .is_some_and(|s| is_sock(&s.kind));
+                    child_sock.then(|| (member(ident(&inst), &name.ident.name), None))
+                }
+                None => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// Socket statements of a constructor or sc_main (§13, §16):
+    /// `a.bind(b)` / `a(b)` between sockets (hierarchical binding too),
+    /// `socket.bind(*this)`, and the `register_*` callbacks of the module's
+    /// own sockets. `None` when the call is not about a socket.
+    fn socket_structural(
+        &mut self,
+        callee: &sc::Expr,
+        args: &[sc::Expr],
+        s: &mut Structure,
+        span: ScSpan,
+    ) -> R<Option<bool>> {
+        use sc::ExprKind as K;
+        let (sock_e, m) = match &callee.kind {
+            K::Member { base, name, .. } => (base.as_ref(), name.ident.name.clone()),
+            _ => (callee, "bind".to_string()),
+        };
+        let Some((sock, own)) = self.socket_ref(sock_e)? else {
+            return Ok(None);
+        };
+        let is_this = |a: &sc::Expr| {
+            matches!(&a.kind, K::Unary { op: sc::UnaryOp::Deref, operand } if matches!(operand.kind, K::This))
+        };
+        let key = super::build::expr_key(&sock);
+        let target_sock = own
+            .as_ref()
+            .and_then(|n| self.lw.m.sockets.get(n).map(|(_, t)| *t))
+            .unwrap_or(false);
+        fn reg<'s>(s: &'s mut Structure, key: &str, sock: &Expression) -> &'s mut SockReg {
+            s.targets.entry(key.to_string()).or_insert_with(|| SockReg {
+                target: sock.clone(),
+                fw: BTreeMap::new(),
+                bw: BTreeMap::new(),
+                id: None,
+                this_fw: false,
+                this_bw: false,
+            })
+        }
+        let method_of = |a: &sc::Expr| -> Option<String> {
+            match &a.kind {
+                K::Unary {
+                    op: sc::UnaryOp::AddrOf,
+                    operand,
+                } => operand.as_name().map(|q| q.last_name().to_string()),
+                _ => None,
+            }
+        };
+        match (m.as_str(), args) {
+            ("bind", [a]) if is_this(a) => {
+                if own.is_none() {
+                    return self.lw.err(span, "only a module's own socket binds to *this");
+                }
+                let r = reg(s, &key, &sock);
+                if target_sock {
+                    r.this_fw = true;
+                } else {
+                    r.this_bw = true;
+                }
+            }
+            ("bind", [a]) => {
+                let Some((other, _)) = self.socket_ref(a)? else {
+                    return self.lw.err(span, "a socket binds to another socket or to *this");
+                };
+                s.elab.push(expr_stmt(method(sock, "bind_", vec![other])));
+            }
+            (
+                "register_b_transport" | "register_nb_transport_fw" | "register_get_direct_mem_ptr"
+                | "register_transport_dbg" | "register_nb_transport_bw"
+                | "register_invalidate_direct_mem_ptr",
+                [_, f, rest @ ..],
+            ) if own.is_some() && rest.len() <= 1 => {
+                let Some(f) = method_of(f) else {
+                    return self.lw.err(span, "register the callback as &Module::function");
+                };
+                let id = match rest {
+                    [i] => Some(self.lw.expr(i)?.0),
+                    _ => None,
+                };
+                let what = m.trim_start_matches("register_").to_string();
+                let r = reg(s, &key, &sock);
+                if matches!(what.as_str(), "nb_transport_bw" | "invalidate_direct_mem_ptr") {
+                    r.bw.insert(what, f);
+                } else {
+                    r.fw.insert(what, f);
+                }
+                if id.is_some() {
+                    r.id = id;
+                }
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(true))
     }
 
     /// The instance a binding expression's object names: `u`, `*u`.
@@ -1519,30 +1875,6 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             Some(SymKind::Port(ifc) | SymKind::Export(ifc)) => {
                 let stmt = self.bind_port_object(member(ident(inst), port), &ifc, a, span)?;
                 s.elab.push(stmt);
-                Ok(())
-            }
-            Some(SymKind::InitSocket) => {
-                // `a.socket.bind(b.socket)`: the initiator socket holds the
-                // target socket object.
-                let target = match &a.kind {
-                    sc::ExprKind::Member { base, name, .. } => self
-                        .instance_of(base)
-                        .map(|(i, _)| member(ident(&i), &name.ident.name)),
-                    sc::ExprKind::Name(q) => self
-                        .lw
-                        .lookup(q.last_name())
-                        .filter(|s| s.kind == SymKind::TargetSocket)
-                        .map(|s| ident(&s.sv)),
-                    _ => None,
-                };
-                let Some(target) = target else {
-                    return self.lw.err(
-                        span,
-                        "an initiator socket must be bound to a target socket of another module",
-                    );
-                };
-                s.elab
-                    .push(assign(member(member(ident(inst), port), "peer"), target));
                 Ok(())
             }
             Some(_) => self
@@ -2133,16 +2465,26 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
                     let size = self.fifo_size.get(n).cloned().unwrap_or_else(|| int(16));
                     (dt, dims, Some(new_obj(Some(vec![size]))))
                 }
-                SymKind::InitSocket => (
-                    named_t("scrt_initiator_socket", Vec::new()),
-                    Vec::new(),
-                    Some(new_obj(Some(vec![string(n)]))),
-                ),
-                SymKind::TargetSocket => (
-                    named_t("scrt_target_socket", Vec::new()),
-                    Vec::new(),
-                    Some(new_obj(None)),
-                ),
+                // A socket (§13): an scrt_socket object, an array of them
+                // a queue.
+                SymKind::InitSocket | SymKind::TargetSocket => {
+                    let (multi, target) = self.lw.m.sockets.get(n).copied().unwrap_or_default();
+                    let base = self.lw.m.sc_names.get(n).cloned().unwrap_or_else(|| n.clone());
+                    let flags = [sized(1, multi as u64), sized(1, target as u64)];
+                    match &sym.ty {
+                        Ty::Array(_, size) => {
+                            let mut a = vec![size.clone(), string(&base)];
+                            a.extend(flags);
+                            let (dt, dims) = sv_type(&Ty::Queue(Box::new(Ty::Class("scrt_socket".into()))));
+                            (dt, dims, Some(call_fn("scrt_sockets", a)))
+                        }
+                        _ => {
+                            let mut a = vec![string(&base)];
+                            a.extend(flags);
+                            (named_t("scrt_socket", Vec::new()), Vec::new(), Some(new_obj(Some(a))))
+                        }
+                    }
+                }
                 // A port or export of a user interface: an object of its
                 // port class, named for diagnostics.
                 SymKind::Port(_) | SymKind::Export(_) => {
@@ -2195,96 +2537,11 @@ impl<'l, 'a> ModuleLowering<'l, 'a> {
             ));
         }
         items.extend(clock_items);
-        // TLM target registrations: a class per target socket whose methods
-        // call this module's transport functions.
-        let mut fw_assigns = Vec::new();
-        let mut aliases = Vec::new();
-        for (sock, reg) in &s.targets {
-            let cname = format!("__sc_fw_{}", sock);
-            let mut citems: Vec<ClassItem> = Vec::new();
-            if let Some(f) = &reg.b_transport {
-                citems.push(class_task(
-                    task_decl(
-                        "b_transport",
-                        vec![
-                            fport(
-                                PortDirection::Input,
-                                named_t("scrt_tlm_gp", Vec::new()),
-                                "trans",
-                            ),
-                            fport(
-                                PortDirection::Inout,
-                                atom_t(crate::ast::types::IntegerAtomType::LongInt, true),
-                                "delay",
-                            ),
-                        ],
-                        vec![expr_stmt(call_fn(
-                            &format!("__sc_call_{}", f),
-                            vec![ident("trans"), ident("delay")],
-                        ))],
-                    ),
-                    true,
-                ));
-                aliases.push(ModuleItem::TaskDeclaration(task_decl(
-                    &format!("__sc_call_{}", f),
-                    vec![
-                        fport(
-                            PortDirection::Input,
-                            named_t("scrt_tlm_gp", Vec::new()),
-                            "trans",
-                        ),
-                        fport(
-                            PortDirection::Inout,
-                            atom_t(crate::ast::types::IntegerAtomType::LongInt, true),
-                            "delay",
-                        ),
-                    ],
-                    vec![expr_stmt(call_fn(f, vec![ident("trans"), ident("delay")]))],
-                )));
-            }
-            if let Some(f) = &reg.transport_dbg {
-                citems.push(class_function(
-                    function_decl(
-                        "transport_dbg",
-                        atom_t(crate::ast::types::IntegerAtomType::Int, true),
-                        vec![fport(
-                            PortDirection::Input,
-                            named_t("scrt_tlm_gp", Vec::new()),
-                            "trans",
-                        )],
-                        vec![ret(Some(call_fn(
-                            &format!("__sc_call_{}", f),
-                            vec![ident("trans")],
-                        )))],
-                    ),
-                    true,
-                ));
-                aliases.push(ModuleItem::FunctionDeclaration(function_decl(
-                    &format!("__sc_call_{}", f),
-                    atom_t(crate::ast::types::IntegerAtomType::Int, true),
-                    vec![fport(
-                        PortDirection::Input,
-                        named_t("scrt_tlm_gp", Vec::new()),
-                        "trans",
-                    )],
-                    vec![ret(Some(call_fn(f, vec![ident("trans")])))],
-                )));
-            }
-            items.push(ModuleItem::ClassDeclaration(class_decl(
-                &cname,
-                Some("scrt_fw_if"),
-                citems,
-            )));
-            let obj = format!("{}_obj", cname);
-            items.push(data_decl(
-                named_t(&cname, Vec::new()),
-                &obj,
-                Vec::new(),
-                Some(new_obj(None)),
-            ));
-            fw_assigns.push(assign(member(ident(sock), "fw"), ident(&obj)));
-        }
-        items.extend(aliases);
+        // TLM sockets: an adapter per registration, whose methods call this
+        // module's functions (through module-level aliases: inside the class
+        // a method's own name would name itself).
+        let (sock_items, fw_assigns) = self.socket_adapters(&s)?;
+        items.extend(sock_items);
         // A channel: an adapter object per interface it implements.
         let (chan_items, chan_elab) = self.channel_items()?;
         items.extend(chan_items);
@@ -3386,7 +3643,9 @@ fn is_structural_loop(s: &sc::Stmt) -> bool {
                 kind: sc::ExprKind::Call { callee, .. },
                 ..
             }) => {
-                matches!(&callee.kind, sc::ExprKind::Member { name, .. } if name.ident.name == "bind")
+                // A binding, or a socket's callback registration.
+                matches!(&callee.kind, sc::ExprKind::Member { name, .. }
+                    if name.ident.name == "bind" || name.ident.name.starts_with("register_"))
             }
             _ => false,
         }

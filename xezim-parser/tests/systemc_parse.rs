@@ -433,6 +433,23 @@ fn derived_modules_and_namespaces() {
     assert!(matches!(&items[0], Item::Namespace { name: Some(n), .. } if n.name == "periph"));
 }
 
+/// `SC_MODULE(name)` expands to the class head `struct name : sc_module`
+/// (§5.2.5), so further bases may follow the macro: a module implementing
+/// a TLM interface itself.
+#[test]
+fn sc_module_with_further_bases() {
+    let r = parse_clean(
+        "SC_MODULE(mem), public tlm::tlm_fw_transport_if<>, private helper {
+            SC_CTOR(mem) {}
+        };",
+    );
+    let c = r.unit.find_class("mem").unwrap();
+    assert!(c.sc_module);
+    let bases: Vec<_> = c.bases.iter().map(|b| b.name.last_name().to_string()).collect();
+    assert_eq!(bases, ["sc_module", "tlm_fw_transport_if", "helper"]);
+    assert_eq!(c.bases[2].access, Some(Access::Private));
+}
+
 /// Quoted includes resolve through `-I`, `#pragma once`, function-like
 /// macros with `##`, and `#if` with `defined` (C++17 §19.1–§19.3).
 #[test]
