@@ -343,7 +343,7 @@ pub(super) fn register(
     }
     register_shape(elab, &full_name, &shape, width);
     let whole = packed(&values);
-    params_insert_traced(&mut elab.parameters, line!(), full_name.clone(), whole);
+    elab.set_param(line!(), full_name.clone(), whole);
     // §6.20.2: aggregate parameter elements use whole Value storage.
     // An unpacked variable type would route their member reads to separate
     // field signals, which this constant representation does not allocate.
@@ -354,7 +354,7 @@ pub(super) fn register(
     }
     for (name, value) in values {
         let name = format!("{prefix}{name}");
-        params_insert_traced(&mut elab.parameters, line!(), name.clone(), value.clone());
+        elab.set_param(line!(), name.clone(), value.clone());
         signals_insert_traced(
             &mut elab.signals,
             line!(),

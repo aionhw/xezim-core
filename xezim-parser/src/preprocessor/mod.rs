@@ -1838,11 +1838,20 @@ impl Preprocessor {
             // formals may start on a later line than its name (white space
             // and comments between them, §5.3), so a line ending in such a
             // name is joined with the following ones like an open paren.
-            while logical_line.contains('`')
-                && (Self::has_unclosed_paren(&logical_line)
-                    || self.ends_with_parameterized_macro(&logical_line))
+            // Carry the balance across physical lines. Rescanning the entire
+            // prefix on each append made a long macro argument quadratic.
+            let has_macro = logical_line.contains('`')
+                && Self::has_macro_outside_string(&logical_line);
+            let mut paren_depth = 0;
+            let mut in_string = false;
+            if has_macro {
+                Self::scan_paren_balance(&logical_line, &mut paren_depth, &mut in_string);
+            }
+            while has_macro
+                && (paren_depth > 0 || self.ends_with_parameterized_macro(&logical_line))
             {
                 if let Some((lj, next)) = lines.next() {
+                    Self::scan_paren_balance(next, &mut paren_depth, &mut in_string);
                     logical_line.push('\n');
                     logical_line.push_str(next);
                     joined.push(lj);
@@ -2702,8 +2711,14 @@ impl Preprocessor {
                     if def.params.is_some() && p < bytes.len() && bytes[p] == b'(' {
                         i = p;
                         // Parameterized macro: find arguments
-                        let args = Self::extract_macro_args(line, &mut i);
+                        let mut args = Self::extract_macro_args(line, &mut i);
                         let params = def.params.as_ref().unwrap();
+                        // §22.5.1: () supplies one empty actual when there
+                        // are formals, just as (,) supplies two. Preserve a
+                        // genuinely zero-argument invocation of `define M().
+                        if args.is_empty() && !params.is_empty() {
+                            args.push(String::new());
+                        }
                         // §22.5.1 strict argument-count validation: too many
                         // actuals, or a non-defaulted formal left without one.
                         if crate::strict_checks() {
@@ -3008,11 +3023,11 @@ impl Preprocessor {
                 continue;
             }
             if !in_string && i + 1 < bytes.len() && bytes[i + 1] == b'*'
-                // `@(*)` is the implicit-sensitivity-list construct, not an
-                // attribute. Skip if the byte after `(*` is `)`. Likewise
+                // §5.3 / §9.4.2.2: `@(* )` is an implicit event control,
+                // also with white space or comments before `)`. Likewise
                 // skip `(**` (e.g. an exponent inside parens) where the
                 // payload starts with another `*`.
-                && bytes.get(i + 2).copied() != Some(b')')
+                && bytes.get(Self::skip_space_and_comments(bytes, i + 2)) != Some(&b')')
                 && bytes.get(i + 2).copied() != Some(b'*')
             {
                 // Find matching *)
@@ -3109,23 +3124,45 @@ impl Preprocessor {
             .is_some_and(|d| d.params.is_some())
     }
 
-    fn has_unclosed_paren(line: &str) -> bool {
-        let mut depth = 0i32;
+    /// §22.5.1: ordinary string literals do not contain macro uses. Treating
+    /// a quoted backtick as a macro joined an ordinary multiline call across
+    /// conditional directives, then recursively resolved the same directives
+    /// forever when macro expansion left that quoted text unchanged.
+    fn has_macro_outside_string(line: &str) -> bool {
+        let mut bytes = line.bytes();
         let mut in_string = false;
+        while let Some(byte) = bytes.next() {
+            match byte {
+                b'\\' if in_string => {
+                    bytes.next();
+                }
+                b'"' => in_string = !in_string,
+                b'`' if !in_string => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    // Each chunk starts after an inserted newline, so quote escaping cannot
+    // carry across the boundary; the string and parenthesis states do.
+    fn scan_paren_balance(line: &str, depth: &mut i32, in_string: &mut bool) {
         let bytes = line.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
-                b'"' if i == 0 || bytes[i - 1] != b'\\' => {
-                    in_string = !in_string;
+                // Inside a string a backslash escapes the next byte, so
+                // `"\\"` closes the string and `"\""` does not.
+                b'\\' if *in_string => i += 1,
+                b'"' if *in_string || i == 0 || bytes[i - 1] != b'\\' => {
+                    *in_string = !*in_string
                 }
-                b'(' if !in_string => depth += 1,
-                b')' if !in_string => depth -= 1,
+                b'(' if !*in_string => *depth += 1,
+                b')' if !*in_string => *depth -= 1,
                 _ => {}
             }
             i += 1;
         }
-        depth > 0
     }
 
     fn contains_preprocessor_directive(text: &str) -> bool {
@@ -3155,5 +3192,89 @@ fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod multiline_scan_tests {
+    use super::Preprocessor;
+
+    /// IEEE 1800-2017 §22.5.1: nested actual arguments and quoted parentheses
+    /// retain their meaning when a macro name and its argument list span lines.
+    #[test]
+    fn multiline_arguments_keep_nested_and_string_parentheses() {
+        let mut pp = Preprocessor::new();
+        let output = pp.preprocess(
+            r#"
+`define ID(x) x
+`ID
+(
+  {"(", ")", nested(
+    1, (2 + 3))}
+)
+`define AFTER 42
+`AFTER
+"#,
+        );
+        let normalized = output.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(normalized, r#"{"(", ")", nested( 1, (2 + 3))} 42"#);
+    }
+
+    /// §22.5.1/§22.6: quoted macro names stay literal while conditional
+    /// directives in the surrounding call select only their active branch.
+    #[test]
+    fn quoted_backticks_do_not_join_across_conditionals() {
+        for selected in [false, true] {
+            for value in ["`ifdef PICK\n1\n`else\n2\n`endif", "`VALUE"] {
+                let prefix = if selected { "`define PICK\n" } else { "" };
+                let source = format!(
+                    "{prefix}`define KEEP wrong\n`define VALUE \\\n`ifdef PICK \\\n1 \\\n`else \\\n2 \\\n`endif\nmodule top;\ninitial $display(\"literal `KEEP\",\n{value}\n);\nendmodule\n"
+                );
+                let out = Preprocessor::new().preprocess(&source);
+                let normalized = out.split_whitespace().collect::<Vec<_>>().join(" ");
+                let number = if selected { 1 } else { 2 };
+                assert_eq!(
+                    normalized,
+                    format!(
+                        "module top; initial $display(\"literal `KEEP\", {number} ); endmodule"
+                    )
+                );
+            }
+        }
+    }
+
+    /// §5.9: `\\` is one escaped backslash, so `"\\"` ends the string and
+    /// the call's closing parenthesis still counts; `"\"` does not end it.
+    #[test]
+    fn escaped_backslash_closes_a_quoted_actual() {
+        let (mut depth, mut quoted) = (0, false);
+        Preprocessor::scan_paren_balance(r#"`ID("\\")"#, &mut depth, &mut quoted);
+        assert_eq!((depth, quoted), (0, false));
+        let (mut depth, mut quoted) = (0, false);
+        Preprocessor::scan_paren_balance(r#"`ID("\")"#, &mut depth, &mut quoted);
+        assert_eq!((depth, quoted), (1, true));
+    }
+
+    #[test]
+    fn incremental_scan_matches_joined_scan() {
+        for chunks in [
+            vec!["((", ")", ")"],
+            vec!["(\"(\"", ", \")\")"],
+            vec!["(\"open", "still string\")"],
+            vec!["(\"escape\\", "\")"],
+            vec!["", "()", "("],
+        ] {
+            let (mut depth, mut quoted) = (0, false);
+            for chunk in &chunks {
+                Preprocessor::scan_paren_balance(chunk, &mut depth, &mut quoted);
+            }
+            let (mut joined_depth, mut joined_quoted) = (0, false);
+            Preprocessor::scan_paren_balance(
+                &chunks.join("\n"),
+                &mut joined_depth,
+                &mut joined_quoted,
+            );
+            assert_eq!((depth, quoted), (joined_depth, joined_quoted), "{chunks:?}");
+        }
     }
 }

@@ -181,7 +181,8 @@ pub use value::Value;
 /// \x31 = \x30 + the `iff` guard of a covergroup bin (§19.5).
 /// \x32 = \x31 + the net kind of a package net (§26.2) and the `with` filter of
 /// a covergroup bin (§19.5.1.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x32";
+/// \x33 = \x32 + ElaboratedClass.assoc_key_decl_types (§8.25).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x33";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -462,6 +463,22 @@ pub struct ModuleTimescaleCli {
     pub global: Option<(i32, i32)>,
     pub named: std::collections::HashMap<String, (i32, i32)>,
     pub force: Option<(i32, i32)>,
+}
+
+/// Timescale for a package or `$unit` subroutine with no `timescale
+/// directive and no in-scope `timeunit`. A directive-less module uses the
+/// global `--module-timescale` / `-timescale`, else 1ns/1ns. Packages
+/// follow that, not the global tick: counting their delays in the finest
+/// precision turns a nanosecond timeout into picoseconds as soon as any
+/// module is `1ps`.
+fn untimed_scope_secs(recorded: Option<(f64, f64)>, cli_global: Option<(i32, i32)>) -> (f64, f64) {
+    if let Some(ts) = recorded {
+        return ts;
+    }
+    if let Some((u, p)) = cli_global {
+        return (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p));
+    }
+    (1e-9, 1e-9)
 }
 
 /// Library-search configuration from the CLI (`-v <file>`, `-y <dir>`,
@@ -1600,6 +1617,9 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    // Every elaboration starts from the same state, whatever the thread
+    // elaborated before (§23.11 binds elaborate a design twice).
+    elaborate::reset_const_eval_snapshots();
     // Array defaults are needed through the final bind/parameter passes,
     // including elaboration of the compilation-unit and top scopes.
     let _array_param_scope = elaborate::array_params::scope();
@@ -1863,6 +1883,9 @@ fn parse_and_elaborate(
         } else {
             None
         };
+        // Under a compilation-unit `timeunit` the bodies below are already
+        // rewritten to global ticks; the second delay pass must keep them.
+        let cu_scaled = cu_scope_ts.map(|_| (tick_s, tick_s));
         let decl_name = match &desc {
             ast::Description::Module(m) => Some(&m.name.name),
             ast::Description::Interface(i) => Some(&i.name.name),
@@ -1971,10 +1994,12 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
                 } else {
-                    let (unit_s, prec_s) = module_timescales
-                        .get("$unit")
-                        .copied()
-                        .unwrap_or((tick_s, tick_s));
+                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                        untimed_scope_secs(
+                            module_timescales.get("$unit").copied().or(cu_scaled),
+                            cli.global,
+                        )
+                    });
                     elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
                 }
                 let name = c.name.name.clone();
@@ -2021,12 +2046,17 @@ fn parse_and_elaborate(
                 // Packages are not in `eff_ts` (that walk covers instantiable
                 // elements); the preprocessor records the directive in effect
                 // at the package, else the compilation unit's first one.
+                // With neither, use the CLI timescale or 1ns/1ns, not the
+                // global tick.
                 let (mut unit_s, mut prec_s) = forced_secs.unwrap_or_else(|| {
-                    module_timescales
-                        .get(&name)
-                        .or_else(|| module_timescales.get("$unit"))
-                        .copied()
-                        .unwrap_or((tick_s, tick_s))
+                    untimed_scope_secs(
+                        module_timescales
+                            .get(&name)
+                            .or_else(|| module_timescales.get("$unit"))
+                            .copied()
+                            .or(cu_scaled),
+                        cli.global,
+                    )
                 });
                 // A `timeunit`/`timeprecision` declared IN the package wins
                 // over the directive (LRM §3.14.2.2), but not over
@@ -2114,10 +2144,12 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
                 } else {
-                    let (unit_s, prec_s) = module_timescales
-                        .get("$unit")
-                        .copied()
-                        .unwrap_or((tick_s, tick_s));
+                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                        untimed_scope_secs(
+                            module_timescales.get("$unit").copied().or(cu_scaled),
+                            cli.global,
+                        )
+                    });
                     for st in f.items.iter_mut() {
                         elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
                     }
@@ -2128,10 +2160,12 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
                 } else {
-                    let (unit_s, prec_s) = module_timescales
-                        .get("$unit")
-                        .copied()
-                        .unwrap_or((tick_s, tick_s));
+                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                        untimed_scope_secs(
+                            module_timescales.get("$unit").copied().or(cu_scaled),
+                            cli.global,
+                        )
+                    });
                     for st in t.items.iter_mut() {
                         elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
                     }
@@ -3231,6 +3265,110 @@ pub fn bind_spec_base(name: &str) -> &str {
     name
 }
 
+/// §23.11: the constant scope in which the index expressions of bind target
+/// paths are evaluated. It is built the first time an index has to be
+/// evaluated, once for module-scope directives and once for `$unit` ones,
+/// instead of a copy of the design-wide parameter table per directive. The
+/// declarations of a directive's own and enclosing scopes are laid over it
+/// (found by a range scan of the sorted dotted keys) while that directive's
+/// indices are evaluated, and taken off again by `leave`; the scope each
+/// evaluation sees is the one formerly built per directive.
+struct BindConstants<'a> {
+    parameters: &'a crate::hasher::HashMap<String, Value>,
+    top: &'a str,
+    unit_params: &'a crate::hasher::HashMap<String, Value>,
+    dotted: Option<Vec<&'a str>>,
+    module: Option<crate::hasher::HashMap<String, Value>>,
+    unit: Option<crate::hasher::HashMap<String, Value>>,
+    entered: Option<bool>,
+    undo: Vec<(&'a str, Option<Value>)>,
+}
+
+impl<'a> BindConstants<'a> {
+    /// The scope of a directive whose enclosing scopes are `ancestors`
+    /// (nearest first); laid over the shared base on the first call.
+    fn scope(
+        &mut self,
+        unit_scope: bool,
+        ancestors: &[&str],
+    ) -> &crate::hasher::HashMap<String, Value> {
+        let (parameters, top, unit_params) = (self.parameters, self.top, self.unit_params);
+        let slot = if unit_scope {
+            &mut self.unit
+        } else {
+            &mut self.module
+        };
+        let constants = slot.get_or_insert_with(|| {
+            let mut constants = parameters.clone();
+            if unit_scope {
+                // §3.12.1/§23.11: $unit declarations cannot inherit a top's
+                // same-named localparam when selecting their bind targets.
+                constants.retain(|name, _| name.contains('.') || name.contains("::"));
+                constants.extend(
+                    unit_params
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+            }
+            // Qualified constants remain available; nearer lexical
+            // declarations replace bare names from enclosing scopes, never
+            // from the target.
+            for (key, value) in parameters {
+                constants.insert(format!("{top}.{key}"), value.clone());
+            }
+            constants
+        });
+        if self.entered.is_none() {
+            self.entered = Some(unit_scope);
+            let dotted = self.dotted.get_or_insert_with(|| {
+                let mut keys: Vec<&str> = parameters
+                    .keys()
+                    .filter(|key| key.contains('.'))
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                keys
+            });
+            for parent in ancestors.iter().rev() {
+                let prefix = format!("{parent}.");
+                let start = dotted.partition_point(|key| *key < prefix.as_str());
+                for &key in dotted[start..]
+                    .iter()
+                    .take_while(|key| key.starts_with(&prefix))
+                {
+                    let local = &key[prefix.len()..];
+                    let previous = constants.insert(local.to_string(), parameters[key].clone());
+                    self.undo.push((local, previous));
+                }
+            }
+        }
+        constants
+    }
+
+    /// Take the scope laid over by `scope` off the base again.
+    fn leave(&mut self) {
+        let Some(unit_scope) = self.entered.take() else {
+            return;
+        };
+        let constants = if unit_scope {
+            self.unit.as_mut()
+        } else {
+            self.module.as_mut()
+        }
+        .expect("entered scope has a base");
+        for (local, previous) in self.undo.drain(..).rev() {
+            match previous {
+                Some(value) => {
+                    constants.insert(local.to_string(), value);
+                }
+                None => {
+                    constants.remove(local);
+                }
+            }
+        }
+    }
+}
+
 /// §23.11: select targets using effective hierarchy and lexical constants.
 fn resolve_instance_binds(
     elab: &mut elaborate::ElaboratedModule,
@@ -3247,44 +3385,37 @@ fn resolve_instance_binds(
     if sites.is_empty() {
         return Ok(false);
     }
-    let mut hosts = vec![(String::new(), elab.name.clone())];
-    hosts.extend(
-        elab.instances
-            .iter()
-            .map(|i| (i.path.clone(), i.def_name.clone())),
-    );
+    // A target names an instance by path or a module by name: index both
+    // once, so selecting a target is a lookup rather than a scan.
+    let mut host_paths = crate::hasher::HashSet::default();
+    let mut hosts_of = crate::hasher::HashMap::<&str, Vec<&str>>::default();
+    host_paths.insert("");
+    hosts_of.entry(elab.name.as_str()).or_default().push("");
+    for i in &elab.instances {
+        host_paths.insert(i.path.as_str());
+        hosts_of
+            .entry(i.def_name.as_str())
+            .or_default()
+            .push(i.path.as_str());
+    }
+    let mut constants = BindConstants {
+        parameters: &elab.parameters,
+        top: &elab.name,
+        unit_params,
+        dotted: None,
+        module: None,
+        unit: None,
+        entered: None,
+        undo: Vec::new(),
+    };
     let mut changed = false;
     let mut unresolved = Vec::new();
     for (scope, b, unit_scope) in sites {
-        let mut constants = elab.parameters.clone();
-        if unit_scope {
-            // §3.12.1/§23.11: $unit declarations cannot inherit a top's
-            // same-named localparam when selecting their bind targets.
-            constants.retain(|name, _| name.contains('.') || name.contains("::"));
-            constants.extend(
-                unit_params
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            );
-        }
-        // Qualified constants remain available; nearer lexical declarations
-        // replace bare names from enclosing scopes, never from the target.
-        for (key, value) in &elab.parameters {
-            constants.insert(format!("{}.{}", elab.name, key), value.clone());
-        }
         let mut ancestors = vec![scope.as_str()];
         let mut ancestor = scope.as_str();
         while let Some((parent, _)) = ancestor.rsplit_once('.') {
             ancestors.push(parent);
             ancestor = parent;
-        }
-        for parent in ancestors.iter().rev() {
-            let prefix = format!("{parent}.");
-            for (key, value) in &elab.parameters {
-                if let Some(local) = key.strip_prefix(&prefix) {
-                    constants.insert(local.to_string(), value.clone());
-                }
-            }
         }
         let mut targets = Vec::new();
         if b.target_path.is_empty() {
@@ -3296,15 +3427,16 @@ fn resolve_instance_binds(
                 .filter(|parent| !parent.is_empty())
                 .map(|parent| format!("{parent}.{}", b.target_module.name))
                 .chain(std::iter::once(b.target_module.name.clone()))
-                .find(|candidate| hosts.iter().any(|(host, _)| host == candidate));
+                .find(|candidate| host_paths.contains(candidate.as_str()));
             if let Some(instance) = instance {
                 targets.push(instance);
             } else {
                 targets.extend(
-                    hosts
-                        .iter()
-                        .filter(|(_, def)| *def == b.target_module.name)
-                        .map(|(p, _)| p.clone()),
+                    hosts_of
+                        .get(b.target_module.name.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(|p| p.to_string()),
                 );
             }
         } else {
@@ -3316,7 +3448,8 @@ fn resolve_instance_binds(
                     }
                     joined.push_str(&segment.name.name);
                     for select in &segment.selects {
-                        let value = elaborate::const_eval_i64_with_params(select, Some(&constants))
+                        let constants = constants.scope(unit_scope, &ancestors);
+                        let value = elaborate::const_eval_i64_with_params(select, Some(constants))
                             .ok_or_else(|| {
                                 format!(
                                     "nonconstant bind target index in '{}' (§23.11)",
@@ -3348,11 +3481,12 @@ fn resolve_instance_binds(
                 }
                 if let Some(target) = candidates
                     .into_iter()
-                    .find(|p| hosts.iter().any(|(host, _)| host == p))
+                    .find(|p| host_paths.contains(p.as_str()))
                 {
                     targets.push(target);
                 }
             }
+            constants.leave();
         }
         if targets.is_empty() && !b.target_path.is_empty() {
             unresolved.push(
