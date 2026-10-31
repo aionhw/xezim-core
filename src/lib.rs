@@ -182,7 +182,9 @@ pub use value::Value;
 /// \x32 = \x31 + the net kind of a package net (§26.2) and the `with` filter of
 /// a covergroup bin (§19.5.1.1).
 /// \x33 = \x32 + ElaboratedClass.assoc_key_decl_types (§8.25).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x33";
+/// \x34 = \x33 + ElaboratedModule.coll_shapes and
+/// ElaboratedClass.prop_coll_shapes (§7.4.5).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x34";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

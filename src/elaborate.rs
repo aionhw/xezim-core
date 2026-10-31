@@ -1265,6 +1265,13 @@ pub struct ElaboratedClass {
     /// `ElaboratedModule::assoc_row_dims`.
     #[serde(default)]
     pub assoc_row_property_dims: HashMap<String, Vec<UnpackedDimension>>,
+    /// §7.4.5: the declared [`CollShape`] of each collection property; the
+    /// class counterpart of `ElaboratedModule::coll_shapes`. Keyed by the
+    /// bare property name (statics too). §8.25: a key typed by a class
+    /// parameter is resolved at the default specialization (or kept
+    /// `Typed`), so a specialized object re-resolves it.
+    #[serde(default)]
+    pub prop_coll_shapes: HashMap<String, CollShape>,
     /// §7.4.2 / §20.7: the DECLARED `(left, right)` bounds of every unpacked
     /// dimension of a fixed-size array member with at least one descending
     /// dimension (`int ds[3:1]`). `array_properties` / `array_nd_properties`
@@ -2149,6 +2156,7 @@ fn elaborate_class_in_scope(
     let mut dynamic_tail_properties: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut assoc_coll_properties: HashSet<String> = HashSet::default();
     let mut assoc_row_property_dims: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
+    let mut prop_coll_shapes: HashMap<String, CollShape> = HashMap::default();
     let mut array_prop_decl_dims: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
     let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
@@ -2399,6 +2407,14 @@ fn elaborate_class_in_scope(
                             }
                             _ => {}
                         }
+                    }
+                    // A typedef'd key (`k12_t`) resolves through the class's
+                    // own typedefs and the installed typedef table.
+                    if let Some(shape) = CollShape::of(&effective_dims, |kdt| {
+                        let kt = kdt.map(|k| class_local_typedef_target(c, k, u8::MAX));
+                        typedefs_snapshot(|td| coll_key_kind(kt, unpacked_params, td, None))
+                    }) {
+                        prop_coll_shapes.insert(decl.name.name.clone(), shape);
                     }
                     if !is_static {
                         if matches!(effective_dims.first(), Some(UnpackedDimension::Unsized(_)))
@@ -3215,6 +3231,7 @@ fn elaborate_class_in_scope(
         dynamic_tail_properties,
         assoc_coll_properties,
         assoc_row_property_dims,
+        prop_coll_shapes,
         array_prop_decl_dims,
     }
 }
@@ -3597,6 +3614,10 @@ pub struct ElaboratedModule {
     /// (`aq[6][0] = 9`) creates it as that kind of collection.
     #[serde(default)]
     pub assoc_row_dims: HashMap<String, Vec<UnpackedDimension>>,
+    /// §7.4.5: the declared [`CollShape`] of every collection of collections
+    /// (see [`CollShape::of`]), by storage name.
+    #[serde(default)]
+    pub coll_shapes: HashMap<String, CollShape>,
     /// N-dimensional unpacked array shapes (N >= 3): name → Vec of (lo, hi) per dim.
     pub arrays_nd: HashMap<String, (Vec<(i64, i64)>, u32)>,
     /// Parameter init expressions that couldn't be evaluated at elaboration time
@@ -4065,6 +4086,7 @@ impl ElaboratedModule {
             assoc_key_type_names: HashMap::default(),
             assoc_inner_string_keys: HashMap::default(),
             assoc_row_dims: HashMap::default(),
+            coll_shapes: HashMap::default(),
             assoc_coll_elems: HashSet::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
@@ -9704,6 +9726,7 @@ pub fn elaborate_module_with_defs(
                         &elab.parameters,
                         &elab.typedef_types,
                     );
+                    record_coll_shape(&mut elab, &decl.name.name, &effective_dims, None);
                     if let Some(UnpackedDimension::Associative {
                         data_type: key_dt, ..
                     }) = effective_dims.first()
@@ -17081,6 +17104,12 @@ fn elaborate_items_numbered(
                             "net",
                         ));
                     }
+                    let shape_dims = normalize_unpacked_dims(
+                        &decl.dimensions,
+                        &elab.parameters,
+                        &elab.typedef_types,
+                    );
+                    record_coll_shape(elab, &decl.name.name, &shape_dims, None);
                     if let Some(UnpackedDimension::Associative {
                         data_type: key_dt, ..
                     }) = decl.dimensions.first()
@@ -19925,9 +19954,128 @@ pub fn resolve_typedef_chain<'a>(
     cur
 }
 
-/// §7.8: the inner-level string-key flags of an associative array of
-/// associative arrays (see `assoc_inner_string_keys`); `None` when `dims`
-/// has no associative dimension after the first.
+/// §7.8.4: the index type of one associative dimension.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum KeyKind {
+    /// `[*]`: any integral index (§7.8.1).
+    Wildcard,
+    /// `[string]` (§7.8.2).
+    String,
+    /// An integral index type of the given width and signedness (§7.8.4).
+    Integral { width: u32, signed: bool },
+    /// A named index type not resolved here — a class (§7.8.5), an enum,
+    /// or a type parameter bound per specialization.
+    Typed(String),
+    /// An index type whose width could not be resolved at elaboration.
+    Unknown,
+}
+
+/// The kind of one unpacked dimension of a collection (§7.4).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Dim {
+    /// `[N]` / `[L:R]` (§7.4.2).
+    Fixed,
+    /// `[]` (§7.5).
+    Dyn,
+    /// `[$]` / `[$:N]` (§7.10).
+    Queue,
+    /// `[T]` (§7.8).
+    Assoc(KeyKind),
+}
+
+/// §7.4.5: the declared shape of an unpacked collection — every dimension,
+/// outermost first, whatever their kinds — so each level of a nested
+/// collection (`int x[string][int][$]`, `int d[][string][$]`) has a declared
+/// kind and key type rather than one guessed from its stored elements.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CollShape {
+    pub dims: Vec<Dim>,
+}
+
+impl CollShape {
+    /// The shape of a declaration with unpacked dimensions `dims` when it is
+    /// a collection of collections — two or more dimensions, one of them
+    /// dynamic, queue or associative — else `None`: a one-dimensional
+    /// collection has no rows, and an all-fixed array is laid out by its
+    /// bounds. `key_kind` resolves each associative dimension's index type.
+    pub fn of(
+        dims: &[UnpackedDimension],
+        key_kind: impl Fn(Option<&DataType>) -> KeyKind,
+    ) -> Option<CollShape> {
+        let fixed = |d: &UnpackedDimension| {
+            matches!(
+                d,
+                UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }
+            )
+        };
+        if dims.len() < 2 || dims.iter().all(fixed) {
+            return None;
+        }
+        let dims: Vec<Dim> = dims
+            .iter()
+            .map(|d| match d {
+                UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. } => {
+                    Dim::Fixed
+                }
+                UnpackedDimension::Unsized(_) => Dim::Dyn,
+                UnpackedDimension::Queue { .. } => Dim::Queue,
+                UnpackedDimension::Associative { data_type, .. } => {
+                    Dim::Assoc(key_kind(data_type.as_deref()))
+                }
+            })
+            .collect();
+        Some(CollShape { dims })
+    }
+}
+
+/// §7.8.4: the [`KeyKind`] of an associative index type `kdt`. Without a
+/// typedef table (a class property) a named type stays `Typed`.
+pub fn coll_key_kind(
+    kdt: Option<&DataType>,
+    params: Option<&HashMap<String, Value>>,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: Option<&HashMap<String, DataType>>,
+) -> KeyKind {
+    let Some(kdt) = kdt else {
+        return KeyKind::Wildcard;
+    };
+    let resolved = typedef_types.map_or(kdt, |t| resolve_typedef_chain(kdt, t));
+    match resolved {
+        DataType::Simple {
+            kind: SimpleType::String,
+            ..
+        } => KeyKind::String,
+        DataType::TypeReference { name, .. } => KeyKind::Typed(name.name.name.clone()),
+        dt => match resolve_type_width(dt, params, typedefs) {
+            0 => KeyKind::Unknown,
+            width => KeyKind::Integral {
+                width,
+                signed: is_type_signed_resolved(dt, typedef_types.unwrap_or(&HashMap::default())),
+            },
+        },
+    }
+}
+
+/// Records the declared [`CollShape`] of a module/package-scope collection.
+fn record_coll_shape(
+    elab: &mut ElaboratedModule,
+    name: &str,
+    dims: &[UnpackedDimension],
+    params: Option<&HashMap<String, Value>>,
+) {
+    let shape = CollShape::of(dims, |kdt| {
+        coll_key_kind(
+            kdt,
+            Some(params.unwrap_or(&elab.parameters)),
+            Some(&elab.typedefs),
+            Some(&elab.typedef_types),
+        )
+    });
+    if let Some(shape) = shape {
+        elab.coll_shapes.insert(name.to_string(), shape);
+    }
+}
+
 /// Records an associative array whose elements are collections
 /// (`assoc_coll_elems`) and the dimensions of its rows (`assoc_row_dims`).
 fn record_assoc_rows(elab: &mut ElaboratedModule, name: &str, dims: &[UnpackedDimension]) {
@@ -19938,6 +20086,9 @@ fn record_assoc_rows(elab: &mut ElaboratedModule, name: &str, dims: &[UnpackedDi
     }
 }
 
+/// §7.8: the inner-level string-key flags of an associative array of
+/// associative arrays (see `assoc_inner_string_keys`); `None` when `dims`
+/// has no associative dimension after the first.
 pub fn assoc_inner_string_levels(dims: &[UnpackedDimension]) -> Option<Vec<bool>> {
     let inner = dims.get(1..)?;
     if !inner
@@ -25778,6 +25929,7 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
             // keyed by the type `N`; classify the normalized dimensions.
             let mdims =
                 normalize_unpacked_dims(&mdecl.dimensions, &elab.parameters, &elab.typedef_types);
+            record_coll_shape(elab, &mbase, &mdims, None);
             match mdims.first() {
                 Some(UnpackedDimension::Associative { data_type: kdt, .. }) => {
                     let is_str = kdt.as_ref().is_some_and(|dt| {
@@ -30074,6 +30226,12 @@ fn inline_instantiations_inner(
                                             .insert(decl.name.name.clone(), dims);
                                     }
                                 }
+                                let shape_dims = normalize_unpacked_dims(
+                                    &decl.dimensions,
+                                    &elab.parameters,
+                                    &elab.typedef_types,
+                                );
+                                record_coll_shape(elab, &decl.name.name, &shape_dims, None);
                                 let first_dim = decl.dimensions.first();
                                 let is_dynamic_dim = first_dim.is_some_and(|d| {
                                     matches!(
@@ -38196,6 +38354,12 @@ fn inline_module_items(
                                     &effective_decl_dims,
                                     &sub_merged_params,
                                     &elab.typedef_types,
+                                );
+                                record_coll_shape(
+                                    elab,
+                                    &sig_name,
+                                    &effective_decl_dims,
+                                    Some(&sub_merged_params),
                                 );
                                 let array_range =
                                     extract_array_range(&effective_decl_dims, &sub_merged_params);
