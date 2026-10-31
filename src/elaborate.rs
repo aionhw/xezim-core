@@ -21,6 +21,7 @@ mod module_class_scope;
 pub(crate) mod constructor_forwarding;
 pub(crate) mod relaxed_static;
 mod param_prefix_index;
+mod param_scope;
 
 struct ScopeGuardLite<F: FnMut()>(F);
 impl<F: FnMut()> Drop for ScopeGuardLite<F> {
@@ -3270,7 +3271,7 @@ pub struct ElaboratedModule {
     /// declaration shadows the imported name — so at such a name the
     /// duplicate-declaration check overrides (drops the imported entry) instead
     /// of erroring. Explicit imports (`import pkg::x`) are never listed here.
-    pub wildcard_shadowed: std::collections::HashSet<String>,
+    pub wildcard_shadowed: HashSet<String>,
     pub port_order: Vec<String>,
     pub continuous_assigns: Vec<ContinuousAssignment>,
     /// §28.8 bidirectional switches (`tran`/`tranif0`/`tranif1`), pending
@@ -3413,7 +3414,7 @@ pub struct ElaboratedModule {
     /// assignment passes the value through unchanged. Applying the gate rule
     /// to both silently turned every `assign y = x;` into a z-eater.
     #[serde(default)]
-    pub gate_driven_nets: std::collections::HashSet<String>,
+    pub gate_driven_nets: HashSet<String>,
     /// Associative array default values.
     pub assoc_defaults: HashMap<String, Expression>,
     /// Dynamic arrays / queues (size starts at 0, not pre-allocated range).
@@ -3685,11 +3686,11 @@ pub struct ElaboratedModule {
     /// is legal and must win — they are only visible at all because package
     /// contents are registered in one flat design-wide namespace.
     #[serde(default)]
-    pub foreign_package_names: std::collections::HashSet<String>,
+    pub foreign_package_names: HashSet<String>,
     /// Foreign-package names a local declaration has already displaced. A
     /// module gets ONE such declaration per name; a second is a real duplicate.
     #[serde(default)]
-    pub foreign_displaced: std::collections::HashSet<String>,
+    pub foreign_displaced: HashSet<String>,
     /// IEEE 1800-2017 §6.2: names of 2-state-typed signals (bit, byte,
     /// shortint, int, longint). Assignments to these coerce X/Z
     /// source bits to 0.
@@ -3989,7 +3990,7 @@ impl ElaboratedModule {
             typed_decls: HashMap::default(),
             completed_ports: HashSet::default(),
             ranged_port_widths: HashMap::default(),
-            wildcard_shadowed: std::collections::HashSet::default(),
+            wildcard_shadowed: HashSet::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
             tran_switches: Vec::new(),
@@ -4027,7 +4028,7 @@ impl ElaboratedModule {
             timing_checks: Vec::new(),
             resolved_net_kinds: HashMap::default(),
             gate_fall_delays: HashMap::default(),
-            gate_driven_nets: std::collections::HashSet::default(),
+            gate_driven_nets: HashSet::default(),
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
             net_strengths: HashMap::default(),
@@ -4083,8 +4084,8 @@ impl ElaboratedModule {
             enum_members: HashMap::default(),
             package_enum_members: HashMap::default(),
             decl_sites: HashMap::default(),
-            foreign_package_names: std::collections::HashSet::default(),
-            foreign_displaced: std::collections::HashSet::default(),
+            foreign_package_names: HashSet::default(),
+            foreign_displaced: HashSet::default(),
             two_state_signals: HashSet::default(),
             z_init_signals: HashSet::default(),
             pending_always: Vec::new(),
@@ -8713,8 +8714,12 @@ pub fn elaborate_module_with_defs(
     // §26.3: names a wildcard import brings in that are ALSO declared locally
     // — the local declaration shadows the imported one (no duplicate error).
     if let Some(defs) = all_defs {
-        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs);
-        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs);
+        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs)
+            .into_iter()
+            .collect();
+        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs)
+            .into_iter()
+            .collect();
     }
     // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
     // the items, so a declaration whose width depends on one of them is sized
@@ -30578,16 +30583,22 @@ fn inline_instantiations_inner(
     let mut cache = HashMap::default();
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
+    // §23.10/§26.3: the snapshot is held once; each scope takes from it only
+    // the entries its definition can name (#740).
+    let param_scope =
+        param_scope::ParamScope::new(&top_params, definitions, &elab.resolved_binds, &elab.lets);
+    let top_scope = param_scope.top_scope(top_def, definitions);
     inline_module_items(
         elab,
         top_def,
         "",
         definitions,
         &mut HashMap::default(),
-        &top_params,
+        &top_scope,
         &mut cache,
         &HashMap::default(),
         &root_defparams,
+        &param_scope,
     )?;
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
@@ -34454,6 +34465,9 @@ fn inline_module_items(
     // `(path_segments, value)` where the value was already evaluated in the
     // scope that declared the defparam. Path[0] is a child instance name.
     pending_defparams: &[(Vec<String>, Value)],
+    // §23.10/§26.3: the package, `$unit` and top parameters, from which a
+    // child's scope takes the entries its definition can name.
+    param_scope: &param_scope::ParamScope,
 ) -> Result<(), String> {
     // Bind this module's imported type names BEFORE its body is prepared or
     // resolved. The top-module path re-runs its imports
@@ -36818,6 +36832,9 @@ fn inline_module_items(
                     }
                     m
                 };
+                // `local_params` holds the parent's scope and the table
+                // entries it names; add those this child names (#740).
+                param_scope.extend_scope(sub_mod, definitions, &mut sub_merged_params);
 
                 // §7.2.1: struct-typed header and generated body parameters —
                 // register the field layout under the SCOPED name so runtime
@@ -40093,6 +40110,7 @@ fn inline_module_items(
                     cache,
                     &rewrite_port_map,
                     &sub_defparams,
+                    param_scope,
                 )?;
                 iprof_since("recursion", __te);
 

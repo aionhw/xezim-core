@@ -1643,8 +1643,9 @@ fn parse_and_elaborate(
     let forced_secs: Option<(f64, f64)> = cli
         .force
         .map(|(u, p)| (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
-    let mut eff_ts: std::collections::HashMap<String, (f64, f64)> =
-        std::collections::HashMap::new();
+    // Deterministic: `module_timescale_exp` is filled by walking this map,
+    // and its serialized order follows the order entries are inserted in.
+    let mut eff_ts: crate::hasher::HashMap<String, (f64, f64)> = crate::hasher::HashMap::default();
     let mut named_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
     // §3.14.2.2 — track modules that carry NO `timescale (no source-level
     // decl, no preceding directive, no CLI override) so a mixed design (some
