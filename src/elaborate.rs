@@ -36865,6 +36865,19 @@ fn inline_module_items(
                         // The instance's own types first (#680): the table
                         // has the first instance's only once it settles.
                         let inlined = inline_body_typedefs(data_type, &local_types);
+                        // §7.4.1 / §7.4.5: body constants need the same scoped
+                        // packed-element geometry as header parameters. Resolve
+                        // local typedefs and dimensions in this instance.
+                        for assign in assignments {
+                            if assign.dimensions.is_empty() {
+                                register_packed_param_index(
+                                    elab,
+                                    &cat2(&inst_prefix, &assign.name.name),
+                                    inlined.as_ref().unwrap_or(data_type),
+                                    Some(&sub_merged_params),
+                                );
+                            }
+                        }
                         if let Some(fields) = flatten_struct_fields(
                             inlined.as_ref().unwrap_or(data_type),
                             &sub_merged_params,
