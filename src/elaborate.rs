@@ -36133,11 +36133,17 @@ fn inline_module_items(
                 // $bits(T)` folds through TYPEDEFS_TLS, which was only synced
                 // with this instance's type parameters at step 1b, after the
                 // header. H read the PREVIOUS instance's T (0 for the first
-                // one). Bind each type parameter as the header reaches it, so
-                // a default that depends on an earlier value parameter
+                // one), and so did a module with no type parameters reading a
+                // design typedef of the same name. Sync before the header, then
+                // bind each type parameter as the header reaches it, so a
+                // default that depends on an earlier value parameter
                 // (`type T = logic [W-1:0]`) sizes with this instance's W; an
-                // overridden one is already in the table. Restored before 1b.
-                let mut header_type_saves: HashMap<String, Option<u32>> = HashMap::default();
+                // overridden one is already in the tables. The declared type
+                // goes in too, so a header `parameter T P = '{..}` of a struct
+                // T packs by its fields. Both restored before 1b.
+                let mut header_type_saves: HashMap<String, (Option<u32>, Option<DataType>)> =
+                    HashMap::default();
+                sync_typedefs_tls(&elab.typedefs);
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
@@ -36149,10 +36155,18 @@ fn inline_module_items(
                                         Some(&sub_local_params),
                                         Some(&elab.typedefs),
                                     );
+                                    let resolved_dt =
+                                        resolve_typedef_chain(def_dt, &elab.typedef_types).clone();
                                     header_type_saves.entry(a.name.name.clone()).or_insert_with(
-                                        || elab.typedefs.get(&a.name.name).copied(),
+                                        || {
+                                            (
+                                                elab.typedefs.get(&a.name.name).copied(),
+                                                elab.typedef_types.get(&a.name.name).cloned(),
+                                            )
+                                        },
                                     );
                                     elab.typedefs.insert(a.name.name.clone(), w);
+                                    elab.typedef_types.insert(a.name.name.clone(), resolved_dt);
                                 }
                             }
                         }
@@ -36641,8 +36655,16 @@ fn inline_module_items(
 
                 // The header's type-parameter bindings: step 1b installs its
                 // own per-round overlay and must see the design's table.
-                for (name, old) in header_type_saves {
-                    match old {
+                for (name, (old_w, old_dt)) in header_type_saves {
+                    match old_dt {
+                        Some(dt) => {
+                            elab.typedef_types.insert(name.clone(), dt);
+                        }
+                        None => {
+                            elab.typedef_types.remove(&name);
+                        }
+                    }
+                    match old_w {
                         Some(width) => {
                             elab.typedefs.insert(name, width);
                         }
