@@ -187,7 +187,8 @@ pub use value::Value;
 /// \x35 = \x34 − ElaboratedModule.{assoc_row_dims, assoc_coll_elems,
 /// assoc_inner_string_keys} and ElaboratedClass.{assoc_coll_properties,
 /// assoc_row_property_dims}, superseded by the collection shapes.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x35";
+/// \x36 = string keys in element names escaped (`value::encode_name_key`).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x36";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

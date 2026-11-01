@@ -7964,7 +7964,9 @@ pub fn elaborate_module_with_defs(
                             for it in items {
                                 if let AssignmentPatternItem::Keyed(k, v) = it {
                                     let key_str = match &k.kind {
-                                        ExprKind::StringLiteral(s) => s.clone(),
+                                        ExprKind::StringLiteral(s) => {
+                                            crate::value::encode_name_key(s).into_owned()
+                                        }
                                         _ => {
                                             eval_const_expr_val(k, &elab.parameters).to_dec_string()
                                         }
@@ -11406,7 +11408,9 @@ pub fn elaborate_module_with_defs(
                                     for it in items {
                                         if let AssignmentPatternItem::Keyed(k, v) = it {
                                             let key_str = match &k.kind {
-                                                ExprKind::StringLiteral(s) => s.clone(),
+                                                ExprKind::StringLiteral(s) => {
+                                                    crate::value::encode_name_key(s).into_owned()
+                                                }
                                                 _ => eval_const_expr_val(k, &elab.parameters)
                                                     .to_dec_string(),
                                             };
@@ -36340,7 +36344,10 @@ fn inline_module_items(
                                             for it in items {
                                                 if let AssignmentPatternItem::Keyed(k, v) = it {
                                                     let key_str = match &k.kind {
-                                                        ExprKind::StringLiteral(s) => s.clone(),
+                                                        ExprKind::StringLiteral(s) => {
+                                                            crate::value::encode_name_key(s)
+                                                                .into_owned()
+                                                        }
                                                         _ => eval_const_expr_val(
                                                             k,
                                                             &sub_local_params,
