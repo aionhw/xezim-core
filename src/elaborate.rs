@@ -19086,40 +19086,22 @@ pub fn scope_time_param_decl(
     }
 }
 
-/// Package-scope counterpart of `rewrite_module_delays_pub`: a package's
-/// classes, tasks and functions take the `timescale in effect at the
-/// package. Without this a `#200` in a package class method stayed 200 raw
-/// ticks (0.2 ns under a 1ps precision) while the same method in a module
-/// class was scaled correctly.
-/// Class-level entry for a compilation-unit (`$unit`) class declaration.
-pub fn rewrite_class_delays_pub(cd: &mut ClassDeclaration, unit_s: f64, prec_s: f64, tick_s: f64) {
-    rewrite_class_delays(cd, unit_s, prec_s, tick_s);
-}
-
-/// Statement-level entry for the compilation-unit (`$unit`) subroutines.
-pub fn rewrite_stmt_delays_pub(stmt: &mut Statement, unit_s: f64, prec_s: f64, tick_s: f64) {
-    rewrite_stmt_delays(stmt, unit_s, prec_s, tick_s);
-}
-
-pub fn rewrite_package_delays_pub(
+/// `rewrite_scope_time_semantics` over a package's subroutines and classes.
+pub fn rewrite_package_time_semantics(
     items: &mut [crate::ast::decl::PackageItem],
-    unit_s: f64,
-    prec_s: f64,
+    unit_exp: i32,
+    prec_exp: i32,
     tick_s: f64,
 ) {
     use crate::ast::decl::PackageItem;
     for item in items.iter_mut() {
         match item {
-            PackageItem::Class(cd) => rewrite_class_delays(cd, unit_s, prec_s, tick_s),
+            PackageItem::Class(cd) => rewrite_class_time_semantics(cd, unit_exp, prec_exp, tick_s),
             PackageItem::Task(td) => {
-                for st in td.items.iter_mut() {
-                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
-                }
+                rewrite_scope_time_semantics(&mut td.items, unit_exp, prec_exp, tick_s)
             }
             PackageItem::Function(f) => {
-                for st in f.items.iter_mut() {
-                    rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
-                }
+                rewrite_scope_time_semantics(&mut f.items, unit_exp, prec_exp, tick_s)
             }
             _ => {}
         }

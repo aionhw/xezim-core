@@ -1645,10 +1645,6 @@ fn parse_and_elaborate(
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
     let cli = module_timescale_cli();
-    // `-override_timescale`: one timescale for everything, in seconds.
-    let forced_secs: Option<(f64, f64)> = cli
-        .force
-        .map(|(u, p)| (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
     // Deterministic: `module_timescale_exp` is filled by walking this map,
     // and its serialized order follows the order entries are inserted in.
     let mut eff_ts: crate::hasher::HashMap<String, (f64, f64)> = crate::hasher::HashMap::default();
@@ -1890,9 +1886,16 @@ fn parse_and_elaborate(
         } else {
             None
         };
-        // Under a compilation-unit `timeunit` the bodies below are already
-        // rewritten to global ticks; the second delay pass must keep them.
-        let cu_scaled = cu_scope_ts.map(|_| (tick_s, tick_s));
+        // §3.14.2.3: the time unit of a scope that is never instantiated (a
+        // package, a `$unit` class or subroutine). Its delays, time literals
+        // and `$time` are all rewritten to it here: at run time only the
+        // calling module's unit is known.
+        let untimed_scope_exp = |recorded: Option<(f64, f64)>| -> (i32, i32) {
+            cu_scope_ts.unwrap_or_else(|| {
+                let (u, p) = untimed_scope_secs(recorded, cli.global);
+                (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p))
+            })
+        };
         let decl_name = match &desc {
             ast::Description::Module(m) => Some(&m.name.name),
             ast::Description::Interface(i) => Some(&i.name.name),
@@ -1993,22 +1996,8 @@ fn parse_and_elaborate(
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
             ast::Description::Class(mut c) => {
-                // A compilation-unit class scales its method delays by the
-                // unit's `timescale, like a package's classes. Under
-                // `-override_timescale` the time-semantics pass converts them
-                // to tick counts already (§3.14.2); the delay-only pass must
-                // not scale them a second time (#571).
-                if let Some((u, p)) = cu_scope_ts {
-                    elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
-                } else {
-                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
-                        untimed_scope_secs(
-                            module_timescales.get("$unit").copied().or(cu_scaled),
-                            cli.global,
-                        )
-                    });
-                    elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
-                }
+                let (u, p) = untimed_scope_exp(module_timescales.get("$unit").copied());
+                elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
                 let name = c.name.name.clone();
                 let rc = Rc::new(c);
                 // Always keep the class in its own registry so a same-named
@@ -2030,59 +2019,29 @@ fn parse_and_elaborate(
                 }
             }
             ast::Description::Package(mut p) => {
-                if let Some((u, pr)) = cu_scope_ts {
-                    for item in &mut p.items {
-                        match item {
-                            ast::decl::PackageItem::Function(f) => {
-                                elaborate::rewrite_scope_time_semantics(&mut f.items, u, pr, tick_s)
-                            }
-                            ast::decl::PackageItem::Task(t) => {
-                                elaborate::rewrite_scope_time_semantics(&mut t.items, u, pr, tick_s)
-                            }
-                            ast::decl::PackageItem::Class(c) => {
-                                elaborate::rewrite_class_time_semantics(c, u, pr, tick_s)
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 let name = p.name.name.clone();
-                // Delays inside the package scale by ITS timescale, exactly
-                // as a module's items do above; without this a `#200` in a
-                // package class method stayed 200 raw ticks.
                 // Packages are not in `eff_ts` (that walk covers instantiable
                 // elements); the preprocessor records the directive in effect
                 // at the package, else the compilation unit's first one.
-                // With neither, use the CLI timescale or 1ns/1ns, not the
-                // global tick.
-                let (mut unit_s, mut prec_s) = forced_secs.unwrap_or_else(|| {
-                    untimed_scope_secs(
-                        module_timescales
-                            .get(&name)
-                            .or_else(|| module_timescales.get("$unit"))
-                            .copied()
-                            .or(cu_scaled),
-                        cli.global,
-                    )
-                });
+                let (mut u, mut pr) = untimed_scope_exp(
+                    module_timescales
+                        .get(&name)
+                        .or_else(|| module_timescales.get("$unit"))
+                        .copied(),
+                );
                 // A `timeunit`/`timeprecision` declared IN the package wins
-                // over the directive (LRM §3.14.2.2), but not over
-                // `-override_timescale`.
-                for item in p.items.iter().filter(|_| forced_secs.is_none()) {
+                // (§3.14.2.2), but not over `-override_timescale`.
+                for item in p.items.iter().filter(|_| cli.force.is_none()) {
                     if let ast::decl::PackageItem::TimeunitsDecl(td) = item {
-                        if let Some(u) = &td.unit {
-                            unit_s = elaborate::exp_to_secs(elaborate::time_literal_to_exp(u));
+                        if let Some(t) = &td.unit {
+                            u = elaborate::time_literal_to_exp(t);
                         }
-                        if let Some(pr) = &td.precision {
-                            prec_s = elaborate::exp_to_secs(elaborate::time_literal_to_exp(pr));
+                        if let Some(t) = &td.precision {
+                            pr = elaborate::time_literal_to_exp(t);
                         }
                     }
                 }
-                // Under `-override_timescale` the time-semantics pass above
-                // converted the package's delays already (#571).
-                if cu_scope_ts.is_none() {
-                    elaborate::rewrite_package_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
-                }
+                elaborate::rewrite_package_time_semantics(&mut p.items, u, pr, tick_s);
                 definitions.insert(name, SourceDefinition::Package(Rc::new(p)));
             }
             ast::Description::TypedefDecl(t) => {
@@ -2144,39 +2103,13 @@ fn parse_and_elaborate(
                 top_level_lets.push(l);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Function(mut f)) => {
-                // A `$unit` subroutine's delays scale by the compilation
-                // unit's `timescale (recorded as "$unit"), like a module's;
-                // under `-override_timescale` the time-semantics pass is the
-                // one conversion (#571).
-                if let Some((u, p)) = cu_scope_ts {
-                    elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
-                } else {
-                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
-                        untimed_scope_secs(
-                            module_timescales.get("$unit").copied().or(cu_scaled),
-                            cli.global,
-                        )
-                    });
-                    for st in f.items.iter_mut() {
-                        elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
-                    }
-                }
+                let (u, p) = untimed_scope_exp(module_timescales.get("$unit").copied());
+                elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
                 top_level_functions.push(f);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Task(mut t)) => {
-                if let Some((u, p)) = cu_scope_ts {
-                    elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
-                } else {
-                    let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
-                        untimed_scope_secs(
-                            module_timescales.get("$unit").copied().or(cu_scaled),
-                            cli.global,
-                        )
-                    });
-                    for st in t.items.iter_mut() {
-                        elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
-                    }
-                }
+                let (u, p) = untimed_scope_exp(module_timescales.get("$unit").copied());
+                elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
                 top_level_tasks.push(t);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
