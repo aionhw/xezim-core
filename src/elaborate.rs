@@ -34969,6 +34969,21 @@ fn inline_module_items(
                     let sub_mod_declares: std::collections::HashSet<String> = {
                         let mut v = Vec::new();
                         collect_decl_names_in_items(sub_mod.items(), &mut v);
+                        // §6.20: a HEADER parameter (`#(parameter ...)`) is a
+                        // constant, not a net: `leaf u (.a(VREF));` binds its
+                        // value. The body items above cover body parameters
+                        // and localparams but not the header, so such an
+                        // actual was taken for an undeclared identifier.
+                        for pd in sub_mod.params() {
+                            match &pd.kind {
+                                ParameterKind::Data { assignments, .. } => {
+                                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
+                                }
+                                ParameterKind::Type { assignments } => {
+                                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
+                                }
+                            }
+                        }
                         v.into_iter().collect()
                     };
                     let mut cands: Vec<String> = Vec::new();
