@@ -42823,7 +42823,8 @@ fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
 ///
 /// Runs after `resolve_user_nettype_drivers`, which does its own member
 /// expansion for nettype nets (it has to — the resolver call only exists there);
-/// those emerge with a `MemberAccess` lhs and are left alone.
+/// those emerge with leaf-path targets (`n.V`), which name no struct, and are
+/// left alone.
 pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     if !has_unpacked_struct_type(elab) {
         return;
@@ -43074,22 +43075,19 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         name: m.clone(),
                         span: Span::dummy(),
                     };
+                    // Each member is its own signal: name it by its leaf
+                    // path (`n.V`), as `emit_struct_member_assigns` does, so
+                    // the assign compiles to bytecode instead of taking the
+                    // AST path on every settle. A `MemberAccess` lhs never
+                    // compiled, and neither did one on an identifier rhs.
+                    let mut mlhs = member_ref_expr(&make_ident_expr(lhs), &mident);
+                    mlhs.span = span;
+                    let mut mrhs = member_ref_expr(&rhs, &mident);
+                    mrhs.span = span;
                     kept.push(ContinuousAssignment {
                         origin: None,
-                        lhs: Expression::new(
-                            ExprKind::MemberAccess {
-                                expr: Box::new(make_ident_expr(lhs)),
-                                member: mident.clone(),
-                            },
-                            span,
-                        ),
-                        rhs: Expression::new(
-                            ExprKind::MemberAccess {
-                                expr: Box::new(rhs.clone()),
-                                member: mident,
-                            },
-                            span,
-                        ),
+                        lhs: mlhs,
+                        rhs: mrhs,
                         delay,
                         rhs_parent_scoped: false,
                         delay_fall: None,
@@ -43168,18 +43166,13 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             let fields: Vec<crate::ast::expr::AssignmentPatternItem> = ms
                                 .iter()
                                 .map(|m| {
-                                    crate::ast::expr::AssignmentPatternItem::Ordered(
-                                        Expression::new(
-                                            ExprKind::MemberAccess {
-                                                expr: Box::new(d.clone()),
-                                                member: Identifier {
-                                                    name: m.clone(),
-                                                    span: Span::dummy(),
-                                                },
-                                            },
-                                            span,
-                                        ),
-                                    )
+                                    let mident = Identifier {
+                                        name: m.clone(),
+                                        span: Span::dummy(),
+                                    };
+                                    let mut e = member_ref_expr(&d, &mident);
+                                    e.span = span;
+                                    crate::ast::expr::AssignmentPatternItem::Ordered(e)
                                 })
                                 .collect();
                             Expression::new(ExprKind::AssignmentPattern(fields), span)
