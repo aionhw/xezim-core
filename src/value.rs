@@ -6466,6 +6466,47 @@ impl Value {
     }
 }
 
+/// A string key as stored inside a flat element name (`a[KEY]`): `[`, `]`
+/// and `\` become `\(`, `\)` and `\\`, so a name never holds a raw bracket
+/// inside a key (§7.8.1 allows any characters). Inverse: `decode_name_key`.
+pub fn encode_name_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if !key.bytes().any(|b| matches!(b, b'[' | b']' | b'\\')) {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 4);
+    for c in key.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '[' => out.push_str("\\("),
+            ']' => out.push_str("\\)"),
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Inverse of `encode_name_key`.
+pub fn decode_name_key(seg: &str) -> std::borrow::Cow<'_, str> {
+    if !seg.contains('\\') {
+        return std::borrow::Cow::Borrowed(seg);
+    }
+    let mut out = String::with_capacity(seg.len());
+    let mut chars = seg.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('(') => out.push('['),
+            Some(')') => out.push(']'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl Value {
     /// Instance method concat: self ++ other (self is MSB side)
     pub fn concat_with(&self, other: &Value) -> Value {
