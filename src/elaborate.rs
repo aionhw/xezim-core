@@ -780,6 +780,9 @@ pub struct RewriteCtx {
     /// Packed width of each bound type parameter — folded into `$bits(T)`
     /// while this instance's items are rewritten (see `TYPE_BIND_WIDTHS_TLS`).
     pub type_bind_widths: HashMap<String, u32>,
+    /// What each bound type parameter answers to the §20.7 array queries
+    /// (`$left(T)`, `$size(T)`, …), folded alongside `$bits(T)`.
+    pub type_bind_queries: HashMap<String, TypeQueryDims>,
     /// Name of the module/interface definition this body came from — the
     /// file a diagnostic's span belongs to.
     pub owner: String,
@@ -881,7 +884,7 @@ impl PendingAlways {
     }
 
     fn rewrite(&self, stmt: &Statement) -> Statement {
-        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
+        set_type_bind_tls(&self.ctx);
         let stmt = rewrite_stmt(
             stmt,
             &self.ctx.prefix,
@@ -889,14 +892,14 @@ impl PendingAlways {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        clear_type_bind_widths_tls();
+        clear_type_bind_tls();
         substitute_type_params_stmt(stmt, &self.ctx.type_binds)
     }
 }
 
 impl PendingInitial {
     pub fn materialize(self) -> InitialBlock {
-        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
+        set_type_bind_tls(&self.ctx);
         let stmt = rewrite_stmt(
             &self.source,
             &self.ctx.prefix,
@@ -904,7 +907,7 @@ impl PendingInitial {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        clear_type_bind_widths_tls();
+        clear_type_bind_tls();
         let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope for name resolution.
@@ -923,9 +926,9 @@ impl PendingInitial {
 
 impl PendingContAssign {
     pub fn materialize(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
-        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
+        set_type_bind_tls(&self.ctx);
         let out = self.materialize_inner(params);
-        clear_type_bind_widths_tls();
+        clear_type_bind_tls();
         out
     }
 
@@ -22008,6 +22011,11 @@ thread_local! {
     /// correctly during elaboration. Same pattern as TYPEDEFS_TLS.
     static TYPE_BIND_WIDTHS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
         = const { std::cell::RefCell::new(None) };
+    /// §20.7 — the same instance's type parameters as array-query operands:
+    /// `$left(T)` / `$size(T)` / … fold from these. At run time `T` is not a
+    /// signal and the queries read 0.
+    static TYPE_BIND_QUERIES_TLS: std::cell::RefCell<Option<HashMap<String, TypeQueryDims>>>
+        = const { std::cell::RefCell::new(None) };
     /// LRM §20.7 — thread-local array-range table for const-eval of
     /// `$size`/`$left`/`$right`/`$high`/`$low`/`$dimensions` on an
     /// array-name ident. Same pattern as TYPEDEFS_TLS to avoid touching
@@ -22982,6 +22990,66 @@ fn tls_register_typedef_shape(name: &str, dt: &DataType, unpacked: &[UnpackedDim
         } else {
             c.1.insert(name.to_string(), unpacked.to_vec());
         }
+    });
+}
+
+/// A TYPEDEF_SHAPES_TLS entry as it stands, for `tls_restore_typedef_shape`.
+type TypedefShapeSave = (Option<DataType>, Option<Vec<UnpackedDimension>>);
+
+fn tls_typedef_shape(name: &str) -> TypedefShapeSave {
+    TYPEDEF_SHAPES_TLS.with(|c| {
+        let c = c.borrow();
+        (c.0.get(name).cloned(), c.1.get(name).cloned())
+    })
+}
+
+/// §20.7: register type parameter `name`, bound to `dt` as written and to
+/// `resolved` after typedef resolution, in TYPEDEF_SHAPES_TLS. Its dimensions
+/// are folded in `env`, the scope that wrote them, and a bound typedef brings
+/// its unpacked dimensions (`typedef logic [3:0] ua_t [0:2]`).
+fn tls_register_type_param_shape(
+    name: &str,
+    dt: &DataType,
+    resolved: &DataType,
+    env: &HashMap<String, Value>,
+) {
+    let mut shape = resolved.clone();
+    lsdd_data_type(&mut shape, env);
+    let mut unpacked = match dt {
+        DataType::TypeReference {
+            name: tn,
+            dimensions,
+            ..
+        } if dimensions.is_empty() && tn.scopes.is_empty() => {
+            TYPEDEF_SHAPES_TLS.with(|c| c.borrow().1.get(&tn.name.name).cloned())
+        }
+        _ => None,
+    }
+    .unwrap_or_default();
+    for d in unpacked.iter_mut() {
+        match d {
+            UnpackedDimension::Range { left, right, .. } => {
+                lsdd_expr(left, env);
+                lsdd_expr(right, env);
+            }
+            UnpackedDimension::Expression { expr, .. } => lsdd_expr(expr, env),
+            _ => {}
+        }
+    }
+    tls_register_typedef_shape(name, &shape, &unpacked);
+}
+
+fn tls_restore_typedef_shape(name: &str, saved: TypedefShapeSave) {
+    TYPEDEF_SHAPES_TLS.with(|c| {
+        let mut c = c.borrow_mut();
+        match saved.0 {
+            Some(dt) => c.0.insert(name.to_string(), dt),
+            None => c.0.remove(name),
+        };
+        match saved.1 {
+            Some(u) => c.1.insert(name.to_string(), u),
+            None => c.1.remove(name),
+        };
     });
 }
 
@@ -35630,6 +35698,13 @@ fn inline_module_items(
                 // recursion into ITS sub-instances, so `.T(type_t)` chains
                 // resolve). Prior same-named entries saved for restore.
                 let mut saved_type_binds: Vec<(String, Option<u32>, Option<DataType>)> = Vec::new();
+                // §20.7: the constant array queries (`localparam L = $left(T)`)
+                // read a type's full definition from TYPEDEF_SHAPES_TLS, where
+                // an instance's type parameters never went: they answered
+                // from the width alone (`[w-1:0]`, no dimension). Each one is
+                // registered there for this instance; prior entries restored
+                // after it.
+                let mut saved_type_shapes: Vec<(String, TypedefShapeSave)> = Vec::new();
                 for (tp_name, tp_dt) in &type_overrides {
                     let resolved_dt = resolve_typedef_chain(tp_dt, &elab.typedef_types).clone();
                     let w = resolve_type_width(
@@ -35648,6 +35723,9 @@ fn inline_module_items(
                         tp_name.clone(),
                         w,
                     );
+                    // The override's dimensions are the parent's expressions.
+                    saved_type_shapes.push((tp_name.clone(), tls_typedef_shape(tp_name)));
+                    tls_register_type_param_shape(tp_name, tp_dt, &resolved_dt, scoped_eval_params);
                     elab.typedef_types.insert(tp_name.clone(), resolved_dt);
                 }
 
@@ -36748,6 +36826,23 @@ fn inline_module_items(
                                         .entry(a.name.name.clone())
                                         .or_insert_with(|| elab.typedefs.get(&a.name.name).copied());
                                     elab.typedefs.insert(a.name.name.clone(), w);
+                                    // §20.7: its full definition too (see
+                                    // `saved_type_shapes`), kept for the
+                                    // rest of this instance.
+                                    let resolved_dt =
+                                        resolve_typedef_chain(def_dt, &elab.typedef_types).clone();
+                                    if !saved_type_shapes.iter().any(|(n, _)| *n == a.name.name) {
+                                        saved_type_shapes.push((
+                                            a.name.name.clone(),
+                                            tls_typedef_shape(&a.name.name),
+                                        ));
+                                    }
+                                    tls_register_type_param_shape(
+                                        &a.name.name,
+                                        def_dt,
+                                        &resolved_dt,
+                                        &sub_local_params,
+                                    );
                                 }
                             }
                         }
@@ -39549,6 +39644,25 @@ fn inline_module_items(
                         )
                     })
                     .collect();
+                // §20.7: the same answers the constant queries give, from the
+                // shapes registered for this instance (`saved_type_shapes`).
+                let pend_type_bind_queries: HashMap<String, TypeQueryDims> = TYPEDEF_SHAPES_TLS
+                    .with(|sh| {
+                        let sh = sh.borrow();
+                        pend_type_binds
+                            .keys()
+                            .filter_map(|n| {
+                                let q = type_query_dims_by_name(
+                                    n,
+                                    Some(&sub_merged_params),
+                                    Some(&elab.typedefs),
+                                    Some(&sh.0),
+                                    Some(&sh.1),
+                                )?;
+                                Some((n.clone(), q))
+                            })
+                            .collect()
+                    });
                 let pend_ctx = std::rc::Rc::new(RewriteCtx {
                     prefix: inst_prefix.clone(),
                     port_map: rewrite_port_map.clone(),
@@ -39556,6 +39670,7 @@ fn inline_module_items(
                     interface_map: sub_interface_map.clone(),
                     type_binds: pend_type_binds,
                     type_bind_widths: pend_type_bind_widths,
+                    type_bind_queries: pend_type_bind_queries,
                     owner: sub_mod.name().to_string(),
                 });
 
@@ -39676,7 +39791,7 @@ fn inline_module_items(
                 // Function/task bodies are copied PER INSTANCE below through
                 // `rewrite_stmt`, so this instance's type-parameter widths
                 // must be live for `$bits(T)` to fold inside them too.
-                set_type_bind_widths_tls(&pend_ctx.type_bind_widths);
+                set_type_bind_tls(&pend_ctx);
                 for (sub_item, body_src) in prepared_sub
                     .effective_items
                     .iter()
@@ -40176,7 +40291,7 @@ fn inline_module_items(
                         });
                     }
                 }
-                clear_type_bind_widths_tls();
+                clear_type_bind_tls();
 
                 // Record the instance before descending. Inlining is about to
                 // dissolve this module into the parent, so this is the only
@@ -40249,6 +40364,9 @@ fn inline_module_items(
                 )?;
                 iprof_since("recursion", __te);
 
+                for (tp_name, saved) in saved_type_shapes.into_iter().rev() {
+                    tls_restore_typedef_shape(&tp_name, saved);
+                }
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.
                 for (tp_name, prev_w, prev_dt) in saved_type_binds {
@@ -45775,10 +45893,10 @@ fn rewrite_expr_impl(
                 .collect(),
         },
         ExprKind::SystemCall { name, args } => {
-            // `$bits(T)` on a bound type parameter folds to its width here,
+            // `$bits(T)` / `$left(T)` / … on a bound type parameter fold here,
             // before the ident could be prefixed into a nonexistent signal.
-            if let Some(w) = bits_of_bound_type_param(name, args) {
-                return make_i64_literal(w as i64, expr.span);
+            if let Some(v) = query_of_bound_type_param(name, args) {
+                return make_i64_literal(v, expr.span);
             }
             ExprKind::SystemCall {
                 name: name.clone(),
@@ -46128,7 +46246,7 @@ fn rescope_expr(
             right: bx(right),
         },
         ExprKind::Paren(x) => ExprKind::Paren(bx(x)),
-        ExprKind::SystemCall { name, args } if bits_of_bound_type_param(name, args).is_none() => {
+        ExprKind::SystemCall { name, args } if query_of_bound_type_param(name, args).is_none() => {
             ExprKind::SystemCall {
                 name: name.clone(),
                 args: args.iter().map(rx).collect(),
@@ -46337,23 +46455,41 @@ fn rewrite_pattern(
     }
 }
 
-fn set_type_bind_widths_tls(w: &HashMap<String, u32>) {
+fn set_type_bind_tls(ctx: &RewriteCtx) {
     // Always assign — an instance WITHOUT type parameters must clear
     // whatever an enclosing instance left, or its `$bits(T)` on a typedef
     // named `T` would fold to the parent's parameter width.
+    let w = &ctx.type_bind_widths;
     TYPE_BIND_WIDTHS_TLS.with(|c| {
         *c.borrow_mut() = if w.is_empty() { None } else { Some(w.clone()) };
     });
+    let q = &ctx.type_bind_queries;
+    TYPE_BIND_QUERIES_TLS.with(|c| {
+        *c.borrow_mut() = if q.is_empty() { None } else { Some(q.clone()) };
+    });
 }
 
-fn clear_type_bind_widths_tls() {
+fn clear_type_bind_tls() {
     TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
+    TYPE_BIND_QUERIES_TLS.with(|c| *c.borrow_mut() = None);
 }
 
-/// `$bits(T)` with `T` a type parameter of the instance being materialized:
-/// its width, or None when the call is anything else.
-fn bits_of_bound_type_param(name: &str, args: &[Expression]) -> Option<u32> {
-    if name != "$bits" || args.len() != 1 {
+/// `$bits(T)` or a §20.7 array query (`$left(T)`, `$size(T, 2)`, …) with `T`
+/// a type parameter of the instance being materialized: its value, or None
+/// when the call is anything else or the dimension does not exist.
+fn query_of_bound_type_param(name: &str, args: &[Expression]) -> Option<i64> {
+    let is_query = matches!(
+        name,
+        "$left"
+            | "$right"
+            | "$high"
+            | "$low"
+            | "$size"
+            | "$increment"
+            | "$dimensions"
+            | "$unpacked_dimensions"
+    );
+    if !(name == "$bits" && args.len() == 1 || is_query && (1..=2).contains(&args.len())) {
         return None;
     }
     let ExprKind::Ident(h) = &args[0].kind else {
@@ -46363,7 +46499,19 @@ fn bits_of_bound_type_param(name: &str, args: &[Expression]) -> Option<u32> {
         return None;
     }
     let t = &h.path[0].name.name;
-    TYPE_BIND_WIDTHS_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(t).copied()))
+    if name == "$bits" {
+        return TYPE_BIND_WIDTHS_TLS
+            .with(|c| c.borrow().as_ref().and_then(|m| m.get(t).copied()))
+            .map(i64::from);
+    }
+    let dim = match args.get(1) {
+        Some(d) => usize::try_from(const_eval_i64_with_params(d, None)?).ok()?,
+        None => 1,
+    };
+    TYPE_BIND_QUERIES_TLS.with(|c| {
+        let c = c.borrow();
+        type_query_bound(name, c.as_ref()?.get(t)?, dim)
+    })
 }
 
 /// Substitute an instance's TYPE-PARAMETER bindings into the declarations of
