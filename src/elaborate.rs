@@ -25831,6 +25831,31 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
     elab.continuous_assigns = expanded;
 }
 
+/// §7.2: is an inlined instance's port of this type stored member-wise — an
+/// unpacked struct (not an untagged union, which is one piece of storage) —
+/// and named by a type the later whole-design passes can still resolve?
+///
+/// A port typed by one of the instance's TYPE PARAMETERS is left out: the
+/// parameter is bound only while the instance is inlined (`saved_type_binds`
+/// restores the slot), so `expand_unpacked_struct_assigns` cannot see that
+/// it names a struct. Such a port keeps the packed container layout it had.
+fn inlined_port_member_wise(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+    type_binds: &[(String, Option<u32>, Option<DataType>)],
+) -> bool {
+    if let DataType::TypeReference { name, .. } = dt {
+        if name.scopes.is_empty() && type_binds.iter().any(|(n, _, _)| *n == name.name.name) {
+            return false;
+        }
+    }
+    matches!(
+        resolve_typedef_chain(dt, typedef_types),
+        DataType::Struct(su) if !su.packed
+            && !(matches!(su.kind, StructUnionKind::Union) && !su.tagged)
+    )
+}
+
 fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &DataType) {
     let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
     let DataType::Struct(su) = resolved else {
@@ -37329,14 +37354,31 @@ fn inline_module_items(
                             // internal signal (`dut.out.a` for an `output
                             // sample_t out`) resolves the field — otherwise the
                             // write was dropped and the output stayed X.
+                            //
+                            // §7.2: not for an UNPACKED struct, which is stored
+                            // member-wise (see `register_unpacked_aggregate`
+                            // below) like the root arm's ports. A layout there
+                            // sent the child's own process writes (`o = '{..}`,
+                            // `o.a = v`) into slices of the width-only
+                            // container, which the parent never reads.
                             if let Some(dt) = &port.data_type {
                                 let mut struct_w: u32 = 0;
-                                if let Some(fields) = flatten_struct_fields(
+                                let member_wise = inlined_port_member_wise(
                                     dt,
-                                    &sub_merged_params,
-                                    &elab.typedefs,
                                     &elab.typedef_types,
-                                ) {
+                                    &saved_type_binds,
+                                );
+                                let fields = if member_wise {
+                                    None
+                                } else {
+                                    flatten_struct_fields(
+                                        dt,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    )
+                                };
+                                if let Some(fields) = fields {
                                     if !fields.is_empty() {
                                         struct_w =
                                             fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
@@ -37460,8 +37502,25 @@ fn inline_module_items(
                                 // instance — register the member leaves too,
                                 // so `<inst>.<port>.<member>` is a real signal
                                 // (see the module-port arm for the symptom).
+                                // A member-wise one also records its declared
+                                // type, as the root arm does: the procedural
+                                // struct copy and `%p` look it up there.
                                 if let Some(dt) = &port.data_type {
                                     register_unpacked_aggregate(elab, &sig_name, dt);
+                                    if inlined_port_member_wise(
+                                        dt,
+                                        &elab.typedef_types,
+                                        &saved_type_binds,
+                                    ) {
+                                        elab.var_decl_types.insert(
+                                            sig_name.clone(),
+                                            scope_local_typerefs(
+                                                dt,
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                            ),
+                                        );
+                                    }
                                 }
                                 // §23.2.2.4: an output-variable default is its
                                 // declaration initializer.  Inlined instances
@@ -42769,115 +42828,64 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     if !has_unpacked_struct_type(elab) {
         return;
     }
-    // (member name, declared type, unpacked dimensions) in declaration order.
-    type MemberDecl = (String, DataType, Vec<UnpackedDimension>);
-    let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<MemberDecl>> {
+    let struct_type = |elab: &ElaboratedModule, name: &str| {
         declared_type_name(elab, name)
-            .and_then(|tn| elab.typedef_types.get(&tn).cloned())
-            .and_then(|dt| match resolve_typedef_chain(&dt, &elab.typedef_types) {
+            .and_then(|tn| elab.typedef_types.get(&tn))
+            .and_then(|dt| match resolve_typedef_chain(dt, &elab.typedef_types) {
                 // A PACKED struct keeps a contiguous bit layout that a
                 // whole-value write already fills correctly.
-                DataType::Struct(su) if !su.packed => {
-                    let ms: Vec<MemberDecl> = su
-                        .members
-                        .iter()
-                        .flat_map(|m| {
-                            m.declarators.iter().map(|d| {
-                                (
-                                    d.name.name.clone(),
-                                    m.data_type.clone(),
-                                    d.dimensions.clone(),
-                                )
-                            })
-                        })
-                        .collect();
-                    if ms.is_empty() { None } else { Some(ms) }
-                }
+                DataType::Struct(su) if !su.packed && !su.members.is_empty() => Some(su.clone()),
                 _ => None,
             })
     };
 
-    // Bounded repeat so a struct whose member is itself an unpacked struct
-    // expands all the way down; each round strictly shortens what is left.
-    for _ in 0..8 {
-        let mut changed = false;
-        let mut out: Vec<ContinuousAssignment> = Vec::new();
-        for ca in std::mem::take(&mut elab.continuous_assigns) {
-            let members =
-                ident_flat_name(&ca.lhs).and_then(|n| struct_members(elab, &n).map(|ms| (n, ms)));
-            let Some((base, ms)) = members else {
-                out.push(ca);
-                continue;
-            };
-            // Ordered pattern items map position-wise onto the members;
-            // member-selecting the literal itself has no evaluation path.
-            let pat: Option<Vec<Expression>> = match &ca.rhs.kind {
-                ExprKind::AssignmentPattern(items) if items.len() == ms.len() => items
-                    .iter()
-                    .map(|it| match it {
-                        crate::ast::expr::AssignmentPatternItem::Ordered(e) => Some(e.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => None,
-            };
-            for (i, (m, mdt, mdims)) in ms.iter().enumerate() {
-                let mident = Identifier {
-                    name: m.clone(),
-                    span: Span::dummy(),
-                };
-                let rhs = match &pat {
-                    Some(items) => items[i].clone(),
-                    None => Expression::new(
-                        ExprKind::MemberAccess {
-                            expr: Box::new(ca.rhs.clone()),
-                            member: mident.clone(),
-                        },
-                        ca.rhs.span,
-                    ),
-                };
-                let lhs = Expression::new(
-                    ExprKind::MemberAccess {
-                        expr: Box::new(make_ident_expr(&base)),
-                        member: mident,
-                    },
-                    ca.lhs.span,
-                );
-                // §7.4.2: an array member is stored per element — expand it
-                // here, where its declaration is in hand; the member name
-                // alone names no storage.
-                if !mdims.is_empty() {
-                    emit_member_elem_assigns(
-                        lhs,
-                        rhs,
-                        pat.is_some(),
-                        mdt,
-                        mdims,
-                        &ca,
-                        &elab.typedef_types,
-                        &elab.parameters,
-                        &mut out,
-                        0,
-                    );
-                    continue;
-                }
-                out.push(ContinuousAssignment {
-                    origin: ca.origin.clone(),
-                    lhs,
-                    rhs,
-                    delay: ca.delay,
-                    rhs_parent_scoped: ca.rhs_parent_scoped,
-                    delay_fall: ca.delay_fall,
-                    delay_off: ca.delay_off,
-                });
+    // A sub-module body may still sit in the LAZY pending list, which the loop
+    // below never sees: `assign o = '{x, 7};` in a child of the usual (lazily
+    // inlined) kind kept its whole-struct lhs, wrote a container no reader
+    // looks at, and the parent's port copy read the leaves' defaults. Bring
+    // exactly the entries landing on an unpacked struct into the eager list.
+    {
+        let pending = std::mem::take(&mut elab.pending_cont_assign);
+        for pca in pending {
+            let lhs = rewrite_expr(
+                &pca.lhs_source,
+                &pca.ctx.prefix,
+                &pca.ctx.port_map,
+                &pca.ctx.local_names,
+                &pca.ctx.interface_map,
+            );
+            if ident_flat_name(&lhs).is_some_and(|n| struct_type(elab, &n).is_some()) {
+                let ca = pca.materialize(&elab.parameters);
+                elab.continuous_assigns.push(ca);
+            } else {
+                elab.pending_cont_assign.push(pca);
             }
-            changed = true;
-        }
-        elab.continuous_assigns = out;
-        if !changed {
-            break;
         }
     }
+
+    // The per-module pass's expansion: ordered and NAMED patterns are taken
+    // apart item by item, nested structs and array members recurse, and each
+    // leaf is named by a hierarchical path (`u.o.a`) that resolves to the
+    // member's own signal — a `real` member stays real (a `MemberAccess` lhs
+    // here wrote `4.5` as `5`).
+    let mut out: Vec<ContinuousAssignment> = Vec::new();
+    for ca in std::mem::take(&mut elab.continuous_assigns) {
+        let target = ident_flat_name(&ca.lhs).and_then(|n| struct_type(elab, &n).map(|su| (n, su)));
+        match target {
+            Some((base, su)) => emit_struct_member_assigns(
+                &make_ident_expr(&base),
+                &ca.rhs,
+                &su,
+                &ca,
+                &elab.typedef_types,
+                &elab.parameters,
+                &mut out,
+                0,
+            ),
+            None => out.push(ca),
+        }
+    }
+    elab.continuous_assigns = out;
 }
 
 pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), String> {
