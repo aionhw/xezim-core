@@ -34640,6 +34640,15 @@ fn inline_module_items(
         }
     }
     if let Some(binds) = elab.resolved_binds.get(prefix.trim_end_matches('.')) {
+        for b in binds {
+            if let Some(def) = definitions.get(&b.instantiation.module_name.name) {
+                crate::param_override_lists::check_bound_instance(
+                    &b.instantiation,
+                    *def,
+                    source_def.name(),
+                )?;
+            }
+        }
         let prepared = Rc::make_mut(&mut prepared_source);
         let bound: Vec<ModuleItem> = binds
             .iter()
@@ -34844,6 +34853,7 @@ fn inline_module_items(
                     ));
                 }
             };
+            crate::param_override_lists::check_instance(elab, inst, sub_mod, source_def.name())?;
 
             for hi in &inst.instances {
                 let __th = iprof_now();
