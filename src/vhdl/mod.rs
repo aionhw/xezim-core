@@ -195,6 +195,9 @@ pub struct VhdlOptions {
     pub assert_level: u8,
     /// The revision of the language.
     pub std: VhdlStd,
+    /// A VHDL simulation top that has ports is lowered as a module with
+    /// those ports, so a VPI testbench can drive them.
+    pub expose_ports: bool,
 }
 
 impl Default for VhdlOptions {
@@ -203,6 +206,7 @@ impl Default for VhdlOptions {
             ieee_asserts: 0,
             assert_level: 3,
             std: VhdlStd::V2008,
+            expose_ports: false,
         }
     }
 }

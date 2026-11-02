@@ -624,7 +624,7 @@ impl<'a> Lw<'a> {
     /// resumes a process with waits is left to the kernel).
     pub(super) fn eager_sv(&self) -> String {
         let mut s = String::from(
-            "  bit vh_busy, vh_started, vh_clkd, vh_nbt;\n  int vh_hand = -1;\n  int vh_kick, vh_ksn;\n",
+            "  bit vh_busy, vh_started, vh_nbt;\n  int vh_hand = -1;\n  int vh_kick, vh_ksn;\n",
         );
         if self.fins.is_empty() {
             return s;

@@ -418,11 +418,17 @@ impl Design {
                     } else {
                         elem
                     };
-                    // VHDL-2008 §9.3.3.3: an element association may give a
-                    // slice (an array of the aggregate's type) positionally.
+                    // VHDL-2008 §9.3.3.3: an element association is the
+                    // element type (one index, or a range that repeats it).
+                    // A range choice may instead give an array the length of
+                    // that choice: a slice, or a string whose bounds come
+                    // from the choice rather than the whole aggregate.
                     let v = match self.try_expr_quiet(r, &a.value, Some(elem_t)) {
                         Some(v) => v,
-                        None => self.expr(r, &a.value, Some(t))?,
+                        None => {
+                            let ctx = self.choice_array_context(&choices, t);
+                            self.expr(r, &a.value, Some(ctx))?
+                        }
                     };
                     out.push((choices, v));
                 }
@@ -492,6 +498,32 @@ impl Design {
                 None
             }
         }
+    }
+
+    /// Context type for an array-valued range choice: a subtype of `agg`
+    /// constrained to that one choice (§9.3.3.3). Anything else keeps the
+    /// aggregate's own type.
+    fn choice_array_context(&mut self, choices: &[HChoice], agg: TypeId) -> TypeId {
+        let [HChoice::Range(hr)] = choices else {
+            return agg;
+        };
+        let b = self.base(agg);
+        let TypeKind::Array { index, .. } = &self.types[b].kind else {
+            return agg;
+        };
+        if index.len() != 1 {
+            return agg;
+        }
+        self.add_type(
+            "",
+            TypeKind::Subtype {
+                base: b,
+                constraint: Some(HConstraint::Index(vec![Some(hr.clone())], None)),
+                resolution: None,
+            },
+            None,
+            None,
+        )
     }
 
     /// Analyse without reporting errors (for trying an interpretation).
@@ -2152,7 +2184,13 @@ impl Design {
     }
 
     /// A predefined operator on static values.
-    pub(super) fn eval_op(&self, op: &str, v: &[Value], ty: TypeId, args: &[HExpr]) -> Option<Value> {
+    pub(super) fn eval_op(
+        &self,
+        op: &str,
+        v: &[Value],
+        ty: TypeId,
+        args: &[HExpr],
+    ) -> Option<Value> {
         let bool_v = |b: bool| Value::Enum(b as u32);
         match (op, v) {
             ("+", [Value::Int(a), Value::Int(b)]) => a.checked_add(*b).map(Value::Int),
