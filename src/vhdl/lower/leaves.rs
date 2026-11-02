@@ -681,25 +681,45 @@ impl<'a> Lw<'a> {
                     path.pop();
                 }
                 let bounds = self.shape(b);
-                let bv = match bounds {
+                let bty = b.ty;
+                // Dimension 0 of a static array does not need the value
+                // (`pk_off` uses the bounds). A later dimension does, unless
+                // its own bounds are static: `.d[0]` with an empty prefix
+                // is not a select.
+                let mut value = match bounds {
                     Some(_) => String::new(),
                     None => self.ex(b),
                 };
                 for (k, x) in idx.iter().enumerate() {
                     let i = self.ex(x);
-                    let arr = if k == 0 { bv.clone() } else { format!("{}{}", bv, ".d[0]".repeat(k)) };
-                    let mut off = match (k, bounds) {
-                        (0, Some(bnd)) => self.pk_off(&i, bnd, &t.loc),
-                        _ => format!(
+                    let static_b = if k == 0 {
+                        bounds
+                    } else {
+                        self.static_dim(bty, k).and_then(|sr| {
+                            Some((sr.left.as_i64()?, sr.dir, sr.right.as_i64()?))
+                        })
+                    };
+                    let mut off = if let Some(bnd) = static_b {
+                        self.pk_off(&i, bnd, &t.loc)
+                    } else {
+                        if value.is_empty() {
+                            value = self.ex(b);
+                        }
+                        let arr = if k == 0 {
+                            value.clone()
+                        } else {
+                            format!("{}{}", value, ".d[0]".repeat(k))
+                        };
+                        format!(
                             "vh_ix({}, {a}.l, {a}.r, {a}.dn, {}, {})",
                             i,
                             sv_string(&f),
                             l,
                             a = arr
-                        ),
+                        )
                     };
-                    let mut v = match (k, bounds, self.d.eval(x).and_then(|v| v.as_i64())) {
-                        (0, Some((lb, dir, _)), Some(iv)) => Some(match dir {
+                    let mut v = match (static_b, self.d.eval(x).and_then(|val| val.as_i64())) {
+                        (Some((lb, dir, _)), Some(iv)) => Some(match dir {
                             Dir::To => iv - lb,
                             Dir::Downto => lb - iv,
                         }),

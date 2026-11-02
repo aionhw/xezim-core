@@ -9,7 +9,10 @@
 //! the signal has an event. Values cross as Questa passes them: std_ulogic
 //! to 4-state as `U X W -` → x, `0 L` → 0, `1 H` → 1, `Z` → z, and back as
 //! 0 1 x z → `'0' '1' 'X' 'Z'`; bit and boolean as 0/1 (x and z → 0);
-//! integers as 32-bit two's complement; reals as reals.
+//! integers as 32-bit two's complement; reals as reals. A record, and an
+//! array whose elements are not integers or reals, crosses as one packed
+//! `logic` vector: the left index and the first field are the most
+//! significant bits, and each `std_logic`, bit or boolean is one bit.
 
 use std::fmt::Write as _;
 
@@ -29,23 +32,76 @@ pub(super) enum Bnd {
     Int,
     Real,
     /// A one-dimensional array of integers or reals: an SV unpacked array
-    /// with the VHDL bounds, `[left:right]`.
+    /// with the VHDL bounds, `[left:right]`. Also one dimension of a packed
+    /// composite (a record, or an array of records or vectors): `.d[0]` is
+    /// the left index.
     Arr(Box<Bnd>, i64, i64),
+    /// A record, fields in declaration order. The first field is the most
+    /// significant when the record is packed onto the boundary.
+    Rec(Vec<Bnd>),
 }
 
 impl Bnd {
+    /// A value that crosses as one `logic [width-1:0]`, not as an unpacked
+    /// array of integers or reals.
+    fn is_packed(&self) -> bool {
+        match self {
+            Bnd::Rec(_) => true,
+            Bnd::Arr(e, _, _) => !matches!(e.as_ref(), Bnd::Int | Bnd::Real),
+            _ => false,
+        }
+    }
+
+    /// `std_logic` bits of a packed value. A real has none.
+    fn width(&self) -> i64 {
+        match self {
+            Bnd::Bit(_) => 1,
+            Bnd::Vec(_, n) => *n,
+            Bnd::Int => 32,
+            Bnd::Real => 0,
+            Bnd::Rec(fs) => fs.iter().map(Bnd::width).sum(),
+            Bnd::Arr(e, l, r) => e.width().saturating_mul((l - r).abs() + 1),
+        }
+    }
+
+    /// The width of a packed value, when this representation is one.
+    fn packed_width(&self) -> Option<i64> {
+        if !self.is_packed() {
+            return None;
+        }
+        let w = self.width();
+        (w > 0).then_some(w)
+    }
+
+    /// A real, or a composite that contains one: it cannot be packed.
+    fn has_real(&self) -> bool {
+        match self {
+            Bnd::Real => true,
+            Bnd::Rec(fs) => fs.iter().any(Bnd::has_real),
+            Bnd::Arr(e, _, _) => e.has_real(),
+            _ => false,
+        }
+    }
+
     /// The SV data type on the boundary.
     fn sv(&self) -> String {
+        if let Some(w) = self.packed_width() {
+            return format!("logic [{}:0]", w - 1);
+        }
         match self {
             Bnd::Bit(_) => "logic".into(),
             Bnd::Vec(_, n) => format!("logic [{}:0]", n - 1),
             Bnd::Int => "logic signed [31:0]".into(),
             Bnd::Real => "real".into(),
             Bnd::Arr(e, _, _) => e.sv(),
+            Bnd::Rec(_) => "logic".into(),
         }
     }
     /// The unpacked dimension of a declaration.
     fn dims(&self) -> String {
+        if self.is_packed() {
+            return String::new();
+        }
         match self {
             Bnd::Arr(_, l, r) => format!(" [{}:{}]", l, r),
             _ => String::new(),
@@ -53,9 +109,12 @@ impl Bnd {
     }
     /// The inequality of two values on the boundary.
     fn ne(&self, a: &str, b: &str) -> String {
+        if self.is_packed() {
+            return format!("{a} !== {b}");
+        }
         match self {
-            Bnd::Real | Bnd::Arr(..) => format!("{} != {}", a, b),
-            _ => format!("{} !== {}", a, b),
+            Bnd::Real | Bnd::Arr(..) => format!("{a} != {b}"),
+            _ => format!("{a} !== {b}"),
         }
     }
 }
@@ -88,27 +147,71 @@ impl<'a> Lw<'a> {
     pub(super) fn bnd(&self, t: TypeId) -> Option<Bnd> {
         let b = self.base(t);
         let ul = Some(b) == self.d.std.std_ulogic;
-        match &self.d.types[b].kind {
-            TypeKind::Enum(_) if self.d.is_logic_enum(b) => Some(Bnd::Bit(ul)),
-            TypeKind::Integer => Some(Bnd::Int),
-            TypeKind::Real => Some(Bnd::Real),
-            TypeKind::Array { index, elem } if index.len() == 1 => {
-                let e = self.base(*elem);
-                let (l, dir, r) = self.static_bounds(t)?;
-                if !self.d.is_logic_enum(e) {
-                    return match self.bnd(e)? {
-                        x @ (Bnd::Int | Bnd::Real) => Some(Bnd::Arr(Box::new(x), l, r)),
-                        _ => None,
-                    };
-                }
-                let n = match dir {
-                    Dir::To => r - l + 1,
-                    Dir::Downto => l - r + 1,
-                };
-                (n > 0).then_some(Bnd::Vec(Some(e) == self.d.std.std_ulogic, n))
-            }
-            _ => None,
+        if matches!(&self.d.types[b].kind, TypeKind::Enum(_)) && self.d.is_logic_enum(b) {
+            return Some(Bnd::Bit(ul));
         }
+        if matches!(&self.d.types[b].kind, TypeKind::Integer) {
+            return Some(Bnd::Int);
+        }
+        if matches!(&self.d.types[b].kind, TypeKind::Real) {
+            return Some(Bnd::Real);
+        }
+        if let TypeKind::Record(fields) = &self.d.types[b].kind {
+            let tys: Vec<TypeId> = fields.iter().map(|(_, ft)| *ft).collect();
+            if tys.is_empty() {
+                return None;
+            }
+            let mut fs = Vec::new();
+            for ft in tys {
+                let fb = self.bnd(ft)?;
+                if fb.has_real() {
+                    return None;
+                }
+                fs.push(fb);
+            }
+            return Some(Bnd::Rec(fs));
+        }
+        let arr = match &self.d.types[b].kind {
+            TypeKind::Array { index, elem } => Some((index.len(), *elem)),
+            _ => None,
+        };
+        let Some((nindex, elem)) = arr else {
+            return None;
+        };
+        let e = self.base(elem);
+        if nindex == 1 && self.d.is_logic_enum(e) {
+            let (l, dir, r) = self.static_bounds(t)?;
+            let n = match dir {
+                Dir::To => r - l + 1,
+                Dir::Downto => l - r + 1,
+            };
+            return (n > 0).then_some(Bnd::Vec(Some(e) == self.d.std.std_ulogic, n));
+        }
+        if nindex == 1
+            && let Some(x @ (Bnd::Int | Bnd::Real)) = self.bnd(elem)
+        {
+            let (l, _, r) = self.static_bounds(t)?;
+            return Some(Bnd::Arr(Box::new(x), l, r));
+        }
+        // Every dimension has to be static: an unconstrained array still
+        // cannot be a port. Dimensions are wrapped innermost first so the
+        // outermost index is the outer `.d`.
+        let mut dims = Vec::new();
+        for k in 0..nindex {
+            let sr = self.static_dim(t, k)?;
+            if sr.length() == 0 {
+                return None;
+            }
+            dims.push((sr.left.as_i64()?, sr.right.as_i64()?));
+        }
+        let mut inner = self.bnd(elem)?;
+        if inner.has_real() {
+            return None;
+        }
+        for (l, r) in dims.into_iter().rev() {
+            inner = Bnd::Arr(Box::new(inner), l, r);
+        }
+        Some(inner)
     }
 
     /// The port list of a root (an entity instantiated from SV), and its
@@ -142,6 +245,11 @@ impl<'a> Lw<'a> {
                 );
                 continue;
             };
+            // The conversion functions are emitted after `type_defs` is
+            // copied out, so the record and array structs have to exist
+            // before then.
+            let loc = info.loc.clone();
+            let _ = self.repr(info.ty, &loc);
             let name = port_ident(&info.name);
             let sig = SigRef {
                 sig: self.sig_map[&(0, p)].sig,
@@ -149,7 +257,8 @@ impl<'a> Lw<'a> {
             };
             let net = if bnd == Bnd::Real { "var" } else { "wire" };
             match mode {
-                Mode::In if matches!(bnd, Bnd::Arr(..)) => {
+                Mode::In if matches!(&bnd, Bnd::Arr(e, ..) if matches!(e.as_ref(), Bnd::Int | Bnd::Real)) =>
+                {
                     self.err(
                         &info.loc,
                         format!(
@@ -203,6 +312,8 @@ impl<'a> Lw<'a> {
             let Some(bnd) = self.bnd(info.ty) else {
                 continue;
             };
+            let loc = info.loc.clone();
+            let _ = self.repr(info.ty, &loc);
             let sv = port_ident(&info.name);
             if self.fouts.iter().any(|f| f.sv == sv) {
                 continue;
@@ -303,7 +414,7 @@ impl<'a> Lw<'a> {
                 .unwrap_or(Part::Whole);
             let sty = f.sig.as_ref().map(|r| self.sigs[r.sig].ty).unwrap_or(f.ty);
             let body = self.conv_out(&f.bnd, &part, sty);
-            let ret = if let Bnd::Arr(..) = f.bnd {
+            let ret = if matches!(f.bnd, Bnd::Arr(..)) && !f.bnd.is_packed() {
                 let _ = writeln!(s, "  typedef {} vh_fat{}{};", f.bnd.sv(), k, f.bnd.dims());
                 format!("vh_fat{}", k)
             } else {
@@ -323,6 +434,13 @@ impl<'a> Lw<'a> {
 
     /// The body of the conversion of SV value `v` to a VHDL value.
     fn conv_in(&mut self, bnd: &Bnd, r: &Repr, ty: TypeId) -> String {
+        if bnd.is_packed() {
+            let hi = bnd.width() - 1;
+            let mut decls = String::new();
+            let mut body = String::new();
+            let v = self.unpack_in("vh_v", bnd, ty, 0, &mut decls, &mut body);
+            return format!("    int vh_bit;\n{decls}    vh_bit = {hi};\n{body}    return {v};\n");
+        }
         let bit = |ul: bool, x: &str| {
             if ul {
                 format!("vh_l2u({})", x)
@@ -360,7 +478,7 @@ impl<'a> Lw<'a> {
             }
             Bnd::Int => format!("    return $isunknown(vh_v) ? 0 : {}'(vh_v);\n", r.sv()),
             Bnd::Real => "    return vh_v;\n".into(),
-            Bnd::Arr(..) => "    return 0;\n".into(),
+            Bnd::Arr(..) | Bnd::Rec(_) => "    return 0;\n".into(),
         }
     }
 
@@ -382,6 +500,18 @@ impl<'a> Lw<'a> {
                 (format!("vh_a{}", sel), slice.map_or(0, |(o, _)| o), at)
             }
         };
+        if bnd.is_packed() {
+            let walk = self
+                .bnd(at)
+                .filter(Bnd::is_packed)
+                .unwrap_or_else(|| bnd.clone());
+            let hi = walk.width() - 1;
+            let mut body = String::new();
+            self.pack_out("vh_o", &x, &walk, at, &mut body);
+            return format!(
+                "    logic [{hi}:0] vh_o;\n    int vh_bit;\n    vh_bit = {hi};\n{body}    return vh_o;\n"
+            );
+        }
         let pk = match self.repr(at, &loc) {
             Repr::Pk(w, n) => Some((w, n)),
             _ => None,
@@ -402,6 +532,7 @@ impl<'a> Lw<'a> {
                 )
             }
             Bnd::Int | Bnd::Real => format!("    return {};\n", x),
+            Bnd::Rec(_) => "    return 0;\n".into(),
             Bnd::Arr(_, l, r) => {
                 let n = (l - r).abs() + 1;
                 let step = if r >= l { "+" } else { "-" };
@@ -415,6 +546,210 @@ impl<'a> Lw<'a> {
                     x = x,
                     off = off
                 )
+            }
+        }
+    }
+
+    fn fresh(&mut self) -> String {
+        self.tmp += 1;
+        format!("vh_u{}", self.tmp)
+    }
+
+    /// Write VHDL value `src` (type `ty`) into packed logic `dst`. `vh_bit`
+    /// is the next bit, and it moves toward 0. `.d[0]` and the first record
+    /// field are written first, so they land in the most significant bits.
+    fn pack_out(&mut self, dst: &str, src: &str, bnd: &Bnd, ty: TypeId, body: &mut String) {
+        match bnd {
+            Bnd::Bit(ul) => {
+                let b = if *ul {
+                    format!("vh_u2l({src})")
+                } else {
+                    format!("logic'({src} != 0)")
+                };
+                let _ = writeln!(body, "    {dst}[vh_bit] = {b}; vh_bit = vh_bit - 1;");
+            }
+            Bnd::Vec(ul, n) => {
+                let loc = self.d.objects[0].loc.clone();
+                let pk = match self.repr(ty, &loc) {
+                    Repr::Pk(w, pn) => Some((w, pn)),
+                    _ => None,
+                };
+                self.tmp += 1;
+                let iv = format!("vh_p{}", self.tmp);
+                let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
+                let elem = match pk {
+                    Some((w, pn)) => Lw::pk_sel(src, w, pn, &iv),
+                    None => format!("{src}.d[{iv}]"),
+                };
+                let b = if *ul {
+                    format!("vh_u2l({elem})")
+                } else {
+                    format!("logic'({elem} != 0)")
+                };
+                let _ = writeln!(body, "      {dst}[vh_bit] = {b}; vh_bit = vh_bit - 1; end");
+            }
+            Bnd::Int => {
+                self.tmp += 1;
+                let iv = format!("vh_p{}", self.tmp);
+                let _ = writeln!(body, "    for (int {iv} = 31; {iv} >= 0; {iv}--) begin");
+                let _ = writeln!(
+                    body,
+                    "      {dst}[vh_bit] = logic'(($unsigned({src}) >> {iv}) & 1); vh_bit = vh_bit - 1; end"
+                );
+            }
+            Bnd::Real => {}
+            Bnd::Rec(fields) => {
+                let rec = if let TypeKind::Record(rec) = &self.d.types[self.base(ty)].kind {
+                    rec.iter().map(|(_, ft)| *ft).collect::<Vec<_>>()
+                } else {
+                    return;
+                };
+                for (i, (fb, ft)) in fields.iter().zip(rec).enumerate() {
+                    self.pack_out(dst, &format!("{src}.f{i}"), fb, ft, body);
+                }
+            }
+            Bnd::Arr(elem, l, r) => {
+                let n = (l - r).abs() + 1;
+                self.tmp += 1;
+                let iv = format!("vh_p{}", self.tmp);
+                let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
+                let inner = format!("{src}.d[{iv}]");
+                if matches!(elem.as_ref(), Bnd::Arr(..)) {
+                    self.pack_out(dst, &inner, elem, ty, body);
+                } else {
+                    let et = self.d.element_subtype(ty).unwrap_or(ty);
+                    self.pack_out(dst, &inner, elem, et, body);
+                }
+                let _ = writeln!(body, "    end");
+            }
+        }
+    }
+
+    /// Read a packed logic vector `vec` into a VHDL value of type `ty`.
+    /// `vh_bit` is the next bit, moving toward 0. Declarations go in
+    /// `decls` (function scope); the filling statements go in `body`.
+    fn unpack_in(
+        &mut self,
+        vec: &str,
+        bnd: &Bnd,
+        ty: TypeId,
+        dim: usize,
+        decls: &mut String,
+        body: &mut String,
+    ) -> String {
+        let loc = self.d.objects[0].loc.clone();
+        match bnd {
+            Bnd::Bit(ul) => {
+                let r = self.repr(ty, &loc);
+                let t = self.fresh();
+                let _ = writeln!(decls, "    {} {t};", r.sv());
+                if *ul {
+                    let _ = writeln!(body, "    {t} = vh_l2u({vec}[vh_bit]);");
+                } else {
+                    let _ = writeln!(body, "    {t} = ({vec}[vh_bit] === 1'b1);");
+                }
+                let _ = writeln!(body, "    vh_bit = vh_bit - 1;");
+                t
+            }
+            Bnd::Vec(ul, n) => {
+                let r = self.repr(ty, &loc);
+                let t = self.fresh();
+                self.tmp += 1;
+                let iv = format!("vh_p{}", self.tmp);
+                let code = if *ul {
+                    format!("vh_l2u({vec}[vh_bit])")
+                } else {
+                    format!("({vec}[vh_bit] === 1'b1)")
+                };
+                if let Repr::Pk(w, _) = r {
+                    let hi = w as i64 * n - 1;
+                    let _ = writeln!(decls, "    bit [{hi}:0] {t};");
+                    let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
+                    let _ = writeln!(
+                        body,
+                        "      {t}[{w} * ({m} - {iv}) +: {w}] = {code}; vh_bit = vh_bit - 1; end",
+                        m = n - 1
+                    );
+                    return t;
+                }
+                let Repr::Arr(name, er) = r else {
+                    return "0".into();
+                };
+                let (l, dir, rr) = self.static_bounds(ty).unwrap_or((n - 1, Dir::Downto, 0));
+                let _ = writeln!(decls, "    {} {t}[];", er.sv());
+                let _ = writeln!(body, "    {t} = new[{n}];");
+                let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
+                let _ = writeln!(body, "      {t}[{iv}] = {code}; vh_bit = vh_bit - 1; end");
+                format!(
+                    "{name}_mk({l}, {rr}, {dn}, {t})",
+                    dn = (dir == Dir::Downto) as u8
+                )
+            }
+            Bnd::Int => {
+                let bits = self.fresh();
+                let t = self.fresh();
+                self.tmp += 1;
+                let iv = format!("vh_p{}", self.tmp);
+                let _ = writeln!(decls, "    logic [31:0] {bits};");
+                let _ = writeln!(decls, "    int {t};");
+                let _ = writeln!(body, "    for (int {iv} = 31; {iv} >= 0; {iv}--) begin");
+                let _ = writeln!(
+                    body,
+                    "      {bits}[{iv}] = {vec}[vh_bit]; vh_bit = vh_bit - 1; end"
+                );
+                let _ = writeln!(body, "    {t} = $isunknown({bits}) ? 0 : int'({bits});");
+                t
+            }
+            Bnd::Real => "0".into(),
+            Bnd::Rec(fields) => {
+                let rec = if let TypeKind::Record(rec) = &self.d.types[self.base(ty)].kind {
+                    rec.iter().map(|(_, ft)| *ft).collect::<Vec<_>>()
+                } else {
+                    return "0".into();
+                };
+                let r = self.repr(ty, &loc);
+                let t = self.fresh();
+                let _ = writeln!(decls, "    {} {t};", r.sv());
+                for (i, (fb, ft)) in fields.iter().zip(rec).enumerate() {
+                    let sub = self.unpack_in(vec, fb, ft, 0, decls, body);
+                    let _ = writeln!(body, "    {t}.f{i} = {sub};");
+                }
+                t
+            }
+            Bnd::Arr(elem, l, r) => {
+                let (levels, er) = self.arr_levels(ty, &loc);
+                let Some(aname) = levels.get(dim).cloned() else {
+                    return "0".into();
+                };
+                let n = (l - r).abs() + 1;
+                let et_sv = if matches!(elem.as_ref(), Bnd::Arr(..)) {
+                    levels.get(dim + 1).cloned().unwrap_or_else(|| er.sv())
+                } else {
+                    er.sv()
+                };
+                let (bl, br, dn) = if let Some(sr) = self.static_dim(ty, dim) {
+                    (
+                        sr.left.as_i64().unwrap_or(*l),
+                        sr.right.as_i64().unwrap_or(*r),
+                        (sr.dir == Dir::Downto) as u8,
+                    )
+                } else {
+                    (*l, *r, (*r < *l) as u8)
+                };
+                let arr = self.fresh();
+                self.tmp += 1;
+                let iv = format!("vh_p{}", self.tmp);
+                let _ = writeln!(decls, "    {et_sv} {arr}[];");
+                let _ = writeln!(body, "    {arr} = new[{n}];");
+                let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
+                let sub = if matches!(elem.as_ref(), Bnd::Arr(..)) {
+                    self.unpack_in(vec, elem, ty, dim + 1, decls, body)
+                } else {
+                    let et = self.d.element_subtype(ty).unwrap_or(ty);
+                    self.unpack_in(vec, elem, et, 0, decls, body)
+                };
+                let _ = writeln!(body, "      {arr}[{iv}] = {sub}; end");
+                format!("{aname}_mk({bl}, {br}, {dn}, {arr})")
             }
         }
     }
