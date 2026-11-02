@@ -72,6 +72,7 @@ pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
 mod body_type_params;
+mod param_override_lists;
 mod unit_subroutine_usage;
 pub mod pkg_scope;
 pub mod sdf;
@@ -1609,6 +1610,21 @@ fn design_declared_names(
     names
 }
 
+/// A module, interface or program name already taken by another of them: only
+/// one definition survives, so a list written for another cannot be judged.
+fn note_if_redefined(definitions: &crate::hasher::HashMap<String, SourceDefinition>, name: &str) {
+    if matches!(
+        definitions.get(name),
+        Some(
+            SourceDefinition::Module(_)
+                | SourceDefinition::Interface(_)
+                | SourceDefinition::Program(_)
+        )
+    ) {
+        param_override_lists::note_redefined_module(name);
+    }
+}
+
 fn parse_and_elaborate(
     mut all_descriptions: Vec<ast::Description>,
     top_module_name: Option<&str>,
@@ -1626,6 +1642,7 @@ fn parse_and_elaborate(
     // Every elaboration starts from the same state, whatever the thread
     // elaborated before (§23.11 binds elaborate a design twice).
     elaborate::reset_const_eval_snapshots();
+    param_override_lists::reset_redefined_modules();
     // Array defaults are needed through the final bind/parameter passes,
     // including elaboration of the compilation-unit and top scopes.
     let _array_param_scope = elaborate::array_params::scope();
@@ -1932,6 +1949,7 @@ fn parse_and_elaborate(
                 for n in nested {
                     let nname = n.name.name.clone();
                     if definitions.contains_key(&nname) {
+                        param_override_lists::note_redefined_module(&nname);
                         log_eprintln(&format!(
                             "[xezim][warning] module '{}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 \u{00a7}3.3)",
                             nname
@@ -1950,6 +1968,7 @@ fn parse_and_elaborate(
                 // existing class/interface/package is legal (§3.13: hierarchy
                 // and data namespaces are separate); `class_defs` preserves the
                 // class, so no warning and no data loss.
+                note_if_redefined(&definitions, &name);
                 if matches!(definitions.get(&name), Some(SourceDefinition::Module(_))) {
                     // The reference simulator ACCEPTS a redefinition with a
                     // warning and the LAST definition wins (measured:
@@ -1983,6 +2002,7 @@ fn parse_and_elaborate(
                 let mut i = i;
                 elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut i.params, unit_s, prec_s);
+                note_if_redefined(&definitions, &name);
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
             ast::Description::Program(mut p) => {
@@ -1993,6 +2013,7 @@ fn parse_and_elaborate(
                 elaborate::rewrite_module_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut p.params, unit_s, prec_s);
                 top_module = Some(name.clone());
+                note_if_redefined(&definitions, &name);
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
             ast::Description::Class(mut c) => {

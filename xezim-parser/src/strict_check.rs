@@ -168,9 +168,14 @@ fn build_module_overridable_params(descriptions: &[Description]) -> HashMap<Stri
     let mut map = HashMap::new();
     for d in descriptions {
         if let Description::Module(m) = d {
-            let mut params = ModuleParams::default();
+            let mut params = ModuleParams {
+                overridable: overridable_param_slots(&m.params, &m.items)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                ..ModuleParams::default()
+            };
             for pd in &m.params {
-                add_overridable_param_names(pd, &mut params.overridable);
                 add_type_param_names(pd, &mut params.types);
                 if !pd.local {
                     if let ParameterKind::Data { assignments, .. } = &pd.kind {
@@ -187,9 +192,6 @@ fn build_module_overridable_params(descriptions: &[Description]) -> HashMap<Stri
             }
             for it in &m.items {
                 if let ModuleItem::ParameterDeclaration(pd) = it {
-                    if m.params.is_empty() {
-                        add_overridable_param_names(pd, &mut params.overridable);
-                    }
                     add_type_param_names(pd, &mut params.types);
                 }
             }
@@ -207,22 +209,34 @@ fn add_type_param_names(pd: &ParameterDeclaration, out: &mut HashSet<String>) {
     }
 }
 
-fn add_overridable_param_names(pd: &ParameterDeclaration, out: &mut HashSet<String>) {
-    if pd.local {
-        return; // localparam — not overridable
-    }
-    match &pd.kind {
-        ParameterKind::Data { assignments, .. } => {
-            for a in assignments {
-                out.insert(a.name.name.clone());
+/// The parameters an instance's override list can set, in the order ordered
+/// values bind to them: the non-local parameters of the parameter port list,
+/// data and type alike and flattened, so `parameter A = 1, B = 2` is two.
+/// Body `parameter`s count only when there is no parameter port list at all:
+/// §6.20.1 makes them local otherwise, even if the list holds only localparams.
+pub fn overridable_param_slots<'a>(
+    params: &'a [ParameterDeclaration],
+    items: &'a [ModuleItem],
+) -> Vec<&'a str> {
+    let body = items.iter().filter_map(|it| match it {
+        ModuleItem::ParameterDeclaration(pd) if params.is_empty() => Some(pd),
+        _ => None,
+    });
+    params
+        .iter()
+        .chain(body)
+        .filter(|pd| !pd.local)
+        .flat_map(|pd| -> Vec<&'a str> {
+            match &pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    assignments.iter().map(|a| a.name.name.as_str()).collect()
+                }
+                ParameterKind::Type { assignments } => {
+                    assignments.iter().map(|a| a.name.name.as_str()).collect()
+                }
             }
-        }
-        ParameterKind::Type { assignments } => {
-            for a in assignments {
-                out.insert(a.name.name.clone());
-            }
-        }
-    }
+        })
+        .collect()
 }
 
 fn check_param_overrides(
@@ -512,5 +526,48 @@ fn check_dup_ports(
         } else {
             seen.push(n);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overridable_param_slots;
+    use crate::ast::Description;
+
+    fn slots(src: &str) -> Vec<String> {
+        let parsed = crate::parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let Some(Description::Module(m)) = parsed.source.descriptions.into_iter().next() else {
+            panic!("no module");
+        };
+        overridable_param_slots(&m.params, &m.items)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn header_parameters_flatten_in_order() {
+        let s = slots("module m #(parameter A = 1, B = 2, parameter type T = int); endmodule");
+        assert_eq!(s, ["A", "B", "T"]);
+    }
+
+    #[test]
+    fn body_parameters_count_without_a_header() {
+        let s = slots("module m; parameter A = 1, B = 2; localparam L = 3; endmodule");
+        assert_eq!(s, ["A", "B"]);
+    }
+
+    /// §6.20.1: a parameter port list makes a body `parameter` local.
+    #[test]
+    fn a_header_makes_body_parameters_local() {
+        let s = slots("module m #(parameter A = 1); parameter B = 2; endmodule");
+        assert_eq!(s, ["A"]);
+    }
+
+    #[test]
+    fn a_header_of_only_localparams_leaves_no_slots() {
+        let s = slots("module m #(localparam X = 1); parameter B = 2; endmodule");
+        assert!(s.is_empty(), "{s:?}");
     }
 }
