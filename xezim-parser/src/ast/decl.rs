@@ -441,6 +441,7 @@ fn let_subst(e: &mut Expression, map: &std::collections::HashMap<String, Express
             let_subst(body, map);
         }
         ExprKind::ShallowCopy { source } => let_subst(source, map),
+        ExprKind::TypedPattern { pattern, .. } => let_subst(pattern, map),
         ExprKind::Number(_)
         | ExprKind::StringLiteral(_)
         | ExprKind::TypeLiteral(_)

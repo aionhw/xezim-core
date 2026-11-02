@@ -193,6 +193,20 @@ fn test_scoped_typed_assignment_pattern() {
     );
 }
 
+/// §10.9: `T'{...}` and `pkg::T'{...}` keep their type as a `TypedPattern`
+/// wrapping the pattern.
+#[test]
+fn test_typed_assignment_pattern_keeps_type() {
+    let source =
+        "module m; initial begin p = s_t'{1, 0}; q = pkg::s_t'{a: 1, default: 0}; end endmodule";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+    let ast = format!("{:?}", result.source);
+    assert_eq!(ast.matches("TypedPattern").count(), 2, "{ast}");
+    assert!(ast.contains("name: \"s_t\""), "{ast}");
+    assert!(ast.contains("name: \"pkg\""), "{ast}");
+}
+
 #[test]
 fn test_associative_arrays() {
     let source = "module m; int aa [string]; int aa2 [*]; endmodule";

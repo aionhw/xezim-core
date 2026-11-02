@@ -5195,7 +5195,7 @@ fn pack_packed_struct_array(
     let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
     let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
     let n = (l - r).unsigned_abs() as usize + 1;
-    let ExprKind::AssignmentPattern(items) = &init.kind else {
+    let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
         return None;
     };
     if items.len() != n {
@@ -7940,7 +7940,7 @@ pub fn elaborate_module_with_defs(
                 // as `<param>["key"]` signals before falling into the
                 // scalar parameter path.
                 if let Some(init) = &assign.init {
-                    if let ExprKind::AssignmentPattern(items) = &init.kind {
+                    if let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind {
                         // A struct/union-typed parameter is NOT an associative
                         // array even if its `'{ident: v}` items parse as Keyed —
                         // its keys are field names, handled by the struct path.
@@ -9735,7 +9735,9 @@ pub fn elaborate_module_with_defs(
                             elab.assoc_key_type_names.insert(decl.name.name.clone(), tn);
                         }
                         if let Some(init_expr) = &decl.init {
-                            if let ExprKind::AssignmentPattern(items) = &init_expr.kind {
+                            if let ExprKind::AssignmentPattern(items) =
+                                &init_expr.peel_typed_pattern().kind
+                            {
                                 for item in items {
                                     if let crate::ast::expr::AssignmentPatternItem::Default(
                                         def_expr,
@@ -10417,13 +10419,14 @@ pub fn elaborate_module_with_defs(
                         // on designs with testbench memory arrays.
                         let _ = (is_signed, width);
                         if let Some(init_expr) = &decl.init {
-                            let init_items: Vec<&Expression> = match &init_expr.kind {
-                                ExprKind::AssignmentPattern(items) => {
-                                    items.iter().map(|i| i.expr()).collect()
-                                }
-                                ExprKind::Concatenation(exprs) => exprs.iter().collect(),
-                                _ => vec![],
-                            };
+                            let init_items: Vec<&Expression> =
+                                match &init_expr.peel_typed_pattern().kind {
+                                    ExprKind::AssignmentPattern(items) => {
+                                        items.iter().map(|i| i.expr()).collect()
+                                    }
+                                    ExprKind::Concatenation(exprs) => exprs.iter().collect(),
+                                    _ => vec![],
+                                };
                             // §7.5/§7.10/§10.10: a dynamic array / queue initialized
                             // by an unpacked array CONCATENATION (`{a, b, 9}`) or any
                             // other non-pattern expression (`= other_q`) is one
@@ -10435,7 +10438,10 @@ pub fn elaborate_module_with_defs(
                             // §10.9.1: retain fixed-array patterns as whole assignments,
                             // including keyed/default entries and declared direction.
                             if (!is_dynamic_dim
-                                && matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                && matches!(
+                                    init_expr.peel_typed_pattern().kind,
+                                    ExprKind::AssignmentPattern(_)
+                                ))
                                 || (is_dynamic_dim
                                     && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
                             {
@@ -11392,7 +11398,9 @@ pub fn elaborate_module_with_defs(
                         // by element instead; the assoc materialization
                         // would leave the parameter itself x.
                         if let Some(init) = &assign.init {
-                            if let ExprKind::AssignmentPattern(items) = &init.kind {
+                            if let ExprKind::AssignmentPattern(items) =
+                                &init.peel_typed_pattern().kind
+                            {
                                 let all_keyed = !items.is_empty()
                                     && items
                                         .iter()
@@ -17303,13 +17311,14 @@ fn elaborate_items_numbered(
                         // HashMap inserts.
                         let _ = (is_signed, width, is_real);
                         if let Some(init_expr) = &decl.init {
-                            let init_items: Vec<&Expression> = match &init_expr.kind {
-                                ExprKind::AssignmentPattern(items) => {
-                                    items.iter().map(|i| i.expr()).collect()
-                                }
-                                ExprKind::Concatenation(exprs) => exprs.iter().collect(),
-                                _ => vec![],
-                            };
+                            let init_items: Vec<&Expression> =
+                                match &init_expr.peel_typed_pattern().kind {
+                                    ExprKind::AssignmentPattern(items) => {
+                                        items.iter().map(|i| i.expr()).collect()
+                                    }
+                                    ExprKind::Concatenation(exprs) => exprs.iter().collect(),
+                                    _ => vec![],
+                                };
                             // §7.5/§7.10/§10.10: a dynamic array / queue initialized
                             // by an unpacked array CONCATENATION (`{a, b, 9}`) or any
                             // other non-pattern expression (`= other_q`) is one
@@ -17321,7 +17330,10 @@ fn elaborate_items_numbered(
                             // §10.9.1: retain fixed-array patterns as whole assignments,
                             // including keyed/default entries and declared direction.
                             if (!is_dynamic_dim
-                                && matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                && matches!(
+                                    init_expr.peel_typed_pattern().kind,
+                                    ExprKind::AssignmentPattern(_)
+                                ))
                                 || (is_dynamic_dim
                                     && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
                             {
@@ -24824,6 +24836,9 @@ fn pack_packed_array_const_value(
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
+    if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
+        return pack_typed_pattern(ty, pattern, params, typedefs, typedef_types);
+    }
     let ExprKind::AssignmentPattern(items) = &expr.kind else {
         return None;
     };
@@ -24891,11 +24906,29 @@ pub(crate) fn pack_packed_vector_pattern(
     // to the enum and dropping those ranges made `'{default: MERGED}` look
     // like a scalar pattern, so the whole member stayed 0 — fpnew then saw
     // every format unit as DISABLED and never asserted in_ready.
+    // §10.9: a typed pattern takes its own type.
+    if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
+        return pack_packed_vector_pattern(ty, pattern, params, typedef_types);
+    }
     let (dims, leaf_w) = packed_pattern_shape(dt, params, typedef_types)?;
     if dims.is_empty() {
         return None;
     }
     pack_vector_pattern_dims(&dims, expr, params, leaf_w)
+}
+
+/// §10.9: the constant value of the typed pattern `ty'{...}`, packed against
+/// `ty` (a packed array of structs, a struct, or a packed vector).
+fn pack_typed_pattern(
+    ty: &DataType,
+    pattern: &Expression,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    pack_packed_array_const_value(ty, pattern, params, typedefs, typedef_types)
+        .or_else(|| pack_struct_const_value(ty, pattern, params, typedefs, typedef_types))
+        .or_else(|| pack_packed_vector_pattern(ty, pattern, params, typedef_types))
 }
 
 /// Packed dimensions of `dt`, outermost first, and the width of one leaf
@@ -26175,6 +26208,9 @@ fn pack_struct_const_value(
         }
         None => params,
     };
+    if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
+        return pack_typed_pattern(ty, pattern, params, typedefs, typedef_types);
+    }
     let su = match resolve_typedef_chain(dt, typedef_types) {
         DataType::Struct(su) => su.clone(),
         _ => return None,
@@ -27395,6 +27431,16 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         ExprKind::Call { .. } => {
             const_eval_user_call(expr, Some(params)).unwrap_or_else(|| Value::zero(32))
         }
+        // §10.9: a typed pattern has its type's value, packed against the
+        // typedef snapshot.
+        ExprKind::TypedPattern { ty, pattern } => TYPEDEF_TYPES_TLS
+            .with(|types| {
+                TYPEDEF_WIDTHS_TLS.with(|widths| {
+                    let (types, widths) = (types.borrow(), widths.borrow());
+                    pack_typed_pattern(ty, pattern, params, widths.as_ref()?, types.as_ref()?)
+                })
+            })
+            .unwrap_or_else(|| Value::zero(32)),
         _ => Value::zero(32),
     };
     // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
@@ -28104,7 +28150,8 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
         ExprKind::MemberAccess { expr, .. }
         | ExprKind::Specialization { base: expr, .. }
         | ExprKind::Paren(expr)
-        | ExprKind::ShallowCopy { source: expr } => for_each_sub_expr(expr, f),
+        | ExprKind::ShallowCopy { source: expr }
+        | ExprKind::TypedPattern { pattern: expr, .. } => for_each_sub_expr(expr, f),
         ExprKind::Index { expr, index } => {
             for_each_sub_expr(expr, f);
             for_each_sub_expr(index, f);
@@ -28144,7 +28191,7 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
 
 /// [`for_each_sub_expr`] with mutable access; `f` sees a node before its
 /// children, so it may replace the node it is given.
-fn for_each_sub_expr_mut(e: &mut Expression, f: &mut dyn FnMut(&mut Expression)) {
+pub fn for_each_sub_expr_mut(e: &mut Expression, f: &mut dyn FnMut(&mut Expression)) {
     f(e);
     match &mut e.kind {
         ExprKind::Unary { operand, .. } => for_each_sub_expr_mut(operand, f),
@@ -28207,7 +28254,8 @@ fn for_each_sub_expr_mut(e: &mut Expression, f: &mut dyn FnMut(&mut Expression))
         ExprKind::MemberAccess { expr, .. }
         | ExprKind::Specialization { base: expr, .. }
         | ExprKind::Paren(expr)
-        | ExprKind::ShallowCopy { source: expr } => for_each_sub_expr_mut(expr, f),
+        | ExprKind::ShallowCopy { source: expr }
+        | ExprKind::TypedPattern { pattern: expr, .. } => for_each_sub_expr_mut(expr, f),
         ExprKind::Index { expr, index } => {
             for_each_sub_expr_mut(expr, f);
             for_each_sub_expr_mut(index, f);
@@ -30596,13 +30644,14 @@ fn inline_instantiations_inner(
                                 let Some(init_expr) = &decl.init else {
                                     continue;
                                 };
-                                let init_items: Vec<&Expression> = match &init_expr.kind {
-                                    ExprKind::AssignmentPattern(items) => {
-                                        items.iter().map(|i| i.expr()).collect()
-                                    }
-                                    ExprKind::Concatenation(exprs) => exprs.iter().collect(),
-                                    _ => vec![],
-                                };
+                                let init_items: Vec<&Expression> =
+                                    match &init_expr.peel_typed_pattern().kind {
+                                        ExprKind::AssignmentPattern(items) => {
+                                            items.iter().map(|i| i.expr()).collect()
+                                        }
+                                        ExprKind::Concatenation(exprs) => exprs.iter().collect(),
+                                        _ => vec![],
+                                    };
                                 // §7.5/§7.10/§10.10: a dynamic array / queue initialized
                                 // by an unpacked array CONCATENATION (`{a, b, 9}`) or any
                                 // other non-pattern expression (`= other_q`) is one
@@ -30614,7 +30663,10 @@ fn inline_instantiations_inner(
                                 // §10.9.1: retain fixed-array patterns as whole assignments,
                                 // including keyed/default entries and declared direction.
                                 if (!is_dynamic_dim
-                                    && matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                    && matches!(
+                                        init_expr.peel_typed_pattern().kind,
+                                        ExprKind::AssignmentPattern(_)
+                                    ))
                                     || (is_dynamic_dim
                                         && !matches!(
                                             init_expr.kind,
@@ -36541,7 +36593,9 @@ fn inline_module_items(
                                     // parameter literal `'{"k": v, ...}`.
                                     // Materialise as `<prefix><param>[key]`
                                     // signals and register the array.
-                                    if let ExprKind::AssignmentPattern(items) = &init.kind {
+                                    if let ExprKind::AssignmentPattern(items) =
+                                        &init.peel_typed_pattern().kind
+                                    {
                                         let all_keyed = !items.is_empty()
                                             && items.iter().all(|it| {
                                                 matches!(it, AssignmentPatternItem::Keyed(_, _))
@@ -44834,7 +44888,8 @@ pub fn whole_array_assign_parts_dir(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
 ) -> Option<Vec<ContinuousAssignment>> {
-    if let ExprKind::AssignmentPattern(_) = &rhs.kind {
+    if let ExprKind::AssignmentPattern(_) = &rhs.peel_typed_pattern().kind {
+        let rhs = rhs.peel_typed_pattern();
         return pattern_array_assign_parts(lhs, rhs, delay, arrays, descending, decl_dims);
     }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
@@ -45015,7 +45070,7 @@ fn pattern_leaves(
         out.push((idx.clone(), e.clone()));
         return Some(());
     };
-    let ExprKind::AssignmentPattern(items) = &e.kind else {
+    let ExprKind::AssignmentPattern(items) = &e.peel_typed_pattern().kind else {
         return None;
     };
     if items.is_empty() {
