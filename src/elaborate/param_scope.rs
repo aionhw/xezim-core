@@ -54,6 +54,11 @@ pub(super) struct ParamScope {
     common: Vec<u32>,
     spelled: RefCell<HashMap<(String, usize), Rc<Spelled>>>,
     selected: RefCell<HashMap<(String, usize), Rc<[u32]>>>,
+    /// The words the packages, file-scope declarations and binds spell
+    /// (`None`: one could not be read to the end).
+    common_words: Option<HashSet<String>>,
+    /// Per definition, every word its scope can read (`scope_words`).
+    words: RefCell<HashMap<(String, usize), Rc<Option<HashSet<String>>>>>,
 }
 
 impl ParamScope {
@@ -94,12 +99,15 @@ impl ParamScope {
             common,
             spelled: RefCell::default(),
             selected: RefCell::default(),
+            common_words: None,
+            words: RefCell::default(),
         };
         let mut found = HashSet::default();
         let mut named = HashSet::default();
+        let mut words = HashSet::default();
         let mut all = false;
         let mut read = |v: &dyn erased::Scannable, scope: &ParamScope| {
-            all |= !scope.scan(v, &mut found, &mut named);
+            all |= !scope.scan_into(v, &mut found, &mut named, Some(&mut words));
         };
         for def in definitions.values() {
             match def {
@@ -154,8 +162,54 @@ impl ParamScope {
             scope.common.extend(found);
             scope.common.sort_unstable();
             scope.common.dedup();
+            scope.common_words = Some(words);
         }
         scope
+    }
+
+    /// Every word an expression in `def`'s scope can be written with: its
+    /// own syntax, that of the definitions it names (an instance array's
+    /// ports are sized in the parent), and what the packages, file-scope
+    /// declarations and binds spell. `None` when one of them could not be
+    /// read to the end. A parameter none of these words names is read by no
+    /// expression the scope evaluates.
+    pub(super) fn scope_words(
+        &self,
+        def: Definition,
+        definitions: &HashMap<String, Definition>,
+    ) -> Rc<Option<HashSet<String>>> {
+        let key = def_key(&def);
+        if let Some(w) = self.words.borrow().get(&key) {
+            return Rc::clone(w);
+        }
+        let mut words = self.common_words.clone();
+        let mut named = HashSet::default();
+        let mut read = |d: &Definition, named: &mut HashSet<String>| {
+            let Some(out) = words.as_mut() else {
+                return;
+            };
+            let mut found = HashSet::default();
+            let ok = match d {
+                Definition::Module(m) => self.scan_into(*m, &mut found, named, Some(out)),
+                Definition::Interface(i) => self.scan_into(*i, &mut found, named, Some(out)),
+                Definition::Program(p) => self.scan_into(*p, &mut found, named, Some(out)),
+                _ => false,
+            };
+            if !ok {
+                words = None;
+            }
+        };
+        read(&def, &mut named);
+        for name in std::mem::take(&mut named) {
+            if name != def.name()
+                && let Some(child) = definitions.get(&name)
+            {
+                read(child, &mut HashSet::default());
+            }
+        }
+        let words = Rc::new(words);
+        self.words.borrow_mut().insert(key, Rc::clone(&words));
+        words
     }
 
     /// The scope of an instance of `def` at the top of the hierarchy.
@@ -255,10 +309,22 @@ impl ParamScope {
         found: &mut HashSet<u32>,
         named: &mut HashSet<String>,
     ) -> bool {
+        self.scan_into(v, found, named, None)
+    }
+
+    /// `scan`, also collecting every word into `words`.
+    fn scan_into(
+        &self,
+        v: &dyn erased::Scannable,
+        found: &mut HashSet<u32>,
+        named: &mut HashSet<String>,
+        words: Option<&mut HashSet<String>>,
+    ) -> bool {
         let mut scan = Scan {
             scope: self,
             found,
             named,
+            words,
         };
         v.scan(&mut scan).is_ok()
     }
@@ -294,6 +360,19 @@ fn def_key(def: &Definition) -> (String, usize) {
     (def.name().to_string(), addr)
 }
 
+/// True when `key` (a parameter's name in a scope) is spelled by `words`,
+/// or has no word to spell it by.
+pub(super) fn spells(words: &HashSet<String>, key: &str) -> bool {
+    let mut any = false;
+    for w in key_words(key) {
+        if words.contains(w) {
+            return true;
+        }
+        any = true;
+    }
+    !any
+}
+
 /// The identifier words of a table key after its last `::`.
 fn key_words(key: &str) -> impl Iterator<Item = &str> {
     let leaf = key.rsplit_once("::").map_or(key, |(_, l)| l);
@@ -325,6 +404,7 @@ struct Scan<'a> {
     scope: &'a ParamScope,
     found: &'a mut HashSet<u32>,
     named: &'a mut HashSet<String>,
+    words: Option<&'a mut HashSet<String>>,
 }
 
 macro_rules! scalar {
@@ -358,6 +438,9 @@ impl<'a, 'b> ser::Serializer for &'a mut Scan<'b> {
         // string literal, a macro body): look up each of its words.
         for w in words(v) {
             self.scope.note(w, self.found, self.named);
+            if let Some(out) = self.words.as_mut() {
+                out.insert(w.to_string());
+            }
         }
         Ok(())
     }

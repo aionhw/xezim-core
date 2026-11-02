@@ -33309,10 +33309,49 @@ fn collect_body_driven_names(
 
 type InlinePrepCache = HashMap<String, Rc<PreparedModuleItems>>;
 
-fn format_param_key(params: &HashMap<String, Value>) -> String {
+/// `XEZIM_COMPILE_PHASES`: how the prepared-body cache is doing, printed as
+/// it goes (an `[elab-stats]` line at each power-of-two miss count and every
+/// 10000 misses), so a run killed for its memory still shows whether bodies
+/// were shared: hits, misses, the bytes of the keys kept and the longest key.
+fn note_prep_lookup(hit: bool, key_len: usize) {
+    use std::cell::Cell;
+    thread_local! {
+        static PREP: Cell<(u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0)) };
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("XEZIM_COMPILE_PHASES").is_some()) {
+        return;
+    }
+    PREP.with(|c| {
+        let (mut hits, mut misses, mut bytes, mut longest) = c.get();
+        if hit {
+            hits += 1;
+        } else {
+            misses += 1;
+            bytes += key_len as u64;
+            longest = longest.max(key_len as u64);
+            if misses.is_power_of_two() || misses % 10_000 == 0 {
+                eprintln!(
+                    "[elab-stats] prep_hits={hits} prep_misses={misses} prep_key_bytes={bytes} prep_key_max={longest}"
+                );
+            }
+        }
+        c.set((hits, misses, bytes, longest));
+    });
+}
+
+/// The cache key of a prepared body: the parameters its scope can read
+/// (`ParamScope::scope_words`), or all of them when that is unknown. A scope
+/// holds every parameter of the instances above it, so keying on all of them
+/// gave nearly every instance a key, and a prepared body, of its own: a key
+/// rendering thousands of parameters, and a copy of the body that was never
+/// shared.
+fn format_param_key(params: &HashMap<String, Value>, words: Option<&HashSet<String>>) -> String {
     let mut ordered = BTreeMap::new();
     for (name, value) in params {
-        ordered.insert(name.as_str(), value);
+        if words.is_none_or(|w| param_scope::spells(w, name)) {
+            ordered.insert(name.as_str(), value);
+        }
     }
     let mut key = String::new();
     for (name, value) in ordered {
@@ -33336,11 +33375,19 @@ fn prepare_module_items(
     local_params: &HashMap<String, Value>,
     typedef_widths: &HashMap<String, u32>,
     cache: &mut InlinePrepCache,
+    param_scope: &param_scope::ParamScope,
 ) -> Rc<PreparedModuleItems> {
-    let cache_key = format!("{}|{}", source_def.name(), format_param_key(local_params));
+    let words = param_scope.scope_words(source_def, definitions);
+    let cache_key = format!(
+        "{}|{}",
+        source_def.name(),
+        format_param_key(local_params, (*words).as_ref())
+    );
     if let Some(prepared) = cache.get(&cache_key) {
+        note_prep_lookup(true, cache_key.len());
         return Rc::clone(prepared);
     }
+    note_prep_lookup(false, cache_key.len());
 
     let mut local_typedefs = std::collections::HashSet::default();
     for item in source_def.items() {
@@ -34626,8 +34673,14 @@ fn inline_module_items(
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
     let _decl_shapes = install_decl_shapes(source_def);
-    let mut prepared_source =
-        prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
+    let mut prepared_source = prepare_module_items(
+        source_def,
+        definitions,
+        local_params,
+        &elab.typedefs,
+        cache,
+        param_scope,
+    );
     // §23.11/§27: only active generate branches contribute declarations.
     for item in &prepared_source.effective_items {
         if let ModuleItem::Bind(b) = item {
@@ -36936,6 +36989,7 @@ fn inline_module_items(
                     &sub_local_params,
                     &elab.typedefs,
                     cache,
+                    param_scope,
                 );
                 iprof_since("prepare_module_items", __tp);
 
