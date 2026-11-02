@@ -675,7 +675,7 @@ impl<'a> Lw<'a> {
                     .zip(&fields)
                     .map(|(v, (_, ft))| self.value(v, *ft, loc))
                     .collect();
-                format!("'{{{}}}", parts.join(", "))
+                self.rec_literal(t, &fields, &parts, loc)
             }
             _ => self.scalar_lit(v, &r),
         }
@@ -713,10 +713,18 @@ impl<'a> Lw<'a> {
             av.elems.len()
         );
         for (i, e) in av.elems.iter().enumerate() {
+            let mark = self.pre_stmts.len();
             let ev = match e {
                 Value::Array(sub) if k + 1 < n => self.value_arr(sub, t, k + 1, loc),
                 _ => self.value(e, elem_t, loc),
             };
+            // A record element is built in this function, not in the caller.
+            for (name, ty, st) in self.pre_stmts.split_off(mark) {
+                let _ = writeln!(body, "    {} {};", ty, name);
+                for line in st.lines() {
+                    let _ = writeln!(body, "    {}", line);
+                }
+            }
             let _ = writeln!(body, "    t[{}] = {};", i, ev);
         }
         let cnt = av.elems.len() as i64;
@@ -735,6 +743,59 @@ impl<'a> Lw<'a> {
         );
         self.lit_items.push_str(&body);
         format!("{}()", f)
+    }
+
+    /// Whether `t` stores a dynamic array, directly or in a record field.
+    fn contains_dyn_arr(&mut self, t: TypeId, loc: &Loc) -> bool {
+        self.contains_dyn_arr_at(t, loc, 0)
+    }
+
+    fn contains_dyn_arr_at(&mut self, t: TypeId, loc: &Loc, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match self.repr(t, loc) {
+            Repr::Arr(..) => true,
+            Repr::Rec(_) => {
+                let fields = self.d.record_fields(t);
+                fields
+                    .into_iter()
+                    .any(|(_, ft)| self.contains_dyn_arr_at(ft, loc, depth + 1))
+            }
+            _ => false,
+        }
+    }
+
+    /// A record value. Packed records stay an assignment pattern. A record
+    /// that holds a dynamic array is assigned field by field: when the
+    /// module is instantiated from SystemVerilog, a pattern drops those
+    /// members (the array arrives with the wrong bounds).
+    fn rec_literal(
+        &mut self,
+        t: TypeId,
+        fields: &[(String, TypeId)],
+        parts: &[String],
+        loc: &Loc,
+    ) -> String {
+        let dyn_arr = fields
+            .iter()
+            .any(|(_, ft)| self.contains_dyn_arr(*ft, loc));
+        if !dyn_arr {
+            return format!("'{{{}}}", parts.join(", "));
+        }
+        let sv = self.repr(t, loc).sv();
+        self.rec_fields(sv, parts)
+    }
+
+    fn rec_fields(&mut self, sv_ty: String, parts: &[String]) -> String {
+        self.tmp += 1;
+        let agg = format!("vh_rd{}", self.tmp);
+        let mut body = String::new();
+        for (i, p) in parts.iter().enumerate() {
+            let _ = writeln!(body, "{agg}.f{i} = {p};");
+        }
+        self.pre_stmts.push((agg.clone(), sv_ty, body));
+        agg
     }
 
     /// The default (initial) value of type `t` (§14.4.2.5: T'LEFT, element
@@ -787,7 +848,7 @@ impl<'a> Lw<'a> {
                     let bsv = self.static_bounds(*ft).map(|b| self.bounds_sv(b));
                     parts.push(self.coerce(v, &fr, &sr, bsv, loc));
                 }
-                format!("'{{{}}}", parts.join(", "))
+                self.rec_literal(t, &fields, &parts, loc)
             }
             _ => {
                 let sr = self.d.scalar_range(t);
