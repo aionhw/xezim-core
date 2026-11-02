@@ -981,6 +981,14 @@ impl Parser {
                 // survives (it was dropped, so `4'(8'hAB)` kept all 8 bits).
                 // Non-literal casting types (pkg::type'(v), id'(v)) stay a
                 // pass-through width/type hint as before.
+                // §6.24 casting_type includes a constant_primary, so the
+                // size may be parenthesized: `(9)'(x)`, `(WIDTH)'(x)`.
+                // The parens are only grouping. Peel them before classifying
+                // or the cast is dropped and `(9)'(cnt) + step` adds at the
+                // operand's width.
+                while let ExprKind::Paren(peeled) = lhs.kind {
+                    lhs = *peeled;
+                }
                 if matches!(lhs.kind, ExprKind::Number(_)) {
                     lhs = Expression::new(
                         ExprKind::SystemCall {
