@@ -569,22 +569,15 @@ impl Parser {
                 continue;
             }
 
-            // §10.9.2 typed assignment pattern after a scoped type:
-            // `pkg::type_t'{...}`. The bare `type_t'{...}` form is folded in
-            // the primary. A package qualifier is applied here, afterwards,
-            // so the `'{` was left for the enclosing concatenation and the
-            // parse died on `expected RBrace`. The type prefix is dropped;
-            // member layout comes from the assignment context, same as the
-            // bare form. Only a scoped NAME can be a type: `f(x)'{...}` or
-            // `a[0]'{...}` stays an error, as for scoped casts.
+            // §10.9 typed assignment pattern after a scoped type:
+            // `pkg::type_t'{...}` (the bare `type_t'{...}` form is folded in
+            // the primary). Only a scoped NAME can be a type: `f(x)'{...}`
+            // or `a[0]'{...}` stays an error, as for scoped casts.
             if self.at(TokenKind::ApostropheLBrace) && Self::scoped_name_expr(&lhs) {
                 self.bump();
                 let items = self.parse_assignment_pattern_items();
                 self.expect(TokenKind::RBrace);
-                lhs = Expression::new(
-                    ExprKind::AssignmentPattern(items),
-                    self.span_from(start),
-                );
+                lhs = Self::typed_pattern(&lhs, items, self.span_from(start));
                 continue;
             }
 
@@ -1047,11 +1040,10 @@ impl Parser {
                 continue;
             }
 
-            // §10.9.2 TYPED assignment pattern with a SCOPED type
+            // §10.9 TYPED assignment pattern with a SCOPED type
             // (`pkg::cfg_t'{XLEN: 64, ...}`). The bare-name form is handled
             // in the primary; the scoped name only exists here, as a member
-            // access chain. Same treatment: the prefix is dropped and the
-            // member layout comes from the assignment context.
+            // access chain.
             if self.at(TokenKind::ApostropheLBrace)
                 && matches!(lhs.kind, ExprKind::MemberAccess { .. })
                 && Self::scoped_name_expr(&lhs)
@@ -1059,7 +1051,7 @@ impl Parser {
                 self.bump();
                 let items = self.parse_assignment_pattern_items();
                 self.expect(TokenKind::RBrace);
-                lhs = Expression::new(ExprKind::AssignmentPattern(items), self.span_from(start));
+                lhs = Self::typed_pattern(&lhs, items, self.span_from(start));
                 continue;
             }
 
@@ -1081,6 +1073,58 @@ impl Parser {
             ExprKind::MemberAccess { expr, .. } => Self::scoped_name_expr(expr),
             _ => false,
         }
+    }
+
+    /// §10.9: `T'{...}` with `ty_expr` the scoped name `T`. The pattern
+    /// keeps `T` as its type (a `TypedPattern`); a name that is not a pure
+    /// scoped name leaves the plain pattern.
+    fn typed_pattern(
+        ty_expr: &Expression,
+        items: Vec<crate::ast::expr::AssignmentPatternItem>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        use crate::ast::types::{DataType, TypeName, TypeScope};
+        let pattern = Expression::new(ExprKind::AssignmentPattern(items), span);
+        let mut links = Vec::new();
+        let mut cur = ty_expr;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    links.push(member.clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    links.push(h.path[0].name.clone());
+                    break;
+                }
+                _ => return pattern,
+            }
+        }
+        links.reverse();
+        let name = links.pop().expect("a scoped name has a leaf");
+        let ty = DataType::TypeReference {
+            name: TypeName {
+                scopes: links
+                    .into_iter()
+                    .map(|name| TypeScope {
+                        name,
+                        type_args: Vec::new(),
+                    })
+                    .collect(),
+                name,
+                span: ty_expr.span,
+            },
+            dimensions: Vec::new(),
+            type_args: Vec::new(),
+            span: ty_expr.span,
+        };
+        Expression::new(
+            ExprKind::TypedPattern {
+                ty: Box::new(ty),
+                pattern: Box::new(pattern),
+            },
+            span,
+        )
     }
 
     /// The `DataType` a cast keyword denotes (`int'(x)`, `byte'(x)`, …).
@@ -1737,13 +1781,9 @@ impl Parser {
                         self.span_from(start),
                     );
                 }
-                // §10.9.2 TYPED assignment pattern: `some_t'{ a: ..., default: ... }`.
+                // §10.9 TYPED assignment pattern: `some_t'{ a: ..., default: ... }`.
                 // The lexer folds `'{` into one token, so the cast branch above
-                // never sees it. The pattern's member layout is resolved from the
-                // ASSIGNMENT CONTEXT downstream (same as the untyped form), so the
-                // type prefix is dropped here — correct whenever the prefix names
-                // the context's own type, which is what real code writes (the
-                // pulp-platform AXI sources use this on every W/AW/AR beat).
+                // never sees it.
                 if self.at(TokenKind::ApostropheLBrace)
                     && matches!(&expr.kind, ExprKind::Ident(h)
                         if h.path.len() == 1 && h.path[0].selects.is_empty())
@@ -1751,10 +1791,7 @@ impl Parser {
                     self.bump();
                     let items = self.parse_assignment_pattern_items();
                     self.expect(TokenKind::RBrace);
-                    return Expression::new(
-                        ExprKind::AssignmentPattern(items),
-                        self.span_from(start),
-                    );
+                    return Self::typed_pattern(&expr, items, self.span_from(start));
                 }
                 // Check for function call (not after `##`, see `sva_delay_count`)
                 if self.at(TokenKind::LParen) && !delay_count {

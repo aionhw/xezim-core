@@ -227,7 +227,7 @@ fn pattern_items(
     struct_elem: bool,
     params: &HashMap<String, Value>,
 ) -> Option<Vec<Expression>> {
-    let items = match &e.kind {
+    let items = match &e.peel_typed_pattern().kind {
         ExprKind::Concatenation(v) => return Some(v.clone()),
         ExprKind::AssignmentPattern(items) => items,
         _ => return None,

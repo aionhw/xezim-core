@@ -2132,6 +2132,10 @@ impl Rw<'_> {
                 self.expr(body);
             }
             ExprKind::ShallowCopy { source } => self.expr(source),
+            ExprKind::TypedPattern { ty, pattern } => {
+                self.dtype(ty);
+                self.expr(pattern);
+            }
             ExprKind::Number(_)
             | ExprKind::StringLiteral(_)
             | ExprKind::Dollar
