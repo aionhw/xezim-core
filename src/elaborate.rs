@@ -40060,14 +40060,9 @@ fn inline_module_items(
                         elab.covergroups.insert(new_cg.name.name.clone(), new_cg);
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
-                        // §14.3 interface-scoped clocking block: register it under
-                        // the instance-prefixed name (`iface_inst.cb`) so
-                        // `@(iface_inst.cb)` and `iface_inst.cb.sig` resolve, with
-                        // the clock signal resolved through the port binding
-                        // (interface `clk` port → the connected net) and the
-                        // sampled/driven signals prefixed to the inlined interface
-                        // nets. Without this the block was dropped and `@(bus.cb)`
-                        // degraded to a never-firing wait (returned at t=0).
+                        // §14.7: one clocking block per instance, registered as
+                        // `inst.cb`; the clock and clocking signals resolve in the
+                        // instance scope.
                         let resolve = |name: &str| -> String {
                             let e = make_ident_expr(name);
                             let re = rewrite_expr(
@@ -40095,8 +40090,21 @@ fn inline_module_items(
                                 span: clk.span,
                             });
                         }
+                        // §14.3: with `= expression` the clockvar name is local to
+                        // the block and the expression is the clocking signal.
                         for s in &mut new_cd.signals {
-                            s.name.name = resolve(&s.name.name);
+                            match &mut s.bound_to {
+                                Some(e) => {
+                                    *e = rewrite_expr(
+                                        e,
+                                        &inst_prefix,
+                                        &rewrite_port_map,
+                                        &prepared_sub.local_names,
+                                        &sub_interface_map,
+                                    )
+                                }
+                                None => s.name.name = resolve(&s.name.name),
+                            }
                         }
                         let mut dirs = HashMap::default();
                         for s in &new_cd.signals {
