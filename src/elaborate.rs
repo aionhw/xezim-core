@@ -45532,6 +45532,12 @@ fn rewrite_expr_impl(
                     for seg in &hier.path[1..] {
                         mhier.path.push(seg.clone());
                     }
+                    // The grafted path is this reference, not the mapped
+                    // target: give it the reference's span. With the
+                    // target's, every `p.<member>` of a renamed local shared
+                    // one span, and a cache keyed by it answered `p.b.size()`
+                    // with `p.a`'s queue (§6.21).
+                    mhier.span = hier.span;
                     return Expression::new(ExprKind::Ident(mhier), expr.span);
                 }
                 // Non-ident mapped target (e.g. an Index/part-select/concat
