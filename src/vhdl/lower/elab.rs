@@ -1863,6 +1863,11 @@ impl<'a> Lw<'a> {
             "  function automatic void vh_elab();\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n{}  endfunction\n",
             elab_temps, np, elab
         );
+        // Clocked processes assign vh_clkd from functions emitted above the
+        // kernel, so the flag has to be declared first.
+        if self.has_boundary() {
+            m.push_str("  bit vh_clkd;\n");
+        }
         m.push_str(&procs);
         m.push_str(&k);
         m.push_str("endmodule\n");
