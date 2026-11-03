@@ -218,10 +218,21 @@ pub fn overridable_param_slots<'a>(
     params: &'a [ParameterDeclaration],
     items: &'a [ModuleItem],
 ) -> Vec<&'a str> {
-    let body = items.iter().filter_map(|it| match it {
-        ModuleItem::ParameterDeclaration(pd) if params.is_empty() => Some(pd),
-        _ => None,
-    });
+    // §27.3: a `generate ... endgenerate` region only wraps module items, so
+    // a parameter in one is a body parameter too.
+    fn body_params<'a>(items: &'a [ModuleItem], out: &mut Vec<&'a ParameterDeclaration>) {
+        for it in items {
+            match it {
+                ModuleItem::ParameterDeclaration(pd) => out.push(pd),
+                ModuleItem::GenerateRegion(gr) => body_params(&gr.items, out),
+                _ => {}
+            }
+        }
+    }
+    let mut body = Vec::new();
+    if params.is_empty() {
+        body_params(items, &mut body);
+    }
     params
         .iter()
         .chain(body)

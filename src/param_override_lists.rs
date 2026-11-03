@@ -46,8 +46,10 @@ fn instantiable_kind(def: Definition) -> Option<&'static str> {
 fn is_local_body_parameter(def: Definition, name: &str) -> bool {
     !def.params().is_empty()
         && def.items().iter().any(|it| {
-            matches!(it, ModuleItem::ParameterDeclaration(_))
-                && overridable_param_slots(&[], std::slice::from_ref(it)).contains(&name)
+            matches!(
+                it,
+                ModuleItem::ParameterDeclaration(_) | ModuleItem::GenerateRegion(_)
+            ) && overridable_param_slots(&[], std::slice::from_ref(it)).contains(&name)
         })
 }
 
