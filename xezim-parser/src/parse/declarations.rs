@@ -1068,6 +1068,10 @@ impl Parser {
         if self.eat(TokenKind::LParen).is_none() {
             return args;
         }
+        // Without the `#` this is a constructor's arguments, which may mix.
+        if _has_hash {
+            self.check_param_list_form();
+        }
         if self.at(TokenKind::RParen) {
             self.bump();
             return args;

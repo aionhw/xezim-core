@@ -328,6 +328,7 @@ impl Parser {
         let mut type_args: Vec<crate::ast::expr::Expression> = Vec::new();
         if self.eat(TokenKind::Hash).is_some() {
             if self.eat(TokenKind::LParen).is_some() {
+                self.check_param_list_form();
                 if !self.at(TokenKind::RParen) {
                     loop {
                         if self.eat(TokenKind::Dot).is_some() {
