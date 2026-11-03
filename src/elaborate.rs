@@ -7464,6 +7464,11 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
                     );
                 }
             }
+            // §8.24: the body of an out-of-block method (`c::set`) is in the
+            // scope of its class, not of this module; a same-named module
+            // variable is not what it names.
+            ModuleItem::TaskDeclaration(t) if !t.name.scopes.is_empty() => {}
+            ModuleItem::FunctionDeclaration(f) if !f.name.scopes.is_empty() => {}
             ModuleItem::TaskDeclaration(t) => {
                 let mut locals = HashSet::default();
                 locals.insert(t.name.name.name.clone());
@@ -7540,6 +7545,8 @@ fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
                         probe_lvalue(lhs, declared_at, &dsf, locals, visited, out);
                     }
                 }
+                ModuleItem::TaskDeclaration(t) if !t.name.scopes.is_empty() => {}
+                ModuleItem::FunctionDeclaration(f) if !f.name.scopes.is_empty() => {}
                 ModuleItem::TaskDeclaration(t) => {
                     let mut ll = locals.clone();
                     ll.insert(t.name.name.name.clone());
