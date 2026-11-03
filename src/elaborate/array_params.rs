@@ -227,7 +227,7 @@ fn pattern_items(
     struct_elem: bool,
     params: &HashMap<String, Value>,
 ) -> Option<Vec<Expression>> {
-    let items = match &e.peel_typed_pattern().kind {
+    let items = match &super::peel_unpacked_typed_pattern(e).kind {
         ExprKind::Concatenation(v) => return Some(v.clone()),
         ExprKind::AssignmentPattern(items) => items,
         _ => return None,
@@ -411,7 +411,7 @@ fn register_shape(elab: &mut ElaboratedModule, name: &str, shape: &[(i64, i64)],
 /// whose items are scalars is the struct's own literal and reaches every
 /// leaf (§10.9.1); a row of struct literals has patterns as items.
 fn default_is_row(d: &Expression, struct_elem: bool) -> bool {
-    match &d.kind {
+    match &super::peel_unpacked_typed_pattern(d).kind {
         ExprKind::Concatenation(_) => true,
         ExprKind::AssignmentPattern(items) => {
             !struct_elem
