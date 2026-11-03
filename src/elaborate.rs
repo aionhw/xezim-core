@@ -22035,6 +22035,10 @@ thread_local! {
     /// signal and the queries read 0.
     static TYPE_BIND_QUERIES_TLS: std::cell::RefCell<Option<HashMap<String, TypeQueryDims>>>
         = const { std::cell::RefCell::new(None) };
+    /// §10.9: the same instance's type parameters as types, for a typed
+    /// pattern `T'{...}`; `T` resolves only while the instance is inlined.
+    static TYPE_BIND_TYPES_TLS: std::cell::RefCell<Option<HashMap<String, DataType>>>
+        = const { std::cell::RefCell::new(None) };
     /// LRM §20.7 — thread-local array-range table for const-eval of
     /// `$size`/`$left`/`$right`/`$high`/`$low`/`$dimensions` on an
     /// array-name ident. Same pattern as TYPEDEFS_TLS to avoid touching
@@ -46225,6 +46229,22 @@ fn rewrite_expr_impl(
                 port_map,
             )))
         }
+        ExprKind::TypedPattern { ty, pattern } => ExprKind::TypedPattern {
+            ty: Box::new(rewrite_typed_pattern_type(
+                ty,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+            pattern: Box::new(rewrite_expr_impl(
+                pattern,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+        },
         // A named class-parameter value `#(.W(N))`: `N` is scoped like any
         // positional value.
         ExprKind::NamedArg { name, expr: inner } => ExprKind::NamedArg {
@@ -46686,11 +46706,55 @@ fn set_type_bind_tls(ctx: &RewriteCtx) {
     TYPE_BIND_QUERIES_TLS.with(|c| {
         *c.borrow_mut() = if q.is_empty() { None } else { Some(q.clone()) };
     });
+    let t = &ctx.type_binds;
+    TYPE_BIND_TYPES_TLS.with(|c| {
+        *c.borrow_mut() = if t.is_empty() { None } else { Some(t.clone()) };
+    });
 }
 
 fn clear_type_bind_tls() {
     TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
     TYPE_BIND_QUERIES_TLS.with(|c| *c.borrow_mut() = None);
+    TYPE_BIND_TYPES_TLS.with(|c| *c.borrow_mut() = None);
+}
+
+/// §10.9: the type of a typed pattern `T'{...}` in the instance being
+/// rewritten: a bound type parameter's type, a local typedef under its
+/// instance name, else `T` with its bounds rescoped.
+fn rewrite_typed_pattern_type(
+    ty: &DataType,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> DataType {
+    if let DataType::TypeReference {
+        name,
+        dimensions,
+        type_args,
+        ..
+    } = ty
+        && name.scopes.is_empty()
+        && dimensions.is_empty()
+        && type_args.is_empty()
+    {
+        let bound = TYPE_BIND_TYPES_TLS.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|m| m.get(&name.name.name).cloned())
+        });
+        if let Some(dt) = bound {
+            return dt;
+        }
+        if !prefix.is_empty() && local_names.contains(&name.name.name) {
+            return scope_local_typerefs(ty, local_names, prefix);
+        }
+    }
+    module_class_scope::data_type(
+        &rewrite_data_type_scoped(ty, prefix, port_map, local_names, interface_map),
+        prefix,
+        port_map,
+    )
 }
 
 /// `$bits(T)` or a §20.7 array query (`$left(T)`, `$size(T, 2)`, …) with `T`
