@@ -67,6 +67,19 @@ fn ordered_values_bind_to_body_parameters_without_a_header() {
     elaborate(&[child, "module t; int y; c #(1, 2) u (.y(y)); endmodule\n"]).expect("legal");
 }
 
+/// §27.3: a `generate ... endgenerate` region adds no scope, so a parameter
+/// in one is a body parameter with an ordered slot.
+#[test]
+fn ordered_values_bind_to_body_parameters_in_a_generate_region() {
+    let child =
+        "module c (output int y); generate parameter A = 0; endgenerate assign y = A; endmodule\n";
+    elaborate(&[child, "module t; int y; c #(7) u (.y(y)); endmodule\n"]).expect("legal");
+    rejected(
+        &[child, "module t; int y; c #(7, 8) u (.y(y)); endmodule\n"],
+        "accepts 1",
+    );
+}
+
 #[test]
 fn excess_ordered_value_counts_a_type_parameter_as_a_slot() {
     let child = "module c #(parameter type T = int, parameter int A = 0) (output int y); T v = A; assign y = v; endmodule\n";
