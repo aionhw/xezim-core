@@ -398,7 +398,7 @@ fn instantiable(d: &Definition) -> bool {
     )
 }
 
-fn def_key(def: &Definition) -> (String, usize) {
+pub(super) fn def_key(def: &Definition) -> (String, usize) {
     let addr = match def {
         Definition::Module(m) => *m as *const _ as usize,
         Definition::Interface(i) => *i as *const _ as usize,

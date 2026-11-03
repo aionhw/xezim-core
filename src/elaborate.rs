@@ -31084,7 +31084,7 @@ fn inline_instantiations_inner(
     set_param_fallback(&top_params);
     set_typedef_types_tls(&elab.typedef_types);
     set_typedef_widths_tls(elab.typedefs.as_map());
-    let mut cache = HashMap::default();
+    let mut cache = InlineCache::default();
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
     // §23.10/§26.3: the snapshot is held once; each scope takes from it only
@@ -33751,7 +33751,61 @@ fn collect_body_driven_names(
     }
 }
 
-type InlinePrepCache = HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>;
+/// What the inlining of one design computes once and reuses for each
+/// instance.
+#[derive(Default)]
+struct InlineCache {
+    /// Prepared bodies, by definition and parameters (`prepare_module_items`).
+    prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
+    /// Per definition, the typedefs its imports bind, one list per import.
+    imports: HashMap<(String, usize), Rc<[ImportedTypedefs]>>,
+    /// Per package, the typedefs `import P::*` binds.
+    wildcards: HashMap<String, ImportedTypedefs>,
+}
+
+/// The typedefs an import binds, as (bare name, qualified key) in binding
+/// order.
+type ImportedTypedefs = Rc<[(String, String)]>;
+
+impl InlineCache {
+    /// §26.3: the typedefs the imports of `def` bind, in binding order.
+    fn imported_typedefs(
+        &mut self,
+        def: Definition,
+        definitions: &HashMap<String, Definition>,
+    ) -> Rc<[ImportedTypedefs]> {
+        let key = param_scope::def_key(&def);
+        if let Some(lists) = self.imports.get(&key) {
+            return Rc::clone(lists);
+        }
+        let mut lists = Vec::new();
+        for item in def.items() {
+            let ModuleItem::ImportDeclaration(imp) = item else {
+                continue;
+            };
+            for ii in &imp.items {
+                let pkg = &ii.package.name;
+                if !matches!(definitions.get(pkg), Some(Definition::Package(_))) {
+                    continue;
+                }
+                lists.push(match &ii.item {
+                    Some(sym) => Rc::from([(sym.name.clone(), format!("{pkg}::{}", sym.name))]),
+                    None => match self.wildcards.get(pkg) {
+                        Some(list) => Rc::clone(list),
+                        None => {
+                            let list = wildcard_typedefs(pkg, definitions);
+                            self.wildcards.insert(pkg.clone(), Rc::clone(&list));
+                            list
+                        }
+                    },
+                });
+            }
+        }
+        let lists: Rc<[ImportedTypedefs]> = lists.into();
+        self.imports.insert(key, Rc::clone(&lists));
+        lists
+    }
+}
 
 /// `XEZIM_COMPILE_PHASES`: how the prepared-body cache is doing, printed as
 /// it goes (an `[elab-stats]` line at each power-of-two miss count and every
@@ -33790,11 +33844,11 @@ fn prepare_module_items(
     definitions: &HashMap<String, Definition>,
     local_params: &HashMap<String, Value>,
     typedef_widths: &HashMap<String, u32>,
-    cache: &mut InlinePrepCache,
+    cache: &mut InlineCache,
     param_scope: &param_scope::ParamScope,
 ) -> Rc<PreparedModuleItems> {
     let (cache_key, key_bytes) = param_scope.prepared_key(source_def, definitions, local_params);
-    if let Some(prepared) = cache.get(&cache_key) {
+    if let Some(prepared) = cache.prepared.get(&cache_key) {
         note_prep_lookup(true, 0);
         return Rc::clone(prepared);
     }
@@ -34156,7 +34210,7 @@ fn prepare_module_items(
         local_names: std::rc::Rc::new(local_names),
         body_driven_ports,
     });
-    cache.insert(cache_key, Rc::clone(&prepared));
+    cache.prepared.insert(cache_key, Rc::clone(&prepared));
     prepared
 }
 
@@ -35043,7 +35097,7 @@ fn inline_module_items(
     definitions: &HashMap<String, Definition>,
     interface_map: &mut HashMap<String, String>,
     local_params: &HashMap<String, Value>,
-    cache: &mut InlinePrepCache,
+    cache: &mut InlineCache,
     // §23.3.3: THIS instance's formal->actual substitution. The module's own
     // statements are rewritten through it (via `RewriteCtx`), so a nested
     // instantiation's connection ACTUALS must be too: without it
@@ -35066,7 +35120,7 @@ fn inline_module_items(
     // (`elaborate_module_with_defs`); the inlined-instance path never processed
     // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
     // took whichever package last hoisted that bare name.
-    rebind_imported_typedefs(elab, source_def.items(), definitions);
+    rebind_imported_typedefs(elab, &cache.imported_typedefs(source_def, definitions));
     INLINE_CHAIN_TLS.with(|c| {
         c.borrow_mut()
             .push((prefix.to_string(), source_def.name().to_string()))
@@ -35366,7 +35420,7 @@ fn inline_module_items(
                 // parent's walk, so rebinding at the recursive call would be too
                 // late — an unqualified `T [1:0] s;` in a module that imports
                 // `P::*` took whichever package last hoisted that bare name.
-                rebind_imported_typedefs(elab, sub_mod.items(), definitions);
+                rebind_imported_typedefs(elab, &cache.imported_typedefs(sub_mod, definitions));
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -48600,110 +48654,90 @@ fn compute_wildcard_shadowed(
     out
 }
 
-/// §26.2/§26.3: bind a scope's IMPORTED type names into the bare namespace.
+/// §26.2/§26.3: bind a scope's imported type names into the bare namespace.
 ///
-/// Package typedefs are hoisted into ONE global bare-name table, so a
-/// same-named typedef in an unrelated package can end up owning the bare key
-/// (and which one does depends on `definitions` iteration order). An
-/// unqualified reference inside a module must resolve to the package THAT
-/// module imports, so re-point the bare keys at the qualified entries before
-/// anything in the body is resolved.
-///
-/// Only the TYPE tables are rebound. The rest of `process_import` has
-/// design-wide side effects (package parameters become signals, classes are
-/// elaborated) that must not re-run per instance.
-fn rebind_imported_typedefs(
-    elab: &mut ElaboratedModule,
-    items: &[ModuleItem],
-    definitions: &HashMap<String, Definition>,
-) {
+/// Package typedefs are hoisted into one global bare-name table, so a
+/// same-named typedef of an unrelated package can own the bare key. An
+/// unqualified reference inside a module resolves to the package that module
+/// imports, so the bare keys are re-pointed at the qualified entries before
+/// the body is resolved. Only the type tables are rebound: the rest of
+/// `process_import` has design-wide effects that must not re-run per instance.
+fn rebind_imported_typedefs(elab: &mut ElaboratedModule, imports: &[ImportedTypedefs]) {
     let mut changed = false;
-    for item in items {
-        let ModuleItem::ImportDeclaration(imp) = item else {
-            continue;
-        };
-        for ii in &imp.items {
-            let pkg = &ii.package.name;
-            let Some(Definition::Package(p)) = definitions.get(pkg) else {
-                continue;
-            };
-            // `import P::sym` binds one name; `import P::*` binds all of P's
-            // AND, transitively, its own wildcard imports' — `import P::*`
-            // where P does `import CHIP::*` is how large testbenches reach
-            // core types without ever naming CHIP. Rebinding only P's own
-            // typedefs left every chained name exposed to transient
-            // re-binding of the global bare slot.
-            fn wildcard_names(
-                pkg: &crate::ast::module::PackageDeclaration,
-                defs: &HashMap<String, Definition>,
-                depth: u32,
-                out: &mut Vec<(String, String)>, // (owning pkg, typedef name)
-            ) {
-                if depth > 8 {
-                    return;
-                }
-                for pi in &pkg.items {
-                    match pi {
-                        PackageItem::Typedef(td) => {
-                            out.push((pkg.name.name.clone(), td.name.name.clone()))
-                        }
-                        PackageItem::Import(inner) => {
-                            for jj in &inner.items {
-                                if jj.item.is_none() {
-                                    if let Some(Definition::Package(q)) = defs.get(&jj.package.name)
-                                    {
-                                        wildcard_names(q, defs, depth + 1, out);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+    for (name, key) in imports.iter().flat_map(|list| list.iter()) {
+        if let Some(w) = elab.typedefs.get(key).copied() {
+            if typedefs_insert_traced(&mut elab.typedefs, "rebind:import", name.clone(), w)
+                != Some(w)
+            {
+                changed = true;
             }
-            let names: Vec<(String, String)> = match &ii.item {
-                Some(sym) => vec![(pkg.clone(), sym.name.clone())],
-                None => {
-                    let mut v = Vec::new();
-                    wildcard_names(p, definitions, 0, &mut v);
-                    v
-                }
-            };
-            for (owner, n) in names {
-                let key = format!("{}::{}", owner, n);
-                if let Some(w) = elab.typedefs.get(&key).copied() {
-                    // trace tag "rebind:import" — logs the old width alongside
-                    // the qualified-key width being rebound onto the bare name.
-                    if typedefs_insert_traced(&mut elab.typedefs, "rebind:import", n.clone(), w)
-                        != Some(w)
-                    {
-                        changed = true;
-                    }
-                }
-                if let Some(t) = elab.typedef_types.get(&key).cloned() {
-                    elab.typedef_types.insert(n.clone(), t);
-                    // §6.18 / §26.3: an import binds the whole type, including
-                    // its shape; a scalar import clears any displaced shape.
-                    if let Some(dims) = elab.typedef_unpacked_dims.get(&key).cloned() {
-                        elab.typedef_unpacked_dims.insert(n.clone(), dims);
-                    } else {
-                        elab.typedef_unpacked_dims.remove(&n);
-                    }
-                    if let Some(width) = elab.typedef_elem_widths.get(&key).copied() {
-                        elab.typedef_elem_widths.insert(n.clone(), width);
-                    } else {
-                        elab.typedef_elem_widths.remove(&n);
-                    }
-                }
+        }
+        if let Some(t) = elab.typedef_types.get(key).cloned() {
+            elab.typedef_types.insert(name.clone(), t);
+            // §6.18, §26.3: an import binds the whole type, its shape included;
+            // a scalar import clears a displaced shape.
+            if let Some(dims) = elab.typedef_unpacked_dims.get(key).cloned() {
+                elab.typedef_unpacked_dims.insert(name.clone(), dims);
+            } else {
+                elab.typedef_unpacked_dims.remove(name);
+            }
+            if let Some(width) = elab.typedef_elem_widths.get(key).copied() {
+                elab.typedef_elem_widths.insert(name.clone(), width);
+            } else {
+                elab.typedef_elem_widths.remove(name);
             }
         }
     }
-    // Keep the const-eval snapshot in step, but only when a width actually
-    // moved — this runs per inlined instance and the map is large.
+    // Keep the const-eval snapshot in step when a width moved.
     if changed {
         type_trace_tls_refresh("rebind_import", &elab.typedefs);
         sync_typedefs_tls(&elab.typedefs);
     }
+}
+
+/// Depth of the import chain `wildcard_typedefs` follows.
+const MAX_IMPORT_DEPTH: u32 = 8;
+
+/// The typedefs `import pkg::*` binds: those of `pkg` and, transitively, of
+/// the packages it wildcard-imports. §26.6 passes those on only through
+/// `export`; following them regardless is an extension. A typedef reached by
+/// two paths keeps its last place.
+fn wildcard_typedefs(pkg: &str, definitions: &HashMap<String, Definition>) -> ImportedTypedefs {
+    fn walk(
+        pkg: &str,
+        definitions: &HashMap<String, Definition>,
+        depth: u32,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let Some(Definition::Package(p)) = definitions.get(pkg) else {
+            return;
+        };
+        if depth > MAX_IMPORT_DEPTH {
+            return;
+        }
+        for item in &p.items {
+            match item {
+                PackageItem::Typedef(td) => {
+                    out.push((td.name.name.clone(), format!("{pkg}::{}", td.name.name)))
+                }
+                PackageItem::Import(inner) => {
+                    for ii in inner.items.iter().filter(|ii| ii.item.is_none()) {
+                        walk(&ii.package.name, definitions, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    walk(pkg, definitions, 0, &mut all);
+    // The key names the pair: keep each one's last place.
+    let mut seen = HashSet::default();
+    let keep: Vec<bool> = all.iter().rev().map(|(_, key)| seen.insert(key.as_str())).collect();
+    all.into_iter()
+        .zip(keep.into_iter().rev())
+        .filter_map(|(pair, keep)| keep.then_some(pair))
+        .collect()
 }
 
 /// §26.6: does `pkg` EXPORT symbols coming from `src` (by name or `*::*`)?
@@ -49962,6 +49996,36 @@ mod logged_map_tests {
             }
         }
         assert_eq!(checked, 3);
+    }
+}
+
+#[cfg(test)]
+mod imported_typedef_tests {
+    /// §26.3, §26.6 (aionhw/xezim#721): each instance binds the typedefs
+    /// its own imports reach, whichever instance came before.
+    #[test]
+    fn each_instance_binds_its_own_imported_typedefs() {
+        let source = "package a; typedef logic [3:0] t; endpackage
+package b; typedef logic [7:0] t; endpackage
+package c; import a::*; export a::*; endpackage
+module via_c; import c::*; t q; endmodule
+module via_b; import b::*; t q; endmodule
+module via_a; import a::t; t q; endmodule
+module top; via_c u0(); via_b u1(); via_c u2(); via_a u3(); via_b u4(); endmodule
+";
+        let (_, design) = crate::parse_and_elaborate_multi(
+            &[source.into()],
+            Some("top"),
+            &[],
+            &["top.sv".into()],
+            &[],
+        )
+        .expect("elaborate imports");
+        let widths: Vec<_> = ["u0.q", "u1.q", "u2.q", "u3.q", "u4.q"]
+            .iter()
+            .map(|n| design.signals[*n].width)
+            .collect();
+        assert_eq!(widths, [4, 8, 4, 4, 8]);
     }
 }
 
