@@ -35617,12 +35617,23 @@ fn inline_module_items(
                                                 let packed = if unpacked {
                                                     None
                                                 } else {
-                                                    pack_packed_vector_pattern(
+                                                    // A packed array of structs
+                                                    // packs by element (#817).
+                                                    pack_packed_array_const_value(
                                                         data_type,
                                                         v,
                                                         scoped_eval_params,
+                                                        &elab.typedefs,
                                                         &elab.typedef_types,
                                                     )
+                                                    .or_else(|| {
+                                                        pack_packed_vector_pattern(
+                                                            data_type,
+                                                            v,
+                                                            scoped_eval_params,
+                                                            &elab.typedef_types,
+                                                        )
+                                                    })
                                                     .or_else(|| {
                                                         pack_struct_const_value(
                                                             data_type,
@@ -35719,12 +35730,23 @@ fn inline_module_items(
                                             if !a.dimensions.is_empty() {
                                                 None
                                             } else {
-                                                pack_packed_vector_pattern(
+                                                // A packed array of structs
+                                                // packs by element (#817).
+                                                pack_packed_array_const_value(
                                                     data_type,
                                                     v,
                                                     scoped_eval_params,
+                                                    &elab.typedefs,
                                                     &elab.typedef_types,
                                                 )
+                                                .or_else(|| {
+                                                    pack_packed_vector_pattern(
+                                                        data_type,
+                                                        v,
+                                                        scoped_eval_params,
+                                                        &elab.typedef_types,
+                                                    )
+                                                })
                                                 .or_else(|| {
                                                     pack_struct_const_value(
                                                         data_type,
@@ -36119,12 +36141,29 @@ fn inline_module_items(
                                                         }
                                                         _ => &elab_ro.typedef_types,
                                                     };
-                                                    if let Some(pv) = pack_packed_vector_pattern(
-                                                        data_type,
-                                                        init,
-                                                        local_map,
-                                                        typedef_types,
-                                                    )
+                                                    // §7.4.5 / §10.9.1: a packed ARRAY of
+                                                    // structs packs element by element;
+                                                    // the struct packer alone laid the
+                                                    // pattern over ONE element (#817).
+                                                    if let Some(pv) = typedefs_snapshot(|td| {
+                                                        pack_packed_array_const_value(
+                                                            data_type,
+                                                            init,
+                                                            local_map,
+                                                            td.unwrap_or_else(|| {
+                                                                elab_ro.typedefs.as_map()
+                                                            }),
+                                                            typedef_types,
+                                                        )
+                                                    })
+                                                    .or_else(|| {
+                                                        pack_packed_vector_pattern(
+                                                            data_type,
+                                                            init,
+                                                            local_map,
+                                                            typedef_types,
+                                                        )
+                                                    })
                                                     .or_else(|| {
                                                         typedefs_snapshot(|td| {
                                                             pack_struct_const_value(
@@ -36702,12 +36741,26 @@ fn inline_module_items(
                                     // struct pattern (`'{tag: ..}`): the plain
                                     // const-eval above yields 0; pack by
                                     // element like the override path does.
-                                    if let Some(pv) = pack_packed_vector_pattern(
+                                    // §7.4.5 / §10.9.1: a packed ARRAY of
+                                    // structs (`s_t [1:0] P = '{'{..}, '{..}}`)
+                                    // packs element by element first; the
+                                    // struct packer alone laid the pattern
+                                    // over ONE element (#817).
+                                    if let Some(pv) = pack_packed_array_const_value(
                                         data_type,
                                         init_eval,
                                         &sub_local_params,
+                                        &elab.typedefs,
                                         &elab.typedef_types,
                                     )
+                                    .or_else(|| {
+                                        pack_packed_vector_pattern(
+                                            data_type,
+                                            init_eval,
+                                            &sub_local_params,
+                                            &elab.typedef_types,
+                                        )
+                                    })
                                     .or_else(|| {
                                         pack_struct_const_value(
                                             data_type,
