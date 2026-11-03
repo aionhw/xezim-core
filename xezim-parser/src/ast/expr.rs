@@ -26,8 +26,9 @@ impl Expression {
         }
     }
 
-    /// The pattern of a typed assignment pattern `T'{...}`, else `self`.
-    /// For contexts that place pattern items by their own target type.
+    /// The pattern of a typed assignment pattern `T'{...}`, else `self`. Only
+    /// where the context type is unpacked: `T` is then equivalent to it
+    /// (§6.22.2) and the items place by the context type.
     pub fn peel_typed_pattern(&self) -> &Expression {
         match &self.kind {
             ExprKind::TypedPattern { pattern, .. } => pattern,
@@ -162,11 +163,8 @@ pub enum ExprKind {
     ShallowCopy {
         source: Box<Expression>,
     },
-    /// §10.9.1, §10.9.2: a typed assignment pattern `T'{...}`. The pattern
-    /// is evaluated against `ty`, not against the assignment context, so the
-    /// expression keeps the type's width and layout wherever it appears
-    /// (`$display("%b", T'{...})`). `pattern` is always an
-    /// `AssignmentPattern`. Appended last to keep bincode variant indices.
+    /// §10.9: a typed assignment pattern `T'{...}`, the value a variable of
+    /// type `ty` initialized with `pattern` (an `AssignmentPattern`) holds.
     TypedPattern {
         ty: Box<crate::ast::types::DataType>,
         pattern: Box<Expression>,

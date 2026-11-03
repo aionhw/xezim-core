@@ -5195,7 +5195,7 @@ fn pack_packed_struct_array(
     let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
     let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
     let n = (l - r).unsigned_abs() as usize + 1;
-    let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
+    let ExprKind::AssignmentPattern(items) = &peel_unpacked_typed_pattern(init).kind else {
         return None;
     };
     if items.len() != n {
@@ -5766,6 +5766,12 @@ pub fn register_scoped_typedef_alias(
         let mut own = std::collections::HashSet::new();
         referenced(&dt, &prefix, &elab.typedef_types, &mut own);
         let dt = scope_local_typerefs(&dt, &own, &prefix);
+        let dims = elab
+            .typedef_unpacked_dims
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        tls_register_typedef_shape(&key, &dt, &dims);
         elab.typedef_types.insert(key, dt);
     }
     // `process_typedef` refreshes the const-eval snapshot, but it runs BEFORE
@@ -7940,7 +7946,9 @@ pub fn elaborate_module_with_defs(
                 // as `<param>["key"]` signals before falling into the
                 // scalar parameter path.
                 if let Some(init) = &assign.init {
-                    if let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind {
+                    if let ExprKind::AssignmentPattern(items) =
+                        &peel_unpacked_typed_pattern(init).kind
+                    {
                         // A struct/union-typed parameter is NOT an associative
                         // array even if its `'{ident: v}` items parse as Keyed —
                         // its keys are field names, handled by the struct path.
@@ -9736,7 +9744,7 @@ pub fn elaborate_module_with_defs(
                         }
                         if let Some(init_expr) = &decl.init {
                             if let ExprKind::AssignmentPattern(items) =
-                                &init_expr.peel_typed_pattern().kind
+                                &peel_unpacked_typed_pattern(init_expr).kind
                             {
                                 for item in items {
                                     if let crate::ast::expr::AssignmentPatternItem::Default(
@@ -10420,7 +10428,7 @@ pub fn elaborate_module_with_defs(
                         let _ = (is_signed, width);
                         if let Some(init_expr) = &decl.init {
                             let init_items: Vec<&Expression> =
-                                match &init_expr.peel_typed_pattern().kind {
+                                match &peel_unpacked_typed_pattern(init_expr).kind {
                                     ExprKind::AssignmentPattern(items) => {
                                         items.iter().map(|i| i.expr()).collect()
                                     }
@@ -10439,11 +10447,14 @@ pub fn elaborate_module_with_defs(
                             // including keyed/default entries and declared direction.
                             if (!is_dynamic_dim
                                 && matches!(
-                                    init_expr.peel_typed_pattern().kind,
+                                    peel_unpacked_typed_pattern(init_expr).kind,
                                     ExprKind::AssignmentPattern(_)
                                 ))
                                 || (is_dynamic_dim
-                                    && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                    && !matches!(
+                                        peel_unpacked_typed_pattern(init_expr).kind,
+                                        ExprKind::AssignmentPattern(_)
+                                    ))
                             {
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
@@ -11399,7 +11410,7 @@ pub fn elaborate_module_with_defs(
                         // would leave the parameter itself x.
                         if let Some(init) = &assign.init {
                             if let ExprKind::AssignmentPattern(items) =
-                                &init.peel_typed_pattern().kind
+                                &peel_unpacked_typed_pattern(init).kind
                             {
                                 let all_keyed = !items.is_empty()
                                     && items
@@ -17312,7 +17323,7 @@ fn elaborate_items_numbered(
                         let _ = (is_signed, width, is_real);
                         if let Some(init_expr) = &decl.init {
                             let init_items: Vec<&Expression> =
-                                match &init_expr.peel_typed_pattern().kind {
+                                match &peel_unpacked_typed_pattern(init_expr).kind {
                                     ExprKind::AssignmentPattern(items) => {
                                         items.iter().map(|i| i.expr()).collect()
                                     }
@@ -17331,11 +17342,14 @@ fn elaborate_items_numbered(
                             // including keyed/default entries and declared direction.
                             if (!is_dynamic_dim
                                 && matches!(
-                                    init_expr.peel_typed_pattern().kind,
+                                    peel_unpacked_typed_pattern(init_expr).kind,
                                     ExprKind::AssignmentPattern(_)
                                 ))
                                 || (is_dynamic_dim
-                                    && !matches!(init_expr.kind, ExprKind::AssignmentPattern(_)))
+                                    && !matches!(
+                                        peel_unpacked_typed_pattern(init_expr).kind,
+                                        ExprKind::AssignmentPattern(_)
+                                    ))
                             {
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
@@ -22994,6 +23008,26 @@ thread_local! {
         = std::cell::RefCell::new((HashMap::default(), HashMap::default()));
 }
 
+/// §10.9: the pattern of the typed pattern `T'{...}` when `T` is unpacked;
+/// `e` otherwise. An unpacked target has an equivalent type (§6.22.2), so
+/// the items place as an untyped pattern's; a packed `T'{...}` is a value.
+fn peel_unpacked_typed_pattern(e: &Expression) -> &Expression {
+    let ExprKind::TypedPattern { ty, pattern } = &e.kind else {
+        return e;
+    };
+    let DataType::TypeReference { name, .. } = ty.as_ref() else {
+        return e;
+    };
+    let unpacked = TYPEDEF_SHAPES_TLS.with(|c| {
+        let (types, dims) = &*c.borrow();
+        lookup_scoped_type(name, dims).is_some_and(|d| !d.is_empty())
+            || lookup_scoped_type(name, types).is_some_and(
+                |dt| matches!(resolve_typedef_chain(dt, types), DataType::Struct(su) if !su.packed),
+            )
+    });
+    if unpacked { pattern } else { e }
+}
+
 /// Record a typedef's full definition for const-eval (see TYPEDEF_SHAPES_TLS).
 /// Called whenever a typedef is (re-)registered, so a later same-named typedef
 /// replaces the earlier one exactly as it does in `typedef_types`.
@@ -25560,7 +25594,7 @@ fn emit_struct_member_assigns(
     // wrote a struct of zeros, with no diagnostic. §10.9.2 gives both forms
     // equal standing, and named is the form anyone writes for a struct whose
     // members are not obviously ordered.
-    let pat_items: Option<Vec<Expression>> = match &rhs.kind {
+    let pat_items: Option<Vec<Expression>> = match &peel_unpacked_typed_pattern(rhs).kind {
         ExprKind::AssignmentPattern(items) if items.len() == flat.len() => {
             use crate::ast::expr::AssignmentPatternItem as Item;
             if items.iter().all(|it| matches!(it, Item::Ordered(_))) {
@@ -25688,7 +25722,7 @@ fn emit_member_elem_assigns(
             let mut cur = Some(&rhs);
             for (d, idx) in tup.iter().enumerate() {
                 let pos = lists[d].iter().position(|i| i == idx);
-                cur = match (cur.map(|e| &e.kind), pos) {
+                cur = match (cur.map(|e| &peel_unpacked_typed_pattern(e).kind), pos) {
                     (Some(ExprKind::AssignmentPattern(items)), Some(p)) => match items.get(p) {
                         Some(crate::ast::expr::AssignmentPatternItem::Ordered(e)) => Some(e),
                         _ => None,
@@ -30649,7 +30683,7 @@ fn inline_instantiations_inner(
                                     continue;
                                 };
                                 let init_items: Vec<&Expression> =
-                                    match &init_expr.peel_typed_pattern().kind {
+                                    match &peel_unpacked_typed_pattern(init_expr).kind {
                                         ExprKind::AssignmentPattern(items) => {
                                             items.iter().map(|i| i.expr()).collect()
                                         }
@@ -30668,12 +30702,12 @@ fn inline_instantiations_inner(
                                 // including keyed/default entries and declared direction.
                                 if (!is_dynamic_dim
                                     && matches!(
-                                        init_expr.peel_typed_pattern().kind,
+                                        peel_unpacked_typed_pattern(init_expr).kind,
                                         ExprKind::AssignmentPattern(_)
                                     ))
                                     || (is_dynamic_dim
                                         && !matches!(
-                                            init_expr.kind,
+                                            peel_unpacked_typed_pattern(init_expr).kind,
                                             ExprKind::AssignmentPattern(_)
                                         ))
                                 {
@@ -32622,7 +32656,7 @@ fn unpacked_connection_elements(
     // `.h('{a, b})`) supplies its elements directly, left to right. Only a
     // positional pattern: a keyed or `default:` pattern needs the formal's
     // shape to place its items and keeps the element-wise fallback.
-    match &expr.kind {
+    match &peel_unpacked_typed_pattern(expr).kind {
         ExprKind::Concatenation(items) if !items.is_empty() => {
             return Some(items.clone());
         }
@@ -35957,7 +35991,7 @@ fn inline_module_items(
                                                 };
                                                 let packed = if override_expr.is_some_and(|e| {
                                                     !matches!(
-                                                        e.kind,
+                                                        peel_unpacked_typed_pattern(e).kind,
                                                         ExprKind::AssignmentPattern(_)
                                                             | ExprKind::Concatenation(_)
                                                     )
@@ -36470,8 +36504,9 @@ fn inline_module_items(
                                 // to an element: pack the converted items,
                                 // element 0 leftmost, as the slicer expects.
                                 // Const-eval of the pattern itself yields 0.
-                                if let Some(ExprKind::AssignmentPattern(items)) =
-                                    ovr_exprs.get(&assign.name.name).map(|e| &e.kind)
+                                if let Some(ExprKind::AssignmentPattern(items)) = ovr_exprs
+                                    .get(&assign.name.name)
+                                    .map(|e| &peel_unpacked_typed_pattern(e).kind)
                                 {
                                     // Any other pattern (replication, keyed,
                                     // `default:`, nested rows, struct elements)
@@ -36521,7 +36556,10 @@ fn inline_module_items(
                                 // elements instead.
                                 if pattern_init.is_none()
                                     && let Some(expr) = ovr_exprs.get(&assign.name.name).cloned()
-                                    && !matches!(expr.kind, ExprKind::AssignmentPattern(_))
+                                    && !matches!(
+                                        peel_unpacked_typed_pattern(&expr).kind,
+                                        ExprKind::AssignmentPattern(_)
+                                    )
                                 {
                                     let snapshot = sub_local_params.clone();
                                     if array_params::register(
@@ -36598,7 +36636,7 @@ fn inline_module_items(
                                     // Materialise as `<prefix><param>[key]`
                                     // signals and register the array.
                                     if let ExprKind::AssignmentPattern(items) =
-                                        &init.peel_typed_pattern().kind
+                                        &peel_unpacked_typed_pattern(init).kind
                                     {
                                         let all_keyed = !items.is_empty()
                                             && items.iter().all(|it| {
@@ -37145,7 +37183,7 @@ fn inline_module_items(
                         let init = override_expr.or(assign.init.as_ref());
                         let packed = if override_expr.is_some_and(|e| {
                             !matches!(
-                                e.kind,
+                                peel_unpacked_typed_pattern(e).kind,
                                 ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                             )
                         }) {
@@ -43243,6 +43281,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     let d = match (&members, &d.kind) {
                         // Already member-wise.
                         (Some(_), ExprKind::AssignmentPattern(_)) => d,
+                        (Some(_), ExprKind::TypedPattern { pattern, .. }) => (**pattern).clone(),
                         // Name it member by member instead: '{d.m0, d.m1, ..}
                         (Some(ms), _) => {
                             let span = d.span;
@@ -44892,9 +44931,9 @@ pub fn whole_array_assign_parts_dir(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
 ) -> Option<Vec<ContinuousAssignment>> {
-    if let ExprKind::AssignmentPattern(_) = &rhs.peel_typed_pattern().kind {
-        let rhs = rhs.peel_typed_pattern();
-        return pattern_array_assign_parts(lhs, rhs, delay, arrays, descending, decl_dims);
+    let pattern = peel_unpacked_typed_pattern(rhs);
+    if let ExprKind::AssignmentPattern(_) = &pattern.kind {
+        return pattern_array_assign_parts(lhs, pattern, delay, arrays, descending, decl_dims);
     }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
         return None;
@@ -45074,7 +45113,7 @@ fn pattern_leaves(
         out.push((idx.clone(), e.clone()));
         return Some(());
     };
-    let ExprKind::AssignmentPattern(items) = &e.peel_typed_pattern().kind else {
+    let ExprKind::AssignmentPattern(items) = &peel_unpacked_typed_pattern(e).kind else {
         return None;
     };
     if items.is_empty() {
@@ -45125,7 +45164,12 @@ fn pattern_leaves(
         match (x, default) {
             (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out)?,
             // §10.9.1: `default:` reaches every leaf of a missing element.
-            (None, Some(d)) if !matches!(d.kind, ExprKind::AssignmentPattern(_)) => {
+            (None, Some(d))
+                if !matches!(
+                    peel_unpacked_typed_pattern(d).kind,
+                    ExprKind::AssignmentPattern(_)
+                ) =>
+            {
                 default_leaves(d, &dims[1..], idx, out)
             }
             (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out)?,
