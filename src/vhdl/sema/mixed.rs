@@ -27,6 +27,10 @@ pub struct SvModule {
     pub name: String,
     pub ports: Vec<String>,
     pub params: Vec<String>,
+    /// Ports declared with an unpacked dimension or an unpacked struct or
+    /// union type: a VHDL record or array, one packed vector, cannot
+    /// connect to them.
+    pub unpacked: Vec<String>,
 }
 
 /// A VHDL entity instantiated from SV, with the instance's parameter

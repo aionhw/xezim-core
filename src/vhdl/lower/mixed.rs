@@ -9,10 +9,13 @@
 //! the signal has an event. Values cross as Questa passes them: std_ulogic
 //! to 4-state as `U X W -` → x, `0 L` → 0, `1 H` → 1, `Z` → z, and back as
 //! 0 1 x z → `'0' '1' 'X' 'Z'`; bit and boolean as 0/1 (x and z → 0);
-//! integers as 32-bit two's complement; reals as reals. A record, and an
-//! array whose elements are not integers or reals, crosses as one packed
-//! `logic` vector: the left index and the first field are the most
-//! significant bits, and each `std_logic`, bit or boolean is one bit.
+//! integers as 32-bit two's complement; reals as reals. A one-dimensional
+//! array of integers or reals crosses as an SV unpacked array. Any other
+//! composite (a record, a multi-dimensional array, an array of records or
+//! of arrays) crosses as one packed `logic` vector: the left index and the
+//! first field are the most significant bits, each `std_logic`, bit or
+//! boolean is one bit and each integer 32 bits. A composite with a real
+//! cannot cross.
 
 use std::fmt::Write as _;
 
@@ -52,15 +55,35 @@ impl Bnd {
         }
     }
 
-    /// `std_logic` bits of a packed value. A real has none.
+    /// `std_logic` bits of a packed value. A real has none. `bnd()` only
+    /// makes values whose width fits (`checked_width`).
     fn width(&self) -> i64 {
+        self.checked_width().unwrap_or(i64::MAX)
+    }
+
+    fn checked_width(&self) -> Option<i64> {
         match self {
-            Bnd::Bit(_) => 1,
+            Bnd::Bit(_) => Some(1),
+            Bnd::Vec(_, n) => Some(*n),
+            Bnd::Int => Some(32),
+            Bnd::Real => Some(0),
+            Bnd::Rec(fs) => fs
+                .iter()
+                .try_fold(0i64, |a, f| a.checked_add(f.checked_width()?)),
+            Bnd::Arr(e, l, r) => e.checked_width()?.checked_mul(arr_len(*l, *r)?),
+        }
+    }
+
+    /// The scalars converted when the value crosses: what a conversion
+    /// costs.
+    fn cells(&self) -> i64 {
+        match self {
             Bnd::Vec(_, n) => *n,
-            Bnd::Int => 32,
-            Bnd::Real => 0,
-            Bnd::Rec(fs) => fs.iter().map(Bnd::width).sum(),
-            Bnd::Arr(e, l, r) => e.width().saturating_mul((l - r).abs() + 1),
+            Bnd::Rec(fs) => fs.iter().fold(0i64, |a, f| a.saturating_add(f.cells())),
+            Bnd::Arr(e, l, r) => e
+                .cells()
+                .saturating_mul(arr_len(*l, *r).unwrap_or(i64::MAX)),
+            _ => 1,
         }
     }
 
@@ -119,6 +142,15 @@ impl Bnd {
     }
 }
 
+/// The length of index range `l`..`r` (either direction).
+fn arr_len(l: i64, r: i64) -> Option<i64> {
+    l.checked_sub(r)?.checked_abs()?.checked_add(1)
+}
+
+/// The largest root signal mirrored for SV, in converted scalars: a
+/// mirror is converted again on every event of its signal.
+const MAX_MIRROR_CELLS: i64 = super::MAX_PK_BITS;
+
 /// An SV value driving a VHDL signal.
 #[derive(Clone, Debug)]
 pub(super) struct ForeignIn {
@@ -126,6 +158,10 @@ pub(super) struct ForeignIn {
     pub sv: String,
     pub bnd: Bnd,
     pub ty: TypeId,
+    /// An input of an exposed top (its signal): until SV drives it with
+    /// something other than all z, the signal keeps its value, the port's
+    /// default.
+    pub keep: Option<usize>,
 }
 
 /// A VHDL signal (or constant) written to SV.
@@ -169,7 +205,8 @@ impl<'a> Lw<'a> {
                 }
                 fs.push(fb);
             }
-            return Some(Bnd::Rec(fs));
+            let rec = Bnd::Rec(fs);
+            return rec.checked_width().map(|_| rec);
         }
         let arr = match &self.d.types[b].kind {
             TypeKind::Array { index, elem } => Some((index.len(), *elem)),
@@ -211,7 +248,7 @@ impl<'a> Lw<'a> {
         for (l, r) in dims.into_iter().rev() {
             inner = Bnd::Arr(Box::new(inner), l, r);
         }
-        Some(inner)
+        inner.checked_width().map(|_| inner)
     }
 
     /// The port list of a root (an entity instantiated from SV), and its
@@ -226,7 +263,7 @@ impl<'a> Lw<'a> {
                 continue;
             };
             if self.d.port_views.contains_key(&p) {
-                self.err(
+                self.unconnectable(
                     &info.loc,
                     format!(
                         "port '{}' has a mode view (VHDL-2019), which cannot be connected to SystemVerilog",
@@ -236,7 +273,7 @@ impl<'a> Lw<'a> {
                 continue;
             }
             let Some(bnd) = self.bnd(info.ty) else {
-                self.err(
+                self.unconnectable(
                     &info.loc,
                     format!(
                         "port '{}' has a type that cannot be connected to SystemVerilog",
@@ -245,11 +282,6 @@ impl<'a> Lw<'a> {
                 );
                 continue;
             };
-            // The conversion functions are emitted after `type_defs` is
-            // copied out, so the record and array structs have to exist
-            // before then.
-            let loc = info.loc.clone();
-            let _ = self.repr(info.ty, &loc);
             let name = port_ident(&info.name);
             let sig = SigRef {
                 sig: self.sig_map[&(0, p)].sig,
@@ -259,7 +291,7 @@ impl<'a> Lw<'a> {
             match mode {
                 Mode::In if matches!(&bnd, Bnd::Arr(e, ..) if matches!(e.as_ref(), Bnd::Int | Bnd::Real)) =>
                 {
-                    self.err(
+                    self.unconnectable(
                         &info.loc,
                         format!(
                             "input port '{}' of an array of integers or reals cannot be connected to SystemVerilog yet",
@@ -269,7 +301,11 @@ impl<'a> Lw<'a> {
                 }
                 Mode::In => {
                     decls.push(format!("input {} {} {}", net, bnd.sv(), name));
+                    let keep = (self.exposed && bnd != Bnd::Real).then_some(sig.sig);
                     self.foreign_driver(sig, name, bnd, info.ty, p);
+                    if let Some(f) = self.fins.last_mut() {
+                        f.keep = keep;
+                    }
                 }
                 Mode::Out | Mode::Buffer => {
                     decls.push(format!("output {} {}{}", bnd.sv(), name, bnd.dims()));
@@ -283,7 +319,7 @@ impl<'a> Lw<'a> {
                     });
                 }
                 Mode::InOut | Mode::Linkage => {
-                    self.err(
+                    self.unconnectable(
                         &info.loc,
                         format!(
                             "inout port '{}' cannot be connected to SystemVerilog yet",
@@ -297,8 +333,19 @@ impl<'a> Lw<'a> {
         decls.join(", ")
     }
 
+    /// A port that cannot cross: an error, or for an exposed top a warning
+    /// (the port is then not visible to VPI).
+    fn unconnectable(&mut self, loc: &Loc, msg: String) {
+        if self.exposed {
+            self.warn(loc, format!("{msg}; it is not visible to VPI"));
+        } else {
+            self.err(loc, msg);
+        }
+    }
+
     /// The root's signals and constants as SV variables of the same names,
-    /// for hierarchical references from SV (`dut.sig`).
+    /// for hierarchical references from SV (`dut.sig`). One wider than
+    /// `MAX_MIRROR_CELLS` (a memory) is left out.
     fn mirrors(&mut self, top: usize) {
         let arch = &self.d.archs[top];
         let objs: Vec<ObjId> = arch
@@ -312,8 +359,9 @@ impl<'a> Lw<'a> {
             let Some(bnd) = self.bnd(info.ty) else {
                 continue;
             };
-            let loc = info.loc.clone();
-            let _ = self.repr(info.ty, &loc);
+            if bnd.cells() > MAX_MIRROR_CELLS {
+                continue;
+            }
             let sv = port_ident(&info.name);
             if self.fouts.iter().any(|f| f.sv == sv) {
                 continue;
@@ -340,7 +388,12 @@ impl<'a> Lw<'a> {
     /// A driver of signal `sig` with the value of SV expression `sv`.
     fn foreign_driver(&mut self, sig: SigRef, sv: String, bnd: Bnd, ty: TypeId, o: ObjId) {
         let k = self.fins.len();
-        self.fins.push(ForeignIn { sv, bnd, ty });
+        self.fins.push(ForeignIn {
+            sv,
+            bnd,
+            ty,
+            keep: None,
+        });
         let drv = super::elab::PSEUDO + self.links.len();
         let cov = match &sig.part {
             Part::Path(path) => self.path_cov(self.sigs[sig.sig].ty, &super::elab::dsels(path)),
@@ -372,7 +425,10 @@ impl<'a> Lw<'a> {
 
     /// The value of foreign driver `k` as a VHDL value (SV).
     pub(super) fn foreign_value(&mut self, k: usize) -> String {
-        format!("vh_fci{}(vh_fl{})", k, k)
+        match self.fins[k].keep {
+            Some(s) => format!("(vh_fd{k} ? vh_fci{k}(vh_fl{k}) : vh_s{s})"),
+            None => format!("vh_fci{}(vh_fl{})", k, k),
+        }
     }
 
     /// The boundary's declarations: the sampled SV values, the change
@@ -389,7 +445,12 @@ impl<'a> Lw<'a> {
         for (k, f) in self.fins.clone().into_iter().enumerate() {
             let loc = self.d.objects[0].loc.clone();
             let r = self.repr(f.ty, &loc);
-            let _ = writeln!(s, "  {} vh_fl{k};\n  bit vh_fx{k};", f.bnd.sv(), k = k);
+            let _ = writeln!(
+                s,
+                "  {} vh_fl{k};\n  bit vh_fx{k}, vh_fd{k};",
+                f.bnd.sv(),
+                k = k
+            );
             let _ = writeln!(s, "  always @({}) vh_extn++;", f.sv);
             let body = self.conv_in(&f.bnd, &r, f.ty);
             let _ = write!(
@@ -493,21 +554,26 @@ impl<'a> Lw<'a> {
             }
         };
         let loc = self.d.objects[0].loc.clone();
-        let (x, off, at) = match part {
-            Part::Whole => ("vh_a".to_string(), 0, sty),
+        let (x, slice, at) = match part {
+            Part::Whole => ("vh_a".to_string(), None, sty),
             Part::Path(path) => {
                 let (sel, slice, at) = self.path_sv(sty, path, &loc);
-                (format!("vh_a{}", sel), slice.map_or(0, |(o, _)| o), at)
+                (format!("vh_a{}", sel), slice, at)
             }
         };
+        let off = slice.map_or(0, |(o, _)| o);
         if bnd.is_packed() {
-            let walk = self
+            let mut walk = self
                 .bnd(at)
                 .filter(Bnd::is_packed)
                 .unwrap_or_else(|| bnd.clone());
+            // A slice: its elements only, from its offset in the array.
+            if let (Some((_, len)), Bnd::Arr(e, ..)) = (slice, &walk) {
+                walk = Bnd::Arr(e.clone(), 0, len - 1);
+            }
             let hi = walk.width() - 1;
             let mut body = String::new();
-            self.pack_out("vh_o", &x, &walk, at, &mut body);
+            self.pack_out("vh_o", &x, &walk, at, 0, off, &mut body);
             return format!(
                 "    logic [{hi}:0] vh_o;\n    int vh_bit;\n    vh_bit = {hi};\n{body}    return vh_o;\n"
             );
@@ -550,15 +616,38 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// What an element of dimension `dim` of array type `ty` is: the next
+    /// dimension of `ty`, or (after the last) the element subtype, itself
+    /// maybe an array (an array of arrays).
+    fn next_dim(&self, ty: TypeId, dim: usize) -> (TypeId, usize) {
+        if dim + 1 < self.ndims(ty) {
+            (ty, dim + 1)
+        } else {
+            (self.d.element_subtype(ty).unwrap_or(ty), 0)
+        }
+    }
+
     fn fresh(&mut self) -> String {
         self.tmp += 1;
         format!("vh_u{}", self.tmp)
     }
 
-    /// Write VHDL value `src` (type `ty`) into packed logic `dst`. `vh_bit`
-    /// is the next bit, and it moves toward 0. `.d[0]` and the first record
-    /// field are written first, so they land in the most significant bits.
-    fn pack_out(&mut self, dst: &str, src: &str, bnd: &Bnd, ty: TypeId, body: &mut String) {
+    /// Write VHDL value `src` (type `ty`; dimension `dim` of it when an
+    /// array) into packed logic `dst`. `vh_bit` is the next bit, and it
+    /// moves toward 0. `.d[0]` and the first record field are written first,
+    /// so they land in the most significant bits. `first` is the offset of
+    /// the first element written (a slice).
+    #[allow(clippy::too_many_arguments)]
+    fn pack_out(
+        &mut self,
+        dst: &str,
+        src: &str,
+        bnd: &Bnd,
+        ty: TypeId,
+        dim: usize,
+        first: i64,
+        body: &mut String,
+    ) {
         match bnd {
             Bnd::Bit(ul) => {
                 let b = if *ul {
@@ -605,7 +694,7 @@ impl<'a> Lw<'a> {
                     return;
                 };
                 for (i, (fb, ft)) in fields.iter().zip(rec).enumerate() {
-                    self.pack_out(dst, &format!("{src}.f{i}"), fb, ft, body);
+                    self.pack_out(dst, &format!("{src}.f{i}"), fb, ft, 0, 0, body);
                 }
             }
             Bnd::Arr(elem, l, r) => {
@@ -613,13 +702,9 @@ impl<'a> Lw<'a> {
                 self.tmp += 1;
                 let iv = format!("vh_p{}", self.tmp);
                 let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
-                let inner = format!("{src}.d[{iv}]");
-                if matches!(elem.as_ref(), Bnd::Arr(..)) {
-                    self.pack_out(dst, &inner, elem, ty, body);
-                } else {
-                    let et = self.d.element_subtype(ty).unwrap_or(ty);
-                    self.pack_out(dst, &inner, elem, et, body);
-                }
+                let inner = format!("{src}.d[{first} + {iv}]");
+                let (sub, sub_dim) = self.next_dim(ty, dim);
+                self.pack_out(dst, &inner, elem, sub, sub_dim, 0, body);
                 let _ = writeln!(body, "    end");
             }
         }
@@ -661,14 +746,16 @@ impl<'a> Lw<'a> {
                 } else {
                     format!("({vec}[vh_bit] === 1'b1)")
                 };
-                if let Repr::Pk(w, _) = r {
-                    let hi = w as i64 * n - 1;
+                if let Repr::Pk(w, pn) = r {
+                    // Stored through the helper: a part-select store into
+                    // a local is not accepted in a function body.
+                    let hi = w as i64 * pn - 1;
+                    let setf = self.pk_set_fn(w, pn);
                     let _ = writeln!(decls, "    bit [{hi}:0] {t};");
                     let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
                     let _ = writeln!(
                         body,
-                        "      {t}[{w} * ({m} - {iv}) +: {w}] = {code}; vh_bit = vh_bit - 1; end",
-                        m = n - 1
+                        "      {t} = {setf}({t}, {iv}, {code}); vh_bit = vh_bit - 1; end"
                     );
                     return t;
                 }
@@ -722,7 +809,8 @@ impl<'a> Lw<'a> {
                     return "0".into();
                 };
                 let n = (l - r).abs() + 1;
-                let et_sv = if matches!(elem.as_ref(), Bnd::Arr(..)) {
+                let (sub, sub_dim) = self.next_dim(ty, dim);
+                let et_sv = if sub == ty {
                     levels.get(dim + 1).cloned().unwrap_or_else(|| er.sv())
                 } else {
                     er.sv()
@@ -742,12 +830,7 @@ impl<'a> Lw<'a> {
                 let _ = writeln!(decls, "    {et_sv} {arr}[];");
                 let _ = writeln!(body, "    {arr} = new[{n}];");
                 let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");
-                let sub = if matches!(elem.as_ref(), Bnd::Arr(..)) {
-                    self.unpack_in(vec, elem, ty, dim + 1, decls, body)
-                } else {
-                    let et = self.d.element_subtype(ty).unwrap_or(ty);
-                    self.unpack_in(vec, elem, et, 0, decls, body)
-                };
+                let sub = self.unpack_in(vec, elem, sub, sub_dim, decls, body);
                 let _ = writeln!(body, "      {arr}[{iv}] = {sub}; end");
                 format!("{aname}_mk({bl}, {br}, {dn}, {arr})")
             }
@@ -815,6 +898,20 @@ impl<'a> Lw<'a> {
                 );
                 continue;
             };
+            if bnd.is_packed()
+                && m.unpacked
+                    .iter()
+                    .any(|x| x.eq_ignore_ascii_case(&info.name))
+            {
+                self.err(
+                    &a.loc,
+                    format!(
+                        "port '{}' of SystemVerilog module '{}' is unpacked; a VHDL record or array crosses as one packed vector",
+                        info.name, m.name
+                    ),
+                );
+                continue;
+            }
             let k = self.sv_nets;
             self.sv_nets += 1;
             let r = self.actual_ref(inst, a);
@@ -928,6 +1025,9 @@ impl<'a> Lw<'a> {
         let mut s = String::new();
         for (k, f) in self.fins.iter().enumerate() {
             let _ = writeln!(s, "    vh_fl{} = {};", k, f.sv);
+            if f.keep.is_some() {
+                let _ = writeln!(s, "    vh_fd{k} = vh_fl{k} !== 'z;");
+            }
         }
         s
     }
@@ -948,6 +1048,9 @@ impl<'a> Lw<'a> {
                 ne = f.bnd.ne(&f.sv, &format!("vh_fl{}", k)),
                 sv = f.sv
             );
+            if f.keep.is_some() {
+                let _ = writeln!(s, "{ind}if (vh_fx{k} && vh_fl{k} !== 'z) vh_fd{k} = 1;");
+            }
         }
         s
     }

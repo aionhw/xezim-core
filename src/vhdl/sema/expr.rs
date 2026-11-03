@@ -404,7 +404,9 @@ impl Design {
                         });
                     }
                     // Multi-dimensional: the element of a dimension is a
-                    // sub-aggregate of the remaining dimensions.
+                    // sub-aggregate of the remaining dimensions. One
+                    // dimension: the element subtype, with the constraint
+                    // of an `(open)(7 downto 0)` subtype.
                     let elem_t = if index.len() > 1 {
                         self.add_type(
                             "",
@@ -416,19 +418,18 @@ impl Design {
                             None,
                         )
                     } else {
-                        elem
+                        self.element_subtype(t).unwrap_or(elem)
                     };
                     // VHDL-2008 §9.3.3.3: an element association is the
                     // element type (one index, or a range that repeats it).
-                    // A range choice may instead give an array the length of
-                    // that choice: a slice, or a string whose bounds come
-                    // from the choice rather than the whole aggregate.
+                    // In a one-dimensional aggregate it may instead give an
+                    // array of the aggregate's type: a slice, or a string
+                    // or bit string of its own length (positionally, or the
+                    // length of its range choice).
                     let v = match self.try_expr_quiet(r, &a.value, Some(elem_t)) {
                         Some(v) => v,
-                        None => {
-                            let ctx = self.choice_array_context(&choices, t);
-                            self.expr(r, &a.value, Some(ctx))?
-                        }
+                        None if index.len() == 1 => self.expr(r, &a.value, Some(b))?,
+                        None => self.expr(r, &a.value, Some(t))?,
                     };
                     out.push((choices, v));
                 }
@@ -500,30 +501,18 @@ impl Design {
         }
     }
 
-    /// Context type for an array-valued range choice: a subtype of `agg`
-    /// constrained to that one choice (§9.3.3.3). Anything else keeps the
-    /// aggregate's own type.
-    fn choice_array_context(&mut self, choices: &[HChoice], agg: TypeId) -> TypeId {
-        let [HChoice::Range(hr)] = choices else {
-            return agg;
-        };
+    /// Whether value `v` of an element association of an aggregate of
+    /// array type `agg` is an array of the aggregate's type, filling its
+    /// choice or as many positions as it has elements (§9.3.3.3), rather
+    /// than one element.
+    pub fn agg_array_value(&self, agg: TypeId, v: &HExpr) -> bool {
         let b = self.base(agg);
-        let TypeKind::Array { index, .. } = &self.types[b].kind else {
-            return agg;
-        };
-        if index.len() != 1 {
-            return agg;
+        match &self.types[b].kind {
+            TypeKind::Array { index, elem } => {
+                index.len() == 1 && self.base(*elem) != b && self.base(v.ty) == b
+            }
+            _ => false,
         }
-        self.add_type(
-            "",
-            TypeKind::Subtype {
-                base: b,
-                constraint: Some(HConstraint::Index(vec![Some(hr.clone())], None)),
-                resolution: None,
-            },
-            None,
-            None,
-        )
     }
 
     /// Analyse without reporting errors (for trying an interpretation).

@@ -1391,7 +1391,8 @@ impl<'a> Lw<'a> {
                         );
                     }
                     let m = mode.to_string();
-                    let code = self.drive_path(sig, p, path, target.ty, &tmp, (&t, &rej, mode), ind);
+                    let st = self.storage_type(target);
+                    let code = self.drive_path(sig, p, path, st, &tmp, (&t, &rej, mode), ind);
                     let _ = m;
                     out.push_str(&code);
                 }
@@ -1830,6 +1831,9 @@ impl<'a> Lw<'a> {
                 self.heap(a, &loc);
             }
         }
+        // The boundary's conversions create the structs they use: before
+        // the type definitions are copied out.
+        let bnd = self.boundary_sv();
         m.push_str(&self.type_defs);
         m.push_str(&self.heap_defs);
         m.push_str(&self.prot_defs);
@@ -1846,7 +1850,6 @@ impl<'a> Lw<'a> {
         m.push_str(&self.tx_defs);
         let files = self.files_sv();
         m.push_str(&files);
-        let bnd = self.boundary_sv();
         m.push_str(&bnd);
         m.push_str(&self.sv_items);
         m.push_str(&decls);

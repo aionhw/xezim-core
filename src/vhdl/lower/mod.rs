@@ -180,6 +180,10 @@ struct Lw<'a> {
     temps: Vec<(String, String)>,
     /// A root instantiated from SV: the module's name (it has ports).
     boundary: Option<String>,
+    /// The boundary is the VHDL top's, exposed to a VPI testbench: a port
+    /// that cannot cross is left out with a warning, and an input keeps
+    /// its default until SV drives it.
+    exposed: bool,
     /// SV values driving VHDL signals, VHDL signals written to SV.
     fins: Vec<mixed::ForeignIn>,
     fouts: Vec<mixed::ForeignOut>,
@@ -239,21 +243,22 @@ pub fn lower(
     let mut sv = String::new();
     let mut errors = Vec::new();
     let mut top = None;
-    let mut units: Vec<(usize, Option<String>)> = Vec::new();
+    let mut units: Vec<(usize, Option<String>, bool)> = Vec::new();
     if let Some(t) = an.top {
         // A VPI testbench drives the top entity's ports, the same boundary
         // an entity instantiated from SystemVerilog already has.
-        let boundary = (opts.expose_ports && !d.archs[t].ports.is_empty())
-            .then(|| sv_ident(&d.archs[t].entity));
-        units.push((t, boundary));
+        let exposed = opts.expose_ports && !d.archs[t].ports.is_empty();
+        let boundary = exposed.then(|| sv_ident(&d.archs[t].entity));
+        units.push((t, boundary, exposed));
         top = Some(sv_ident(&d.archs[t].entity));
     }
     for (a, name) in an.roots.iter().zip(roots) {
-        units.push((*a, Some(name.clone())));
+        units.push((*a, Some(name.clone()), false));
     }
-    for (a, boundary) in units {
+    for (a, boundary, exposed) in units {
         let mut lw = Lw::new(d, boundary);
         lw.opts = opts;
+        lw.exposed = exposed;
         // STRING (messages) first.
         lw.arr_type(&Repr::U8);
         let m = lw.module(a);
@@ -274,6 +279,7 @@ impl<'a> Lw<'a> {
     fn new(d: &'a Design, boundary: Option<String>) -> Self {
         Lw {
             d,
+            exposed: false,
             type_defs: String::new(),
             arr_types: BTreeSet::new(),
             heaps: BTreeSet::new(),
@@ -383,6 +389,11 @@ impl<'a> Lw<'a> {
         let (f, l, c) = self.d.file_line(loc);
         self.errors
             .push(format!("{}:{}:{}: error: VHDL: {}", f, l, c, msg.into()));
+    }
+
+    fn warn(&self, loc: &Loc, msg: impl Into<String>) {
+        let (f, l, c) = self.d.file_line(loc);
+        crate::log_eprintln(&format!("{}:{}:{}: warning: VHDL: {}", f, l, c, msg.into()));
     }
 
     fn file_line(&self, loc: &Loc) -> (String, usize, usize) {
@@ -703,15 +714,11 @@ impl<'a> Lw<'a> {
             er.sv()
         };
         let elem_t = self.d.element_subtype(t).unwrap_or(t);
+        // Declarations first (IEEE 1800 §9.3.1), then the statements.
+        let mut decls = String::new();
         let mut body = String::new();
-        let _ = writeln!(
-            body,
-            "  function automatic {} {}();\n    {} t[];\n    t = new[{}];",
-            name,
-            f,
-            elem_sv,
-            av.elems.len()
-        );
+        let _ = writeln!(decls, "  function automatic {} {}();\n    {} t[];", name, f, elem_sv);
+        let _ = writeln!(body, "    t = new[{}];", av.elems.len());
         for (i, e) in av.elems.iter().enumerate() {
             let mark = self.pre_stmts.len();
             let ev = match e {
@@ -720,13 +727,14 @@ impl<'a> Lw<'a> {
             };
             // A record element is built in this function, not in the caller.
             for (name, ty, st) in self.pre_stmts.split_off(mark) {
-                let _ = writeln!(body, "    {} {};", ty, name);
+                let _ = writeln!(decls, "    {} {};", ty, name);
                 for line in st.lines() {
                     let _ = writeln!(body, "    {}", line);
                 }
             }
             let _ = writeln!(body, "    t[{}] = {};", i, ev);
         }
+        let mut body = decls + &body;
         let cnt = av.elems.len() as i64;
         let right = match dir {
             Dir::To => left + cnt - 1,
@@ -745,23 +753,15 @@ impl<'a> Lw<'a> {
         format!("{}()", f)
     }
 
-    /// Whether `t` stores a dynamic array, directly or in a record field.
+    /// Whether `t` stores a dynamic array, directly or in a record field
+    /// (as the struct stores it: the field types as declared).
     fn contains_dyn_arr(&mut self, t: TypeId, loc: &Loc) -> bool {
-        self.contains_dyn_arr_at(t, loc, 0)
-    }
-
-    fn contains_dyn_arr_at(&mut self, t: TypeId, loc: &Loc, depth: usize) -> bool {
-        if depth > 32 {
-            return false;
-        }
         match self.repr(t, loc) {
             Repr::Arr(..) => true,
-            Repr::Rec(_) => {
-                let fields = self.d.record_fields(t);
-                fields
-                    .into_iter()
-                    .any(|(_, ft)| self.contains_dyn_arr_at(ft, loc, depth + 1))
-            }
+            Repr::Rec(_) => self
+                .field_storage(t)
+                .into_iter()
+                .any(|ft| self.contains_dyn_arr(ft, loc)),
             _ => false,
         }
     }
@@ -879,8 +879,12 @@ impl<'a> Lw<'a> {
         let (e, e_sv) = if k + 1 < n {
             (self.default_arr(t, k + 1, loc), levels[k + 1].clone())
         } else {
+            // In its (constrained) subtype, stored as the array stores it.
             let elem_t = self.d.element_subtype(t).unwrap_or(t);
-            (self.default_value(elem_t, loc), er.sv())
+            let v = self.default_value(elem_t, loc);
+            let fr = self.repr(elem_t, loc);
+            let bsv = self.static_bounds(elem_t).map(|b| self.bounds_sv(b));
+            (self.coerce(v, &fr, &er, bsv, loc), er.sv())
         };
         let e = self.as_arg(e, &e_sv);
         let (l, r, dn) = self
@@ -1032,8 +1036,21 @@ impl<'a> Lw<'a> {
                             cr = Repr::U8;
                         }
                         Repr::Arr(name, er) => {
+                            // The object's own bounds when static, as a
+                            // write takes them: a port's formal bounds,
+                            // whatever the actual's (§6.5.6.3).
+                            let sb = if k == 0 {
+                                shape0
+                            } else {
+                                self.static_dim(b.ty, k).and_then(|sr| {
+                                    Some((sr.left.as_i64()?, sr.dir, sr.right.as_i64()?))
+                                })
+                            };
                             cur = if call {
                                 format!("{}_at({}, {}, {}, {})", name, cur, i, sv_string(&f), l)
+                            } else if let Some(sb) = sb {
+                                let off = self.pk_off(&i, sb, &h.loc);
+                                format!("{}.d[{}]", cur, off)
                             } else {
                                 format!(
                                     "{c}.d[vh_ix({i}, {c}.l, {c}.r, {c}.dn, {f}, {l})]",
@@ -2507,19 +2524,16 @@ impl<'a> Lw<'a> {
         for (choices, v) in items {
             // A range choice may give an array the length of the choice
             // (§9.3.3.3). The element type is repeated only for a scalar.
-            if self.array_assoc(v, et) {
-                if choices.is_empty() {
-                    self.pk_place_array(&mut body, &agg, &setf, &mark, named, &mut pos, None, v, b);
-                } else if choices.iter().all(|c| matches!(c, HChoice::Range(_))) {
-                    for c in choices {
-                        let HChoice::Range(hr) = c else { continue };
-                        self.pk_place_array(
-                            &mut body, &agg, &setf, &mark, named, &mut pos, Some(hr), v, b,
-                        );
-                    }
-                } else {
-                    self.err(&v.loc, "an array value in an aggregate needs a range choice");
-                }
+            if self.d.agg_array_value(h.ty, v) {
+                let dst = AggDst::Pk {
+                    agg: agg.clone(),
+                    setf: setf.clone(),
+                    set: named.then(|| set.clone()),
+                    w,
+                    n,
+                    b,
+                };
+                self.place_assoc(&mut body, &dst, choices, &mut pos, v);
                 continue;
             }
             let x = self.ex_as(v, &er);
@@ -2580,153 +2594,155 @@ impl<'a> Lw<'a> {
         agg
     }
 
-    /// The association value is an array filling a choice, not one element.
-    fn array_assoc(&mut self, v: &HExpr, elem: TypeId) -> bool {
-        let arr = matches!(self.erepr(v), Repr::Pk(..) | Repr::Arr(..));
-        arr && self.base(v.ty) != self.base(elem)
+    /// Array value `v` of an element association, evaluated once: a
+    /// packed value is read in place, anything else as an array struct.
+    fn agg_src(&mut self, v: &HExpr) -> AggSrc {
+        if let Repr::Pk(w, n) = self.erepr(v) {
+            let x = self.ex(v);
+            let src = self.as_tmp(x, &Repr::Pk(w, n).sv());
+            return AggSrc { src, pk: Some((w, n)) };
+        }
+        let fat = self.fat_repr(v.ty, &v.loc);
+        let x = self.ex_as(v, &fat);
+        let src = self.as_tmp(x, &fat.sv());
+        AggSrc { src, pk: None }
     }
 
-    /// Copy array value `v` into a packed aggregate (§9.3.3.3). `hr` is the
-    /// range choice; `None` is a positional association written at `pos`.
-    /// Element 0 of `v` is its leftmost element.
-    fn pk_place_array<M: Fn(&str) -> String>(
-        &mut self,
-        body: &mut String,
-        agg: &str,
-        setf: &str,
-        mark: &M,
-        named: bool,
-        pos: &mut i64,
-        hr: Option<&HRange>,
-        v: &HExpr,
-        agg_bounds: Bounds,
-    ) {
-        let note = |body: &mut String, off: &str, elem: &str| {
-            let _ = writeln!(body, "{a} = {f}({a}, {off}, {elem});", a = agg, f = setf);
-            if named {
-                let _ = writeln!(body, "{}", mark(off));
-            }
-        };
-        let fat = self.fat_repr(v.ty, &v.loc);
-        let fat_sv = fat.sv();
-        let expr = self.ex_as(v, &fat);
-        let src = self.as_tmp(expr, &fat_sv);
+    /// Copy array value `v` into aggregate `dst` (§9.3.3.3): its leftmost
+    /// element at the left index of range choice `hr`, or, positionally,
+    /// at offset `*pos` (then moved past it). The lengths have to match and
+    /// the choice has to lie in the aggregate's index range.
+    fn place_array(&mut self, body: &mut String, dst: &AggDst, hr: Option<&HRange>, pos: &mut i64, v: &HExpr) {
         let (file, line, _) = self.file_line(&v.loc);
         let fatal = format!(
             "vh_fatal($sformatf(\"length mismatch in aggregate at %s:%0d\", {}, {}));",
             sv_string(&file),
             line
         );
-        let vlen_sv = format!("vh_len({s}.l, {s}.r, {s}.dn)", s = src);
+        let vlen = match self.erepr(v) {
+            Repr::Pk(_, n) => Some(n),
+            _ => self.shape(v).map(bounds_len),
+        };
+        let src = self.agg_src(v);
         let Some(hr) = hr else {
-            let Some(vb) = self.shape(v) else {
+            let Some(vlen) = vlen else {
                 self.err(&v.loc, "a positional array association needs static bounds");
                 return;
             };
-            let vlen = bounds_len(vb);
-            for i in 0..vlen {
-                let off = *pos + i;
-                note(body, &off.to_string(), &format!("{src}.d[{i}]"));
+            let end = *pos + vlen;
+            match dst {
+                AggDst::Pk { n, .. } if end > *n => {
+                    let _ = writeln!(body, "{fatal}");
+                    return;
+                }
+                AggDst::Pk { .. } => {}
+                AggDst::Arr { tv, .. } => {
+                    let _ = writeln!(body, "if ({end} > {tv}.size()) begin {fatal} end");
+                }
             }
-            *pos += vlen;
+            let _ = writeln!(
+                body,
+                "for (longint vh_i = 0; vh_i < {vlen}; vh_i++) begin {} end",
+                dst.store(&format!("{} + vh_i", *pos), &src.elem("vh_i"))
+            );
+            *pos = end;
             return;
         };
-        if let (Some(cb), Some(vb)) = (self.range_bounds(hr), self.shape(v)) {
-            let (clen, vlen) = (bounds_len(cb), bounds_len(vb));
+        let (b, n) = match dst {
+            AggDst::Pk { b, n, .. } => (Some(*b), *n),
+            AggDst::Arr { .. } => (None, 0),
+        };
+        if let (Some(cb), Some(ab), Some(vlen)) = (self.range_bounds(hr), b, vlen) {
+            // All static: the offsets, checked here.
+            let clen = bounds_len(cb);
             if clen != vlen {
                 let _ = writeln!(body, "{fatal}");
                 return;
             }
-            for i in 0..clen {
-                let idx = match cb.1 {
-                    Dir::Downto => cb.0 - i,
-                    Dir::To => cb.0 + i,
-                };
-                let off = match agg_bounds.1 {
-                    Dir::To => idx - agg_bounds.0,
-                    Dir::Downto => agg_bounds.0 - idx,
-                };
-                note(body, &off.to_string(), &format!("{src}.d[{i}]"));
+            if clen <= 0 {
+                return;
             }
+            let off = |idx: i64| match ab.1 {
+                Dir::To => idx - ab.0,
+                Dir::Downto => ab.0 - idx,
+            };
+            let (o0, o1) = (off(cb.0), off(cb.2));
+            if o0.min(o1) < 0 || o0.max(o1) >= n {
+                self.err(&v.loc, "choice is out of index range");
+                return;
+            }
+            if let (AggDst::Pk { agg, set, w, .. }, Some((sw, _))) = (dst, src.pk)
+                && sw == *w
+                && o1 >= o0
+            {
+                // In the same direction: one store of the whole value.
+                let put = self.pk_put_fn(*w, n, clen);
+                let _ = writeln!(body, "{agg} = {put}({agg}, {o0}, {});", src.src);
+                if let Some(set) = set {
+                    let _ = writeln!(
+                        body,
+                        "{set} = {set} | ((({n}'d1 << {clen}) - {n}'d1) << {o0});"
+                    );
+                }
+                return;
+            }
+            let step = if o1 >= o0 { "+" } else { "-" };
+            let _ = writeln!(
+                body,
+                "for (longint vh_i = 0; vh_i < {clen}; vh_i++) begin {} end",
+                dst.store(&format!("{o0} {step} vh_i"), &src.elem("vh_i"))
+            );
             return;
         }
-        let (left, right, dn) = self.range_parts(hr);
-        let clen = format!("vh_len(({left}), ({right}), ({dn}))");
-        let _ = writeln!(body, "if (({vlen_sv}) != ({clen})) begin {fatal} end");
-        let k = format!("(({dn}) ? (({left}) - vh_i) : (({left}) + vh_i))");
-        let off = match agg_bounds.1 {
-            Dir::To => format!("({k}) - {}", agg_bounds.0),
-            Dir::Downto => format!("{} - ({k})", agg_bounds.0),
+        // The choice's bounds are evaluated once; each index is checked.
+        let (cl, cr, cdn) = match self.range_bounds(hr) {
+            Some((l, d, r)) => (l.to_string(), r.to_string(), ((d == Dir::Downto) as u8).to_string()),
+            None => {
+                let (l, r, dn) = self.range_parts(hr);
+                (
+                    self.as_tmp(l, "longint"),
+                    self.as_tmp(r, "longint"),
+                    self.as_tmp(dn, "bit"),
+                )
+            }
         };
-        let marked = if named { mark(&off) } else { String::new() };
+        let len = match vlen {
+            Some(n) => n.to_string(),
+            None => src.len(),
+        };
+        let (bl, br, bdn) = match (dst, b) {
+            (AggDst::Arr { l, r, dn, .. }, _) => (l.clone(), r.clone(), dn.clone()),
+            (_, Some(ab)) => self.bounds_sv(ab),
+            (_, None) => unreachable!("a packed aggregate has static bounds"),
+        };
+        let _ = writeln!(body, "if (vh_len({cl}, {cr}, {cdn}) != {len}) begin {fatal} end");
+        let o = format!(
+            "vh_ix({cdn} ? {cl} - vh_i : {cl} + vh_i, {bl}, {br}, {bdn}, {}, {line})",
+            sv_string(&file)
+        );
         let _ = writeln!(
             body,
-            "for (longint vh_i = 0; vh_i < ({clen}); vh_i++) begin {a} = {f}({a}, {off}, {src}.d[vh_i]); {m} end",
-            a = agg,
-            f = setf,
-            m = marked
+            "for (longint vh_i = 0; vh_i < {len}; vh_i++) begin {} end",
+            dst.store(&o, &src.elem("vh_i"))
         );
     }
 
-    /// Copy array value `v` into a struct aggregate's range choice.
-    /// `slot` maps an index expression to the element offset.
-    fn arr_place_array<S: Fn(&str) -> String>(
-        &mut self,
-        body: &mut String,
-        tv: &str,
-        setv: &str,
-        slot: &S,
-        hr: &HRange,
-        v: &HExpr,
-    ) {
-        let fat = self.fat_repr(v.ty, &v.loc);
-        let fat_sv = fat.sv();
-        let expr = self.ex_as(v, &fat);
-        let src = self.as_tmp(expr, &fat_sv);
-        let (file, line, _) = self.file_line(&v.loc);
-        let fatal = format!(
-            "vh_fatal($sformatf(\"length mismatch in aggregate at %s:%0d\", {}, {}));",
-            sv_string(&file),
-            line
-        );
-        let vlen_sv = format!("vh_len({s}.l, {s}.r, {s}.dn)", s = src);
-        let store = |body: &mut String, index: &str, elem: &str| {
-            let o = slot(index);
-            let _ = writeln!(
-                body,
-                "{t}[{o}] = {elem}; {s}[{o}] = 1;",
-                t = tv,
-                s = setv,
-                o = o,
-                elem = elem
-            );
-        };
-        if let (Some(cb), Some(vb)) = (self.range_bounds(hr), self.shape(v)) {
-            let (clen, vlen) = (bounds_len(cb), bounds_len(vb));
-            if clen != vlen {
-                let _ = writeln!(body, "{fatal}");
-                return;
-            }
-            for i in 0..clen {
-                let idx = match cb.1 {
-                    Dir::Downto => cb.0 - i,
-                    Dir::To => cb.0 + i,
-                };
-                store(body, &idx.to_string(), &format!("{src}.d[{i}]"));
-            }
+    /// An element association whose value is an array: positional, or
+    /// one copy per range choice.
+    fn place_assoc(&mut self, body: &mut String, dst: &AggDst, choices: &[HChoice], pos: &mut i64, v: &HExpr) {
+        if choices.is_empty() {
+            self.place_array(body, dst, None, pos, v);
             return;
         }
-        let (left, right, dn) = self.range_parts(hr);
-        let clen = format!("vh_len(({left}), ({right}), ({dn}))");
-        let _ = writeln!(body, "if (({vlen_sv}) != ({clen})) begin {fatal} end");
-        let k = format!("(({dn}) ? (({left}) - vh_i) : (({left}) + vh_i))");
-        let o = slot(&k);
-        let _ = writeln!(
-            body,
-            "for (longint vh_i = 0; vh_i < ({clen}); vh_i++) begin {t}[{o}] = {src}.d[vh_i]; {s}[{o}] = 1; end",
-            t = tv,
-            s = setv
-        );
+        if !choices.iter().all(|c| matches!(c, HChoice::Range(_))) {
+            self.err(&v.loc, "an array value in an aggregate needs a range choice");
+            return;
+        }
+        for c in choices {
+            if let HChoice::Range(hr) = c {
+                self.place_array(body, dst, Some(hr), pos, v);
+            }
+        }
     }
 
     /// The aggregate of dimension `k` of array type `t` (`k > 0`: a
@@ -2805,25 +2821,68 @@ impl<'a> Lw<'a> {
                     )
                 }
             };
-            let _ = writeln!(body, "{} = new[{}];", tv, items.len());
-            for (i, (_, v)) in items.iter().enumerate() {
-                let x = elem(self, v);
-                let _ = writeln!(body, "{}[{}] = {};", tv, i, x);
+            if n == 1 && items.iter().any(|(_, v)| self.d.agg_array_value(t, v)) {
+                // Arrays give their elements in order (§9.3.3.3): the
+                // length is their sum, known at run time.
+                let p = format!("{}_p", agg);
+                decls.push((p.clone(), "longint".into()));
+                let mut parts = Vec::new();
+                for (_, v) in items {
+                    if self.d.agg_array_value(t, v) {
+                        parts.push(Err(self.agg_src(v)));
+                    } else {
+                        let x = elem(self, v);
+                        parts.push(Ok(self.as_tmp(x, &elem_sv)));
+                    }
+                }
+                let total: Vec<String> = parts
+                    .iter()
+                    .map(|x| match x {
+                        Ok(_) => "1".to_string(),
+                        Err(a) => a.len(),
+                    })
+                    .collect();
+                let _ = writeln!(body, "{} = new[{}];\n{} = 0;", tv, total.join(" + "), p);
+                for x in &parts {
+                    match x {
+                        Ok(x) => {
+                            let _ = writeln!(body, "{tv}[{p}] = {x}; {p}++;");
+                        }
+                        Err(a) => {
+                            let _ = writeln!(
+                                body,
+                                "for (longint vh_i = 0; vh_i < {}; vh_i++) begin {tv}[{p}] = {}; {p}++; end",
+                                a.len(),
+                                a.elem("vh_i")
+                            );
+                        }
+                    }
+                }
+                let _ = writeln!(
+                    body,
+                    "{lv} = {l}; {dnv} = {dn}; {rv} = {dnv} ? {lv} - ({p} - 1) : {lv} + ({p} - 1);"
+                );
+            } else {
+                let _ = writeln!(body, "{} = new[{}];", tv, items.len());
+                for (i, (_, v)) in items.iter().enumerate() {
+                    let x = elem(self, v);
+                    let _ = writeln!(body, "{}[{}] = {};", tv, i, x);
+                }
+                let _ = writeln!(
+                    body,
+                    "{} = {}; {} = {}; {} = {} ? {} - {} : {} + {};",
+                    lv,
+                    l,
+                    dnv,
+                    dn,
+                    rv,
+                    dnv,
+                    lv,
+                    items.len() as i64 - 1,
+                    lv,
+                    items.len() as i64 - 1
+                );
             }
-            let _ = writeln!(
-                body,
-                "{} = {}; {} = {}; {} = {} ? {} - {} : {} + {};",
-                lv,
-                l,
-                dnv,
-                dn,
-                rv,
-                dnv,
-                lv,
-                items.len() as i64 - 1,
-                lv,
-                items.len() as i64 - 1
-            );
         } else {
             // Named/others: the bounds come from the subtype; without one,
             // from the smallest and largest choices in the index subtype's
@@ -2899,20 +2958,17 @@ impl<'a> Lw<'a> {
             };
             let mut pos = 0i64;
             for (choices, v) in items {
-                // Same rule as a packed aggregate: a range choice may give
-                // an array the length of the choice, not one element.
-                let fills = k + 1 >= n
-                    && matches!(self.erepr(v), Repr::Pk(..) | Repr::Arr(..))
-                    && matches!(er, Repr::U8 | Repr::U32 | Repr::I32 | Repr::I64 | Repr::Real);
-                if fills {
-                    if !choices.iter().all(|c| matches!(c, HChoice::Range(_))) {
-                        self.err(&v.loc, "an array value in an aggregate needs a range choice");
-                        continue;
-                    }
-                    for c in choices {
-                        let HChoice::Range(hr) = c else { continue };
-                        self.arr_place_array(&mut body, &tv, &setv, &off, hr, v);
-                    }
+                // Same rule as a packed aggregate: the value may be an
+                // array filling its choice or its positions.
+                if n == 1 && self.d.agg_array_value(t, v) {
+                    let dst = AggDst::Arr {
+                        tv: tv.clone(),
+                        setv: setv.clone(),
+                        l: lv.clone(),
+                        r: rv.clone(),
+                        dn: dnv.clone(),
+                    };
+                    self.place_assoc(&mut body, &dst, choices, &mut pos, v);
                     continue;
                 }
                 let x = elem(self, v);
@@ -3986,6 +4042,68 @@ impl<'a> Lw<'a> {
             Repr::Arr(n, _) => format!("{}_eq({}, {})", n, a, b),
             Repr::Rec(n) => format!("{}_eq({}, {})", n, a, b),
             _ => format!("({} == {})", a, b),
+        }
+    }
+}
+
+/// Where `place_array` stores an aggregate's elements.
+enum AggDst {
+    /// A packed temporary of `n` elements of `w` bits with static bounds
+    /// `b`, stored through `setf`; `set` is its mask of named elements.
+    Pk {
+        agg: String,
+        setf: String,
+        set: Option<String>,
+        w: u32,
+        n: i64,
+        b: Bounds,
+    },
+    /// The dynamic array of an aggregate struct, its mask of named
+    /// elements and the variables holding its bounds.
+    Arr {
+        tv: String,
+        setv: String,
+        l: String,
+        r: String,
+        dn: String,
+    },
+}
+
+impl AggDst {
+    /// Store `elem` at offset `off` (from the left) and mark it named.
+    fn store(&self, off: &str, elem: &str) -> String {
+        match self {
+            AggDst::Pk { agg, setf, set, n, .. } => {
+                let mut s = format!("{agg} = {setf}({agg}, {off}, {elem});");
+                if let Some(set) = set {
+                    let _ = write!(s, " {set} = {set} | ({n}'d1 << ({off}));");
+                }
+                s
+            }
+            AggDst::Arr { tv, setv, .. } => format!("{tv}[{off}] = {elem}; {setv}[{off}] = 1;"),
+        }
+    }
+}
+
+/// An array value copied into an aggregate (a temporary).
+struct AggSrc {
+    src: String,
+    /// Packed: element width and count.
+    pk: Option<(u32, i64)>,
+}
+
+impl AggSrc {
+    /// Element `i` (from the left).
+    fn elem(&self, i: &str) -> String {
+        match self.pk {
+            Some((w, n)) => Lw::pk_sel(&self.src, w, n, i),
+            None => format!("{}.d[{}]", self.src, i),
+        }
+    }
+    fn len(&self) -> String {
+        match self.pk {
+            Some((_, n)) => n.to_string(),
+            None => format!("{}.d.size()", self.src),
         }
     }
 }

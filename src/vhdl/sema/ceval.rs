@@ -630,10 +630,15 @@ impl<'a> Interp<'a> {
         let positional = items.iter().all(|(c, _)| c.is_empty());
         let target = self.bounds(t);
         if positional {
-            let elems = items
-                .iter()
-                .map(|(_, e)| self.expr(e))
-                .collect::<Option<Vec<_>>>()?;
+            // An array of the aggregate's type gives its elements in order.
+            let mut elems = Vec::new();
+            for (_, e) in items {
+                let v = self.expr(e)?;
+                match v {
+                    Value::Array(av) if d.agg_array_value(t, e) => elems.extend(av.elems),
+                    v => elems.push(v),
+                }
+            }
             let n = elems.len() as i64;
             let (l, dir) = match target {
                 Some((l, dir, r)) => {
@@ -668,6 +673,29 @@ impl<'a> Interp<'a> {
         let mut others = None;
         for (choices, e) in items {
             let v = self.expr(e)?;
+            if d.agg_array_value(t, e) {
+                // Its elements fill the range choice from its left index.
+                let Value::Array(av) = &v else {
+                    return None;
+                };
+                for c in choices {
+                    let HChoice::Range(r) = c else {
+                        return None;
+                    };
+                    let (l, dir, rr) = self.range(r)?;
+                    if len(l, dir, rr) != av.elems.len() as i64 {
+                        return None;
+                    }
+                    for (i, x) in av.elems.iter().enumerate() {
+                        let k = match dir {
+                            Dir::To => l + i as i64,
+                            Dir::Downto => l - i as i64,
+                        };
+                        named.push((k, k, x.clone()));
+                    }
+                }
+                continue;
+            }
             for c in choices {
                 match c {
                     HChoice::Others => others = Some(v.clone()),

@@ -10,6 +10,7 @@ use crate::ast::decl::{
 };
 use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral, UnaryOp};
 use crate::ast::module::PortList;
+use crate::ast::types::DataType;
 
 use super::sema::{RootReq, SvConst, SvModule};
 
@@ -28,7 +29,17 @@ pub fn sv_modules(descs: &[Description]) -> BTreeMap<String, SvModule> {
             ..Default::default()
         };
         match ports {
-            PortList::Ansi(ps) => m.ports.extend(ps.iter().map(|p| p.name.name.clone())),
+            PortList::Ansi(ps) => {
+                m.ports.extend(ps.iter().map(|p| p.name.name.clone()));
+                m.unpacked.extend(
+                    ps.iter()
+                        .filter(|p| {
+                            !p.dimensions.is_empty()
+                                || matches!(&p.data_type, Some(DataType::Struct(s)) if !s.packed)
+                        })
+                        .map(|p| p.name.name.clone()),
+                );
+            }
             PortList::NonAnsi(ps) => m.ports.extend(ps.iter().map(|p| p.name.clone())),
             PortList::Empty => {}
         }

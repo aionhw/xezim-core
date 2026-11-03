@@ -164,10 +164,19 @@ impl<'a> Lw<'a> {
                     return Some(b);
                 }
                 // Positional: from the index subtype's left bound (§9.3.3.3).
+                // An array of the aggregate's type gives all its elements.
                 if items.iter().all(|(c, _)| c.is_empty()) && self.ndims(h.ty) == 1 {
+                    let mut n = 0;
+                    for (_, v) in items {
+                        n += if self.d.agg_array_value(h.ty, v) {
+                            bounds_len(self.shape(v)?)
+                        } else {
+                            1
+                        };
+                    }
                     let (il, idn) = self.index_left_dir(h.ty);
                     let dir = if idn { Dir::Downto } else { Dir::To };
-                    return Some(bounds_from(il, dir, items.len() as i64));
+                    return Some(bounds_from(il, dir, n));
                 }
                 None
             }
@@ -182,6 +191,27 @@ impl<'a> Lw<'a> {
         match &self.d.types[self.base(t)].kind {
             TypeKind::Record(fields) => fields.iter().map(|(_, ft)| *ft).collect(),
             _ => Vec::new(),
+        }
+    }
+
+    /// The type part `h` of a value is stored as (what `erepr` gives): a
+    /// record field or an array element as declared, an unconstrained one
+    /// a struct whatever the constraint of the subtype.
+    pub(super) fn storage_type(&mut self, h: &HExpr) -> TypeId {
+        if let HExprKind::Field(b, i) = &h.kind {
+            return self.field_storage(b.ty).get(*i).copied().unwrap_or(h.ty);
+        }
+        if !matches!(self.erepr(h), Repr::Arr(..)) || matches!(self.repr(h.ty, &h.loc), Repr::Arr(..)) {
+            return h.ty;
+        }
+        match &h.kind {
+            HExprKind::Index(b, idx) => match &self.d.types[self.base(b.ty)].kind {
+                TypeKind::Array { index, elem } if index.len() == idx.len() => *elem,
+                _ => h.ty,
+            },
+            // A slice of such a part: stored as the part is.
+            HExprKind::Slice(b, _) => self.storage_type(b),
+            _ => h.ty,
         }
     }
 
@@ -366,6 +396,20 @@ impl<'a> Lw<'a> {
             HExprKind::Call(s, args) => self.call_repr(*s, args, h),
             HExprKind::Cond(..) => self.cond_repr(h),
             HExprKind::ArrayAgg(_) => self.shape_repr(h),
+            // An element: as its array stores it. An element of an
+            // unconstrained element type is a struct whatever the
+            // subtype's element constraint (`(open)(7 downto 0)`), as a
+            // record field is.
+            HExprKind::Index(b, idx) => {
+                let mut r = self.erepr(b);
+                for _ in idx {
+                    match r {
+                        Repr::Arr(_, er) => r = *er,
+                        _ => return self.repr(h.ty, &h.loc),
+                    }
+                }
+                r
+            }
             // A field: the struct member's representation.
             HExprKind::Field(b, i) => match self.field_storage(b.ty).get(*i) {
                 Some(ft) => self.repr(*ft, &h.loc),
