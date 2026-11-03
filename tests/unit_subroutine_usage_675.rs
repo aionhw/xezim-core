@@ -199,3 +199,34 @@ module top; leaf a(); endmodule
     .expect("elaborate");
     assert_eq!(subs(&defs["leaf"]), ["first", "second"]);
 }
+
+/// IEEE 1800-2023 §23.3.1: a package or a class is never instantiated, so it
+/// is no hierarchy root; with no top named, one uninstantiated module beside
+/// them is still the unit-body carrier (#834).
+#[test]
+fn a_package_or_class_does_not_make_the_root_ambiguous() {
+    let with_package = r#"
+function automatic int unused(); return 1; endfunction
+package unrelated_pkg; int v; endpackage
+module leaf; endmodule
+module top; leaf a(); endmodule
+"#;
+    let (defs, _) = elaborate(with_package, None).expect("package beside the root");
+    assert_eq!(subs(&defs["top"]), ["unused"]);
+    assert!(subs(&defs["leaf"]).is_empty());
+
+    let with_class = r#"
+function automatic int unused(); return 1; endfunction
+class lookup; extern function int get(int x); endclass
+function int lookup::get(int x); return x+3; endfunction
+module leaf; endmodule
+module top; leaf a(); lookup value; initial begin value=new; $display("%0d", value.get(4)); end endmodule
+"#;
+    let (defs, design) = elaborate(with_class, None).expect("class beside the root");
+    assert_eq!(subs(&defs["top"]), ["unused", "lookup::get"]);
+    assert!(subs(&defs["leaf"]).is_empty());
+    match &design.classes["lookup"].methods["get"].kind {
+        xezim_core::ast::decl::ClassMethodKind::Function(f) => assert!(!f.items.is_empty()),
+        _ => panic!("expected function body"),
+    }
+}
