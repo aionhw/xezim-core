@@ -3492,6 +3492,11 @@ pub struct ElaboratedModule {
     /// (LRM §21.2.1.7), which must walk nested structs/arrays/enums.
     #[serde(default)]
     pub var_decl_types: HashMap<String, DataType>,
+    /// Value parameter -> its declared type, for an explicitly typed one
+    /// (`localparam e_t RST`), keyed as in `parameters`. The self-determined
+    /// type of a parameter (§6.20.2), e.g. for a `default:` key (§10.9.1).
+    #[serde(default)]
+    pub param_decl_types: HashMap<String, DataType>,
     /// Struct variable -> its top-level member names in DECLARATION order, for
     /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
     /// offset (i.e. reversed) and unpacked members live in separate signals, so
@@ -4031,6 +4036,7 @@ impl ElaboratedModule {
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             var_decl_types: HashMap::default(),
+            param_decl_types: HashMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
@@ -7937,6 +7943,31 @@ pub fn elaborate_module_with_defs(
         if let ModuleItem::ImportDeclaration(imp) = item {
             if let Some(defs) = all_defs {
                 process_import(imp, &mut elab, defs)?;
+            }
+        }
+    }
+    record_param_decl_types(
+        &mut elab,
+        module
+            .params()
+            .iter()
+            .chain(item_param_decls(module.items())),
+        str::to_string,
+        DataType::clone,
+    );
+    if let Some(defs) = all_defs {
+        for def in defs.values() {
+            if let Definition::Package(p) = def {
+                let pds = p.items.iter().filter_map(|i| match i {
+                    PackageItem::Parameter(pd) => Some(pd),
+                    _ => None,
+                });
+                record_param_decl_types(
+                    &mut elab,
+                    pds,
+                    |n| format!("{}::{n}", p.name.name),
+                    DataType::clone,
+                );
             }
         }
     }
@@ -23035,6 +23066,41 @@ fn peel_unpacked_typed_pattern(e: &Expression) -> &Expression {
     if unpacked { pattern } else { e }
 }
 
+/// §6.20.2: record under `key(name)` the declared type of each explicitly
+/// typed value parameter of `pds`.
+fn record_param_decl_types<'a>(
+    elab: &mut ElaboratedModule,
+    pds: impl Iterator<Item = &'a ParameterDeclaration>,
+    key: impl Fn(&str) -> String,
+    ty: impl Fn(&DataType) -> DataType,
+) {
+    for pd in pds {
+        let ParameterKind::Data {
+            data_type,
+            assignments,
+        } = &pd.kind
+        else {
+            continue;
+        };
+        if matches!(data_type, DataType::Implicit { signing: None, dimensions, .. } if dimensions.is_empty())
+        {
+            continue;
+        }
+        let dt = ty(data_type);
+        for a in assignments.iter().filter(|a| a.dimensions.is_empty()) {
+            elab.param_decl_types.insert(key(&a.name.name), dt.clone());
+        }
+    }
+}
+
+/// The parameter declarations among `items`, header ones excluded.
+fn item_param_decls(items: &[ModuleItem]) -> impl Iterator<Item = &ParameterDeclaration> {
+    items.iter().filter_map(|item| match item {
+        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+        _ => None,
+    })
+}
+
 /// Record a typedef's full definition for const-eval (see TYPEDEF_SHAPES_TLS).
 /// Called whenever a typedef is (re-)registered, so a later same-named typedef
 /// replaces the earlier one exactly as it does in `typedef_types`.
@@ -37309,6 +37375,15 @@ fn inline_module_items(
                         _ => None,
                     })
                     .collect();
+                record_param_decl_types(
+                    elab,
+                    sub_mod
+                        .params()
+                        .iter()
+                        .chain(item_param_decls(&prepared_sub.effective_items)),
+                    |n| cat2(&inst_prefix, n),
+                    |dt| scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix),
+                );
                 let mut sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
                     sub_local_params.clone()
                 } else if sub_local_params.is_empty() {

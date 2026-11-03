@@ -189,7 +189,8 @@ pub use value::Value;
 /// assoc_inner_string_keys} and ElaboratedClass.{assoc_coll_properties,
 /// assoc_row_property_dims}, superseded by the collection shapes.
 /// \x36 = string keys in element names escaped (`value::encode_name_key`).
-/// \x37 = \x36 + ExprKind::TypedPattern, the type of `T'{...}` (§10.9).
+/// \x37 = \x36 + ExprKind::TypedPattern, the type of `T'{...}` (§10.9), and
+/// ElaboratedModule.param_decl_types.
 pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x37";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
