@@ -731,6 +731,7 @@ impl Parser {
                 if self.at(TokenKind::Hash) && self.peek_kind() == TokenKind::LParen {
                     self.bump(); // #
                     self.bump(); // (
+                    self.check_param_list_form();
                     let mut depth = 1;
                     let mut text = String::new();
                     while depth > 0 && !self.at(TokenKind::Eof) {
@@ -1649,6 +1650,7 @@ impl Parser {
                 let mut spec_text: Option<String> = None;
                 if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
+                        self.check_param_list_form();
                         let mut depth = 1;
                         let mut text = String::new();
                         while depth > 0 && !self.at(TokenKind::Eof) {

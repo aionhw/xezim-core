@@ -4395,7 +4395,7 @@ impl Parser {
     }
 
     /// The optional `#(...)` parameter value assignment of an instantiation
-    /// (`mod #(.P(v), 3) u (...)`), shared by module items and `bind`
+    /// (`mod #(.P(v), .Q(3)) u (...)`), shared by module items and `bind`
     /// directives. `None` when no `#` follows.
     pub(super) fn parse_instantiation_params(&mut self) -> Option<Vec<ParamConnection>> {
         if !self.at(TokenKind::Hash) {
@@ -4403,6 +4403,7 @@ impl Parser {
         }
         self.bump();
         if self.eat(TokenKind::LParen).is_some() {
+            self.check_param_list_form();
             let mut p = Vec::new();
             while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                 if self.at(TokenKind::Dot) {
