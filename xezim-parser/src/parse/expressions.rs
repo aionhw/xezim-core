@@ -990,7 +990,17 @@ impl Parser {
                 while let ExprKind::Paren(peeled) = lhs.kind {
                     lhs = *peeled;
                 }
-                if matches!(lhs.kind, ExprKind::Number(_)) {
+                // Any other constant expression sizes the cast too:
+                // `(W+1)'(x)`, `$clog2(N)'(x)`, `(N > 4 ? 8 : 4)'(x)`.
+                if matches!(
+                    lhs.kind,
+                    ExprKind::Number(_)
+                        | ExprKind::Binary { .. }
+                        | ExprKind::Unary { .. }
+                        | ExprKind::Conditional { .. }
+                        | ExprKind::SystemCall { .. }
+                        | ExprKind::Call { .. }
+                ) {
                     lhs = Expression::new(
                         ExprKind::SystemCall {
                             name: "$__xz_size_cast".to_string(),
