@@ -989,22 +989,26 @@ impl Parser {
                     let to = Self::udp_norm_level(chars[1])?;
                     out.push(UdpSym::Edge { from, to });
                 }
+                // A.5.3: each symbol is one character, and adjacent symbols
+                // (`01`, `bB`, `x0`) reach here as one token, so take every
+                // character of the token as its own symbol.
                 _ => {
-                    let sym = match t.text.as_str() {
-                        "0" => UdpSym::Level('0'),
-                        "1" => UdpSym::Level('1'),
-                        "x" | "X" => UdpSym::Level('x'),
-                        "z" | "Z" => UdpSym::Level('x'), // input z ⇒ x
-                        "?" => UdpSym::AnyQ,
-                        "b" | "B" => UdpSym::B,
-                        "r" | "R" => UdpSym::EdgeShort('r'),
-                        "f" | "F" => UdpSym::EdgeShort('f'),
-                        "p" | "P" => UdpSym::EdgeShort('p'),
-                        "n" | "N" => UdpSym::EdgeShort('n'),
-                        "*" => UdpSym::EdgeShort('*'),
-                        _ => return None,
-                    };
-                    out.push(sym);
+                    for c in t.text.chars() {
+                        out.push(match c {
+                            '0' => UdpSym::Level('0'),
+                            '1' => UdpSym::Level('1'),
+                            'x' | 'X' => UdpSym::Level('x'),
+                            'z' | 'Z' => UdpSym::Level('x'), // input z ⇒ x
+                            '?' => UdpSym::AnyQ,
+                            'b' | 'B' => UdpSym::B,
+                            'r' | 'R' => UdpSym::EdgeShort('r'),
+                            'f' | 'F' => UdpSym::EdgeShort('f'),
+                            'p' | 'P' => UdpSym::EdgeShort('p'),
+                            'n' | 'N' => UdpSym::EdgeShort('n'),
+                            '*' => UdpSym::EdgeShort('*'),
+                            _ => return None,
+                        });
+                    }
                     i += 1;
                 }
             }
