@@ -2239,13 +2239,15 @@ fn parse_and_elaborate(
         for bind in &top_level_binds {
             instantiated.insert(bind.instantiation.module_name.name.clone());
         }
-        let mut roots = definitions.iter().filter(|(name, d)| {
-            !instantiated.contains(name.as_str())
-                && !matches!(d, SourceDefinition::Typedef(_) | SourceDefinition::Udp(_))
-        });
-        roots.next().and_then(|(name, d)| {
-            (roots.next().is_none() && carrier_eligible(d)).then(|| name.clone())
-        })
+        // §23.3.1: only an uninstantiated module, interface or program is a
+        // hierarchy root. A package or a class is consumed globally and never
+        // instantiated, so it must not make the root ambiguous (#834).
+        let mut roots = definitions
+            .iter()
+            .filter(|(name, d)| !instantiated.contains(name.as_str()) && carrier_eligible(d));
+        roots
+            .next()
+            .and_then(|(name, _)| roots.next().is_none().then(|| name.clone()))
     };
     let unit_usage = unit_subroutine_usage::Usage::new(&top_level_functions, &top_level_tasks);
     let common_unit_refs = unit_usage.references(&(
