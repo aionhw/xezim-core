@@ -74,3 +74,20 @@ endmodule";
     let r = parse(src);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
 }
+
+/// A.5.3 (aionhw/xezim#841): a UDP table row may write its symbols next to
+/// each other; the lexer joins them into one token, and each character is
+/// still one symbol.
+#[test]
+fn udp_row_symbols_may_be_adjacent() {
+    let src = "primitive p (o, a, b, c);\n  output o; input a, b, c;\n  table\n    00?:0;\n    1bB:1;\n    x0?:x;\n  endtable\nendprimitive\n";
+    let r = sv_parser::parse(src);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let tree = format!("{:?}", r.source);
+    assert!(tree.contains("Udp("), "the primitive was not kept as a UDP: {tree}");
+    assert!(
+        !r.warnings.iter().any(|d| d.message.contains("UNSUPPORTED UDP TABLE")),
+        "{:?}",
+        r.warnings
+    );
+}
