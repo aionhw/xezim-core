@@ -35410,11 +35410,21 @@ fn inline_module_items(
                 // binds A and C (not A and B).
                 let mut sub_param_decls: Vec<&ParameterDeclaration> =
                     sub_mod.params().iter().filter(|p| !p.local).collect();
-                for it in sub_mod.items() {
-                    if let ModuleItem::ParameterDeclaration(pd) = it {
-                        sub_param_decls.push(pd);
+                // §27.3: a `generate ... endgenerate` region only wraps module
+                // items, so its parameters take positional slots too.
+                fn body_params<'a>(
+                    items: &'a [ModuleItem],
+                    out: &mut Vec<&'a ParameterDeclaration>,
+                ) {
+                    for it in items {
+                        match it {
+                            ModuleItem::ParameterDeclaration(pd) => out.push(pd),
+                            ModuleItem::GenerateRegion(gr) => body_params(&gr.items, out),
+                            _ => {}
+                        }
                     }
                 }
+                body_params(sub_mod.items(), &mut sub_param_decls);
                 if dbg_param {
                     eprintln!(
                         "[DBG_PARAM] inlining {} into prefix='{}', inst.params={:?}, inst_name={}, sub_param_decls={}",
