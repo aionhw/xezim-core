@@ -2559,13 +2559,13 @@ impl<'a> Lw<'a> {
             let _ = writeln!(ub, "    if (vh_s{s}_act) vh_s{s}_lact = vh_now;", s = s);
         }
         ub.push_str(&self.boundary_write(false, "    "));
-        if boundary {
-            let _ = write!(
-                k,
-                "  // The update phase of a simulation cycle (§14.7.3, §14.7.5.3 b, c).\n  function automatic void vh_update();\n{}  endfunction\n",
-                ub
-            );
-        }
+        // Always a function. Pasting this into the cycle block makes that
+        // block too large to compile, so every clock edge interprets it.
+        let _ = write!(
+            k,
+            "  // The update phase of a simulation cycle (§14.7.3, §14.7.5.3 b, c).\n  function automatic void vh_update();\n{}  endfunction\n",
+            ub
+        );
 
         // ---- the resumption of processes (§14.7.5.3 e): the conditions.
         let mut conds: Vec<Option<String>> = Vec::new();
@@ -2639,9 +2639,7 @@ impl<'a> Lw<'a> {
             Next,
         }
         let mut segs: Vec<(Seg, String)> = Vec::new();
-        for line in ub.lines() {
-            segs.push((Seg::Update, format!("  {}\n", line)));
-        }
+        segs.push((Seg::Update, "    vh_update();\n".into()));
         let bodies: std::collections::BTreeMap<usize, (String, String)> = self
             .fproc_bodies
             .iter()
@@ -2650,12 +2648,12 @@ impl<'a> Lw<'a> {
         // The blocks' variables at module scope: a block-local declaration
         // keeps the simulator from compiling the block.
         let mut cyc = String::new();
-        let _ = writeln!(cyc, "  longint vh_cyc_n;");
         for (temps, _) in bodies.values() {
             for line in temps.lines() {
                 let _ = writeln!(cyc, "  {}", line.trim_start());
             }
         }
+        let mut sens = String::new();
         for (pi, c) in conds.iter().enumerate() {
             let Some(c) = c.clone() else { continue };
             let mut t = String::new();
@@ -2667,17 +2665,21 @@ impl<'a> Lw<'a> {
                     c = c
                 );
             } else if fp.contains(&pi) {
-                let body = bodies.get(&pi).map(|b| b.1.clone()).unwrap_or_default();
+                // The body stays in vh_run, and the sensitivity test stays in
+                // its own function. Inlining either into this always block
+                // makes the block too large to compile, which is where a
+                // clock edge was spending its time.
                 let _ = writeln!(
-                    t,
-                    "    if (vh_r < 0 && vh_from <= {p} && ({c})) begin",
+                    sens,
+                    "  function automatic bit vh_sens{p}();\n    return ({c});\n  endfunction",
                     p = pi,
                     c = c
                 );
-                for line in body.lines() {
-                    let _ = writeln!(t, "  {}", line);
-                }
-                let _ = writeln!(t, "    end");
+                let _ = writeln!(
+                    t,
+                    "    if (vh_r < 0 && vh_from <= {p} && vh_sens{p}()) vh_run{p}();",
+                    p = pi
+                );
             } else {
                 let _ = writeln!(
                     t,
@@ -2688,18 +2690,9 @@ impl<'a> Lw<'a> {
             }
             segs.push((Seg::Scan, t));
         }
-        segs.push((Seg::Next, "      vh_cyc_n = -64'sd1;\n".into()));
-        for line in nx.lines() {
-            // `vh_n` only (not `vh_now`).
-            segs.push((
-                Seg::Next,
-                format!(
-                    "  {}\n",
-                    line.replace("vh_now", "\u{1}").replace("vh_n", "vh_cyc_n").replace('\u{1}', "vh_now")
-                ),
-            ));
-        }
-        segs.push((Seg::Next, "      vh_nxt = vh_cyc_n;\n".into()));
+        // `vh_next` already holds this. Pasting it here has the same effect
+        // as pasting the update: the cycle block stops compiling.
+        segs.push((Seg::Next, "      vh_nxt = vh_next();\n".into()));
         // Pack the segments into blocks.
         let mut blocks: Vec<Vec<(Seg, String)>> = vec![Vec::new()];
         let mut lines = 0usize;
@@ -2762,6 +2755,7 @@ impl<'a> Lw<'a> {
             }
             let _ = writeln!(cyc, "  end");
         }
+        k.push_str(&sens);
         k.push_str(&cyc);
 
         // ---- the kernel thread.
