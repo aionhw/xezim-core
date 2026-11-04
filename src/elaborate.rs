@@ -4178,7 +4178,18 @@ impl ElaboratedModule {
                 &self.arrays,
                 Some(&self.descending_arrays),
                 Some(&self.unpacked_decl_dims),
-            ) {
+            )
+            .or_else(|| {
+                slice_array_assign_parts(
+                    &ca.lhs,
+                    &ca.rhs,
+                    ca.delay,
+                    &self.arrays,
+                    Some(&self.descending_arrays),
+                    Some(&self.unpacked_decl_dims),
+                    &self.parameters,
+                )
+            }) {
                 Some(parts) => {
                     for e in parts {
                         f(e);
@@ -6318,76 +6329,77 @@ fn resolve_interface_modport_view(
 
 fn validate_class_constraint_expr(
     expr: &Expression,
-    allowed: &HashSet<String>,
+    names: &ConstraintNames,
+    locals: &[&str],
 ) -> Result<(), String> {
     match &expr.kind {
         ExprKind::Ident(hier) if hier.path.len() == 1 => {
             let n = &hier.path[0].name.name;
-            if n != "this" && n != "super" && n != "new" && !allowed.contains(n) {
+            if n != "this" && n != "super" && n != "new" && !names.contains(n, locals) {
                 return Err(format!("Undeclared identifier '{}' in class constraint", n));
             }
         }
-        ExprKind::Unary { operand, .. } => validate_class_constraint_expr(operand, allowed)?,
+        ExprKind::Unary { operand, .. } => validate_class_constraint_expr(operand, names, locals)?,
         ExprKind::Binary { left, right, .. } => {
-            validate_class_constraint_expr(left, allowed)?;
-            validate_class_constraint_expr(right, allowed)?;
+            validate_class_constraint_expr(left, names, locals)?;
+            validate_class_constraint_expr(right, names, locals)?;
         }
         ExprKind::Conditional {
             condition,
             then_expr,
             else_expr,
         } => {
-            validate_class_constraint_expr(condition, allowed)?;
-            validate_class_constraint_expr(then_expr, allowed)?;
-            validate_class_constraint_expr(else_expr, allowed)?;
+            validate_class_constraint_expr(condition, names, locals)?;
+            validate_class_constraint_expr(then_expr, names, locals)?;
+            validate_class_constraint_expr(else_expr, names, locals)?;
         }
         ExprKind::Concatenation(parts) => {
             for p in parts {
-                validate_class_constraint_expr(p, allowed)?;
+                validate_class_constraint_expr(p, names, locals)?;
             }
         }
         ExprKind::Replication { count, exprs } => {
-            validate_class_constraint_expr(count, allowed)?;
+            validate_class_constraint_expr(count, names, locals)?;
             for e in exprs {
-                validate_class_constraint_expr(e, allowed)?;
+                validate_class_constraint_expr(e, names, locals)?;
             }
         }
         ExprKind::Index { expr, index } => {
-            validate_class_constraint_expr(expr, allowed)?;
-            validate_class_constraint_expr(index, allowed)?;
+            validate_class_constraint_expr(expr, names, locals)?;
+            validate_class_constraint_expr(index, names, locals)?;
         }
         ExprKind::RangeSelect {
             expr, left, right, ..
         } => {
-            validate_class_constraint_expr(expr, allowed)?;
-            validate_class_constraint_expr(left, allowed)?;
-            validate_class_constraint_expr(right, allowed)?;
+            validate_class_constraint_expr(expr, names, locals)?;
+            validate_class_constraint_expr(left, names, locals)?;
+            validate_class_constraint_expr(right, names, locals)?;
         }
         ExprKind::Inside { expr, ranges } => {
-            validate_class_constraint_expr(expr, allowed)?;
+            validate_class_constraint_expr(expr, names, locals)?;
             for r in ranges {
-                validate_class_constraint_expr(r, allowed)?;
+                validate_class_constraint_expr(r, names, locals)?;
             }
         }
         ExprKind::Range(lo, hi) => {
-            validate_class_constraint_expr(lo, allowed)?;
-            validate_class_constraint_expr(hi, allowed)?;
+            validate_class_constraint_expr(lo, names, locals)?;
+            validate_class_constraint_expr(hi, names, locals)?;
         }
-        ExprKind::Paren(inner) => validate_class_constraint_expr(inner, allowed)?,
+        ExprKind::Paren(inner) => validate_class_constraint_expr(inner, names, locals)?,
         ExprKind::Call { func: _, args } => {
             // Don't validate the callee identifier: it resolves to a function/method
             // (including class methods, package functions, built-ins) that may not be
             // in the property-name allowed set.
             for a in args {
-                validate_class_constraint_expr(a, allowed)?;
+                validate_class_constraint_expr(a, names, locals)?;
             }
         }
         ExprKind::SystemCall { args, .. } => {
             for a in args {
-                validate_class_constraint_expr(a, allowed)?;
+                validate_class_constraint_expr(a, names, locals)?;
             }
         }
-        ExprKind::MemberAccess { expr, .. } => validate_class_constraint_expr(expr, allowed)?,
+        ExprKind::MemberAccess { expr, .. } => validate_class_constraint_expr(expr, names, locals)?,
         _ => {}
     }
     Ok(())
@@ -6395,18 +6407,19 @@ fn validate_class_constraint_expr(
 
 fn validate_constraint_item_names(
     item: &ConstraintItem,
-    allowed: &HashSet<String>,
+    names: &ConstraintNames,
+    locals: &[&str],
 ) -> Result<(), String> {
     match item {
-        ConstraintItem::Expr(expr) => validate_class_constraint_expr(expr, allowed)?,
+        ConstraintItem::Expr(expr) => validate_class_constraint_expr(expr, names, locals)?,
         ConstraintItem::Inside { expr, range, .. } => {
-            validate_class_constraint_expr(expr, allowed)?;
+            validate_class_constraint_expr(expr, names, locals)?;
             for r in range {
                 match r {
-                    ConstraintRange::Value(e) => validate_class_constraint_expr(e, allowed)?,
+                    ConstraintRange::Value(e) => validate_class_constraint_expr(e, names, locals)?,
                     ConstraintRange::Range { lo, hi } => {
-                        validate_class_constraint_expr(lo, allowed)?;
-                        validate_class_constraint_expr(hi, allowed)?;
+                        validate_class_constraint_expr(lo, names, locals)?;
+                        validate_class_constraint_expr(hi, names, locals)?;
                     }
                 }
             }
@@ -6416,8 +6429,8 @@ fn validate_constraint_item_names(
             constraint,
             ..
         } => {
-            validate_class_constraint_expr(condition, allowed)?;
-            validate_constraint_item_names(constraint, allowed)?;
+            validate_class_constraint_expr(condition, names, locals)?;
+            validate_constraint_item_names(constraint, names, locals)?;
         }
         ConstraintItem::IfElse {
             condition,
@@ -6425,36 +6438,39 @@ fn validate_constraint_item_names(
             else_item,
             ..
         } => {
-            validate_class_constraint_expr(condition, allowed)?;
-            validate_constraint_item_names(then_item, allowed)?;
+            validate_class_constraint_expr(condition, names, locals)?;
+            validate_constraint_item_names(then_item, names, locals)?;
             if let Some(ei) = else_item {
-                validate_constraint_item_names(ei, allowed)?;
+                validate_constraint_item_names(ei, names, locals)?;
             }
         }
         ConstraintItem::Foreach {
             array, vars, item, ..
         } => {
-            validate_class_constraint_expr(array, allowed)?;
-            let mut inner = allowed.clone();
-            for id in vars.iter().flatten() {
-                inner.insert(id.name.clone());
-            }
-            validate_constraint_item_names(item, &inner)?;
+            validate_class_constraint_expr(array, names, locals)?;
+            // §18.5.8.1: the loop variables are a scope of their own over
+            // the enclosing one, not a copy of every name.
+            let inner: Vec<&str> = locals
+                .iter()
+                .copied()
+                .chain(vars.iter().flatten().map(|id| id.name.as_str()))
+                .collect();
+            validate_constraint_item_names(item, names, &inner)?;
         }
-        ConstraintItem::Soft(inner) => validate_constraint_item_names(inner, allowed)?,
+        ConstraintItem::Soft(inner) => validate_constraint_item_names(inner, names, locals)?,
         ConstraintItem::Unique { exprs, .. } => {
             for e in exprs {
-                validate_class_constraint_expr(e, allowed)?;
+                validate_class_constraint_expr(e, names, locals)?;
             }
         }
         ConstraintItem::Block(items) => {
             for it in items {
-                validate_constraint_item_names(it, allowed)?;
+                validate_constraint_item_names(it, names, locals)?;
             }
         }
         ConstraintItem::Solve { before, after, .. } => {
             for id in before {
-                if !allowed.contains(&id.name) {
+                if !names.contains(&id.name, locals) {
                     return Err(format!(
                         "Undeclared identifier '{}' in class constraint",
                         id.name
@@ -6462,7 +6478,7 @@ fn validate_constraint_item_names(
                 }
             }
             for id in after {
-                if !allowed.contains(&id.name) {
+                if !names.contains(&id.name, locals) {
                     return Err(format!(
                         "Undeclared identifier '{}' in class constraint",
                         id.name
@@ -6672,27 +6688,21 @@ fn validate_class_constraints(
     all_defs: Option<&HashMap<String, Definition>>,
     module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
     scope: Option<&ElaboratedModule>,
+    inst_prefix: Option<&str>,
 ) -> Result<(), String> {
+    // A class without a constraint has nothing to check (aionhw/xezim#871).
+    if !c
+        .items
+        .iter()
+        .any(|it| matches!(it, ClassItem::Constraint(_)))
+    {
+        return Ok(());
+    }
     let mut allowed = HashSet::default();
     let mut seen = HashSet::default();
     collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
     if let Some(defs) = all_defs {
         collect_global_constraint_names(defs, &mut allowed);
-    }
-    // §18.3: a constraint expression may reference any variable visible at the
-    // class's declaration scope — for a class declared INSIDE a module that
-    // includes the module's own variables and parameters (state variables,
-    // held constant during solving). For a class inlined FROM an instance the
-    // instance's signals are registered under prefixed names while the
-    // constraint says the bare one, so accept the leaf spelling too.
-    if let Some(elab) = scope {
-        allowed.extend(elab.signals.keys().cloned());
-        allowed.extend(
-            elab.signals
-                .keys()
-                .filter_map(|k| k.rsplit_once('.').map(|(_, leaf)| leaf.to_string())),
-        );
-        allowed.extend(elab.parameters.keys().cloned());
     }
     // Enum typedefs declared at MODULE scope (before the class) are legal
     // constraint references too — `constraint c { m != R0; }` where `reg_t`
@@ -6707,14 +6717,76 @@ fn validate_class_constraints(
             }
         }
     }
+    let names = ConstraintNames {
+        own: allowed,
+        scope,
+        inst_prefix,
+        leaves: std::cell::OnceCell::new(),
+    };
     for item in &c.items {
         if let ClassItem::Constraint(con) = item {
             for it in &con.items {
-                validate_constraint_item_names(it, &allowed)?;
+                validate_constraint_item_names(it, &names, &[])?;
             }
         }
     }
     Ok(())
+}
+
+/// The names a class constraint may read (§18.3): the class's own members,
+/// the global names and the enum names in `own`, and the variables and
+/// parameters of the scope the class is declared in, looked up in the
+/// elaborated design as a constraint reads them. For a class inlined from an
+/// instance the instance's signals are registered under prefixed names while
+/// the constraint says the bare one, so the leaf spelling of any signal is
+/// accepted too. Copying every signal and parameter name of the design
+/// inlined so far into a set for every class made elaboration grow with the
+/// square of the instances (aionhw/xezim#871); the accepted names are the
+/// same.
+struct ConstraintNames<'a> {
+    own: HashSet<String>,
+    scope: Option<&'a ElaboratedModule>,
+    /// The prefix of the instance the class was inlined from (`g[0].u.`).
+    inst_prefix: Option<&'a str>,
+    /// The last segment of every dotted signal key, built on first use.
+    leaves: std::cell::OnceCell<HashSet<String>>,
+}
+
+impl ConstraintNames<'_> {
+    /// Whether `n` is a name a constraint may read; `locals` are the loop
+    /// variables of the enclosing `foreach` constraints (§18.5.8.1).
+    fn contains(&self, n: &str, locals: &[&str]) -> bool {
+        if locals.contains(&n) || self.own.contains(n) {
+            return true;
+        }
+        let Some(elab) = self.scope else {
+            return false;
+        };
+        if elab.signals.contains_key(n) || elab.parameters.contains_key(n) {
+            return true;
+        }
+        // The instance prefix carries its trailing dot (`g[0].u.`).
+        if !n.contains('.')
+            && self.inst_prefix.is_some_and(|p| {
+                let key = if p.ends_with('.') {
+                    format!("{p}{n}")
+                } else {
+                    format!("{p}.{n}")
+                };
+                elab.signals.contains_key(&key)
+            })
+        {
+            return true;
+        }
+        self.leaves
+            .get_or_init(|| {
+                elab.signals
+                    .keys()
+                    .filter_map(|k| k.rsplit_once('.').map(|(_, leaf)| leaf.to_string()))
+                    .collect()
+            })
+            .contains(n)
+    }
 }
 
 /// §6.21 (measured): a local variable WITH an initializer inside a
@@ -7803,6 +7875,7 @@ pub fn elaborate_module_with_defs(
                         Some(defs),
                         Some(&elab.enum_members),
                         Some(&elab),
+                        None,
                     )?;
                     register_class_enum_members(c, &mut elab);
                     register_class_covergroups(c, &mut elab);
@@ -8633,7 +8706,13 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 crate::ast::decl::PackageItem::Class(c) => {
-                    validate_class_constraints(c, all_defs, Some(&elab.enum_members), Some(&elab))?;
+                    validate_class_constraints(
+                        c,
+                        all_defs,
+                        Some(&elab.enum_members),
+                        Some(&elab),
+                        None,
+                    )?;
                     register_class_enum_members(c, &mut elab);
                     register_class_covergroups(c, &mut elab);
                     register_class_scoped_typedef_aliases(c, Some(&p.name.name), &mut elab);
@@ -12329,7 +12408,13 @@ pub fn elaborate_module_with_defs(
                 elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, cls_defs, Some(&elab.enum_members), Some(&elab))?;
+                validate_class_constraints(
+                    cd,
+                    cls_defs,
+                    Some(&elab.enum_members),
+                    Some(&elab),
+                    None,
+                )?;
                 // Class-body enum typedef members are class constants; without
                 // this, `CB` in a method and `box::CB` both read x for classes
                 // declared in a MODULE body (package/$unit classes already
@@ -17972,7 +18057,13 @@ fn elaborate_items_numbered(
             }
 
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, cls_defs, Some(&elab.enum_members), Some(&elab))?;
+                validate_class_constraints(
+                    cd,
+                    cls_defs,
+                    Some(&elab.enum_members),
+                    Some(&elab),
+                    None,
+                )?;
                 // Class-body enum typedef members are class constants; without
                 // this, `CB` in a method and `box::CB` both read x for classes
                 // declared in a MODULE body (package/$unit classes already
@@ -32802,33 +32893,39 @@ fn shape_index_tuples(shape: &[(i64, i64)]) -> Vec<Vec<i64>> {
 
 /// §7.6 / §23.3.3: enumerate an unpacked actual left to right, stripping
 /// a slice into its element expressions before binding formal positions.
+/// An indexed slice (`pw[10 +: 6]`, `pw[k -: 6]`, §7.4.6) is read in the
+/// dimension's direction like a constant range; a variable base gives the
+/// element indices `base + c`, so the connection follows the base
+/// (aionhw/xezim#867).
 fn unpacked_connection_elements(
     expr: &Expression,
     elab: &ElaboratedModule,
     params: &HashMap<String, Value>,
 ) -> Option<Vec<Expression>> {
-    fn split(e: &Expression) -> Option<(String, Vec<Expression>)> {
+    enum Sel {
+        One(Expression),
+        Range(crate::ast::expr::RangeKind, Expression, Expression),
+    }
+    fn split(e: &Expression) -> Option<(String, Vec<Sel>)> {
         match &e.kind {
             ExprKind::Paren(inner) => split(inner),
-            ExprKind::Ident(h) if h.path.len() == 1 => {
-                Some((h.path[0].name.name.clone(), h.path[0].selects.clone()))
-            }
+            ExprKind::Ident(h) if h.path.len() == 1 => Some((
+                h.path[0].name.name.clone(),
+                h.path[0].selects.iter().cloned().map(Sel::One).collect(),
+            )),
             ExprKind::Index { expr, index } => {
                 let (name, mut sels) = split(expr)?;
-                sels.push((**index).clone());
+                sels.push(Sel::One((**index).clone()));
                 Some((name, sels))
             }
             ExprKind::RangeSelect {
                 expr,
-                kind: crate::ast::expr::RangeKind::Constant,
+                kind,
                 left,
                 right,
             } => {
                 let (name, mut sels) = split(expr)?;
-                sels.push(Expression::new(
-                    ExprKind::Range(left.clone(), right.clone()),
-                    e.span,
-                ));
+                sels.push(Sel::Range(*kind, (**left).clone(), (**right).clone()));
                 Some((name, sels))
             }
             _ => None,
@@ -32854,7 +32951,7 @@ fn unpacked_connection_elements(
         _ => {}
     }
     let (name, sels) = split(expr)?;
-    let mut dims = elab.unpacked_decl_dims.get(&name).cloned().or_else(|| {
+    let dims = elab.unpacked_decl_dims.get(&name).cloned().or_else(|| {
         if let Some(&(lo, hi, _)) = elab.arrays.get(&name) {
             Some(vec![if elab.descending_arrays.contains(&name) {
                 (hi, lo)
@@ -32870,30 +32967,79 @@ fn unpacked_connection_elements(
     if sels.len() > dims.len() {
         return None;
     }
-    for (dim, sel) in dims.iter_mut().zip(sels) {
-        *dim = match &sel.kind {
-            ExprKind::Range(l, r) => (
-                const_eval_i64_with_params(l, Some(params))?,
-                const_eval_i64_with_params(r, Some(params))?,
-            ),
-            _ => {
-                let i = const_eval_i64_with_params(&sel, Some(params))?;
-                (i, i)
-            }
-        };
-    }
-    let mut elements = vec![make_ident_expr(&name)];
-    for (l, r) in dims {
-        let mut next = Vec::new();
+    let konst = |e: &Expression| const_eval_i64_with_params(e, Some(params));
+    // `l` to `r`, one literal index each.
+    let range = |l: i64, r: i64| -> Option<Vec<Expression>> {
         let count = l.abs_diff(r).checked_add(1)?;
-        for base in elements {
-            for k in 0..count {
+        (0..count)
+            .map(|k| {
                 let i = if l <= r {
                     l.checked_add(k as i64)?
                 } else {
                     l.checked_sub(k as i64)?
                 };
-                next.push(ai_append_indices(base.clone(), &[i]));
+                Some(ai_num_expr(i, expr.span))
+            })
+            .collect()
+    };
+    // The indices each dimension contributes, left to right.
+    let mut per_dim: Vec<Vec<Expression>> = Vec::with_capacity(dims.len());
+    for (d, &(dl, dr)) in dims.iter().enumerate() {
+        let idx = match sels.get(d) {
+            None => range(dl, dr)?,
+            Some(Sel::One(e)) => vec![ai_num_expr(konst(e)?, expr.span)],
+            Some(Sel::Range(crate::ast::expr::RangeKind::Constant, l, r)) => {
+                range(konst(l)?, konst(r)?)?
+            }
+            Some(Sel::Range(kind, b, w)) => {
+                let w = konst(w)?;
+                if w <= 0 || w > 4096 {
+                    return None;
+                }
+                let up = matches!(kind, crate::ast::expr::RangeKind::IndexedUp);
+                // `[b +: w]` covers b .. b+w-1 and `[b -: w]` covers
+                // b-w+1 .. b, read in the dimension's direction.
+                let off = |k: i64| -> i64 {
+                    match (up, dl > dr) {
+                        (true, true) => w - 1 - k,
+                        (true, false) => k,
+                        (false, true) => -k,
+                        (false, false) => k - (w - 1),
+                    }
+                };
+                match konst(b) {
+                    Some(b) => (0..w).map(|k| ai_num_expr(b + off(k), expr.span)).collect(),
+                    None => (0..w)
+                        .map(|k| match off(k) {
+                            0 => b.clone(),
+                            o => Expression::new(
+                                ExprKind::Binary {
+                                    op: if o > 0 { BinaryOp::Add } else { BinaryOp::Sub },
+                                    left: Box::new(b.clone()),
+                                    right: Box::new(ai_num_expr(o.abs(), b.span)),
+                                },
+                                b.span,
+                            ),
+                        })
+                        .collect(),
+                }
+            }
+        };
+        per_dim.push(idx);
+    }
+    let mut elements = vec![make_ident_expr(&name)];
+    for idx in per_dim {
+        let mut next = Vec::with_capacity(elements.len() * idx.len());
+        for base in elements {
+            for i in &idx {
+                let span = base.span;
+                next.push(Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(base.clone()),
+                        index: Box::new(i.clone()),
+                    },
+                    span,
+                ));
             }
         }
         elements = next;
@@ -40420,6 +40566,7 @@ fn inline_module_items(
                             Some(definitions),
                             Some(&elab.enum_members),
                             Some(&elab),
+                            Some(&inst_prefix),
                         )?;
                         let scoped = module_class_scope::class(cd, &inst_prefix, &class_bindings);
                         register_class_enum_members(&scoped, elab);
@@ -45191,6 +45338,200 @@ pub fn whole_array_assign_parts_dir(
     )
 }
 
+/// §7.4.6 (§7.4.5 in 1800-2023), §7.6, §10.3: a continuous assignment of a
+/// SLICE of a one-dimensional unpacked array, or to one: `assign cw =
+/// w[58 +: 6];`, `assign a[0 +: 6] = b;`, `assign d[2:7] = w[i -: 6];`.
+/// Like a whole array, a slice has no signal of its own, so the assignment
+/// drove nothing (aionhw/xezim#867). It becomes one assignment per element,
+/// the elements paired left to right. A target slice needs constant bounds
+/// (§10.3.1); a source slice may have a variable base, which becomes the
+/// element index `base + k`, so each element assignment follows the base.
+pub fn slice_array_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    params: &HashMap<String, Value>,
+) -> Option<Vec<ContinuousAssignment>> {
+    if !matches!(lhs.kind, ExprKind::RangeSelect { .. })
+        && !matches!(rhs.kind, ExprKind::RangeSelect { .. })
+    {
+        return None;
+    }
+    let lhs_elems = slice_side_elems(lhs, arrays, descending, decl_dims, params, true)?;
+    let rhs_elems = slice_side_elems(rhs, arrays, descending, decl_dims, params, false)?;
+    if lhs_elems.len() != rhs_elems.len() || lhs_elems.is_empty() || lhs_elems.len() > 4096 {
+        return None;
+    }
+    Some(
+        lhs_elems
+            .into_iter()
+            .zip(rhs_elems)
+            .map(|(l, r)| ContinuousAssignment {
+                origin: None,
+                lhs: l,
+                rhs: r,
+                delay,
+                rhs_parent_scoped: false,
+                delay_fall: None,
+                delay_off: None,
+            })
+            .collect(),
+    )
+}
+
+/// The element expressions of one side of `slice_array_assign_parts`, left
+/// to right: a whole 1-D unpacked array, or a slice of one. `target` asks for
+/// constant bounds.
+fn slice_side_elems(
+    e: &Expression,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    params: &HashMap<String, Value>,
+    target: bool,
+) -> Option<Vec<Expression>> {
+    let name_of = |h: &HierarchicalIdentifier| {
+        h.path.iter().all(|s| s.selects.is_empty()).then(|| {
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+    };
+    // The declared (left, right) of the array's one dimension.
+    let bounds = |name: &str| -> Option<(i64, i64)> {
+        let &(lo, hi, _) = arrays.get(name)?;
+        if hi < lo {
+            return None;
+        }
+        Some(match decl_dims.and_then(|d| d.get(name)) {
+            Some(d) if d.len() == 1 => d[0],
+            Some(_) => return None,
+            None if descending.is_some_and(|d| d.contains(name)) => (hi, lo),
+            None => (lo, hi),
+        })
+    };
+    let konst = |x: &Expression| -> Option<i64> {
+        if eval_const_expr_val(x, params).has_xz() {
+            return None;
+        }
+        const_eval_i64_with_params(x, Some(params))
+    };
+    match &e.kind {
+        ExprKind::Ident(h) => {
+            let name = name_of(h)?;
+            let (left, right) = bounds(&name)?;
+            let idx: Vec<i64> = if left >= right {
+                (right..=left).rev().collect()
+            } else {
+                (left..=right).collect()
+            };
+            Some(idx.into_iter().map(|i| index_expr(e.clone(), i)).collect())
+        }
+        ExprKind::RangeSelect {
+            expr: base,
+            kind,
+            left: sl,
+            right: sr,
+        } => {
+            let ExprKind::Ident(h) = &base.kind else {
+                return None;
+            };
+            let name = name_of(h)?;
+            let (left, right) = bounds(&name)?;
+            let desc = left >= right;
+            let (lo_d, hi_d) = (left.min(right), left.max(right));
+            match kind {
+                RangeKind::Constant => {
+                    let (l, r) = (konst(sl)?, konst(sr)?);
+                    if l.min(r) < lo_d || l.max(r) > hi_d {
+                        return None;
+                    }
+                    let idx: Vec<i64> = if l >= r {
+                        (r..=l).rev().collect()
+                    } else {
+                        (l..=r).collect()
+                    };
+                    Some(
+                        idx.into_iter()
+                            .map(|i| index_expr((**base).clone(), i))
+                            .collect(),
+                    )
+                }
+                RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                    let w = konst(sr)?;
+                    if w <= 0 || w > 4096 {
+                        return None;
+                    }
+                    let up = matches!(kind, RangeKind::IndexedUp);
+                    // The offset from the base of the k-th element, left to
+                    // right: `[b +: w]` covers b .. b+w-1 and `[b -: w]`
+                    // covers b-w+1 .. b, read in the array's direction.
+                    let offset = |k: i64| -> i64 {
+                        match (up, desc) {
+                            (true, true) => w - 1 - k,
+                            (true, false) => k,
+                            (false, true) => -k,
+                            (false, false) => k - (w - 1),
+                        }
+                    };
+                    match konst(sl) {
+                        Some(b) => {
+                            let idx: Vec<i64> = (0..w).map(|k| b + offset(k)).collect();
+                            if idx.iter().any(|&i| i < lo_d || i > hi_d) {
+                                return None;
+                            }
+                            Some(
+                                idx.into_iter()
+                                    .map(|i| index_expr((**base).clone(), i))
+                                    .collect(),
+                            )
+                        }
+                        // §10.3.1: a continuous assignment's target has
+                        // constant selects.
+                        None if target => None,
+                        None => Some(
+                            (0..w)
+                                .map(|k| {
+                                    let off = offset(k);
+                                    let index = if off == 0 {
+                                        (**sl).clone()
+                                    } else {
+                                        Expression::new(
+                                            ExprKind::Binary {
+                                                op: if off > 0 {
+                                                    BinaryOp::Add
+                                                } else {
+                                                    BinaryOp::Sub
+                                                },
+                                                left: sl.clone(),
+                                                right: Box::new(make_udp_int_expr(off.abs())),
+                                            },
+                                            sl.span,
+                                        )
+                                    };
+                                    Expression::new(
+                                        ExprKind::Index {
+                                            expr: base.clone(),
+                                            index: Box::new(index),
+                                        },
+                                        e.span,
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 /// §7.6: `assign dst = src[row];` drives a 1-D unpacked array from one row of
 /// a 2-D unpacked array with the same inner count, element by element. Like
 /// the 1-D form, it has no single target signal to assign.
@@ -45443,7 +45784,18 @@ fn expand_whole_array_assign(
         &elab.arrays,
         Some(&elab.descending_arrays),
         Some(&elab.unpacked_decl_dims),
-    ) {
+    )
+    .or_else(|| {
+        slice_array_assign_parts(
+            lhs,
+            rhs,
+            delay,
+            &elab.arrays,
+            Some(&elab.descending_arrays),
+            Some(&elab.unpacked_decl_dims),
+            &elab.parameters,
+        )
+    }) {
         Some(parts) => {
             elab.continuous_assigns.extend(parts);
             true

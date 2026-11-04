@@ -19,11 +19,12 @@
 //!   instance array, an interface port names its interface),
 //! - every scope above it (`sub_merged_params` starts from the parent's
 //!   scope, so a type parameter written in the parent keeps its names),
-//! - the items of every package other than its parameters' names and
-//!   initializers (a package typedef, function or class body read through a
-//!   package name), the file-scope classes, typedefs and `let`s, and every resolved
-//!   `bind` with the definition it binds (its overrides and connections are
-//!   evaluated in the target's scope, §23.11).
+//! - the file-scope `let`s (a `let` body is expanded where it is used,
+//!   §11.12), and every resolved `bind` with the definition it binds (its
+//!   overrides and connections are evaluated in the target's scope, §23.11).
+//!
+//! Package items and file-scope classes, covergroups and typedefs are
+//! evaluated where they are declared, so their words are not read here.
 //!
 //! A name nothing spells is read by no expression of the scope, and a
 //! constant-evaluation miss still finds it in `PARAM_FALLBACK_TLS`. A
@@ -51,12 +52,12 @@ pub(super) struct ParamScope {
     /// Module, interface and program names.
     instantiable: HashSet<String>,
     /// Entries every scope holds: keys without a word, and the names the
-    /// packages, file-scope declarations and binds spell.
+    /// file-scope `let`s and the binds spell.
     common: Vec<u32>,
     spelled: RefCell<HashMap<(String, usize), Rc<Spelled>>>,
     selected: RefCell<HashMap<(String, usize), Rc<[u32]>>>,
-    /// The words the packages, file-scope declarations and binds spell
-    /// (`None`: one could not be read to the end).
+    /// The words the file-scope `let`s and the binds spell (`None`: one
+    /// could not be read to the end).
     common_words: Rc<Option<HashSet<String>>>,
     /// Per definition, only its own and its immediate children's words.
     words: RefCell<HashMap<(String, usize), Rc<ScopeWords>>>,
@@ -120,33 +121,12 @@ impl ParamScope {
         let mut read = |v: &dyn erased::Scannable, scope: &ParamScope| {
             all |= !scope.scan_into(v, &mut found, &mut named, Some(&mut words));
         };
-        for def in definitions.values() {
-            match def {
-                Definition::Package(p) => {
-                    for item in &p.items {
-                        match item {
-                            crate::ast::decl::PackageItem::Parameter(pd) => match &pd.kind {
-                                crate::ast::decl::ParameterKind::Data {
-                                    data_type,
-                                    assignments,
-                                } => {
-                                    read(data_type, &scope);
-                                    for a in assignments {
-                                        read(&a.dimensions, &scope);
-                                    }
-                                }
-                                crate::ast::decl::ParameterKind::Type { .. } => read(pd, &scope),
-                            },
-                            other => read(other, &scope),
-                        }
-                    }
-                }
-                Definition::Class(c) => read(*c, &scope),
-                Definition::Covergroup(c) => read(*c, &scope),
-                Definition::Typedef(t) => read(*t, &scope),
-                _ => {}
-            }
-        }
+        // The items of packages and the file-scope classes, covergroups and
+        // typedefs are evaluated where they are declared, and a name no scope
+        // spells is answered by `PARAM_FALLBACK_TLS`, so what they spell is
+        // not part of every scope. Reading it made a design whose packages
+        // spell most package parameters give every instance nearly the whole
+        // table again, and key every prepared body by it (aionhw/xezim#870).
         // A `let` body is expanded where it is used (§11.12).
         for l in lets.values() {
             read(l, &scope);
@@ -180,8 +160,8 @@ impl ParamScope {
 
     /// Every word an expression in `def`'s scope can be written with: its
     /// own syntax, that of the definitions it names (an instance array's
-    /// ports are sized in the parent), and what the packages, file-scope
-    /// declarations and binds spell. `None` when one of them could not be
+    /// ports are sized in the parent), and what the file-scope `let`s and
+    /// the binds spell. `None` when one of them could not be
     /// read to the end. A parameter none of these words names is read by no
     /// expression the scope evaluates.
     pub(super) fn scope_words(
@@ -681,7 +661,49 @@ structure!(SerializeStructVariant);
 
 #[cfg(test)]
 mod tests {
-    use super::{key_words, words};
+    use super::{ParamScope, key_words, words};
+    use crate::ast::Description;
+    use crate::elaborate::Definition;
+    use crate::hasher::HashMap;
+    use crate::value::Value;
+
+    /// aionhw/xezim#870: what a package's own functions spell is no part of
+    /// an instance's scope. Only the module's own words select entries, so a
+    /// package whose items spell most of its parameters does not hand every
+    /// instance the whole table again.
+    #[test]
+    fn package_items_do_not_widen_every_scope() {
+        let src = "package pkg;
+  localparam int A = 1;
+  localparam int FILL = 3;
+  function automatic int f(); return FILL; endfunction
+  typedef logic [FILL-1:0] t_t;
+  class c; static function int g(); return FILL; endfunction endclass
+endpackage
+module top; localparam int X = pkg::A + pkg::f(); endmodule
+";
+        let parsed = crate::parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut defs: HashMap<String, Definition> = HashMap::default();
+        for d in &parsed.source.descriptions {
+            match d {
+                Description::Module(m) => {
+                    defs.insert(m.name.name.clone(), Definition::Module(m));
+                }
+                Description::Package(p) => {
+                    defs.insert(p.name.name.clone(), Definition::Package(p));
+                }
+                _ => {}
+            }
+        }
+        let mut table: HashMap<String, Value> = HashMap::default();
+        table.insert("pkg::A".into(), Value::from_u64(1, 32));
+        table.insert("pkg::FILL".into(), Value::from_u64(3, 32));
+        let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
+        let top = scope.top_scope(defs["top"], &defs);
+        assert!(top.contains_key("pkg::A"), "{top:?}");
+        assert!(!top.contains_key("pkg::FILL"), "{top:?}");
+    }
 
     #[test]
     fn a_key_is_named_by_the_words_after_its_package() {
@@ -719,20 +741,27 @@ mod tests {
             .collect()
     }
 
-    /// §26.3: package declarations remain visible in every scope, while their
-    /// immutable spelling set and unchanged values are retained only once (#721).
+    /// §11.12, §23.10: file-scope let bodies contribute shared words, while
+    /// their immutable spelling set and unchanged values are retained once (#721).
     #[test]
-    fn package_words_and_absence_masks_are_shared_across_definitions() {
+    fn common_words_and_absence_masks_are_shared_across_definitions() {
         use super::{ParamScope, Value};
         use crate::hasher::HashMap;
         use std::rc::Rc;
         let mut text = String::from("package pk;\n");
         let mut table = HashMap::default();
         for i in 0..2048 {
-            text.push_str(&format!("typedef logic [P_{i}%8:0] T_{i};\n"));
+            text.push_str(&format!("localparam int P_{i} = {i};\n"));
             table.insert(format!("pk::P_{i}"), Value::from_u64(i, 32));
         }
-        text.push_str("endpackage\n");
+        text.push_str("endpackage\nlet shared_values = {");
+        for i in 0..2048 {
+            if i > 0 {
+                text.push_str(", ");
+            }
+            text.push_str(&format!("pk::P_{i}"));
+        }
+        text.push_str("};\n");
         for i in 0..64 {
             text.push_str(&format!(
                 "module m{i} #(parameter int W=1); logic[W-1:0] a; endmodule\n"
@@ -740,7 +769,19 @@ mod tests {
         }
         let parsed = crate::parse_str(&text).unwrap();
         let defs = definitions(&parsed.source);
-        let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
+        let lets: HashMap<_, _> = parsed
+            .source
+            .descriptions
+            .iter()
+            .filter_map(|description| match description {
+                Description::PackageItem(crate::ast::decl::PackageItem::Let(decl)) => {
+                    Some((decl.name.name.clone(), decl.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lets.len(), 1);
+        let scope = ParamScope::new(&table, &defs, &HashMap::default(), &lets);
         let empty = HashMap::default();
         let mut previous_mask = None;
         let mut bytes = 0;

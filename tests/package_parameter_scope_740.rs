@@ -209,3 +209,43 @@ fn type_parameter_from_the_parent() {
     assert_eq!(width(&d, "m.l.t"), 13);
     assert_eq!(param(&d, "m.l.B"), 13);
 }
+
+/// aionhw/xezim#870: package items are evaluated where they are declared, so
+/// an instance that names only a package function or typedef still gets what
+/// it reads, although the parameters those items spell are no longer part of
+/// every scope.
+#[test]
+fn package_functions_and_typedefs_read_their_own_parameters() {
+    let source = format!(
+        "package cfg;
+{}  localparam int W = 6;
+  localparam int H = 3;
+  typedef logic [W-1:0] word_t;
+  typedef struct packed {{ logic [W-1:0] a; logic [H-1:0] b; }} pair_t;
+  function automatic int width(); return W + H; endfunction
+  function automatic int twice(); return 2 * width(); endfunction
+endpackage
+module leaf;
+  localparam int A = cfg::width();
+  localparam int B = cfg::twice();
+  cfg::word_t w;
+  cfg::pair_t p;
+endmodule
+module wild;
+  import cfg::*;
+  localparam int A = width() + 100;
+endmodule
+module top;
+  leaf u ();
+  wild v ();
+endmodule
+",
+        filler(200)
+    );
+    let design = elaborate(&source);
+    assert_eq!(param(&design, "u.A"), 9);
+    assert_eq!(param(&design, "u.B"), 18);
+    assert_eq!(param(&design, "v.A"), 109);
+    assert_eq!(width(&design, "u.w"), 6);
+    assert_eq!(width(&design, "u.p"), 9);
+}

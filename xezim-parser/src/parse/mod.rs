@@ -662,8 +662,11 @@ impl Parser {
         // non-ANSI headers alike since port names are always identifiers.
         let mut ports: Vec<crate::ast::Identifier> = Vec::new();
         let mut is_sequential = false;
+        // A.5.2: `output reg q = v` gives the start state in either header form.
+        let mut init: Option<char> = None;
         if self.eat(TokenKind::LParen).is_some() {
             let mut depth = 1i32;
+            let mut init_val: Option<String> = None;
             while depth > 0 && !self.at(TokenKind::Eof) {
                 match self.current_kind() {
                     TokenKind::LParen => {
@@ -678,6 +681,22 @@ impl Parser {
                         is_sequential = true;
                         self.bump();
                     }
+                    TokenKind::Assign | TokenKind::Eq if depth == 1 && is_sequential => {
+                        init_val = Some(String::new());
+                        self.bump();
+                    }
+                    TokenKind::Comma if depth == 1 => {
+                        if let Some(v) = init_val.take() {
+                            init = Some(Self::udp_init_symbol(&v));
+                        }
+                        self.bump();
+                    }
+                    _ if depth == 1 && init_val.is_some() => {
+                        if let Some(v) = init_val.as_mut() {
+                            v.push_str(&self.current().text);
+                        }
+                        self.bump();
+                    }
                     TokenKind::Identifier | TokenKind::EscapedIdentifier if depth == 1 => {
                         ports.push(self.parse_identifier());
                     }
@@ -686,12 +705,14 @@ impl Parser {
                     }
                 }
             }
+            if let Some(v) = init_val {
+                init = Some(Self::udp_init_symbol(&v));
+            }
         }
         self.eat(TokenKind::Semicolon);
 
         // --- Body declarations up to `table`: pick up `reg` (=> sequential)
         // and `initial out = 1'bX;` (start state).
-        let mut init: Option<char> = None;
         while !self.at(TokenKind::KwTable)
             && !self.at(TokenKind::KwEndprimitive)
             && !self.at(TokenKind::Eof)
@@ -719,19 +740,40 @@ impl Parser {
                         self.bump();
                     }
                     self.eat(TokenKind::Semicolon);
-                    let low = val.to_ascii_lowercase();
-                    init = Some(if low.contains('x') || low.contains('z') {
-                        'x'
-                    } else if low.ends_with('1') {
-                        '1'
-                    } else if low.ends_with('0') {
-                        '0'
-                    } else {
-                        'x'
-                    });
+                    init = Some(Self::udp_init_symbol(&val));
                 }
+                // §29.3.2, A.5.2: in the body of a non-ANSI header the output
+                // may be declared `output reg q [= v];`, which is the reg
+                // declaration of a sequential UDP and may give its start
+                // state. It was skipped whole, so the UDP lost its state.
                 _ => {
-                    self.skip_udp_to_semi();
+                    let mut output = false;
+                    let mut reg = false;
+                    let mut val: Option<String> = None;
+                    while !self.at(TokenKind::Semicolon)
+                        && !self.at(TokenKind::Eof)
+                        && !self.at(TokenKind::KwTable)
+                        && !self.at(TokenKind::KwEndprimitive)
+                    {
+                        match self.current_kind() {
+                            TokenKind::KwOutput => output = true,
+                            TokenKind::KwReg if output => reg = true,
+                            TokenKind::Assign | TokenKind::Eq if reg => val = Some(String::new()),
+                            _ => {
+                                if let Some(v) = val.as_mut() {
+                                    v.push_str(&self.current().text);
+                                }
+                            }
+                        }
+                        self.bump();
+                    }
+                    self.eat(TokenKind::Semicolon);
+                    if reg {
+                        is_sequential = true;
+                        if let Some(v) = val {
+                            init = Some(Self::udp_init_symbol(&v));
+                        }
+                    }
                 }
             }
         }
@@ -849,6 +891,21 @@ impl Parser {
     }
 
     /// Consume tokens up to and including the next `;` (UDP body decls).
+    /// The start state an initial value `1'b0`, `1`, `1'bx` gives a UDP
+    /// output (§29.3.3): 0, 1, or x for anything else.
+    fn udp_init_symbol(val: &str) -> char {
+        let low = val.to_ascii_lowercase();
+        if low.contains('x') || low.contains('z') {
+            'x'
+        } else if low.ends_with('1') {
+            '1'
+        } else if low.ends_with('0') {
+            '0'
+        } else {
+            'x'
+        }
+    }
+
     fn skip_udp_to_semi(&mut self) {
         while !self.at(TokenKind::Semicolon)
             && !self.at(TokenKind::Eof)
