@@ -19,11 +19,12 @@
 //!   instance array, an interface port names its interface),
 //! - every scope above it (`sub_merged_params` starts from the parent's
 //!   scope, so a type parameter written in the parent keeps its names),
-//! - the items of every package other than its parameters' names and
-//!   initializers (a package typedef, function or class body read through a
-//!   package name), the file-scope classes, typedefs and `let`s, and every resolved
-//!   `bind` with the definition it binds (its overrides and connections are
-//!   evaluated in the target's scope, §23.11).
+//! - the file-scope `let`s (a `let` body is expanded where it is used,
+//!   §11.12), and every resolved `bind` with the definition it binds (its
+//!   overrides and connections are evaluated in the target's scope, §23.11).
+//!
+//! Package items and file-scope classes, covergroups and typedefs are
+//! evaluated where they are declared, so their words are not read here.
 //!
 //! A name nothing spells is read by no expression of the scope, and a
 //! constant-evaluation miss still finds it in `PARAM_FALLBACK_TLS`. A
@@ -50,12 +51,12 @@ pub(super) struct ParamScope {
     /// Module, interface and program names.
     instantiable: HashSet<String>,
     /// Entries every scope holds: keys without a word, and the names the
-    /// packages, file-scope declarations and binds spell.
+    /// file-scope `let`s and the binds spell.
     common: Vec<u32>,
     spelled: RefCell<HashMap<(String, usize), Rc<Spelled>>>,
     selected: RefCell<HashMap<(String, usize), Rc<[u32]>>>,
-    /// The words the packages, file-scope declarations and binds spell
-    /// (`None`: one could not be read to the end).
+    /// The words the file-scope `let`s and the binds spell (`None`: one
+    /// could not be read to the end).
     common_words: Option<HashSet<String>>,
     /// Per definition, every word its scope can read (`scope_words`).
     words: RefCell<HashMap<(String, usize), Rc<Option<HashSet<String>>>>>,
@@ -109,33 +110,12 @@ impl ParamScope {
         let mut read = |v: &dyn erased::Scannable, scope: &ParamScope| {
             all |= !scope.scan_into(v, &mut found, &mut named, Some(&mut words));
         };
-        for def in definitions.values() {
-            match def {
-                Definition::Package(p) => {
-                    for item in &p.items {
-                        match item {
-                            crate::ast::decl::PackageItem::Parameter(pd) => match &pd.kind {
-                                crate::ast::decl::ParameterKind::Data {
-                                    data_type,
-                                    assignments,
-                                } => {
-                                    read(data_type, &scope);
-                                    for a in assignments {
-                                        read(&a.dimensions, &scope);
-                                    }
-                                }
-                                crate::ast::decl::ParameterKind::Type { .. } => read(pd, &scope),
-                            },
-                            other => read(other, &scope),
-                        }
-                    }
-                }
-                Definition::Class(c) => read(*c, &scope),
-                Definition::Covergroup(c) => read(*c, &scope),
-                Definition::Typedef(t) => read(*t, &scope),
-                _ => {}
-            }
-        }
+        // The items of packages and the file-scope classes, covergroups and
+        // typedefs are evaluated where they are declared, and a name no scope
+        // spells is answered by `PARAM_FALLBACK_TLS`, so what they spell is
+        // not part of every scope. Reading it made a design whose packages
+        // spell most package parameters give every instance nearly the whole
+        // table again, and key every prepared body by it (aionhw/xezim#870).
         // A `let` body is expanded where it is used (§11.12).
         for l in lets.values() {
             read(l, &scope);
@@ -169,8 +149,8 @@ impl ParamScope {
 
     /// Every word an expression in `def`'s scope can be written with: its
     /// own syntax, that of the definitions it names (an instance array's
-    /// ports are sized in the parent), and what the packages, file-scope
-    /// declarations and binds spell. `None` when one of them could not be
+    /// ports are sized in the parent), and what the file-scope `let`s and
+    /// the binds spell. `None` when one of them could not be
     /// read to the end. A parameter none of these words names is read by no
     /// expression the scope evaluates.
     pub(super) fn scope_words(
