@@ -20,6 +20,7 @@ mod module_class_scope;
 pub(crate) mod constructor_forwarding;
 pub(crate) mod relaxed_static;
 mod param_prefix_index;
+mod canonical;
 mod param_scope;
 
 struct ScopeGuardLite<F: FnMut()>(F);
@@ -33755,7 +33756,7 @@ fn collect_body_driven_names(
 /// instance.
 #[derive(Default)]
 struct InlineCache {
-    /// Prepared bodies, by definition and parameters (`prepare_module_items`).
+    /// Prepared bodies (`prepare_module_items`).
     prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
     /// Per definition, the typedefs its imports bind, one list per import.
     imports: HashMap<(String, usize), Rc<[ImportedTypedefs]>>,
@@ -33839,6 +33840,31 @@ fn note_prep_lookup(hit: bool, key_len: usize) {
     });
 }
 
+/// The definition's type parameters as bound, for its prepared-body key;
+/// `None` when one has no recorded shape to tell its bindings apart.
+fn type_bindings(
+    def: Definition,
+    typedef_widths: &HashMap<String, u32>,
+) -> Option<Vec<param_scope::TypeBinding>> {
+    def.params_and_body_types()
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Type { assignments } => assignments.as_slice(),
+            _ => &[],
+        })
+        .map(|a| {
+            let name = &a.name.name;
+            let shape = TYPEDEF_SHAPES_TLS.with(|c| {
+                let c = c.borrow();
+                match (c.0.get(name), c.1.get(name)) {
+                    (None, None) => None,
+                    shape => canonical::span_free(&shape),
+                }
+            })?;
+            Some((name.clone(), typedef_widths.get(name).copied(), shape))
+        })
+        .collect()
+}
+
 fn prepare_module_items(
     source_def: Definition,
     definitions: &HashMap<String, Definition>,
@@ -33847,12 +33873,13 @@ fn prepare_module_items(
     cache: &mut InlineCache,
     param_scope: &param_scope::ParamScope,
 ) -> Rc<PreparedModuleItems> {
-    let (cache_key, key_bytes) = param_scope.prepared_key(source_def, definitions, local_params);
-    if let Some(prepared) = cache.prepared.get(&cache_key) {
+    let cache_key = type_bindings(source_def, typedef_widths)
+        .map(|types| param_scope.prepared_key(source_def, definitions, local_params, types));
+    if let Some(prepared) = cache_key.as_ref().and_then(|(k, _)| cache.prepared.get(k)) {
         note_prep_lookup(true, 0);
         return Rc::clone(prepared);
     }
-    note_prep_lookup(false, key_bytes);
+    note_prep_lookup(false, cache_key.as_ref().map_or(0, |(_, bytes)| *bytes));
 
     let mut local_typedefs = std::collections::HashSet::default();
     for item in source_def.items() {
@@ -34210,7 +34237,9 @@ fn prepare_module_items(
         local_names: std::rc::Rc::new(local_names),
         body_driven_ports,
     });
-    cache.prepared.insert(cache_key, Rc::clone(&prepared));
+    if let Some((key, _)) = cache_key {
+        cache.prepared.insert(key, Rc::clone(&prepared));
+    }
     prepared
 }
 

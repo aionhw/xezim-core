@@ -218,6 +218,7 @@ impl ParamScope {
         def: Definition,
         definitions: &HashMap<String, Definition>,
         params: &HashMap<String, Value>,
+        types: Vec<TypeBinding>,
     ) -> (PreparedKey, usize) {
         let words = self.scope_words(def, definitions);
         let mut changed = Vec::new();
@@ -259,6 +260,7 @@ impl ParamScope {
             definition: def_key(&def),
             missing,
             changed,
+            types,
         };
         let bytes = key.retained_bytes() + shared_bytes;
         (key, bytes)
@@ -442,7 +444,12 @@ pub(super) struct PreparedKey {
     definition: (String, usize),
     missing: Rc<[u64]>,
     changed: Vec<(String, Value)>,
+    types: Vec<TypeBinding>,
 }
+
+/// A type parameter as bound (§6.20.3): its name, width and the span-free
+/// bytes of its shape (`canonical::span_free`).
+pub(super) type TypeBinding = (String, Option<u32>, Box<[u8]>);
 
 impl PreparedKey {
     /// Retained key payload, excluding separately counted interned masks and
@@ -462,6 +469,11 @@ impl PreparedKey {
                             0
                         }
                 })
+                .sum::<usize>()
+            + self
+                .types
+                .iter()
+                .map(|(name, _, shape)| size_of::<TypeBinding>() + name.len() + shape.len())
                 .sum::<usize>()
     }
 }
@@ -791,7 +803,7 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
             assert!(Rc::ptr_eq(&scope.common_words, &words.common));
             assert!(words.local.as_ref().unwrap().len() < 16);
             assert!(words.spells("pk::P_2047"));
-            let (key, added) = scope.prepared_key(def, &defs, &empty);
+            let (key, added) = scope.prepared_key(def, &defs, &empty, Vec::new());
             assert!(key.changed.is_empty());
             if let Some(mask) = &previous_mask {
                 assert!(Rc::ptr_eq(mask, &key.missing));
@@ -800,7 +812,7 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
             bytes += added;
             let mut params = table.clone();
             params.insert("W".to_string(), Value::from_u64(i + 1, 32));
-            let (present, added) = scope.prepared_key(def, &defs, &params);
+            let (present, added) = scope.prepared_key(def, &defs, &params, Vec::new());
             assert_eq!(present.changed.len(), 1);
             assert!(present.missing.is_empty());
             assert!(added < 512, "key retained {added} bytes");
@@ -823,19 +835,19 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
         let table = HashMap::from_iter([("P".into(), Value::from_u64(3, 32))]);
         let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
         let def = defs["m"];
-        let (visible, _) = scope.prepared_key(def, &defs, &table);
-        let (absent, _) = scope.prepared_key(def, &defs, &HashMap::default());
+        let (visible, _) = scope.prepared_key(def, &defs, &table, Vec::new());
+        let (absent, _) = scope.prepared_key(def, &defs, &HashMap::default(), Vec::new());
         assert_ne!(visible, absent);
         let mut local = table.clone();
         local.insert("P".into(), Value::from_u64(9, 32));
-        let (shadowed, _) = scope.prepared_key(def, &defs, &local);
+        let (shadowed, _) = scope.prepared_key(def, &defs, &local, Vec::new());
         assert_ne!(visible, shadowed);
         assert_ne!(absent, shadowed);
         assert_eq!(shadowed.changed.len(), 1);
         local.insert("UNREAD".into(), Value::from_u64(23, 32));
-        assert_eq!(shadowed, scope.prepared_key(def, &defs, &local).0);
+        assert_eq!(shadowed, scope.prepared_key(def, &defs, &local, Vec::new()).0);
         local.insert("P".into(), Value::from_u64(3, 32));
-        assert_eq!(visible, scope.prepared_key(def, &defs, &local).0);
+        assert_eq!(visible, scope.prepared_key(def, &defs, &local, Vec::new()).0);
     }
 
     /// §5.7, §6.20: cache equality must compare the whole value, including
@@ -877,16 +889,16 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
         let mut keys = HashSet::default();
         for value in &values {
             let params = HashMap::from_iter([("P".into(), value.clone())]);
-            assert!(keys.insert(scope.prepared_key(defs["m"], &defs, &params).0));
+            assert!(keys.insert(scope.prepared_key(defs["m"], &defs, &params, Vec::new()).0));
         }
         assert_eq!(keys.len(), values.len());
         // A cache hit uses equality as well as hashing, including baseline
         // omissions; constructing the key again finds the same prepared body.
         let mut cache = HashMap::default();
-        let (key, _) = scope.prepared_key(defs["m"], &defs, &table);
+        let (key, _) = scope.prepared_key(defs["m"], &defs, &table, Vec::new());
         cache.insert(key, 42);
         assert_eq!(
-            cache.get(&scope.prepared_key(defs["m"], &defs, &table).0),
+            cache.get(&scope.prepared_key(defs["m"], &defs, &table, Vec::new()).0),
             Some(&42)
         );
     }
