@@ -27233,8 +27233,15 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
                 }
             }
         }
-        // A nested UNPACKED struct member: recurse into its own members.
-        DataType::Struct(_) => register_unpacked_aggregate(elab, name, dt),
+        // §7.2 / §23.3.3: a nested unpacked struct is itself a valid port
+        // actual. It has no container signal, so retain its type for the
+        // whole-struct expansion of `parent.member = inst.port` as well as
+        // registering its leaves. Resolve the alias while its scope is live.
+        DataType::Struct(_) => {
+            elab.var_decl_types
+                .insert(name.to_string(), resolved.clone());
+            register_unpacked_aggregate(elab, name, dt);
+        }
         _ => {
             elab.signals.entry(name.to_string()).or_insert(Signal {
                 is_const: false,
