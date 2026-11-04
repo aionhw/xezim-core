@@ -374,8 +374,16 @@ pub static RELAX_CROSS_HIER_ITEM: RelaxFlag = RelaxFlag::new(
     "accept a hierarchical reference as a cross item, with an implicit coverpoint (§19.6)",
 );
 
+/// §6.5: a module net or variable used ahead of its declaration (checked
+/// at elaboration; the flag lives here with the others).
+pub static RELAX_USE_BEFORE_DECL: RelaxFlag = RelaxFlag::new(
+    "use-before-decl",
+    "XEZIM_RELAX_USE_BEFORE_DECL",
+    "accept a net or variable that a module reads or writes ahead of its declaration (§6.5)",
+);
+
 /// Every parser relaxation, for command-line options and cache keys.
-pub fn relax_flags() -> [&'static RelaxFlag; 8] {
+pub fn relax_flags() -> [&'static RelaxFlag; 9] {
     [
         &RELAX_DUPLICATE_DECLS,
         &RELAX_ENUM_NO_BASE,
@@ -385,6 +393,7 @@ pub fn relax_flags() -> [&'static RelaxFlag; 8] {
         &RELAX_MACRO_SPACE,
         &RELAX_NUL_BYTES,
         &RELAX_CROSS_HIER_ITEM,
+        &RELAX_USE_BEFORE_DECL,
     ]
 }
 

@@ -1641,6 +1641,7 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    let _declaration_order_scope = elaborate::declaration_order_scope();
     // Every elaboration starts from the same state, whatever the thread
     // elaborated before (§23.11 binds elaborate a design twice).
     elaborate::reset_const_eval_snapshots();
@@ -2203,6 +2204,41 @@ fn parse_and_elaborate(
     // Before binds clone any definition, so a specialized clone carries the
     // overridden default too.
     let mut param_override_hits = apply_param_overrides(&mut definitions, None)?;
+
+    // §3.12.1/§6.5: source modules still have their own lexical items here.
+    // Check before unit declarations are copied into their storage; source
+    // spans are file-local and cannot identify that provenance after merging.
+    elaborate::declaration_order_unit_types(&top_level_vars);
+    {
+        let mut defs: crate::hasher::HashMap<_, _> = definitions
+            .iter()
+            .map(|(name, def)| {
+                let def = match def {
+                    SourceDefinition::Module(m) => elaborate::Definition::Module(m),
+                    SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
+                    SourceDefinition::Program(p) => elaborate::Definition::Program(p),
+                    SourceDefinition::Class(c) => elaborate::Definition::Class(c),
+                    SourceDefinition::Package(p) => elaborate::Definition::Package(p),
+                    SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(t),
+                    SourceDefinition::Udp(u) => elaborate::Definition::Udp(u),
+                };
+                (name.clone(), def)
+            })
+            .collect();
+        // A class and a module may share a name (§3.13). Preserve the
+        // class values without replacing the module's definition-map entry.
+        for (name, class) in &class_defs {
+            defs.insert(
+                format!("$unit-class::{name}"),
+                elaborate::Definition::Class(class),
+            );
+        }
+        let first = top_module_name
+            .or(top_module.as_deref())
+            .and_then(|name| defs.get(name))
+            .copied();
+        elaborate::validate_module_data_declarations(first, Some(&defs), &top_level_imports)?;
+    }
 
     // §13.4.3/§6.24.1: constant folding distinguishes a retained `$unit`
     // function from a function the module declares itself.
