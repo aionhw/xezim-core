@@ -138,18 +138,85 @@ module top; leaf a(), b(); endmodule
 }
 
 #[test]
-fn single_automatic_root_uses_pruning_but_multiple_roots_stay_conservative() {
+fn automatic_roots_share_one_carrier() {
     let single = r#"
 function automatic int unused(); return 1; endfunction
 module leaf; endmodule
 module top; leaf a(); endmodule
 "#;
-    let (defs, _) = elaborate(single, None).expect("single root");
+    let extras = format!(
+        "package unrelated_pkg; int v; endpackage\nclass unrelated_cls; int v; endclass\n{single}"
+    );
+    let multiple = format!("{extras}\nmodule second; endmodule\n");
+    for source in [single, extras.as_str(), multiple.as_str()] {
+        for named_top in [None, Some("top")] {
+            let (defs, _) = elaborate(source, named_top).expect("elaborate");
+            assert_eq!(subs(&defs["top"]), ["unused"]);
+            assert!(subs(&defs["leaf"]).is_empty());
+            if let Some(second) = defs.get("second") {
+                assert!(subs(second).is_empty());
+            }
+        }
+    }
+}
+
+/// §3.12.1 (#834): a noncarrier root keeps its called transitive bodies,
+/// while unrelated declarations do not restore copying into every module.
+#[test]
+fn multiple_roots_retain_only_used_transitive_bodies() {
+    let source = r#"
+function automatic int last(int n); return n+1; endfunction
+function automatic int first(int n); return last(n)+1; endfunction
+function automatic int unused(); return 99; endfunction
+module z_first; endmodule
+module a_second; initial $display("%0d", first(3)); endmodule
+module leaf; endmodule
+package unrelated; int n; endpackage
+"#;
+    let (defs, design) = elaborate(source, None).expect("multiple roots");
+    assert_eq!(subs(&defs["z_first"]), ["last", "first", "unused"]);
+    assert_eq!(subs(&defs["a_second"]), ["last", "first"]);
     assert!(subs(&defs["leaf"]).is_empty());
-    let multiple = format!("{single}\nmodule second; endmodule\n");
-    let (defs, _) = elaborate(&multiple, None).expect("multiple roots");
-    for name in ["top", "leaf", "second"] {
-        assert_eq!(subs(&defs[name]), ["unused"]);
+    assert!(design.functions.keys().any(|n| n.ends_with("first")));
+}
+
+/// §8.24 (#834): the one carrier still links unused unit-class methods.
+#[test]
+fn automatic_carrier_preserves_unit_extern_linking() {
+    for extra in [
+        "package unrelated; int n; endpackage",
+        "class unrelated; int n; endclass",
+        "module second; endmodule",
+    ] {
+        let source = format!(
+            "class lookup; extern function int get(); endclass\n\
+             function int lookup::get(); return 3; endfunction\n\
+             module leaf; endmodule\nmodule top; leaf a(); endmodule\n{extra}"
+        );
+        let (defs, design) = elaborate(&source, None).expect("elaborate");
+        assert_eq!(subs(&defs["top"]), ["lookup::get"]);
+        assert!(subs(&defs["leaf"]).is_empty());
+        match &design.classes["lookup"].methods["get"].kind {
+            xezim_core::ast::decl::ClassMethodKind::Function(f) => assert!(!f.items.is_empty()),
+            _ => panic!("expected function body"),
+        }
+    }
+}
+
+/// §13.4.4 (#834): pruning cannot hide an invalid unused unit declaration
+/// merely because an unrelated package/class precedes the module root.
+#[test]
+fn automatic_carrier_preserves_unused_body_diagnostics() {
+    for prefix in [
+        "package unrelated; int n; endpackage",
+        "class unrelated; int n; endclass",
+    ] {
+        let source = format!(
+            "function int unused(); int value=3; return value; endfunction\n\
+             {prefix}\nmodule top; endmodule"
+        );
+        let error = elaborate(&source, None).expect_err("unused body must still be checked");
+        assert!(error.contains("implicitly static"), "{error}");
     }
 }
 
