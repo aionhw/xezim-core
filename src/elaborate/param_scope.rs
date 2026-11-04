@@ -47,6 +47,7 @@ pub(super) struct ParamScope {
     /// Word of an entry's key (`W` of `pkg::W`, `LIM` of `pkg::LIM[3]`,
     /// `Cfg` and `VLEN` of `pkg::Cfg.VLEN`) to the entries it names.
     by_word: HashMap<String, Vec<u32>>,
+    by_name: HashMap<String, u32>,
     /// Module, interface and program names.
     instantiable: HashSet<String>,
     /// Entries every scope holds: keys without a word, and the names the
@@ -56,9 +57,12 @@ pub(super) struct ParamScope {
     selected: RefCell<HashMap<(String, usize), Rc<[u32]>>>,
     /// The words the packages, file-scope declarations and binds spell
     /// (`None`: one could not be read to the end).
-    common_words: Option<HashSet<String>>,
-    /// Per definition, every word its scope can read (`scope_words`).
-    words: RefCell<HashMap<(String, usize), Rc<Option<HashSet<String>>>>>,
+    common_words: Rc<Option<HashSet<String>>>,
+    /// Per definition, only its own and its immediate children's words.
+    words: RefCell<HashMap<(String, usize), Rc<ScopeWords>>>,
+    /// Absence from a scope matters too. Share identical absence masks instead
+    /// of retaining a copy of the immutable table in each prepared-body key.
+    missing: RefCell<HashSet<Rc<[u64]>>>,
 }
 
 impl ParamScope {
@@ -72,6 +76,11 @@ impl ParamScope {
             table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         // A fixed order, so the scopes built from it are the same each run.
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let by_name = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (name.clone(), i as u32))
+            .collect();
         let mut by_word: HashMap<String, Vec<u32>> = HashMap::default();
         let mut common = Vec::new();
         for (i, (key, _)) in entries.iter().enumerate() {
@@ -95,12 +104,14 @@ impl ParamScope {
         let mut scope = Self {
             entries,
             by_word,
+            by_name,
             instantiable,
             common,
             spelled: RefCell::default(),
             selected: RefCell::default(),
-            common_words: None,
+            common_words: Rc::new(None),
             words: RefCell::default(),
+            missing: RefCell::default(),
         };
         let mut found = HashSet::default();
         let mut named = HashSet::default();
@@ -162,7 +173,7 @@ impl ParamScope {
             scope.common.extend(found);
             scope.common.sort_unstable();
             scope.common.dedup();
-            scope.common_words = Some(words);
+            scope.common_words = Rc::new(Some(words));
         }
         scope
     }
@@ -177,12 +188,16 @@ impl ParamScope {
         &self,
         def: Definition,
         definitions: &HashMap<String, Definition>,
-    ) -> Rc<Option<HashSet<String>>> {
+    ) -> Rc<ScopeWords> {
         let key = def_key(&def);
         if let Some(w) = self.words.borrow().get(&key) {
             return Rc::clone(w);
         }
-        let mut words = self.common_words.clone();
+        let mut words = self
+            .common_words
+            .as_ref()
+            .as_ref()
+            .map(|_| HashSet::default());
         let mut named = HashSet::default();
         let mut read = |d: &Definition, named: &mut HashSet<String>| {
             let Some(out) = words.as_mut() else {
@@ -207,9 +222,66 @@ impl ParamScope {
                 read(child, &mut HashSet::default());
             }
         }
-        let words = Rc::new(words);
+        let words = Rc::new(ScopeWords {
+            common: Rc::clone(&self.common_words),
+            local: words,
+        });
         self.words.borrow_mut().insert(key, Rc::clone(&words));
         words
+    }
+
+    /// An exact key relative to the immutable table held by this scope.
+    /// Unchanged entries need no payload. Missing eligible entries are retained
+    /// explicitly: an absent bare name must not alias a visible package value.
+    pub(super) fn prepared_key(
+        &self,
+        def: Definition,
+        definitions: &HashMap<String, Definition>,
+        params: &HashMap<String, Value>,
+    ) -> (PreparedKey, usize) {
+        let words = self.scope_words(def, definitions);
+        let mut changed = Vec::new();
+        for (name, value) in params {
+            if words.spells(name)
+                && !self
+                    .by_name
+                    .get(name)
+                    .is_some_and(|&i| self.entries[i as usize].1 == *value)
+            {
+                changed.push((name.clone(), value.clone()));
+            }
+        }
+        changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut missing = Vec::new();
+        for (i, (name, _)) in self.entries.iter().enumerate() {
+            if words.spells(name) && !params.contains_key(name) {
+                if missing.is_empty() {
+                    missing.resize(self.entries.len().div_ceil(64), 0u64);
+                }
+                missing[i / 64] |= 1 << (i % 64);
+            }
+        }
+        while missing.last() == Some(&0) {
+            missing.pop();
+        }
+        // Rc<[u64]> hashes and compares its complete contents. This interner
+        // is collision-safe; a digest alone would not be a valid cache key.
+        let mut masks = self.missing.borrow_mut();
+        let (missing, shared_bytes) = if let Some(mask) = masks.get(missing.as_slice()) {
+            (Rc::clone(mask), 0)
+        } else {
+            let bytes = missing.len() * size_of::<u64>();
+            let mask: Rc<[u64]> = missing.into();
+            masks.insert(Rc::clone(&mask));
+            (mask, bytes)
+        };
+        let key = PreparedKey {
+            definition: def_key(&def),
+            missing,
+            changed,
+        };
+        let bytes = key.retained_bytes() + shared_bytes;
+        (key, bytes)
     }
 
     /// The scope of an instance of `def` at the top of the hierarchy.
@@ -360,17 +432,58 @@ fn def_key(def: &Definition) -> (String, usize) {
     (def.name().to_string(), addr)
 }
 
-/// True when `key` (a parameter's name in a scope) is spelled by `words`,
-/// or has no word to spell it by.
-pub(super) fn spells(words: &HashSet<String>, key: &str) -> bool {
-    let mut any = false;
-    for w in key_words(key) {
-        if words.contains(w) {
+/// The common words have one owner for the whole inlining pass. Keeping them
+/// separate from local words avoids one large package-word clone per definition.
+pub(super) struct ScopeWords {
+    common: Rc<Option<HashSet<String>>>,
+    local: Option<HashSet<String>>,
+}
+
+impl ScopeWords {
+    fn spells(&self, key: &str) -> bool {
+        let (Some(common), Some(local)) = (&*self.common, &self.local) else {
             return true;
+        };
+        let mut any = false;
+        for word in key_words(key) {
+            any = true;
+            if common.contains(word) || local.contains(word) {
+                return true;
+            }
         }
-        any = true;
+        !any
     }
-    !any
+}
+
+/// Complete semantic parameter values, relative to one immutable ParamScope.
+/// The cache and scope have the same lifetime; IDs never escape that pass.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct PreparedKey {
+    definition: (String, usize),
+    missing: Rc<[u64]>,
+    changed: Vec<(String, Value)>,
+}
+
+impl PreparedKey {
+    /// Retained key payload, excluding separately counted interned masks and
+    /// allocator/hash-table overhead. Wide values include both complete planes.
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.definition.0.len()
+            + self
+                .changed
+                .iter()
+                .map(|(name, value)| {
+                    size_of::<(String, Value)>()
+                        + name.len()
+                        + if value.width > 64 {
+                            value.width.div_ceil(64) as usize * 16
+                        } else {
+                            0
+                        }
+                })
+                .sum::<usize>()
+    }
 }
 
 /// The identifier words of a table key after its last `::`.
@@ -587,5 +700,153 @@ mod tests {
         assert_eq!(w("%0d FILL_3"), ["FILL_3"]);
         assert_eq!(w("8'hFF"), ["hFF"]);
         assert_eq!(w("$unit::X"), ["$unit", "X"]);
+    }
+
+    fn definitions(
+        source: &crate::ast::SourceText,
+    ) -> crate::hasher::HashMap<String, super::Definition<'_>> {
+        source
+            .descriptions
+            .iter()
+            .filter_map(|description| {
+                let definition = match description {
+                    crate::ast::Description::Module(m) => super::Definition::Module(m),
+                    crate::ast::Description::Package(p) => super::Definition::Package(p),
+                    _ => return None,
+                };
+                Some((definition.name().to_string(), definition))
+            })
+            .collect()
+    }
+
+    /// §26.3: package declarations remain visible in every scope, while their
+    /// immutable spelling set and unchanged values are retained only once (#721).
+    #[test]
+    fn package_words_and_absence_masks_are_shared_across_definitions() {
+        use super::{ParamScope, Value};
+        use crate::hasher::HashMap;
+        use std::rc::Rc;
+        let mut text = String::from("package pk;\n");
+        let mut table = HashMap::default();
+        for i in 0..2048 {
+            text.push_str(&format!("typedef logic [P_{i}%8:0] T_{i};\n"));
+            table.insert(format!("pk::P_{i}"), Value::from_u64(i, 32));
+        }
+        text.push_str("endpackage\n");
+        for i in 0..64 {
+            text.push_str(&format!(
+                "module m{i} #(parameter int W=1); logic[W-1:0] a; endmodule\n"
+            ));
+        }
+        let parsed = crate::parse_str(&text).unwrap();
+        let defs = definitions(&parsed.source);
+        let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
+        let empty = HashMap::default();
+        let mut previous_mask = None;
+        let mut bytes = 0;
+        for i in 0..64 {
+            let def = defs[&format!("m{i}")];
+            let words = scope.scope_words(def, &defs);
+            assert!(Rc::ptr_eq(&scope.common_words, &words.common));
+            assert!(words.local.as_ref().unwrap().len() < 16);
+            assert!(words.spells("pk::P_2047"));
+            let (key, added) = scope.prepared_key(def, &defs, &empty);
+            assert!(key.changed.is_empty());
+            if let Some(mask) = &previous_mask {
+                assert!(Rc::ptr_eq(mask, &key.missing));
+            }
+            previous_mask = Some(Rc::clone(&key.missing));
+            bytes += added;
+            let mut params = table.clone();
+            params.insert("W".to_string(), Value::from_u64(i + 1, 32));
+            let (present, added) = scope.prepared_key(def, &defs, &params);
+            assert_eq!(present.changed.len(), 1);
+            assert!(present.missing.is_empty());
+            assert!(added < 512, "key retained {added} bytes");
+        }
+        assert_eq!(scope.missing.borrow().len(), 2);
+        assert!(
+            bytes < 16 * 1024,
+            "shared masks/keys retained {bytes} bytes"
+        );
+    }
+
+    /// §6.20, §23.10: a local/ancestor override, an absent name and an
+    /// unchanged visible package value denote distinct scope states.
+    #[test]
+    fn prepared_keys_preserve_absence_and_parameter_shadowing() {
+        use super::{ParamScope, Value};
+        use crate::hasher::HashMap;
+        let parsed = crate::parse_str("module m; logic[P-1:0] a; endmodule").unwrap();
+        let defs = definitions(&parsed.source);
+        let table = HashMap::from_iter([("P".into(), Value::from_u64(3, 32))]);
+        let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
+        let def = defs["m"];
+        let (visible, _) = scope.prepared_key(def, &defs, &table);
+        let (absent, _) = scope.prepared_key(def, &defs, &HashMap::default());
+        assert_ne!(visible, absent);
+        let mut local = table.clone();
+        local.insert("P".into(), Value::from_u64(9, 32));
+        let (shadowed, _) = scope.prepared_key(def, &defs, &local);
+        assert_ne!(visible, shadowed);
+        assert_ne!(absent, shadowed);
+        assert_eq!(shadowed.changed.len(), 1);
+        local.insert("UNREAD".into(), Value::from_u64(23, 32));
+        assert_eq!(shadowed, scope.prepared_key(def, &defs, &local).0);
+        local.insert("P".into(), Value::from_u64(3, 32));
+        assert_eq!(visible, scope.prepared_key(def, &defs, &local).0);
+    }
+
+    /// §5.7, §6.20: cache equality must compare the whole value, including
+    /// context-sensitive fill/sign/real flags and both planes above bit 63.
+    #[test]
+    fn prepared_keys_compare_complete_parameter_values() {
+        use super::{ParamScope, Value};
+        use crate::hasher::{HashMap, HashSet};
+        use crate::value::LogicBit;
+        let parsed = crate::parse_str("module m; localparam Q=P; endmodule").unwrap();
+        let defs = definitions(&parsed.source);
+        let table = HashMap::from_iter([("P".into(), Value::from_u64(1, 1))]);
+        let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
+        let one = Value::from_u64(1, 1);
+        let mut signed = one.clone();
+        signed.is_signed = true;
+        let mut real = one.clone();
+        real.is_real = true;
+        let wide = Value::from_u64(1, 128);
+        let mut high = wide.clone();
+        high.set_bit(90, LogicBit::One);
+        let mut x = wide.clone();
+        x.set_bit(90, LogicBit::X);
+        let mut z = wide.clone();
+        z.set_bit(90, LogicBit::Z);
+        let values = [
+            one,
+            Value::fill_of('1'),
+            signed,
+            real,
+            Value::from_u64(1, 32),
+            wide,
+            high,
+            x,
+            z,
+            Value::from_string("first___same_low"),
+            Value::from_string("other___same_low"),
+        ];
+        let mut keys = HashSet::default();
+        for value in &values {
+            let params = HashMap::from_iter([("P".into(), value.clone())]);
+            assert!(keys.insert(scope.prepared_key(defs["m"], &defs, &params).0));
+        }
+        assert_eq!(keys.len(), values.len());
+        // A cache hit uses equality as well as hashing, including baseline
+        // omissions; constructing the key again finds the same prepared body.
+        let mut cache = HashMap::default();
+        let (key, _) = scope.prepared_key(defs["m"], &defs, &table);
+        cache.insert(key, 42);
+        assert_eq!(
+            cache.get(&scope.prepared_key(defs["m"], &defs, &table).0),
+            Some(&42)
+        );
     }
 }

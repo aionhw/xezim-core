@@ -2218,7 +2218,7 @@ fn parse_and_elaborate(
     // part of every module. Retain all bodies in a known hierarchy root for
     // diagnostics and out-of-block method linking; other definitions need
     // only the bodies they reference, including transitive dependencies.
-    // An ambiguous root keeps the conservative eager behavior.
+    // With several roots, the first in source order carries all bodies.
     let carrier_eligible = |def: &SourceDefinition| {
         matches!(
             def,
@@ -2227,9 +2227,12 @@ fn parse_and_elaborate(
                 | SourceDefinition::Interface(_)
         )
     };
+    // Match the later top selection when a missing named top may fall back
+    // to automatic detection with strict-top checking disabled.
+    let named_top = top_module_name.filter(|name| definitions.contains_key(*name));
     let unit_carrier = if top_level_functions.is_empty() && top_level_tasks.is_empty() {
         None
-    } else if let Some(name) = top_module_name {
+    } else if let Some(name) = named_top {
         definitions
             .get(name)
             .and_then(|d| carrier_eligible(d).then(|| name.to_string()))
@@ -2241,15 +2244,23 @@ fn parse_and_elaborate(
         for bind in &top_level_binds {
             instantiated.insert(bind.instantiation.module_name.name.clone());
         }
-        // §23.3.1: only an uninstantiated module, interface or program is a
-        // hierarchy root. A package or a class is consumed globally and never
-        // instantiated, so it must not make the root ambiguous (#834).
-        let mut roots = definitions
+        // §23.3.1 (#834): packages and classes are not hierarchy roots;
+        // retain one deterministic module-like carrier for unit bodies.
+        definitions
             .iter()
-            .filter(|(name, d)| !instantiated.contains(name.as_str()) && carrier_eligible(d));
-        roots
-            .next()
-            .and_then(|(name, _)| roots.next().is_none().then(|| name.clone()))
+            .filter(|(name, d)| !instantiated.contains(name.as_str()) && carrier_eligible(d))
+            .min_by(|(a, _), (b, _)| {
+                let ap = def_source_pos
+                    .get(a.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                let bp = def_source_pos
+                    .get(b.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                ap.cmp(&bp).then_with(|| a.cmp(b))
+            })
+            .map(|(name, _)| name.clone())
     };
     let unit_usage = unit_subroutine_usage::Usage::new(&top_level_functions, &top_level_tasks);
     let common_unit_refs = unit_usage.references(&(
