@@ -10,7 +10,6 @@ use crate::ast::types::*;
 use crate::ast::{Identifier, Span};
 use crate::hasher::HashMap;
 use crate::hasher::HashSet;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub(crate) mod array_params;
@@ -201,7 +200,7 @@ fn params_insert_traced(
 
 /// Insert into a typedef-width table, logging the written width and the value
 /// it replaced when the key is traced. Same result as `HashMap::insert`; the
-/// untraced path is the plain insert.
+/// untraced path does no tracing work.
 /// A table typedef widths can be recorded in: the design's own
 /// `TypedefTable` or a scratch `HashMap`.
 trait WidthTable {
@@ -216,7 +215,7 @@ impl WidthTable for HashMap<String, u32> {
 
 impl WidthTable for TypedefTable {
     fn insert_width(&mut self, key: String, w: u32) -> Option<u32> {
-        self.insert(key, w)
+        self.insert_if_changed(key, w)
     }
 }
 
@@ -333,6 +332,19 @@ impl<V> LoggedMap<V> {
                 }
             }
         }
+    }
+}
+
+impl LoggedMap<u32> {
+    /// Same return value as `insert`, but an unchanged width leaves both
+    /// the table and its change-log position intact. Wildcard imports bind
+    /// large package type tables twice per instance (#721); recording those
+    /// no-ops retained one key allocation per typedef per instance forever.
+    pub fn insert_if_changed(&mut self, key: String, width: u32) -> Option<u32> {
+        if self.map.get(&key) == Some(&width) {
+            return Some(width);
+        }
+        self.insert(key, width)
     }
 }
 
@@ -2886,6 +2898,14 @@ fn elaborate_class_in_scope(
                 }
             }
             ClassItem::Method(m) => {
+                // §8.24 (#842): a scoped body written here belongs to a
+                // nested class, not to this class under the same bare name.
+                // The extern linker attaches it after all classes exist.
+                if matches!(&m.kind, ClassMethodKind::Function(f) if f.name.has_scope())
+                    || matches!(&m.kind, ClassMethodKind::Task(t) if t.name.has_scope())
+                {
+                    continue;
+                }
                 let name = match &m.kind {
                     ClassMethodKind::Function(f) => f.name.name.name.clone(),
                     ClassMethodKind::Task(t) => t.name.name.name.clone(),
@@ -5734,9 +5754,17 @@ pub fn register_scoped_typedef_alias(
     // declare — read `a_pkg::ADD`'s value. Members wider than 64 bits are
     // parked by the inliner's package pass (`wide_enum_value_map`).
     if matches!(td.data_type, DataType::Enum(_)) {
-        let w = elab.typedefs.get(&td.name.name).copied().unwrap_or(32).max(1);
-        if w <= 64 {
-            if let Some(members) = elab.enum_members.get(&td.name.name).cloned() {
+        if let Some(members) = elab.enum_members.get(&td.name.name).cloned() {
+            // §18.3 / §26.3 (#862): qualified struct member types retain
+            // their own enum domain when packages share a typedef name.
+            elab.enum_members.insert(key.clone(), members.clone());
+            let w = elab
+                .typedefs
+                .get(&td.name.name)
+                .copied()
+                .unwrap_or(32)
+                .max(1);
+            if w <= 64 {
                 for (m, v) in members {
                     alias_pkg_param(elab, pkg, &m, &Value::from_u64(v, w));
                 }
@@ -12947,7 +12975,7 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
     };
     for def in definitions.values() {
         // Out-of-body method definitions (`function Class::m(); ...`) appear
-        // in TWO places depending on where the source wrote them:
+        // in these places depending on where the source wrote them:
         //   * `Definition::Package` items (a function inside a `package ... endpackage`),
         //   * `Definition::Module/Interface/Program` items — compilation-unit-
         //     scope (`$unit`) functions are injected into EVERY module by the
@@ -12957,6 +12985,7 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
         //     their empty `extern` prototype and field initializers like
         //     `seq_item_export = new(...)` never ran — every handle field
         //     stayed null, surfacing as "Cannot connect to null port handle".
+        //   * class bodies: the declaration scope of nested classes (#842).
         match def {
             Definition::Package(p) => {
                 for item in &p.items {
@@ -12991,6 +13020,10 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
                                 t.span,
                             );
                         }
+                        PackageItem::Class(c) => {
+                            let owner = nested_class_owner(Some(&p.name.name), c);
+                            link_class_items(c, &owner, &mut attach);
+                        }
                         _ => {}
                     }
                 }
@@ -12998,6 +13031,68 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
             Definition::Module(m) => link_module_items(&m.items, &mut attach),
             Definition::Interface(i) => link_module_items(&i.items, &mut attach),
             Definition::Program(p) => link_module_items(&p.items, &mut attach),
+            Definition::Class(c) => link_class_items(c, &c.name.name, &mut attach),
+            _ => {}
+        }
+    }
+}
+
+/// §8.23/§26.3: colliding class names have already been qualified by
+/// `pkg_scope`; otherwise extend the lexical enclosing class/package.
+fn nested_class_owner(enclosing: Option<&str>, c: &ClassDeclaration) -> String {
+    let name = &c.name.name;
+    match enclosing {
+        Some(outer) => nested_scope_name(outer, name),
+        _ => name.clone(),
+    }
+}
+
+/// A class-scoped name may already include its enclosing class chain but
+/// omit the package prefix (`Outer::Inner` inside `pkg::Outer`). Retain the
+/// longest existing overlap instead of repeating that chain.
+fn nested_scope_name(enclosing: &str, name: &str) -> String {
+    let matches = |scope: &str| name == scope || name.starts_with(&format!("{scope}::"));
+    if matches(enclosing) {
+        return name.to_string();
+    }
+    for (at, _) in enclosing.match_indices("::") {
+        if matches(&enclosing[at + 2..]) {
+            return format!("{}::{name}", &enclosing[..at]);
+        }
+    }
+    format!("{enclosing}::{name}")
+}
+
+/// §8.24 (#842): the enclosing class body is the declaration scope of a
+/// nested class's out-of-block methods. Reuse the ordinary extern linker
+/// so constructors, qualifiers and the class table's aliases stay intact.
+fn link_class_items<F>(class: &ClassDeclaration, owner: &str, attach: &mut F)
+where
+    F: FnMut(String, String, crate::ast::decl::ClassMethodKind, crate::ast::Span),
+{
+    let target =
+        |name: &crate::ast::types::TypeName| nested_scope_name(owner, &name.scope_prefix());
+    for item in &class.items {
+        match item {
+            ClassItem::Method(method) => match &method.kind {
+                ClassMethodKind::Function(f) if f.name.has_scope() => attach(
+                    target(&f.name),
+                    f.name.name.name.clone(),
+                    ClassMethodKind::Function(f.clone()),
+                    f.span,
+                ),
+                ClassMethodKind::Task(t) if t.name.has_scope() => attach(
+                    target(&t.name),
+                    t.name.name.name.clone(),
+                    ClassMethodKind::Task(t.clone()),
+                    t.span,
+                ),
+                _ => {}
+            },
+            ClassItem::Class(inner) => {
+                let inner_owner = nested_class_owner(Some(owner), inner);
+                link_class_items(inner, &inner_owner, attach);
+            }
             _ => {}
         }
     }
@@ -13045,6 +13140,7 @@ where
                     t.span,
                 );
             }
+            ModuleItem::ClassDeclaration(c) => link_class_items(c, &c.name.name, attach),
             _ => {}
         }
     }
@@ -27892,7 +27988,10 @@ fn register_nested_classes(
             register_class_enum_members(inner, elab);
             let mut cls = elaborate_class_with_params(inner, Some(&elab.parameters));
             cls.enclosing = Some(outer.to_string());
-            let scoped = format!("{}::{}", outer, inner.name.name);
+            // pkg_scope may already have qualified a colliding inner name.
+            // Do not repeat the enclosing scope: package aliases must remain
+            // spellable as `pkg::Outer#(...)::Inner` (#842).
+            let scoped = nested_class_owner(Some(outer), inner);
             let cls = std::sync::Arc::new(cls);
             elab.classes.insert(scoped.clone(), cls.clone());
             elab.classes.entry(inner.name.name.clone()).or_insert(cls);
@@ -29657,7 +29756,7 @@ struct SubroutineBody<'a> {
     owner: &'a str,
     /// Class whose members it may name bare: the enclosing class of a method,
     /// or the `C` of an out-of-class `C::m` body; empty otherwise.
-    class: &'a str,
+    class: String,
     /// The subroutine's own name (a function's return variable).
     name: &'a str,
     ports: &'a [crate::ast::decl::FunctionPort],
@@ -29666,11 +29765,7 @@ struct SubroutineBody<'a> {
 
 impl<'a> SubroutineBody<'a> {
     fn task(owner: &'a str, class: &'a str, t: &'a TaskDeclaration) -> Self {
-        let class = t
-            .name
-            .scopes
-            .first()
-            .map_or(class, |s| s.name.name.as_str());
+        let class = Self::class_scope(class, &t.name);
         SubroutineBody {
             owner,
             class,
@@ -29681,17 +29776,27 @@ impl<'a> SubroutineBody<'a> {
     }
 
     fn function(owner: &'a str, class: &'a str, f: &'a FunctionDeclaration) -> Self {
-        let class = f
-            .name
-            .scopes
-            .first()
-            .map_or(class, |s| s.name.name.as_str());
+        let class = Self::class_scope(class, &f.name);
         SubroutineBody {
             owner,
             class,
             name: &f.name.name.name,
             ports: &f.ports,
             items: &f.items,
+        }
+    }
+
+    /// §8.24/§23.9 (#842): preserve the complete owner of a nested method.
+    /// A bare last component could name an unrelated class, while a body
+    /// written inside its enclosing class has a relative class scope.
+    fn class_scope(enclosing: &str, name: &crate::ast::types::TypeName) -> String {
+        let scope = name.scope_prefix();
+        if scope.is_empty() {
+            enclosing.to_string()
+        } else if enclosing.is_empty() {
+            scope
+        } else {
+            nested_scope_name(enclosing, &scope)
         }
     }
 }
@@ -29891,15 +29996,20 @@ fn validate_subroutine_bodies(
     };
     let mut scopes: HashMap<&str, HashSet<String>> = HashMap::default();
     for body in &bodies {
-        if !body.class.is_empty() && !bases_declared(body.class) {
+        // Qualified and bare aliases point to one elaborated class, whose
+        // declared name indexes the AST's lexical scope maps. Resolve the
+        // full chain before choosing the declarations visible to the body.
+        let class = elab
+            .classes
+            .get(&body.class)
+            .map_or(body.class.as_str(), |c| c.name.as_str());
+        if !class.is_empty() && !bases_declared(class) {
             continue;
         }
-        let found = if body.class.is_empty() {
+        let found = if class.is_empty() {
             first_undeclared_in_subroutine(body, known, None)
         } else {
-            let scope = scopes
-                .entry(body.class)
-                .or_insert_with(|| class_scope(body.class));
+            let scope = scopes.entry(class).or_insert_with(|| class_scope(class));
             first_undeclared_in_subroutine(body, outside_classes, Some(scope))
         };
         if let Some((name, span)) = found {
@@ -33641,12 +33751,13 @@ fn collect_body_driven_names(
     }
 }
 
-type InlinePrepCache = HashMap<String, Rc<PreparedModuleItems>>;
+type InlinePrepCache = HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>;
 
 /// `XEZIM_COMPILE_PHASES`: how the prepared-body cache is doing, printed as
 /// it goes (an `[elab-stats]` line at each power-of-two miss count and every
 /// 10000 misses), so a run killed for its memory still shows whether bodies
-/// were shared: hits, misses, the bytes of the keys kept and the longest key.
+/// were shared: hits, misses, retained key payload bytes and the longest added
+/// key payload (shared absence masks counted once, allocator overhead excluded).
 fn note_prep_lookup(hit: bool, key_len: usize) {
     use std::cell::Cell;
     thread_local! {
@@ -33674,35 +33785,6 @@ fn note_prep_lookup(hit: bool, key_len: usize) {
     });
 }
 
-/// The cache key of a prepared body: the parameters its scope can read
-/// (`ParamScope::scope_words`), or all of them when that is unknown. A scope
-/// holds every parameter of the instances above it, so keying on all of them
-/// gave nearly every instance a key, and a prepared body, of its own: a key
-/// rendering thousands of parameters, and a copy of the body that was never
-/// shared.
-fn format_param_key(params: &HashMap<String, Value>, words: Option<&HashSet<String>>) -> String {
-    let mut ordered = BTreeMap::new();
-    for (name, value) in params {
-        if words.is_none_or(|w| param_scope::spells(w, name)) {
-            ordered.insert(name.as_str(), value);
-        }
-    }
-    let mut key = String::new();
-    for (name, value) in ordered {
-        use std::fmt::Write as _;
-        let _ = write!(
-            key,
-            "{}:{}:{}:{}:{:?}|",
-            name,
-            value.width,
-            value.is_signed as u8,
-            value.is_real as u8,
-            value.raw_bits()
-        );
-    }
-    key
-}
-
 fn prepare_module_items(
     source_def: Definition,
     definitions: &HashMap<String, Definition>,
@@ -33711,17 +33793,12 @@ fn prepare_module_items(
     cache: &mut InlinePrepCache,
     param_scope: &param_scope::ParamScope,
 ) -> Rc<PreparedModuleItems> {
-    let words = param_scope.scope_words(source_def, definitions);
-    let cache_key = format!(
-        "{}|{}",
-        source_def.name(),
-        format_param_key(local_params, (*words).as_ref())
-    );
+    let (cache_key, key_bytes) = param_scope.prepared_key(source_def, definitions, local_params);
     if let Some(prepared) = cache.get(&cache_key) {
-        note_prep_lookup(true, cache_key.len());
+        note_prep_lookup(true, 0);
         return Rc::clone(prepared);
     }
-    note_prep_lookup(false, cache_key.len());
+    note_prep_lookup(false, key_bytes);
 
     let mut local_typedefs = std::collections::HashSet::default();
     for item in source_def.items() {
@@ -36686,7 +36763,7 @@ fn inline_module_items(
                                             )
                                         },
                                     );
-                                    elab.typedefs.insert(a.name.name.clone(), w);
+                                    elab.typedefs.insert_if_changed(a.name.name.clone(), w);
                                     elab.typedef_types.insert(a.name.name.clone(), resolved_dt);
                                 }
                             }
@@ -37207,7 +37284,7 @@ fn inline_module_items(
                     }
                     match old_w {
                         Some(width) => {
-                            elab.typedefs.insert(name, width);
+                            elab.typedefs.insert_if_changed(name, width);
                         }
                         None => {
                             elab.typedefs.remove(&name);
@@ -37306,7 +37383,7 @@ fn inline_module_items(
                                     saved_tds
                                         .entry(a.name.name.clone())
                                         .or_insert_with(|| elab.typedefs.get(&a.name.name).copied());
-                                    elab.typedefs.insert(a.name.name.clone(), w);
+                                    elab.typedefs.insert_if_changed(a.name.name.clone(), w);
                                     // §20.7: its full definition too (see
                                     // `saved_type_shapes`), kept for the
                                     // rest of this instance.
@@ -37339,7 +37416,7 @@ fn inline_module_items(
                                 saved_tds
                                     .entry(td.name.name.clone())
                                     .or_insert_with(|| elab.typedefs.get(&td.name.name).copied());
-                                elab.typedefs.insert(td.name.name.clone(), w);
+                                elab.typedefs.insert_if_changed(td.name.name.clone(), w);
                             }
                         }
                     }
@@ -37351,7 +37428,7 @@ fn inline_module_items(
                     for (name, old) in saved_tds {
                         match old {
                             Some(width) => {
-                                elab.typedefs.insert(name, width);
+                                elab.typedefs.insert_if_changed(name, width);
                             }
                             None => {
                                 elab.typedefs.remove(&name);
@@ -49676,6 +49753,105 @@ mod logged_map_tests {
 
     fn same(a: &HashMap<String, u32>, b: &HashMap<String, u32>) -> bool {
         a.len() == b.len() && a.iter().all(|(k, v)| b.get(k) == Some(v))
+    }
+
+    /// #721: no-op width bindings must not grow the retained change log,
+    /// and replay positions must still describe actual mutations exactly.
+    #[test]
+    fn unchanged_typedef_widths_do_not_advance_snapshot_positions() {
+        let mut table = TypedefTable::default();
+        assert_eq!(table.insert_if_changed("word_t".into(), 8), None);
+        let id = table.ident.0;
+        sync_typedefs_tls(&table);
+        let seen = table.log.len();
+        let mut older_snapshot = table.map.clone();
+
+        for _ in 0..1000 {
+            assert_eq!(table.insert_if_changed("word_t".into(), 8), Some(8));
+            assert_eq!(table.log.len(), seen);
+            sync_typedefs_tls(&table);
+            assert_eq!(TYPEDEFS_TLS_MIRROR.with(|m| m.get()), Some((id, seen)));
+        }
+        assert_eq!(table.insert_if_changed("word_t".into(), 16), Some(8));
+        assert_eq!(table.remove("word_t"), Some(16));
+        assert_eq!(table.remove("word_t"), None);
+        assert_eq!(table.insert_if_changed("word_t".into(), 32), None);
+        assert_eq!(table.insert_if_changed("word_t".into(), 32), Some(32));
+        assert_eq!(table.insert_if_changed("other_t".into(), 4), None);
+        assert_eq!(table.log.len(), seen + 4);
+
+        // A snapshot may miss a width change, removal and reinsertion:
+        // replay still restores the final table, including deleted keys.
+        table.replay_into(&mut older_snapshot, seen);
+        assert!(same(&older_snapshot, table.as_map()));
+        sync_typedefs_tls(&table);
+        assert!(same(&tls_snapshot().unwrap(), table.as_map()));
+        let seen = table.log.len();
+        assert_eq!(table.remove("word_t"), Some(32));
+        let mut deleted_snapshot = older_snapshot;
+        table.replay_into(&mut deleted_snapshot, seen);
+        assert!(same(&deleted_snapshot, table.as_map()));
+    }
+
+    /// #721: clones and deserialized tables own fresh identities. Skipping
+    /// no-ops must never make their empty logs reuse another table's TLS.
+    #[test]
+    fn unchanged_widths_preserve_clone_and_roundtrip_snapshot_identity() {
+        let mut original = TypedefTable::default();
+        original.insert_if_changed("word_t".into(), 8);
+        sync_typedefs_tls(&original);
+        let mut cloned = original.clone();
+        assert_ne!(cloned.ident.0, original.ident.0);
+        assert!(cloned.log.is_empty());
+        assert_eq!(cloned.insert_if_changed("word_t".into(), 8), Some(8));
+        assert!(cloned.log.is_empty());
+        cloned.insert_if_changed("word_t".into(), 16);
+        sync_typedefs_tls(&cloned);
+        assert_eq!(tls_snapshot().unwrap()["word_t"], 16);
+        sync_typedefs_tls(&original);
+        assert_eq!(tls_snapshot().unwrap()["word_t"], 8);
+
+        let config = crate::xez_bincode_config();
+        let encoded = bincode::serde::encode_to_vec(&cloned, config).unwrap();
+        let (mut restored, _): (TypedefTable, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).unwrap();
+        assert_ne!(restored.ident.0, cloned.ident.0);
+        assert!(restored.log.is_empty());
+        assert_eq!(restored.insert_if_changed("word_t".into(), 16), Some(16));
+        assert!(restored.log.is_empty());
+        sync_typedefs_tls(&restored);
+        assert_eq!(tls_snapshot().unwrap()["word_t"], 16);
+        original.insert_if_changed("word_t".into(), 32);
+        sync_typedefs_tls(&original);
+        assert_eq!(tls_snapshot().unwrap()["word_t"], 32);
+        sync_typedefs_tls(&restored);
+        assert_eq!(tls_snapshot().unwrap()["word_t"], 16);
+    }
+
+    /// §26.3 (#721): repeated transitive wildcard imports share typedef
+    /// widths without retaining a log key per typedef per instance.
+    #[test]
+    fn repeated_wildcard_typedef_imports_keep_a_bounded_change_log() {
+        let mut source = String::from("package many_types;\n");
+        for i in 0..96 {
+            source.push_str(&format!("typedef logic [7:0] word_{i}_t;\n"));
+        }
+        source.push_str(
+            "endpackage\npackage relay; import many_types::*; endpackage\n\
+             module leaf; import relay::*; word_0_t q; endmodule\n\
+             module top; for (genvar i=0;i<32;i++) begin:g leaf u(); end endmodule\n",
+        );
+        let (_, design) =
+            crate::parse_and_elaborate_multi(&[source], Some("top"), &[], &["top.sv".into()], &[])
+                .expect("elaborate repeated imports");
+        assert_eq!(design.signals["g[31].u.q"].width, 8);
+        assert_eq!(design.typedefs["word_95_t"], 8);
+        assert!(
+            design.typedefs.log.len() <= design.typedefs.len(),
+            "{} retained changes for {} widths",
+            design.typedefs.log.len(),
+            design.typedefs.len(),
+        );
     }
 
     /// The const-eval snapshot must equal the table after every sync, whether
