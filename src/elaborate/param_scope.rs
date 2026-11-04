@@ -59,6 +59,9 @@ pub(super) struct ParamScope {
     /// The words the file-scope `let`s and the binds spell (`None`: one
     /// could not be read to the end).
     common_words: Rc<Option<HashSet<String>>>,
+    /// The entries every scope's words spell: keys without a word and those
+    /// under a common word.
+    common_spelled: Box<[u32]>,
     /// Per definition, only its own and its immediate children's words.
     words: RefCell<HashMap<(String, usize), Rc<ScopeWords>>>,
     /// Absence from a scope matters too. Share identical absence masks instead
@@ -111,6 +114,7 @@ impl ParamScope {
             spelled: RefCell::default(),
             selected: RefCell::default(),
             common_words: Rc::new(None),
+            common_spelled: Box::default(),
             words: RefCell::default(),
             missing: RefCell::default(),
         };
@@ -150,6 +154,13 @@ impl ParamScope {
         if all {
             scope.common = (0..scope.entries.len() as u32).collect();
         } else {
+            // Keys without a word, which `common` holds so far, and those
+            // under a common word.
+            let mut spelled = scope.common.clone();
+            spelled.extend(words.iter().filter_map(|w| scope.by_word.get(w)).flatten());
+            spelled.sort_unstable();
+            spelled.dedup();
+            scope.common_spelled = spelled.into();
             scope.common.extend(found);
             scope.common.sort_unstable();
             scope.common.dedup();
@@ -202,9 +213,21 @@ impl ParamScope {
                 read(child, &mut HashSet::default());
             }
         }
+        let spelled = match (&*self.common_words, &words) {
+            (Some(_), Some(local)) => Some(
+                local
+                    .iter()
+                    .filter_map(|w| self.by_word.get(w))
+                    .flatten()
+                    .copied()
+                    .collect(),
+            ),
+            _ => None,
+        };
         let words = Rc::new(ScopeWords {
             common: Rc::clone(&self.common_words),
             local: words,
+            spelled,
         });
         self.words.borrow_mut().insert(key, Rc::clone(&words));
         words
@@ -234,13 +257,18 @@ impl ParamScope {
         }
         changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut missing = Vec::new();
-        for (i, (name, _)) in self.entries.iter().enumerate() {
-            if words.spells(name) && !params.contains_key(name) {
+        let mut note = |i: u32| {
+            let i = i as usize;
+            if !params.contains_key(&self.entries[i].0) {
                 if missing.is_empty() {
                     missing.resize(self.entries.len().div_ceil(64), 0u64);
                 }
                 missing[i / 64] |= 1 << (i % 64);
             }
+        };
+        match &words.spelled {
+            Some(own) => self.common_spelled.iter().chain(own).copied().for_each(&mut note),
+            None => (0..self.entries.len() as u32).for_each(&mut note),
         }
         while missing.last() == Some(&0) {
             missing.pop();
@@ -419,6 +447,9 @@ pub(super) fn def_key(def: &Definition) -> (String, usize) {
 pub(super) struct ScopeWords {
     common: Rc<Option<HashSet<String>>>,
     local: Option<HashSet<String>>,
+    /// The table entries the local words spell, beside
+    /// `ParamScope::common_spelled`; `None` when the words are unknown.
+    spelled: Option<Box<[u32]>>,
 }
 
 impl ScopeWords {
@@ -803,6 +834,13 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
             assert!(Rc::ptr_eq(&scope.common_words, &words.common));
             assert!(words.local.as_ref().unwrap().len() < 16);
             assert!(words.spells("pk::P_2047"));
+            let mut ids: Vec<u32> = scope.common_spelled.iter().copied().collect();
+            ids.extend(words.spelled.as_deref().unwrap());
+            ids.sort_unstable();
+            ids.dedup();
+            let spelled = (0..scope.entries.len() as u32)
+                .filter(|&i| words.spells(&scope.entries[i as usize].0));
+            assert!(ids.into_iter().eq(spelled));
             let (key, added) = scope.prepared_key(def, &defs, &empty, Vec::new());
             assert!(key.changed.is_empty());
             if let Some(mask) = &previous_mask {
