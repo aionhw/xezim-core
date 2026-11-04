@@ -5779,6 +5779,27 @@ impl Value {
         let num_bytes = self.width.div_ceil(8) as usize;
         let mut out: Vec<u8> = Vec::with_capacity(num_bytes);
         let mut started = false;
+        // String values carry no X/Z bits: read each byte straight from its
+        // value word. String building (`s = {s, x}`) converts the whole
+        // accumulated value on every append, so this runs per character.
+        if let ValueStorage::Wide(planes) = &self.storage
+            && planes.xz.iter().all(|&w| w == 0)
+        {
+            for bi in (0..num_bytes).rev() {
+                let mut byte = (planes.val[bi / 8] >> ((bi % 8) * 8)) as u8;
+                let w = self.width as usize - bi * 8;
+                if w < 8 {
+                    byte &= ((1u16 << w) - 1) as u8;
+                }
+                if byte != 0 {
+                    started = true;
+                }
+                if started {
+                    out.push(byte);
+                }
+            }
+            return out;
+        }
         // Whole bytes via the SWAR slice reader (word extraction) instead of
         // eight get_bit calls per byte — string values are wide (one byte per
         // char) and this ran per formatted UVM message.
@@ -5803,10 +5824,12 @@ impl Value {
     /// to one char (Latin-1, the inverse of `from_string`), so raw bytes
     /// above 0x7F survive a round-trip instead of becoming U+FFFD.
     pub fn to_sv_string(&self) -> String {
-        self.sv_string_bytes()
-            .into_iter()
-            .map(|b| b as char)
-            .collect()
+        let bytes = self.sv_string_bytes();
+        if bytes.is_ascii() {
+            // ASCII is already valid UTF-8 with one byte per char.
+            return String::from_utf8(bytes).unwrap_or_default();
+        }
+        bytes.into_iter().map(|b| b as char).collect()
     }
 
     /// Hex string representation
@@ -6464,6 +6487,47 @@ impl Value {
         self.is_real = other.is_real;
         self.is_fill = other.is_fill;
     }
+}
+
+/// A string key as stored inside a flat element name (`a[KEY]`): `[`, `]`
+/// and `\` become `\(`, `\)` and `\\`, so a name never holds a raw bracket
+/// inside a key (§7.8.1 allows any characters). Inverse: `decode_name_key`.
+pub fn encode_name_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if !key.bytes().any(|b| matches!(b, b'[' | b']' | b'\\')) {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 4);
+    for c in key.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '[' => out.push_str("\\("),
+            ']' => out.push_str("\\)"),
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Inverse of `encode_name_key`.
+pub fn decode_name_key(seg: &str) -> std::borrow::Cow<'_, str> {
+    if !seg.contains('\\') {
+        return std::borrow::Cow::Borrowed(seg);
+    }
+    let mut out = String::with_capacity(seg.len());
+    let mut chars = seg.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('(') => out.push('['),
+            Some(')') => out.push(']'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 impl Value {

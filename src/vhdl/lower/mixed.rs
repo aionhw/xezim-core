@@ -938,7 +938,7 @@ impl<'a> Lw<'a> {
                 },
                 (Mode::Out | Mode::Buffer, Some(r)) => {
                     let w = format!("vh_w{}", k);
-                    let _ = writeln!(self.sv_items, "  wire {} {};", bnd.sv(), w);
+                    let _ = writeln!(self.sv_wires, "  wire {} {};", bnd.sv(), w);
                     conns.push(format!(".{}({})", pname, w));
                     self.foreign_driver(r, w, bnd, ty, *p);
                 }

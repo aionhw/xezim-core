@@ -150,14 +150,14 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
   this is the shared lib — declaring it here covers xezim, xezim-b, and every
   test binary. **Never add another `#[global_allocator]`.** A consumer opting
   out uses `xezim-core = { path = "../xezim-core", default-features = false }`.
-- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x29"`
+- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x32"`
   (`src/lib.rs`). The last byte is the serialized-format version. When you add
   or change a serialized field in `ElaboratedModule` (or any bincode-serialized
-  type), **bump `\x29` to `\x2A`** and add one line to the version-ladder
-  comment above it, so stale `.xez` artifacts fail with a clear "recompile with
+  type), **bump the version byte** (`\x32` to `\x33`) and add one line to the
+  version-ladder comment above it, so stale `.xez` artifacts fail with a clear "recompile with
   current xezim" error instead of deserializing garbage.
-- **Artifacts are zstd-compressed bincode.** Default level 3 (overridable via
-  `set_zstd_level`). The magic/version check runs before decompression.
+- **Artifacts are zstd-compressed bincode 2** (serde, standard configuration).
+  Default level 3 (overridable via `set_zstd_level`). The magic/version check runs before decompression.
 - **Logging routing**: output goes through `log_println`/`log_eprintln`
   (`src/lib.rs`) so the caller's `-l` fd-level redirect works — it captures
   DPI/VPI C output too. Bare `println!`/`eprintln!` bypasses `--log`.

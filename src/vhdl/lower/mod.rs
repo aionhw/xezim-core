@@ -190,6 +190,9 @@ struct Lw<'a> {
     /// SV module instances (VHDL components bound to SV modules) and their
     /// wires; a counter naming their nets.
     sv_items: String,
+    /// The wires SV modules' outputs drive (declared before the boundary
+    /// that samples them).
+    sv_wires: String,
     sv_nets: usize,
     /// Processes with a sensitivity list, run by the kernel's cycle block
     /// (and lowered as functions in a mixed design, for the eager path).
@@ -329,6 +332,7 @@ impl<'a> Lw<'a> {
             fins: Vec::new(),
             fouts: Vec::new(),
             sv_items: String::new(),
+            sv_wires: String::new(),
             sv_nets: 0,
             fprocs: BTreeSet::new(),
             fproc_bodies: Vec::new(),

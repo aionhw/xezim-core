@@ -19,6 +19,10 @@ pub struct MacroDef {
     pub body: String,
 }
 
+/// Ends a macro usage at a `` paste and is removed once usages expand
+/// (`apply_token_pasting`). A character source text rarely holds.
+const PASTE_SEPARATOR: char = '\u{1}';
+
 pub struct Preprocessor {
     defines: HashMap<String, MacroDef>,
     /// Directories to search for `include files (in order).
@@ -75,6 +79,9 @@ pub struct Preprocessor {
     /// Undefined macro names seen while expanding the current line; reported
     /// (located at the use) when the line is done.
     undefined_seen: std::cell::RefCell<Vec<String>>,
+    /// Whether `apply_token_pasting` left a `PASTE_SEPARATOR` that
+    /// `expand_macros` must remove; a 0x01 byte of the source is kept.
+    paste_separated: std::cell::Cell<bool>,
     /// Files contributing to the text being produced, for its line map.
     map_files: Vec<MapFile>,
     /// Macro names referenced by the line map, and their indices.
@@ -136,6 +143,11 @@ impl OriginSink {
         self.origins.extend(origins);
         self.seen = output.len();
     }
+}
+
+/// The first position of `needle` in `hay`.
+fn find_byte_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Offset of the first byte of `b` equal to one of `targets`, eight bytes at
@@ -332,6 +344,7 @@ impl Preprocessor {
             unconnected_pull: None,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
             undefined_seen: std::cell::RefCell::new(Vec::new()),
+            paste_separated: std::cell::Cell::new(false),
             map_files: Vec::new(),
             map_macros: Vec::new(),
             map_columns: Vec::new(),
@@ -512,6 +525,45 @@ impl Preprocessor {
         matches!(it.next(), Some("end_protected") | Some("end"))
     }
 
+    /// Whether a `` `define `` line opens a formal argument list (a `(` right
+    /// after the macro name, §22.5.1) that the line does not close.
+    fn define_formals_open(line: &str) -> bool {
+        let Some(rest) = fast_trim_start(line).strip_prefix("`define") else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        let name_len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .unwrap_or(rest.len());
+        let Some(list) = rest[name_len..].strip_prefix('(') else {
+            return false;
+        };
+        let mut depth = 1i32;
+        let mut in_str = false;
+        let mut prev = ' ';
+        for c in list.chars() {
+            if in_str {
+                if c == '"' && prev != '\\' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            prev = c;
+        }
+        true
+    }
+
     fn is_directive(trimmed: &str, name: &str) -> bool {
         if let Some(rest) = trimmed
             .strip_prefix('`')
@@ -523,34 +575,96 @@ impl Preprocessor {
         }
     }
 
-    /// Update the design-element nesting depth from one source line. Opening
-    /// keywords increment; `end…` keywords decrement (floored at 0).
+    /// Update the design-element nesting depth from one source line. An
+    /// opening keyword counts as the line's first word or right after a
+    /// closing one (`endmodule module b;`); every closing `end…` keyword on
+    /// the line counts (floored at 0), so `module m; endmodule` on one line
+    /// opens and closes (§22.3 `\`resetall` after it is legal). Comments and
+    /// string literals are skipped; `interface class` is a class (§8.26).
     fn update_design_depth(trimmed: &str, depth: &mut i32) {
-        // The leading word, scanned bytewise while it stays ASCII.
-        let b = trimmed.as_bytes();
-        let n = b
-            .iter()
-            .position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
-            .unwrap_or(b.len());
-        let first = if n < b.len() && b[n] >= 0x80 {
-            trimmed
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or("")
-        } else {
-            &trimmed[..n]
+        let code = Self::strip_line_comments_and_strings(trimmed);
+        let words: Vec<&str> = code
+            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let is_open = |w: &str| {
+            matches!(
+                w,
+                "module"
+                    | "macromodule"
+                    | "interface"
+                    | "package"
+                    | "program"
+                    | "primitive"
+                    | "checker"
+            )
         };
-        match first {
-            "module" | "macromodule" | "interface" | "package" | "program" | "primitive"
-            | "checker" => *depth += 1,
-            "endmodule" | "endinterface" | "endpackage" | "endprogram" | "endprimitive"
-            | "endchecker" => {
+        let is_close = |w: &str| {
+            matches!(
+                w,
+                "endmodule"
+                    | "endinterface"
+                    | "endpackage"
+                    | "endprogram"
+                    | "endprimitive"
+                    | "endchecker"
+            )
+        };
+        let mut prev_close = true; // the line start counts as an opener slot
+        for (i, w) in words.iter().enumerate() {
+            if is_close(w) {
                 if *depth > 0 {
                     *depth -= 1;
                 }
+                prev_close = true;
+                continue;
             }
-            _ => {}
+            if prev_close
+                && is_open(w)
+                && !(*w == "interface" && words.get(i + 1) == Some(&"class"))
+            {
+                *depth += 1;
+            }
+            prev_close = false;
         }
+    }
+
+    /// `line` without `//` and `/* … */` comments and the contents of string
+    /// literals, for keyword scanning.
+    fn strip_line_comments_and_strings(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => break,
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                        i += 1;
+                    }
+                    i += 2;
+                    out.push(' ');
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        if b[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    out.push(' ');
+                }
+                _ => {
+                    let ch = line[i..].chars().next().unwrap_or(' ');
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        out
     }
 
     /// §22.12: validate `\`line <number> "<filename>" <level>`.
@@ -724,7 +838,10 @@ impl Preprocessor {
                 self.add_include_dir(parent);
             }
         }
-        let stripped = self.strip_comments(source);
+        let name = source_path
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let stripped = self.strip_file_comments(source, &name);
         let (resolved, origins) = self.resolve_directives(
             &stripped,
             source_path,
@@ -742,7 +859,7 @@ impl Preprocessor {
         // directive from a previous file in the same process doesn't
         // pollute this one.
         crate::set_default_nettype_none_seen(false);
-        let stripped = self.strip_comments(source);
+        let stripped = self.strip_file_comments(source, "");
         let (resolved, origins) = self.resolve_directives(
             &stripped,
             None,
@@ -771,6 +888,91 @@ impl Preprocessor {
     /// returned: which file, line and column each of its lines came from.
     pub fn take_line_map(&mut self) -> Option<LineMap> {
         self.last_map.take()
+    }
+
+    /// `strip_comments` of one file's text, `path` naming it in warnings,
+    /// with the opt-in source relaxations applied: a NUL byte read as a
+    /// space (XEZIM_RELAX_NUL_BYTES, #628) and white space between a
+    /// backtick and a name removed (XEZIM_RELAX_MACRO_SPACE, #627).
+    fn strip_file_comments(&self, source: &str, path: &str) -> String {
+        let warn = |n: usize, what: &str, clause: &str, var: &str| {
+            eprintln!(
+                "{path}: warning: {n} {what} (IEEE 1800-2017 {clause}, {var})",
+                path = if path.is_empty() { "<input>" } else { path }
+            );
+        };
+        let nuls = if crate::RELAX_NUL_BYTES.get() {
+            source.bytes().filter(|&b| b == 0).count()
+        } else {
+            0
+        };
+        let stripped = if nuls > 0 {
+            warn(
+                nuls,
+                "NUL byte(s) read as white space",
+                "§5.3",
+                "XEZIM_RELAX_NUL_BYTES",
+            );
+            self.strip_comments(&source.replace('\0', " "))
+        } else {
+            self.strip_comments(source)
+        };
+        if !crate::RELAX_MACRO_SPACE.get() || !stripped.contains('`') {
+            return stripped;
+        }
+        let (joined, spaced) = Self::join_spaced_backticks(&stripped);
+        if spaced > 0 {
+            warn(
+                spaced,
+                "backtick(s) followed by white space read as a macro usage or directive",
+                "§22.5.1",
+                "XEZIM_RELAX_MACRO_SPACE",
+            );
+        }
+        joined
+    }
+
+    /// The text with the blanks and tabs removed between a backtick and the
+    /// name that follows it, outside string literals, and how many there
+    /// were. A `` `` `` paste is left as it is.
+    fn join_spaced_backticks(text: &str) -> (String, usize) {
+        let b = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut count = 0;
+        let mut in_str = false;
+        let mut seg = 0;
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\\' if in_str => i += 1,
+                b'"' if i == 0 || b[i - 1] != b'`' => in_str = !in_str,
+                b'\n' => in_str = false,
+                b'`' if !in_str => {
+                    if b.get(i + 1) == Some(&b'`') {
+                        i += 2;
+                        continue;
+                    }
+                    let mut j = i + 1;
+                    while matches!(b.get(j), Some(b' ' | b'\t')) {
+                        j += 1;
+                    }
+                    if j > i + 1
+                        && b.get(j)
+                            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                    {
+                        out.push_str(&text[seg..=i]);
+                        seg = j;
+                        count += 1;
+                        i = j;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&text[seg..]);
+        (out, count)
     }
 
     fn strip_comments(&self, source: &str) -> String {
@@ -897,6 +1099,9 @@ impl Preprocessor {
             ("`elsif", true),
             ("`endif", false),
             ("`else", false),
+            // §22.5.2: `undef names one macro; the text after it on the line
+            // is ordinary source, split off like a conditional's (#619).
+            ("`undef", true),
         ] {
             if let Some(rest) = s.strip_prefix(kw) {
                 // §22: the directive name is an identifier — it ends at the
@@ -935,6 +1140,10 @@ impl Preprocessor {
         // their column is approximate; only text pieces need it exact.
         let mut pos: Vec<(u32, u32)> = Vec::new();
         let mut in_define_cont = false;
+        // The `define text so far while its formal list is still open over
+        // several lines (§22.5.1): those lines belong to the define even
+        // without a `\`, and so do the body lines after them (#656).
+        let mut open_formals: Option<String> = None;
         for (ln, line) in source.lines().enumerate() {
             let ln = ln as u32;
             // A line with no backtick outside a `define body passes through
@@ -947,7 +1156,21 @@ impl Preprocessor {
             }
             let trimmed = fast_trim_start(line);
             if in_define_cont || directive_word(trimmed, "`define") {
-                in_define_cont = line.trim_end().ends_with('\\');
+                let text = match open_formals.take() {
+                    Some(mut t) => {
+                        t.push(' ');
+                        t.push_str(line);
+                        t
+                    }
+                    None if directive_word(trimmed, "`define") => line.to_string(),
+                    None => String::new(),
+                };
+                if !text.is_empty() && Self::define_formals_open(&text) {
+                    open_formals = Some(text);
+                    in_define_cont = true;
+                } else {
+                    in_define_cont = line.trim_end().ends_with('\\');
+                }
                 out.push_str(line);
                 out.push('\n');
                 pos.push((ln, 0));
@@ -1116,6 +1339,20 @@ impl Preprocessor {
                 // For the directive, we want to strip the \ and the newline
                 let mut clean_line = String::new();
                 let mut current = line.to_string();
+                // §22.5.1 / §5.2: the formal argument list may span lines
+                // (`\`define M(a,` then `b) body`): white space includes
+                // newlines, and no backslash is needed inside the list. The
+                // header ended at the first line, so `b)` was read as code
+                // (#606). Join lines until the list closes.
+                while Self::define_formals_open(&current) && !current.trim_end().ends_with('\\') {
+                    let Some((next_li, next)) = lines.next() else {
+                        break;
+                    };
+                    current.push(' ');
+                    current.push_str(next);
+                    consumed_lines += 1;
+                    continuation.push(next_li);
+                }
 
                 loop {
                     let text = current.as_str();
@@ -1304,7 +1541,10 @@ impl Preprocessor {
                             }) {
                                 Ok(contents) => {
                                     self.include_depth += 1;
-                                    let stripped = self.strip_comments(&contents);
+                                    let stripped = self.strip_file_comments(
+                                        &contents,
+                                        &resolved.display().to_string(),
+                                    );
                                     let site = (here.file, here.line);
                                     let (included, origins) = self.resolve_directives(
                                         &stripped,
@@ -1594,8 +1834,24 @@ impl Preprocessor {
             // Split-text indices of the lines joined into `logical_line`.
             joined.clear();
             joined.push(li);
-            while logical_line.contains('`') && Self::has_unclosed_paren(&logical_line) {
+            // §22.5.1: the actual-argument list of a macro defined with
+            // formals may start on a later line than its name (white space
+            // and comments between them, §5.3), so a line ending in such a
+            // name is joined with the following ones like an open paren.
+            // Carry the balance across physical lines. Rescanning the entire
+            // prefix on each append made a long macro argument quadratic.
+            let has_macro = logical_line.contains('`')
+                && Self::has_macro_outside_string(&logical_line);
+            let mut paren_depth = 0;
+            let mut in_string = false;
+            if has_macro {
+                Self::scan_paren_balance(&logical_line, &mut paren_depth, &mut in_string);
+            }
+            while has_macro
+                && (paren_depth > 0 || self.ends_with_parameterized_macro(&logical_line))
+            {
                 if let Some((lj, next)) = lines.next() {
+                    Self::scan_paren_balance(next, &mut paren_depth, &mut in_string);
                     logical_line.push('\n');
                     logical_line.push_str(next);
                     joined.push(lj);
@@ -1836,10 +2092,8 @@ impl Preprocessor {
         while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
             k += 1;
         }
-        let mut j = k;
-        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
-            j += 1;
-        }
+        // The list may follow on a later line (§22.5.1), as in the lookahead.
+        let mut j = Self::skip_space_and_comments(b, k);
         if b.get(j) == Some(&b'(') {
             let mut depth = 0usize;
             while j < b.len() {
@@ -2217,10 +2471,13 @@ impl Preprocessor {
             }
             result = next;
         }
+        if self.paste_separated.replace(false) {
+            result.retain(|c| c != PASTE_SEPARATOR);
+        }
         result
     }
 
-    fn apply_token_pasting(text: &str) -> String {
+    fn apply_token_pasting(&self, text: &str) -> String {
         if !text.contains("``") {
             return text.to_string();
         }
@@ -2256,6 +2513,28 @@ impl Preprocessor {
                 // after `localparam` (br979), while `i``a` glues because there
                 // was no whitespace between the tokens to begin with.
                 i += 2;
+                // A usage of a defined macro ends at the `` (`` unit_`TAG``_n ``
+                // is `TAG then _n): keep a separator so the name does not run
+                // on into `TAG_n; `expand_macros` drops it after expansion,
+                // gluing the result (#616). A name the paste itself forms
+                // (`` `ID_``n `` with `ID_` no macro) is still pasted whole.
+                let ident_len = result
+                    .bytes()
+                    .rev()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$')
+                    .count();
+                if ident_len > 0 {
+                    let head = &result[..result.len() - ident_len];
+                    let name = &result[result.len() - ident_len..];
+                    if head.ends_with('`')
+                        && !head.ends_with("``")
+                        && self.defines.contains_key(name)
+                        && !self.paste_forms_macro(name, &text[i..])
+                    {
+                        result.push(PASTE_SEPARATOR);
+                        self.paste_separated.set(true);
+                    }
+                }
                 continue;
             }
 
@@ -2270,10 +2549,48 @@ impl Preprocessor {
         result
     }
 
+    /// Whether the names a paste chain joins onto `name` form a macro, so the
+    /// usage is pasted whole: `` `x``y `` with `AB` defined is `AB`, and
+    /// `` `P``A``B `` with `PAB` defined is `PAB` (§22.5.1). `rest` is the
+    /// text after the first ``.
+    fn paste_forms_macro(&self, name: &str, mut rest: &str) -> bool {
+        let mut joined = name.to_string();
+        loop {
+            let seg = rest
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$')
+                .count();
+            // Nothing more to glue: the paste ends the name, so it is a
+            // usage of whatever `joined` names (`` `uvm_pack_``da``(x) `` is
+            // `uvm_pack_da(x)`, its arguments kept).
+            if seg == 0 {
+                return self.defines.contains_key(&joined);
+            }
+            joined.push_str(&rest[..seg]);
+            if self.defines.contains_key(&joined) {
+                return true;
+            }
+            match rest[seg..].strip_prefix("``") {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        }
+    }
+
+    /// Whether `text` holds a `` `define `` of `name`.
+    fn line_defines(text: &str, name: &str) -> bool {
+        text.match_indices("`define").any(|(i, d)| {
+            let rest = text[i + d.len()..].trim_start();
+            rest.strip_prefix(name).is_some_and(|after| {
+                !after.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+            })
+        })
+    }
+
     fn expand_macros_once(&self, line: &str) -> String {
         let line_pasted;
         let line: &str = if line.contains("``") {
-            line_pasted = Self::apply_token_pasting(line);
+            line_pasted = self.apply_token_pasting(line);
             &line_pasted
         } else {
             line
@@ -2384,15 +2701,24 @@ impl Preprocessor {
                     result.push_str(&self.current_line.to_string());
                 } else if let Some(def) = self.defines.get(macro_name) {
                     // eprintln!("[PP] expanding macro '{}'", macro_name);
-                    let mut p = i;
-                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
-                        p += 1;
-                    }
+                    // §22.5.1/§5.3: white space, newlines and comments may
+                    // separate the name from its actual-argument list.
+                    let p = if def.params.is_some() {
+                        Self::skip_space_and_comments(bytes, i)
+                    } else {
+                        i
+                    };
                     if def.params.is_some() && p < bytes.len() && bytes[p] == b'(' {
                         i = p;
                         // Parameterized macro: find arguments
-                        let args = Self::extract_macro_args(line, &mut i);
+                        let mut args = Self::extract_macro_args(line, &mut i);
                         let params = def.params.as_ref().unwrap();
+                        // §22.5.1: () supplies one empty actual when there
+                        // are formals, just as (,) supplies two. Preserve a
+                        // genuinely zero-argument invocation of `define M().
+                        if args.is_empty() && !params.is_empty() {
+                            args.push(String::new());
+                        }
                         // §22.5.1 strict argument-count validation: too many
                         // actuals, or a non-defaulted formal left without one.
                         if crate::strict_checks() {
@@ -2447,7 +2773,7 @@ impl Preprocessor {
                             actuals.push((pname.as_str(), arg));
                         }
                         let body = Self::substitute_formals(&def.body, &actuals);
-                        let body_pasted = Self::apply_token_pasting(&body);
+                        let body_pasted = self.apply_token_pasting(&body);
                         result.push_str(&body_pasted);
                     } else {
                         // §22.5.1: a macro defined with a formal list must be
@@ -2462,7 +2788,7 @@ impl Preprocessor {
                                 ),
                             ));
                         }
-                        let body_pasted = Self::apply_token_pasting(&def.body);
+                        let body_pasted = self.apply_token_pasting(&def.body);
                         result.push_str(&body_pasted);
                     }
                 } else {
@@ -2475,7 +2801,12 @@ impl Preprocessor {
                     // reached the parser as literal text and produced ten
                     // "expected RParen, found Comma" errors that named neither
                     // the macro nor the reason.
-                    self.note_undefined_macro(macro_name);
+                    // A macro an expansion on this line defines (`` `define CUR n
+                    // `CUR `undef CUR ``) is defined once the expansion's
+                    // directives run; it is expanded then, not undefined.
+                    if !Self::line_defines(line, macro_name) {
+                        self.note_undefined_macro(macro_name);
+                    }
                     result.push('`');
                     result.push_str(macro_name);
                 }
@@ -2692,11 +3023,11 @@ impl Preprocessor {
                 continue;
             }
             if !in_string && i + 1 < bytes.len() && bytes[i + 1] == b'*'
-                // `@(*)` is the implicit-sensitivity-list construct, not an
-                // attribute. Skip if the byte after `(*` is `)`. Likewise
+                // §5.3 / §9.4.2.2: `@(* )` is an implicit event control,
+                // also with white space or comments before `)`. Likewise
                 // skip `(**` (e.g. an exponent inside parens) where the
                 // payload starts with another `*`.
-                && bytes.get(i + 2).copied() != Some(b')')
+                && bytes.get(Self::skip_space_and_comments(bytes, i + 2)) != Some(&b')')
                 && bytes.get(i + 2).copied() != Some(b'*')
             {
                 // Find matching *)
@@ -2728,23 +3059,110 @@ impl Preprocessor {
         result
     }
 
-    fn has_unclosed_paren(line: &str) -> bool {
-        let mut depth = 0i32;
-        let mut in_string = false;
+    /// The first byte at or after `i` that is not white space or part of a
+    /// comment (`// ...` to the end of its line, `/* ... */`).
+    fn skip_space_and_comments(bytes: &[u8], mut i: usize) -> usize {
+        loop {
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
+                i += 1;
+            }
+            if bytes[i..].starts_with(b"//") {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"/*") {
+                match find_byte_seq(&bytes[i + 2..], b"*/") {
+                    Some(k) => {
+                        i += 2 + k + 2;
+                        continue;
+                    }
+                    None => return bytes.len(),
+                }
+            }
+            return i;
+        }
+    }
+
+    /// Whether `line` ends, outside a string, with the use of a macro defined
+    /// with formal arguments followed only by white space and comments: its
+    /// argument list must still come (§22.5.1).
+    fn ends_with_parameterized_macro(&self, line: &str) -> bool {
         let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut last: Option<usize> = None;
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
-                b'"' if i == 0 || bytes[i - 1] != b'\\' => {
-                    in_string = !in_string;
+                b'\\' if in_string => i += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes[i..].starts_with(b"//") => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
                 }
-                b'(' if !in_string => depth += 1,
-                b')' if !in_string => depth -= 1,
+                b'`' if !in_string => last = Some(i),
                 _ => {}
             }
             i += 1;
         }
-        depth > 0
+        let Some(at) = last else {
+            return false;
+        };
+        let start = at + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start || Self::skip_space_and_comments(bytes, end) != bytes.len() {
+            return false;
+        }
+        self.defines
+            .get(&line[start..end])
+            .is_some_and(|d| d.params.is_some())
+    }
+
+    /// §22.5.1: ordinary string literals do not contain macro uses. Treating
+    /// a quoted backtick as a macro joined an ordinary multiline call across
+    /// conditional directives, then recursively resolved the same directives
+    /// forever when macro expansion left that quoted text unchanged.
+    fn has_macro_outside_string(line: &str) -> bool {
+        let mut bytes = line.bytes();
+        let mut in_string = false;
+        while let Some(byte) = bytes.next() {
+            match byte {
+                b'\\' if in_string => {
+                    bytes.next();
+                }
+                b'"' => in_string = !in_string,
+                b'`' if !in_string => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    // Each chunk starts after an inserted newline, so quote escaping cannot
+    // carry across the boundary; the string and parenthesis states do.
+    fn scan_paren_balance(line: &str, depth: &mut i32, in_string: &mut bool) {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                // Inside a string a backslash escapes the next byte, so
+                // `"\\"` closes the string and `"\""` does not.
+                b'\\' if *in_string => i += 1,
+                b'"' if *in_string || i == 0 || bytes[i - 1] != b'\\' => {
+                    *in_string = !*in_string
+                }
+                b'(' if !*in_string => *depth += 1,
+                b')' if !*in_string => *depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
     }
 
     fn contains_preprocessor_directive(text: &str) -> bool {
@@ -2774,5 +3192,89 @@ fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod multiline_scan_tests {
+    use super::Preprocessor;
+
+    /// IEEE 1800-2017 §22.5.1: nested actual arguments and quoted parentheses
+    /// retain their meaning when a macro name and its argument list span lines.
+    #[test]
+    fn multiline_arguments_keep_nested_and_string_parentheses() {
+        let mut pp = Preprocessor::new();
+        let output = pp.preprocess(
+            r#"
+`define ID(x) x
+`ID
+(
+  {"(", ")", nested(
+    1, (2 + 3))}
+)
+`define AFTER 42
+`AFTER
+"#,
+        );
+        let normalized = output.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(normalized, r#"{"(", ")", nested( 1, (2 + 3))} 42"#);
+    }
+
+    /// §22.5.1/§22.6: quoted macro names stay literal while conditional
+    /// directives in the surrounding call select only their active branch.
+    #[test]
+    fn quoted_backticks_do_not_join_across_conditionals() {
+        for selected in [false, true] {
+            for value in ["`ifdef PICK\n1\n`else\n2\n`endif", "`VALUE"] {
+                let prefix = if selected { "`define PICK\n" } else { "" };
+                let source = format!(
+                    "{prefix}`define KEEP wrong\n`define VALUE \\\n`ifdef PICK \\\n1 \\\n`else \\\n2 \\\n`endif\nmodule top;\ninitial $display(\"literal `KEEP\",\n{value}\n);\nendmodule\n"
+                );
+                let out = Preprocessor::new().preprocess(&source);
+                let normalized = out.split_whitespace().collect::<Vec<_>>().join(" ");
+                let number = if selected { 1 } else { 2 };
+                assert_eq!(
+                    normalized,
+                    format!(
+                        "module top; initial $display(\"literal `KEEP\", {number} ); endmodule"
+                    )
+                );
+            }
+        }
+    }
+
+    /// §5.9: `\\` is one escaped backslash, so `"\\"` ends the string and
+    /// the call's closing parenthesis still counts; `"\"` does not end it.
+    #[test]
+    fn escaped_backslash_closes_a_quoted_actual() {
+        let (mut depth, mut quoted) = (0, false);
+        Preprocessor::scan_paren_balance(r#"`ID("\\")"#, &mut depth, &mut quoted);
+        assert_eq!((depth, quoted), (0, false));
+        let (mut depth, mut quoted) = (0, false);
+        Preprocessor::scan_paren_balance(r#"`ID("\")"#, &mut depth, &mut quoted);
+        assert_eq!((depth, quoted), (1, true));
+    }
+
+    #[test]
+    fn incremental_scan_matches_joined_scan() {
+        for chunks in [
+            vec!["((", ")", ")"],
+            vec!["(\"(\"", ", \")\")"],
+            vec!["(\"open", "still string\")"],
+            vec!["(\"escape\\", "\")"],
+            vec!["", "()", "("],
+        ] {
+            let (mut depth, mut quoted) = (0, false);
+            for chunk in &chunks {
+                Preprocessor::scan_paren_balance(chunk, &mut depth, &mut quoted);
+            }
+            let (mut joined_depth, mut joined_quoted) = (0, false);
+            Preprocessor::scan_paren_balance(
+                &chunks.join("\n"),
+                &mut joined_depth,
+                &mut joined_quoted,
+            );
+            assert_eq!((depth, quoted), (joined_depth, joined_quoted), "{chunks:?}");
+        }
     }
 }

@@ -452,6 +452,7 @@ impl Parser {
         let declarators = self.parse_var_declarator_list();
         self.expect(TokenKind::Semicolon);
         DataDeclaration {
+            net_type: None,
             const_kw,
             var_kw,
             lifetime,
@@ -494,7 +495,12 @@ impl Parser {
         let return_type = self.parse_function_return_type(start);
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
-        let mut ports = self.parse_function_ports();
+        let default_args = self.eat_default_constructor_args(&name.name.name);
+        let mut ports = if default_args {
+            Vec::new()
+        } else {
+            self.parse_function_ports()
+        };
         let ansi_ports = ports.len();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
@@ -524,7 +530,7 @@ impl Parser {
         self.pop_let_scope();
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
-        self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
+        self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
         // §8.7: a class constructor takes its arguments in a port list only;
         // its body has no tf_item_declaration.
@@ -543,8 +549,28 @@ impl Parser {
             items,
             endlabel,
             strict_body_ports,
+            default_args,
             span: self.span_from(start),
         }
+    }
+
+    /// IEEE 1800-2023 §8.17: `function new(default);` — consumes the
+    /// `(default)` argument list of a constructor and reports it, so the
+    /// constructor takes its superclass constructor's arguments. Leaves the
+    /// cursor untouched for any other port list (or in 2017 mode).
+    pub(super) fn eat_default_constructor_args(&mut self, method_name: &str) -> bool {
+        if method_name == "new"
+            && crate::is_sv2023()
+            && self.at(TokenKind::LParen)
+            && self.peek_kind() == TokenKind::KwDefault
+            && self.peek_kind_n(2) == TokenKind::RParen
+        {
+            self.bump();
+            self.bump();
+            self.bump();
+            return true;
+        }
+        false
     }
 
     /// Parse a NON-ANSI task/function body port declaration
@@ -652,7 +678,7 @@ impl Parser {
         self.pop_let_scope();
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
-        self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
+        self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
         TaskDeclaration {
             lifetime,
@@ -674,42 +700,108 @@ impl Parser {
     fn check_tf_body_redeclarations(
         &mut self,
         body_ports: &[FunctionPort],
-        items: &[super::super::ast::stmt::Statement],
+        items: &mut Vec<super::super::ast::stmt::Statement>,
+    ) {
+        if crate::strict_checks() || crate::RELAX_DUPLICATE_DECLS.get() {
+            self.redeclarations(body_ports, items, "subroutine");
+        }
+    }
+
+    /// `XEZIM_RELAX_DUPLICATE_DECLS`: a repeated name in a `begin ... end` or
+    /// `fork ... join` block's declarations is ignored with a warning. Without
+    /// it a block is not checked.
+    pub(super) fn check_block_redeclarations(
+        &mut self,
+        items: &mut Vec<super::super::ast::stmt::Statement>,
+    ) {
+        if crate::RELAX_DUPLICATE_DECLS.get() {
+            self.redeclarations(&[], items, "block");
+        }
+    }
+
+    /// §3.13: a name already declared in a subroutine's or block's
+    /// declarations may not be declared again. An error; with
+    /// `XEZIM_RELAX_DUPLICATE_DECLS` a warning, and the second variable
+    /// declaration is dropped so the first's type and initializer stay (a
+    /// port declared after the variable is kept).
+    fn redeclarations(
+        &mut self,
+        body_ports: &[FunctionPort],
+        items: &mut Vec<super::super::ast::stmt::Statement>,
+        scope: &str,
     ) {
         use super::super::ast::stmt::StatementKind;
-        if !crate::strict_checks() {
-            return;
-        }
-        let mut decls: Vec<(&Identifier, bool)> =
-            body_ports.iter().map(|p| (&p.name, true)).collect();
-        for it in items {
+        let relax = crate::RELAX_DUPLICATE_DECLS.get();
+        // (name, span start, statement and declarator index of a variable)
+        let mut decls: Vec<(&Identifier, Option<(usize, usize)>)> =
+            body_ports.iter().map(|p| (&p.name, None)).collect();
+        for (si, it) in items.iter().enumerate() {
             if let StatementKind::VarDecl { declarators, .. } = &it.kind {
-                decls.extend(declarators.iter().map(|d| (&d.name, false)));
+                decls.extend(
+                    declarators
+                        .iter()
+                        .enumerate()
+                        .map(|(di, d)| (&d.name, Some((si, di)))),
+                );
             }
         }
         decls.sort_by_key(|(id, _)| id.span.start);
         // name -> variable declarations seen so far
         let mut vars: std::collections::HashMap<&str, u32> = Default::default();
-        let mut errs = Vec::new();
-        for (id, is_port) in decls {
+        let mut diags = Vec::new();
+        let mut dropped: Vec<(usize, usize)> = Vec::new();
+        for (id, var) in decls {
             let n = vars.entry(id.name.as_str()).or_default();
-            let redeclared = if is_port {
-                *n > 0
-            } else {
-                *n += 1;
-                *n > 1
+            let redeclared = match var {
+                None => *n > 0,
+                Some(_) => {
+                    *n += 1;
+                    *n > 1
+                }
             };
-            if redeclared {
-                errs.push(crate::diagnostics::Diagnostic::error(
+            if !redeclared {
+                continue;
+            }
+            diags.push(if relax {
+                if let Some(at) = var {
+                    dropped.push(at);
+                }
+                crate::diagnostics::Diagnostic::warning(
                     format!(
-                        "'{}' is already declared in this subroutine (IEEE 1800-2017 §23.2.2.1)",
+                        "'{}' is already declared in this {scope}; the second declaration is \
+                         ignored (IEEE 1800-2023 §3.13, XEZIM_RELAX_DUPLICATE_DECLS)",
                         id.name
                     ),
                     id.span,
-                ));
-            }
+                )
+            } else {
+                crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "'{}' is already declared in this {scope} (IEEE 1800-2023 §3.13)",
+                        id.name
+                    ),
+                    id.span,
+                )
+            });
         }
-        self.diagnostics.extend(errs);
+        self.diagnostics.extend(diags);
+        if dropped.is_empty() {
+            return;
+        }
+        let mut si = 0;
+        items.retain_mut(|it| {
+            let here = si;
+            si += 1;
+            let StatementKind::VarDecl { declarators, .. } = &mut it.kind else {
+                return true;
+            };
+            let mut di = 0;
+            declarators.retain(|_| {
+                di += 1;
+                !dropped.contains(&(here, di - 1))
+            });
+            !declarators.is_empty()
+        });
     }
 
     /// §13.3: the non-ANSI style may declare a port's DIRECTION and its DATA
@@ -773,15 +865,26 @@ impl Parser {
     /// type is present the next token is that name instead
     /// (`function pkg::t_e cls::m();`), and this stays false.
     fn scoped_name_is_the_method_name(&self) -> bool {
-        matches!(
-            self.peek_kind_n(3),
-            TokenKind::LParen | TokenKind::Semicolon
-        )
+        // `a::b(`, and a longer chain `a::b::c(` (a nested class, §8.23).
+        let mut n = 1;
+        while self.peek_kind_n(n) == TokenKind::DoubleColon
+            && matches!(
+                self.peek_kind_n(n + 1),
+                TokenKind::Identifier | TokenKind::KwNew
+            )
+        {
+            n += 2;
+        }
+        n >= 3
+            && matches!(
+                self.peek_kind_n(n),
+                TokenKind::LParen | TokenKind::Semicolon
+            )
     }
 
     pub(super) fn parse_method_name(&mut self) -> TypeName {
         let start = self.current().span.start;
-        let first = if self.at(TokenKind::KwNew) {
+        let mut name = if self.at(TokenKind::KwNew) {
             let tok = self.bump();
             Identifier {
                 name: tok.text.clone(),
@@ -790,10 +893,14 @@ impl Parser {
         } else {
             self.parse_identifier()
         };
-
-        if self.at(TokenKind::DoubleColon) {
+        // §8.24 out-of-block declaration, §8.23 class scope: the scope may
+        // name a nested class (`function int outer::inner::m(...)`), so every
+        // `::` link is a scope, the last name the method. Only one link was
+        // read, and the second `::` was a parse error (#617).
+        let mut scopes = Vec::new();
+        while self.at(TokenKind::DoubleColon) {
             self.bump();
-            let second = if self.at(TokenKind::KwNew) {
+            let next = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
                 Identifier {
                     name: tok.text.clone(),
@@ -802,20 +909,15 @@ impl Parser {
             } else {
                 self.parse_identifier()
             };
-            TypeName {
-                scopes: vec![crate::ast::types::TypeScope {
-                    name: first,
-                    type_args: Vec::new(),
-                }],
-                name: second,
-                span: self.span_from(start),
-            }
-        } else {
-            TypeName {
-                scopes: Vec::new(),
-                name: first,
-                span: self.span_from(start),
-            }
+            scopes.push(crate::ast::types::TypeScope {
+                name: std::mem::replace(&mut name, next),
+                type_args: Vec::new(),
+            });
+        }
+        TypeName {
+            scopes,
+            name,
+            span: self.span_from(start),
         }
     }
     /// The return type of a function declaration or prototype: an explicit
@@ -874,7 +976,12 @@ impl Parser {
         let lifetime = self.parse_optional_lifetime();
         let return_type = self.parse_function_return_type(start);
         let name = self.parse_method_name();
-        let ports = self.parse_function_ports();
+        let default_args = self.eat_default_constructor_args(&name.name.name);
+        let ports = if default_args {
+            Vec::new()
+        } else {
+            self.parse_prototype_ports()
+        };
         self.expect(TokenKind::Semicolon);
         FunctionDeclaration {
             lifetime,
@@ -885,6 +992,7 @@ impl Parser {
             items: Vec::new(),
             endlabel: None,
             strict_body_ports: Vec::new(),
+            default_args,
             span: self.span_from(start),
         }
     }
@@ -895,7 +1003,7 @@ impl Parser {
         let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_method_name();
-        let ports = self.parse_function_ports();
+        let ports = self.parse_prototype_ports();
         self.expect(TokenKind::Semicolon);
         TaskDeclaration {
             lifetime,
@@ -960,6 +1068,10 @@ impl Parser {
         if self.eat(TokenKind::LParen).is_none() {
             return args;
         }
+        // Without the `#` this is a constructor's arguments, which may mix.
+        if _has_hash {
+            self.check_param_list_form();
+        }
         if self.at(TokenKind::RParen) {
             self.bump();
             return args;
@@ -1006,6 +1118,16 @@ impl Parser {
         self.expect(TokenKind::RParen);
         args
     }
+    /// A prototype's ports (an `extern`, `pure virtual` or DPI import): a
+    /// formal may give only its type, `import "DPI-C" function int f(int);`
+    /// (A.2.7 footnote 28, #655).
+    fn parse_prototype_ports(&mut self) -> Vec<FunctionPort> {
+        let saved = std::mem::replace(&mut self.prototype_ports, true);
+        let ports = self.parse_function_ports();
+        self.prototype_ports = saved;
+        ports
+    }
+
     pub(super) fn parse_function_ports(&mut self) -> Vec<FunctionPort> {
         let mut ports = Vec::new();
         if self.eat(TokenKind::LParen).is_none() {
@@ -1228,7 +1350,21 @@ impl Parser {
                     span: self.span_from(start),
                 }
             };
-            let name = self.parse_identifier();
+            // An unnamed formal of a prototype: a placeholder name by position.
+            let name = if self.prototype_ports
+                && matches!(
+                    self.current_kind(),
+                    TokenKind::RParen | TokenKind::Comma | TokenKind::LBracket
+                )
+                && !matches!(data_type, DataType::Implicit { .. })
+            {
+                Identifier {
+                    name: format!("__arg{}", ports.len()),
+                    span: self.current().span,
+                }
+            } else {
+                self.parse_identifier()
+            };
             let dimensions = self.parse_unpacked_dimensions();
             let default = if self.eat(TokenKind::Assign).is_some() {
                 Some(self.parse_expression())
@@ -1388,6 +1524,47 @@ impl Parser {
                     Some(PackageItem::Data(self.parse_data_declaration()))
                 }
             }
+            // §26.2 / A.1.11: a package may declare nets. A net with an
+            // implicit data type (`wire [W-1:0] t;`, `wire t;`) went to the
+            // data-declaration parser, which needs an explicit type (#602).
+            // Parse it as a module item does and keep it as package data,
+            // as `wire logic [...] t;` already was.
+            _ if self.is_net_type_keyword() => match self.parse_module_item() {
+                Some(ModuleItem::NetDeclaration(n)) => Some(PackageItem::Data(DataDeclaration {
+                    net_type: Some(n.net_type),
+                    const_kw: false,
+                    var_kw: false,
+                    lifetime: None,
+                    data_type: n.data_type,
+                    declarators: n
+                        .declarators
+                        .into_iter()
+                        .map(|d| VarDeclarator {
+                            // §6.6: an undriven net holds z (a supply net its
+                            // constant), where a package variable would start
+                            // at its type's default.
+                            init: Some(d.init.unwrap_or_else(|| {
+                                let fill = match n.net_type {
+                                    NetType::Supply1 => '1',
+                                    NetType::Supply0 => '0',
+                                    _ => 'z',
+                                };
+                                crate::ast::expr::Expression::new(
+                                    crate::ast::expr::ExprKind::Number(
+                                        crate::ast::expr::NumberLiteral::UnbasedUnsized(fill),
+                                    ),
+                                    d.span,
+                                )
+                            })),
+                            name: d.name,
+                            dimensions: d.dimensions,
+                            span: d.span,
+                        })
+                        .collect(),
+                    span: n.span,
+                })),
+                _ => Some(PackageItem::Null),
+            },
             _ if self.is_data_type_keyword()
                 || self.at(TokenKind::KwVar)
                 || self.at(TokenKind::KwConst) =>
@@ -1399,9 +1576,12 @@ impl Parser {
                 self.bump();
                 self.parse_package_item()
             }
+            // A.1.11: `;` is an empty package item. It used to skip ahead to
+            // the next item, so at the end of a package the caller, given
+            // none, consumed `endpackage` itself (#658).
             TokenKind::Semicolon => {
                 self.bump();
-                self.parse_package_item()
+                Some(PackageItem::Null)
             }
             _ => None,
         }

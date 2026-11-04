@@ -441,6 +441,7 @@ fn let_subst(e: &mut Expression, map: &std::collections::HashMap<String, Express
             let_subst(body, map);
         }
         ExprKind::ShallowCopy { source } => let_subst(source, map),
+        ExprKind::TypedPattern { pattern, .. } => let_subst(pattern, map),
         ExprKind::Number(_)
         | ExprKind::StringLiteral(_)
         | ExprKind::TypeLiteral(_)
@@ -765,6 +766,14 @@ pub struct CoverBin {
     #[cfg_attr(feature = "serde", serde(default))]
     pub transitions: Vec<Vec<TransStep>>,
     pub span: Span,
+    /// LRM §19.5 `bins b = {..} iff (expr);` — the bin is not incremented
+    /// while the guard is false.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub iff_guard: Option<Expression>,
+    /// LRM §19.5.1.1 `bins b[] = {..} with (expr);` — only the values for
+    /// which `expr` holds, with `item` bound to the value, are in the bin.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub with_filter: Option<Expression>,
 }
 
 /// One step of a §19.5.2 transition: a value set (`1, [3:4]`) with an
@@ -1052,6 +1061,11 @@ pub struct DataDeclaration {
     pub data_type: DataType,
     pub declarators: Vec<VarDeclarator>,
     pub span: Span,
+    /// §26.2: a net declared in a package (`wire`, `supply1`, `wand`, ...),
+    /// kept as package data with its net kind so elaboration registers it
+    /// as a net (supply value, wired resolution).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub net_type: Option<NetType>,
 }
 
 #[derive(Debug, Clone)]
@@ -1314,6 +1328,11 @@ pub struct FunctionDeclaration {
     /// Not consumed by elaboration — behavior-neutral.
     #[cfg_attr(feature = "serde", serde(default))]
     pub strict_body_ports: Vec<Identifier>,
+    /// IEEE 1800-2023 §8.17: `function new(default);` — the constructor
+    /// takes the argument list of its superclass constructor and forwards
+    /// it. The elaborator fills `ports` in from the base chain.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_args: bool,
     pub span: Span,
 }
 
@@ -1402,6 +1421,10 @@ pub struct ClassExtends {
     /// packages resolves to the one the prefix names (§26.3).
     #[cfg_attr(feature = "serde", serde(default))]
     pub scopes: Vec<Identifier>,
+    /// IEEE 1800-2023 §8.17: `extends Base(default)` — the subclass
+    /// constructor's arguments are forwarded to the superclass constructor.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_args: bool,
 }
 
 /// Items that can appear inside a class body.

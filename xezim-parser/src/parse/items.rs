@@ -144,8 +144,18 @@ impl Parser {
             loop {
                 let name = self.parse_identifier();
                 let span = name.span;
+                // A.2.4 / §16.10: `variable_identifier { variable_dimension }`:
+                // a local may be an unpacked array (`bit flags[3:0];`). It was
+                // a parse error (#618). Its element selects read as the packed
+                // equivalent's, so the dimensions fold into the type.
+                let dims = if self.at(TokenKind::LBracket) {
+                    self.parse_unpacked_dimensions()
+                } else {
+                    Vec::new()
+                };
+                let local_type = self.sva_local_array_type(&data_type, &name, dims);
                 let mut args = vec![
-                    Expression::new(ExprKind::TypeLiteral(Box::new(data_type.clone())), span),
+                    Expression::new(ExprKind::TypeLiteral(Box::new(local_type)), span),
                     Self::sva_ident(name),
                 ];
                 if self.eat(TokenKind::Assign).is_some() {
@@ -163,6 +173,125 @@ impl Parser {
                 }
             }
             self.expect(TokenKind::Semicolon);
+        }
+    }
+
+    /// An assertion local declared with unpacked dimensions, as the packed
+    /// type that selects the same elements: each fixed unpacked dimension
+    /// (`[3:0]`, `[N]` as `[0:N-1]`) outside the element's own packed ones,
+    /// an integer atom element as its sized vector. Any other element type,
+    /// or a dynamic dimension, is an error rather than a silently scalar local.
+    fn sva_local_array_type(
+        &mut self,
+        dt: &DataType,
+        name: &Identifier,
+        dims: Vec<UnpackedDimension>,
+    ) -> DataType {
+        if dims.is_empty() {
+            return dt.clone();
+        }
+        let unsupported = |this: &mut Self, what: &str| {
+            this.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                format!(
+                    "unpacked dimensions on assertion local '{}' {what} are not supported \
+                     (IEEE 1800-2023 §16.10)",
+                    name.name
+                ),
+                name.span,
+            ));
+            dt.clone()
+        };
+        let int = |v: i64, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                span,
+            )
+        };
+        let mut outer = Vec::new();
+        for d in dims {
+            match d {
+                UnpackedDimension::Range { left, right, span } => {
+                    outer.push(PackedDimension::Range { left, right, span });
+                }
+                UnpackedDimension::Expression { expr, span } => {
+                    let hi = Expression::new(
+                        ExprKind::Binary {
+                            op: crate::ast::expr::BinaryOp::Sub,
+                            left: expr,
+                            right: Box::new(int(1, span)),
+                        },
+                        span,
+                    );
+                    outer.push(PackedDimension::Range {
+                        left: Box::new(int(0, span)),
+                        right: Box::new(hi),
+                        span,
+                    });
+                }
+                _ => return unsupported(self, "that are not fixed-size"),
+            }
+        }
+        let (kind, signing, inner, span) = match dt {
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => (*kind, *signing, dimensions.clone(), *span),
+            DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => {
+                use crate::ast::types::IntegerAtomType as A;
+                let (w, four, signed) = match kind {
+                    A::Byte => (8, false, true),
+                    A::ShortInt => (16, false, true),
+                    A::Int => (32, false, true),
+                    A::LongInt => (64, false, true),
+                    A::Integer => (32, true, true),
+                    A::Time => (64, true, false),
+                };
+                let sign = signing.or(signed.then_some(crate::ast::types::Signing::Signed));
+                let elem = PackedDimension::Range {
+                    left: Box::new(int(w - 1, *span)),
+                    right: Box::new(int(0, *span)),
+                    span: *span,
+                };
+                let k = if four {
+                    crate::ast::types::IntegerVectorType::Logic
+                } else {
+                    crate::ast::types::IntegerVectorType::Bit
+                };
+                (k, sign, vec![elem], *span)
+            }
+            _ => return unsupported(self, "of this element type"),
+        };
+        // §11.8.1: a select of a packed array is unsigned, so a signed
+        // element (`int counts[4]`) reads back unsigned.
+        if signing == Some(crate::ast::types::Signing::Signed) {
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    format!(
+                        "element selects of assertion local '{}' read unsigned: its unpacked \
+                         dimensions fold into a packed array (IEEE 1800-2023 §16.10, §11.8.1)",
+                        name.name
+                    ),
+                    name.span,
+                ));
+        }
+        outer.extend(inner);
+        DataType::IntegerVector {
+            kind,
+            signing,
+            dimensions: outer,
+            span,
         }
     }
 
@@ -979,6 +1108,87 @@ impl Parser {
         (ports, local_ports)
     }
 
+    /// Whether the bracket groups starting `n` tokens ahead are followed by
+    /// an identifier: `my_t [3:0] x` (a type, packed dimensions, a name), not
+    /// `a [4]` (a name and its unpacked dimensions, §7.4.2, #657).
+    fn dims_then_identifier(&self, mut n: usize) -> bool {
+        while self.peek_kind_n(n) == TokenKind::LBracket {
+            let mut depth = 0usize;
+            loop {
+                match self.peek_kind_n(n) {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            n += 1;
+                            break;
+                        }
+                    }
+                    TokenKind::Eof | TokenKind::Semicolon => return false,
+                    _ => {}
+                }
+                n += 1;
+            }
+        }
+        matches!(
+            self.peek_kind_n(n),
+            TokenKind::Identifier | TokenKind::EscapedIdentifier
+        )
+    }
+
+    /// §18.5.1, A.1.11: `constraint C::name { ... }` in a package defines the
+    /// body of the `extern constraint name;` its class `C` of the same package
+    /// declares; the body is put on that prototype (#654).
+    fn parse_package_ooc_constraint(&mut self, items: &mut [PackageItem]) {
+        let start = self.current().span.start;
+        self.expect(TokenKind::KwConstraint);
+        let hid = self.parse_hierarchical_identifier();
+        let mut body = Vec::new();
+        if self.at(TokenKind::LBrace) {
+            self.bump();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                body.push(self.parse_constraint_item(ConstraintPos::BlockItem));
+            }
+            self.expect(TokenKind::RBrace);
+        }
+        self.eat(TokenKind::Semicolon);
+        let [.., class, name] = hid.path.as_slice() else {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "an out-of-block constraint names its class: `constraint C::name { ... }` \
+                 (IEEE 1800-2023 §18.5.1)",
+                self.span_from(start),
+            ));
+            return;
+        };
+        let prototype = items.iter_mut().find_map(|it| match it {
+            PackageItem::Class(c) if c.name.name == class.name.name => {
+                c.items.iter_mut().find_map(|ci| match ci {
+                    crate::ast::decl::ClassItem::Constraint(k)
+                        if k.name.name == name.name.name && !k.has_body =>
+                    {
+                        Some(k)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        match prototype {
+            Some(k) => {
+                k.items = body;
+                k.has_body = true;
+            }
+            None => self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                format!(
+                    "class '{}' of this package declares no `extern constraint {};` \
+                     (IEEE 1800-2023 §18.5.1)",
+                    class.name.name, name.name.name
+                ),
+                self.span_from(start),
+            )),
+        }
+    }
+
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
         let start = self.current().span.start;
         self.expect(TokenKind::KwPackage);
@@ -989,6 +1199,10 @@ impl Parser {
         let mut items = Vec::new();
         self.push_let_scope();
         while !self.at(TokenKind::KwEndpackage) && !self.at(TokenKind::Eof) {
+            if self.at(TokenKind::KwConstraint) {
+                self.parse_package_ooc_constraint(&mut items);
+                continue;
+            }
             if let Some(item) = self.parse_package_item() {
                 items.push(item);
             } else {
@@ -1458,6 +1672,7 @@ impl Parser {
                 at + 1,
                 if is_var {
                     ModuleItem::DataDeclaration(DataDeclaration {
+                        net_type: None,
                         const_kw: false,
                         var_kw: false,
                         lifetime: None,
@@ -1862,13 +2077,11 @@ impl Parser {
                 {
                     self.parse_data_type()
                 } else if self.at(TokenKind::Identifier)
-                    && matches!(
+                    && (matches!(
                         self.peek_kind(),
-                        TokenKind::Identifier
-                            | TokenKind::DoubleColon
-                            | TokenKind::Hash
-                            | TokenKind::LBracket
-                    )
+                        TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash
+                    ) || (self.peek_kind() == TokenKind::LBracket
+                        && self.dims_then_identifier(1)))
                 {
                     self.parse_data_type()
                 } else if self.at(TokenKind::LBracket) {
@@ -2536,6 +2749,13 @@ impl Parser {
                     endlabel,
                     span: self.span_from(start),
                 }))
+            }
+            // §16.14.4: read and set aside, as a simulator checks no
+            // restriction; it was a parse error that lost the rest of the
+            // module (#614).
+            TokenKind::KwRestrict if self.peek_kind() == TokenKind::KwProperty => {
+                self.skip_restrict_property();
+                Some(ModuleItem::Null)
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement()))
@@ -4132,6 +4352,21 @@ impl Parser {
                     kind: crate::ast::types::SimpleType::String,
                     span,
                 } => ("string".to_string(), *span),
+                // §25.9: `C #(virtual bus_if) x;` — the same identifier
+                // `parse_type_args_hash` builds for a procedural declaration.
+                // Dropped, the module-scope variable was built as the
+                // default specialization, so its type-parameter property was
+                // no virtual interface.
+                DataType::Interface { span, .. } => {
+                    let toks: Vec<String> = self
+                        .tokens
+                        .iter()
+                        .filter(|t| t.span.start >= span.start && t.span.end <= span.end)
+                        .skip_while(|t| t.kind == TokenKind::KwVirtual)
+                        .map(|t| t.text.clone())
+                        .collect();
+                    (Self::virtual_type_arg_text(&toks), *span)
+                }
                 // §6.12: `C #(real) x;` — dropping the argument built the
                 // object as the default specialization.
                 DataType::Real { kind, span } => (
@@ -4160,7 +4395,7 @@ impl Parser {
     }
 
     /// The optional `#(...)` parameter value assignment of an instantiation
-    /// (`mod #(.P(v), 3) u (...)`), shared by module items and `bind`
+    /// (`mod #(.P(v), .Q(3)) u (...)`), shared by module items and `bind`
     /// directives. `None` when no `#` follows.
     pub(super) fn parse_instantiation_params(&mut self) -> Option<Vec<ParamConnection>> {
         if !self.at(TokenKind::Hash) {
@@ -4168,6 +4403,7 @@ impl Parser {
         }
         self.bump();
         if self.eat(TokenKind::LParen).is_some() {
+            self.check_param_list_form();
             let mut p = Vec::new();
             while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                 if self.at(TokenKind::Dot) {
@@ -4185,7 +4421,16 @@ impl Parser {
                         value: pv,
                     });
                 } else {
-                    p.push(ParamConnection::Ordered(Some(self.parse_param_value())));
+                    let v = self.parse_param_value();
+                    // §29.3/§28.16 `delay2 ::= #(mintypmax [, mintypmax])`:
+                    // a UDP's delay may be `min:typ:max`.
+                    let v = match v {
+                        ParamValue::Expr(e) if self.at(TokenKind::Colon) => {
+                            ParamValue::Expr(self.parse_mintypmax_rest(e))
+                        }
+                        v => v,
+                    };
+                    p.push(ParamConnection::Ordered(Some(v)));
                 }
 
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4197,7 +4442,9 @@ impl Parser {
         } else if matches!(
             self.current_kind(),
             TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
-        ) {
+        ) || (self.at(TokenKind::Identifier)
+            && !matches!(self.peek_kind(), TokenKind::DoubleColon | TokenKind::Dot))
+        {
             // §28.3 primitive delay without parens — `ubuf #2 u (o, i)`.
             // Eating the `#` and returning None left the literal in the
             // stream to trip the instance-name parse. A single NUMERIC
@@ -4205,9 +4452,15 @@ impl Parser {
             // `#(2)` downstream (the UDP elaborator reads a scalar delay
             // out of `params`). Literals only: an identifier here would
             // be ambiguous against too many neighbors.
-            Some(vec![ParamConnection::Ordered(Some(
-                self.parse_param_value(),
-            ))])
+            // A.2.2.3 `delay_value` is also a parameter name (`#D`): with
+            // the `#` eaten and nothing returned, `my_mux #D (z, a)` became
+            // an instance NAMED `D` with no delay.
+            // One delay value (A.2.2.3), as for a gate: a general expression
+            // went on into an unnamed instance's terminal list as a call on
+            // the literal (`my_mux #0 (z, a, b, s)` read `0 (z, a, b, s)`).
+            Some(vec![ParamConnection::Ordered(Some(ParamValue::Expr(
+                self.parse_delay_value(),
+            )))])
         } else {
             None
         }
@@ -4266,6 +4519,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4303,6 +4557,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4310,6 +4565,17 @@ impl Parser {
                 declarators: decls,
                 span: self.span_from(start),
             });
+        }
+        // §29.3: `udp_identifier [drive_strength] [delay2] udp_instance`.
+        // A `(` opening with a strength keyword is the drive strength; xezim
+        // does not model strengths (as for gates, §28.4), so it is consumed.
+        // Taken for the terminal list, it read `(strong0, weak1)` as ports.
+        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
+            self.bump(); // (
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                self.bump();
+            }
+            self.expect(TokenKind::RParen);
         }
         let params = self.parse_instantiation_params();
 
@@ -4369,6 +4635,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4404,6 +4671,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             return ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4499,6 +4767,7 @@ impl Parser {
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
                 ModuleItem::DataDeclaration(DataDeclaration {
+                    net_type: None,
                     const_kw: false,
                     var_kw: false,
                     lifetime: None,
@@ -4529,6 +4798,7 @@ impl Parser {
             let decls = self.parse_var_declarator_list();
             self.expect(TokenKind::Semicolon);
             ModuleItem::DataDeclaration(DataDeclaration {
+                net_type: None,
                 const_kw: false,
                 var_kw: false,
                 lifetime: None,
@@ -4727,10 +4997,24 @@ impl Parser {
                 unscoped_bases.push(base_name.clone());
             }
             let args_at = self.pos;
+            let mut ext_default_args = false;
             let args = if self.at(TokenKind::Hash) {
                 self.parse_param_args()
             } else if self.at(TokenKind::LParen) {
-                self.parse_param_args()
+                // IEEE 1800-2023 §8.17: `extends Base(default)` forwards the
+                // subclass constructor's arguments to the superclass's.
+                if crate::is_sv2023()
+                    && self.peek_kind() == TokenKind::KwDefault
+                    && self.peek_kind_n(2) == TokenKind::RParen
+                {
+                    self.bump();
+                    self.bump();
+                    self.bump();
+                    ext_default_args = true;
+                    Vec::new()
+                } else {
+                    self.parse_param_args()
+                }
             }
             // Support extends C(args) or C#(args)
             else {
@@ -4763,6 +5047,7 @@ impl Parser {
                 args,
                 span: self.span_from(ext_start),
                 scopes: base_scopes,
+                default_args: ext_default_args,
             })
         } else {
             None
@@ -5219,6 +5504,79 @@ impl Parser {
     }
 
     /// §19.6.1 select_expression, `||` level.
+    /// §19.6.1.4: a cross bin given as a list of value tuples,
+    /// `'{'{1,2}, '{3,4}}`, one value per crossed item in order: the product
+    /// bins holding one of the tuples, i.e. the `||` over the tuples of the
+    /// `&&` of `binsof(item) intersect {value}` (#651).
+    fn cross_tuple_select(
+        &mut self,
+        set: &Expression,
+        items: &[Identifier],
+    ) -> crate::ast::decl::CrossSelect {
+        use crate::ast::decl::{ConstraintRange, CrossSelect};
+        let tuples: Option<Vec<Vec<Expression>>> = match &set.kind {
+            ExprKind::AssignmentPattern(list) => list
+                .iter()
+                .map(|t| match t {
+                    AssignmentPatternItem::Ordered(e) => match &e.kind {
+                        ExprKind::AssignmentPattern(vals) => vals
+                            .iter()
+                            .map(|v| match v {
+                                AssignmentPatternItem::Ordered(x) => Some(x.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        };
+        let Some(tuples) = tuples else {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "a cross bin's tuple list is an ordered list of ordered tuples, \
+                 '{'{v1, v2}, ...} (IEEE 1800-2023 §19.6.1.4)",
+                set.span,
+            ));
+            return CrossSelect::All;
+        };
+        let mut any: Option<CrossSelect> = None;
+        for t in tuples {
+            if t.len() != items.len() {
+                self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "a tuple of {} values for a cross of {} items (IEEE 1800-2023 §19.6.1.4)",
+                        t.len(),
+                        items.len()
+                    ),
+                    set.span,
+                ));
+                continue;
+            }
+            let mut all: Option<CrossSelect> = None;
+            for (cp, v) in items.iter().zip(t) {
+                let term = CrossSelect::Binsof {
+                    cp: cp.clone(),
+                    bin: None,
+                    intersect: Some(vec![ConstraintRange::Value(v)]),
+                };
+                all = Some(match all {
+                    Some(a) => CrossSelect::And(Box::new(a), Box::new(term)),
+                    None => term,
+                });
+            }
+            if let Some(all) = all {
+                any = Some(match any {
+                    Some(a) => CrossSelect::Or(Box::new(a), Box::new(all)),
+                    None => all,
+                });
+            }
+        }
+        // An empty list selects no product bin.
+        any.unwrap_or_else(|| CrossSelect::Not(Box::new(CrossSelect::All)))
+    }
+
     fn parse_cross_select_or(&mut self) -> crate::ast::decl::CrossSelect {
         let mut l = self.parse_cross_select_and();
         while self.eat(TokenKind::LogOr).is_some() {
@@ -5506,7 +5864,31 @@ impl Parser {
                                     // the terminating `;` (depth-aware).
                                     self.skip_bin_body_to_semicolon();
                                 }
+                                // §19.5.1.1: `with (expr)` filters the bin's
+                                // values; it comes before any `iff` (#611).
+                                let with_filter = if self.eat(TokenKind::KwWith).is_some() {
+                                    self.expect(TokenKind::LParen);
+                                    let f = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(f)
+                                } else {
+                                    None
+                                };
+                                // §19.5: `iff (expr)` after the bin's values.
+                                // Unparsed, its tokens were skipped one by one
+                                // and the guard was lost, or tripped the
+                                // covergroup parser on an `inside` (#605).
+                                let iff_guard = if self.eat(TokenKind::KwIff).is_some() {
+                                    self.expect(TokenKind::LParen);
+                                    let g = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(g)
+                                } else {
+                                    None
+                                };
                                 bins.push(crate::ast::decl::CoverBin {
+                                    iff_guard,
+                                    with_filter,
                                     name: bin_name,
                                     kind: bin_kind,
                                     values,
@@ -5563,7 +5945,33 @@ impl Parser {
                 self.bump();
                 let mut ids = Vec::new();
                 loop {
-                    ids.push(self.parse_identifier());
+                    let mut id = self.parse_identifier();
+                    // XEZIM_RELAX_CROSS_HIER_ITEM (#629): a cross item is a
+                    // coverpoint label or a variable (A.2.11); read a
+                    // hierarchical reference (`vif.mode`) as a variable too,
+                    // kept as its dotted name for an implicit coverpoint.
+                    if self.at(TokenKind::Dot)
+                        && self.peek_kind() == TokenKind::Identifier
+                        && crate::RELAX_CROSS_HIER_ITEM.get()
+                    {
+                        while self.at(TokenKind::Dot) && self.peek_kind() == TokenKind::Identifier {
+                            self.bump();
+                            let next = self.parse_identifier();
+                            id.name = format!("{}.{}", id.name, next.name);
+                            id.span = crate::ast::Span::new(id.span.start, next.span.end);
+                        }
+                        self.diagnostics
+                            .push(crate::diagnostics::Diagnostic::warning(
+                                format!(
+                                    "a cross item is a coverpoint or a variable; '{}' gets an \
+                                     implicit coverpoint (IEEE 1800-2017 §19.6, A.2.11, \
+                                     XEZIM_RELAX_CROSS_HIER_ITEM)",
+                                    id.name
+                                ),
+                                id.span,
+                            ));
+                    }
+                    ids.push(id);
                     if !self.at(TokenKind::Comma) {
                         break;
                     }
@@ -5618,7 +6026,12 @@ impl Parser {
                             }
                             let bin_name = self.parse_identifier();
                             self.expect(TokenKind::Assign);
-                            let select = self.parse_cross_select_or();
+                            let select = if self.at(TokenKind::ApostropheLBrace) {
+                                let set = self.parse_expression();
+                                self.cross_tuple_select(&set, &ids)
+                            } else {
+                                self.parse_cross_select_or()
+                            };
                             let mut iff_guard = None;
                             if self.eat(TokenKind::KwIff).is_some() {
                                 self.expect(TokenKind::LParen);
@@ -5744,17 +6157,51 @@ impl Parser {
                 break;
             }
         }
+        // §18.5.10: `constraint_primary` ends in an optional `( )`, which
+        // orders an array's size: `solve sel before arr.size();`. It is the
+        // call `arr.size()` the constraints themselves read.
+        let call =
+            self.at(TokenKind::LParen) && self.peek_kind() == TokenKind::RParen && path.len() > 1;
+        if call {
+            self.bump();
+            self.bump();
+        }
         let span = self.span_from(start);
-        let e = Expression::new(
-            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                root: None,
-                path,
+        let ident = |path: Vec<crate::ast::expr::HierPathSegment>, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path,
+                    span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
-            }),
-            span,
-        );
+            )
+        };
+        let e = if call {
+            let method = path.pop().expect("a path of two segments or more").name;
+            let receiver_span = crate::ast::Span {
+                start,
+                end: method.span.start.saturating_sub(1).max(start),
+            };
+            let func = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(ident(path, receiver_span)),
+                    member: method,
+                },
+                span,
+            );
+            Expression::new(
+                ExprKind::Call {
+                    func: Box::new(func),
+                    args: Vec::new(),
+                },
+                span,
+            )
+        } else {
+            ident(path, span)
+        };
         (root, e)
     }
 

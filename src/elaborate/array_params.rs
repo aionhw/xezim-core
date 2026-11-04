@@ -34,6 +34,24 @@ fn remember_default(
     DEFAULTS.with(|values| values.borrow_mut().insert(name.to_string(), value));
 }
 
+/// An instance's local parameter environment lacks the names its module
+/// imports from a package (`import pkg::*; ... A [N]`). The elaboration-wide
+/// map has them, so resolve the declared shape against it, overlaid with the
+/// local environment, when the local environment alone does not.
+fn shape_params<'a>(
+    elab: &ElaboratedModule,
+    dims: &[UnpackedDimension],
+    params: &'a HashMap<String, Value>,
+) -> std::borrow::Cow<'a, HashMap<String, Value>> {
+    let local = normalize_unpacked_dims(dims, params, &elab.typedef_types);
+    if declared_unpacked_dims(&local, params).is_some() {
+        return std::borrow::Cow::Borrowed(params);
+    }
+    let mut merged = elab.parameters.clone();
+    merged.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
+    std::borrow::Cow::Owned(merged)
+}
+
 /// Share element folding with the instance-local parameter environment, so
 /// dependent constants and the eventual signal storage see the same values.
 pub(super) fn elements(
@@ -46,6 +64,8 @@ pub(super) fn elements(
     params: &HashMap<String, Value>,
     init_params: &HashMap<String, Value>,
 ) -> Option<Vec<(String, Value)>> {
+    let shape_params = shape_params(elab, dims, params);
+    let params = &*shape_params;
     remember_default(name, data_type, params, elab);
     let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
     let shape = declared_unpacked_dims(&dims, params)?;
@@ -62,18 +82,42 @@ pub(super) fn elements(
     if outer.is_empty() {
         return None;
     }
-    let items: Option<Vec<&Expression>> = init.and_then(|e| match &e.kind {
-        ExprKind::Concatenation(v) => Some(v.iter().collect()),
-        ExprKind::AssignmentPattern(v) => Some(v.iter().map(|v| v.expr()).collect()),
-        _ => None,
-    });
+    // §10.9.1: a `default:` that is itself a pattern is a ROW of a nested
+    // array — unless the element is a struct, whose literal is a pattern of
+    // scalars (`'{default: '{7, 2'd1}}` over `p_t A[2][2]`) and fills every
+    // leaf. See `pattern_items`.
+    let struct_elem = matches!(
+        resolve_typedef_chain(data_type, &elab.typedef_types),
+        DataType::Struct(_)
+    );
+    let items =
+        init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, struct_elem, init_params));
     let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    // An initializer that names another unpacked-array parameter (`= pkg::A`)
+    // evaluates to that array packed (see `packed`), so slice it like an
+    // override.
+    let referenced;
+    let override_val = match (override_val, &items, init) {
+        (None, None, Some(e)) => {
+            referenced = eval_const_expr_val(e, init_params);
+            Some(&referenced)
+        }
+        (v, _, _) => v,
+    };
     let row_count = dims[1..].iter().try_fold(1usize, |n, d| {
         n.checked_mul(const_dim_indices(std::slice::from_ref(d), params)?.len())
     })?;
     let row_w = row_count.checked_mul(elem_w as usize)?;
     if let Some(v) = override_val {
         if (v.width as usize) < row_w.checked_mul(outer.len())? {
+            // A legacy environment may carry only individual array elements.
+            if dims.len() == 1
+                && let Some(init) = init
+                && let Some(copied) =
+                    referenced_array_elements(name, &outer, init, init_params, elab)
+            {
+                return Some(copied);
+            }
             return None;
         }
     } else if items.as_ref()?.len() != outer.len() {
@@ -82,7 +126,7 @@ pub(super) fn elements(
     let mut out = Vec::new();
     for (position, index) in outer.iter().enumerate() {
         let key = format!("{name}[{index}]");
-        let item = items.as_ref().and_then(|v| v.get(position)).copied();
+        let item = items.as_ref().and_then(|v| v.get(position));
         let packed = override_val.map(|v| {
             let low = (outer.len() - 1 - position) * row_w;
             v.range_select(low + row_w - 1, low)
@@ -101,7 +145,14 @@ pub(super) fn elements(
             continue;
         }
         let mut value = if let Some(v) = packed {
-            v
+            // §6.20.2: the whole-array transport stores real elements as
+            // IEEE 754 bits. Restore their type after slicing, without a
+            // numeric integer-to-real conversion.
+            if is_type_real_resolved(data_type, &elab.typedef_types) {
+                Value::from_f64(f64::from_bits(v.raw_bits().0))
+            } else {
+                v
+            }
         } else {
             let item = item?;
             pack_struct_const_value(
@@ -128,6 +179,122 @@ pub(super) fn elements(
     Some(out)
 }
 
+/// Whole-array copy of an unpacked parameter (`localparam t B[N] = pkg::A`,
+/// or `#(.B(pkg::A))`). Elements live under `base[index]` (§6.20.2). A
+/// pattern is handled by `pattern_items`; this is the name-reference form.
+fn referenced_array_elements(
+    name: &str,
+    outer: &[i64],
+    init: &Expression,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+) -> Option<Vec<(String, Value)>> {
+    let mut keys = Vec::new();
+    super::const_index_base_keys(init, Some(params), &mut keys);
+    for key in keys {
+        let mut out = Vec::with_capacity(outer.len());
+        let mut complete = true;
+        for index in outer {
+            let elem = params
+                .get(&format!("{key}[{index}]"))
+                .or_else(|| elab.parameters.get(&format!("{key}[{index}]")))
+                .cloned();
+            match elem {
+                Some(value) => out.push((format!("{name}[{index}]"), value)),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete && !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// One initializer per index of `outer` (declared order), from pattern `e`.
+///
+/// §10.9.1: `'{n{a, b}}` replicates pattern elements, `'{k: v}` places `v`
+/// at index `k` (not at position `k`), and `default:` fills every index left
+/// unset. For a nested array a non-pattern `default:` reaches every leaf, so
+/// each missing row becomes `'{default: v}` (`int a [2][3] = '{default: 5}`).
+fn pattern_items(
+    e: &Expression,
+    outer: &[i64],
+    nested: bool,
+    struct_elem: bool,
+    params: &HashMap<String, Value>,
+) -> Option<Vec<Expression>> {
+    let items = match &super::peel_unpacked_typed_pattern(e).kind {
+        ExprKind::Concatenation(v) => return Some(v.clone()),
+        ExprKind::AssignmentPattern(items) => items,
+        _ => return None,
+    };
+    if items
+        .iter()
+        .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
+    {
+        if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
+            && let ExprKind::Replication { count, exprs } = &only.kind
+        {
+            let reps = usize::try_from(const_eval_i64_with_params(count, Some(params))?).ok()?;
+            if reps.checked_mul(exprs.len())? > outer.len() {
+                return None;
+            }
+            return Some(
+                exprs
+                    .iter()
+                    .cycle()
+                    .take(reps * exprs.len())
+                    .cloned()
+                    .collect(),
+            );
+        }
+        return Some(items.iter().map(|it| it.expr().clone()).collect());
+    }
+    let mut slots: Vec<Option<&Expression>> = vec![None; outer.len()];
+    let mut default = None;
+    for it in items {
+        match it {
+            AssignmentPatternItem::Keyed(key, v) => {
+                let index = const_eval_i64_with_params(key, Some(params))?;
+                *slots.get_mut(outer.iter().position(|&i| i == index)?)? = Some(v);
+            }
+            // A bare identifier key (`'{K: v}`) parses as a member name; in
+            // an array pattern it is a constant index.
+            AssignmentPatternItem::Named(key, v) => {
+                let index = const_eval_i64_with_params(&make_ident_expr(&key.name), Some(params))?;
+                *slots.get_mut(outer.iter().position(|&i| i == index)?)? = Some(v);
+            }
+            AssignmentPatternItem::Default(v) => default = Some(v),
+            _ => return None,
+        }
+    }
+    slots
+        .into_iter()
+        .map(|slot| match (slot, default) {
+            (Some(v), _) => Some(v.clone()),
+            (None, Some(d)) if nested && !default_is_row(d, struct_elem) => {
+                Some(Expression::new(
+                    ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(d.clone())]),
+                    d.span,
+                ))
+            }
+            (None, Some(d)) => Some(d.clone()),
+            (None, None) => None,
+        })
+        .collect()
+}
+
+/// The whole array as one value, the element at the left bound leftmost: the
+/// layout an override carries, so a bare reference to the array (`.R(R)`,
+/// `= pkg::A`) hands its elements on.
+pub(super) fn packed(values: &[(String, Value)]) -> Value {
+    Value::concat_refs(values.iter().map(|(_, v)| v))
+}
+
 pub(super) fn register(
     elab: &mut ElaboratedModule,
     prefix: &str,
@@ -139,6 +306,8 @@ pub(super) fn register(
     params: &HashMap<String, Value>,
     init_params: &HashMap<String, Value>,
 ) -> bool {
+    let shape_params = shape_params(elab, dims, params);
+    let params = &*shape_params;
     remember_default(&format!("{prefix}{name}"), data_type, params, elab);
     let Some(values) = elements(
         elab,
@@ -173,6 +342,8 @@ pub(super) fn register(
             .or_insert(fields);
     }
     register_shape(elab, &full_name, &shape, width);
+    let whole = packed(&values);
+    elab.set_param(line!(), full_name.clone(), whole);
     // §6.20.2: aggregate parameter elements use whole Value storage.
     // An unpacked variable type would route their member reads to separate
     // field signals, which this constant representation does not allocate.
@@ -183,7 +354,7 @@ pub(super) fn register(
     }
     for (name, value) in values {
         let name = format!("{prefix}{name}");
-        params_insert_traced(&mut elab.parameters, line!(), name.clone(), value.clone());
+        elab.set_param(line!(), name.clone(), value.clone());
         signals_insert_traced(
             &mut elab.signals,
             line!(),
@@ -232,5 +403,25 @@ fn register_shape(elab: &mut ElaboratedModule, name: &str, shape: &[(i64, i64)],
         for index in left.min(right)..=left.max(right) {
             register_shape(elab, &format!("{name}[{index}]"), &shape[1..], width);
         }
+    }
+}
+
+/// Is a nested array's `default:` value a row literal? A pattern or a
+/// concatenation is a row — except for a struct element, where a pattern
+/// whose items are scalars is the struct's own literal and reaches every
+/// leaf (§10.9.1); a row of struct literals has patterns as items.
+fn default_is_row(d: &Expression, struct_elem: bool) -> bool {
+    match &super::peel_unpacked_typed_pattern(d).kind {
+        ExprKind::Concatenation(_) => true,
+        ExprKind::AssignmentPattern(items) => {
+            !struct_elem
+                || items.iter().any(|it| {
+                    matches!(
+                        it.expr().kind,
+                        ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+                    )
+                })
+        }
+        _ => false,
     }
 }

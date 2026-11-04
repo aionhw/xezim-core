@@ -25,6 +25,16 @@ impl Expression {
             cached_width: Cell::new(None),
         }
     }
+
+    /// The pattern of a typed assignment pattern `T'{...}`, else `self`. Only
+    /// where the context type is unpacked: `T` is then equivalent to it
+    /// (§6.22.2) and the items place by the context type.
+    pub fn peel_typed_pattern(&self) -> &Expression {
+        match &self.kind {
+            ExprKind::TypedPattern { pattern, .. } => pattern,
+            _ => self,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +162,12 @@ pub enum ExprKind {
     /// variant indices (format version bumped regardless).
     ShallowCopy {
         source: Box<Expression>,
+    },
+    /// §10.9: a typed assignment pattern `T'{...}`, the value a variable of
+    /// type `ty` initialized with `pattern` (an `AssignmentPattern`) holds.
+    TypedPattern {
+        ty: Box<crate::ast::types::DataType>,
+        pattern: Box<Expression>,
     },
 }
 

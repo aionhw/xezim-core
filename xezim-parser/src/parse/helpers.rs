@@ -139,6 +139,66 @@ impl Parser {
         self.diagnostics.push(Diagnostic::error(msg, span));
     }
 
+    /// A.4.1.1: a parameter value list is all ordered or all named, and a
+    /// comma must be followed by another assignment. Call just past `#(`.
+    /// This only looks ahead, so each caller reads the list its own way.
+    pub(super) fn check_param_list_form(&mut self) {
+        if !crate::strict_checks() {
+            return;
+        }
+        let mut depth = 0usize;
+        let mut at_entry_start = true;
+        let mut first_is_named = None;
+        let mut mixed_at = None;
+        let mut comma_at = None;
+        let mut trailing_at = None;
+        for token in &self.tokens[self.pos..] {
+            if depth == 0 && token.kind == TokenKind::RParen && at_entry_start {
+                trailing_at = comma_at;
+            }
+            if at_entry_start && !(depth == 0 && token.kind == TokenKind::RParen) {
+                let named = token.kind == TokenKind::Dot;
+                if *first_is_named.get_or_insert(named) != named {
+                    mixed_at = Some(token.span);
+                    break;
+                }
+                at_entry_start = false;
+            }
+            match token.kind {
+                TokenKind::LParen
+                | TokenKind::LBracket
+                | TokenKind::LBrace
+                | TokenKind::ApostropheLBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Comma if depth == 0 => {
+                    at_entry_start = true;
+                    comma_at = Some(token.span);
+                }
+                TokenKind::Semicolon | TokenKind::Eof => break,
+                _ => {}
+            }
+        }
+        if let Some(span) = mixed_at {
+            self.diagnostics.push(Diagnostic::error(
+                "a parameter value list cannot mix ordered and named entries \
+                 (IEEE 1800-2017 A.4.1.1); --no-strict accepts it",
+                span,
+            ));
+        }
+        if let Some(span) = trailing_at {
+            self.diagnostics.push(Diagnostic::error(
+                "a parameter value list cannot end with a comma \
+                 (IEEE 1800-2017 A.4.1.1); --no-strict accepts it",
+                span,
+            ));
+        }
+    }
+
     #[allow(dead_code)]
     pub(super) fn skip_to_semi(&mut self) {
         while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {

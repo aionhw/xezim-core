@@ -50,7 +50,12 @@ pub(crate) fn normalize(definitions: &mut HashMap<String, SourceDefinition>) {
                 let default_static = p.lifetime != Some(Lifetime::Automatic);
                 for item in &mut p.items {
                     match item {
-                        PackageItem::Function(f) if is_static(f.lifetime, default_static) => {
+                        // §8.6/§8.24: an out-of-block class method (`C::m`)
+                        // is automatic whatever the package's default (#621).
+                        PackageItem::Function(f)
+                            if is_static(f.lifetime, default_static)
+                                && f.name.scopes.is_empty() =>
+                        {
                             statements(
                                 &mut f.items,
                                 &HashSet::default(),
@@ -58,7 +63,10 @@ pub(crate) fn normalize(definitions: &mut HashMap<String, SourceDefinition>) {
                                     .subroutine("function", &f.name.name.name),
                             );
                         }
-                        PackageItem::Task(t) if is_static(t.lifetime, default_static) => {
+                        PackageItem::Task(t)
+                            if is_static(t.lifetime, default_static)
+                                && t.name.scopes.is_empty() =>
+                        {
                             statements(
                                 &mut t.items,
                                 &HashSet::default(),

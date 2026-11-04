@@ -1817,6 +1817,9 @@ impl<'a> Lw<'a> {
             "  localparam int VH_STOP_LEVEL = {};\n  localparam int VH_IEEE_ASSERTS = {};",
             self.opts.assert_level, self.opts.ieee_asserts
         );
+        // The kernel's state, declared before every function that reads it
+        // (IEEE 1800 §6.5: a variable is declared before its use).
+        let _ = writeln!(m, "  bit vh_tick, vh_tock;\n  int vh_from, vh_r;\n  longint vh_nxt;\n  // The current time, published by the kernel thread: `$time` in the\n  // cycle block would be an expression the simulator interprets.\n  longint vh_now;");
         m.push_str(super::runtime::COMMON);
         // The STRING heap (TEXTIO lines).
         if self.textio {
@@ -1850,6 +1853,10 @@ impl<'a> Lw<'a> {
         m.push_str(&self.tx_defs);
         let files = self.files_sv();
         m.push_str(&files);
+        // The wires of SV modules' outputs, which the boundary samples, then
+        // the boundary (its variables are the modules' inputs), then the
+        // module instances.
+        m.push_str(&self.sv_wires);
         m.push_str(&bnd);
         m.push_str(&self.sv_items);
         m.push_str(&decls);
@@ -2328,7 +2335,8 @@ impl<'a> Lw<'a> {
         // The kernel's state: the cycle block's trigger and acknowledgement,
         // the initialization passes, the scan's start and the process it
         // hands over, the next cycle's time.
-        let _ = writeln!(k, "  bit vh_tick, vh_tock;\n  int vh_from, vh_r;\n  longint vh_nxt;\n  // The current time, published by the kernel thread: `$time` in the\n  // cycle block would be an expression the simulator interprets.\n  longint vh_now;");
+        // (vh_tick, vh_tock, vh_from, vh_r, vh_nxt and vh_now are declared at
+        // the top of the module: the functions above the kernel use them.)
 
         // ---- the time of the next simulation cycle (§14.7.5.3 g), into vh_n.
         let mut nx = String::new();

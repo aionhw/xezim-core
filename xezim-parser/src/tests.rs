@@ -178,6 +178,35 @@ fn test_assignment_pattern() {
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
 }
 
+/// `pkg::type_t'{...}` is a typed assignment pattern. Release 0.11.3 only
+/// folded a bare typedef name, so `dm::hartinfo_t'{...}` inside a
+/// concatenation failed with `expected RBrace`.
+#[test]
+fn test_scoped_typed_assignment_pattern() {
+    let source = "module m; initial p = {dm::hartinfo_t'{8'h0, 4'h2, 3'b0, 1'b1, dm::DataCount, dm::DataAddr}}; endmodule";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+    let ast = format!("{:?}", result.source);
+    assert!(
+        ast.contains("AssignmentPattern"),
+        "scoped type prefix was not folded into an assignment pattern: {ast}"
+    );
+}
+
+/// §10.9: `T'{...}` and `pkg::T'{...}` keep their type as a `TypedPattern`
+/// wrapping the pattern.
+#[test]
+fn test_typed_assignment_pattern_keeps_type() {
+    let source =
+        "module m; initial begin p = s_t'{1, 0}; q = pkg::s_t'{a: 1, default: 0}; end endmodule";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+    let ast = format!("{:?}", result.source);
+    assert_eq!(ast.matches("TypedPattern").count(), 2, "{ast}");
+    assert!(ast.contains("name: \"s_t\""), "{ast}");
+    assert!(ast.contains("name: \"pkg\""), "{ast}");
+}
+
 #[test]
 fn test_associative_arrays() {
     let source = "module m; int aa [string]; int aa2 [*]; endmodule";
@@ -286,6 +315,52 @@ fn test_processes_events() {
     ";
     let result = parse(source);
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+}
+
+/// §9.4.2: a bare event control naming a member (`@vif.cb`, `@h.ev`) builds
+/// the same one-term event expression as the parenthesized form. A plain name
+/// keeps the bare form.
+#[test]
+fn bare_event_control_on_a_member() {
+    for ctrl in ["@vif.cb", "@h.ev", "@cfg.vif.cb"] {
+        let source = format!(
+            "class E; event ev; endclass
+             class D; E h; task t(); {ctrl}; endtask endclass"
+        );
+        let result = parse(&source);
+        assert!(result.errors.is_empty(), "{ctrl}: {:?}", result.errors);
+        let ast = format!("{:?}", result.source);
+        assert!(ast.contains("EventExpr("), "{ctrl}: {ast}");
+        assert!(!ast.contains("HierIdentifier("), "{ctrl}: {ast}");
+        assert!(ast.contains("MemberAccess"), "{ctrl}: {ast}");
+    }
+    let result = parse("module m; event ev; initial @ev; endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(format!("{:?}", result.source).contains("HierIdentifier("));
+}
+
+/// §8.25, §25.9: a module-scope class variable specialized by a virtual
+/// interface type (`holder #(virtual bus_if) h;`) keeps that type argument,
+/// spelled as the procedural declaration spells it. It was dropped, so the
+/// variable was built as the default specialization.
+#[test]
+fn module_class_var_keeps_virtual_interface_type_arg() {
+    for (decl, arg) in [
+        ("holder #(virtual bus_if) h;", "virtual bus_if"),
+        ("holder #(virtual interface bus_if) h;", "virtual interface bus_if"),
+        ("holder #(virtual bus_if.mon) h;", "virtual bus_if . mon"),
+        ("holder #(virtual bus_if #(4)) h;", "virtual bus_if#(4)"),
+    ] {
+        for source in [
+            format!("module m; {decl} endmodule"),
+            format!("module m; initial begin {decl} end endmodule"),
+        ] {
+            let result = parse(&source);
+            assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
+            let ast = format!("{:?}", result.source);
+            assert!(ast.contains(&format!("name: {arg:?}")), "{source}: {ast}");
+        }
+    }
 }
 
 #[test]

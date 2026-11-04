@@ -1,6 +1,6 @@
 [package]
 name = "sv-parser"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2024"
 rust-version = "1.92"
 description = "SystemVerilog parser targeting IEEE 1800-2017/2023"

@@ -1,6 +1,6 @@
 [package]
 name = "xezim-core"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2024"
 rust-version = "1.92"
 description = "Shared SystemVerilog elaboration and runtime primitives for xezim and xezim-b"
@@ -19,8 +19,8 @@ sv-parser = { path = "xezim-parser" }
 # (vhdl-lang/README.md); only src/vhdl/cst/ uses it.
 vhdl_lang = { path = "vhdl-lang/vhdl_lang" }
 serde = { version = "1", features = ["derive", "rc"] }
-bincode = "1.3"
-zstd = "0.13"
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
+zstd = "0.14"
 
 # The local time zone of STD.ENV.LOCALTIME (src/vhdl/mod.rs, localtime_r).
 [target.'cfg(unix)'.dependencies]

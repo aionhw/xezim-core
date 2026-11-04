@@ -728,6 +728,11 @@ struct Frame {
     explicit: HashMap<String, String>,
     /// `import Q::*;`
     wild: Vec<String>,
+    /// §26.3: a name a reference found through exactly one wildcard import
+    /// here, with that import's package. The name is then locally visible,
+    /// so a later reference takes it like an explicit import, whatever
+    /// wildcard import of another package follows (#620).
+    bound: std::cell::RefCell<HashMap<String, String>>,
     /// A class scope with a base class: names it inherits are not tracked
     /// here, so value names are not resolved past it.
     inherits: bool,
@@ -910,11 +915,24 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 other.insert(cg.name.name.clone());
             }
             Description::PackageItem(pi) => package_item_values(pi, &mut other_values),
-            Description::Module(m) => module_level_types(&m.items, &mut other, &mut other_members),
-            Description::Interface(m) => {
-                module_level_types(&m.items, &mut other, &mut other_members)
+            Description::DPIImport(di) => {
+                other_values.insert(match &di.proto {
+                    DPIProto::Function(f) => f.name.name.name.clone(),
+                    DPIProto::Task(t) => t.name.name.name.clone(),
+                });
             }
-            Description::Program(m) => module_level_types(&m.items, &mut other, &mut other_members),
+            Description::Module(m) => {
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
+            Description::Interface(m) => {
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
+            Description::Program(m) => {
+                module_level_types(&m.items, &mut other, &mut other_members);
+                module_dpi_names(&m.items, &mut other_values);
+            }
             _ => {}
         }
     }
@@ -1069,6 +1087,29 @@ fn module_level_types(
     }
 }
 
+/// Module DPI declarations also shadow imported package subroutines.
+fn module_dpi_names(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            ModuleItem::DPIImport(di) => {
+                out.insert(match &di.proto {
+                    DPIProto::Function(f) => f.name.name.name.clone(),
+                    DPIProto::Task(t) => t.name.name.name.clone(),
+                });
+            }
+            ModuleItem::GenerateRegion(g) => module_dpi_names(&g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (_, items) in &g.branches { module_dpi_names(items, out); }
+            }
+            ModuleItem::GenerateFor(g) => module_dpi_names(&g.items, out),
+            ModuleItem::GenerateCase(g) => {
+                for arm in &g.arms { module_dpi_names(&arm.items, out); }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The member names an enum type declares (`enum {A, B}`); empty for any
 /// other type. A ranged member (`A[2]`) declares generated names, left out.
 fn enum_members(dt: &DataType, out: &mut HashSet<String>) {
@@ -1094,10 +1135,16 @@ fn unit_frame(descs: &[Description]) -> Frame {
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
                 f.types.insert(c.name.name.clone());
             }
-            Description::ImportDecl(imp) | Description::PackageItem(PackageItem::Import(imp)) => {
-                f.add_imports(imp)
-            }
+            // §26.3: a `$unit` import counts from where it appears; the walk
+            // adds it then (`Rw::description`).
+            Description::ImportDecl(_) | Description::PackageItem(PackageItem::Import(_)) => {}
             Description::PackageItem(pi) => package_item_values(pi, &mut f.values),
+            Description::DPIImport(di) => {
+                f.values.insert(match &di.proto {
+                    DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    DPIProto::Task(td) => td.name.name.name.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -1131,6 +1178,12 @@ fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
         }
         PackageItem::Task(t) if t.name.scopes.is_empty() => {
             out.insert(t.name.name.name.clone());
+        }
+        PackageItem::DPIImport(di) => {
+            out.insert(match &di.proto {
+                DPIProto::Function(f) => f.name.name.name.clone(),
+                DPIProto::Task(t) => t.name.name.name.clone(),
+            });
         }
         PackageItem::Let(l) => {
             out.insert(l.name.name.clone());
@@ -1204,6 +1257,17 @@ fn plain_ident(e: &Expression) -> Option<&str> {
 }
 
 impl Rw<'_> {
+    /// Record that a reference found `n` through the one wildcard import of
+    /// `f` whose package declares it (see `Frame::bound`).
+    fn bind_wild(f: &Frame, n: &str, declares: impl Fn(&str) -> bool) {
+        if let Some(q) = f.wild.iter().find(|q| declares(q)) {
+            f.bound
+                .borrow_mut()
+                .entry(n.to_string())
+                .or_insert_with(|| q.clone());
+        }
+    }
+
     fn resolve(&self, n: &str) -> Res {
         let pkg_col = self.info.colliding.contains(n);
         let cls_col = self.info.class_colliding.contains(n);
@@ -1242,7 +1306,7 @@ impl Rw<'_> {
             if f.types.contains(n) {
                 return Res::Keep;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return match self.info.owner(q, n, 0) {
                     Some(o) => Res::To(mangle(&o, n)),
                     None => Res::Keep,
@@ -1253,6 +1317,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => return Res::To(mangle(cands.first().unwrap(), n)),
@@ -1282,7 +1349,7 @@ impl Rw<'_> {
             if f.values.contains(n) {
                 return None;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.member_owner(q, n, 0);
             }
             let cands: BTreeSet<String> = f
@@ -1290,6 +1357,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.member_owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.member_owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => return cands.into_iter().next(),
@@ -1327,7 +1397,7 @@ impl Rw<'_> {
             if f.values.contains(n) || f.inherits {
                 return None;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.value_owner(q, n, 0);
             }
             let cands: BTreeSet<String> = f
@@ -1335,6 +1405,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.value_owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => return cands.into_iter().next(),
@@ -1369,7 +1442,7 @@ impl Rw<'_> {
             if f.values.contains(n) || f.inherits {
                 return None;
             }
-            if let Some(q) = f.explicit.get(n) {
+            if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self
                     .info
                     .value_owner(q, n, 0)
@@ -1381,6 +1454,9 @@ impl Rw<'_> {
                 .iter()
                 .filter_map(|q| self.info.value_owner(q, n, 0))
                 .collect();
+            if cands.len() == 1 {
+                Self::bind_wild(f, n, |q| self.info.value_owner(q, n, 0).is_some());
+            }
             match cands.len() {
                 0 => {}
                 1 => {
@@ -2056,6 +2132,10 @@ impl Rw<'_> {
                 self.expr(body);
             }
             ExprKind::ShallowCopy { source } => self.expr(source),
+            ExprKind::TypedPattern { ty, pattern } => {
+                self.dtype(ty);
+                self.expr(pattern);
+            }
             ExprKind::Number(_)
             | ExprKind::StringLiteral(_)
             | ExprKind::Dollar
@@ -2988,6 +3068,14 @@ impl Rw<'_> {
         }
     }
 
+    /// A `$unit` import, added to the compilation-unit frame where the walk
+    /// reaches it.
+    fn unit_import(&mut self, imp: &ImportDeclaration) {
+        if let Some(unit) = self.frames.first_mut() {
+            unit.add_imports(imp);
+        }
+    }
+
     fn description(&mut self, d: &mut Description) {
         match d {
             Description::Module(m) => self.module_body(&mut m.params, &mut m.ports, &mut m.items),
@@ -3021,8 +3109,16 @@ impl Rw<'_> {
                 self.dtype(&mut td.data_type);
                 self.unpacked(&mut td.dimensions);
             }
-            Description::ImportDecl(imp) => self.import_decl(imp),
-            Description::PackageItem(pi) => self.package_item(None, pi),
+            Description::ImportDecl(imp) => {
+                self.import_decl(imp);
+                self.unit_import(imp);
+            }
+            Description::PackageItem(pi) => {
+                self.package_item(None, pi);
+                if let PackageItem::Import(imp) = pi {
+                    self.unit_import(imp);
+                }
+            }
             Description::DPIImport(di) => self.dpi(&mut di.proto),
             Description::DPIExport(de) => self.dpi(&mut de.proto),
             Description::Bind(b) => self.instantiation(&mut b.instantiation),
@@ -3075,6 +3171,12 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             }
             ModuleItem::TaskDeclaration(td) => {
                 f.values.insert(td.name.name.name.clone());
+            }
+            ModuleItem::DPIImport(di) => {
+                f.values.insert(match &di.proto {
+                    DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    DPIProto::Task(td) => td.name.name.name.clone(),
+                });
             }
             ModuleItem::LetDeclaration(l) => {
                 f.values.insert(l.name.name.clone());
@@ -3237,4 +3339,65 @@ endmodule
             expected.map(|(name, ty)| (name.to_string(), ty.to_string()))
         );
     }
+
+    /// The packages each module's `mode_t` resolves to, in module order.
+    fn module_mode_owners(source: &str) -> Result<Vec<String>, String> {
+        let mut parsed = crate::parse(source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        qualify_colliding_package_types(&mut parsed.source.descriptions)?;
+        Ok(parsed
+            .source
+            .descriptions
+            .iter()
+            .filter_map(|d| match d {
+                Description::Module(m) => {
+                    let text = format!("{:?}", m.items);
+                    Some(
+                        ["pkg_one", "pkg_two"]
+                            .into_iter()
+                            .find(|p| text.contains(&format!("\"{p}::mode_t\"")))
+                            .unwrap_or("none")
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    const MODE_PKGS: &str = "package pkg_one; typedef enum logic [1:0] { A1 } mode_t; endpackage\n\
+                             package pkg_two; typedef enum logic [3:0] { B1 } mode_t; endpackage\n";
+
+    /// §26.3 (#620): a `$unit` wildcard import counts from where it appears,
+    /// and the first reference that finds a name through one makes it locally
+    /// visible: a later wildcard import of another package declaring it does
+    /// not change it, and the order of the imports decides.
+    #[test]
+    fn unit_wildcard_binds_at_the_first_reference() {
+        let a = "import pkg_one::*;\nmodule probe_a; mode_t m; endmodule\n";
+        let b = "import pkg_two::*;\nmodule probe_b; mode_t m; endmodule\n";
+        let c = "module probe_c; mode_t m; endmodule\n";
+        assert_eq!(
+            module_mode_owners(&format!("{MODE_PKGS}{a}{b}{c}")).unwrap(),
+            ["pkg_one", "pkg_one", "pkg_one"]
+        );
+        assert_eq!(
+            module_mode_owners(&format!("{MODE_PKGS}{b}{a}{c}")).unwrap(),
+            ["pkg_two", "pkg_two", "pkg_two"]
+        );
+    }
+
+    /// §26.3: both wildcard imports before the first reference, in `$unit`
+    /// or in the module, still make the name ambiguous.
+    #[test]
+    fn two_wildcard_imports_before_a_reference_conflict() {
+        for src in [
+            "import pkg_one::*;\nimport pkg_two::*;\nmodule t; mode_t m; endmodule\n",
+            "module t; import pkg_one::*; import pkg_two::*; mode_t m; endmodule\n",
+        ] {
+            let err = module_mode_owners(&format!("{MODE_PKGS}{src}")).unwrap_err();
+            assert!(err.contains("more than one wildcard-imported package"), "{err}");
+        }
+    }
+
 }
