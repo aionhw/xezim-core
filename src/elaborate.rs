@@ -22887,8 +22887,8 @@ pub(super) fn const_index_base_keys(
     }
 }
 
-/// Full spelling of a hierarchical constant, including constant instance
-/// indices. Interface-array parameters must retain every selected instance.
+/// Full spelling of a hierarchical path with constant selects, for parameter
+/// lookup and member-wise storage. Retain every selected instance or element.
 fn const_parameter_path(
     expr: &Expression,
     params: Option<&HashMap<String, Value>>,
@@ -45385,15 +45385,36 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     if !has_unpacked_struct_type(elab) {
         return;
     }
-    let struct_type = |elab: &ElaboratedModule, name: &str| {
-        declared_type_name(elab, name)
-            .and_then(|tn| elab.typedef_types.get(&tn))
-            .and_then(|dt| match resolve_typedef_chain(dt, &elab.typedef_types) {
-                // A PACKED struct keeps a contiguous bit layout that a
-                // whole-value write already fills correctly.
-                DataType::Struct(su) if !su.packed && !su.members.is_empty() => Some(su.clone()),
-                _ => None,
-            })
+    // §23.3.3.5: instance-array splitting produces `w[k]` actuals. They
+    // still denote whole structs, but `ident_flat_name` deliberately rejects
+    // selects. Recover only constant storage paths here, not arbitrary
+    // expressions: evaluating an index per member could repeat side effects.
+    let struct_target = |elab: &ElaboratedModule, expr: &Expression| {
+        let name = const_parameter_path(expr, Some(&elab.parameters))?;
+        let mut base = name.as_str();
+        let mut rank = 0;
+        while base.ends_with(']') {
+            let bracket = base.rfind('[')?;
+            base[bracket + 1..base.len() - 1].parse::<i64>().ok()?;
+            base = &base[..bracket];
+            rank += 1;
+        }
+        // Only consume unpacked dimensions, never packed bit selects or a
+        // partial array. The element's declared type lives on the array.
+        if elab.unpacked_decl_dims.get(base).map_or(0, Vec::len) != rank {
+            return None;
+        }
+        let dt = elab.var_decl_types.get(base).or_else(|| {
+            declared_type_name(elab, base).and_then(|tn| elab.typedef_types.get(&tn))
+        })?;
+        match resolve_typedef_chain(dt, &elab.typedef_types) {
+            // A PACKED struct keeps a contiguous bit layout that a
+            // whole-value write already fills correctly.
+            DataType::Struct(su) if !su.packed && !su.members.is_empty() => {
+                Some((name, su.clone()))
+            }
+            _ => None,
+        }
     };
 
     // A sub-module body may still sit in the LAZY pending list, which the loop
@@ -45411,7 +45432,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                 &pca.ctx.local_names,
                 &pca.ctx.interface_map,
             );
-            if ident_flat_name(&lhs).is_some_and(|n| struct_type(elab, &n).is_some()) {
+            if struct_target(elab, &lhs).is_some() {
                 let ca = pca.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {
@@ -45427,7 +45448,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     // here wrote `4.5` as `5`).
     let mut out: Vec<ContinuousAssignment> = Vec::new();
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        let target = ident_flat_name(&ca.lhs).and_then(|n| struct_type(elab, &n).map(|su| (n, su)));
+        let target = struct_target(elab, &ca.lhs);
         match target {
             Some((base, su)) => emit_struct_member_assigns(
                 &make_ident_expr(&base),
