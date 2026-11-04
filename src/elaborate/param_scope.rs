@@ -548,7 +548,49 @@ structure!(SerializeStructVariant);
 
 #[cfg(test)]
 mod tests {
-    use super::{key_words, words};
+    use super::{ParamScope, key_words, words};
+    use crate::ast::Description;
+    use crate::elaborate::Definition;
+    use crate::hasher::HashMap;
+    use crate::value::Value;
+
+    /// aionhw/xezim#870: what a package's own functions spell is no part of
+    /// an instance's scope. Only the module's own words select entries, so a
+    /// package whose items spell most of its parameters does not hand every
+    /// instance the whole table again.
+    #[test]
+    fn package_items_do_not_widen_every_scope() {
+        let src = "package pkg;
+  localparam int A = 1;
+  localparam int FILL = 3;
+  function automatic int f(); return FILL; endfunction
+  typedef logic [FILL-1:0] t_t;
+  class c; static function int g(); return FILL; endfunction endclass
+endpackage
+module top; localparam int X = pkg::A + pkg::f(); endmodule
+";
+        let parsed = crate::parse(src);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let mut defs: HashMap<String, Definition> = HashMap::default();
+        for d in &parsed.source.descriptions {
+            match d {
+                Description::Module(m) => {
+                    defs.insert(m.name.name.clone(), Definition::Module(m));
+                }
+                Description::Package(p) => {
+                    defs.insert(p.name.name.clone(), Definition::Package(p));
+                }
+                _ => {}
+            }
+        }
+        let mut table: HashMap<String, Value> = HashMap::default();
+        table.insert("pkg::A".into(), Value::from_u64(1, 32));
+        table.insert("pkg::FILL".into(), Value::from_u64(3, 32));
+        let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
+        let top = scope.top_scope(defs["top"], &defs);
+        assert!(top.contains_key("pkg::A"), "{top:?}");
+        assert!(!top.contains_key("pkg::FILL"), "{top:?}");
+    }
 
     #[test]
     fn a_key_is_named_by_the_words_after_its_package() {
