@@ -45585,6 +45585,14 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             kept.push(ca);
             continue;
         };
+        // §6.6.7: without a resolver the driver is an ordinary assignment.
+        // Keep it (and its port links) for `expand_unpacked_struct_assigns`:
+        // the resolver emitter selects members of an evaluated struct, but
+        // an assignment pattern needs type-directed expansion instead.
+        // Still gather the drivers below for the existing count check.
+        if net_resolver[&lhs_name].is_empty() {
+            kept.push(ca.clone());
+        }
         // Identity link to another nettype net => port connection, not a driver.
         if let Some(rhs_name) = ident_flat_name(&ca.rhs) {
             if net_resolver.contains_key(&rhs_name) && rhs_name != lhs_name {
@@ -45716,7 +45724,9 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     drivers.len()
                 ));
             }
-            drivers.into_iter().next().unwrap()
+            // The original assignments and links were retained above. This
+            // also preserves their delay and scope metadata.
+            continue;
         } else {
             // §6.6.7: the resolution function must exist, be `automatic`, and
             // take a single unpacked-array input. Checked here because this is
