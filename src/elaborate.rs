@@ -18335,8 +18335,8 @@ fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
 
 /// §6.10 implicit-net candidates of a continuous assignment: like
 /// `collect_ident_names`, but the root of a dotted reference (`blk.x`,
-/// `u.sig`, `s.field`) names a scope or a declared struct, never an implicit
-/// net. A select base (`arr[0].f`) is still collected.
+/// `u.sig`, `s.field`, `g[0].u.sig`) names a scope or a declared struct or
+/// array, never an implicit net.
 fn collect_assign_net_names(expr: &Expression, out: &mut Vec<String>) {
     collect_ident_names_in(expr, out, false);
 }
@@ -18395,9 +18395,40 @@ fn collect_ident_names_in(expr: &Expression, out: &mut Vec<String>, member_roots
             }
         }
         ExprKind::MemberAccess { expr, .. } => {
-            let bare_root = matches!(&expr.kind,
+            if member_roots {
+                rec(expr, out);
+                return;
+            }
+            // §6.10: the root of `blk.x`, and of `g[0].u.x` (a member reached
+            // through a select), names a scope or an array of instances,
+            // interfaces or structs, never a scalar net; only the select
+            // expressions can name nets. Collected, the generate block `g`
+            // of `assign g[0].u.a = s;` became a 1-bit implicit net.
+            let mut base = expr.as_ref();
+            let mut selects: Vec<&Expression> = Vec::new();
+            loop {
+                match &base.kind {
+                    ExprKind::Index { expr, index } => {
+                        selects.push(index);
+                        base = expr;
+                    }
+                    ExprKind::RangeSelect {
+                        expr, left, right, ..
+                    } => {
+                        selects.push(left);
+                        selects.push(right);
+                        base = expr;
+                    }
+                    _ => break,
+                }
+            }
+            let bare_root = matches!(&base.kind,
                 ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty());
-            if member_roots || !bare_root {
+            if bare_root {
+                for s in selects {
+                    rec(s, out);
+                }
+            } else {
                 rec(expr, out);
             }
         }
