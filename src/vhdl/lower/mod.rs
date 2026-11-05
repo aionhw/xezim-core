@@ -3594,13 +3594,22 @@ impl<'a> Lw<'a> {
             HLoop::For(o, r) => {
                 let (a, b, dn) = self.range_parts(r);
                 let v = self.obj_name(*o);
-                self.temps.push((format!("{}_dn", v), "bit".into()));
-                self.temps.push((format!("{}_end", v), "longint".into()));
+                // The parameter is a temporary of the scope, not declared by
+                // the loop: a loop declaring its variable is interpreted.
+                for (n, t) in [
+                    (v.clone(), "longint"),
+                    (format!("{}_dn", v), "bit"),
+                    (format!("{}_end", v), "longint"),
+                ] {
+                    if !self.temps.iter().any(|(m, _)| *m == n) {
+                        self.temps.push((n, t.into()));
+                    }
+                }
                 let _ = writeln!(out, "{}{}_dn = {};", pad, v, dn);
                 let _ = writeln!(out, "{}{}_end = {};", pad, v, b);
                 let _ = writeln!(
                     out,
-                    "{pad}for (longint {v} = {a}; {v}_dn ? {v} >= {v}_end : {v} <= {v}_end; {v} = {v}_dn ? {v} - 1 : {v} + 1) begin",
+                    "{pad}for ({v} = {a}; {v}_dn ? {v} >= {v}_end : {v} <= {v}_end; {v} = {v}_dn ? {v} - 1 : {v} + 1) begin",
                     pad = pad,
                     v = v,
                     a = a

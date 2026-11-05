@@ -270,7 +270,8 @@ impl<'a> Lw<'a> {
         let signed = |c: Cls| matches!(c, Cls::S | Cls::BitS);
         let rel = matches!(name, "=" | "/=" | "<" | "<=" | ">" | ">=");
         let arith = matches!(name, "+" | "-");
-        if !(arith || rel || matches!(name, "to_integer" | "to_unsigned" | "to_signed"))
+        let shift = matches!(name, "shift_left" | "shift_right");
+        if !(arith || rel || shift || matches!(name, "to_integer" | "to_unsigned" | "to_signed"))
             || args.len() > 2
             || args.len() != cls.len()
         {
@@ -429,6 +430,41 @@ impl<'a> Lw<'a> {
                         decl, val[0], sv_op, val[1]
                     );
                 }
+            }
+            // SHIFT_LEFT / SHIFT_RIGHT by a NATURAL (XSLL, XSRL, XSRA in the
+            // IEEE body): elements move, metavalues included, so any operand
+            // takes this path. '0' comes in, or for SHIFT_RIGHT of SIGNED the
+            // left element; a count of the length or more leaves only those.
+            ("shift_left" | "shift_right", [c0, Cls::Int]) if is_vec(*c0) => {
+                let n = ns[0].unwrap();
+                let (rn, rs) = ret_pk(self)?;
+                if rn != n {
+                    return None;
+                }
+                ret_sv = rs;
+                conds.clear();
+                let bits = w as i64 * n;
+                let fill = if name == "shift_right" && signed(*c0) {
+                    format!("{{{}{{a[{} -: {}]}}}}", n, bits - 1, w)
+                } else if bit_elem {
+                    format!("{}'d0", bits)
+                } else {
+                    nib_pat(n, '2')
+                };
+                let (sh, back) = if name == "shift_left" {
+                    ("<<", ">>")
+                } else {
+                    (">>", "<<")
+                };
+                let _ = writeln!(decls, "    bit [{}:0] z;", bits - 1);
+                body = format!(
+                    "    z = {fill};\n    if (b >= {n}) return z;\n    return (a {sh} ({w} * b)) | (z {back} ({w} * ({n} - b)));",
+                    fill = fill,
+                    n = n,
+                    sh = sh,
+                    back = back,
+                    w = w
+                );
             }
             ("to_integer", [c0]) if is_vec(*c0) => {
                 let n = ns[0].unwrap();

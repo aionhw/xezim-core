@@ -170,6 +170,55 @@ impl<'a> Lw<'a> {
         out
     }
 
+    /// The element of the outer dimension of a class, selected by `k`, and
+    /// the number of leaves under it, when only array dimensions lie below
+    /// that dimension (a record field below it is a class of its own, which
+    /// another driver may cover).
+    fn leaf_elem_sv(c: &LeafClass, k: &str) -> Option<(i64, String)> {
+        let first = c.steps.iter().position(|s| matches!(s, Step::Dim(_)))?;
+        if c.steps[..first]
+            .iter()
+            .any(|s| !matches!(s, Step::Field(_)))
+            || c.steps[first + 1..]
+                .iter()
+                .any(|s| matches!(s, Step::Field(_)))
+            || first + 1 == c.steps.len()
+        {
+            return None;
+        }
+        let mut out = String::new();
+        for s in &c.steps[..first] {
+            if let Step::Field(i) = s {
+                let _ = write!(out, ".f{}", i);
+            }
+        }
+        let _ = write!(out, ".d[{}]", k);
+        let stride: i64 = c.dims()[1..].iter().product();
+        Some((stride, out))
+    }
+
+    /// The runs of consecutive leaves of a coverage in `base..base + count`.
+    fn cov_runs(cov: &Cov, base: i64, count: i64) -> Vec<(i64, i64)> {
+        let mut runs: Vec<(i64, i64)> = Vec::new();
+        let leaves: Vec<i64> = match cov {
+            Cov::All => {
+                return if count > 0 {
+                    vec![(base, base + count - 1)]
+                } else {
+                    Vec::new()
+                };
+            }
+            Cov::Set(set) => set.range(base..base + count).copied().collect(),
+        };
+        for x in leaves {
+            match runs.last_mut() {
+                Some((_, b)) if *b + 1 == x => *b = x,
+                _ => runs.push((x, x)),
+            }
+        }
+        runs
+    }
+
     /// The global numbers of the leaves under a path; a step with an
     /// offset computed at run time covers every offset of its dimension.
     pub(super) fn path_cov(&self, t: TypeId, path: &[DSel]) -> Cov {
@@ -557,10 +606,13 @@ impl<'a> Lw<'a> {
             );
             return None;
         };
+        // Declarations first: a local declared in the loop over the leaves
+        // keeps the loop on the interpreter.
+        let mut decls = String::new();
+        let _ = writeln!(decls, "    {} nv;\n    int c, cc;\n    longint g, k;", tsv);
         let mut body = String::new();
-        let _ = writeln!(body, "    {} nv;\n    int c, cc;\n    longint g;", tsv);
         let _ = writeln!(body, "    nv = vh_s{};", s);
-        for c in &classes {
+        for (ci, c) in classes.iter().enumerate() {
             let cov: Vec<&(usize, Driver)> = ds
                 .iter()
                 .filter(|(_, d)| match &d.cov {
@@ -588,32 +640,81 @@ impl<'a> Lw<'a> {
             }
             let et = self.repr(c.scalar, &info.loc).sv();
             let leaf = Self::leaf_sv(c, "k");
+            // Sources that share no leaf (each process driving its own
+            // element, the usual case): a leaf has at most one, whose value
+            // it takes (an unresolved signal, or RESOLVED of one value).
+            // Each driver copies the leaves it covers, whole elements of the
+            // outer dimension where its runs cover them.
+            let one_source = match res {
+                None => true,
+                Some((f, _)) => self.d.subprograms[f]
+                    .path
+                    .eq_ignore_ascii_case("ieee.std_logic_1164.resolved"),
+            };
+            let disjoint = cov.iter().enumerate().all(|(i, a)| {
+                cov[i + 1..]
+                    .iter()
+                    .all(|b| !a.1.cov.overlaps(&b.1.cov, c.base, c.count))
+            });
+            if kind.is_none() && one_source && disjoint {
+                let elem = Self::leaf_elem_sv(c, "k");
+                for (p, d) in &cov {
+                    for (a, b) in Self::cov_runs(&d.cov, c.base, c.count) {
+                        let (a, b) = (a - c.base, b - c.base);
+                        match &elem {
+                            Some((stride, e)) if a % stride == 0 && (b + 1) % stride == 0 => {
+                                let _ = writeln!(
+                                    body,
+                                    "    for (k = {}; k <= {}; k++) nv{e} = vh_dv{s}_{p}{e};",
+                                    a / stride,
+                                    b / stride,
+                                    e = e,
+                                    s = s,
+                                    p = p
+                                );
+                            }
+                            _ => {
+                                let _ = writeln!(
+                                    body,
+                                    "    for (k = {}; k <= {}; k++) nv{leaf} = vh_dv{s}_{p}{leaf};",
+                                    a,
+                                    b,
+                                    leaf = leaf,
+                                    s = s,
+                                    p = p
+                                );
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            let _ = writeln!(decls, "    {} rv{}[{}];", et, ci, cov.len());
             let _ = writeln!(
                 body,
-                "    for (longint k = 0; k < {}; k++) begin\n      {} rv[{}];\n      g = {} + k;\n      c = 0; cc = 0;",
-                c.count,
-                et,
-                cov.len(),
-                c.base
+                "    for (k = 0; k < {}; k++) begin\n      g = {} + k;\n      c = 0; cc = 0;",
+                c.count, c.base
             );
             for (p, d) in &cov {
                 let cond = super::elab::cov_cond_var(&d.cov, "g");
                 if kind.is_some() {
                     let _ = writeln!(
                         body,
-                        "      if ({cond}) begin cc++; if (vh_don{s}_{p}) begin rv[c] = vh_dv{s}_{p}{leaf}; c++; end end",
+                        "      if ({cond}) begin cc++; if (vh_don{s}_{p}) begin rv{ci}[c] = vh_dv{s}_{p}{leaf}; c++; end end",
                         cond = cond,
                         s = s,
                         p = p,
+                        ci = ci,
                         leaf = leaf
                     );
                 } else {
                     let _ = writeln!(
                         body,
-                        "      if ({cond}) begin rv[c] = vh_dv{s}_{p}{leaf}; c++; end",
+                        "      if ({cond}) begin rv{ci}[c] = vh_dv{s}_{p}{leaf}; c++; end",
                         cond = cond,
                         s = s,
                         p = p,
+                        ci = ci,
                         leaf = leaf
                     );
                 }
@@ -628,23 +729,40 @@ impl<'a> Lw<'a> {
                     let pt = self.d.objects[self.d.subprograms[f].params[0]].ty;
                     let pname = self.arr_name(pt, &info.loc);
                     self.need_sub(f);
+                    let _ = writeln!(decls, "    {} ra{}[];", et, ci);
+                    // STD_LOGIC's RESOLVED returns the value of a single
+                    // source (`s'length = 1`, the IEEE body): a leaf driven
+                    // once, the usual case, skips the call.
+                    let single = if self.d.subprograms[f]
+                        .path
+                        .eq_ignore_ascii_case("ieee.std_logic_1164.resolved")
+                    {
+                        format!(
+                            "if (c == 1) nv{leaf} = rv{ci}[0];\n      else ",
+                            leaf = leaf,
+                            ci = ci
+                        )
+                    } else {
+                        String::new()
+                    };
                     let _ = writeln!(
                         body,
-                        "      if ({any} > 0) begin\n        {et} ra[];\n        ra = new[c];\n        for (int j = 0; j < c; j++) ra[j] = rv[j];\n        nv{leaf} = {f}({p}_mk(0, c - 1, 0, ra));\n      end",
+                        "      {single}if ({any} > 0) begin\n        ra{ci} = new[c];\n        for (int j = 0; j < c; j++) ra{ci}[j] = rv{ci}[j];\n        nv{leaf} = {f}({p}_mk(0, c - 1, 0, ra{ci}));\n      end",
+                        single = single,
                         any = any,
-                        et = et,
+                        ci = ci,
                         leaf = leaf,
                         f = self.sub_name(f),
                         p = pname
                     );
                 }
                 None => {
-                    let _ = writeln!(body, "      if (c > 0) nv{} = rv[0];", leaf);
+                    let _ = writeln!(body, "      if (c > 0) nv{} = rv{}[0];", leaf, ci);
                 }
             }
             let _ = writeln!(body, "    end");
         }
-        Some(body)
+        Some(decls + &body)
     }
 
     /// The path an assignment target names (`a(i)(j)`, `r.f(3 downto 0)`):
