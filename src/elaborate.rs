@@ -32779,6 +32779,59 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
     }
 }
 
+/// The names a generate block declares in its own scope, which is all that a
+/// bare reference in that block can bind to among the block's declarations
+/// (§23.9, §27.5). A `generate` region opens no scope; nested blocks do.
+fn collect_own_decl_names(items: &[ModuleItem], names: &mut Vec<String>) {
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(gr) => collect_own_decl_names(&gr.items, names),
+            ModuleItem::GenerateIf(_)
+            | ModuleItem::GenerateCase(_)
+            | ModuleItem::GenerateFor(_) => {}
+            other => collect_decl_names_in_items(std::slice::from_ref(other), names),
+        }
+    }
+}
+
+/// A reference to the renamed declaration `renamed`.
+fn gen_renamed_ref(renamed: String) -> Expression {
+    let hier = HierarchicalIdentifier {
+        root: None,
+        path: vec![HierPathSegment {
+            name: Identifier {
+                name: renamed,
+                span: Span { start: 0, end: 0 },
+            },
+            selects: Vec::new(),
+        }],
+        span: Span { start: 0, end: 0 },
+        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+        cached_resolved_name: crate::ast::cache::NameCache::new(),
+    };
+    Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 })
+}
+
+/// The references visible in a nested block: those of the enclosing scope and
+/// the block's own declarations, which shadow them under the same rename.
+fn gen_block_port_map<'m>(
+    block_items: &[ModuleItem],
+    rename: &GenRename,
+    enclosing: &'m HashMap<String, Expression>,
+) -> std::borrow::Cow<'m, HashMap<String, Expression>> {
+    let mut own = Vec::new();
+    collect_own_decl_names(block_items, &mut own);
+    if own.iter().all(|n| enclosing.contains_key(n)) {
+        return std::borrow::Cow::Borrowed(enclosing);
+    }
+    let mut visible = enclosing.clone();
+    for n in own {
+        let renamed = rename.apply(&n);
+        visible.insert(n, gen_renamed_ref(renamed));
+    }
+    std::borrow::Cow::Owned(visible)
+}
+
 /// Rename declarations inside a generate-for iteration so that each iteration
 /// owns a distinct copy of every locally declared name. References in
 /// always/initial/contassign/instance ports get rewritten via a port_map.
@@ -32813,29 +32866,19 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
     if names.is_empty() {
         return items.to_vec();
     }
-    // Build rewrite map: original_name -> Ident(renamed)
-    let mut port_map: HashMap<String, Expression> = HashMap::default();
+    // Every declaration below is renamed, but a reference only binds to what
+    // is visible from it (§23.9, §27.5). Here that is this block's own names;
+    // each nested block adds its own (`gen_block_port_map`). A reference that
+    // binds to none keeps its bare name and resolves in an outer scope: taking
+    // `W` beside a nested `localparam int W` for this block's named a `g.W`
+    // that does not exist.
     let rename_set: std::collections::HashSet<String> = names.iter().cloned().collect();
-    for n in &names {
-        let renamed = rename.apply(n);
-        let id = Identifier {
-            name: renamed.clone(),
-            span: Span { start: 0, end: 0 },
-        };
-        let hier = HierarchicalIdentifier {
-            root: None,
-            path: vec![HierPathSegment {
-                name: id,
-                selects: Vec::new(),
-            }],
-            span: Span { start: 0, end: 0 },
-            cached_signal_id: crate::ast::cache::SignalCache::new(None),
-            cached_resolved_name: crate::ast::cache::NameCache::new(),
-        };
-        port_map.insert(
-            n.clone(),
-            Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }),
-        );
+    let mut own_names = Vec::new();
+    collect_own_decl_names(items, &mut own_names);
+    let mut port_map: HashMap<String, Expression> = HashMap::default();
+    for n in own_names {
+        let renamed = rename.apply(&n);
+        port_map.insert(n, gen_renamed_ref(renamed));
     }
     // §23.6/§27.6: an INSTANCE declared in a nested generate block keeps its
     // bare name here (the instance path gets each scope later, innermost
@@ -32854,23 +32897,7 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
                     continue;
                 }
                 let renamed = rename.apply(&h);
-                let hier = HierarchicalIdentifier {
-                    root: None,
-                    path: vec![HierPathSegment {
-                        name: Identifier {
-                            name: renamed,
-                            span: Span { start: 0, end: 0 },
-                        },
-                        selects: Vec::new(),
-                    }],
-                    span: Span { start: 0, end: 0 },
-                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                    cached_resolved_name: crate::ast::cache::NameCache::new(),
-                };
-                port_map.insert(
-                    h,
-                    Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }),
-                );
+                port_map.insert(h, gen_renamed_ref(renamed));
             }
         }
     }
@@ -33223,6 +33250,7 @@ fn rename_item_decls(
                     let new_cond = cond
                         .as_ref()
                         .map(|c| rewrite_expr(c, "", port_map, local_names, interface_map));
+                    let visible = gen_block_port_map(branch_items, rename, port_map);
                     let new_items: Vec<ModuleItem> = branch_items
                         .iter()
                         .map(|i| {
@@ -33230,7 +33258,7 @@ fn rename_item_decls(
                                 i,
                                 rename,
                                 rename_set,
-                                port_map,
+                                &visible,
                                 local_names,
                                 interface_map,
                             )
@@ -33245,27 +33273,30 @@ fn rename_item_decls(
             let new_arms: Vec<GenerateCaseArm> = gc
                 .arms
                 .iter()
-                .map(|arm| GenerateCaseArm {
-                    values: arm
-                        .values
-                        .iter()
-                        .map(|v| rewrite_expr(v, "", port_map, local_names, interface_map))
-                        .collect(),
-                    items: arm
-                        .items
-                        .iter()
-                        .map(|i| {
-                            rename_item_decls(
-                                i,
-                                rename,
-                                rename_set,
-                                port_map,
-                                local_names,
-                                interface_map,
-                            )
-                        })
-                        .collect(),
-                    label: arm.label.clone(),
+                .map(|arm| {
+                    let visible = gen_block_port_map(&arm.items, rename, port_map);
+                    GenerateCaseArm {
+                        values: arm
+                            .values
+                            .iter()
+                            .map(|v| rewrite_expr(v, "", port_map, local_names, interface_map))
+                            .collect(),
+                        items: arm
+                            .items
+                            .iter()
+                            .map(|i| {
+                                rename_item_decls(
+                                    i,
+                                    rename,
+                                    rename_set,
+                                    &visible,
+                                    local_names,
+                                    interface_map,
+                                )
+                            })
+                            .collect(),
+                        label: arm.label.clone(),
+                    }
                 })
                 .collect();
             ModuleItem::GenerateCase(GenerateCase {
@@ -33284,11 +33315,12 @@ fn rename_item_decls(
                 .map(|e| rewrite_expr(e, "", port_map, local_names, interface_map));
             new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
             new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
+            let visible = gen_block_port_map(&gf.items, rename, port_map);
             new_gf.items = gf
                 .items
                 .iter()
                 .map(|i| {
-                    rename_item_decls(i, rename, rename_set, port_map, local_names, interface_map)
+                    rename_item_decls(i, rename, rename_set, &visible, local_names, interface_map)
                 })
                 .collect();
             ModuleItem::GenerateFor(new_gf)
