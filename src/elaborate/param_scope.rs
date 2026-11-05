@@ -59,6 +59,9 @@ pub(super) struct ParamScope {
     /// The words the file-scope `let`s and the binds spell (`None`: one
     /// could not be read to the end).
     common_words: Rc<Option<HashSet<String>>>,
+    /// The entries every scope's words spell: keys without a word and those
+    /// under a common word.
+    common_spelled: Box<[u32]>,
     /// Per definition, only its own and its immediate children's words.
     words: RefCell<HashMap<(String, usize), Rc<ScopeWords>>>,
     /// Absence from a scope matters too. Share identical absence masks instead
@@ -111,6 +114,7 @@ impl ParamScope {
             spelled: RefCell::default(),
             selected: RefCell::default(),
             common_words: Rc::new(None),
+            common_spelled: Box::default(),
             words: RefCell::default(),
             missing: RefCell::default(),
         };
@@ -150,6 +154,13 @@ impl ParamScope {
         if all {
             scope.common = (0..scope.entries.len() as u32).collect();
         } else {
+            // Keys without a word, which `common` holds so far, and those
+            // under a common word.
+            let mut spelled = scope.common.clone();
+            spelled.extend(words.iter().filter_map(|w| scope.by_word.get(w)).flatten());
+            spelled.sort_unstable();
+            spelled.dedup();
+            scope.common_spelled = spelled.into();
             scope.common.extend(found);
             scope.common.sort_unstable();
             scope.common.dedup();
@@ -202,9 +213,21 @@ impl ParamScope {
                 read(child, &mut HashSet::default());
             }
         }
+        let spelled = match (&*self.common_words, &words) {
+            (Some(_), Some(local)) => Some(
+                local
+                    .iter()
+                    .filter_map(|w| self.by_word.get(w))
+                    .flatten()
+                    .copied()
+                    .collect(),
+            ),
+            _ => None,
+        };
         let words = Rc::new(ScopeWords {
             common: Rc::clone(&self.common_words),
             local: words,
+            spelled,
         });
         self.words.borrow_mut().insert(key, Rc::clone(&words));
         words
@@ -218,6 +241,7 @@ impl ParamScope {
         def: Definition,
         definitions: &HashMap<String, Definition>,
         params: &HashMap<String, Value>,
+        types: Vec<TypeBinding>,
     ) -> (PreparedKey, usize) {
         let words = self.scope_words(def, definitions);
         let mut changed = Vec::new();
@@ -233,13 +257,18 @@ impl ParamScope {
         }
         changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut missing = Vec::new();
-        for (i, (name, _)) in self.entries.iter().enumerate() {
-            if words.spells(name) && !params.contains_key(name) {
+        let mut note = |i: u32| {
+            let i = i as usize;
+            if !params.contains_key(&self.entries[i].0) {
                 if missing.is_empty() {
                     missing.resize(self.entries.len().div_ceil(64), 0u64);
                 }
                 missing[i / 64] |= 1 << (i % 64);
             }
+        };
+        match &words.spelled {
+            Some(own) => self.common_spelled.iter().chain(own).copied().for_each(&mut note),
+            None => (0..self.entries.len() as u32).for_each(&mut note),
         }
         while missing.last() == Some(&0) {
             missing.pop();
@@ -259,6 +288,7 @@ impl ParamScope {
             definition: def_key(&def),
             missing,
             changed,
+            types,
         };
         let bytes = key.retained_bytes() + shared_bytes;
         (key, bytes)
@@ -398,7 +428,7 @@ fn instantiable(d: &Definition) -> bool {
     )
 }
 
-fn def_key(def: &Definition) -> (String, usize) {
+pub(super) fn def_key(def: &Definition) -> (String, usize) {
     let addr = match def {
         Definition::Module(m) => *m as *const _ as usize,
         Definition::Interface(i) => *i as *const _ as usize,
@@ -417,6 +447,9 @@ fn def_key(def: &Definition) -> (String, usize) {
 pub(super) struct ScopeWords {
     common: Rc<Option<HashSet<String>>>,
     local: Option<HashSet<String>>,
+    /// The table entries the local words spell, beside
+    /// `ParamScope::common_spelled`; `None` when the words are unknown.
+    spelled: Option<Box<[u32]>>,
 }
 
 impl ScopeWords {
@@ -442,7 +475,12 @@ pub(super) struct PreparedKey {
     definition: (String, usize),
     missing: Rc<[u64]>,
     changed: Vec<(String, Value)>,
+    types: Vec<TypeBinding>,
 }
+
+/// A type parameter as bound (§6.20.3): its name, width and the span-free
+/// bytes of its shape (`canonical::span_free`).
+pub(super) type TypeBinding = (String, Option<u32>, Box<[u8]>);
 
 impl PreparedKey {
     /// Retained key payload, excluding separately counted interned masks and
@@ -462,6 +500,11 @@ impl PreparedKey {
                             0
                         }
                 })
+                .sum::<usize>()
+            + self
+                .types
+                .iter()
+                .map(|(name, _, shape)| size_of::<TypeBinding>() + name.len() + shape.len())
                 .sum::<usize>()
     }
 }
@@ -791,7 +834,14 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
             assert!(Rc::ptr_eq(&scope.common_words, &words.common));
             assert!(words.local.as_ref().unwrap().len() < 16);
             assert!(words.spells("pk::P_2047"));
-            let (key, added) = scope.prepared_key(def, &defs, &empty);
+            let mut ids: Vec<u32> = scope.common_spelled.iter().copied().collect();
+            ids.extend(words.spelled.as_deref().unwrap());
+            ids.sort_unstable();
+            ids.dedup();
+            let spelled = (0..scope.entries.len() as u32)
+                .filter(|&i| words.spells(&scope.entries[i as usize].0));
+            assert!(ids.into_iter().eq(spelled));
+            let (key, added) = scope.prepared_key(def, &defs, &empty, Vec::new());
             assert!(key.changed.is_empty());
             if let Some(mask) = &previous_mask {
                 assert!(Rc::ptr_eq(mask, &key.missing));
@@ -800,7 +850,7 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
             bytes += added;
             let mut params = table.clone();
             params.insert("W".to_string(), Value::from_u64(i + 1, 32));
-            let (present, added) = scope.prepared_key(def, &defs, &params);
+            let (present, added) = scope.prepared_key(def, &defs, &params, Vec::new());
             assert_eq!(present.changed.len(), 1);
             assert!(present.missing.is_empty());
             assert!(added < 512, "key retained {added} bytes");
@@ -823,19 +873,19 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
         let table = HashMap::from_iter([("P".into(), Value::from_u64(3, 32))]);
         let scope = ParamScope::new(&table, &defs, &HashMap::default(), &HashMap::default());
         let def = defs["m"];
-        let (visible, _) = scope.prepared_key(def, &defs, &table);
-        let (absent, _) = scope.prepared_key(def, &defs, &HashMap::default());
+        let (visible, _) = scope.prepared_key(def, &defs, &table, Vec::new());
+        let (absent, _) = scope.prepared_key(def, &defs, &HashMap::default(), Vec::new());
         assert_ne!(visible, absent);
         let mut local = table.clone();
         local.insert("P".into(), Value::from_u64(9, 32));
-        let (shadowed, _) = scope.prepared_key(def, &defs, &local);
+        let (shadowed, _) = scope.prepared_key(def, &defs, &local, Vec::new());
         assert_ne!(visible, shadowed);
         assert_ne!(absent, shadowed);
         assert_eq!(shadowed.changed.len(), 1);
         local.insert("UNREAD".into(), Value::from_u64(23, 32));
-        assert_eq!(shadowed, scope.prepared_key(def, &defs, &local).0);
+        assert_eq!(shadowed, scope.prepared_key(def, &defs, &local, Vec::new()).0);
         local.insert("P".into(), Value::from_u64(3, 32));
-        assert_eq!(visible, scope.prepared_key(def, &defs, &local).0);
+        assert_eq!(visible, scope.prepared_key(def, &defs, &local, Vec::new()).0);
     }
 
     /// §5.7, §6.20: cache equality must compare the whole value, including
@@ -877,16 +927,16 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
         let mut keys = HashSet::default();
         for value in &values {
             let params = HashMap::from_iter([("P".into(), value.clone())]);
-            assert!(keys.insert(scope.prepared_key(defs["m"], &defs, &params).0));
+            assert!(keys.insert(scope.prepared_key(defs["m"], &defs, &params, Vec::new()).0));
         }
         assert_eq!(keys.len(), values.len());
         // A cache hit uses equality as well as hashing, including baseline
         // omissions; constructing the key again finds the same prepared body.
         let mut cache = HashMap::default();
-        let (key, _) = scope.prepared_key(defs["m"], &defs, &table);
+        let (key, _) = scope.prepared_key(defs["m"], &defs, &table, Vec::new());
         cache.insert(key, 42);
         assert_eq!(
-            cache.get(&scope.prepared_key(defs["m"], &defs, &table).0),
+            cache.get(&scope.prepared_key(defs["m"], &defs, &table, Vec::new()).0),
             Some(&42)
         );
     }
