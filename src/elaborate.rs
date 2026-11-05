@@ -19871,7 +19871,7 @@ fn elaborate_generate_if(
         .and_then(|l| l.as_ref())
     {
         Some(label) => {
-            let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(label));
+            let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(label), &[]);
             alias_labelled_subroutines(&mut renamed, label);
             stamp_gen_scope(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
@@ -19951,7 +19951,7 @@ fn elaborate_generate_case_arm(
 ) -> Result<(), String> {
     match &arm.label {
         Some(label) => {
-            let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label));
+            let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label), &[]);
             alias_labelled_subroutines(&mut renamed, label);
             stamp_gen_scope(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
@@ -20036,6 +20036,34 @@ fn alias_labelled_subroutines(items: &mut Vec<ModuleItem>, label: &str) {
     items.extend(aliases);
 }
 
+/// The subroutines `scope_generated_subroutines` renames that a bare call can
+/// name: those of the iteration's items, `generate` regions and conditional
+/// generate branches, not out-of-block methods.
+fn collect_generated_subroutine_names(items: &[ModuleItem], names: &mut Vec<String>) {
+    for item in items {
+        match item {
+            ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
+                names.push(fd.name.name.name.clone())
+            }
+            ModuleItem::TaskDeclaration(td) if td.name.scopes.is_empty() => {
+                names.push(td.name.name.name.clone())
+            }
+            ModuleItem::GenerateRegion(gr) => collect_generated_subroutine_names(&gr.items, names),
+            ModuleItem::GenerateIf(gi) => {
+                for (_, branch) in &gi.branches {
+                    collect_generated_subroutine_names(branch, names);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    collect_generated_subroutine_names(&arm.items, names);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
     for item in items {
         match item {
@@ -20093,7 +20121,10 @@ fn elaborate_generate_for(
         // §27.6: unnamed blocks use the enclosing construct's genblk ordinal,
         // exactly as named blocks use their label. Data and process scopes agree.
         let scope = format!("{}[{}]", gen_scope_name(gf.name.as_ref(), ordinal), i);
-        let mut renamed = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
+        // §27.4: a call to the iteration's own `f` names its `<scope>.f`.
+        let mut subroutines = Vec::new();
+        collect_generated_subroutine_names(&subst, &mut subroutines);
+        let mut renamed = rename_decls_in_iter(&subst, &GenRename::Scope(&scope), &subroutines);
         scope_generated_subroutines(&mut renamed, &scope);
         stamp_gen_scope(&mut renamed, &scope);
         elaborate_items(&renamed, elab, all_defs)?;
@@ -32860,10 +32891,18 @@ impl GenRename<'_> {
     }
 }
 
-fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleItem> {
+/// `subroutines` names the subroutines a generate-for iteration declares,
+/// which `scope_generated_subroutines` renames to `<scope>.<name>`: a bare
+/// call to one from inside the iteration is renamed with it, as a reference
+/// to a renamed declaration is (§23.9, §27.4). Other callers pass none.
+fn rename_decls_in_iter(
+    items: &[ModuleItem],
+    rename: &GenRename,
+    subroutines: &[String],
+) -> Vec<ModuleItem> {
     let mut names = Vec::new();
     collect_decl_names_in_items(items, &mut names);
-    if names.is_empty() {
+    if names.is_empty() && subroutines.is_empty() {
         return items.to_vec();
     }
     // Every declaration below is renamed, but a reference only binds to what
@@ -32879,6 +32918,11 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
     for n in own_names {
         let renamed = rename.apply(&n);
         port_map.insert(n, gen_renamed_ref(renamed));
+    }
+    for s in subroutines {
+        if !port_map.contains_key(s) {
+            port_map.insert(s.clone(), gen_renamed_ref(rename.apply(s)));
+        }
     }
     // §23.6/§27.6: an INSTANCE declared in a nested generate block keeps its
     // bare name here (the instance path gets each scope later, innermost
@@ -34118,7 +34162,7 @@ fn collect_effective_items_scoped(
                         let branch_items = match label {
                             Some(l) => {
                                 scoped_items =
-                                    rename_decls_in_iter(branch_items, &GenRename::Scope(l));
+                                    rename_decls_in_iter(branch_items, &GenRename::Scope(l), &[]);
                                 &scoped_items
                             }
                             None => branch_items,
@@ -34162,7 +34206,8 @@ fn collect_effective_items_scoped(
                     let scoped_items;
                     let arm_items = match &arm.label {
                         Some(l) => {
-                            scoped_items = rename_decls_in_iter(&arm.items, &GenRename::Scope(l));
+                            scoped_items =
+                                rename_decls_in_iter(&arm.items, &GenRename::Scope(l), &[]);
                             &scoped_items
                         }
                         None => &arm.items,
@@ -34204,7 +34249,7 @@ fn collect_effective_items_scoped(
                     // sees a flat duplicate.
                     let scope =
                         format!("{}[{}]", gen_scope_name(gf.name.as_ref(), *gen_ordinal), i);
-                    let subst = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
+                    let subst = rename_decls_in_iter(&subst, &GenRename::Scope(&scope), &[]);
                     let mut inner = collect_effective_items(&subst, &local_params);
                     prefix_gen_scope(&mut inner, &scope);
                     result.extend(inner);
