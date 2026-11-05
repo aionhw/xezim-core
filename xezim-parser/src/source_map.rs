@@ -331,3 +331,79 @@ impl LineMap {
         self.locate(text, span).map(|l| l.short())
     }
 }
+
+#[cfg(test)]
+mod line_start_tests {
+    use super::{line_at_by_scan, LineMap};
+    use crate::ast::Span;
+    use crate::preprocessor::Preprocessor;
+
+    /// Byte offsets of `text` that start a character, and its end.
+    fn char_offsets(text: &str) -> impl Iterator<Item = usize> + '_ {
+        text.char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+    }
+
+    /// The line found by binary search is the one a scan finds, at every
+    /// offset: line starts, newlines, the end, an empty last line.
+    #[test]
+    fn binary_search_finds_the_scanned_line() {
+        for text in [
+            "",
+            "a",
+            "\n",
+            "\n\n",
+            "ab\ncd",
+            "ab\ncd\n",
+            "a\n\nb\r\n\u{e9}\u{fc}\n  x\n",
+        ] {
+            let map = LineMap::default();
+            for start in char_offsets(text) {
+                assert_eq!(
+                    map.line_at(text, start),
+                    line_at_by_scan(text, start),
+                    "offset {start} of {text:?}"
+                );
+            }
+        }
+    }
+
+    /// `locate` answers as before the index at every offset of a text with
+    /// an include, macros (one spanning lines) and a `line directive: one
+    /// map's index is built from the text, the other's from a text of
+    /// another length, so that it scans.
+    #[test]
+    fn locate_matches_the_scan_at_every_offset() {
+        let dir =
+            std::env::temp_dir().join(format!("sv-parser-line-starts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inc = dir.join("inc.svh");
+        std::fs::write(&inc, "wire from_inc;\n`define TWO(a) a + \\\n  a\n").unwrap();
+        let top = dir.join("top.sv");
+        let src = format!(
+            "`include \"{}\"\n`define W 8\nmodule top;\n  logic [`W-1:0] d;\n  \
+             initial d = `TWO(3);\n`line 40 \"other.sv\" 0\n  wire \u{e9}t\u{e9};\nendmodule\n",
+            inc.display()
+        );
+        let mut pp = Preprocessor::new();
+        let text = pp.preprocess_file(&src, Some(&top));
+        let indexed = pp.take_line_map().expect("line map");
+        let scanned = indexed.clone();
+        let longer = format!("{text} ");
+        let _ = scanned.locate(&longer, Span::new(0, 0));
+        let _ = indexed.locate(&text, Span::new(0, 0));
+        for start in char_offsets(&text) {
+            let end = (start + 3..=text.len())
+                .find(|&e| text.is_char_boundary(e))
+                .unwrap_or(text.len());
+            let span = Span::new(start, end);
+            assert_eq!(
+                indexed.locate(&text, span),
+                scanned.locate(&text, span),
+                "offset {start} of:\n{text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
