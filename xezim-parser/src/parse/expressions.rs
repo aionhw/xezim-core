@@ -1598,10 +1598,10 @@ impl Parser {
                 self.bump(); // $unit
                 self.bump(); // ::
                 let mut hier = self.parse_hierarchical_identifier();
-                if !self.at(TokenKind::LParen) {
-                    if let Some(seg) = hier.path.first_mut() {
-                        seg.name.name = crate::unit_scope_name(&seg.name.name);
-                    }
+                if (!self.at(TokenKind::LParen) || hier.path.len() > 1)
+                    && let Some(seg) = hier.path.first_mut()
+                {
+                    seg.name.name = crate::unit_scope_name(&seg.name.name);
                 }
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }

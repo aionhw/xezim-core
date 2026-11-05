@@ -13,15 +13,15 @@ use crate::hasher::HashSet;
 use std::rc::Rc;
 
 pub(crate) mod array_params;
+mod canonical;
 mod const_function_scope;
+pub(crate) mod constructor_forwarding;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
-pub(crate) mod constructor_forwarding;
-pub(crate) mod relaxed_static;
 mod param_prefix_index;
-mod canonical;
 mod param_scope;
+pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);
 impl<F: FnMut()> Drop for ScopeGuardLite<F> {
@@ -6494,6 +6494,7 @@ fn validate_constraint_item_names(
 fn collect_class_member_names(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
+    body_classes: &[&ClassDeclaration],
     allowed: &mut HashSet<String>,
     seen: &mut HashSet<String>,
 ) {
@@ -6553,26 +6554,30 @@ fn collect_class_member_names(
             }
         }
     }
-    if let Some(ext) = &c.extends {
-        if let Some(defs) = all_defs {
-            // §8.16/§26.3: the base of a class declared in a MODULE body (or
-            // another package) may live INSIDE an imported package
-            // (`mypacket extends packet` where `packet` is `packet_pkg`'s
-            // class) rather than as a top-level Class definition. Packages
-            // are kept whole in `all_defs` (Definition::Package), so a bare
-            // `defs.get(base)` lookup misses package members and an inherited
-            // property reference in a derived constraint is wrongly rejected
-            // as undeclared. Fall back to searching every package's classes.
-            let parent: Option<&ClassDeclaration> = match defs.get(&ext.name.name) {
+    if let Some(ext) = &c.extends
+        && let Some(defs) = all_defs
+    {
+        // §8.16/§26.3: the base of a class declared in a MODULE body (or
+        // another package) may live INSIDE an imported package
+        // (`mypacket extends packet` where `packet` is `packet_pkg`'s
+        // class) rather than as a top-level Class definition. Packages
+        // are kept whole in `all_defs` (Definition::Package), so a bare
+        // `defs.get(base)` lookup misses package members and an inherited
+        // property reference in a derived constraint is wrongly rejected
+        // as undeclared. Fall back to searching every package's classes.
+        let parent = body_classes
+            .iter()
+            .copied()
+            .find(|p| p.name.name == ext.name.name)
+            .or_else(|| match defs.get(&ext.name.name) {
                 Some(Definition::Class(p)) => Some(p),
                 Some(Definition::Package(_)) | None => {
                     find_base_class_in_packages(defs, &ext.name.name)
                 }
                 _ => None,
-            };
-            if let Some(parent) = parent {
-                collect_class_member_names(parent, all_defs, allowed, seen);
-            }
+            });
+        if let Some(parent) = parent {
+            collect_class_member_names(parent, all_defs, body_classes, allowed, seen);
         }
     }
 }
@@ -6679,7 +6684,8 @@ fn defs_with_local_classes<'a>(
     }
     let mut merged: HashMap<String, Definition<'a>> = all_defs.cloned().unwrap_or_default();
     for (n, cd) in local {
-        merged.entry(n.to_string()).or_insert(Definition::Class(cd));
+        // §23.9: the nearest lexical class hides an enclosing declaration.
+        merged.insert(n.to_string(), Definition::Class(cd));
     }
     Some(merged)
 }
@@ -6687,6 +6693,20 @@ fn defs_with_local_classes<'a>(
 fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
+    module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
+    scope: Option<&ElaboratedModule>,
+    inst_prefix: Option<&str>,
+) -> Result<(), String> {
+    validate_class_constraints_in_body(c, all_defs, &[], module_enums, scope, inst_prefix)
+}
+
+/// §8.3/§18.5: an instantiated module's own classes participate in base
+/// lookup and scoped constraint names. Borrow its prepared body rather than
+/// copying the design-wide definition table for each instance.
+fn validate_class_constraints_in_body(
+    c: &ClassDeclaration,
+    all_defs: Option<&HashMap<String, Definition>>,
+    body_classes: &[&ClassDeclaration],
     module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
     scope: Option<&ElaboratedModule>,
     inst_prefix: Option<&str>,
@@ -6701,7 +6721,8 @@ fn validate_class_constraints(
     }
     let mut allowed = HashSet::default();
     let mut seen = HashSet::default();
-    collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
+    collect_class_member_names(c, all_defs, body_classes, &mut allowed, &mut seen);
+    allowed.extend(body_classes.iter().map(|c| c.name.name.clone()));
     if let Some(defs) = all_defs {
         collect_global_constraint_names(defs, &mut allowed);
     }
@@ -13731,19 +13752,19 @@ pub fn elaborate_module_with_defs(
                 // Recursively process generate region items. A region is not
                 // a scope (§27.3): its constructs share this scope's genblk
                 // numbering.
-                elaborate_items_numbered(&gr.items, &mut elab, all_defs, &mut gen_ordinal)?;
+                elaborate_items_numbered(&gr.items, &mut elab, cls_defs, &mut gen_ordinal)?;
             }
             ModuleItem::GenerateIf(gi) => {
                 gen_ordinal += 1;
-                elaborate_generate_if(gi, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_if(gi, &mut elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateCase(gc) => {
                 gen_ordinal += 1;
-                elaborate_generate_case(gc, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_case(gc, &mut elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateFor(gf) => {
                 gen_ordinal += 1;
-                elaborate_generate_for(gf, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_for(gf, &mut elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::CovergroupDeclaration(cg) => {
                 elab.covergroups.insert(cg.name.name.clone(), cg.clone());
@@ -19012,7 +19033,13 @@ fn elaborate_items_numbered(
                             }
                         }
                     } else {
-                        let init_val = if let Some(init_expr) = &decl.init {
+                        let procedural_init = decl
+                            .init
+                            .as_ref()
+                            .filter(|init| !is_const_expr(init, &elab.parameters));
+                        let init_val = if let Some(init_expr) =
+                            decl.init.as_ref().filter(|_| procedural_init.is_none())
+                        {
                             let mut rv = eval_init_for_width(init_expr, &elab.parameters, width);
                             if !is_real {
                                 rv.is_signed = is_signed;
@@ -19047,6 +19074,24 @@ fn elaborate_items_numbered(
                         if let Some(view) = &data_modport_view {
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());
+                        }
+                        // §6.8/§27: a generate-body initializer also executes
+                        // before initial processes. Constant folding cannot
+                        // construct an object or call a runtime function.
+                        if let Some(init) = procedural_init {
+                            if dd.const_kw {
+                                elab.const_decl_inits.insert(decl.name.name.clone());
+                            }
+                            elab.static_init_blocks.push(InitialBlock {
+                                stmt: Statement::new(
+                                    StatementKind::BlockingAssign {
+                                        lvalue: make_ident_expr(&decl.name.name),
+                                        rvalue: init.clone(),
+                                    },
+                                    decl.name.span,
+                                ),
+                                scope: String::new(),
+                            });
                         }
                         // Packed-struct metadata for a GENERATE-scope (or other
                         // elaborate_items-routed) declaration, mirroring the
@@ -19434,19 +19479,19 @@ fn elaborate_items_numbered(
                 process_typedef(td, elab);
             }
             ModuleItem::GenerateRegion(gr) => {
-                elaborate_items_numbered(&gr.items, elab, all_defs, gen_ordinal)?;
+                elaborate_items_numbered(&gr.items, elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateIf(gi) => {
                 *gen_ordinal += 1;
-                elaborate_generate_if(gi, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_if(gi, elab, cls_defs, *gen_ordinal)?;
             }
             ModuleItem::GenerateCase(gc) => {
                 *gen_ordinal += 1;
-                elaborate_generate_case(gc, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_case(gc, elab, cls_defs, *gen_ordinal)?;
             }
             ModuleItem::GenerateFor(gf) => {
                 *gen_ordinal += 1;
-                elaborate_generate_for(gf, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_for(gf, elab, cls_defs, *gen_ordinal)?;
             }
 
             ModuleItem::ClassDeclaration(cd) => {
@@ -36576,6 +36621,7 @@ fn register_modport_expressions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -37171,10 +37217,9 @@ fn inline_module_items(
                                         (port.name.name.clone(), is_if_port)
                                     })
                                     .collect(),
-                                PortList::NonAnsi(names) => names
-                                    .iter()
-                                    .map(|n| (n.name.clone(), false))
-                                    .collect(),
+                                PortList::NonAnsi(names) => {
+                                    names.iter().map(|n| (n.name.clone(), false)).collect()
+                                }
                                 PortList::Empty => Vec::new(),
                             };
                             for (name, is_if_port) in wildcard_ports {
@@ -37195,7 +37240,7 @@ fn inline_module_items(
                                 // propagated to the real parent net and every reader
                                 // of it read z. `rewrite_expr`'s fallback IS
                                 // `prefix + name`, so the unmapped case is unchanged.
-                                let parent_name = cat2(&prefix, &name);
+                                let parent_name = cat2(prefix, &name);
                                 let actual = rewrite_expr(
                                     &make_ident_expr(&name),
                                     prefix,
@@ -39146,7 +39191,7 @@ fn inline_module_items(
                 // parent clone when local_params is empty (top-level case).
                 // §6.18/§23.10: this sub-module's own typedef names — used to
                 // rename type references to their instance-scoped keys.
-                let sub_typedef_names_all: std::collections::HashSet<String> = prepared_sub
+                let mut sub_typedef_names_all: std::collections::HashSet<String> = prepared_sub
                     .effective_items
                     .iter()
                     .filter_map(|it| match it {
@@ -39155,6 +39200,12 @@ fn inline_module_items(
                         _ => None,
                     })
                     .collect();
+                for parameter in sub_mod.params_and_body_types() {
+                    if let ParameterKind::Type { assignments } = &parameter.kind {
+                        sub_typedef_names_all
+                            .extend(assignments.iter().map(|a| a.name.name.clone()));
+                    }
+                }
                 record_param_decl_types(
                     elab,
                     sub_mod
@@ -41790,6 +41841,21 @@ fn inline_module_items(
                 // survive inlining. Bake class-valued type parameters into
                 // expression receivers as well as declaration data types.
                 for (name, dt) in &pend_type_binds {
+                    // §6.20.3: variables declared with a module type parameter
+                    // need its binding after the temporary bare typedef is
+                    // restored. Keep an instance-qualified alias for `new`,
+                    // reflection and member access through those variables.
+                    let key = cat2(&inst_prefix, name);
+                    let scoped = scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix);
+                    let width =
+                        resolve_type_width(&scoped, Some(&sub_merged_params), Some(&elab.typedefs));
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:instance_type_parameter",
+                        key.clone(),
+                        width,
+                    );
+                    elab.typedef_types.insert(key, scoped);
                     if let Some(receiver) = module_class_scope::receiver(dt) {
                         rewrite_port_map.insert(name.clone(), receiver);
                     }
@@ -41951,6 +42017,14 @@ fn inline_module_items(
                 // `rewrite_stmt`, so this instance's type-parameter widths
                 // must be live for `$bits(T)` to fold inside them too.
                 set_type_bind_tls(&pend_ctx);
+                let body_classes: Vec<&ClassDeclaration> = prepared_sub
+                    .effective_items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ModuleItem::ClassDeclaration(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
                 for (sub_item, body_src) in prepared_sub
                     .effective_items
                     .iter()
@@ -42118,9 +42192,10 @@ fn inline_module_items(
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
-                        validate_class_constraints(
+                        validate_class_constraints_in_body(
                             cd,
                             Some(definitions),
+                            &body_classes,
                             Some(&elab.enum_members),
                             Some(&elab),
                             Some(&inst_prefix),
@@ -50168,12 +50243,11 @@ fn compute_wildcard_shadowed(
 fn rebind_imported_typedefs(elab: &mut ElaboratedModule, imports: &[ImportedTypedefs]) {
     let mut changed = false;
     for (name, key) in imports.iter().flat_map(|list| list.iter()) {
-        if let Some(w) = elab.typedefs.get(key).copied() {
-            if typedefs_insert_traced(&mut elab.typedefs, "rebind:import", name.clone(), w)
+        if let Some(w) = elab.typedefs.get(key).copied()
+            && typedefs_insert_traced(&mut elab.typedefs, "rebind:import", name.clone(), w)
                 != Some(w)
-            {
-                changed = true;
-            }
+        {
+            changed = true;
         }
         if let Some(t) = elab.typedef_types.get(key).cloned() {
             elab.typedef_types.insert(name.clone(), t);
@@ -50236,7 +50310,11 @@ fn wildcard_typedefs(pkg: &str, definitions: &HashMap<String, Definition>) -> Im
     walk(pkg, definitions, 0, &mut all);
     // The key names the pair: keep each one's last place.
     let mut seen = HashSet::default();
-    let keep: Vec<bool> = all.iter().rev().map(|(_, key)| seen.insert(key.as_str())).collect();
+    let keep: Vec<bool> = all
+        .iter()
+        .rev()
+        .map(|(_, key)| seen.insert(key.as_str()))
+        .collect();
     all.into_iter()
         .zip(keep.into_iter().rev())
         .filter_map(|(pair, keep)| keep.then_some(pair))

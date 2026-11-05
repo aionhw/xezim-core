@@ -267,7 +267,12 @@ impl ParamScope {
             }
         };
         match &words.spelled {
-            Some(own) => self.common_spelled.iter().chain(own).copied().for_each(&mut note),
+            Some(own) => self
+                .common_spelled
+                .iter()
+                .chain(own)
+                .copied()
+                .for_each(&mut note),
             None => (0..self.entries.len() as u32).for_each(&mut note),
         }
         while missing.last() == Some(&0) {
@@ -834,7 +839,7 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
             assert!(Rc::ptr_eq(&scope.common_words, &words.common));
             assert!(words.local.as_ref().unwrap().len() < 16);
             assert!(words.spells("pk::P_2047"));
-            let mut ids: Vec<u32> = scope.common_spelled.iter().copied().collect();
+            let mut ids: Vec<u32> = scope.common_spelled.to_vec();
             ids.extend(words.spelled.as_deref().unwrap());
             ids.sort_unstable();
             ids.dedup();
@@ -883,9 +888,15 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
         assert_ne!(absent, shadowed);
         assert_eq!(shadowed.changed.len(), 1);
         local.insert("UNREAD".into(), Value::from_u64(23, 32));
-        assert_eq!(shadowed, scope.prepared_key(def, &defs, &local, Vec::new()).0);
+        assert_eq!(
+            shadowed,
+            scope.prepared_key(def, &defs, &local, Vec::new()).0
+        );
         local.insert("P".into(), Value::from_u64(3, 32));
-        assert_eq!(visible, scope.prepared_key(def, &defs, &local, Vec::new()).0);
+        assert_eq!(
+            visible,
+            scope.prepared_key(def, &defs, &local, Vec::new()).0
+        );
     }
 
     /// §5.7, §6.20: cache equality must compare the whole value, including

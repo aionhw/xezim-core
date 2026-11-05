@@ -1,6 +1,24 @@
 use crate::ast::{Description, decl::ModuleItem};
 use crate::parse;
 
+/// A.8.2: a parenthesized primary can be a method-call root, with optional
+/// call parentheses. The runtime regression `parenthesized_member_select_is_rejected`
+/// checks A.8.3's field-select restriction after receiver type resolution.
+#[test]
+fn parenthesized_method_roots_keep_optional_call_parentheses() {
+    let good =
+        parse("module top; initial $display((obj).get(), (obj).get, (text).len()); endmodule");
+    assert!(good.errors.is_empty(), "{:?}", good.errors);
+}
+
+/// §3.12.1: a class static call keeps its explicit compilation-unit root.
+#[test]
+fn unit_qualified_class_call_retains_its_scope() {
+    let result = parse("module top; initial $display($unit::C::get()); endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(format!("{:?}", result.source).contains("$unit::C"));
+}
+
 /// §10.4.2 / §25.9: calls within an NBA target do not turn `<=` into a
 /// relational expression. A comparison inside an argument remains one.
 #[test]
@@ -347,7 +365,10 @@ fn bare_event_control_on_a_member() {
 fn module_class_var_keeps_virtual_interface_type_arg() {
     for (decl, arg) in [
         ("holder #(virtual bus_if) h;", "virtual bus_if"),
-        ("holder #(virtual interface bus_if) h;", "virtual interface bus_if"),
+        (
+            "holder #(virtual interface bus_if) h;",
+            "virtual interface bus_if",
+        ),
         ("holder #(virtual bus_if.mon) h;", "virtual bus_if . mon"),
         ("holder #(virtual bus_if #(4)) h;", "virtual bus_if#(4)"),
     ] {
