@@ -216,17 +216,40 @@ impl<'a> Lw<'a> {
     }
 
     /// The type of the storage at a static path from type `t`: record
-    /// fields as declared (see `field_storage`), elements by their subtype.
+    /// fields as declared (see `field_storage`), elements as `elem_storage`.
     pub(super) fn path_storage_type(&self, t: TypeId, path: &[Sel]) -> Option<TypeId> {
         let mut cur = t;
         for s in path {
             cur = match s {
                 Sel::Field(i) => *self.field_storage(cur).get(*i)?,
-                Sel::Elem(_) => self.d.element_subtype(cur)?,
+                Sel::Elem(_) => self.elem_storage(cur)?,
                 Sel::Slice(..) => cur,
             };
         }
         Some(cur)
+    }
+
+    /// Whether the elements of array `t` may be stored packed: `fat_repr`
+    /// stores them as the element type its type declares, so an element
+    /// constraint of the object (`arr(0 to 1)(3 downto 0)` of an array of
+    /// unconstrained vectors, §5.3.2.2) leaves them structs.
+    pub(super) fn elem_packs(&self, t: TypeId) -> bool {
+        match &self.d.types[self.base(t)].kind {
+            TypeKind::Array { elem, .. } => self.ndims(*elem) == 0 || self.pk_of(*elem).is_some(),
+            _ => true,
+        }
+    }
+
+    /// The type the elements of array `t` are stored as: the element type
+    /// its type declares when that is not packed (see `elem_packs`), else
+    /// the element subtype.
+    pub(super) fn elem_storage(&self, t: TypeId) -> Option<TypeId> {
+        if !self.elem_packs(t)
+            && let TypeKind::Array { elem, .. } = &self.d.types[self.base(t)].kind
+        {
+            return Some(*elem);
+        }
+        self.d.element_subtype(t)
     }
 
     /// Whether the first dimension of array subtype `t` is constrained
@@ -858,15 +881,19 @@ impl<'a> Lw<'a> {
     pub(super) fn path_sv(&mut self, t: TypeId, path: &[Sel], loc: &Loc) -> (String, Option<(i64, i64)>, TypeId) {
         let mut out = String::new();
         let mut cur = t;
+        // Whether `cur` is stored as its own representation (an element of
+        // an array of unconstrained arrays is a struct, see `elem_packs`).
+        let mut packs = true;
         for s in path {
             match s {
                 Sel::Field(i) => {
                     let _ = write!(out, ".f{}", i);
                     cur = self.field_storage(cur).get(*i).copied().unwrap_or(cur);
+                    packs = true;
                 }
                 Sel::Elem(k) => {
                     match self.repr(cur, loc) {
-                        Repr::Pk(w, n) => {
+                        Repr::Pk(w, n) if packs => {
                             let lo = w as i64 * (n - 1 - k);
                             let _ = write!(out, "[{}:{}]", lo + w as i64 - 1, lo);
                         }
@@ -874,6 +901,7 @@ impl<'a> Lw<'a> {
                             let _ = write!(out, ".d[{}]", k);
                         }
                     }
+                    packs = self.elem_packs(cur);
                     cur = self.d.element_subtype(cur).unwrap_or(cur);
                 }
                 Sel::Slice(k, n) => return (out, Some((*k, *n)), cur),

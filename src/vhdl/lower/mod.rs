@@ -152,6 +152,9 @@ struct Lw<'a> {
     /// Implicit signals, and their signals by attribute name and prefix.
     imps: Vec<elab::Imp>,
     imp_keys: HashMap<String, usize>,
+    /// Functions computing an expression the kernel evaluates outside any
+    /// statement (`elab::standalone`), by instance, location and use.
+    standalone_fns: HashMap<String, String>,
     /// Implicit signals read while lowering (dependencies of an implicit
     /// signal's own update).
     imp_refs: Vec<usize>,
@@ -315,6 +318,7 @@ impl<'a> Lw<'a> {
             cur_proc: None,
             imps: Vec::new(),
             imp_keys: HashMap::new(),
+            standalone_fns: HashMap::new(),
             imp_refs: Vec::new(),
             need_lact: BTreeSet::new(),
             drv_checks: Vec::new(),
@@ -1026,7 +1030,7 @@ impl<'a> Lw<'a> {
                 };
                 let (f, l, _) = self.file_line(&h.loc);
                 // A call result is evaluated once, through `_at`.
-                let call = !Self::selectable(&cur);
+                let mut call = !Self::selectable(&cur);
                 for (k, ix) in idx.iter().enumerate() {
                     let i = self.ex(ix);
                     match cr.clone() {
@@ -1050,6 +1054,14 @@ impl<'a> Lw<'a> {
                                     Some((sr.left.as_i64()?, sr.dir, sr.right.as_i64()?))
                                 })
                             };
+                            // Past the first dimension, bounds known only at
+                            // run time are read from the element reached so
+                            // far: inline, that prefix would be written out
+                            // for the element and for each bound, four times
+                            // per dimension. It is evaluated once instead.
+                            if k > 0 && sb.is_none() {
+                                call = true;
+                            }
                             cur = if call {
                                 format!("{}_at({}, {}, {}, {})", name, cur, i, sv_string(&f), l)
                             } else if let Some(sb) = sb {

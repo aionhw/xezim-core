@@ -873,7 +873,9 @@ impl<'a> Lw<'a> {
             let p = self.obj_name(*o);
             let cur = self.ex(x);
             let last = self.ex_last(x);
-            let r = self.repr(x.ty, &x.loc);
+            // Compared as stored (an element of an array of unconstrained
+            // arrays is a struct whatever its subtype).
+            let r = self.erepr(x);
             return Some(match name {
                 "event" => format!("({}_ev && !{})", p, self.eq_expr(&r, &cur, &last)),
                 "active" => format!("{}_act", p),
@@ -894,7 +896,7 @@ impl<'a> Lw<'a> {
         }
         let cur = self.ex(x);
         let last = self.ex_last(x);
-        let r = self.repr(x.ty, &x.loc);
+        let r = self.erepr(x);
         Some(match name {
             "event" => format!("(vh_s{}_ev && !{})", s, self.eq_expr(&r, &cur, &last)),
             "last_value" => last,
@@ -938,7 +940,14 @@ impl<'a> Lw<'a> {
             return None;
         }
         let mark = self.imp_refs.len();
-        let px = self.ex(x);
+        let r = self.repr(x.ty, loc);
+        let px = self
+            .standalone(
+                format!("{}|{:?}|{}|value", self.inst, loc, name),
+                &r.sv(),
+                |me| Some(me.ex(x)),
+            )
+            .unwrap_or_default();
         let delay = match param {
             Some(t) => self.ex(t),
             None => "64'sd0".into(),
@@ -948,13 +957,15 @@ impl<'a> Lw<'a> {
             self.imp_refs.truncate(mark);
             return Some(r);
         }
-        let trig = self.sig_attr(
-            x,
-            if matches!(name, "stable" | "delayed") {
-                "event"
-            } else {
-                "active"
-            },
+        let attr = if matches!(name, "stable" | "delayed") {
+            "event"
+        } else {
+            "active"
+        };
+        let trig = self.standalone(
+            format!("{}|{:?}|{}|{}", self.inst, loc, name, attr),
+            "bit",
+            |me| me.sig_attr(x, attr),
         );
         let Some(trig) = trig else {
             self.err(
@@ -1232,11 +1243,55 @@ impl<'a> Lw<'a> {
         out
     }
 
+    /// An expression of SV type `sv_ty` that the kernel evaluates outside
+    /// any statement: a sensitivity test, an implicit signal's trigger or
+    /// value. When lowering it needs temporaries (the element of a nested
+    /// array of records), they would be declared and computed before the
+    /// next statement lowered, wherever that is; the expression is then a
+    /// function computing them, emitted with the module's subprograms.
+    /// `key` names the use (instance, location): the discovery pass over
+    /// the processes lowers it too.
+    fn standalone(
+        &mut self,
+        key: String,
+        sv_ty: &str,
+        f: impl FnOnce(&mut Self) -> Option<String>,
+    ) -> Option<String> {
+        let saved = std::mem::take(&mut self.pre_stmts);
+        let v = f(self);
+        let pre = std::mem::replace(&mut self.pre_stmts, saved);
+        let v = v?;
+        if pre.is_empty() {
+            return Some(v);
+        }
+        if let Some(n) = self.standalone_fns.get(&key) {
+            return Some(format!("{}()", n));
+        }
+        self.tmp += 1;
+        let n = format!("vh_sa{}", self.tmp);
+        let mut decls = String::new();
+        let mut stmts = String::new();
+        for (tn, tt, st) in pre {
+            let _ = writeln!(decls, "    {} {};", tt, tn);
+            for line in st.lines() {
+                let _ = writeln!(stmts, "    {}", line);
+            }
+        }
+        let _ = write!(
+            self.lit_items,
+            "  function automatic {} {}();\n{}{}    return {};\n  endfunction\n",
+            sv_ty, n, decls, stmts, v
+        );
+        self.standalone_fns.insert(key, n.clone());
+        Some(format!("{}()", n))
+    }
+
     /// The event conditions of a sensitivity list.
     pub(super) fn sensitivity(&mut self, on: &[HExpr]) -> Vec<String> {
         let mut conds = Vec::new();
         for s in on {
-            match self.sig_attr(s, "event") {
+            let key = format!("{}|{:?}|event", self.inst, s.loc);
+            match self.standalone(key, "bit", |me| me.sig_attr(s, "event")) {
                 Some(c) => {
                     if !conds.contains(&c) {
                         conds.push(c);

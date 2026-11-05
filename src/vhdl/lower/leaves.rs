@@ -114,7 +114,8 @@ impl<'a> Lw<'a> {
                     }
                 }
                 let e = self.d.element_subtype(t)?;
-                self.collect_classes(e, steps, out, true)?;
+                let pk = self.elem_packs(t);
+                self.collect_classes(e, steps, out, pk)?;
                 steps.truncate(n0);
                 Some(())
             }
@@ -398,7 +399,9 @@ impl<'a> Lw<'a> {
             }
             TypeKind::Array { index, .. } => {
                 let ndim = index.len();
-                let Some(e) = self.d.element_subtype(t) else { return };
+                // The elements as stored (an element constraint of an array
+                // of unconstrained arrays leaves them structs).
+                let Some(e) = self.elem_storage(t) else { return };
                 let mut v = val.to_string();
                 let mut opened = 0;
                 // A packed value: `pk_n` elements (a slice target's value has
