@@ -100,6 +100,9 @@ struct Info {
     /// Type names (typedefs, nested classes) a class declares that are also
     /// declared in another class or any other scope (§8.3, §6.18).
     class_colliding: HashSet<String>,
+    /// §23.9: module-local classes whose names another lexical scope owns.
+    hiding: HashSet<String>,
+    repeated_module_classes: HashSet<String>,
     /// Every class by the name it carries after this pass: its own type
     /// names and the base class name as written.
     classes: HashMap<String, ClassInfo>,
@@ -604,24 +607,32 @@ fn bind_params(
 
 /// Every class declaration of the design with the package (if any) it is
 /// declared in.
-fn design_classes(descs: &[Description]) -> Vec<(Option<&str>, &ClassDeclaration)> {
+#[derive(Clone, Copy)]
+enum ClassScope<'a> {
+    Unit,
+    Package(&'a str),
+    Module(&'a str),
+}
+
+fn design_classes(descs: &[Description]) -> Vec<(ClassScope<'_>, &ClassDeclaration)> {
     fn module_classes<'a>(
         items: &'a [ModuleItem],
-        out: &mut Vec<(Option<&'a str>, &'a ClassDeclaration)>,
+        owner: &'a str,
+        out: &mut Vec<(ClassScope<'a>, &'a ClassDeclaration)>,
     ) {
         for it in items {
             match it {
-                ModuleItem::ClassDeclaration(c) => out.push((None, c)),
-                ModuleItem::GenerateRegion(g) => module_classes(&g.items, out),
+                ModuleItem::ClassDeclaration(c) => out.push((ClassScope::Module(owner), c)),
+                ModuleItem::GenerateRegion(g) => module_classes(&g.items, owner, out),
                 ModuleItem::GenerateIf(g) => {
                     for (_, b) in &g.branches {
-                        module_classes(b, out);
+                        module_classes(b, owner, out);
                     }
                 }
-                ModuleItem::GenerateFor(g) => module_classes(&g.items, out),
+                ModuleItem::GenerateFor(g) => module_classes(&g.items, owner, out),
                 ModuleItem::GenerateCase(g) => {
                     for a in &g.arms {
-                        module_classes(&a.items, out);
+                        module_classes(&a.items, owner, out);
                     }
                 }
                 _ => {}
@@ -634,16 +645,16 @@ fn design_classes(descs: &[Description]) -> Vec<(Option<&str>, &ClassDeclaration
             Description::Package(p) => {
                 for it in &p.items {
                     if let PackageItem::Class(c) = it {
-                        out.push((Some(p.name.name.as_str()), c));
+                        out.push((ClassScope::Package(p.name.name.as_str()), c));
                     }
                 }
             }
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
-                out.push((None, c))
+                out.push((ClassScope::Unit, c))
             }
-            Description::Module(m) => module_classes(&m.items, &mut out),
-            Description::Interface(m) => module_classes(&m.items, &mut out),
-            Description::Program(m) => module_classes(&m.items, &mut out),
+            Description::Module(m) => module_classes(&m.items, &m.name.name, &mut out),
+            Description::Interface(m) => module_classes(&m.items, &m.name.name, &mut out),
+            Description::Program(m) => module_classes(&m.items, &m.name.name, &mut out),
             _ => {}
         }
     }
@@ -651,6 +662,17 @@ fn design_classes(descs: &[Description]) -> Vec<(Option<&str>, &ClassDeclaration
 }
 
 impl Info {
+    fn module_class_name(&self, owner: &str, c: &ClassDeclaration) -> String {
+        let named = mangle(owner, &c.name.name);
+        if self.repeated_module_classes.contains(&named) {
+            mangle(
+                &format!("{owner}::__scope{}", c.name.span.start),
+                &c.name.name,
+            )
+        } else {
+            named
+        }
+    }
     /// The package whose declaration `Q::name` denotes: Q itself when it
     /// declares `name`, else the package it re-exports `name` from (§26.6).
     fn owner(&self, q: &str, name: &str, depth: u32) -> Option<String> {
@@ -719,6 +741,9 @@ fn mangle(pkg: &str, name: &str) -> String {
 struct Frame {
     /// Set on a package's own frame: its declarations resolve to `pkg::name`.
     pkg: Option<String>,
+    /// The enclosing module and the class bindings this lexical body owns.
+    module: Option<String>,
+    module_classes: HashMap<String, String>,
     /// Type names declared here (they shadow imports and outer scopes).
     types: HashSet<String>,
     /// Value names declared here — an identifier naming one of these is not
@@ -1002,6 +1027,36 @@ fn collect(descs: &[Description]) -> Option<Info> {
     // §8.3: a class is a scope of its own; a type name a class declares
     // collides when it is declared anywhere else as well.
     let all_classes = design_classes(descs);
+    let mut lexical_counts: HashMap<&str, usize> = HashMap::default();
+    for (scope, c) in &all_classes {
+        if !matches!(scope, ClassScope::Package(_)) {
+            *lexical_counts.entry(c.name.name.as_str()).or_default() += 1;
+        }
+    }
+    let hiding: HashSet<String> = all_classes
+        .iter()
+        .filter(|(s, c)| {
+            matches!(s, ClassScope::Module(_))
+                && lexical_counts
+                    .get(c.name.name.as_str())
+                    .is_some_and(|count| *count > 1)
+        })
+        .map(|(_, c)| c.name.name.clone())
+        .collect();
+    let mut module_counts: HashMap<String, usize> = HashMap::default();
+    for (scope, c) in &all_classes {
+        if let ClassScope::Module(owner) = scope
+            && hiding.contains(&c.name.name)
+        {
+            *module_counts
+                .entry(mangle(owner, &c.name.name))
+                .or_default() += 1;
+        }
+    }
+    let repeated_module_classes: HashSet<String> = module_counts
+        .into_iter()
+        .filter_map(|(n, count)| (count > 1).then_some(n))
+        .collect();
     let mut class_names: HashSet<String> = HashSet::default();
     for (_, c) in &all_classes {
         class_names_of(c, &mut class_names);
@@ -1019,9 +1074,17 @@ fn collect(descs: &[Description]) -> Option<Info> {
         .collect();
     let mut classes: HashMap<String, ClassInfo> = HashMap::default();
     let mut class_by_bare: HashMap<String, Vec<String>> = HashMap::default();
-    for (pkg, c) in &all_classes {
-        let named = match pkg {
-            Some(p) if colliding.contains(&c.name.name) => mangle(p, &c.name.name),
+    for (scope, c) in &all_classes {
+        let named = match scope {
+            ClassScope::Package(p) if colliding.contains(&c.name.name) => mangle(p, &c.name.name),
+            ClassScope::Module(m) if hiding.contains(&c.name.name) => {
+                let owner = if repeated_module_classes.contains(&mangle(m, &c.name.name)) {
+                    format!("{m}::__scope{}", c.name.span.start)
+                } else {
+                    m.to_string()
+                };
+                mangle(&owner, &c.name.name)
+            }
             _ => c.name.name.clone(),
         };
         record_class(
@@ -1037,6 +1100,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
         && colliding_members.is_empty()
         && colliding_values.is_empty()
         && class_colliding.is_empty()
+        && hiding.is_empty()
         && classes.values().all(|ci| ci.inline.is_empty())
     {
         return None;
@@ -1048,6 +1112,8 @@ fn collect(descs: &[Description]) -> Option<Info> {
         colliding_values,
         mangled_vars,
         class_colliding,
+        hiding,
+        repeated_module_classes,
         classes,
         class_by_bare,
     })
@@ -1271,10 +1337,13 @@ impl Rw<'_> {
     fn resolve(&self, n: &str) -> Res {
         let pkg_col = self.info.colliding.contains(n);
         let cls_col = self.info.class_colliding.contains(n);
-        if !pkg_col && !cls_col {
+        if !pkg_col && !cls_col && !self.info.hiding.contains(n) {
             return Res::Keep;
         }
         for f in self.frames.iter().rev() {
+            if let Some(named) = f.module_classes.get(n) {
+                return Res::To(named.clone());
+            }
             // §8.3/§8.13: a class's own type names, then its base classes'.
             if let Some(c) = &f.cls {
                 for k in std::iter::once(c).chain(f.bases.iter()) {
@@ -1924,6 +1993,15 @@ impl Rw<'_> {
                 self.expr(expr);
             }
             ExprKind::Ident(h) => {
+                if h.root.is_none() && h.path.len() > 1 {
+                    let n = &h.path[0].name.name;
+                    if self.info.hiding.contains(n)
+                        && !self.value_shadowed(n)
+                        && let Res::To(named) = self.resolve(n)
+                    {
+                        h.path[0].name.name = named;
+                    }
+                }
                 // A renamed package variable (see `mangled_vars`), as
                 // `Q::v...` or bare: spell it by its storage name and keep the
                 // selects and member path.
@@ -1973,7 +2051,9 @@ impl Rw<'_> {
                             return;
                         }
                     }
-                    if (self.info.colliding.contains(n) || self.info.class_colliding.contains(n))
+                    if (self.info.colliding.contains(n)
+                        || self.info.class_colliding.contains(n)
+                        || self.info.hiding.contains(n))
                         && !self.value_shadowed(n)
                     {
                         // Expression positions only rename; an ambiguous
@@ -2086,7 +2166,35 @@ impl Rw<'_> {
                 self.expr(expr);
                 self.pattern(pattern);
             }
-            ExprKind::Specialization { base, .. } => self.expr(base),
+            ExprKind::Specialization {
+                base,
+                type_args_text: args_text,
+            } => {
+                self.expr(base);
+                // §8.25: the parser retains specialization operands as
+                // tokens. Qualify lexical class references there as well,
+                // preserving strings, named formals and explicit scopes.
+                if !self.info.hiding.is_empty() {
+                    use crate::lexer::{Lexer, TokenKind};
+                    let tokens = Lexer::new(args_text).tokenize();
+                    let mut edits = Vec::new();
+                    for (i, token) in tokens.iter().enumerate() {
+                        if token.kind == TokenKind::Identifier
+                            && self.info.hiding.contains(&token.text)
+                            && !self.value_shadowed(&token.text)
+                            && !i.checked_sub(1).is_some_and(|p| {
+                                matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
+                            })
+                            && let Res::To(named) = self.resolve(&token.text)
+                        {
+                            edits.push((token.span, named));
+                        }
+                    }
+                    for (span, named) in edits.into_iter().rev() {
+                        args_text.replace_range(span.start..span.end, &named);
+                    }
+                }
+            }
             ExprKind::Index { expr, index } => {
                 self.expr(expr);
                 self.expr(index);
@@ -2812,11 +2920,19 @@ impl Rw<'_> {
 
     fn module_body(
         &mut self,
+        name: &str,
         params: &mut [ParameterDeclaration],
         ports: &mut PortList,
         items: &mut [ModuleItem],
     ) {
-        let f = Self::module_frame(params, ports, items);
+        // §23.2/§6.5: body classes are not visible in header defaults.
+        let mut f = Self::module_frame(params, ports, &[]);
+        f.module = Some(name.to_string());
+        for it in items.iter() {
+            if let ModuleItem::ImportDeclaration(imp) = it {
+                f.add_imports(imp);
+            }
+        }
         self.frames.push(f);
         params.iter_mut().for_each(|p| self.param_decl(p));
         if let PortList::Ansi(v) = ports {
@@ -2828,7 +2944,12 @@ impl Rw<'_> {
                 self.opt(&mut p.default);
             }
         }
+        let mut body = Frame::default();
+        self.module_class_bindings(items, &mut body);
+        module_item_names(items, &mut body);
+        self.frames.push(body);
         items.iter_mut().for_each(|i| self.module_item(i));
+        self.frames.pop();
         self.frames.pop();
     }
 
@@ -2856,6 +2977,12 @@ impl Rw<'_> {
                 self.param_decl(p)
             }
             ModuleItem::TypedefDeclaration(td) => {
+                if (td.forward || matches!(td.data_type, DataType::Void(_)))
+                    && self.info.hiding.contains(&td.name.name)
+                    && let Res::To(named) = self.resolve(&td.name.name)
+                {
+                    td.name.name = named;
+                }
                 self.dtype(&mut td.data_type);
                 self.unpacked(&mut td.dimensions);
             }
@@ -2914,7 +3041,17 @@ impl Rw<'_> {
             ModuleItem::FunctionDeclaration(f) => self.function(f),
             ModuleItem::TaskDeclaration(t) => self.task(t),
             ModuleItem::ImportDeclaration(imp) => self.import_decl(imp),
-            ModuleItem::ClassDeclaration(c) => self.class(c),
+            ModuleItem::ClassDeclaration(c) => {
+                if self.info.hiding.contains(&c.name.name)
+                    && let Res::To(named) = self.resolve(&c.name.name)
+                {
+                    c.name.name = named.clone();
+                    if let Some(end) = &mut c.endlabel {
+                        end.name = named;
+                    }
+                }
+                self.class(c)
+            }
             ModuleItem::AssertionItem(a) => self.assertion(a),
             ModuleItem::PropertyDeclaration(p) => {
                 p.items.iter_mut().for_each(|s| self.stmt(s));
@@ -2960,7 +3097,7 @@ impl Rw<'_> {
             }
             ModuleItem::NestedModule(m) => {
                 let m = &mut **m;
-                self.module_body(&mut m.params, &mut m.ports, &mut m.items);
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items);
             }
             ModuleItem::AliasDecl(v) => v.iter_mut().for_each(|x| self.expr(x)),
             ModuleItem::GenvarDeclaration(_)
@@ -2974,10 +3111,26 @@ impl Rw<'_> {
     /// §27: each generate block owns its declarations, not its parent.
     fn generate_body(&mut self, items: &mut [ModuleItem]) {
         let mut frame = Frame::default();
+        self.module_class_bindings(items, &mut frame);
         module_item_names(items, &mut frame);
         self.frames.push(frame);
         items.iter_mut().for_each(|item| self.module_item(item));
         self.frames.pop();
+    }
+
+    fn module_class_bindings(&self, items: &[ModuleItem], frame: &mut Frame) {
+        let Some(owner) = self.frames.iter().rev().find_map(|f| f.module.as_deref()) else {
+            return;
+        };
+        for item in items {
+            if let ModuleItem::ClassDeclaration(c) = item
+                && self.info.hiding.contains(&c.name.name)
+            {
+                frame
+                    .module_classes
+                    .insert(c.name.name.clone(), self.info.module_class_name(owner, c));
+            }
+        }
     }
 
     fn class_name_string(&mut self, s: &mut String) {
@@ -3078,11 +3231,15 @@ impl Rw<'_> {
 
     fn description(&mut self, d: &mut Description) {
         match d {
-            Description::Module(m) => self.module_body(&mut m.params, &mut m.ports, &mut m.items),
-            Description::Interface(m) => {
-                self.module_body(&mut m.params, &mut m.ports, &mut m.items)
+            Description::Module(m) => {
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items)
             }
-            Description::Program(m) => self.module_body(&mut m.params, &mut m.ports, &mut m.items),
+            Description::Interface(m) => {
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items)
+            }
+            Description::Program(m) => {
+                self.module_body(&m.name.name, &mut m.params, &mut m.ports, &mut m.items)
+            }
             Description::Package(p) => {
                 // A package sees its own declarations and imports, not the
                 // compilation unit's imports.

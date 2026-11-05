@@ -14,16 +14,17 @@ use crate::shared_names::{SharedName, SharedNameMap};
 use std::rc::Rc;
 
 pub(crate) mod array_params;
+mod canonical;
 mod const_function_scope;
 #[cfg(test)]
 mod callable_sharing_tests;
+pub(crate) mod constructor_forwarding;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
-pub(crate) mod constructor_forwarding;
-pub(crate) mod relaxed_static;
 mod param_prefix_index;
 mod param_scope;
+pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);
 impl<F: FnMut()> Drop for ScopeGuardLite<F> {
@@ -6527,6 +6528,7 @@ fn validate_constraint_item_names(
 fn collect_class_member_names(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
+    body_classes: &[&ClassDeclaration],
     allowed: &mut HashSet<String>,
     seen: &mut HashSet<String>,
 ) {
@@ -6586,26 +6588,30 @@ fn collect_class_member_names(
             }
         }
     }
-    if let Some(ext) = &c.extends {
-        if let Some(defs) = all_defs {
-            // §8.16/§26.3: the base of a class declared in a MODULE body (or
-            // another package) may live INSIDE an imported package
-            // (`mypacket extends packet` where `packet` is `packet_pkg`'s
-            // class) rather than as a top-level Class definition. Packages
-            // are kept whole in `all_defs` (Definition::Package), so a bare
-            // `defs.get(base)` lookup misses package members and an inherited
-            // property reference in a derived constraint is wrongly rejected
-            // as undeclared. Fall back to searching every package's classes.
-            let parent: Option<&ClassDeclaration> = match defs.get(&ext.name.name) {
+    if let Some(ext) = &c.extends
+        && let Some(defs) = all_defs
+    {
+        // §8.16/§26.3: the base of a class declared in a MODULE body (or
+        // another package) may live INSIDE an imported package
+        // (`mypacket extends packet` where `packet` is `packet_pkg`'s
+        // class) rather than as a top-level Class definition. Packages
+        // are kept whole in `all_defs` (Definition::Package), so a bare
+        // `defs.get(base)` lookup misses package members and an inherited
+        // property reference in a derived constraint is wrongly rejected
+        // as undeclared. Fall back to searching every package's classes.
+        let parent = body_classes
+            .iter()
+            .copied()
+            .find(|p| p.name.name == ext.name.name)
+            .or_else(|| match defs.get(&ext.name.name) {
                 Some(Definition::Class(p)) => Some(p),
                 Some(Definition::Package(_)) | None => {
                     find_base_class_in_packages(defs, &ext.name.name)
                 }
                 _ => None,
-            };
-            if let Some(parent) = parent {
-                collect_class_member_names(parent, all_defs, allowed, seen);
-            }
+            });
+        if let Some(parent) = parent {
+            collect_class_member_names(parent, all_defs, body_classes, allowed, seen);
         }
     }
 }
@@ -6712,7 +6718,8 @@ fn defs_with_local_classes<'a>(
     }
     let mut merged: HashMap<String, Definition<'a>> = all_defs.cloned().unwrap_or_default();
     for (n, cd) in local {
-        merged.entry(n.to_string()).or_insert(Definition::Class(cd));
+        // §23.9: the nearest lexical class hides an enclosing declaration.
+        merged.insert(n.to_string(), Definition::Class(cd));
     }
     Some(merged)
 }
@@ -6720,6 +6727,20 @@ fn defs_with_local_classes<'a>(
 fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
+    module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
+    scope: Option<&ElaboratedModule>,
+    inst_prefix: Option<&str>,
+) -> Result<(), String> {
+    validate_class_constraints_in_body(c, all_defs, &[], module_enums, scope, inst_prefix)
+}
+
+/// §8.3/§18.5: an instantiated module's own classes participate in base
+/// lookup and scoped constraint names. Borrow its prepared body rather than
+/// copying the design-wide definition table for each instance.
+fn validate_class_constraints_in_body(
+    c: &ClassDeclaration,
+    all_defs: Option<&HashMap<String, Definition>>,
+    body_classes: &[&ClassDeclaration],
     module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
     scope: Option<&ElaboratedModule>,
     inst_prefix: Option<&str>,
@@ -6734,7 +6755,8 @@ fn validate_class_constraints(
     }
     let mut allowed = HashSet::default();
     let mut seen = HashSet::default();
-    collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
+    collect_class_member_names(c, all_defs, body_classes, &mut allowed, &mut seen);
+    allowed.extend(body_classes.iter().map(|c| c.name.name.clone()));
     if let Some(defs) = all_defs {
         collect_global_constraint_names(defs, &mut allowed);
     }
@@ -13045,39 +13067,7 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
-                        // Same element-width/full-dims registration the
-                        // variable path does: `PARAM[i]` on a multi-dim packed
-                        // parameter must element-select, not bit-select.
-                        if let Some(elem_w) =
-                            packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs)
-                        {
-                            // The CONST-eval index arm reads its own TLS table
-                            // (only `register_packed_array_elem_w` fed it, which
-                            // handles a typedef'd element type). Without this a
-                            // `localparam logic [1:0][7:0] MP` element select
-                            // `MP[0]` in another localparam bit-selected instead.
-                            // The runtime map is `register_packed_param_index`.
-                            tls_register_elem_w(&assign.name.name, elem_w);
-                        }
-                        if let Some((ew, msb0)) =
-                            packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types)
-                        {
-                            tls_register_elem_w(&assign.name.name, ew);
-                            if msb0 {
-                                tls_register_elem_msb0(&assign.name.name);
-                            }
-                        }
-                        // A typedef'd array (`exp_arr_t EXPS`, `enc_t [0:4] LOCAL`)
-                        // has its dims on the typedef or as a single ascending
-                        // range. `packed_inner_elem_width` / `packed_full_dims_of`
-                        // miss those, so a variable index bit-selects or reads
-                        // the last element.
-                        register_packed_param_index(
-                            &mut elab,
-                            &assign.name.name,
-                            data_type,
-                            None,
-                        );
+                        register_packed_param_shape(&mut elab, &assign.name.name, data_type);
                         let mut current_width = width;
                         let mut current_is_real = is_real;
                         let mut current_signed = signed;
@@ -13796,19 +13786,19 @@ pub fn elaborate_module_with_defs(
                 // Recursively process generate region items. A region is not
                 // a scope (§27.3): its constructs share this scope's genblk
                 // numbering.
-                elaborate_items_numbered(&gr.items, &mut elab, all_defs, &mut gen_ordinal)?;
+                elaborate_items_numbered(&gr.items, &mut elab, cls_defs, &mut gen_ordinal)?;
             }
             ModuleItem::GenerateIf(gi) => {
                 gen_ordinal += 1;
-                elaborate_generate_if(gi, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_if(gi, &mut elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateCase(gc) => {
                 gen_ordinal += 1;
-                elaborate_generate_case(gc, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_case(gc, &mut elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateFor(gf) => {
                 gen_ordinal += 1;
-                elaborate_generate_for(gf, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_for(gf, &mut elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::CovergroupDeclaration(cg) => {
                 elab.covergroups.insert(cg.name.name.clone(), cg.clone());
@@ -19077,7 +19067,13 @@ fn elaborate_items_numbered(
                             }
                         }
                     } else {
-                        let init_val = if let Some(init_expr) = &decl.init {
+                        let procedural_init = decl
+                            .init
+                            .as_ref()
+                            .filter(|init| !is_const_expr(init, &elab.parameters));
+                        let init_val = if let Some(init_expr) =
+                            decl.init.as_ref().filter(|_| procedural_init.is_none())
+                        {
                             let mut rv = eval_init_for_width(init_expr, &elab.parameters, width);
                             if !is_real {
                                 rv.is_signed = is_signed;
@@ -19112,6 +19108,24 @@ fn elaborate_items_numbered(
                         if let Some(view) = &data_modport_view {
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());
+                        }
+                        // §6.8/§27: a generate-body initializer also executes
+                        // before initial processes. Constant folding cannot
+                        // construct an object or call a runtime function.
+                        if let Some(init) = procedural_init {
+                            if dd.const_kw {
+                                elab.const_decl_inits.insert(decl.name.name.clone());
+                            }
+                            elab.static_init_blocks.push(InitialBlock {
+                                stmt: Statement::new(
+                                    StatementKind::BlockingAssign {
+                                        lvalue: make_ident_expr(&decl.name.name),
+                                        rvalue: init.clone(),
+                                    },
+                                    decl.name.span,
+                                ),
+                                scope: String::new(),
+                            });
                         }
                         // Packed-struct metadata for a GENERATE-scope (or other
                         // elaborate_items-routed) declaration, mirroring the
@@ -19245,6 +19259,26 @@ fn elaborate_items_numbered(
                             "parameter/localparam",
                             true,
                         );
+                        // §27, §6.20.2: a generate scope holds the same shapes
+                        // as a module body. Without this an unpacked array got
+                        // no elements, so every `A[i]` read 0, and an index of
+                        // a packed array bit-selected.
+                        if !assign.dimensions.is_empty() {
+                            let params_snapshot = elab.parameters.clone();
+                            if register_array_param(
+                                elab,
+                                "",
+                                &assign.name.name,
+                                &assign.dimensions,
+                                assign.init.as_ref(),
+                                None,
+                                data_type,
+                                &params_snapshot,
+                            ) {
+                                continue;
+                            }
+                        }
+                        register_packed_param_shape(elab, &assign.name.name, data_type);
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
                                 // §6.20.2 + §5.7.1: an implicit-type parameter
@@ -19479,19 +19513,19 @@ fn elaborate_items_numbered(
                 process_typedef(td, elab);
             }
             ModuleItem::GenerateRegion(gr) => {
-                elaborate_items_numbered(&gr.items, elab, all_defs, gen_ordinal)?;
+                elaborate_items_numbered(&gr.items, elab, cls_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateIf(gi) => {
                 *gen_ordinal += 1;
-                elaborate_generate_if(gi, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_if(gi, elab, cls_defs, *gen_ordinal)?;
             }
             ModuleItem::GenerateCase(gc) => {
                 *gen_ordinal += 1;
-                elaborate_generate_case(gc, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_case(gc, elab, cls_defs, *gen_ordinal)?;
             }
             ModuleItem::GenerateFor(gf) => {
                 *gen_ordinal += 1;
-                elaborate_generate_for(gf, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_for(gf, elab, cls_defs, *gen_ordinal)?;
             }
 
             ModuleItem::ClassDeclaration(cd) => {
@@ -27196,6 +27230,30 @@ fn register_array_param(
     )
 }
 
+/// An index of a multi-dimensional packed parameter is an element select, not
+/// a bit select, the same registration the variable path does.
+fn register_packed_param_shape(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
+    if let Some(elem_w) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
+        // The CONST-eval index arm reads its own TLS table (only
+        // `register_packed_array_elem_w` fed it, which handles a typedef'd
+        // element type). Without this a `localparam logic [1:0][7:0] MP`
+        // element select `MP[0]` in another localparam bit-selected instead.
+        // The runtime map is `register_packed_param_index`.
+        tls_register_elem_w(name, elem_w);
+    }
+    if let Some((ew, msb0)) = packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types) {
+        tls_register_elem_w(name, ew);
+        if msb0 {
+            tls_register_elem_msb0(name);
+        }
+    }
+    // A typedef'd array (`exp_arr_t EXPS`, `enc_t [0:4] LOCAL`) has its dims on
+    // the typedef or as a single ascending range. `packed_inner_elem_width` /
+    // `packed_full_dims_of` miss those, so a variable index bit-selects or
+    // reads the last element.
+    register_packed_param_index(elab, name, data_type, None);
+}
+
 /// `base.member` as a hierarchical IDENTIFIER when `base` is a whole-net
 /// identifier, falling back to a `MemberAccess` node otherwise.
 ///
@@ -32522,7 +32580,7 @@ fn inline_instantiations_inner(
     set_param_fallback(&top_params);
     set_typedef_types_tls(&elab.typedef_types);
     set_typedef_widths_tls(elab.typedefs.as_map());
-    let mut cache = InlinePrepCache::default();
+    let mut cache = InlineCache::default();
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
     // §23.10/§26.3: the snapshot is held once; each scope takes from it only
@@ -33017,11 +33075,25 @@ fn rename_item_decls(
         }
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
             let mut new_pd = pd.clone();
-            if let ParameterKind::Data { assignments, .. } = &mut new_pd.kind {
+            if let ParameterKind::Data {
+                data_type,
+                assignments,
+            } = &mut new_pd.kind
+            {
+                // The type and dimensions may name a renamed sibling
+                // localparam, as a data declaration's may.
+                *data_type =
+                    rewrite_data_type_genvar(data_type, port_map, local_names, interface_map);
                 for a in assignments {
                     if rename_set.contains(&a.name.name) {
                         a.name.name = rename.apply(&a.name.name);
                     }
+                    a.dimensions = rewrite_unpacked_dims_genvar(
+                        &a.dimensions,
+                        port_map,
+                        local_names,
+                        interface_map,
+                    );
                     if let Some(init) = &a.init {
                         a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
                     }
@@ -33329,6 +33401,33 @@ fn rewrite_unpacked_dims_scoped(
                     ))
                 }),
                 span: *span,
+            },
+            // `[N]` parses as an associative index until `N` is known not to be
+            // a type (`normalize_unpacked_dims`). A generate rename maps a
+            // sibling localparam or genvar, which cannot be a type, so bind the
+            // name now: later the bare `N` resolves to nothing.
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                span,
+            } if prefix.is_empty() => match dt.as_ref() {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty()
+                    && name.scopes.is_empty()
+                    && port_map.contains_key(&name.name.name) =>
+                {
+                    UnpackedDimension::Expression {
+                        expr: Box::new(rewrite_expr(
+                            &make_ident_expr(&name.name.name),
+                            prefix,
+                            port_map,
+                            local_names,
+                            interface_map,
+                        )),
+                        span: *span,
+                    }
+                }
+                _ => d.clone(),
             },
             other => other.clone(),
         })
@@ -35190,22 +35289,65 @@ fn collect_body_driven_names(
     }
 }
 
+/// What the inlining of one design computes once and reuses for each
+/// instance.
 #[derive(Default)]
-struct InlinePrepCache {
+struct InlineCache {
+    /// Prepared bodies (`prepare_module_items`).
     prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
+    /// Per definition, the typedefs its imports bind, one list per import.
+    imports: HashMap<(String, usize), Rc<[ImportedTypedefs]>>,
+    /// Per package, the typedefs `import P::*` binds.
+    wildcards: HashMap<String, ImportedTypedefs>,
 }
 
-impl InlinePrepCache {
-    fn get(&self, key: &param_scope::PreparedKey) -> Option<&Rc<PreparedModuleItems>> {
-        self.prepared.get(key)
-    }
-    fn insert(&mut self, key: param_scope::PreparedKey, items: Rc<PreparedModuleItems>) {
-        self.prepared.insert(key, items);
-    }
+/// The typedefs an import binds, as (bare name, qualified key) in binding
+/// order.
+type ImportedTypedefs = Rc<[(String, String)]>;
+
+impl InlineCache {
     #[cfg(test)]
     fn len(&self) -> usize { self.prepared.len() }
+
+    /// §26.3: the typedefs the imports of `def` bind, in binding order.
+    fn imported_typedefs(
+        &mut self,
+        def: Definition,
+        definitions: &HashMap<String, Definition>,
+    ) -> Rc<[ImportedTypedefs]> {
+        let key = param_scope::def_key(&def);
+        if let Some(lists) = self.imports.get(&key) {
+            return Rc::clone(lists);
+        }
+        let mut lists = Vec::new();
+        for item in def.items() {
+            let ModuleItem::ImportDeclaration(imp) = item else {
+                continue;
+            };
+            for ii in &imp.items {
+                let pkg = &ii.package.name;
+                if !matches!(definitions.get(pkg), Some(Definition::Package(_))) {
+                    continue;
+                }
+                lists.push(match &ii.item {
+                    Some(sym) => Rc::from([(sym.name.clone(), format!("{pkg}::{}", sym.name))]),
+                    None => match self.wildcards.get(pkg) {
+                        Some(list) => Rc::clone(list),
+                        None => {
+                            let list = wildcard_typedefs(pkg, definitions);
+                            self.wildcards.insert(pkg.clone(), Rc::clone(&list));
+                            list
+                        }
+                    },
+                });
+            }
+        }
+        let lists: Rc<[ImportedTypedefs]> = lists.into();
+        self.imports.insert(key, Rc::clone(&lists));
+        lists
+    }
 }
 
 /// `XEZIM_COMPILE_PHASES`: how the prepared-body cache is doing, printed as
@@ -35240,20 +35382,46 @@ fn note_prep_lookup(hit: bool, key_len: usize) {
     });
 }
 
+/// The definition's type parameters as bound, for its prepared-body key;
+/// `None` when one has no recorded shape to tell its bindings apart.
+fn type_bindings(
+    def: Definition,
+    typedef_widths: &HashMap<String, u32>,
+) -> Option<Vec<param_scope::TypeBinding>> {
+    def.params_and_body_types()
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Type { assignments } => assignments.as_slice(),
+            _ => &[],
+        })
+        .map(|a| {
+            let name = &a.name.name;
+            let shape = TYPEDEF_SHAPES_TLS.with(|c| {
+                let c = c.borrow();
+                match (c.0.get(name), c.1.get(name)) {
+                    (None, None) => None,
+                    shape => canonical::span_free(&shape),
+                }
+            })?;
+            Some((name.clone(), typedef_widths.get(name).copied(), shape))
+        })
+        .collect()
+}
+
 fn prepare_module_items(
     source_def: Definition,
     definitions: &HashMap<String, Definition>,
     local_params: &HashMap<String, Value>,
     typedef_widths: &HashMap<String, u32>,
-    cache: &mut InlinePrepCache,
+    cache: &mut InlineCache,
     param_scope: &param_scope::ParamScope,
 ) -> Rc<PreparedModuleItems> {
-    let (cache_key, key_bytes) = param_scope.prepared_key(source_def, definitions, local_params);
-    if let Some(prepared) = cache.get(&cache_key) {
+    let cache_key = type_bindings(source_def, typedef_widths)
+        .map(|types| param_scope.prepared_key(source_def, definitions, local_params, types));
+    if let Some(prepared) = cache_key.as_ref().and_then(|(k, _)| cache.prepared.get(k)) {
         note_prep_lookup(true, 0);
         return Rc::clone(prepared);
     }
-    note_prep_lookup(false, key_bytes);
+    note_prep_lookup(false, cache_key.as_ref().map_or(0, |(_, bytes)| *bytes));
 
     let mut local_typedefs = std::collections::HashSet::default();
     for item in source_def.items() {
@@ -35627,7 +35795,9 @@ fn prepare_module_items(
         local_names: std::rc::Rc::new(local_names),
         body_driven_ports,
     });
-    cache.insert(cache_key, Rc::clone(&prepared));
+    if let Some((key, _)) = cache_key {
+        cache.prepared.insert(key, Rc::clone(&prepared));
+    }
     prepared
 }
 
@@ -36507,6 +36677,7 @@ fn register_modport_expressions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -36514,7 +36685,7 @@ fn inline_module_items(
     definitions: &HashMap<String, Definition>,
     interface_map: &mut HashMap<String, String>,
     local_params: &HashMap<String, Value>,
-    cache: &mut InlinePrepCache,
+    cache: &mut InlineCache,
     // §23.3.3: THIS instance's formal->actual substitution. The module's own
     // statements are rewritten through it (via `RewriteCtx`), so a nested
     // instantiation's connection ACTUALS must be too: without it
@@ -36537,7 +36708,7 @@ fn inline_module_items(
     // (`elaborate_module_with_defs`); the inlined-instance path never processed
     // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
     // took whichever package last hoisted that bare name.
-    rebind_imported_typedefs(elab, source_def.items(), definitions);
+    rebind_imported_typedefs(elab, &cache.imported_typedefs(source_def, definitions));
     INLINE_CHAIN_TLS.with(|c| {
         c.borrow_mut()
             .push((prefix.to_string(), source_def.name().to_string()))
@@ -36837,7 +37008,7 @@ fn inline_module_items(
                 // parent's walk, so rebinding at the recursive call would be too
                 // late — an unqualified `T [1:0] s;` in a module that imports
                 // `P::*` took whichever package last hoisted that bare name.
-                rebind_imported_typedefs(elab, sub_mod.items(), definitions);
+                rebind_imported_typedefs(elab, &cache.imported_typedefs(sub_mod, definitions));
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -37083,47 +37254,63 @@ fn inline_module_items(
                             }
                         }
                         if has_wildcard {
-                            if let PortList::Ansi(ports) = sub_mod.ports() {
-                                for port in ports {
-                                    let name = &port.name.name;
-                                    if explicit.contains(name)
-                                        || port_map.contains_key(name)
-                                        || sub_interface_map.contains_key(name)
-                                    {
-                                        continue;
-                                    }
-                                    // §23.3.2: the implicitly-connected actual is the
-                                    // same-named net IN THE PARENT SCOPE — which may
-                                    // itself be a PORT of the enclosing instance. Resolve
-                                    // it through that instance's formal->actual map, as an
-                                    // EXPLICIT connection already is. Binding straight to
-                                    // `prefix + name` ties the connection to the formal's
-                                    // own signal, so a driver reaching it from inside (a
-                                    // bound interface output driving an input port) never
-                                    // propagated to the real parent net and every reader
-                                    // of it read z. `rewrite_expr`'s fallback IS
-                                    // `prefix + name`, so the unmapped case is unchanged.
-                                    let parent_name = cat2(&prefix, &name);
-                                    let actual = rewrite_expr(
-                                        &make_ident_expr(name),
-                                        prefix,
-                                        parent_port_map,
-                                        parent_local_names,
-                                        interface_map,
+                            // §23.3.2.4 `.*` fills every port the connection list
+                            // does not name, ANSI or non-ANSI. A non-ANSI header
+                            // is only a name list (`module m(clk, rst); input clk;`);
+                            // the type lives in a later port declaration, so those
+                            // ports are connected as nets. Leaving the arm ANSI-only
+                            // dropped clk/rst/wr_en on `sfifo_fill`-style instances
+                            // and the unconnected inputs read Z.
+                            let wildcard_ports: Vec<(String, bool)> = match sub_mod.ports() {
+                                PortList::Ansi(ports) => ports
+                                    .iter()
+                                    .map(|port| {
+                                        let is_if_port = port
+                                            .data_type
+                                            .as_ref()
+                                            .map(|dt| is_interface_type(dt, definitions))
+                                            .unwrap_or(false);
+                                        (port.name.name.clone(), is_if_port)
+                                    })
+                                    .collect(),
+                                PortList::NonAnsi(names) => {
+                                    names.iter().map(|n| (n.name.clone(), false)).collect()
+                                }
+                                PortList::Empty => Vec::new(),
+                            };
+                            for (name, is_if_port) in wildcard_ports {
+                                if explicit.contains(&name)
+                                    || port_map.contains_key(&name)
+                                    || sub_interface_map.contains_key(&name)
+                                {
+                                    continue;
+                                }
+                                // §23.3.2: the implicitly-connected actual is the
+                                // same-named net IN THE PARENT SCOPE — which may
+                                // itself be a PORT of the enclosing instance. Resolve
+                                // it through that instance's formal->actual map, as an
+                                // EXPLICIT connection already is. Binding straight to
+                                // `prefix + name` ties the connection to the formal's
+                                // own signal, so a driver reaching it from inside (a
+                                // bound interface output driving an input port) never
+                                // propagated to the real parent net and every reader
+                                // of it read z. `rewrite_expr`'s fallback IS
+                                // `prefix + name`, so the unmapped case is unchanged.
+                                let parent_name = cat2(prefix, &name);
+                                let actual = rewrite_expr(
+                                    &make_ident_expr(&name),
+                                    prefix,
+                                    parent_port_map,
+                                    parent_local_names,
+                                    interface_map,
+                                );
+                                if is_if_port {
+                                    sub_interface_map.insert(
+                                        name,
+                                        whole_net_ident_name(&actual).unwrap_or(parent_name),
                                     );
-                                    let is_if_port = port
-                                        .data_type
-                                        .as_ref()
-                                        .map(|dt| is_interface_type(dt, definitions))
-                                        .unwrap_or(false);
-                                    if is_if_port {
-                                        sub_interface_map.insert(
-                                            name.clone(),
-                                            whole_net_ident_name(&actual).unwrap_or(parent_name),
-                                        );
-                                    } else {
-                                        port_map.insert(name.clone(), actual);
-                                    }
+                                } else {
+                                    port_map.insert(name, actual);
                                 }
                             }
                         }
@@ -39060,7 +39247,7 @@ fn inline_module_items(
                 // parent clone when local_params is empty (top-level case).
                 // §6.18/§23.10: this sub-module's own typedef names — used to
                 // rename type references to their instance-scoped keys.
-                let sub_typedef_names_all: std::collections::HashSet<String> = prepared_sub
+                let mut sub_typedef_names_all: std::collections::HashSet<String> = prepared_sub
                     .effective_items
                     .iter()
                     .filter_map(|it| match it {
@@ -39069,6 +39256,12 @@ fn inline_module_items(
                         _ => None,
                     })
                     .collect();
+                for parameter in sub_mod.params_and_body_types() {
+                    if let ParameterKind::Type { assignments } = &parameter.kind {
+                        sub_typedef_names_all
+                            .extend(assignments.iter().map(|a| a.name.name.clone()));
+                    }
+                }
                 record_param_decl_types(
                     elab,
                     sub_mod
@@ -41704,6 +41897,21 @@ fn inline_module_items(
                 // survive inlining. Bake class-valued type parameters into
                 // expression receivers as well as declaration data types.
                 for (name, dt) in &pend_type_binds {
+                    // §6.20.3: variables declared with a module type parameter
+                    // need its binding after the temporary bare typedef is
+                    // restored. Keep an instance-qualified alias for `new`,
+                    // reflection and member access through those variables.
+                    let key = cat2(&inst_prefix, name);
+                    let scoped = scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix);
+                    let width =
+                        resolve_type_width(&scoped, Some(&sub_merged_params), Some(&elab.typedefs));
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:instance_type_parameter",
+                        key.clone(),
+                        width,
+                    );
+                    elab.typedef_types.insert(key, scoped);
                     if let Some(receiver) = module_class_scope::receiver(dt) {
                         rewrite_port_map.insert(name.clone(), receiver);
                     }
@@ -41872,6 +42080,14 @@ fn inline_module_items(
                 // `rewrite_stmt`, so this instance's type-parameter widths
                 // must be live for `$bits(T)` to fold inside them too.
                 set_type_bind_tls(&pend_ctx);
+                let body_classes: Vec<&ClassDeclaration> = prepared_sub
+                    .effective_items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ModuleItem::ClassDeclaration(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
                 for (sub_item, body_src) in prepared_sub
                     .effective_items
                     .iter()
@@ -42041,9 +42257,10 @@ fn inline_module_items(
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
-                        validate_class_constraints(
+                        validate_class_constraints_in_body(
                             cd,
                             Some(definitions),
+                            &body_classes,
                             Some(&elab.enum_members),
                             Some(&elab),
                             Some(&inst_prefix),
@@ -50094,110 +50311,93 @@ fn compute_wildcard_shadowed(
     out
 }
 
-/// §26.2/§26.3: bind a scope's IMPORTED type names into the bare namespace.
+/// §26.2/§26.3: bind a scope's imported type names into the bare namespace.
 ///
-/// Package typedefs are hoisted into ONE global bare-name table, so a
-/// same-named typedef in an unrelated package can end up owning the bare key
-/// (and which one does depends on `definitions` iteration order). An
-/// unqualified reference inside a module must resolve to the package THAT
-/// module imports, so re-point the bare keys at the qualified entries before
-/// anything in the body is resolved.
-///
-/// Only the TYPE tables are rebound. The rest of `process_import` has
-/// design-wide side effects (package parameters become signals, classes are
-/// elaborated) that must not re-run per instance.
-fn rebind_imported_typedefs(
-    elab: &mut ElaboratedModule,
-    items: &[ModuleItem],
-    definitions: &HashMap<String, Definition>,
-) {
+/// Package typedefs are hoisted into one global bare-name table, so a
+/// same-named typedef of an unrelated package can own the bare key. An
+/// unqualified reference inside a module resolves to the package that module
+/// imports, so the bare keys are re-pointed at the qualified entries before
+/// the body is resolved. Only the type tables are rebound: the rest of
+/// `process_import` has design-wide effects that must not re-run per instance.
+fn rebind_imported_typedefs(elab: &mut ElaboratedModule, imports: &[ImportedTypedefs]) {
     let mut changed = false;
-    for item in items {
-        let ModuleItem::ImportDeclaration(imp) = item else {
-            continue;
-        };
-        for ii in &imp.items {
-            let pkg = &ii.package.name;
-            let Some(Definition::Package(p)) = definitions.get(pkg) else {
-                continue;
-            };
-            // `import P::sym` binds one name; `import P::*` binds all of P's
-            // AND, transitively, its own wildcard imports' — `import P::*`
-            // where P does `import CHIP::*` is how large testbenches reach
-            // core types without ever naming CHIP. Rebinding only P's own
-            // typedefs left every chained name exposed to transient
-            // re-binding of the global bare slot.
-            fn wildcard_names(
-                pkg: &crate::ast::module::PackageDeclaration,
-                defs: &HashMap<String, Definition>,
-                depth: u32,
-                out: &mut Vec<(String, String)>, // (owning pkg, typedef name)
-            ) {
-                if depth > 8 {
-                    return;
-                }
-                for pi in &pkg.items {
-                    match pi {
-                        PackageItem::Typedef(td) => {
-                            out.push((pkg.name.name.clone(), td.name.name.clone()))
-                        }
-                        PackageItem::Import(inner) => {
-                            for jj in &inner.items {
-                                if jj.item.is_none() {
-                                    if let Some(Definition::Package(q)) = defs.get(&jj.package.name)
-                                    {
-                                        wildcard_names(q, defs, depth + 1, out);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+    for (name, key) in imports.iter().flat_map(|list| list.iter()) {
+        if let Some(w) = elab.typedefs.get(key).copied()
+            && typedefs_insert_traced(&mut elab.typedefs, "rebind:import", name.clone(), w)
+                != Some(w)
+        {
+            changed = true;
+        }
+        if let Some(t) = elab.typedef_types.get(key).cloned() {
+            elab.typedef_types.insert(name.clone(), t);
+            // §6.18, §26.3: an import binds the whole type, its shape included;
+            // a scalar import clears a displaced shape.
+            if let Some(dims) = elab.typedef_unpacked_dims.get(key).cloned() {
+                elab.typedef_unpacked_dims.insert(name.clone(), dims);
+            } else {
+                elab.typedef_unpacked_dims.remove(name);
             }
-            let names: Vec<(String, String)> = match &ii.item {
-                Some(sym) => vec![(pkg.clone(), sym.name.clone())],
-                None => {
-                    let mut v = Vec::new();
-                    wildcard_names(p, definitions, 0, &mut v);
-                    v
-                }
-            };
-            for (owner, n) in names {
-                let key = format!("{}::{}", owner, n);
-                if let Some(w) = elab.typedefs.get(&key).copied() {
-                    // trace tag "rebind:import" — logs the old width alongside
-                    // the qualified-key width being rebound onto the bare name.
-                    if typedefs_insert_traced(&mut elab.typedefs, "rebind:import", n.clone(), w)
-                        != Some(w)
-                    {
-                        changed = true;
-                    }
-                }
-                if let Some(t) = elab.typedef_types.get(&key).cloned() {
-                    elab.typedef_types.insert(n.clone(), t);
-                    // §6.18 / §26.3: an import binds the whole type, including
-                    // its shape; a scalar import clears any displaced shape.
-                    if let Some(dims) = elab.typedef_unpacked_dims.get(&key).cloned() {
-                        elab.typedef_unpacked_dims.insert(n.clone(), dims);
-                    } else {
-                        elab.typedef_unpacked_dims.remove(&n);
-                    }
-                    if let Some(width) = elab.typedef_elem_widths.get(&key).copied() {
-                        elab.typedef_elem_widths.insert(n.clone(), width);
-                    } else {
-                        elab.typedef_elem_widths.remove(&n);
-                    }
-                }
+            if let Some(width) = elab.typedef_elem_widths.get(key).copied() {
+                elab.typedef_elem_widths.insert(name.clone(), width);
+            } else {
+                elab.typedef_elem_widths.remove(name);
             }
         }
     }
-    // Keep the const-eval snapshot in step, but only when a width actually
-    // moved — this runs per inlined instance and the map is large.
+    // Keep the const-eval snapshot in step when a width moved.
     if changed {
         type_trace_tls_refresh("rebind_import", &elab.typedefs);
         sync_typedefs_tls(&elab.typedefs);
     }
+}
+
+/// Depth of the import chain `wildcard_typedefs` follows.
+const MAX_IMPORT_DEPTH: u32 = 8;
+
+/// The typedefs `import pkg::*` binds: those of `pkg` and, transitively, of
+/// the packages it wildcard-imports. §26.6 passes those on only through
+/// `export`; following them regardless is an extension. A typedef reached by
+/// two paths keeps its last place.
+fn wildcard_typedefs(pkg: &str, definitions: &HashMap<String, Definition>) -> ImportedTypedefs {
+    fn walk(
+        pkg: &str,
+        definitions: &HashMap<String, Definition>,
+        depth: u32,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let Some(Definition::Package(p)) = definitions.get(pkg) else {
+            return;
+        };
+        if depth > MAX_IMPORT_DEPTH {
+            return;
+        }
+        for item in &p.items {
+            match item {
+                PackageItem::Typedef(td) => {
+                    out.push((td.name.name.clone(), format!("{pkg}::{}", td.name.name)))
+                }
+                PackageItem::Import(inner) => {
+                    for ii in inner.items.iter().filter(|ii| ii.item.is_none()) {
+                        walk(&ii.package.name, definitions, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    walk(pkg, definitions, 0, &mut all);
+    // The key names the pair: keep each one's last place.
+    let mut seen = HashSet::default();
+    let keep: Vec<bool> = all
+        .iter()
+        .rev()
+        .map(|(_, key)| seen.insert(key.as_str()))
+        .collect();
+    all.into_iter()
+        .zip(keep.into_iter().rev())
+        .filter_map(|(pair, keep)| keep.then_some(pair))
+        .collect()
 }
 
 /// §26.6: does `pkg` EXPORT symbols coming from `src` (by name or `*::*`)?
@@ -51460,6 +51660,36 @@ mod logged_map_tests {
 }
 
 #[cfg(test)]
+mod imported_typedef_tests {
+    /// §26.3, §26.6 (aionhw/xezim#721): each instance binds the typedefs
+    /// its own imports reach, whichever instance came before.
+    #[test]
+    fn each_instance_binds_its_own_imported_typedefs() {
+        let source = "package a; typedef logic [3:0] t; endpackage
+package b; typedef logic [7:0] t; endpackage
+package c; import a::*; export a::*; endpackage
+module via_c; import c::*; t q; endmodule
+module via_b; import b::*; t q; endmodule
+module via_a; import a::t; t q; endmodule
+module top; via_c u0(); via_b u1(); via_c u2(); via_a u3(); via_b u4(); endmodule
+";
+        let (_, design) = crate::parse_and_elaborate_multi(
+            &[source.into()],
+            Some("top"),
+            &[],
+            &["top.sv".into()],
+            &[],
+        )
+        .expect("elaborate imports");
+        let widths: Vec<_> = ["u0.q", "u1.q", "u2.q", "u3.q", "u4.q"]
+            .iter()
+            .map(|n| design.signals[*n].width)
+            .collect();
+        assert_eq!(widths, [4, 8, 4, 4, 8]);
+    }
+}
+
+#[cfg(test)]
 mod generated_instance_tests {
     use super::*;
 
@@ -51638,7 +51868,7 @@ mod prepared_process_ownership_tests {
         let scope = param_scope::ParamScope::new(
             &base, &definitions, &HashMap::default(), &HashMap::default(),
         );
-        let mut cache = InlinePrepCache::default();
+        let mut cache = InlineCache::default();
         let mut prepare = |id, sel| {
             let params = HashMap::from_iter([
                 ("ID".into(), Value::from_u64(id, 32)),
@@ -51693,7 +51923,7 @@ mod prepared_process_ownership_tests {
             &HashMap::default(),
             &HashMap::default(),
         );
-        let mut cache = InlinePrepCache::default();
+        let mut cache = InlineCache::default();
         let prepared = prepare_module_items(
             definitions["leaf"],
             &definitions,
