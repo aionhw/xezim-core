@@ -142,8 +142,8 @@ fn ident(path: &[&str], span: crate::ast::Span) -> Expression {
                 })
                 .collect(),
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         span,
     )

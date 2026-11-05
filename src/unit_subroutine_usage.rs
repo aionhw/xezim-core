@@ -13,6 +13,7 @@ type Error = serde::de::value::Error;
 pub(crate) struct Usage {
     names: HashSet<String>,
     deps: HashMap<String, HashSet<String>>,
+    qualified_components: bool,
 }
 
 impl Usage {
@@ -34,6 +35,7 @@ impl Usage {
         let mut usage = Self {
             names,
             deps: HashMap::default(),
+            qualified_components: false,
         };
         for f in functions.iter().filter(|f| !f.name.has_scope()) {
             let refs = usage.references(f);
@@ -54,6 +56,55 @@ impl Usage {
         usage
     }
 
+    /// §3.12.1 / §6.20: retain unit constants reached through types, values,
+    /// or other constants, including dependencies within grouped declarations.
+    pub(crate) fn parameters(parameters: &[crate::ast::decl::ParameterDeclaration]) -> Self {
+        use crate::ast::decl::ParameterKind;
+        let declaration_names = |p: &crate::ast::decl::ParameterDeclaration| -> Vec<String> {
+            match &p.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    assignments.iter().map(|a| a.name.name.clone()).collect()
+                }
+                ParameterKind::Type { assignments } => {
+                    assignments.iter().map(|a| a.name.name.clone()).collect()
+                }
+            }
+        };
+        let mut usage = Self {
+            names: parameters.iter().flat_map(declaration_names).collect(),
+            deps: HashMap::default(),
+            qualified_components: true,
+        };
+        for parameter in parameters {
+            match &parameter.kind {
+                ParameterKind::Data {
+                    data_type,
+                    assignments,
+                } => {
+                    for assignment in assignments {
+                        let refs = usage.references(&(data_type, assignment));
+                        usage
+                            .deps
+                            .entry(assignment.name.name.clone())
+                            .or_default()
+                            .extend(refs);
+                    }
+                }
+                ParameterKind::Type { assignments } => {
+                    for assignment in assignments {
+                        let refs = usage.references(assignment);
+                        usage
+                            .deps
+                            .entry(assignment.name.name.clone())
+                            .or_default()
+                            .extend(refs);
+                    }
+                }
+            }
+        }
+        usage
+    }
+
     pub(crate) fn references<T: Serialize + ?Sized>(&self, value: &T) -> HashSet<String> {
         let mut found = HashSet::default();
         if self.names.is_empty() {
@@ -62,6 +113,9 @@ impl Usage {
         let mut scan = Scan {
             names: &self.names,
             found: &mut found,
+            qualified_components: self.qualified_components,
+            collect_direct: false,
+            indirect: false,
         };
         // AST Serialize implementations are derived and infallible. If a new
         // custom implementation declines traversal, preserve every candidate.
@@ -89,6 +143,32 @@ impl Usage {
 struct Scan<'a> {
     names: &'a HashSet<String>,
     found: &'a mut HashSet<String>,
+    qualified_components: bool,
+    collect_direct: bool,
+    indirect: bool,
+}
+
+/// Direct constant bindings mentioned anywhere in a declaration. Calls and
+/// named types may read additional definitions, so those keep the full scope.
+pub(crate) fn direct_parameter_reads<T: Serialize + ?Sized>(value: &T) -> Option<HashSet<String>> {
+    let names = HashSet::default();
+    let mut found = HashSet::default();
+    let mut scan = Scan {
+        names: &names,
+        found: &mut found,
+        qualified_components: true,
+        collect_direct: true,
+        indirect: false,
+    };
+    if value.serialize(&mut scan).is_err() || scan.indirect { None } else { Some(found) }
+}
+
+impl Scan<'_> {
+    fn variant(&mut self, variant: &str) {
+        if self.collect_direct && matches!(variant, "Call" | "SystemCall" | "TypeReference" | "Specialization") {
+            self.indirect = true;
+        }
+    }
 }
 
 macro_rules! scalar {
@@ -113,8 +193,26 @@ impl<'a, 'b> ser::Serializer for &'a mut Scan<'b> {
     serialize_u32(u32), serialize_u64(u64), serialize_u128(u128), serialize_f32(f32),
     serialize_f64(f64), serialize_char(char) }
     fn serialize_str(self, v: &str) -> Result<(), Error> {
+        if self.collect_direct {
+            self.found.insert(v.to_string());
+            self.found.extend(v.split(['.', ':', '[', ']']).map(str::to_string));
+            return Ok(());
+        }
         if let Some(name) = self.names.get(v) {
             self.found.insert(name.clone());
+        }
+        // Qualified identifiers can be encoded as one AST string, notably
+        // `$unit::P`. Hierarchical references must retain the target constant
+        // even if its declaring module contains no direct reference to it.
+        if self.qualified_components {
+            if let Some(name) = v.strip_prefix("$unit::").and_then(|bare| self.names.get(bare)) {
+                self.found.insert(name.clone());
+            }
+            for component in v.split(['.', ':', '[', ']']) {
+                if let Some(name) = self.names.get(component) {
+                    self.found.insert(name.clone());
+                }
+            }
         }
         Ok(())
     }
@@ -133,7 +231,8 @@ impl<'a, 'b> ser::Serializer for &'a mut Scan<'b> {
     fn serialize_unit_struct(self, _: &'static str) -> Result<(), Error> {
         Ok(())
     }
-    fn serialize_unit_variant(self, _: &'static str, _: u32, _: &'static str) -> Result<(), Error> {
+    fn serialize_unit_variant(self, _: &'static str, _: u32, variant: &'static str) -> Result<(), Error> {
+        self.variant(variant);
         Ok(())
     }
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
@@ -147,9 +246,10 @@ impl<'a, 'b> ser::Serializer for &'a mut Scan<'b> {
         self,
         _: &'static str,
         _: u32,
-        _: &'static str,
+        variant: &'static str,
         v: &T,
     ) -> Result<(), Error> {
+        self.variant(variant);
         v.serialize(self)
     }
     fn serialize_seq(self, _: Option<usize>) -> Result<Self, Error> {
@@ -165,9 +265,10 @@ impl<'a, 'b> ser::Serializer for &'a mut Scan<'b> {
         self,
         _: &'static str,
         _: u32,
-        _: &'static str,
+        variant: &'static str,
         _: usize,
     ) -> Result<Self, Error> {
+        self.variant(variant);
         Ok(self)
     }
     fn serialize_map(self, _: Option<usize>) -> Result<Self, Error> {
@@ -180,9 +281,10 @@ impl<'a, 'b> ser::Serializer for &'a mut Scan<'b> {
         self,
         _: &'static str,
         _: u32,
-        _: &'static str,
+        variant: &'static str,
         _: usize,
     ) -> Result<Self, Error> {
+        self.variant(variant);
         Ok(self)
     }
 }
@@ -239,3 +341,43 @@ macro_rules! structure {
 }
 structure!(SerializeStruct);
 structure!(SerializeStructVariant);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escaped_qualified_parameter_name_is_preserved() {
+        let usage = Usage {
+            names: ["escaped.name".to_string()].into_iter().collect(),
+            deps: HashMap::default(),
+            qualified_components: true,
+        };
+        assert!(usage.references(&"$unit::escaped.name").contains("escaped.name"));
+    }
+
+    #[test]
+    fn qualified_parameter_names_and_dependencies_are_conservative() {
+        let usage = Usage {
+            names: ["WIDTH", "BASE", "HIER", "UNUSED"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            deps: [(
+                "WIDTH".to_owned(),
+                ["BASE".to_owned()].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            qualified_components: true,
+        };
+        let found = usage.close(usage.references(&["$unit::WIDTH", "top.g[2].leaf.HIER"]));
+        assert_eq!(
+            found,
+            ["WIDTH", "BASE", "HIER"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        );
+    }
+}

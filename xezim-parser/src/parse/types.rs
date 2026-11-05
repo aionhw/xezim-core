@@ -406,8 +406,8 @@ impl Parser {
                                     selects: Vec::new(),
                                 }],
                                 span: sp,
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
                             };
                             type_args.push(crate::ast::expr::Expression::new(
                                 crate::ast::expr::ExprKind::Ident(hier),
@@ -478,8 +478,8 @@ impl Parser {
                 selects: Vec::new(),
             }],
             span: sp,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         };
         crate::ast::expr::Expression::new(crate::ast::expr::ExprKind::Ident(hier), sp)
     }
@@ -670,7 +670,7 @@ impl Parser {
                                     signed: false,
                                     base: crate::ast::expr::NumberBase::Decimal,
                                     value: v.to_string(),
-                                    cached_val: std::cell::Cell::new(None),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                 },
                             ),
                             span,
@@ -906,7 +906,7 @@ impl Parser {
                                 signed: false,
                                 base: crate::ast::expr::NumberBase::Decimal,
                                 value: "0".to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             },
                         ),
                         sp,
@@ -918,7 +918,7 @@ impl Parser {
                                 signed: false,
                                 base: crate::ast::expr::NumberBase::Decimal,
                                 value: "1".to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             },
                         ),
                         sp,

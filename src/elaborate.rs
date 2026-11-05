@@ -10,10 +10,13 @@ use crate::ast::types::*;
 use crate::ast::{Identifier, Span};
 use crate::hasher::HashMap;
 use crate::hasher::HashSet;
+use crate::shared_names::{SharedName, SharedNameMap};
 use std::rc::Rc;
 
 pub(crate) mod array_params;
 mod const_function_scope;
+#[cfg(test)]
+mod callable_sharing_tests;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
@@ -240,7 +243,7 @@ impl Default for TableIdent {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct LoggedMap<V> {
-    map: HashMap<String, V>,
+    map: Rc<HashMap<String, V>>,
     #[serde(skip)]
     ident: TableIdent,
     #[serde(skip)]
@@ -252,7 +255,7 @@ pub type TypedefTable = LoggedMap<u32>;
 /// Subroutine name -> declaration.
 pub type FuncTable = LoggedMap<FunctionDeclaration>;
 
-impl<V> Default for LoggedMap<V> {
+impl<V: Clone> Default for LoggedMap<V> {
     fn default() -> Self {
         Self::from_map(HashMap::default())
     }
@@ -260,7 +263,7 @@ impl<V> Default for LoggedMap<V> {
 
 impl<V: Clone> Clone for LoggedMap<V> {
     fn clone(&self) -> Self {
-        Self::from_map(self.map.clone())
+        Self::from_shared(Rc::clone(&self.map))
     }
 }
 
@@ -271,8 +274,14 @@ impl<V> std::ops::Deref for LoggedMap<V> {
     }
 }
 
-impl<V> LoggedMap<V> {
+impl<V: Clone> LoggedMap<V> {
     pub fn from_map(map: HashMap<String, V>) -> Self {
+        Self::from_shared(Rc::new(map))
+    }
+
+    /// Read-only constant-evaluation shells share the existing function
+    /// snapshot. A later insertion detaches it before mutating (§13.4.3).
+    fn from_shared(map: Rc<HashMap<String, V>>) -> Self {
         Self {
             map,
             ident: TableIdent::default(),
@@ -286,16 +295,20 @@ impl<V> LoggedMap<V> {
 
     /// The plain map, for bulk in-place edits (rewrap with `from_map`).
     pub fn into_map(self) -> HashMap<String, V> {
-        self.map
+        Rc::try_unwrap(self.map).unwrap_or_else(|shared| (*shared).clone())
     }
 
     pub fn insert(&mut self, key: String, value: V) -> Option<V> {
         self.log.push(key.clone());
-        self.map.insert(key, value)
+        Rc::make_mut(&mut self.map).insert(key, value)
     }
 
     pub fn remove(&mut self, key: &str) -> Option<V> {
-        let prev = self.map.remove(key);
+        // Avoid detaching a read-only snapshot for an absent-key no-op.
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        let prev = Rc::make_mut(&mut self.map).remove(key);
         if prev.is_some() {
             self.log.push(key.to_string());
         }
@@ -385,7 +398,7 @@ fn type_trace_tls_refresh(at: &str, map: &HashMap<String, u32>) {
 /// A resolved signal in the simulation model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Signal {
-    pub name: String,
+    pub name: SharedName,
     pub width: u32,
     pub is_signed: bool,
     pub is_real: bool,
@@ -1916,11 +1929,29 @@ fn size_struct_member_dims(
 /// the property came out **1 bit** — truncating every store through
 /// `fit_class_prop` and reporting `$bits() == 1`. The same held for any
 /// module/package/`$unit` parameter used in a class property's packed range.
+/// Keep only directly mentioned outer bindings when all dimensions/defaults
+/// are self-contained. §6.20/§8.13: inheritance, calls and named types can
+/// read hidden declarations and deliberately retain the complete environment.
+fn class_enclosing_scope(
+    c: &ClassDeclaration,
+    scope_params: Option<&HashMap<String, Value>>,
+) -> HashMap<String, Value> {
+    let Some(scope) = scope_params else { return HashMap::default() };
+    let reads = c.extends.is_none()
+        .then(|| crate::unit_subroutine_usage::direct_parameter_reads(c))
+        .flatten();
+    let Some(reads) = reads else { return scope.clone() };
+    scope.iter().filter(|(name, _)| {
+        reads.contains(name.as_str())
+            || name.split(['.', ':', '[', ']']).any(|part| reads.contains(part))
+    }).map(|(name, value)| (name.clone(), value.clone())).collect()
+}
+
 fn class_const_scope(
     c: &ClassDeclaration,
     scope_params: Option<&HashMap<String, Value>>,
 ) -> HashMap<String, Value> {
-    let mut params: HashMap<String, Value> = scope_params.cloned().unwrap_or_default();
+    let mut params = class_enclosing_scope(c, scope_params);
     // §8.13: inherited constants, overridden below by the class's own.
     if c.extends.is_some() {
         for (n, v) in inherited_class_consts(c, &params) {
@@ -2106,11 +2137,14 @@ fn elaborate_class_in_scope(
     // specialization a wrong FIXED size. Such properties stay queue-backed
     // (indexing works; `size()`/`foreach` see the pushed elements only).
     let owned_unpacked_scope: HashMap<String, Value>;
-    let unpacked_scope: &HashMap<String, Value> = if !binds_values {
-        enclosing
+    let unpacked_scope: &HashMap<String, Value> = if !class_has_value_params(c) {
+        // §8.25/§6.20: only header value parameters distinguish these scopes.
+        // Localparam-only and inherited-constant classes can reuse the same
+        // evaluated bindings rather than copy every enclosing parameter twice.
+        const_scope
     } else {
         owned_unpacked_scope = {
-            let mut m = scope_params.cloned().unwrap_or_default();
+            let mut m = class_enclosing_scope(c, scope_params);
             m.extend(inherited.iter().cloned());
             for item in &c.items {
                 if let ClassItem::Parameter(pd) = item {
@@ -2828,7 +2862,7 @@ fn elaborate_class_in_scope(
                         decl.name.name.clone(),
                         Signal {
                             is_const: false,
-                            name: decl.name.name.clone(),
+                            name: decl.name.name.clone().into(),
                             width,
                             is_signed,
                             is_real,
@@ -2885,7 +2919,7 @@ fn elaborate_class_in_scope(
                         cg_name.clone(),
                         Signal {
                             is_const: false,
-                            name: cg_name.clone(),
+                            name: cg_name.clone().into(),
                             width: 32,
                             is_signed: false,
                             is_real: false,
@@ -3028,7 +3062,7 @@ fn elaborate_class_in_scope(
                                 a.name.name.clone(),
                                 Signal {
                                     is_const: true,
-                                    name: a.name.name.clone(),
+                                    name: a.name.name.clone().into(),
                                     width: ew,
                                     is_signed: is_type_signed(data_type),
                                     is_real: false,
@@ -3089,7 +3123,7 @@ fn elaborate_class_in_scope(
                         a.name.name.clone(),
                         Signal {
                             is_const: true,
-                            name: a.name.name.clone(),
+                            name: a.name.name.clone().into(),
                             width,
                             is_signed: implicit_no_dims || is_type_signed(data_type),
                             is_real: false,
@@ -3267,7 +3301,7 @@ pub struct ElaboratedModule {
     /// pre-scaled to this unit at elaboration; the simulator counts ticks of it.
     #[serde(default = "default_tick_s")]
     pub tick_s: f64,
-    pub signals: HashMap<String, Signal>,
+    pub signals: SharedNameMap<Signal>,
     /// Transient elaboration bookkeeping (not serialized): names that already
     /// received a type-bearing declaration, mapped to whether that type was
     /// *incompatible* (a named/atom/real/struct/enum type, which cannot be
@@ -3516,7 +3550,7 @@ pub struct ElaboratedModule {
     /// (`localparam e_t RST`), keyed as in `parameters`. The self-determined
     /// type of a parameter (§6.20.2), e.g. for a `default:` key (§10.9.1).
     #[serde(default)]
-    pub param_decl_types: HashMap<String, DataType>,
+    pub param_decl_types: SharedNameMap<DataType>,
     /// Struct variable -> its top-level member names in DECLARATION order, for
     /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
     /// offset (i.e. reversed) and unpacked members live in separate signals, so
@@ -3993,7 +4027,7 @@ impl ElaboratedModule {
         Self {
             name,
             tick_s: default_tick_s(),
-            signals: HashMap::default(),
+            signals: SharedNameMap::default(),
             typed_decls: HashMap::default(),
             completed_ports: HashSet::default(),
             ranged_port_widths: HashMap::default(),
@@ -4056,7 +4090,7 @@ impl ElaboratedModule {
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             var_decl_types: HashMap::default(),
-            param_decl_types: HashMap::default(),
+            param_decl_types: SharedNameMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
@@ -4494,7 +4528,7 @@ fn const_value_literal(v: &Value, span: Span) -> Option<Expression> {
             signed: v.is_signed,
             base: crate::ast::expr::NumberBase::Binary,
             value: v.to_bin(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     ))
@@ -4799,7 +4833,7 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
                     .or_insert_with(|| v.clone());
                 elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
                     is_const: false,
-                    name: nm.clone(),
+                    name: nm.clone().into(),
                     width: base_width,
                     is_signed: false,
                     is_real: false,
@@ -5188,7 +5222,7 @@ fn signal_trace_patterns() -> &'static Option<Vec<String>> {
 }
 
 pub(crate) fn signals_insert_traced(
-    map: &mut HashMap<String, Signal>,
+    map: &mut SharedNameMap<Signal>,
     line: u32,
     name: String,
     sig: Signal,
@@ -6187,7 +6221,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                     nm.clone(),
                     Signal {
                         is_const: false,
-                        name: nm.clone(),
+                        name: nm.clone().into(),
                         width: base_width,
                         is_signed: enum_signed,
                         is_real: false,
@@ -9533,7 +9567,7 @@ pub fn elaborate_module_with_defs(
                                         signal_name.clone(),
                                         Signal {
                                             is_const: true,
-                                            name: signal_name,
+                                            name: signal_name.into(),
                                             width: elem_w,
                                             is_signed: is_type_signed(data_type),
                                             is_real: false,
@@ -9897,7 +9931,7 @@ pub fn elaborate_module_with_defs(
                 };
                 let sig = Signal {
                     is_const: false,
-                    name: port.name.name.clone(),
+                    name: port.name.name.clone().into(),
                     width,
                     is_signed,
                     is_real,
@@ -10620,7 +10654,7 @@ pub fn elaborate_module_with_defs(
                     }
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width,
                         is_signed,
                         is_real,
@@ -10768,7 +10802,7 @@ pub fn elaborate_module_with_defs(
                     let init_value = default_net_value(nd.net_type, w, is_real);
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width: w,
                         is_signed,
                         is_real,
@@ -11902,7 +11936,7 @@ pub fn elaborate_module_with_defs(
                                         en.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: en,
+                                            name: en.into(),
                                             width: 1,
                                             is_signed: false,
                                             is_real: false,
@@ -12029,7 +12063,7 @@ pub fn elaborate_module_with_defs(
                                                         signed: false,
                                                         base: crate::ast::expr::NumberBase::Decimal,
                                                         value: idx_i.to_string(),
-                                                        cached_val: std::cell::Cell::new(None),
+                                                        cached_val: crate::ast::cache::LiteralCache::new(None),
                                                     },
                                                 ),
                                                 Span::dummy(),
@@ -12049,7 +12083,7 @@ pub fn elaborate_module_with_defs(
                                     let size_name = format!("{}.size", decl.name.name);
                                     let size_sig = Signal {
                                         is_const: false,
-                                        name: size_name.clone(),
+                                        name: size_name.clone().into(),
                                         width: 32,
                                         is_signed: false,
                                         is_real: false,
@@ -12162,7 +12196,7 @@ pub fn elaborate_module_with_defs(
 
                         let sig = Signal {
                             is_const: dd.const_kw,
-                            name: decl.name.name.clone(),
+                            name: decl.name.name.clone().into(),
                             width: w,
                             is_signed,
                             is_real,
@@ -12996,7 +13030,7 @@ pub fn elaborate_module_with_defs(
                                                     name: format!(
                                                         "{}[{}]",
                                                         assign.name.name, key_str
-                                                    ),
+                                                    ).into(),
                                                     width,
                                                     is_signed: signed,
                                                     is_real: false,
@@ -13319,7 +13353,7 @@ pub fn elaborate_module_with_defs(
                             assign.name.name.clone(),
                             Signal {
                                 is_const: false,
-                                name: assign.name.name.clone(),
+                                name: assign.name.name.clone().into(),
                                 width: current_width,
                                 is_signed: current_signed,
                                 is_real: current_is_real,
@@ -13914,7 +13948,7 @@ pub fn elaborate_module_with_defs(
                             hi.name.name.clone(),
                             Signal {
                                 is_const: false,
-                                name: hi.name.name.clone(),
+                                name: hi.name.name.clone().into(),
                                 width: 1,
                                 is_signed: false,
                                 is_real: false,
@@ -17059,7 +17093,7 @@ fn register_generate_labels(items: &[ModuleItem], elab: &mut ElaboratedModule) {
                 l.clone(),
                 Signal {
                     is_const: false,
-                    name: l,
+                    name: l.into(),
                     width: 1,
                     is_signed: false,
                     is_real: false,
@@ -17792,7 +17826,7 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             name.clone(),
             Signal {
                 is_const: false,
-                name: name.clone(),
+                name: name.clone().into(),
                 width: 1,
                 is_signed: false,
                 direction: None,
@@ -18077,7 +18111,7 @@ fn create_implicit_nets(
                 name.clone(),
                 Signal {
                     is_const: false,
-                    name: name.clone(),
+                    name: name.clone().into(),
                     width: 1,
                     is_signed: false,
                     direction: None,
@@ -18145,7 +18179,7 @@ fn create_implicit_nets(
                 name.clone(),
                 Signal {
                     is_const: false,
-                    name: name.clone(),
+                    name: name.clone().into(),
                     width: width.max(1),
                     is_signed: false,
                     direction: None,
@@ -18188,7 +18222,7 @@ fn create_implicit_nets(
             name.clone(),
             Signal {
                 is_const: false,
-                name: name.clone(),
+                name: name.clone().into(),
                 width: 1,
                 is_signed: false,
                 direction: None,
@@ -18487,7 +18521,7 @@ fn elaborate_items_numbered(
                     }
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width,
                         is_signed,
                         direction: Some(pd.direction),
@@ -18533,7 +18567,7 @@ fn elaborate_items_numbered(
                     let init_value = default_net_value(nd.net_type, width, is_real);
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width,
                         is_signed,
                         direction: None,
@@ -18998,7 +19032,7 @@ fn elaborate_items_numbered(
                                                         signed: false,
                                                         base: crate::ast::expr::NumberBase::Decimal,
                                                         value: idx_i.to_string(),
-                                                        cached_val: std::cell::Cell::new(None),
+                                                        cached_val: crate::ast::cache::LiteralCache::new(None),
                                                     },
                                                 ),
                                                 Span::dummy(),
@@ -19018,7 +19052,7 @@ fn elaborate_items_numbered(
                                     let size_name = format!("{}.size", decl.name.name);
                                     let size_sig = Signal {
                                         is_const: false,
-                                        name: size_name.clone(),
+                                        name: size_name.clone().into(),
                                         width: 32,
                                         is_signed: false,
                                         is_real: false,
@@ -19061,7 +19095,7 @@ fn elaborate_items_numbered(
                         };
                         let sig = Signal {
                             is_const: dd.const_kw,
-                            name: decl.name.name.clone(),
+                            name: decl.name.name.clone().into(),
                             width,
                             is_signed,
                             is_real,
@@ -19235,7 +19269,7 @@ fn elaborate_items_numbered(
                                             assign.name.name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: assign.name.name.clone(),
+                                                name: assign.name.name.clone().into(),
                                                 width: 1,
                                                 is_signed: false,
                                                 direction: None,
@@ -19300,7 +19334,7 @@ fn elaborate_items_numbered(
                                 assign.name.name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: assign.name.name.clone(),
+                                    name: assign.name.name.clone().into(),
                                     width,
                                     is_signed: signed,
                                     direction: None,
@@ -19429,7 +19463,7 @@ fn elaborate_items_numbered(
                             hi.name.name.clone(),
                             Signal {
                                 is_const: false,
-                                name: hi.name.name.clone(),
+                                name: hi.name.name.clone().into(),
                                 width: 1,
                                 is_signed: false,
                                 direction: None,
@@ -21273,7 +21307,7 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
         signed: true,
         base: crate::ast::expr::NumberBase::Decimal,
         value: v.to_string(),
-        cached_val: std::cell::Cell::new(None),
+        cached_val: crate::ast::cache::LiteralCache::new(None),
     });
 }
 
@@ -22576,7 +22610,7 @@ fn const_eval_user_call(
     if let Some(p) = params {
         shell.parameters = p.clone();
     }
-    shell.functions = FuncTable::from_map((*funcs).clone());
+    shell.functions = FuncTable::from_shared(Rc::clone(&funcs));
     // Generate-if conditions reach this shell with no typedef table. A formal
     // `fmt_unit_types_t` then has no element width, so `types[i] == MERGED`
     // reads a bit and the merged opgroup is not generated. The localparam
@@ -23589,7 +23623,7 @@ fn set_funcs_tls(funcs: &FuncTable) {
                     funcs.replay_into(std::rc::Rc::make_mut(rc), seen);
                 }
             }
-            _ => *slot = Some(std::rc::Rc::new(funcs.map.clone())),
+            _ => *slot = Some(std::rc::Rc::new((*funcs.map).clone())),
         }
     });
     FUNCS_TLS_MIRROR.with(|m| m.set(Some((funcs.ident.0, funcs.log.len()))));
@@ -23647,7 +23681,7 @@ fn sync_typedefs_tls(table: &TypedefTable) {
             (Some(snap), Some((id, seen))) if id == table.ident.0 && seen <= table.log.len() => {
                 table.replay_into(snap, seen)
             }
-            _ => *slot = Some(table.map.clone()),
+            _ => *slot = Some((*table.map).clone()),
         }
     });
     TYPEDEFS_TLS_MIRROR.with(|m| m.set(Some((table.ident.0, table.log.len()))));
@@ -24202,7 +24236,7 @@ fn prebind_bits_from_declared_types(
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: w.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 });
             }
             return out;
@@ -24334,7 +24368,7 @@ fn flatten_member_chain(e: &Expression) -> Option<(String, Vec<String>)> {
 /// select, so only a base that really names a signal is rewritten here.
 fn prebind_bits_of_signals(
     e: &Expression,
-    signals: &HashMap<String, Signal>,
+    signals: &SharedNameMap<Signal>,
     params: &HashMap<String, Value>,
     prefix: &str,
     typedefs: &HashMap<String, u32>,
@@ -24367,7 +24401,7 @@ fn prebind_bits_of_signals(
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: w.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 });
             }
             return out;
@@ -24414,7 +24448,7 @@ fn prebind_bits_of_signals(
 #[allow(clippy::too_many_arguments)]
 fn bits_of_signal_expr(
     arg: &Expression,
-    signals: &HashMap<String, Signal>,
+    signals: &SharedNameMap<Signal>,
     params: &HashMap<String, Value>,
     prefix: &str,
     typedefs: &HashMap<String, u32>,
@@ -27087,7 +27121,7 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
         DataType::Struct(su) if su.packed => {
             elab.signals.entry(name.to_string()).or_insert(Signal {
                 is_const: false,
-                name: name.to_string(),
+                name: name.to_string().into(),
                 width: w,
                 is_signed: signed,
                 is_real: false,
@@ -27108,7 +27142,7 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
         _ => {
             elab.signals.entry(name.to_string()).or_insert(Signal {
                 is_const: false,
-                name: name.to_string(),
+                name: name.to_string().into(),
                 width: w,
                 is_signed: signed,
                 is_real: real,
@@ -27183,8 +27217,8 @@ fn member_ref_expr(base: &Expression, member: &Identifier) -> Expression {
                     root: None,
                     path: segs,
                     span: base.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 base.span,
             );
@@ -27467,7 +27501,7 @@ fn index_expr_of(base: Expression, idx: i64) -> Expression {
                     signed: true,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: idx.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )),
@@ -27607,7 +27641,7 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
         let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
         elab.signals.entry(base.to_string()).or_insert(Signal {
             is_const: false,
-            name: base.to_string(),
+            name: base.to_string().into(),
             width: w,
             is_signed: false,
             is_real: false,
@@ -32334,7 +32368,7 @@ fn inline_instantiations_inner(
                                         qualified.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: qualified,
+                                            name: qualified.into(),
                                             width: w,
                                             is_signed,
                                             is_real,
@@ -32347,7 +32381,7 @@ fn inline_instantiations_inner(
                                         .entry(decl.name.name.clone())
                                         .or_insert(Signal {
                                             is_const: false,
-                                            name: decl.name.name.clone(),
+                                            name: decl.name.name.clone().into(),
                                             width: w,
                                             is_signed,
                                             is_real,
@@ -32407,7 +32441,7 @@ fn inline_instantiations_inner(
                                     for (i, item_expr) in init_items.iter().enumerate() {
                                         let lval = Expression::new(ExprKind::Index {
                                             expr: Box::new(make_ident_expr(&decl.name.name)),
-                                            index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: i.to_string(), cached_val: std::cell::Cell::new(None) }), Span::dummy())),
+                                            index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: i.to_string(), cached_val: crate::ast::cache::LiteralCache::new(None) }), Span::dummy())),
                                         }, Span::dummy());
                                         stmts.push(Statement::new(
                                             StatementKind::BlockingAssign {
@@ -32425,7 +32459,7 @@ fn inline_instantiations_inner(
                                             size_name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: size_name,
+                                                name: size_name.into(),
                                                 width: 32,
                                                 is_signed: false,
                                                 is_real: false,
@@ -32488,7 +32522,7 @@ fn inline_instantiations_inner(
     set_param_fallback(&top_params);
     set_typedef_types_tls(&elab.typedef_types);
     set_typedef_widths_tls(elab.typedefs.as_map());
-    let mut cache = HashMap::default();
+    let mut cache = InlinePrepCache::default();
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
     // §23.10/§26.3: the snapshot is held once; each scope takes from it only
@@ -32604,7 +32638,7 @@ fn genvar_const_expr(value: i64) -> Expression {
             signed: true,
             base: NumberBase::Decimal,
             value: value.to_string(),
-            cached_val: std::cell::Cell::new(Some((value as u64, 0u64, 32u32))),
+            cached_val: crate::ast::cache::LiteralCache::new(Some((value as u64, 0u64, 32u32))),
         }),
         Span::dummy(),
     )
@@ -32737,8 +32771,8 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
                 selects: Vec::new(),
             }],
             span: Span { start: 0, end: 0 },
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         };
         port_map.insert(
             n.clone(),
@@ -32772,8 +32806,8 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
                         selects: Vec::new(),
                     }],
                     span: Span { start: 0, end: 0 },
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 };
                 port_map.insert(
                     h,
@@ -33809,7 +33843,7 @@ fn fold_class_param_arg(arg: &Expression, params: &HashMap<String, Value>) -> Ex
                     signed: false,
                     base: NumberBase::Decimal,
                     value: n.unsigned_abs().to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 arg.span,
             );
@@ -34475,7 +34509,7 @@ fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
                 signed: true,
                 base: crate::ast::expr::NumberBase::Hex,
                 value: format!("{:x}", n as u64),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         );
@@ -34486,7 +34520,7 @@ fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
             signed: false,
             base: crate::ast::expr::NumberBase::Decimal,
             value: n.to_string(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     )
@@ -34961,6 +34995,7 @@ enum BodySource {
 struct PreparedModuleItems {
     effective_items: Vec<ModuleItem>,
     body_sources: Vec<BodySource>,
+    has_subroutines: bool,
     local_typedefs: std::collections::HashSet<String>,
     interface_ports: std::collections::HashSet<String>,
     port_directions: HashMap<String, PortDirection>,
@@ -35155,7 +35190,23 @@ fn collect_body_driven_names(
     }
 }
 
-type InlinePrepCache = HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>;
+#[derive(Default)]
+struct InlinePrepCache {
+    prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
+    process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
+    callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
+}
+
+impl InlinePrepCache {
+    fn get(&self, key: &param_scope::PreparedKey) -> Option<&Rc<PreparedModuleItems>> {
+        self.prepared.get(key)
+    }
+    fn insert(&mut self, key: param_scope::PreparedKey, items: Rc<PreparedModuleItems>) {
+        self.prepared.insert(key, items);
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize { self.prepared.len() }
+}
 
 /// `XEZIM_COMPILE_PHASES`: how the prepared-body cache is doing, printed as
 /// it goes (an `[elab-stats]` line at each power-of-two miss count and every
@@ -35488,8 +35539,29 @@ fn prepare_module_items(
         }
     }
 
+    let body_driven_ports = {
+        let mut driven = std::collections::HashSet::default();
+        collect_body_driven_names(&effective_items, definitions, &mut driven);
+        // Keep only PORT names — everything else is a local and irrelevant to
+        // the substitution decision.
+        driven.retain(|n| port_directions.contains_key(n));
+        driven
+    };
+
+    // Fill literals before extracting shared sources so pending processes
+    // reuse the cached values instead of parsing them in every instance.
+    prefill_literal_caches(&effective_items);
+
+    // §9.2.1/§9.2.2 (#721): pending processes own the shared source body.
+    // Run name/driver analysis and literal prefill before moving it out of
+    // the prepared item. Remaining consumers need only the wrapper's kind,
+    // span and generate scope; retaining its AST would duplicate every
+    // process once per prepared specialization for the whole inline pass.
+    let has_subroutines = effective_items.iter().any(|item| matches!(
+        item, ModuleItem::FunctionDeclaration(_) | ModuleItem::TaskDeclaration(_)
+    ));
     let body_sources: Vec<BodySource> = effective_items
-        .iter()
+        .iter_mut()
         .map(|item| {
             match item {
                 ModuleItem::ContinuousAssign(ca) => BodySource::ContAssign(
@@ -35514,13 +35586,20 @@ fn prepare_module_items(
                         })
                         .collect(),
                 ),
-                ModuleItem::AlwaysConstruct(ac) => BodySource::Always(
-                    ac.kind,
-                    std::rc::Rc::new(ac.stmt.clone()),
-                    ac.gen_scope.clone(),
-                ),
+                ModuleItem::AlwaysConstruct(ac) => {
+                    let placeholder = Statement::new(StatementKind::Null, ac.stmt.span);
+                    BodySource::Always(
+                        ac.kind,
+                        cache.process_bodies.intern(Rc::new(std::mem::replace(&mut ac.stmt, placeholder))),
+                        ac.gen_scope.clone(),
+                    )
+                }
                 ModuleItem::InitialConstruct(ic) => {
-                    BodySource::Initial(std::rc::Rc::new(ic.stmt.clone()), ic.gen_scope.clone())
+                    let placeholder = Statement::new(StatementKind::Null, ic.stmt.span);
+                    BodySource::Initial(
+                        cache.process_bodies.intern(Rc::new(std::mem::replace(&mut ic.stmt, placeholder))),
+                        ic.gen_scope.clone(),
+                    )
                 }
                 // §16.5: a concurrent assertion in an INLINED instance (sub-module
                 // or interface) travels like the top-level hoist — one synthetic
@@ -35538,22 +35617,10 @@ fn prepare_module_items(
         })
         .collect();
 
-    let body_driven_ports = {
-        let mut driven = std::collections::HashSet::default();
-        collect_body_driven_names(&effective_items, definitions, &mut driven);
-        // Keep only PORT names — everything else is a local and irrelevant to
-        // the substitution decision.
-        driven.retain(|n| port_directions.contains_key(n));
-        driven
-    };
-
-    // Every instance of this module gets a copy of these items, so parse
-    // their integer literals once, here, instead of once per instance.
-    prefill_literal_caches(&effective_items);
-
     let prepared = Rc::new(PreparedModuleItems {
         effective_items,
         body_sources,
+        has_subroutines,
         local_typedefs,
         interface_ports,
         port_directions,
@@ -36634,7 +36701,7 @@ fn inline_module_items(
                                 sig_name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: sig_name,
+                                    name: sig_name.into(),
                                     width,
                                     is_signed: is_real,
                                     direction: None,
@@ -36667,7 +36734,7 @@ fn inline_module_items(
                                 sig_name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: sig_name,
+                                    name: sig_name.into(),
                                     width: 1,
                                     is_signed: false,
                                     direction: None,
@@ -36871,7 +36938,7 @@ fn inline_module_items(
                             scoped.clone(),
                             Signal {
                                 is_const: false,
-                                name: scoped.clone(),
+                                name: scoped.clone().into(),
                                 width: 1,
                                 is_signed: false,
                                 direction: None,
@@ -38427,7 +38494,7 @@ fn inline_module_items(
                                                         sname.clone(),
                                                         Signal {
                                                             is_const: true,
-                                                            name: sname,
+                                                            name: sname.into(),
                                                             width: elem_w,
                                                             is_signed: is_type_signed(data_type),
                                                             is_real: false,
@@ -38977,7 +39044,7 @@ fn inline_module_items(
                         full_name.clone(),
                         Signal {
                             is_const: false,
-                            name: full_name,
+                            name: full_name.into(),
                             width: val.width,
                             is_signed: val.is_signed,
                             is_real: val.is_real,
@@ -39425,7 +39492,7 @@ fn inline_module_items(
                                     sig_name.clone(),
                                     Signal {
                                         is_const: false,
-                                        name: sig_name.clone(),
+                                        name: sig_name.clone().into(),
                                         width,
                                         is_signed: port
                                             .data_type
@@ -39581,7 +39648,7 @@ fn inline_module_items(
                                         sig_name.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: sig_name.clone(),
+                                            name: sig_name.clone().into(),
                                             width,
                                             is_signed,
                                             direction: Some(pd.direction),
@@ -39678,7 +39745,7 @@ fn inline_module_items(
                                         member.name.name.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: member.name.name.clone(),
+                                            name: member.name.name.clone().into(),
                                             width: base_width,
                                             is_signed: false,
                                             direction: None,
@@ -39712,7 +39779,7 @@ fn inline_module_items(
                                     sc.clone(),
                                     Signal {
                                         is_const: false,
-                                        name: sc,
+                                        name: sc.into(),
                                         width: base_width,
                                         is_signed: false,
                                         direction: None,
@@ -39995,7 +40062,7 @@ fn inline_module_items(
                                     sig_name.clone(),
                                     Signal {
                                         is_const: false,
-                                        name: sig_name,
+                                        name: sig_name.into(),
                                         width,
                                         is_signed: is_type_signed(&nd.data_type),
                                         // Resolved through the typedef table so a
@@ -40084,7 +40151,7 @@ fn inline_module_items(
                                         scoped.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: scoped,
+                                            name: scoped.into(),
                                             width: base_width,
                                             is_signed: false,
                                             is_real: false,
@@ -40995,7 +41062,7 @@ fn inline_module_items(
                                         sig_name.clone(),
                                         Signal {
                                             is_const: dd.const_kw,
-                                            name: sig_name,
+                                            name: sig_name.into(),
                                             width,
                                             is_signed,
                                             direction: None,
@@ -41237,7 +41304,7 @@ fn inline_module_items(
                                                     signed: false,
                                                     base: crate::ast::expr::NumberBase::Binary,
                                                     value: "z".to_string(),
-                                                    cached_val: std::cell::Cell::new(None),
+                                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                                 },
                                             ),
                                             span,
@@ -41739,10 +41806,17 @@ fn inline_module_items(
                 // call time, and the formal would collapse to 1 bit. Substitute
                 // the sub-instance's resolved params into the formals' data
                 // types + unpacked dims.
-                let param_expr_map: HashMap<String, Expression> = sub_merged_params
-                    .iter()
-                    .filter_map(|(k, v)| v.to_i64().map(|iv| (k.clone(), genvar_const_expr(iv))))
-                    .collect();
+                // §13.3/#721: only callable signatures need these literal
+                // expressions. Empty instances must not copy every ancestor's
+                // parameters into another retained map at each hierarchy level.
+                let param_expr_map: HashMap<String, Expression> = if prepared_sub.has_subroutines {
+                    sub_merged_params
+                        .iter()
+                        .filter_map(|(k, v)| v.to_i64().map(|iv| (k.clone(), genvar_const_expr(iv))))
+                        .collect()
+                } else {
+                    HashMap::default()
+                };
                 let no_local: std::collections::HashSet<String> =
                     std::collections::HashSet::default();
                 let no_iface: HashMap<String, String> = HashMap::default();
@@ -41847,7 +41921,7 @@ fn inline_module_items(
                         }
                         let formal_names: Vec<&str> =
                             fd.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        new_fd.items = with_shadowed(
+                        new_fd.items = crate::ast::cache::without_scope_caches(|| with_shadowed(
                             &formal_names,
                             &rewrite_port_map,
                             &fn_locals,
@@ -41860,7 +41934,8 @@ fn inline_module_items(
                                     &sub_interface_map,
                                 )
                             },
-                        );
+                        )).into();
+                        new_fd.items = cache.callable_bodies.intern(new_fd.items);
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
                     // §16.6/§16.8: a named property or sequence of an INLINED
@@ -41948,7 +42023,7 @@ fn inline_module_items(
                         }
                         let formal_names: Vec<&str> =
                             td.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        new_td.items = with_shadowed(
+                        new_td.items = crate::ast::cache::without_scope_caches(|| with_shadowed(
                             &formal_names,
                             &rewrite_port_map,
                             &task_locals,
@@ -41961,7 +42036,8 @@ fn inline_module_items(
                                     &sub_interface_map,
                                 )
                             },
-                        );
+                        )).into();
+                        new_td.items = cache.callable_bodies.intern(new_td.items);
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
@@ -41972,7 +42048,18 @@ fn inline_module_items(
                             Some(&elab),
                             Some(&inst_prefix),
                         )?;
-                        let scoped = module_class_scope::class(cd, &inst_prefix, &class_bindings);
+                        let mut scoped = module_class_scope::class(cd, &inst_prefix, &class_bindings);
+                        for item in &mut scoped.items {
+                            if let ClassItem::Method(method) = item {
+                                let body = match &mut method.kind {
+                                    ClassMethodKind::Function(f)
+                                    | ClassMethodKind::Extern(f)
+                                    | ClassMethodKind::PureVirtual(f) => &mut f.items,
+                                    ClassMethodKind::Task(t) => &mut t.items,
+                                };
+                                *body = cache.callable_bodies.intern(std::mem::take(body));
+                            }
+                        }
                         register_class_enum_members(&scoped, elab);
                         register_class_covergroups(&scoped, elab);
                         register_class_scoped_typedef_aliases(&scoped, None, elab);
@@ -42307,6 +42394,9 @@ fn inline_module_items(
                     }
                 }
                 clear_type_bind_tls();
+                // Signature rewriting is complete; do not retain this map
+                // through recursive child elaboration (§13.3, #721).
+                drop(param_expr_map);
 
                 // Record the instance before descending. Inlining is about to
                 // dissolve this module into the parent, so this is the only
@@ -44308,7 +44398,7 @@ fn make_i64_literal(v: i64, span: crate::ast::Span) -> Expression {
             signed: true,
             base: crate::ast::expr::NumberBase::Decimal,
             value: txt,
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     );
@@ -45192,8 +45282,8 @@ fn retarget_lvalue_net(e: &mut Expression, from: &str, to: &str) {
                     },
                     selects,
                 }];
-                h.cached_signal_id = std::cell::Cell::new(None);
-                h.cached_resolved_name = std::cell::OnceCell::new();
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
             }
         }
         ExprKind::MemberAccess { expr, .. }
@@ -45422,7 +45512,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         // The driver side: a copy of the net, same kind and shape.
         let drv = format!("{net}$netdrv");
         let mut sig = elab.signals[&net].clone();
-        sig.name = drv.clone();
+        sig.name = drv.clone().into();
         sig.direction = None;
         elab.signals.insert(drv.clone(), sig);
         elab.nets.insert(drv.clone());
@@ -45477,7 +45567,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             elab.signals.insert(
                 b.clone(),
                 Signal {
-                    name: b.clone(),
+                    name: b.clone().into(),
                     width: 1,
                     is_signed: false,
                     is_real: false,
@@ -45552,7 +45642,7 @@ fn make_z_fill(k: u32, span: Span) -> Expression {
             signed: false,
             base: NumberBase::Binary,
             value: "z".repeat(k as usize),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     )
@@ -46014,7 +46104,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             *k += 1;
             if let Some(sig) = elab.signals.get(&name) {
                 let mut sig = sig.clone();
-                sig.name = drv.clone();
+                sig.name = drv.clone().into();
                 sig.direction = None;
                 elab.signals.insert(drv.clone(), sig);
             }
@@ -46522,7 +46612,7 @@ fn lower_udp_instances(
                                 name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: name.clone(),
+                                    name: name.clone().into(),
                                     width: 1,
                                     is_signed: false,
                                     direction: None,
@@ -46628,7 +46718,7 @@ fn make_udp_int_expr(v: i64) -> Expression {
             signed: true,
             base: NumberBase::Decimal,
             value: v.unsigned_abs().to_string(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         Span::dummy(),
     );
@@ -47220,8 +47310,8 @@ fn make_ident_expr(name: &str) -> Expression {
                 selects: Vec::new(),
             }],
             span: Span::dummy(),
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         Span::dummy(),
     )
@@ -47491,8 +47581,8 @@ fn rewrite_expr_impl(
                 if !local_names.contains(hier.path[0].name.name.as_str()) {
                     let mut new_hier = hier.clone();
                     new_hier.path[0].name.name = bare.to_string();
-                    new_hier.cached_signal_id = std::cell::Cell::new(None);
-                    new_hier.cached_resolved_name = std::cell::OnceCell::new();
+                    new_hier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    new_hier.cached_resolved_name = crate::ast::cache::NameCache::new();
                     let bare_expr = Expression::new(ExprKind::Ident(new_hier), expr.span);
                     return rewrite_expr_impl(
                         &bare_expr,
@@ -48940,8 +49030,8 @@ pub fn substitute_bare_idents_stmt(
                 selects: Vec::new(),
             }],
             span: stmt.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         };
         port_map.insert(
             from.clone(),
@@ -49016,8 +49106,8 @@ pub fn rename_process_shadowed_locals(
                             selects: Vec::new(),
                         }],
                         span: d.name.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
                     };
                     map.insert(
                         d.name.name.clone(),
@@ -50352,7 +50442,7 @@ fn process_import(
                                             assign.name.name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: assign.name.name.clone(),
+                                                name: assign.name.name.clone().into(),
                                                 width,
                                                 is_signed: signed,
                                                 is_real,
@@ -50422,7 +50512,7 @@ fn process_import(
                                                 nm.clone(),
                                                 Signal {
                                                     is_const: false,
-                                                    name: nm.clone(),
+                                                    name: nm.clone().into(),
                                                     width: base_width,
                                                     is_signed: false,
                                                     is_real: false,
@@ -50559,7 +50649,7 @@ fn process_import(
                                         decl.name.name.clone(),
                                         Signal {
                                             is_const: dd.const_kw,
-                                            name: decl.name.name.clone(),
+                                            name: decl.name.name.clone().into(),
                                             width,
                                             is_signed,
                                             is_real,
@@ -50770,7 +50860,7 @@ fn process_import(
                                             assign.name.name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: assign.name.name.clone(),
+                                                name: assign.name.name.clone().into(),
                                                 width,
                                                 is_signed: signed,
                                                 is_real,
@@ -50963,7 +51053,7 @@ fn process_import(
                                     decl.name.name.clone(),
                                     Signal {
                                         is_const: dd.const_kw,
-                                        name: decl.name.name.clone(),
+                                        name: decl.name.name.clone().into(),
                                         width,
                                         is_signed,
                                         is_real,
@@ -51168,7 +51258,7 @@ mod logged_map_tests {
         let id = table.ident.0;
         sync_typedefs_tls(&table);
         let seen = table.log.len();
-        let mut older_snapshot = table.map.clone();
+        let mut older_snapshot = (*table.map).clone();
 
         for _ in 0..1000 {
             assert_eq!(table.insert_if_changed("word_t".into(), 8), Some(8));
@@ -51521,5 +51611,179 @@ mod package_net_tests {
             );
             assert_eq!(elab.supply_nets.contains("s"), bare_is_net, "{source}");
         }
+    }
+}
+
+#[cfg(test)]
+mod prepared_process_ownership_tests {
+    use super::*;
+
+    /// §23.10/§27.5: prepared environments stay distinct, while identical
+    /// source syntax shares ownership; selecting another branch must differ.
+    #[test]
+    fn different_prepared_keys_share_only_identical_process_sources() {
+        let parsed = crate::parse(
+            "module leaf #(parameter ID=0, SEL=0)(input logic a, output logic y);
+               initial y=ID;
+               if (SEL) begin: chosen initial y=1; end
+               else begin: other initial y=0; end
+             endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        let definitions = HashMap::from_iter([("leaf".to_string(), Definition::Module(module))]);
+        let base = HashMap::default();
+        let scope = param_scope::ParamScope::new(
+            &base, &definitions, &HashMap::default(), &HashMap::default(),
+        );
+        let mut cache = InlinePrepCache::default();
+        let mut prepare = |id, sel| {
+            let params = HashMap::from_iter([
+                ("ID".into(), Value::from_u64(id, 32)),
+                ("SEL".into(), Value::from_u64(sel, 32)),
+            ]);
+            prepare_module_items(definitions["leaf"], &definitions, &params,
+                &HashMap::default(), &mut cache, &scope)
+        };
+        let a = prepare(1, 0);
+        let b = prepare(2, 0);
+        let c = prepare(2, 1);
+        assert_eq!(cache.len(), 3);
+        assert!(!Rc::ptr_eq(&a, &b));
+        let sources = |prepared: &PreparedModuleItems| {
+            prepared.body_sources.iter().filter_map(|body| match body {
+                BodySource::Initial(body, _) => Some(Rc::clone(body)),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        let a = sources(&a);
+        let b = sources(&b);
+        let c = sources(&c);
+        assert_eq!((a.len(), b.len(), c.len()), (2, 2, 2));
+        assert!(Rc::ptr_eq(&a[0], &b[0]));
+        assert!(Rc::ptr_eq(&a[1], &b[1]));
+        assert!(Rc::ptr_eq(&b[0], &c[0]));
+        assert!(!Rc::ptr_eq(&b[1], &c[1]));
+    }
+
+    /// #721, IEEE 1800-2023 §9.2.1/§9.2.2 and §23.6: a prepared process
+    /// retains one complete source tree, while its ordering/scope wrapper and
+    /// name/driver analysis survive. Cache hits and bound-instance copies share
+    /// that source rather than retaining another owned statement tree.
+    #[test]
+    fn prepared_processes_keep_one_body_and_share_it_across_cache_and_bind_copies() {
+        let parsed = crate::parse(
+            "module leaf(input logic a, output logic [31:0] y, output logic q);
+               initial begin : boot y = 8'h2a; y = 3000000000; end
+               always_comb begin : drive q = a; end
+             endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        let original = format!("{:?}", module.items);
+        let definitions = HashMap::from_iter([("leaf".to_string(), Definition::Module(module))]);
+        let params = HashMap::default();
+        let scope = param_scope::ParamScope::new(
+            &params,
+            &definitions,
+            &HashMap::default(),
+            &HashMap::default(),
+        );
+        let mut cache = InlinePrepCache::default();
+        let prepared = prepare_module_items(
+            definitions["leaf"],
+            &definitions,
+            &params,
+            &HashMap::default(),
+            &mut cache,
+            &scope,
+        );
+        assert!(prepared.local_names.contains("boot"));
+        assert!(prepared.local_names.contains("drive"));
+        assert!(prepared.body_driven_ports.contains("y"));
+        assert!(prepared.body_driven_ports.contains("q"));
+        assert!(!prepared.body_driven_ports.contains("a"));
+        let mut sources = Vec::new();
+        for (item, body) in prepared.effective_items.iter().zip(&prepared.body_sources) {
+            let (placeholder, source, expected_len) = match (item, body) {
+                (ModuleItem::InitialConstruct(ic), BodySource::Initial(source, scope)) => {
+                    assert_eq!(&ic.gen_scope, scope);
+                    (&ic.stmt, source, 2)
+                }
+                (ModuleItem::AlwaysConstruct(ac), BodySource::Always(kind, source, scope)) => {
+                    assert_eq!(&ac.kind, kind);
+                    assert_eq!(&ac.gen_scope, scope);
+                    (&ac.stmt, source, 1)
+                }
+                _ => continue,
+            };
+            assert!(
+                matches!(placeholder.kind, StatementKind::Null),
+                "prepared item must not retain a second process tree"
+            );
+            assert_eq!(placeholder.span, source.span);
+            let StatementKind::SeqBlock { stmts, .. } = &source.kind else {
+                panic!("complete named block expected");
+            };
+            assert_eq!(stmts.len(), expected_len);
+            sources.push(Rc::clone(source));
+        }
+        assert_eq!(sources.len(), 2);
+        // §5.7.1: cache ordinary literals in the retained source, but leave
+        // warning-producing unsized decimal literals for their evaluator.
+        let StatementKind::SeqBlock { stmts, .. } = &sources[0].kind else {
+            unreachable!();
+        };
+        for (stmt, expected) in stmts.iter().zip([Some((42, 0, 8)), None]) {
+            let StatementKind::BlockingAssign { rvalue, .. } = &stmt.kind else {
+                panic!("assignment expected");
+            };
+            let ExprKind::Number(NumberLiteral::Integer { cached_val, .. }) = &rvalue.kind else {
+                panic!("integer literal expected");
+            };
+            assert_eq!(cached_val.get(), expected);
+        }
+        let hit = prepare_module_items(
+            definitions["leaf"],
+            &definitions,
+            &params,
+            &HashMap::default(),
+            &mut cache,
+            &scope,
+        );
+        assert!(Rc::ptr_eq(&prepared, &hit));
+        assert_eq!(cache.len(), 1);
+        // §23.11: resolved binds mutate a private prepared wrapper using
+        // make_mut; complete process sources must still be shared.
+        let mut bound = Rc::clone(&prepared);
+        Rc::make_mut(&mut bound);
+        for (old, new) in prepared.body_sources.iter().zip(&bound.body_sources) {
+            match (old, new) {
+                (BodySource::Initial(a, _), BodySource::Initial(b, _))
+                | (BodySource::Always(_, a, _), BodySource::Always(_, b, _)) => {
+                    assert!(Rc::ptr_eq(a, b));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            format!("{:?}", module.items),
+            original,
+            "preparing an instance must not consume or mutate its source definition"
+        );
+        drop(bound);
+        drop(hit);
+        drop(prepared);
+        drop(cache);
+        // Pending processes own Rc handles after the preparation cache dies.
+        assert!(
+            sources
+                .iter()
+                .all(|s| matches!(s.kind, StatementKind::SeqBlock { .. }))
+        );
     }
 }

@@ -68,11 +68,13 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
     }
 }
 
+mod ast_intern;
 pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
 mod body_type_params;
 mod param_override_lists;
+pub mod shared_names;
 mod unit_subroutine_usage;
 pub mod pkg_scope;
 pub mod sdf;
@@ -191,7 +193,8 @@ pub use value::Value;
 /// \x36 = string keys in element names escaped (`value::encode_name_key`).
 /// \x37 = \x36 + ExprKind::TypedPattern, the type of `T'{...}` (§10.9), and
 /// ElaboratedModule.param_decl_types.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x37";
+/// \x38 = \x37 + shared callable bodies and interned hierarchical signal names.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x38";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -374,6 +377,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the file size and decompression info.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
+    let _name_registry = shared_names::registry_scope();
     use std::io::Read;
 
     let stats_enabled = compression_stats_enabled();
@@ -428,6 +432,7 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
 /// Like `read_compiled` but reads from an in-memory slice (e.g. an embedded
 /// `include_bytes!()` payload in a binary produced by `--emit-native`).
 pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, String> {
+    let _name_registry = shared_names::registry_scope();
     if bytes.len() < 8 {
         return Err("xezim artifact: payload shorter than magic header".to_string());
     }
@@ -1641,6 +1646,7 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    let _name_registry = shared_names::registry_scope();
     let _declaration_order_scope = elaborate::declaration_order_scope();
     // Every elaboration starts from the same state, whatever the thread
     // elaborated before (§23.11 binds elaborate a design twice).
@@ -2266,7 +2272,10 @@ fn parse_and_elaborate(
     // Match the later top selection when a missing named top may fall back
     // to automatic detection with strict-top checking disabled.
     let named_top = top_module_name.filter(|name| definitions.contains_key(*name));
-    let unit_carrier = if top_level_functions.is_empty() && top_level_tasks.is_empty() {
+    let unit_carrier = if top_level_functions.is_empty()
+        && top_level_tasks.is_empty()
+        && top_level_params.is_empty()
+    {
         None
     } else if let Some(name) = named_top {
         definitions
@@ -2309,6 +2318,48 @@ fn parse_and_elaborate(
         &top_level_dpi_imports,
         &top_level_dpi_exports,
     ));
+
+    // §3.12.1 / §6.20: compilation-unit constants need not become owned
+    // declarations and parameter/signal/type entries in every unrelated
+    // definition and instance. Retain all constants on the root carrier for
+    // diagnostics and global lookup. Elsewhere discard only constants unused
+    // throughout the design: a reference from another scope (including a
+    // hierarchical reference) conservatively retains the constant everywhere.
+    // Do not seed from the parameter declarations themselves: their names
+    // would mark every candidate used. Follow their dependencies instead.
+    let unit_param_usage = unit_subroutine_usage::Usage::parameters(&top_level_params);
+    let mut needed_unit_params = unit_param_usage.references(&(
+        (&top_level_functions, &top_level_tasks, &top_level_nettypes),
+        (&top_level_vars, &top_level_nets, &top_level_covergroups),
+        (
+            &top_level_assertion_decls,
+            &top_level_dpi_imports,
+            &top_level_dpi_exports,
+        ),
+        (&top_level_lets, &top_level_binds, &top_level_ooc_constraints),
+        (&top_level_imports, &class_defs, &typedef_defs),
+    ));
+    for def in definitions.values() {
+        let refs = match def {
+            SourceDefinition::Module(d) => unit_param_usage.references(d),
+            SourceDefinition::Interface(d) => unit_param_usage.references(d),
+            SourceDefinition::Program(d) => unit_param_usage.references(d),
+            SourceDefinition::Class(d) => unit_param_usage.references(d),
+            SourceDefinition::Package(d) => unit_param_usage.references(d),
+            SourceDefinition::Typedef(d) => unit_param_usage.references(d),
+            SourceDefinition::Udp(d) => unit_param_usage.references(d),
+        };
+        needed_unit_params.extend(refs);
+    }
+    // Library modules are adopted below, after unit injection. Their bodies
+    // may contain hierarchical references into these definitions that this
+    // scan cannot see yet. Keep all candidates until those sources can be
+    // included in the dependency scan as well.
+    let lib_cli = library_cli_cell().lock().unwrap().clone();
+    if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
+        needed_unit_params.extend(unit_param_usage.references(&top_level_params));
+    }
+    let needed_unit_params = unit_param_usage.close(needed_unit_params);
 
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
@@ -2421,7 +2472,7 @@ fn parse_and_elaborate(
                     }
                     let mut f = f.clone();
                     if let Some(items) = subst_body(&f.items, &f.ports) {
-                        f.items = items;
+                        f.items = items.into();
                     }
                     items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
                 }
@@ -2433,7 +2484,7 @@ fn parse_and_elaborate(
                     }
                     let mut t = t.clone();
                     if let Some(items) = subst_body(&t.items, &t.ports) {
-                        t.items = items;
+                        t.items = items.into();
                     }
                     items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t));
                 }
@@ -2498,11 +2549,33 @@ fn parse_and_elaborate(
                 // declaring only `B`, dropping the whole declaration would have
                 // lost `A` and keeping it re-declared `B`.
                 for p in top_level_params.iter().rev() {
+                    let needed = |name: &str| retain_all || needed_unit_params.contains(name);
+                    let keep = match &p.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } => assignments
+                            .iter()
+                            .any(|a| !local_decl_names.contains(&a.name.name) && needed(&a.name.name)),
+                        ast::decl::ParameterKind::Type { assignments } => {
+                            assignments.iter().any(|a| needed(&a.name.name))
+                        }
+                    };
+                    if !keep {
+                        continue;
+                    }
                     let mut p = p.clone();
-                    if let ast::decl::ParameterKind::Data { assignments, .. } = &mut p.kind {
-                        assignments.retain(|a| !local_decl_names.contains(&a.name.name));
-                        if assignments.is_empty() {
-                            continue;
+                    match &mut p.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } => {
+                            assignments.retain(|a| {
+                                !local_decl_names.contains(&a.name.name) && needed(&a.name.name)
+                            });
+                            if assignments.is_empty() {
+                                continue;
+                            }
+                        }
+                        ast::decl::ParameterKind::Type { assignments } => {
+                            assignments.retain(|a| needed(&a.name.name));
+                            if assignments.is_empty() {
+                                continue;
+                            }
                         }
                     }
                     items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p));
@@ -2585,7 +2658,6 @@ fn parse_and_elaborate(
     // as the top and run. An include dir is a search path, not a compile list.
     let explicit_def_names: std::collections::HashSet<String> =
         definitions.keys().cloned().collect();
-    let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(
             &mut definitions,
@@ -2686,7 +2758,7 @@ fn parse_and_elaborate(
                                 signed: true,
                                 base: ast::expr::NumberBase::Decimal,
                                 value: v.to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             e.span,
                         );
@@ -2729,7 +2801,7 @@ fn parse_and_elaborate(
                                                     signed: true,
                                                     base: ast::expr::NumberBase::Decimal,
                                                     value: n.to_string(),
-                                                    cached_val: std::cell::Cell::new(None),
+                                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                                 },
                                             ),
                                             *span,

@@ -397,7 +397,7 @@ fn merge_packed(mut rep: DataType, mut outer: Vec<PackedDimension>) -> Option<Da
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: v.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 ))
@@ -1223,8 +1223,8 @@ fn ident_expr(name: String, span: crate::ast::Span) -> Expression {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         }),
         span,
     )
@@ -3249,7 +3249,7 @@ endmodule
                     StatementKind::SeqBlock { stmts, .. } => stmts,
                     _ => panic!("expected a block"),
                 },
-                ModuleItem::FunctionDeclaration(f) => f.items,
+                ModuleItem::FunctionDeclaration(f) => f.items.into_vec(),
                 _ => continue,
             };
             assert_eq!(declared_type(&stmts[0]), "copper::word_t");

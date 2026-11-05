@@ -1320,7 +1320,7 @@ pub struct FunctionDeclaration {
     pub return_type: DataType,
     pub name: TypeName,
     pub ports: Vec<FunctionPort>,
-    pub items: Vec<super::stmt::Statement>,
+    pub items: super::shared_vec::SharedVec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
     /// Non-ANSI body port declarations (`function f; input int x; …`). The
     /// main parser otherwise discards these (they parse to a `Null` stmt);
@@ -1345,7 +1345,7 @@ pub struct TaskDeclaration {
     pub specifier: Option<MethodSpecifier>,
     pub name: TypeName,
     pub ports: Vec<FunctionPort>,
-    pub items: Vec<super::stmt::Statement>,
+    pub items: super::shared_vec::SharedVec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
     /// Non-ANSI body port declarations (`task t; input int x; …`); retained
     /// only for the strict-check pass. Not consumed by elaboration.

@@ -291,11 +291,14 @@ pub(super) fn class(
                 for name in stmt_list_declared_names(body) {
                     method_bindings.remove(name);
                 }
-                for s in body {
+                // §8.3/§13.4: rewrite from the shared source directly. Mutating
+                // the cloned body first would copy every statement before the
+                // rewriter builds a second copy.
+                *body = crate::ast::cache::without_scope_caches(|| body.iter().map(|s| {
                     // Prefix only class aliases, keeping existing ownership
                     // rules for ordinary method locals and module variables.
-                    *s = rewrite_stmt(s, prefix, &method_bindings, &empty_names, &empty_interfaces);
-                }
+                    rewrite_stmt(s, prefix, &method_bindings, &empty_names, &empty_interfaces)
+                }).collect());
             }
             _ => {}
         }

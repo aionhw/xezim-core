@@ -1,8 +1,10 @@
 //! Abstract Syntax Tree definitions for SystemVerilog IEEE 1800-2017/2023.
 
+pub mod cache;
 pub mod decl;
 pub mod expr;
 pub mod module;
+pub mod shared_vec;
 pub mod stmt;
 pub mod types;
 

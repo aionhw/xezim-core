@@ -58,8 +58,8 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: sp,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 };
                 return Some(Expression::new(ExprKind::Ident(hier), sp));
             }
@@ -86,8 +86,8 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span: sp,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             };
             return Some(Expression::new(ExprKind::Ident(hier), sp));
         }
@@ -208,7 +208,7 @@ impl Parser {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -748,8 +748,8 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             span,
         )
@@ -1493,7 +1493,7 @@ impl Parser {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -1719,8 +1719,8 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
             }),
             span,
         );
@@ -4388,8 +4388,8 @@ impl Parser {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
         };
         Some(Expression::new(ExprKind::Ident(hier), span))
     }
@@ -6173,8 +6173,8 @@ impl Parser {
                     root: None,
                     path,
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
                 }),
                 span,
             )

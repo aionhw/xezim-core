@@ -510,23 +510,27 @@ impl Parser {
         for p in &ports {
             self.hide_let_name(&p.name.name);
         }
-        while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
-            if matches!(
-                self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
-            ) {
-                // §13.4.2 non-ANSI body ports fill `ports` for arg binding
-                // (ANSI functions already have a non-empty `ports` here).
-                let n0 = ports.len();
-                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
-                for i in n0..ports.len() {
-                    let n = ports[i].name.name.clone();
-                    self.hide_let_name(&n);
+        // §13.3/§13.4: declaration clones share this body, including package
+        // and generic-class uses that need no instance rewrite.
+        crate::ast::cache::without_scope_caches(|| {
+            while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+                ) {
+                    // §13.4.2 non-ANSI body ports fill `ports` for arg binding
+                    // (ANSI functions already have a non-empty `ports` here).
+                    let n0 = ports.len();
+                    self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                    for i in n0..ports.len() {
+                        let n = ports[i].name.name.clone();
+                        self.hide_let_name(&n);
+                    }
+                } else {
+                    self.parse_block_item(&mut items);
                 }
-            } else {
-                self.parse_block_item(&mut items);
             }
-        }
+        });
         self.pop_let_scope();
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
@@ -546,7 +550,7 @@ impl Parser {
             return_type,
             name,
             ports,
-            items,
+            items: items.into(),
             endlabel,
             strict_body_ports,
             default_args,
@@ -660,21 +664,25 @@ impl Parser {
         for p in &ports {
             self.hide_let_name(&p.name.name);
         }
-        while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
-            if matches!(
-                self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
-            ) {
-                let n0 = ports.len();
-                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
-                for i in n0..ports.len() {
-                    let n = ports[i].name.name.clone();
-                    self.hide_let_name(&n);
+        // §13.3/§13.4: declaration clones share this body, including package
+        // and generic-class uses that need no instance rewrite.
+        crate::ast::cache::without_scope_caches(|| {
+            while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+                ) {
+                    let n0 = ports.len();
+                    self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                    for i in n0..ports.len() {
+                        let n = ports[i].name.name.clone();
+                        self.hide_let_name(&n);
+                    }
+                } else {
+                    self.parse_block_item(&mut items);
                 }
-            } else {
-                self.parse_block_item(&mut items);
             }
-        }
+        });
         self.pop_let_scope();
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
@@ -685,7 +693,7 @@ impl Parser {
             specifier,
             name,
             ports,
-            items,
+            items: items.into(),
             endlabel,
             strict_body_ports,
             span: self.span_from(start),
@@ -989,7 +997,7 @@ impl Parser {
             return_type,
             name,
             ports,
-            items: Vec::new(),
+            items: Default::default(),
             endlabel: None,
             strict_body_ports: Vec::new(),
             default_args,
@@ -1010,7 +1018,7 @@ impl Parser {
             specifier,
             name,
             ports,
-            items: Vec::new(),
+            items: Default::default(),
             endlabel: None,
             strict_body_ports: Vec::new(),
             span: self.span_from(start),

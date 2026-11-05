@@ -5,7 +5,6 @@ use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral
 use crate::ast::stmt::*;
 use crate::ast::types::{DataType, Lifetime, SimpleType};
 use crate::lexer::token::TokenKind;
-use std::cell::Cell;
 use std::collections::HashMap;
 
 impl Parser {
@@ -2262,7 +2261,7 @@ impl Parser {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: delay.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 );
@@ -2494,7 +2493,7 @@ impl Parser {
                 signed: true,
                 base: NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         );
@@ -2774,7 +2773,7 @@ fn expand_alt(prods: &ProdMap, alt: &RsAlt, depth: &mut u32, span: crate::ast::S
                 signed: true,
                 base: NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             sp,
         )
