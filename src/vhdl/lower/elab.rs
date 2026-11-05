@@ -1725,7 +1725,6 @@ impl<'a> Lw<'a> {
             self.inst = inst;
             self.cur_proc = Some(gp);
             self.temps.clear();
-            self.proc_slow = false;
             let func = self.fprocs.contains(&gp);
             let body = self.stmts(&p.stmts, if func { 4 } else { 6 });
             let mut implicit = String::new();
@@ -1741,12 +1740,7 @@ impl<'a> Lw<'a> {
                 );
             }
             let mut temps = String::new();
-            let mut slow = self.proc_slow;
             for (n, t) in std::mem::take(&mut self.temps) {
-                // A temporary of a struct type: the body copies structs.
-                if t.starts_with("vh_") {
-                    slow = true;
-                }
                 let _ = writeln!(temps, "    {} {};", t, n);
             }
             let label = if p.label.is_empty() {
@@ -1770,12 +1764,6 @@ impl<'a> Lw<'a> {
                         temps = temps,
                         body = body
                     );
-                }
-                if slow {
-                    self.fproc_bodies
-                        .push((gp, String::new(), format!("    vh_run{}();\n", gp)));
-                } else {
-                    self.fproc_bodies.push((gp, temps, body));
                 }
                 continue;
             }
@@ -2622,13 +2610,13 @@ impl<'a> Lw<'a> {
             let _ = writeln!(ub, "    if (vh_s{s}_act) vh_s{s}_lact = vh_now;", s = s);
         }
         ub.push_str(&self.boundary_write(false, "    "));
-        if boundary {
-            let _ = write!(
-                k,
-                "  // The update phase of a simulation cycle (§14.7.3, §14.7.5.3 b, c).\n  function automatic void vh_update();\n{}  endfunction\n",
-                ub
-            );
-        }
+        // Always a function. Pasting this into the cycle block makes that
+        // block too large to compile, so every clock edge interprets it.
+        let _ = write!(
+            k,
+            "  // The update phase of a simulation cycle (§14.7.3, §14.7.5.3 b, c).\n  function automatic void vh_update();\n{}  endfunction\n",
+            ub
+        );
 
         // ---- the resumption of processes (§14.7.5.3 e): the conditions.
         let mut conds: Vec<Option<String>> = Vec::new();
@@ -2689,11 +2677,13 @@ impl<'a> Lw<'a> {
             k.push_str(&self.eager_sv());
         }
 
-        // ---- the cycle blocks: the update phase, the resumption scan from
-        // vh_from, the next cycle's time; split into a chain of always
-        // blocks of bounded size (a block too large for the simulator's
-        // register file is interpreted). Each block triggers the next; the
-        // last acknowledges the kernel.
+        // ---- the cycle blocks: one call to vh_update, one vh_sens/vh_run
+        // pair per resumed process, then vh_next. Each of those functions is
+        // its own block. The edge-block compiler names them with
+        // `vhdl_kernel_cycle_fn` and emits CallFreeFunction instead of
+        // inlining up to EDGE_INLINE_MAX; inlining pastes the bodies back
+        // into vh_tick (aionhw/xezim-core#155). The chain below only fires
+        // when the call list itself exceeds MAX_LINES.
         const MAX_LINES: usize = 2500;
         #[derive(PartialEq, Clone, Copy)]
         enum Seg {
@@ -2702,23 +2692,11 @@ impl<'a> Lw<'a> {
             Next,
         }
         let mut segs: Vec<(Seg, String)> = Vec::new();
-        for line in ub.lines() {
-            segs.push((Seg::Update, format!("  {}\n", line)));
-        }
-        let bodies: std::collections::BTreeMap<usize, (String, String)> = self
-            .fproc_bodies
-            .iter()
-            .map(|(gp, t, b)| (*gp, (t.clone(), b.clone())))
-            .collect();
-        // The blocks' variables at module scope: a block-local declaration
-        // keeps the simulator from compiling the block.
+        segs.push((Seg::Update, "    vh_update();\n".into()));
+        // Temporaries stay inside each vh_run. Hoisting them here declared
+        // every process local at module scope after the bodies had moved.
         let mut cyc = String::new();
-        let _ = writeln!(cyc, "  longint vh_cyc_n;");
-        for (temps, _) in bodies.values() {
-            for line in temps.lines() {
-                let _ = writeln!(cyc, "  {}", line.trim_start());
-            }
-        }
+        let mut sens = String::new();
         for (pi, c) in conds.iter().enumerate() {
             let Some(c) = c.clone() else { continue };
             let mut t = String::new();
@@ -2730,17 +2708,21 @@ impl<'a> Lw<'a> {
                     c = c
                 );
             } else if fp.contains(&pi) {
-                let body = bodies.get(&pi).map(|b| b.1.clone()).unwrap_or_default();
+                // The body stays in vh_run, and the sensitivity test stays in
+                // its own function. Inlining either into this always block
+                // makes the block too large to compile, which is where a
+                // clock edge was spending its time.
                 let _ = writeln!(
-                    t,
-                    "    if (vh_r < 0 && vh_from <= {p} && ({c})) begin",
+                    sens,
+                    "  function automatic bit vh_sens{p}();\n    return ({c});\n  endfunction",
                     p = pi,
                     c = c
                 );
-                for line in body.lines() {
-                    let _ = writeln!(t, "  {}", line);
-                }
-                let _ = writeln!(t, "    end");
+                let _ = writeln!(
+                    t,
+                    "    if (vh_r < 0 && vh_from <= {p} && vh_sens{p}()) vh_run{p}();",
+                    p = pi
+                );
             } else {
                 let _ = writeln!(
                     t,
@@ -2751,18 +2733,9 @@ impl<'a> Lw<'a> {
             }
             segs.push((Seg::Scan, t));
         }
-        segs.push((Seg::Next, "      vh_cyc_n = -64'sd1;\n".into()));
-        for line in nx.lines() {
-            // `vh_n` only (not `vh_now`).
-            segs.push((
-                Seg::Next,
-                format!(
-                    "  {}\n",
-                    line.replace("vh_now", "\u{1}").replace("vh_n", "vh_cyc_n").replace('\u{1}', "vh_now")
-                ),
-            ));
-        }
-        segs.push((Seg::Next, "      vh_nxt = vh_cyc_n;\n".into()));
+        // `vh_next` already holds this. Pasting it here has the same effect
+        // as pasting the update: the cycle block stops compiling.
+        segs.push((Seg::Next, "      vh_nxt = vh_next();\n".into()));
         // Pack the segments into blocks.
         let mut blocks: Vec<Vec<(Seg, String)>> = vec![Vec::new()];
         let mut lines = 0usize;
@@ -2825,6 +2798,7 @@ impl<'a> Lw<'a> {
             }
             let _ = writeln!(cyc, "  end");
         }
+        k.push_str(&sens);
         k.push_str(&cyc);
 
         // ---- the kernel thread.

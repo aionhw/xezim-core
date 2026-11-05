@@ -200,12 +200,6 @@ struct Lw<'a> {
     /// Processes with a sensitivity list, run by the kernel's cycle block
     /// (and lowered as functions in a mixed design, for the eager path).
     fprocs: BTreeSet<usize>,
-    /// Their bodies: process, temporaries, statements.
-    fproc_bodies: Vec<(usize, String, String)>,
-    /// The process being lowered assigns a record or struct-array
-    /// variable: it runs as a called function (the simulator's compiled
-    /// `always` blocks do not copy structs between module variables).
-    proc_slow: bool,
     /// The leaf transactions being emitted are a zero-delay inertial
     /// assignment (the pending fast path applies, leaves.rs).
     leaf_zero: bool,
@@ -339,8 +333,6 @@ impl<'a> Lw<'a> {
             sv_wires: String::new(),
             sv_nets: 0,
             fprocs: BTreeSet::new(),
-            fproc_bodies: Vec::new(),
-            proc_slow: false,
             leaf_zero: false,
             leaf_vars: BTreeSet::new(),
             clocked: BTreeSet::new(),
@@ -3103,23 +3095,6 @@ impl<'a> Lw<'a> {
         }
     }
 
-    /// Whether an assignment target is, or is part of, a variable of a
-    /// record or struct-array representation.
-    fn struct_root(&mut self, t: &HExpr) -> bool {
-        let mut cur = t;
-        loop {
-            match &cur.kind {
-                HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) => {
-                    if matches!(self.erepr(cur), Repr::Rec(_) | Repr::Arr(..)) {
-                        return true;
-                    }
-                    cur = b;
-                }
-                _ => return matches!(self.erepr(cur), Repr::Rec(_) | Repr::Arr(..)),
-            }
-        }
-    }
-
     /// An lvalue: the target of a variable assignment.
     fn assign_to(&mut self, target: &HExpr, value: String, ind: usize) -> String {
         let pad = " ".repeat(ind);
@@ -3332,9 +3307,6 @@ impl<'a> Lw<'a> {
                     ty: o.ty,
                     loc: o.loc.clone(),
                 };
-                if self.struct_root(&target) {
-                    self.proc_slow = true;
-                }
                 let r = self.obj_repr(*l, &o.loc);
                 let v = match (&o.init, &r) {
                     (Some(i), _) => self.store_value_init(&target, i),
@@ -3344,9 +3316,6 @@ impl<'a> Lw<'a> {
                 self.assign_to(&target, v, ind)
             }
             HStmtKind::VarAssign { target, value } => {
-                if self.struct_root(target) {
-                    self.proc_slow = true;
-                }
                 let v = self.store_value(target, value);
                 self.assign_to(target, v, ind)
             }
