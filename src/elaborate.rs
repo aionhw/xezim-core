@@ -13011,39 +13011,7 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
-                        // Same element-width/full-dims registration the
-                        // variable path does: `PARAM[i]` on a multi-dim packed
-                        // parameter must element-select, not bit-select.
-                        if let Some(elem_w) =
-                            packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs)
-                        {
-                            // The CONST-eval index arm reads its own TLS table
-                            // (only `register_packed_array_elem_w` fed it, which
-                            // handles a typedef'd element type). Without this a
-                            // `localparam logic [1:0][7:0] MP` element select
-                            // `MP[0]` in another localparam bit-selected instead.
-                            // The runtime map is `register_packed_param_index`.
-                            tls_register_elem_w(&assign.name.name, elem_w);
-                        }
-                        if let Some((ew, msb0)) =
-                            packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types)
-                        {
-                            tls_register_elem_w(&assign.name.name, ew);
-                            if msb0 {
-                                tls_register_elem_msb0(&assign.name.name);
-                            }
-                        }
-                        // A typedef'd array (`exp_arr_t EXPS`, `enc_t [0:4] LOCAL`)
-                        // has its dims on the typedef or as a single ascending
-                        // range. `packed_inner_elem_width` / `packed_full_dims_of`
-                        // miss those, so a variable index bit-selects or reads
-                        // the last element.
-                        register_packed_param_index(
-                            &mut elab,
-                            &assign.name.name,
-                            data_type,
-                            None,
-                        );
+                        register_packed_param_shape(&mut elab, &assign.name.name, data_type);
                         let mut current_width = width;
                         let mut current_is_real = is_real;
                         let mut current_signed = signed;
@@ -19211,6 +19179,26 @@ fn elaborate_items_numbered(
                             "parameter/localparam",
                             true,
                         );
+                        // §27, §6.20.2: a generate scope holds the same shapes
+                        // as a module body. Without this an unpacked array got
+                        // no elements, so every `A[i]` read 0, and an index of
+                        // a packed array bit-selected.
+                        if !assign.dimensions.is_empty() {
+                            let params_snapshot = elab.parameters.clone();
+                            if register_array_param(
+                                elab,
+                                "",
+                                &assign.name.name,
+                                &assign.dimensions,
+                                assign.init.as_ref(),
+                                None,
+                                data_type,
+                                &params_snapshot,
+                            ) {
+                                continue;
+                            }
+                        }
+                        register_packed_param_shape(elab, &assign.name.name, data_type);
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
                                 // §6.20.2 + §5.7.1: an implicit-type parameter
@@ -27162,6 +27150,30 @@ fn register_array_param(
     )
 }
 
+/// An index of a multi-dimensional packed parameter is an element select, not
+/// a bit select, the same registration the variable path does.
+fn register_packed_param_shape(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
+    if let Some(elem_w) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
+        // The CONST-eval index arm reads its own TLS table (only
+        // `register_packed_array_elem_w` fed it, which handles a typedef'd
+        // element type). Without this a `localparam logic [1:0][7:0] MP`
+        // element select `MP[0]` in another localparam bit-selected instead.
+        // The runtime map is `register_packed_param_index`.
+        tls_register_elem_w(name, elem_w);
+    }
+    if let Some((ew, msb0)) = packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types) {
+        tls_register_elem_w(name, ew);
+        if msb0 {
+            tls_register_elem_msb0(name);
+        }
+    }
+    // A typedef'd array (`exp_arr_t EXPS`, `enc_t [0:4] LOCAL`) has its dims on
+    // the typedef or as a single ascending range. `packed_inner_elem_width` /
+    // `packed_full_dims_of` miss those, so a variable index bit-selects or
+    // reads the last element.
+    register_packed_param_index(elab, name, data_type, None);
+}
+
 /// `base.member` as a hierarchical IDENTIFIER when `base` is a whole-net
 /// identifier, falling back to a `MemberAccess` node otherwise.
 ///
@@ -32983,11 +32995,25 @@ fn rename_item_decls(
         }
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
             let mut new_pd = pd.clone();
-            if let ParameterKind::Data { assignments, .. } = &mut new_pd.kind {
+            if let ParameterKind::Data {
+                data_type,
+                assignments,
+            } = &mut new_pd.kind
+            {
+                // The type and dimensions may name a renamed sibling
+                // localparam, as a data declaration's may.
+                *data_type =
+                    rewrite_data_type_genvar(data_type, port_map, local_names, interface_map);
                 for a in assignments {
                     if rename_set.contains(&a.name.name) {
                         a.name.name = rename.apply(&a.name.name);
                     }
+                    a.dimensions = rewrite_unpacked_dims_genvar(
+                        &a.dimensions,
+                        port_map,
+                        local_names,
+                        interface_map,
+                    );
                     if let Some(init) = &a.init {
                         a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
                     }
@@ -33295,6 +33321,33 @@ fn rewrite_unpacked_dims_scoped(
                     ))
                 }),
                 span: *span,
+            },
+            // `[N]` parses as an associative index until `N` is known not to be
+            // a type (`normalize_unpacked_dims`). A generate rename maps a
+            // sibling localparam or genvar, which cannot be a type, so bind the
+            // name now: later the bare `N` resolves to nothing.
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                span,
+            } if prefix.is_empty() => match dt.as_ref() {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty()
+                    && name.scopes.is_empty()
+                    && port_map.contains_key(&name.name.name) =>
+                {
+                    UnpackedDimension::Expression {
+                        expr: Box::new(rewrite_expr(
+                            &make_ident_expr(&name.name.name),
+                            prefix,
+                            port_map,
+                            local_names,
+                            interface_map,
+                        )),
+                        span: *span,
+                    }
+                }
+                _ => d.clone(),
             },
             other => other.clone(),
         })
