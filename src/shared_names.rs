@@ -2,24 +2,92 @@
 //! and is scoped to elaboration or artifact loading; live designs continue to
 //! own their names after the registry and its allocation are released.
 
-use crate::hasher::HashMap;
+use crate::hasher::{DeterministicState, HashMap};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, Cow},
     cell::RefCell,
     collections::hash_map,
-    hash::{Hash, Hasher},
+    hash::{BuildHasher, Hash, Hasher},
     ops::{Deref, Index},
     sync::{Arc, Weak},
 };
 
+/// The usual hash has one weak pointer inline in its table entry. Only
+/// genuine hash collisions allocate a candidate vector; neither table owns
+/// name text. Equality always checks the complete string, regardless of hash.
+#[derive(Default)]
+struct NameRegistry {
+    primary: HashMap<u64, Weak<String>>,
+    collisions: HashMap<u64, Vec<Weak<String>>>,
+}
+
+impl NameRegistry {
+    fn intern(&mut self, hash: u64, value: Cow<'_, str>) -> Arc<String> {
+        match self.primary.entry(hash) {
+            hash_map::Entry::Vacant(entry) => {
+                let name = Arc::new(value.into_owned());
+                entry.insert(Arc::downgrade(&name));
+                name
+            }
+            hash_map::Entry::Occupied(mut entry) => {
+                let primary = entry.get().upgrade();
+                if primary
+                    .as_ref()
+                    .is_some_and(|name| name.as_str() == value.as_ref())
+                {
+                    return primary.expect("matched live name");
+                }
+                if let Some(bucket) = self.collisions.get_mut(&hash) {
+                    let mut existing = None;
+                    bucket.retain(|weak| {
+                        if let Some(name) = weak.upgrade() {
+                            if name.as_str() == value.as_ref() {
+                                existing = Some(name);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if let Some(name) = existing {
+                        return name;
+                    }
+                    if bucket.is_empty() {
+                        self.collisions.remove(&hash);
+                    }
+                }
+                // Borrowed inputs allocate only after every candidate misses.
+                let name = Arc::new(value.into_owned());
+                let weak = Arc::downgrade(&name);
+                if primary.is_none() {
+                    entry.insert(weak);
+                } else {
+                    self.collisions.entry(hash).or_default().push(weak);
+                }
+                name
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.primary.capacity() + self.collisions.capacity()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.primary.is_empty() && self.collisions.is_empty()
+    }
+}
+
 thread_local! {
-    static NAMES: RefCell<HashMap<u64, Vec<Weak<String>>>> = RefCell::new(HashMap::default());
+    static NAMES: RefCell<NameRegistry> = RefCell::new(NameRegistry::default());
     static SCOPE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn reset_registry() {
-    NAMES.with(|names| *names.borrow_mut() = HashMap::default());
+    NAMES.with(|names| *names.borrow_mut() = NameRegistry::default());
 }
 
 pub(crate) struct RegistryScope;
@@ -58,48 +126,34 @@ impl SharedName {
     }
 }
 
-impl From<String> for SharedName {
-    fn from(value: String) -> Self {
+impl SharedName {
+    fn intern(value: Cow<'_, str>) -> Self {
         // Runtime initialization and independent API users can create names
         // after elaboration returns. Do not accumulate a thread-lifetime weak
         // index for those unscoped operations.
         if SCOPE_DEPTH.with(|depth| depth.get() == 0) {
-            return Self(Arc::new(value));
+            return Self(Arc::new(value.into_owned()));
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        value.hash(&mut hasher);
+        let mut hasher = DeterministicState::default().build_hasher();
+        value.as_ref().hash(&mut hasher);
         let hash = hasher.finish();
-        NAMES.with(|names| {
-            let mut names = names.borrow_mut();
-            let bucket = names.entry(hash).or_default();
-            let mut existing = None;
-            bucket.retain(|weak| {
-                if let Some(name) = weak.upgrade() {
-                    if *name == value {
-                        existing = Some(name);
-                    }
-                    true
-                } else {
-                    false
-                }
-            });
-            if let Some(name) = existing {
-                return Self(name);
-            }
-            let name = Arc::new(value);
-            bucket.push(Arc::downgrade(&name));
-            Self(name)
-        })
+        NAMES.with(|names| Self(names.borrow_mut().intern(hash, value)))
+    }
+}
+
+impl From<String> for SharedName {
+    fn from(value: String) -> Self {
+        Self::intern(Cow::Owned(value))
     }
 }
 impl From<&str> for SharedName {
     fn from(value: &str) -> Self {
-        value.to_owned().into()
+        Self::intern(Cow::Borrowed(value))
     }
 }
 impl From<&String> for SharedName {
     fn from(value: &String) -> Self {
-        value.clone().into()
+        Self::from(value.as_str())
     }
 }
 impl From<SharedName> for String {
@@ -350,6 +404,73 @@ impl<V> IntoIterator for SharedNameMap<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_names_use_inline_weak_entries_without_collision_vectors() {
+        let _scope = registry_scope();
+        let names: Vec<_> = (0..256)
+            .map(|i| SharedName::from(format!("top.deep.leaf.PARAM_{i}")))
+            .collect();
+        for name in &names {
+            assert!(name.ptr_eq(&SharedName::from(name.as_str())));
+            assert!(name.ptr_eq(&SharedName::from(&**name)));
+        }
+        NAMES.with(|registry| {
+            let registry = registry.borrow();
+            assert_eq!(registry.primary.len(), 256);
+            assert_eq!(registry.collisions.capacity(), 0);
+            assert!(
+                registry
+                    .primary
+                    .values()
+                    .all(|name| name.strong_count() == 1)
+            );
+        });
+    }
+
+    #[test]
+    fn colliding_names_keep_distinct_storage_and_reuse_dead_primary_slots() {
+        let mut registry = NameRegistry::default();
+        let first = registry.intern(7, Cow::Borrowed("top.a.P"));
+        let second = registry.intern(7, Cow::Borrowed("top.b.P"));
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(
+            &first,
+            &registry.intern(7, Cow::Borrowed("top.a.P"))
+        ));
+        assert!(Arc::ptr_eq(
+            &second,
+            &registry.intern(7, Cow::Owned("top.b.P".into()))
+        ));
+        assert_eq!(registry.collisions[&7].len(), 1);
+        let weak_first = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak_first.upgrade().is_none());
+        let third = registry.intern(7, Cow::Borrowed("top.c.P"));
+        assert!(Arc::ptr_eq(
+            &third,
+            &registry.primary[&7].upgrade().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &second,
+            &registry.intern(7, Cow::Borrowed("top.b.P"))
+        ));
+        drop(second);
+        let fourth = registry.intern(7, Cow::Borrowed("top.d.P"));
+        assert_eq!(
+            registry.collisions[&7].len(),
+            1,
+            "dead collision is discarded"
+        );
+        assert_eq!(third.as_str(), "top.c.P");
+        assert_eq!(fourth.as_str(), "top.d.P");
+        let weak_third = Arc::downgrade(&third);
+        let weak_fourth = Arc::downgrade(&fourth);
+        drop(third);
+        drop(fourth);
+        assert!(weak_third.upgrade().is_none());
+        assert!(weak_fourth.upgrade().is_none());
+    }
     #[test]
     fn registry_allocation_is_released_on_success_and_early_error() {
         let name = {

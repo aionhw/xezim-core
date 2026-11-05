@@ -21,22 +21,6 @@ impl<T> Default for AstInterner<T> {
     }
 }
 
-struct HashWriter<H> {
-    hash: H,
-    bytes: u64,
-}
-
-impl<H: Hasher> Write for HashWriter<H> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.hash.write(bytes);
-        self.bytes += bytes.len() as u64;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 struct CompareWriter<'a> {
     expected: &'a [u8],
     position: usize,
@@ -57,31 +41,24 @@ impl Write for CompareWriter<'_> {
 
 impl<T: Serialize + Clone> AstInterner<T> {
     pub(crate) fn intern(&mut self, value: T) -> T {
-        let mut writer = HashWriter {
-            hash: DeterministicState::default().build_hasher(),
-            bytes: 0,
-        };
-        if bincode::serde::encode_into_std_write(&value, &mut writer, crate::xez_bincode_config())
-            .is_err()
-        {
+        // Encode incoming syntax once (§9.2, §13.3/§13.4). The temporary
+        // buffer also supplies exact comparison on a hit; only canonical AST
+        // handles are retained, so the index never holds serialized copies.
+        let Ok(bytes) = bincode::serde::encode_to_vec(&value, crate::xez_bincode_config()) else {
             return value;
-        }
-        self.intern_bucket(value, (writer.hash.finish(), writer.bytes))
+        };
+        let mut hash = DeterministicState::default().build_hasher();
+        hash.write(&bytes);
+        let key = (hash.finish(), bytes.len() as u64);
+        self.intern_encoded(value, &bytes, key)
     }
 
-    fn intern_bucket(&mut self, value: T, key: (u64, u64)) -> T {
+    fn intern_encoded(&mut self, value: T, bytes: &[u8], key: (u64, u64)) -> T {
         let bucket = self.buckets.entry(key).or_default();
         if !bucket.is_empty() {
-            // Only a hash match needs this temporary buffer. No serialized
-            // payload is retained in the interner, and existing candidates
-            // stream into a comparator rather than allocating a second copy.
-            let Ok(bytes) = bincode::serde::encode_to_vec(&value, crate::xez_bincode_config())
-            else {
-                return value;
-            };
             for candidate in bucket.iter() {
                 let mut compare = CompareWriter {
-                    expected: &bytes,
+                    expected: bytes,
                     position: 0,
                     equal: true,
                 };
@@ -101,6 +78,12 @@ impl<T: Serialize + Clone> AstInterner<T> {
         bucket.push(value.clone());
         value
     }
+
+    #[cfg(test)]
+    fn intern_bucket(&mut self, value: T, key: (u64, u64)) -> T {
+        let bytes = bincode::serde::encode_to_vec(&value, crate::xez_bincode_config()).unwrap();
+        self.intern_encoded(value, &bytes, key)
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +102,28 @@ mod tests {
         assert!(!Rc::ptr_eq(&first, &different));
         assert!(Rc::ptr_eq(&first, &same));
         assert_eq!(different.as_str(), "y");
+    }
+
+    /// Incoming syntax must be encoded once even when an equal body exists.
+    #[test]
+    fn cache_hit_encodes_incoming_body_once() {
+        use std::cell::Cell;
+        #[derive(Clone)]
+        struct Counted(Rc<String>, Rc<Cell<usize>>);
+        impl Serialize for Counted {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.1.set(self.1.get() + 1);
+                self.0.serialize(s)
+            }
+        }
+        let mut pool = AstInterner::default();
+        let first_count = Rc::new(Cell::new(0));
+        let first = pool.intern(Counted(Rc::new("body".into()), first_count.clone()));
+        assert_eq!(first_count.get(), 1);
+        let next_count = Rc::new(Cell::new(0));
+        let hit = pool.intern(Counted(Rc::new("body".into()), next_count.clone()));
+        assert_eq!(next_count.get(), 1);
+        assert!(Rc::ptr_eq(&first.0, &hit.0));
+        assert_eq!(first_count.get(), 2, "canonical body is compared exactly");
     }
 }
