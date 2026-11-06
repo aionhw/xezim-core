@@ -812,6 +812,9 @@ pub struct RewriteCtx {
     /// Name of the module/interface definition this body came from — the
     /// file a diagnostic's span belongs to.
     pub owner: String,
+    /// §23.8: the design's scope tree (`ElaboratedModule::upward_scopes`),
+    /// installed for `upward_scope_rewrite` while this body is rewritten.
+    pub upward: Rc<std::cell::RefCell<UpwardScopes>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1387,6 +1390,138 @@ thread_local! {
     /// Class constant declarations by class name (`register_class_consts`).
     static CLASS_CONST_DECLS_TLS: std::cell::RefCell<HashMap<String, Rc<ClassConstDecl>>>
         = std::cell::RefCell::new(HashMap::default());
+    /// §23.8: the design's scope tree for `upward_scope_rewrite`, shared
+    /// with `ElaboratedModule::upward_scopes` and every `RewriteCtx`
+    /// (installed by `inline_module_items` and `set_type_bind_tls`).
+    static UPWARD_SCOPES_TLS: std::cell::RefCell<Option<Rc<std::cell::RefCell<UpwardScopes>>>>
+        = const { std::cell::RefCell::new(None) };
+    /// §6.21 / §13.3: the names the statement lists and subroutine headers
+    /// being rewritten declare themselves (block locals, formals), innermost
+    /// last. Such a name is never a scope for `upward_scope_rewrite`: a
+    /// block-local handle named like an enclosing instance read null (the
+    /// `instance_block_locals_shadow_module_names` regression).
+    static STMT_LOCALS_TLS: std::cell::RefCell<Vec<HashSet<String>>>
+        = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pops the `STMT_LOCALS_TLS` frame `push_stmt_locals` pushed.
+struct StmtLocalsFrame;
+
+impl Drop for StmtLocalsFrame {
+    fn drop(&mut self) {
+        STMT_LOCALS_TLS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Registers `names` as statement-local for the lifetime of the returned
+/// guard; nothing is pushed for an empty set.
+fn push_stmt_locals(names: HashSet<String>) -> Option<StmtLocalsFrame> {
+    if names.is_empty() {
+        return None;
+    }
+    STMT_LOCALS_TLS.with(|s| s.borrow_mut().push(names));
+    Some(StmtLocalsFrame)
+}
+
+fn stmt_local_declared(name: &str) -> bool {
+    STMT_LOCALS_TLS.with(|s| s.borrow().iter().any(|frame| frame.contains(name)))
+}
+
+/// §23.8: what an upward hierarchical name is resolved against — the
+/// elaborated instance tree, grouped by parent scope, and per definition the
+/// scope names its source declares. Filled while the design is inlined
+/// (`inline_module_items`, the `ElabInstance` registration) and read by
+/// `upward_scope_rewrite`, both during elaboration and when a deferred body
+/// is materialized, by which time the tree is complete.
+#[derive(Debug, Default)]
+pub struct UpwardScopes {
+    /// Parent scope path (`""` = the top module) → its child instances as
+    /// `(instance name, definition name)`, bound instances included.
+    children: HashMap<String, Vec<(String, String)>>,
+    /// Instance path (`""` = the top module) → definition name.
+    defs: HashMap<String, String>,
+    /// Definition name → the scope names its source declares anywhere in
+    /// its body (instances of every generate branch, generate and block
+    /// labels, subroutines): a reference headed by one of them is a
+    /// DOWNWARD reference (§23.8 step a) even before that child is inlined.
+    declared: HashMap<String, HashSet<String>>,
+    /// §26.3: package names — `pkg.member` is the inliner's spelling of a
+    /// package constant, never a scope path.
+    packages: HashSet<String>,
+}
+
+impl UpwardScopes {
+    fn add_instance(&mut self, parent: &str, path: &str, def: &str) {
+        let leaf = match parent.is_empty() {
+            true => path,
+            false => path
+                .strip_prefix(parent)
+                .map_or(path, |p| p.trim_start_matches('.')),
+        };
+        self.children
+            .entry(parent.to_string())
+            .or_default()
+            .push((leaf.to_string(), def.to_string()));
+        self.defs.insert(path.to_string(), def.to_string());
+    }
+
+    fn declare(&mut self, def: &Definition) {
+        if self.declared.contains_key(def.name()) {
+            return;
+        }
+        let mut names = HashSet::default();
+        collect_instance_names_in_items(def.items(), &mut names);
+        collect_scope_labels_in_items(def.items(), &mut names);
+        self.declared.insert(def.name().to_string(), names);
+    }
+}
+
+/// Generate-block labels, named-block labels and subroutine names declared
+/// in `items`, nested generate blocks included (the non-instance scopes of
+/// §23.8 step a).
+fn collect_scope_labels_in_items(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(gr) => collect_scope_labels_in_items(&gr.items, out),
+            ModuleItem::GenerateIf(gi) => {
+                out.extend(gi.branch_labels.iter().flatten().cloned());
+                for (_, branch) in &gi.branches {
+                    collect_scope_labels_in_items(branch, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    out.extend(arm.label.iter().cloned());
+                    collect_scope_labels_in_items(&arm.items, out);
+                }
+            }
+            ModuleItem::GenerateFor(gf) => {
+                out.extend(gf.name.iter().cloned());
+                collect_scope_labels_in_items(&gf.items, out);
+            }
+            ModuleItem::AlwaysConstruct(a) => collect_block_labels(&a.stmt, out),
+            ModuleItem::InitialConstruct(i) => collect_block_labels(&i.stmt, out),
+            ModuleItem::FinalConstruct(f) => collect_block_labels(&f.stmt, out),
+            ModuleItem::FunctionDeclaration(f) => {
+                out.insert(f.name.name.name.clone());
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                out.insert(t.name.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn install_upward_scopes(scopes: &Rc<std::cell::RefCell<UpwardScopes>>) {
+    UPWARD_SCOPES_TLS.with(|c| {
+        let mut slot = c.borrow_mut();
+        if !slot.as_ref().is_some_and(|s| Rc::ptr_eq(s, scopes)) {
+            *slot = Some(Rc::clone(scopes));
+        }
+    });
 }
 
 fn class_const_decl(c: &ClassDeclaration) -> ClassConstDecl {
@@ -3670,6 +3805,12 @@ pub struct ElaboratedModule {
     /// enough to enumerate a scope's children. Drives the VPI object model.
     #[serde(default)]
     pub instances: Vec<ElabInstance>,
+    /// §23.8: `instances` as a scope tree for `upward_scope_rewrite`, shared
+    /// with every `RewriteCtx` so a body materialized after elaboration
+    /// resolves its upward names against the complete design. Not cached:
+    /// the artifact stores materialized bodies only.
+    #[serde(skip)]
+    pub upward_scopes: Rc<std::cell::RefCell<UpwardScopes>>,
     /// §23.11: bind directives selected for each elaborated host path.
     pub resolved_binds: HashMap<String, Vec<crate::ast::decl::BindDirective>>,
     /// Active declarations collected in their elaborated lexical scopes.
@@ -4118,6 +4259,7 @@ impl ElaboratedModule {
             interconnect_nets: HashSet::default(),
             elab_diagnostics: Vec::new(),
             instances: Vec::new(),
+            upward_scopes: Rc::default(),
             resolved_binds: HashMap::default(),
             bind_sites: Vec::new(),
             param_index: Default::default(),
@@ -36833,6 +36975,19 @@ fn inline_module_items(
         }
     }
     let _chain_pop = ChainPop;
+    // §23.8: this definition's declared scopes, and the tree every upward
+    // name in its body is resolved against (`upward_scope_rewrite`).
+    install_upward_scopes(&elab.upward_scopes);
+    {
+        let mut scopes = elab.upward_scopes.borrow_mut();
+        scopes.declare(&source_def);
+        if prefix.is_empty() {
+            scopes
+                .defs
+                .insert(String::new(), source_def.name().to_string());
+            scopes.packages.extend(elab.packages.iter().cloned());
+        }
+    }
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
@@ -42081,6 +42236,7 @@ fn inline_module_items(
                     type_bind_widths: pend_type_bind_widths,
                     type_bind_queries: pend_type_bind_queries,
                     owner: sub_mod.name().to_string(),
+                    upward: Rc::clone(&elab.upward_scopes),
                 });
 
                 // §6.8: the deferred (non-constant) declaration initializers of
@@ -42752,6 +42908,11 @@ fn inline_module_items(
                     parent: prefix.trim_end_matches('.').to_string(),
                     src_pos: hi.span.start.max(item_floor),
                 });
+                elab.upward_scopes.borrow_mut().add_instance(
+                    prefix.trim_end_matches('.'),
+                    inst_prefix.trim_end_matches('.'),
+                    &sub_mod_name,
+                );
                 // Keep later items strictly after this one: bound
                 // instantiations carry spans from elsewhere.
                 items_end = items_end.max(hi.span.start.max(item_floor) + 1);
@@ -47764,6 +47925,104 @@ pub fn rewrite_expr(
     rewrite_expr_impl(expr, prefix, port_map, local_names, interface_map)
 }
 
+/// §23.8 (upward name referencing) for a hierarchical name in an inlined body
+/// whose first segment names none of the body's own declarations (not a
+/// local, a port, an interface port or a package). The first segment is
+/// looked for as a SCOPE NAME, starting at the instance the body belongs to
+/// and walking up one enclosing scope at a time, until the top module:
+///   a) a scope the current design element declares anywhere (a child
+///      instance of any generate branch, a generate or block label, a
+///      subroutine) makes it a downward reference, which the ordinary
+///      scope-relative resolution already handles — left alone;
+///   b) in each enclosing scope `p`: the DEFINITION name of `p`'s own
+///      instance (`node1.req1` from a module bound into `u_node1`, an
+///      instance of `node1`, is the nearest enclosing instance of that
+///      module — it wins over a same-named instance further up), then a
+///      child instance of `p` by its INSTANCE name, then a generate or block
+///      label `p` declares. A module name that is not an ancestor's (a
+///      sibling's) matches nothing, as in the reference simulator.
+/// The hit is rewritten to the matched scope's absolute path and rooted, so
+/// the simulator resolves it exactly there instead of guessing from a
+/// scope hint: the earlier runtime-only search bound `node1.req1` to a
+/// same-named signal of the top module (#890). A head that names nothing
+/// (the top module's own name, `$root`, a `$unit` variable) is left as it
+/// was.
+fn upward_scope_rewrite(hier: &HierarchicalIdentifier, prefix: &str) -> Option<ExprKind> {
+    if hier.root.is_some() || hier.path.len() < 2 || !hier.path[0].selects.is_empty() {
+        return None;
+    }
+    let head = hier.path[0].name.name.as_str();
+    if head.contains(['.', ':', '$']) || stmt_local_declared(head) {
+        return None;
+    }
+    let scopes = UPWARD_SCOPES_TLS.with(|c| c.borrow().clone())?;
+    let scopes = scopes.borrow();
+    if scopes.packages.contains(head) {
+        return None;
+    }
+    let declares = |p: &str| -> bool {
+        scopes
+            .defs
+            .get(p)
+            .and_then(|d| scopes.declared.get(d))
+            .is_some_and(|names| names.contains(head))
+    };
+    let kids_of = |p: &str| scopes.children.get(p).map(Vec::as_slice).unwrap_or(&[]);
+    let child_named = |p: &str| {
+        kids_of(p)
+            .iter()
+            .find(|(l, _)| l == head)
+            .map(|(l, _)| l.as_str())
+    };
+    let cur = prefix.trim_end_matches('.');
+    // Step a: the current design element's own scopes are downward.
+    if declares(cur) || child_named(cur).is_some() {
+        return None;
+    }
+    let mut p = cur;
+    // The matched scope and what replaces the head below it: nothing when
+    // the head named `p`'s module, the child's name, or the label itself.
+    let hit: Option<(&str, Option<&str>)> = loop {
+        if !p.is_empty() && scopes.defs.get(p).is_some_and(|d| d == head) {
+            break Some((p, None));
+        }
+        if p != cur {
+            if let Some(leaf) = child_named(p) {
+                break Some((p, Some(leaf)));
+            }
+            if declares(p) {
+                break Some((p, Some(head)));
+            }
+        }
+        if p.is_empty() {
+            break None;
+        }
+        p = p.rsplit_once('.').map_or("", |(parent, _)| parent);
+    };
+    let (scope, below) = hit?;
+    let mut new_hier = hier.clone();
+    let template = HierPathSegment {
+        name: new_hier.path[0].name.clone(),
+        selects: Vec::new(),
+    };
+    let segment = |name: &str| {
+        let mut s = template.clone();
+        s.name.name = name.to_string();
+        s
+    };
+    let mut path: Vec<HierPathSegment> = Vec::with_capacity(hier.path.len() + 4);
+    if !scope.is_empty() {
+        path.extend(scope.split('.').map(segment));
+    }
+    path.extend(below.map(segment));
+    path.extend(new_hier.path.drain(1..));
+    new_hier.path = path;
+    new_hier.root = Some("$root".to_string());
+    new_hier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+    new_hier.cached_resolved_name = crate::ast::cache::NameCache::new();
+    Some(ExprKind::Ident(new_hier))
+}
+
 /// §23.8 / §23.10.1: a port actual `dut.gclk_a` whose first segment names
 /// no local, port, interface or child instance of the current scope but IS
 /// the definition name of an enclosing instance (the harness is bound into
@@ -48197,6 +48456,11 @@ fn rewrite_expr_impl(
                 let mut new_hier = hier.clone();
                 new_hier.path[0].name.name = cat2(&prefix, &name);
                 ExprKind::Ident(new_hier)
+            } else if let Some(upward) = upward_scope_rewrite(hier, prefix) {
+                // §23.8: a name headed by an enclosing scope (the bind
+                // target's module name, a sibling instance, ...) resolves
+                // there, not to whatever the runtime's scope hint suggests.
+                upward
             } else {
                 expr.kind.clone()
             }
@@ -48474,7 +48738,14 @@ fn rewrite_expr_impl(
                     name: member.clone(),
                     selects: Vec::new(),
                 });
-                ExprKind::Ident(hier)
+                // §23.8: `node1.req1` parses as a member access on the bare
+                // `node1`; folded into one path, its head may name an
+                // enclosing scope (see `upward_scope_rewrite`). A head the
+                // body declares was prefixed above and is skipped there.
+                match upward_scope_rewrite(&hier, prefix) {
+                    Some(upward) => upward,
+                    None => ExprKind::Ident(hier),
+                }
             } else {
                 ExprKind::MemberAccess {
                     expr: Box::new(rewritten_base),
@@ -48893,6 +49164,8 @@ fn with_shadowed<R>(
     local_names: &std::collections::HashSet<String>,
     f: impl FnOnce(&HashMap<String, Expression>, &std::collections::HashSet<String>) -> R,
 ) -> R {
+    // §13.3: the formals are not scopes either (`upward_scope_rewrite`).
+    let _stmt_locals = push_stmt_locals(bound.iter().map(|b| (*b).to_string()).collect());
     let ln = without_declared(local_names, bound.iter().copied());
     let pm = if bound.iter().any(|b| port_map.contains_key(*b)) {
         let mut m = port_map.clone();
@@ -49082,6 +49355,9 @@ fn rewrite_pattern(
 }
 
 fn set_type_bind_tls(ctx: &RewriteCtx) {
+    // §23.8: a body materialized after elaboration (possibly on another
+    // thread) resolves its upward names against the design's scope tree.
+    install_upward_scopes(&ctx.upward);
     // Always assign — an instance WITHOUT type parameters must clear
     // whatever an enclosing instance left, or its `$bits(T)` on a typedef
     // named `T` would fold to the parent's parameter width.
@@ -49640,6 +49916,18 @@ fn rewrite_stmt_list_scoped(
 ) -> Vec<Statement> {
     let mut cur: Option<std::collections::HashSet<String>> = None;
     let mut cur_ports: Option<HashMap<String, Expression>> = None;
+    // §6.21: the list's own declarations are not scopes (`upward_scope_rewrite`).
+    let _stmt_locals = push_stmt_locals(
+        stmts
+            .iter()
+            .filter_map(|st| match &st.kind {
+                StatementKind::VarDecl { declarators, .. } => Some(declarators),
+                _ => None,
+            })
+            .flatten()
+            .map(|d| d.name.name.clone())
+            .collect(),
+    );
     let mut out = Vec::with_capacity(stmts.len());
     for st in stmts {
         let names = cur.as_ref().unwrap_or(local_names);
