@@ -3800,13 +3800,15 @@ pub struct ElaboratedModule {
     /// connected instance, including when reached from outside the module.
     #[serde(default)]
     pub interface_port_aliases: HashMap<String, String>,
-    /// IEEE 1800-2023 §23.3.3: `(instance path, actual)` of every input port
-    /// whose reads in the instance body were renamed to its actual. The port
-    /// is a continuous assignment from the actual, so its time-0 value is an
-    /// update event in the instance — the simulator replays it for the
-    /// level-sensitive blocks there.
+    /// IEEE 1800-2023 §23.3.3: `(instance path, actual, formal is 2-state)`
+    /// of every input port whose reads in the instance body were renamed to
+    /// its actual. The port is a continuous assignment from the actual, so its
+    /// time-0 value is an update event in the instance — the simulator
+    /// replays it for the blocks there. The update starts from the formal's
+    /// own initial value, unknown for a 4-state type and 0 for a 2-state one
+    /// (§6.8), which an elided port no longer records anywhere else.
     #[serde(default)]
-    pub input_port_actuals: Vec<(String, Expression)>,
+    pub input_port_actuals: Vec<(String, Expression, bool)>,
     /// Input ports whose net was never built (see [`set_port_elision`]): the
     /// [`elided_port_hash`] of each `<inst>.<port>` flat name, sorted. The
     /// simulator checks a failed name lookup against it, so a reference the
@@ -41877,9 +41879,20 @@ fn inline_module_items(
                         prepared_sub.port_directions.get(pname.as_str()),
                         Some(PortDirection::Input)
                     ) {
+                        // §6.8: the formal starts at its own initial value,
+                        // 0 for a 2-state type and z for a 4-state one
+                        // (`default_port_value`); a scalar ANSI port is not
+                        // in `two_state_signals`.
+                        let formal = cat2(&inst_prefix, pname);
+                        let two_state = elab.two_state_signals.contains(&formal)
+                            || elab
+                                .signals
+                                .get(&formal)
+                                .is_some_and(|s| !s.is_real && !s.value.has_xz());
                         elab.input_port_actuals.push((
                             inst_prefix.trim_end_matches('.').to_string(),
                             actual.clone(),
+                            two_state,
                         ));
                     }
                 }

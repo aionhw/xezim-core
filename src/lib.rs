@@ -194,7 +194,9 @@ pub use value::Value;
 /// \x37 = \x36 + ExprKind::TypedPattern, the type of `T'{...}` (§10.9), and
 /// ElaboratedModule.param_decl_types.
 /// \x38 = \x37 + shared callable bodies and interned hierarchical signal names.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x38";
+/// \x39 = \x38 + whether the formal of an ElaboratedModule.input_port_actuals
+/// entry is 2-state (§23.3.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x39";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
