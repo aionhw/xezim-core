@@ -10404,7 +10404,21 @@ pub fn elaborate_module_with_defs(
                 if !expr_idents_all_known(init_eval, &elab.parameters) {
                     continue;
                 }
-                let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
+                // §10.8 / §11.6.1: a parameter with a declared type is ASSIGNED
+                // its initializer, so the declared width is the operands'
+                // context — the same fold the walk below performs. This seed
+                // used the self-determined fold, so `localparam int A =
+                // (8'd128 + 8'd128) >> 8` was 0 here (the sum wrapped at
+                // 8 bits), so the declarations sized from it (`logic [A:0] v`)
+                // kept that width while the value itself was later corrected
+                // to 1 (#894).
+                let mut v = eval_param_init(
+                    data_type,
+                    init_eval,
+                    &elab.parameters,
+                    &elab.typedef_types,
+                    width,
+                );
                 // §6.20.2: the DECLARED signedness is authoritative. Setting it
                 // only when true let a signed INITIALIZER leak its signedness
                 // into an unsigned parameter: `parameter [7:0] UP = -3` kept
