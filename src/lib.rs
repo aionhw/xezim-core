@@ -196,7 +196,9 @@ pub use value::Value;
 /// \x38 = \x37 + shared callable bodies and interned hierarchical signal names.
 /// \x39 = \x38 + whether the formal of an ElaboratedModule.input_port_actuals
 /// entry is 2-state (§23.3.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x39";
+/// \x3a = \x39 + the formal's path, not its instance's, in
+/// ElaboratedModule.input_port_actuals.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3a";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

@@ -3800,13 +3800,15 @@ pub struct ElaboratedModule {
     /// connected instance, including when reached from outside the module.
     #[serde(default)]
     pub interface_port_aliases: HashMap<String, String>,
-    /// IEEE 1800-2023 §23.3.3: `(instance path, actual, formal is 2-state)`
+    /// IEEE 1800-2023 §23.3.3: `(formal's path, actual, formal is 2-state)`
     /// of every input port whose reads in the instance body were renamed to
-    /// its actual. The port is a continuous assignment from the actual, so its
-    /// time-0 value is an update event in the instance — the simulator
-    /// replays it for the blocks there. The update starts from the formal's
-    /// own initial value, unknown for a 4-state type and 0 for a 2-state one
-    /// (§6.8), which an elided port no longer records anywhere else.
+    /// its actual; the instance is the path's parent. The port is a
+    /// continuous assignment from the actual, so its time-0 value is an
+    /// update event in the instance — the simulator replays it for the blocks
+    /// there, and for a parent's reference to the port by this path. The
+    /// update starts from the formal's own initial value, unknown for a
+    /// 4-state type and 0 for a 2-state one (§6.8), which an elided port no
+    /// longer records anywhere else.
     #[serde(default)]
     pub input_port_actuals: Vec<(String, Expression, bool)>,
     /// Input ports whose net was never built (see [`set_port_elision`]): the
@@ -41889,11 +41891,8 @@ fn inline_module_items(
                                 .signals
                                 .get(&formal)
                                 .is_some_and(|s| !s.is_real && !s.value.has_xz());
-                        elab.input_port_actuals.push((
-                            inst_prefix.trim_end_matches('.').to_string(),
-                            actual.clone(),
-                            two_state,
-                        ));
+                        elab.input_port_actuals
+                            .push((formal, actual.clone(), two_state));
                     }
                 }
 
