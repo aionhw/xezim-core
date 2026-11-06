@@ -1926,14 +1926,65 @@ impl Rw<'_> {
                         self.expr(m);
                     }
                 }
-                UnpackedDimension::Associative { data_type, .. } => {
+                UnpackedDimension::Associative { data_type, span } => {
                     if let Some(t) = data_type {
+                        if let Some(size) = self.contested_size_name(t, *span) {
+                            *d = UnpackedDimension::Expression {
+                                expr: Box::new(size),
+                                span: *span,
+                            };
+                            continue;
+                        }
                         self.dtype(t);
                     }
                 }
                 UnpackedDimension::Unsized(_) => {}
             }
         }
+    }
+
+    /// §7.4.2 / §26.3: `x[N]` with a bare `N` parses as an associative
+    /// dimension keyed by the type `N`, and is a fixed size when `N` names a
+    /// constant. When two packages (or a package and `$unit`) declare the
+    /// value `N`, the one this scope sees is found by the §26.3 rules, like
+    /// any other reference to it: the explicit import `import q::N;` of a
+    /// module wins over the compilation unit's `import r::*;`. The size is
+    /// then spelled `q::N`, the qualified lookup — the elaborator's own
+    /// resolution of a bare size name read the flat table, where the
+    /// compilation unit's wildcard import had registered `r::N` (#895).
+    fn contested_size_name(&mut self, t: &DataType, span: crate::ast::Span) -> Option<Expression> {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = t
+        else {
+            return None;
+        };
+        if !name.scopes.is_empty() || !dimensions.is_empty() || !type_args.is_empty() {
+            return None;
+        }
+        let n = name.name.name.as_str();
+        // A type of that name in scope keeps the associative reading.
+        if !matches!(self.resolve(n), Res::Keep)
+            || self.frames.iter().any(|f| f.types.contains(n))
+            || !self.info.colliding_values.contains(n)
+        {
+            return None;
+        }
+        let pkg = self.resolve_value(n)?;
+        let member = crate::ast::Identifier {
+            name: n.to_string(),
+            span: name.name.span,
+        };
+        Some(Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(ident_expr(pkg, span)),
+                member,
+            },
+            span,
+        ))
     }
 
     fn opt(&mut self, e: &mut Option<Expression>) {
