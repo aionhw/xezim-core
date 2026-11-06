@@ -129,3 +129,66 @@ fn same_name_in_two_scopes_stays_apart() {
     let read = |k: &str| design.parameters[k].to_i64().unwrap();
     assert_eq!([read("a.L[1]"), read("b.L[1]"), read("L[1]")], [2, 4, 6]);
 }
+
+/// §7.4.2 / §7.8 (core #162): `r [N]` in a generate scope is fixed when `N`
+/// is any parameter — a module-level or package one as much as a sibling of
+/// the block. The generate path decided "associative" from the raw dimension,
+/// so such an array was registered both fixed and associative.
+#[test]
+fn data_array_sized_by_a_module_level_parameter() {
+    let design = elaborate(
+        "module t;
+          localparam int N = 4;
+          logic [31:0] m [N];
+          if (1) begin : g
+            logic [31:0] r [N];
+          end
+          if (1) begin
+            logic [31:0] s [N];
+          end
+        endmodule",
+    );
+    assert_eq!(design.arrays.get("g.r"), design.arrays.get("m"));
+    assert_eq!(design.arrays.get("s"), design.arrays.get("m"));
+    assert!(!design.associative_arrays.contains_key("g.r"));
+    assert!(!design.associative_arrays.contains_key("s"));
+}
+
+#[test]
+fn data_array_sized_by_a_package_parameter() {
+    let design = elaborate(
+        "package p; localparam int N = 3; endpackage
+         module t;
+          import p::*;
+          logic [31:0] m [N];
+          if (1) begin : g
+            logic [31:0] r [N];
+            logic [31:0] q [p::N];
+          end
+        endmodule",
+    );
+    assert_eq!(design.arrays.get("g.r"), design.arrays.get("m"));
+    assert_eq!(design.arrays.get("g.q"), design.arrays.get("m"));
+    assert!(!design.associative_arrays.contains_key("g.r"));
+    assert!(!design.associative_arrays.contains_key("g.q"));
+}
+
+/// A real associative dimension in a generate scope still registers as one.
+#[test]
+fn associative_array_in_a_generate_scope_stays_associative() {
+    let design = elaborate(
+        "module t;
+          typedef int key_t;
+          if (1) begin : g
+            int a [string];
+            int b [key_t];
+            int c [*];
+          end
+        endmodule",
+    );
+    assert_eq!(design.associative_arrays.get("g.a"), Some(&true));
+    assert_eq!(design.associative_arrays.get("g.b"), Some(&false));
+    assert!(design.associative_arrays.contains_key("g.c"));
+    assert!(!design.arrays.contains_key("g.a"));
+    assert!(!design.arrays.contains_key("g.b"));
+}
