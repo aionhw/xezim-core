@@ -33930,6 +33930,14 @@ fn substitute_in_module_item(
     }
 }
 
+/// §23.2.2.1: the parser names a non-ANSI null port (`(a, , b)`) and an
+/// unnamed port expression (`(a[1:0])`, `({a, b})`) with a placeholder that
+/// no source identifier can spell. Such a port has no name to connect by
+/// (`.*`, §23.3.2.4).
+pub fn is_unnamed_port_placeholder(name: &str) -> bool {
+    name.starts_with("__xz_null_port_") || name.starts_with("__xz_port_expr_")
+}
+
 /// Recursively inline all instantiations found in `source_mod`, using `prefix` for signal naming.
 /// Flatten module items by resolving generate-if/else and generate regions.
 /// Returns all effective items after evaluating generate conditions.
@@ -37376,9 +37384,18 @@ fn inline_module_items(
                                         (port.name.name.clone(), is_if_port)
                                     })
                                     .collect(),
-                                PortList::NonAnsi(names) => {
-                                    names.iter().map(|n| (n.name.clone(), false)).collect()
-                                }
+                                // §23.3.2.4: `.*` connects ports that have a
+                                // name. A null port (`(a, , b)`) and an unnamed
+                                // port expression (`(a[1:0])`, `({a, b})`) carry
+                                // the parser's placeholder names; they stay
+                                // unconnected, instead of binding to the
+                                // placeholder of a non-ANSI parent's own port
+                                // expression or to a name that exists nowhere.
+                                PortList::NonAnsi(names) => names
+                                    .iter()
+                                    .filter(|n| !is_unnamed_port_placeholder(&n.name))
+                                    .map(|n| (n.name.clone(), false))
+                                    .collect(),
                                 PortList::Empty => Vec::new(),
                             };
                             for (name, is_if_port) in wildcard_ports {
