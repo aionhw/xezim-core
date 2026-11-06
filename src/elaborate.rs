@@ -19912,22 +19912,23 @@ fn elaborate_generate_if(
     // continuous assign READING `g.x` recorded a dependency on a name that
     // matched no signal (so it evaluated once and stayed X forever), and a
     // same-named declaration at module scope was a false "duplicate" error.
-    // Unlabeled branches keep bare names (their genblk ordinal is not known
-    // here, and in-suite code relies on the historical leakage).
+    // Unlabeled branches keep their DATA under bare names (in-suite code
+    // relies on the historical leakage); their subroutines are scoped under
+    // the §27.6 `genblk<n>` name like a labeled branch's (`GenRename`).
     let take_branch = |bi: usize, items: &Vec<ModuleItem>, elab: &mut ElaboratedModule| match gi
         .branch_labels
         .get(bi)
         .and_then(|l| l.as_ref())
     {
         Some(label) => {
-            let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(label), &[]);
-            alias_labelled_subroutines(&mut renamed, label);
+            let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(label));
             stamp_gen_scope(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
         }
         None => {
-            let mut scoped = items.clone();
-            stamp_gen_scope(&mut scoped, &gen_scope_name(None, ordinal));
+            let scope = gen_scope_name(None, ordinal);
+            let mut scoped = rename_decls_in_iter(items, &GenRename::Subroutines(&scope));
+            stamp_gen_scope(&mut scoped, &scope);
             elaborate_items(&scoped, elab, all_defs)
         }
     };
@@ -20000,14 +20001,14 @@ fn elaborate_generate_case_arm(
 ) -> Result<(), String> {
     match &arm.label {
         Some(label) => {
-            let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label), &[]);
-            alias_labelled_subroutines(&mut renamed, label);
+            let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label));
             stamp_gen_scope(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
         }
         None => {
-            let mut scoped = arm.items.clone();
-            stamp_gen_scope(&mut scoped, &gen_scope_name(None, ordinal));
+            let scope = gen_scope_name(None, ordinal);
+            let mut scoped = rename_decls_in_iter(&arm.items, &GenRename::Subroutines(&scope));
+            stamp_gen_scope(&mut scoped, &scope);
             elaborate_items(&scoped, elab, all_defs)
         }
     }
@@ -20047,99 +20048,6 @@ fn stamp_gen_scope(items: &mut [ModuleItem], scope: &str) {
     }
 }
 
-/// §27.6: a subroutine declared in the labelled generate-if/case branch `blk`
-/// is `blk.f` from outside the branch. The branch's items are elaborated into
-/// the enclosing module under their own names (so the branch's own bare calls
-/// keep resolving), so also register each subroutine under the labelled name:
-/// `blk.f(0)` — or `u.blk.f(0)` once the module is instantiated as `u` — then
-/// finds its body through the ordinary hierarchical-name lookup instead of
-/// silently returning 0. A function's result variable is its name, so the
-/// alias body assigns `blk.f`.
-fn alias_labelled_subroutines(items: &mut Vec<ModuleItem>, label: &str) {
-    let no_local = std::collections::HashSet::default();
-    let no_iface = HashMap::default();
-    let aliases: Vec<ModuleItem> = items
-        .iter()
-        .filter_map(|it| match it {
-            ModuleItem::FunctionDeclaration(fd) => {
-                let mut a = fd.clone();
-                let alias = format!("{}.{}", label, fd.name.name.name);
-                let mut result_var = HashMap::default();
-                result_var.insert(fd.name.name.name.clone(), make_ident_expr(&alias));
-                a.items = fd
-                    .items
-                    .iter()
-                    .map(|st| rewrite_stmt(st, "", &result_var, &no_local, &no_iface))
-                    .collect();
-                a.name.name.name = alias;
-                Some(ModuleItem::FunctionDeclaration(a))
-            }
-            ModuleItem::TaskDeclaration(td) => {
-                let mut a = td.clone();
-                a.name.name.name = format!("{}.{}", label, td.name.name.name);
-                Some(ModuleItem::TaskDeclaration(a))
-            }
-            _ => None,
-        })
-        .collect();
-    items.extend(aliases);
-}
-
-/// The subroutines `scope_generated_subroutines` renames that a bare call can
-/// name: those of the iteration's items, `generate` regions and conditional
-/// generate branches, not out-of-block methods.
-fn collect_generated_subroutine_names(items: &[ModuleItem], names: &mut Vec<String>) {
-    for item in items {
-        match item {
-            ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
-                names.push(fd.name.name.name.clone())
-            }
-            ModuleItem::TaskDeclaration(td) if td.name.scopes.is_empty() => {
-                names.push(td.name.name.name.clone())
-            }
-            ModuleItem::GenerateRegion(gr) => collect_generated_subroutine_names(&gr.items, names),
-            ModuleItem::GenerateIf(gi) => {
-                for (_, branch) in &gi.branches {
-                    collect_generated_subroutine_names(branch, names);
-                }
-            }
-            ModuleItem::GenerateCase(gc) => {
-                for arm in &gc.arms {
-                    collect_generated_subroutine_names(&arm.items, names);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
-    for item in items {
-        match item {
-            ModuleItem::FunctionDeclaration(fd) => {
-                fd.name.name.name = format!("{}.{}", scope, fd.name.name.name);
-            }
-            ModuleItem::TaskDeclaration(td) => {
-                td.name.name.name = format!("{}.{}", scope, td.name.name.name);
-            }
-            ModuleItem::GenerateRegion(gr) => {
-                scope_generated_subroutines(&mut gr.items, scope);
-            }
-            ModuleItem::GenerateIf(gi) => {
-                for (_, branch) in &mut gi.branches {
-                    scope_generated_subroutines(branch, scope);
-                }
-            }
-            ModuleItem::GenerateCase(gc) => {
-                for arm in &mut gc.arms {
-                    scope_generated_subroutines(&mut arm.items, scope);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn elaborate_generate_for(
     gf: &GenerateFor,
     elab: &mut ElaboratedModule,
@@ -20170,11 +20078,7 @@ fn elaborate_generate_for(
         // §27.6: unnamed blocks use the enclosing construct's genblk ordinal,
         // exactly as named blocks use their label. Data and process scopes agree.
         let scope = format!("{}[{}]", gen_scope_name(gf.name.as_ref(), ordinal), i);
-        // §27.4: a call to the iteration's own `f` names its `<scope>.f`.
-        let mut subroutines = Vec::new();
-        collect_generated_subroutine_names(&subst, &mut subroutines);
-        let mut renamed = rename_decls_in_iter(&subst, &GenRename::Scope(&scope), &subroutines);
-        scope_generated_subroutines(&mut renamed, &scope);
+        let mut renamed = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
         stamp_gen_scope(&mut renamed, &scope);
         elaborate_items(&renamed, elab, all_defs)?;
         if trace && (iter_count % 8) == 0 {
@@ -32797,52 +32701,71 @@ fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Ve
         .collect()
 }
 
-/// Collect the names of signals/parameters/instances declared at the top level
-/// of a generate-for body. These need per-iteration renaming so that 20 copies
-/// of `logic valid_q;` don't collapse into a single flat signal.
+/// Collect the names of signals/parameters/instances/subroutines declared at
+/// the top level of a generate-for body. These need per-iteration renaming so
+/// that 20 copies of `logic valid_q;` don't collapse into a single flat
+/// signal. Nested generate bodies are included (see the comments inside).
 fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
+    collect_renamed_decl_names(items, true, names);
+}
+
+/// The declared names a generate rename applies to: the subroutines always
+/// (§23.9: a generate block's functions and tasks belong to the block's
+/// scope like its data, so `g_a.look` and `g_b.look` are two tasks), the
+/// data, parameters and instances when `data` is set.
+fn collect_renamed_decl_names(items: &[ModuleItem], data: bool, names: &mut Vec<String>) {
     for item in items {
         match item {
-            ModuleItem::DataDeclaration(dd) => {
+            ModuleItem::DataDeclaration(dd) if data => {
                 for d in &dd.declarators {
                     names.push(d.name.name.clone());
                 }
             }
-            ModuleItem::NetDeclaration(nd) => {
+            ModuleItem::NetDeclaration(nd) if data => {
                 for d in &nd.declarators {
                     names.push(d.name.name.clone());
                 }
             }
-            ModuleItem::PortDeclaration(pd) => {
+            ModuleItem::PortDeclaration(pd) if data => {
                 for d in &pd.declarators {
                     names.push(d.name.name.clone());
                 }
             }
-            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)
+                if data =>
+            {
                 if let ParameterKind::Data { assignments, .. } = &pd.kind {
                     for a in assignments {
                         names.push(a.name.name.clone());
                     }
                 }
             }
-            ModuleItem::ModuleInstantiation(mi) => {
+            ModuleItem::ModuleInstantiation(mi) if data => {
                 for hi in &mi.instances {
                     names.push(hi.name.name.clone());
                 }
+            }
+            // An out-of-block class method (`function C::m`) is the class's,
+            // not the block's.
+            ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
+                names.push(fd.name.name.name.clone());
+            }
+            ModuleItem::TaskDeclaration(td) if td.name.scopes.is_empty() => {
+                names.push(td.name.name.name.clone());
             }
             // Nested generate constructs declare their own scope; we recurse
             // and rename names declared in the unconditional bodies, since a
             // nested generate-if may declare a name that the parent's other
             // siblings reference.
-            ModuleItem::GenerateRegion(gr) => collect_decl_names_in_items(&gr.items, names),
+            ModuleItem::GenerateRegion(gr) => collect_renamed_decl_names(&gr.items, data, names),
             ModuleItem::GenerateIf(gi) => {
                 for (_cond, branch) in &gi.branches {
-                    collect_decl_names_in_items(branch, names);
+                    collect_renamed_decl_names(branch, data, names);
                 }
             }
             ModuleItem::GenerateCase(gc) => {
                 for arm in &gc.arms {
-                    collect_decl_names_in_items(&arm.items, names);
+                    collect_renamed_decl_names(&arm.items, data, names);
                 }
             }
             // A NESTED generate-for's body decls must also be uniquified by the
@@ -32853,7 +32776,7 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
             // `for(a) for(b) localparam Idx = f(a,b)` to `f(0,b)` — the
             // rr_arb_tree binary-tree index bug. The inner loop's own rename
             // then composes a second suffix, giving a distinct name per (a,b).
-            ModuleItem::GenerateFor(gf) => collect_decl_names_in_items(&gf.items, names),
+            ModuleItem::GenerateFor(gf) => collect_renamed_decl_names(&gf.items, data, names),
             _ => {}
         }
     }
@@ -32862,14 +32785,15 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
 /// The names a generate block declares in its own scope, which is all that a
 /// bare reference in that block can bind to among the block's declarations
 /// (§23.9, §27.5). A `generate` region opens no scope; nested blocks do.
-fn collect_own_decl_names(items: &[ModuleItem], names: &mut Vec<String>) {
+/// `data` as in `collect_renamed_decl_names`.
+fn collect_own_decl_names(items: &[ModuleItem], data: bool, names: &mut Vec<String>) {
     for item in items {
         match item {
-            ModuleItem::GenerateRegion(gr) => collect_own_decl_names(&gr.items, names),
+            ModuleItem::GenerateRegion(gr) => collect_own_decl_names(&gr.items, data, names),
             ModuleItem::GenerateIf(_)
             | ModuleItem::GenerateCase(_)
             | ModuleItem::GenerateFor(_) => {}
-            other => collect_decl_names_in_items(std::slice::from_ref(other), names),
+            other => collect_renamed_decl_names(std::slice::from_ref(other), data, names),
         }
     }
 }
@@ -32900,7 +32824,7 @@ fn gen_block_port_map<'m>(
     enclosing: &'m HashMap<String, Expression>,
 ) -> std::borrow::Cow<'m, HashMap<String, Expression>> {
     let mut own = Vec::new();
-    collect_own_decl_names(block_items, &mut own);
+    collect_own_decl_names(block_items, rename.renames_data(), &mut own);
     if own.iter().all(|n| enclosing.contains_key(n)) {
         return std::borrow::Cow::Borrowed(enclosing);
     }
@@ -32925,33 +32849,45 @@ fn gen_block_port_map<'m>(
 /// Nested loops insert the inner scope BEFORE the base name
 /// (`outer[0].x` + `inner[1]` → `outer[0].inner[1].x`), matching the LRM path.
 ///
+/// `Scope` renames every declaration of the block. `Subroutines` renames only
+/// its functions and tasks: an UNLABELED block keeps its data under bare
+/// names (in-suite code relies on that leakage), but its subroutines are
+/// scoped (§23.9, §27.6 `genblk<n>`), so two unlabeled blocks declaring `f`
+/// are two functions and neither hides a module-level `f`.
 enum GenRename<'a> {
     Scope(&'a str),
+    Subroutines(&'a str),
 }
 
 impl GenRename<'_> {
     fn apply(&self, n: &str) -> String {
         match self {
-            GenRename::Scope(sc) => match n.rsplit_once('.') {
+            GenRename::Scope(sc) | GenRename::Subroutines(sc) => match n.rsplit_once('.') {
                 Some((outer, base)) => format!("{}.{}.{}", outer, sc, base),
                 None => format!("{}.{}", sc, n),
             },
         }
     }
+
+    fn renames_data(&self) -> bool {
+        matches!(self, GenRename::Scope(_))
+    }
 }
 
-/// `subroutines` names the subroutines a generate-for iteration declares,
-/// which `scope_generated_subroutines` renames to `<scope>.<name>`: a bare
-/// call to one from inside the iteration is renamed with it, as a reference
-/// to a renamed declaration is (§23.9, §27.4). Other callers pass none.
-fn rename_decls_in_iter(
-    items: &[ModuleItem],
-    rename: &GenRename,
-    subroutines: &[String],
-) -> Vec<ModuleItem> {
+/// Rename the declarations of one generate block (or generate-for
+/// iteration), and every reference to them from inside the block, to
+/// `<scope>.<name>`. A function or task is a declaration of the block like
+/// its data (§23.9, §27.6): the declaration becomes `<scope>.f`, and a bare
+/// call to `f` from the block — a process, a continuous assign, another of
+/// the block's subroutines, a nested block, a `disable` — binds to the
+/// innermost enclosing block that declares `f`, else to the module's `f`
+/// (§23.8.1 Example 2). The elaborated module keeps one flat subroutine
+/// table, so without the rename the last block's `look` answered every
+/// block's calls, and a block's `t` was a false duplicate of the module's.
+fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleItem> {
     let mut names = Vec::new();
-    collect_decl_names_in_items(items, &mut names);
-    if names.is_empty() && subroutines.is_empty() {
+    collect_renamed_decl_names(items, rename.renames_data(), &mut names);
+    if names.is_empty() {
         return items.to_vec();
     }
     // Every declaration below is renamed, but a reference only binds to what
@@ -32962,16 +32898,11 @@ fn rename_decls_in_iter(
     // that does not exist.
     let rename_set: std::collections::HashSet<String> = names.iter().cloned().collect();
     let mut own_names = Vec::new();
-    collect_own_decl_names(items, &mut own_names);
+    collect_own_decl_names(items, rename.renames_data(), &mut own_names);
     let mut port_map: HashMap<String, Expression> = HashMap::default();
     for n in own_names {
         let renamed = rename.apply(&n);
         port_map.insert(n, gen_renamed_ref(renamed));
-    }
-    for s in subroutines {
-        if !port_map.contains_key(s) {
-            port_map.insert(s.clone(), gen_renamed_ref(rename.apply(s)));
-        }
     }
     // §23.6/§27.6: an INSTANCE declared in a nested generate block keeps its
     // bare name here (the instance path gets each scope later, innermost
@@ -33291,22 +33222,33 @@ fn rename_item_decls(
             };
             ModuleItem::AssertionItem(a)
         }
+        // §23.9 / §27.6: a block's function or task is renamed with its data
+        // (`g.f`); its return type and formals may read the block's
+        // parameters. Inside the body a formal or a local shadows a same-named
+        // block declaration (§13.3, §13.4): `f(int x)` beside the block's
+        // `int x` returns from its argument. The function's own name is kept
+        // mapped — it is its result variable (`f = ...`) or a recursive call,
+        // and both name the renamed function.
         ModuleItem::FunctionDeclaration(fd) => {
             let mut new_fd = fd.clone();
-            new_fd.items = fd
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
+            if fd.name.scopes.is_empty() && rename_set.contains(&fd.name.name.name) {
+                new_fd.name.name.name = rename.apply(&fd.name.name.name);
+            }
+            new_fd.return_type =
+                rewrite_data_type_genvar(&fd.return_type, port_map, local_names, interface_map);
+            rename_subroutine_ports(&mut new_fd.ports, port_map, local_names, interface_map);
+            new_fd.items =
+                rename_subroutine_body(&fd.items, &fd.ports, port_map, local_names, interface_map);
             ModuleItem::FunctionDeclaration(new_fd)
         }
         ModuleItem::TaskDeclaration(td) => {
             let mut new_td = td.clone();
-            new_td.items = td
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
+            if td.name.scopes.is_empty() && rename_set.contains(&td.name.name.name) {
+                new_td.name.name.name = rename.apply(&td.name.name.name);
+            }
+            rename_subroutine_ports(&mut new_td.ports, port_map, local_names, interface_map);
+            new_td.items =
+                rename_subroutine_body(&td.items, &td.ports, port_map, local_names, interface_map);
             ModuleItem::TaskDeclaration(new_td)
         }
         ModuleItem::ContinuousAssign(ca) => {
@@ -33420,6 +33362,45 @@ fn rename_item_decls(
         }
         other => other.clone(),
     }
+}
+
+/// The formals of a generate block's subroutine, with their types,
+/// dimensions and defaults rewritten through the block's rename (§27.6).
+fn rename_subroutine_ports(
+    ports: &mut [FunctionPort],
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) {
+    for p in ports {
+        p.data_type = rewrite_data_type_genvar(&p.data_type, port_map, local_names, interface_map);
+        p.dimensions =
+            rewrite_unpacked_dims_genvar(&p.dimensions, port_map, local_names, interface_map);
+        if let Some(def) = &p.default {
+            p.default = Some(rewrite_expr(def, "", port_map, local_names, interface_map));
+        }
+    }
+}
+
+/// The body of a generate block's subroutine rewritten through the block's
+/// rename, with the formals and the body's own locals shadowing the block's
+/// declarations (§13.3, §13.4).
+fn rename_subroutine_body(
+    items: &[Statement],
+    ports: &[FunctionPort],
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> crate::ast::shared_vec::SharedVec<Statement> {
+    let mut bound: Vec<&str> = ports.iter().map(|p| p.name.name.as_str()).collect();
+    bound.extend(stmt_list_declared_names(items));
+    with_shadowed(&bound, port_map, local_names, |ports, locals| {
+        items
+            .iter()
+            .map(|s| rewrite_stmt(s, "", ports, locals, interface_map))
+            .collect::<Vec<_>>()
+            .into()
+    })
 }
 
 /// Genvar-substitute the expressions inside unpacked dimensions.
@@ -34207,19 +34188,13 @@ fn collect_effective_items_scoped(
                         // Labeled branch: scope the declarations themselves
                         // (see elaborate_generate_if) so this expansion path
                         // registers the same `g.x` keys as the direct path.
-                        let scoped_items;
-                        let branch_items = match label {
-                            Some(l) => {
-                                scoped_items =
-                                    rename_decls_in_iter(branch_items, &GenRename::Scope(l), &[]);
-                                &scoped_items
+                        let scoped_items = match label {
+                            Some(l) => rename_decls_in_iter(branch_items, &GenRename::Scope(l)),
+                            None => {
+                                rename_decls_in_iter(branch_items, &GenRename::Subroutines(&scope))
                             }
-                            None => branch_items,
                         };
-                        let mut inner = collect_effective_items(branch_items, params);
-                        if let Some(l) = label {
-                            alias_labelled_subroutines(&mut inner, l);
-                        }
+                        let mut inner = collect_effective_items(&scoped_items, params);
                         prefix_gen_scope(&mut inner, &scope);
                         result.extend(inner);
                         matched = true;
@@ -34252,19 +34227,11 @@ fn collect_effective_items_scoped(
                 }
                 if let Some(arm) = chosen {
                     let scope = gen_scope_name(arm.label.as_ref(), *gen_ordinal);
-                    let scoped_items;
                     let arm_items = match &arm.label {
-                        Some(l) => {
-                            scoped_items =
-                                rename_decls_in_iter(&arm.items, &GenRename::Scope(l), &[]);
-                            &scoped_items
-                        }
-                        None => &arm.items,
+                        Some(l) => rename_decls_in_iter(&arm.items, &GenRename::Scope(l)),
+                        None => rename_decls_in_iter(&arm.items, &GenRename::Subroutines(&scope)),
                     };
-                    let mut inner = collect_effective_items(arm_items, params);
-                    if let Some(l) = &arm.label {
-                        alias_labelled_subroutines(&mut inner, l);
-                    }
+                    let mut inner = collect_effective_items(&arm_items, params);
                     prefix_gen_scope(&mut inner, &scope);
                     result.extend(inner);
                 }
@@ -34298,7 +34265,7 @@ fn collect_effective_items_scoped(
                     // sees a flat duplicate.
                     let scope =
                         format!("{}[{}]", gen_scope_name(gf.name.as_ref(), *gen_ordinal), i);
-                    let subst = rename_decls_in_iter(&subst, &GenRename::Scope(&scope), &[]);
+                    let subst = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
                     let mut inner = collect_effective_items(&subst, &local_params);
                     prefix_gen_scope(&mut inner, &scope);
                     result.extend(inner);
@@ -50162,6 +50129,21 @@ fn rewrite_stmt(
             local_names,
             interface_map,
         ))),
+        // §9.6.2 / §27.6: `disable t` of a generate block's own task names the
+        // renamed task (`g_a.t`), as the calls to it do. A block label is never
+        // mapped (only declarations are), and no formal port shares a block
+        // or task name (§3.13, one namespace), so only a rename binds here.
+        StatementKind::Disable(id) => match port_map.get(&id.name).map(|m| &m.kind) {
+            Some(ExprKind::Ident(h))
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                StatementKind::Disable(Identifier {
+                    name: h.path[0].name.name.clone(),
+                    span: id.span,
+                })
+            }
+            _ => stmt.kind.clone(),
+        },
         other => other.clone(),
     };
     Statement::new(new_kind, stmt.span)
