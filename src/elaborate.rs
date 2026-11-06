@@ -18782,9 +18782,16 @@ fn elaborate_items_numbered(
                         &elab.typedef_types,
                     );
                     record_coll_shape(elab, &decl.name.name, &shape_dims, None);
+                    // §7.4.2 / §7.8: `r [N]` parses as an associative dimension
+                    // keyed by "type N"; the normalized dims know whether `N` is
+                    // a parameter (fixed size) or a type (associative). Decided
+                    // from the raw dimension, a block's `[N]` sized by a
+                    // module or package parameter was registered associative
+                    // as well as fixed (the module-body path reads the
+                    // normalized dims).
                     if let Some(UnpackedDimension::Associative {
                         data_type: key_dt, ..
-                    }) = decl.dimensions.first()
+                    }) = shape_dims.first()
                     {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| {
                             matches!(
@@ -32059,7 +32066,10 @@ fn inline_instantiations_inner(
                                     &elab.typedef_types,
                                 );
                                 record_coll_shape(elab, &decl.name.name, &shape_dims, None);
-                                let first_dim = decl.dimensions.first();
+                                // `[N]` sized by a parameter is fixed, not
+                                // associative: read the normalized dims (see
+                                // the generate-scope path).
+                                let first_dim = shape_dims.first();
                                 let is_dynamic_dim = first_dim.is_some_and(|d| {
                                     matches!(
                                         d,
