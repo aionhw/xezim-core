@@ -1,8 +1,8 @@
-//! §23.3.3, §6.8: each input port renamed to its actual records whether its
-//! formal is 2-state, which sets the value the port's time-0 update starts
-//! from (0 for `bit`, unknown for `logic` or `wire`). The simulator needs it
-//! for elided ports, whose own net and type entries are gone; a scalar ANSI
-//! port is not in `two_state_signals` either.
+//! §23.3.3, §6.8: each input port renamed to its actual records its formal's
+//! path and whether the formal is 2-state, which sets the value the port's
+//! time-0 update starts from (0 for `bit`, unknown for `logic` or `wire`).
+//! The simulator needs it for elided ports, whose own net and type entries
+//! are gone; a scalar ANSI port is not in `two_state_signals` either.
 
 fn elaborate(src: &str) -> xezim_core::ElaboratedModule {
     xezim_core::parse_and_elaborate_multi(
@@ -45,7 +45,7 @@ endmodule
     let state = |inst: &str| {
         m.input_port_actuals
             .iter()
-            .find(|(i, ..)| i.rsplit('.').next() == Some(inst))
+            .find(|(f, ..)| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".c"))
             .map(|(_, _, two_state)| *two_state)
     };
     assert_eq!(state("ul"), Some(false));
