@@ -45537,7 +45537,12 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 &pca.ctx.local_names,
                 &pca.ctx.interface_map,
             );
-            if ident_flat_name(&lhs).is_some_and(|n| net_resolver.contains_key(&n)) {
+            // A member of one too (`u.p.V`): a port connection taken apart.
+            if ident_flat_name(&lhs).is_some_and(|n| {
+                net_resolver.contains_key(&n)
+                    || n.match_indices('.')
+                        .any(|(i, _)| net_resolver.contains_key(&n[..i]))
+            }) {
                 let ca = pca.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {
