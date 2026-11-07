@@ -408,6 +408,7 @@ impl Parser {
                                 span: sp,
                                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             };
                             type_args.push(crate::ast::expr::Expression::new(
                                 crate::ast::expr::ExprKind::Ident(hier),
@@ -480,6 +481,7 @@ impl Parser {
             span: sp,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         crate::ast::expr::Expression::new(crate::ast::expr::ExprKind::Ident(hier), sp)
     }
