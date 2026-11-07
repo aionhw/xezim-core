@@ -51294,24 +51294,54 @@ fn rewrite_stmt(
             local_names,
             interface_map,
         ))),
-        // §9.6.2 / §27.6: `disable t` of a generate block's own task names the
-        // renamed task (`g_a.t`), as the calls to it do. A block label is never
-        // mapped (only declarations are), and no formal port shares a block
-        // or task name (§3.13, one namespace), so only a rename binds here.
-        StatementKind::Disable(id) => match port_map.get(&id.name).map(|m| &m.kind) {
-            Some(ExprKind::Ident(h))
-                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
-            {
-                StatementKind::Disable(Identifier {
-                    name: h.path[0].name.name.clone(),
-                    span: id.span,
-                })
-            }
-            _ => stmt.kind.clone(),
-        },
+        StatementKind::Disable(h) => {
+            StatementKind::Disable(rewrite_disable(h, prefix, port_map, local_names))
+        }
         other => other.clone(),
     };
     Statement::new(new_kind, stmt.span)
+}
+
+/// §9.6.2: a `disable` of a task names the task's key, as a call does: the
+/// generate rename unless the name binds elsewhere (§23.9), then the instance
+/// prefix, or the key found upward (§23.8.1). A block keeps its label, by
+/// which it is matched.
+fn rewrite_disable(
+    h: &HierarchicalIdentifier,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+) -> HierarchicalIdentifier {
+    let [seg] = &h.path[..] else {
+        return h.clone();
+    };
+    if h.root.is_some() || !seg.selects.is_empty() {
+        return h.clone();
+    }
+    let name = seg.name.name.as_str();
+    let renamed = match port_map.get(name).map(|m| &m.kind) {
+        Some(ExprKind::Ident(m))
+            if m.root.is_none()
+                && m.path.len() == 1
+                && m.path[0].selects.is_empty()
+                && h.bound != Bound::NO_TARGET
+                && !gen_rename_hides(name, h.bound) =>
+        {
+            Some(m.path[0].name.name.clone())
+        }
+        _ => None,
+    };
+    let key = renamed
+        .or_else(|| {
+            (h.bound.as_decl().is_some() && local_names.contains(name))
+                .then(|| cat2(prefix, name))
+        })
+        .or_else(|| upward_subroutine_key(h, prefix));
+    let mut out = h.clone();
+    if let Some(k) = key {
+        out.path[0].name.name = k;
+    }
+    out
 }
 
 fn rewrite_event_control(
