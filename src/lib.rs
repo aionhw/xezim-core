@@ -3096,7 +3096,18 @@ fn parse_and_elaborate(
         if module_candidates.len() > 1 {
             // Multi-top design: synthesize `__xezim_multi_top` instantiating
             // every top-level module and elaborate that as the root.
-            let wrapper = make_multi_top_wrapper(&module_candidates);
+            let mut wrapper = make_multi_top_wrapper(&module_candidates);
+            // §6.6.7, §3.12.1: the root elaboration publishes the nettype
+            // registry from its own items, and the `$unit` declarations were
+            // copied into each source module's items only. Without them the
+            // wrapper root registered no `$unit` nettype, so in a design with
+            // two tops a net's resolution function never ran and the
+            // one-driver rule was never checked.
+            for n in top_level_nettypes.iter().rev() {
+                wrapper
+                    .items
+                    .insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+            }
             let wrapper_name = wrapper.name.name.clone();
             definitions.insert(
                 wrapper_name.clone(),
