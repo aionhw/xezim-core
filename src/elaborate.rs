@@ -2,6 +2,7 @@
 //! Resolves net/variable declarations, continuous assigns, always blocks.
 
 use super::value::Value;
+use crate::ast::binding::{Bound, DeclId};
 use crate::ast::decl::*;
 use crate::ast::expr::*;
 use crate::ast::module::*;
@@ -1402,6 +1403,9 @@ thread_local! {
     /// block-local handle named like an enclosing instance read null (the
     /// `instance_block_locals_shadow_module_names` regression).
     static STMT_LOCALS_TLS: std::cell::RefCell<Vec<HashSet<String>>>
+        = const { std::cell::RefCell::new(Vec::new()) };
+    /// The generate renames in progress, innermost last.
+    static GEN_RENAME_TLS: std::cell::RefCell<Vec<GenRenameGate>>
         = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -32897,26 +32901,36 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
     collect_renamed_decl_names(items, true, names);
 }
 
-/// The declared names a generate rename applies to: the subroutines always
+/// See `visit_renamed_decls`.
+fn collect_renamed_decl_names(items: &[ModuleItem], data: bool, names: &mut Vec<String>) {
+    visit_renamed_decls(items, data, &mut |n, _| names.push(n.to_string()));
+}
+
+/// The declarations a generate rename applies to: the subroutines always
 /// (§23.9: a generate block's functions and tasks belong to the block's
 /// scope like its data, so `g_a.look` and `g_b.look` are two tasks), the
-/// data, parameters and instances when `data` is set.
-fn collect_renamed_decl_names(items: &[ModuleItem], data: bool, names: &mut Vec<String>) {
+/// data, parameters and instances when `data` is set. `visit` gets the name,
+/// and a subroutine's own id.
+fn visit_renamed_decls(
+    items: &[ModuleItem],
+    data: bool,
+    visit: &mut dyn FnMut(&str, Option<Bound>),
+) {
     for item in items {
         match item {
             ModuleItem::DataDeclaration(dd) if data => {
                 for d in &dd.declarators {
-                    names.push(d.name.name.clone());
+                    visit(&d.name.name, None);
                 }
             }
             ModuleItem::NetDeclaration(nd) if data => {
                 for d in &nd.declarators {
-                    names.push(d.name.name.clone());
+                    visit(&d.name.name, None);
                 }
             }
             ModuleItem::PortDeclaration(pd) if data => {
                 for d in &pd.declarators {
-                    names.push(d.name.name.clone());
+                    visit(&d.name.name, None);
                 }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)
@@ -32924,36 +32938,36 @@ fn collect_renamed_decl_names(items: &[ModuleItem], data: bool, names: &mut Vec<
             {
                 if let ParameterKind::Data { assignments, .. } = &pd.kind {
                     for a in assignments {
-                        names.push(a.name.name.clone());
+                        visit(&a.name.name, None);
                     }
                 }
             }
             ModuleItem::ModuleInstantiation(mi) if data => {
                 for hi in &mi.instances {
-                    names.push(hi.name.name.clone());
+                    visit(&hi.name.name, None);
                 }
             }
             // An out-of-block class method (`function C::m`) is the class's,
             // not the block's.
             ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
-                names.push(fd.name.name.name.clone());
+                visit(&fd.name.name.name, Some(fd.decl));
             }
             ModuleItem::TaskDeclaration(td) if td.name.scopes.is_empty() => {
-                names.push(td.name.name.name.clone());
+                visit(&td.name.name.name, Some(td.decl));
             }
             // Nested generate constructs declare their own scope; we recurse
             // and rename names declared in the unconditional bodies, since a
             // nested generate-if may declare a name that the parent's other
             // siblings reference.
-            ModuleItem::GenerateRegion(gr) => collect_renamed_decl_names(&gr.items, data, names),
+            ModuleItem::GenerateRegion(gr) => visit_renamed_decls(&gr.items, data, visit),
             ModuleItem::GenerateIf(gi) => {
                 for (_cond, branch) in &gi.branches {
-                    collect_renamed_decl_names(branch, data, names);
+                    visit_renamed_decls(branch, data, visit);
                 }
             }
             ModuleItem::GenerateCase(gc) => {
                 for arm in &gc.arms {
-                    collect_renamed_decl_names(&arm.items, data, names);
+                    visit_renamed_decls(&arm.items, data, visit);
                 }
             }
             // A NESTED generate-for's body decls must also be uniquified by the
@@ -32964,10 +32978,79 @@ fn collect_renamed_decl_names(items: &[ModuleItem], data: bool, names: &mut Vec<
             // `for(a) for(b) localparam Idx = f(a,b)` to `f(0,b)` — the
             // rr_arb_tree binary-tree index bug. The inner loop's own rename
             // then composes a second suffix, giving a distinct name per (a,b).
-            ModuleItem::GenerateFor(gf) => collect_renamed_decl_names(&gf.items, data, names),
+            ModuleItem::GenerateFor(gf) => visit_renamed_decls(&gf.items, data, visit),
             _ => {}
         }
     }
+}
+
+/// §23.9, §26.3: which references a generate rename may rewrite to a
+/// subroutine of the block, decided by the binding.
+#[derive(Default)]
+struct GenRenameGate {
+    /// The renamed subroutines.
+    renamed: HashSet<DeclId>,
+    sub_names: HashSet<String>,
+    data_names: HashSet<String>,
+    /// Names with an unbound renamed subroutine.
+    ungated: HashSet<String>,
+}
+
+impl GenRenameGate {
+    fn add_subroutine(&mut self, name: &str, stamp: Bound) {
+        self.sub_names.insert(name.to_string());
+        match stamp.as_decl() {
+            Some(d) => {
+                self.renamed.insert(d);
+            }
+            None => {
+                self.ungated.insert(name.to_string());
+            }
+        }
+    }
+
+    /// Whether a reference bound as `bound` hides the renamed subroutine
+    /// `name`: it binds to a formal, local, member, import, label or `$unit`
+    /// name, or to a deeper declaration that is no subroutine of this rename.
+    ///
+    /// Fallbacks to the name-based rule: data names, an unbound definition
+    /// and an unanalysed reference.
+    fn hides(&self, name: &str, bound: Bound) -> bool {
+        if !self.sub_names.contains(name) || self.ungated.contains(name) || bound.is_unset() {
+            return false;
+        }
+        match bound.as_decl() {
+            Some(d) => !self.renamed.contains(&d) && !self.data_names.contains(name),
+            None => true,
+        }
+    }
+}
+
+/// Pops the gate `rename_decls_in_iter` pushed.
+struct GenRenameFrame;
+
+impl GenRenameFrame {
+    fn push(gate: GenRenameGate) -> Self {
+        GEN_RENAME_TLS.with(|g| g.borrow_mut().push(gate));
+        Self
+    }
+}
+
+impl Drop for GenRenameFrame {
+    fn drop(&mut self) {
+        GEN_RENAME_TLS.with(|g| {
+            g.borrow_mut().pop();
+        });
+    }
+}
+
+/// Whether the generate rename in progress leaves this reference alone.
+fn gen_rename_hides(name: &str, bound: Bound) -> bool {
+    GEN_RENAME_TLS.with(|g| {
+        g.borrow()
+            .last()
+            .is_some_and(|gate| gate.hides(name, bound))
+    })
 }
 
 /// The names a generate block declares in its own scope, which is all that a
@@ -33075,10 +33158,24 @@ impl GenRename<'_> {
 /// block's calls, and a block's `t` was a false duplicate of the module's.
 fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleItem> {
     let mut names = Vec::new();
-    collect_renamed_decl_names(items, rename.renames_data(), &mut names);
+    let mut gate = GenRenameGate::default();
+    visit_renamed_decls(items, rename.renames_data(), &mut |n, stamp| {
+        names.push(n.to_string());
+        if let Some(stamp) = stamp {
+            gate.add_subroutine(n, stamp);
+        }
+    });
     if names.is_empty() {
         return items.to_vec();
     }
+    // Under either rename, `rename_item_decls` renames a nested declarator
+    // that shares a name with a renamed subroutine.
+    visit_renamed_decls(items, true, &mut |n, stamp| {
+        if stamp.is_none() {
+            gate.data_names.insert(n.to_string());
+        }
+    });
+    let _gate = GenRenameFrame::push(gate);
     // Every declaration below is renamed, but a reference only binds to what
     // is visible from it (§23.9, §27.5). Here that is this block's own names;
     // each nested block adds its own (`gen_block_port_map`). A reference that
@@ -48671,7 +48768,10 @@ fn rewrite_expr_impl(
                     return mapped.clone();
                 }
             }
-            if let Some(mapped) = port_map.get(name) {
+            if let Some(mapped) = port_map
+                .get(name)
+                .filter(|_| !gen_rename_hides(name, hier.bound))
+            {
                 // §25.5.4: `p.b` through a modport-typed port whose actual is
                 // an interface instance — a modport EXPRESSION member
                 // substitutes its registered expression (see

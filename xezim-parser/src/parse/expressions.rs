@@ -1597,9 +1597,10 @@ impl Parser {
                 self.bump(); // $unit
                 self.bump(); // ::
                 let mut hier = self.parse_hierarchical_identifier();
-                if (!self.at(TokenKind::LParen) || hier.path.len() > 1)
-                    && let Some(seg) = hier.path.first_mut()
-                {
+                if self.at(TokenKind::LParen) && hier.path.len() == 1 {
+                    // §3.12.1: no lexical lookup applies to this name.
+                    hier.bound = crate::ast::binding::Bound::NO_TARGET;
+                } else if let Some(seg) = hier.path.first_mut() {
                     seg.name.name = crate::unit_scope_name(&seg.name.name);
                 }
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
