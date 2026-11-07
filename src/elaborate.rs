@@ -10716,14 +10716,33 @@ pub fn elaborate_module_with_defs(
                     // `output logic [3:0][9:0] o; assign o[1] = v;` degraded
                     // to a bit-window write (only the low bits landed) and
                     // struct-port member writes missed the layout.
+                    // §7.4.1: the packed dims may live on the TYPEDEF (`typedef
+                    // b_t [0:3] w_t; output w_t o;`): one step of a bare
+                    // reference, as the DataDeclaration arm takes.
                     if let Some(ew) =
                         packed_inner_elem_width(&pd.data_type, &elab.parameters, &elab.typedefs)
+                            .or_else(|| {
+                                let one = bare_typedef_step(&pd.data_type, &elab.typedef_types)?;
+                                packed_inner_elem_width(&one, &elab.parameters, &elab.typedefs)
+                            })
                     {
                         elab.packed_signal_elem_widths
                             .entry(decl.name.name.clone())
                             .or_insert(ew);
                     }
-                    if let Some(fd) = packed_full_dims_of(&pd.data_type, &elab.parameters) {
+                    // A TYPEDEF'd element with declared dims (`output u8_t
+                    // [0:7] o;`): chain them with the typedef's, as the
+                    // DataDeclaration arm does. Unrecorded, the ascending
+                    // `[0:7]` fell back to [7:0] element order (§7.4.1).
+                    if let Some(fd) =
+                        packed_full_dims_of(&pd.data_type, &elab.parameters).or_else(|| {
+                            packed_full_dims_chained(
+                                &pd.data_type,
+                                &elab.parameters,
+                                &elab.typedef_types,
+                            )
+                        })
+                    {
                         elab.packed_full_dims
                             .entry(decl.name.name.clone())
                             .or_insert(fd);
@@ -10735,6 +10754,17 @@ pub fn elaborate_module_with_defs(
                         &elab.typedef_types,
                     ) {
                         if !fields.is_empty() {
+                            // §7.4.1: a packed ARRAY of the struct (`output
+                            // s_t [0:3] o;`): its dims, the struct the
+                            // innermost, as the ANSI arm records them.
+                            let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                            if let Some(fd) =
+                                packed_typedef_array_dims(&pd.data_type, struct_w, &elab.parameters)
+                            {
+                                elab.packed_full_dims
+                                    .entry(decl.name.name.clone())
+                                    .or_insert(fd);
+                            }
                             tls_register_struct_layout(&decl.name.name, &fields);
                             elab.packed_struct_fields
                                 .entry(decl.name.name.clone())
@@ -36782,6 +36812,18 @@ fn scope_local_type_name(
     })
 }
 
+/// One typedef step of a BARE reference with no dimensions of its own:
+/// `w_t` gives `b_t [0:3]` for `typedef b_t [0:3] w_t;`. A reference that
+/// carries dims keeps them for the chained walk instead.
+fn bare_typedef_step(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> Option<DataType> {
+    match dt {
+        DataType::TypeReference {
+            name, dimensions, ..
+        } if dimensions.is_empty() => lookup_scoped_type(name, typedef_types).cloned(),
+        _ => None,
+    }
+}
+
 /// §6.18/§23.10: rename every bare `TypeReference` in `dt` that names one of
 /// `local_names` to its instance-scoped form `"<prefix><name>"`. A typedef
 /// stored under a scoped key still carried BARE member-type references, so a
@@ -40360,13 +40402,32 @@ fn inline_module_items(
                                     &pd.data_type,
                                     &sub_local_params,
                                     &elab.typedefs,
-                                ) {
+                                )
+                                .or_else(|| {
+                                    // Dims on the TYPEDEF (`output w_t o;`).
+                                    let one =
+                                        bare_typedef_step(&pd.data_type, &elab.typedef_types)?;
+                                    packed_inner_elem_width(&one, &sub_local_params, &elab.typedefs)
+                                }) {
                                     elab.packed_signal_elem_widths
                                         .entry(sig_name.clone())
                                         .or_insert(ew);
                                 }
+                                // §7.4.1: a TYPEDEF'd element with
+                                // declared dims (`output u8_t [0:7] o;`)
+                                // chains them with the typedef's, as the
+                                // ANSI arm does; unrecorded, ascending
+                                // `[0:7]` fell back to [7:0] order.
                                 if let Some(fd) =
-                                    packed_full_dims_of(&pd.data_type, &sub_local_params)
+                                    packed_full_dims_of(&pd.data_type, &sub_local_params).or_else(
+                                        || {
+                                            packed_full_dims_chained(
+                                                &pd.data_type,
+                                                &sub_local_params,
+                                                &elab.typedef_types,
+                                            )
+                                        },
+                                    )
                                 {
                                     elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
                                 }
@@ -40377,6 +40438,20 @@ fn inline_module_items(
                                     &elab.typedef_types,
                                 ) {
                                     if !fields.is_empty() {
+                                        // §7.4.1: a packed ARRAY of the struct
+                                        // (`output s_t [0:3] o;`), as the ANSI
+                                        // arm records it.
+                                        let struct_w =
+                                            fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                        if let Some(fd) = packed_typedef_array_dims(
+                                            &pd.data_type,
+                                            struct_w,
+                                            &sub_local_params,
+                                        ) {
+                                            elab.packed_full_dims
+                                                .entry(sig_name.clone())
+                                                .or_insert(fd);
+                                        }
                                         tls_register_struct_layout(&sig_name, &fields);
                                         elab.packed_struct_fields
                                             .entry(sig_name.clone())
