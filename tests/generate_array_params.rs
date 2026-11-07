@@ -192,3 +192,39 @@ fn associative_array_in_a_generate_scope_stays_associative() {
     assert!(!design.arrays.contains_key("g.a"));
     assert!(!design.arrays.contains_key("g.b"));
 }
+
+/// A header parameter sizes `r [N]` as fixed in each iteration of a loop
+/// generate, not only in the first.
+#[test]
+fn data_array_sized_by_a_header_parameter_in_each_loop_iteration() {
+    let design = elaborate(
+        "module t #(parameter int N = 4);
+          logic [31:0] m [N];
+          for (genvar i = 0; i < 2; i++) begin : g
+            logic [31:0] r [N];
+          end
+        endmodule",
+    );
+    assert!(design.arrays.contains_key("m"));
+    for key in ["g[0].r", "g[1].r"] {
+        assert_eq!(design.arrays.get(key), design.arrays.get("m"), "{key}");
+        assert!(!design.associative_arrays.contains_key(key), "{key}");
+    }
+}
+
+/// `[N]` as the first of two unpacked dimensions is fixed too.
+#[test]
+fn two_dimensional_data_array_sized_by_a_module_level_parameter() {
+    let design = elaborate(
+        "module t;
+          localparam int N = 4;
+          logic [31:0] m [N][2];
+          if (1) begin : g
+            logic [31:0] r [N][2];
+          end
+        endmodule",
+    );
+    assert!(design.arrays_2d.contains_key("m"));
+    assert_eq!(design.arrays_2d.get("g.r"), design.arrays_2d.get("m"));
+    assert!(!design.associative_arrays.contains_key("g.r"));
+}
