@@ -279,12 +279,14 @@ impl Parser {
                     name: iname,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 };
                 let instantiation = crate::ast::decl::ModuleInstantiation {
                     module_name: bind_mod,
                     params: bind_params,
                     instances: vec![instance],
+                    scope: None,
                     span,
                 };
                 return Some(crate::ast::decl::BindDirective {

@@ -616,6 +616,8 @@ impl Binder<'_> {
                 }
             }
             ModuleItem::ModuleInstantiation(m) => {
+                // §23.8.1: an upward call from the instance searches here first.
+                m.scope = Some(self.scope);
                 for p in m.params.iter_mut().flatten() {
                     let value = match p {
                         ParamConnection::Ordered(v) => v,

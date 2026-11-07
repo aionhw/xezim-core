@@ -1187,6 +1187,10 @@ pub struct ModuleInstantiation {
     pub module_name: Identifier,
     pub params: Option<Vec<ParamConnection>>,
     pub instances: Vec<HierarchicalInstance>,
+    /// The scope of its definition's tree that holds it; `None` when not
+    /// bound. Written by the lexical binder (§23.8.1).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub scope: Option<super::binding::ScopeId>,
     pub span: Span,
 }
 
@@ -1213,6 +1217,10 @@ pub struct HierarchicalInstance {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
     pub connections: Vec<PortConnection>,
+    /// §27.4: the loop index of each generate-for block around it in its
+    /// definition, outermost first. Written by generate expansion.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub gen_indices: Vec<i64>,
     pub span: Span,
 }
 

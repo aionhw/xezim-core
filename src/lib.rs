@@ -3759,8 +3759,10 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
                     },
                     dimensions: vec![],
                     connections: vec![],
+                    gen_indices: vec![],
                     span: ast::Span::dummy(),
                 }],
+                scope: None,
                 span: ast::Span::dummy(),
             })
         })
