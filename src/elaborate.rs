@@ -40027,145 +40027,8 @@ fn inline_module_items(
                             }
                         }
                     }
-                    PortList::NonAnsi(_names) => {
-                        for sub_item in &prepared_sub.effective_items {
-                            if let ModuleItem::PortDeclaration(pd) = sub_item {
-                                if is_interface_type(&pd.data_type, definitions) {
-                                    continue;
-                                }
-                                let width = resolve_type_width(
-                                    &pd.data_type,
-                                    Some(&sub_local_params),
-                                    Some(&elab.typedefs),
-                                );
-                                let is_signed = is_type_signed(&pd.data_type);
-                                for decl in &pd.declarators {
-                                    let sig_name = cat2(&inst_prefix, &decl.name.name);
-                                    let dims = if decl.dimensions.is_empty() {
-                                        match &pd.data_type {
-                                            DataType::TypeReference { name, .. } => {
-                                                lookup_scoped_type(
-                                                    name,
-                                                    &elab.typedef_unpacked_dims,
-                                                )
-                                                .cloned()
-                                                .unwrap_or_default()
-                                            }
-                                            _ => Vec::new(),
-                                        }
-                                    } else {
-                                        decl.dimensions.clone()
-                                    };
-                                    let dims = normalize_unpacked_dims(
-                                        &dims,
-                                        &sub_local_params,
-                                        &elab.typedef_types,
-                                    );
-                                    if let Some(shape) =
-                                        fixed_unpacked_shape(&dims, &sub_local_params)
-                                            .filter(|d| !d.is_empty())
-                                    {
-                                        register_fixed_unpacked_array(
-                                            elab,
-                                            &sig_name,
-                                            &shape,
-                                            width,
-                                            is_type_two_state_resolved(
-                                                &pd.data_type,
-                                                &elab.typedef_types,
-                                            ),
-                                        );
-                                        if let Some(declared) =
-                                            declared_unpacked_dims(&dims, &sub_local_params)
-                                        {
-                                            if declared.first().is_some_and(|(l, r)| l > r) {
-                                                elab.descending_arrays.insert(sig_name.clone());
-                                            }
-                                            elab.unpacked_decl_dims
-                                                .insert(sig_name.clone(), declared);
-                                        }
-                                        elab.var_decl_types
-                                            .insert(sig_name.clone(), scope_local_typerefs(&pd.data_type, &sub_typedef_names_all, &inst_prefix));
-                                    }
-                                    // §7.4.1: a non-ANSI PORT of a packed
-                                    // multi-D / packed-struct type needs the
-                                    // same shape registrations a variable
-                                    // declaration gets. Without them
-                                    // `assign o[1] = v;` on a
-                                    // `output logic [3:0][9:0] o;` inlined
-                                    // port degraded to a bit-window write, and
-                                    // struct-port member assigns lost the
-                                    // layout.
-                                    if let Some(ew) = packed_inner_elem_width(
-                                        &pd.data_type,
-                                        &sub_local_params,
-                                        &elab.typedefs,
-                                    ) {
-                                        elab.packed_signal_elem_widths
-                                            .entry(sig_name.clone())
-                                            .or_insert(ew);
-                                    }
-                                    if let Some(fd) =
-                                        packed_full_dims_of(&pd.data_type, &sub_local_params)
-                                    {
-                                        elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
-                                    }
-                                    if let Some(fields) = packed_struct_field_layout(
-                                        &pd.data_type,
-                                        &sub_local_params,
-                                        &elab.typedefs,
-                                        &elab.typedef_types,
-                                    ) {
-                                        if !fields.is_empty() {
-                                            tls_register_struct_layout(&sig_name, &fields);
-                                            elab.packed_struct_fields
-                                                .entry(sig_name.clone())
-                                                .or_insert(fields);
-                                        }
-                                    }
-                                    // §6.6.7: resolve REALNESS through the
-                                    // typedef table — a nettype port formal
-                                    // (`inout rnet p`, rnet = `nettype real`)
-                                    // is a real signal. The bare is_type_real
-                                    // left it integral, so `%f` on the formal
-                                    // printed raw bits and any true real
-                                    // consumer read 0.0 (reads only worked
-                                    // when both sides were bit-identical).
-                                    let port_is_real =
-                                        is_type_real_resolved(&pd.data_type, &elab.typedef_types);
-                                    signals_insert_traced(
-                                        &mut elab.signals,
-                                        line!(),
-                                        sig_name.clone(),
-                                        Signal {
-                                            is_const: false,
-                                            name: sig_name.clone().into(),
-                                            width,
-                                            is_signed,
-                                            direction: Some(pd.direction),
-                                            value: default_port_value(
-                                                Some(pd.direction),
-                                                Some(&pd.data_type),
-                                                width,
-                                                port_is_real,
-                                                port_decl_net_type(pd),
-                                            ),
-                                            is_real: port_is_real,
-                                            type_name: scope_local_type_name(
-                                                get_type_name(&pd.data_type),
-                                                &sub_typedef_names_all,
-                                                &inst_prefix,
-                                            ),
-                                        },
-                                    );
-                                    if let Some(net_type) = port_decl_net_type(pd) {
-                                        register_net_type(elab, &sig_name, net_type);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    PortList::Empty => {}
+                    // Non-ANSI: registered after the local typedefs, below.
+                    PortList::NonAnsi(_) | PortList::Empty => {}
                 }
 
                 iprof_since("ck3_after_hdrparams", __th);
@@ -40415,6 +40278,150 @@ fn inline_module_items(
                                         &inst_prefix,
                                     )
                                 });
+                        }
+                    }
+                }
+                // §23.2.2.1/§6.18: a non-ANSI port declaration lives in the
+                // BODY, so it may name a typedef declared there (`typedef
+                // logic [7:0] u8_t; output u8_t [0:7] o;`). Register the
+                // ports after this instance's typedefs (loop B above): sized
+                // before them, the local type fell back to 32 bits per element.
+                if let PortList::NonAnsi(_) = sub_mod.ports() {
+                    for sub_item in &prepared_sub.effective_items {
+                        if let ModuleItem::PortDeclaration(pd) = sub_item {
+                            if is_interface_type(&pd.data_type, definitions) {
+                                continue;
+                            }
+                            let width = resolve_type_width(
+                                &pd.data_type,
+                                Some(&sub_local_params),
+                                Some(&elab.typedefs),
+                            );
+                            let is_signed = is_type_signed(&pd.data_type);
+                            for decl in &pd.declarators {
+                                let sig_name = cat2(&inst_prefix, &decl.name.name);
+                                let dims = if decl.dimensions.is_empty() {
+                                    match &pd.data_type {
+                                        DataType::TypeReference { name, .. } => {
+                                            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                                .cloned()
+                                                .unwrap_or_default()
+                                        }
+                                        _ => Vec::new(),
+                                    }
+                                } else {
+                                    decl.dimensions.clone()
+                                };
+                                let dims = normalize_unpacked_dims(
+                                    &dims,
+                                    &sub_local_params,
+                                    &elab.typedef_types,
+                                );
+                                if let Some(shape) = fixed_unpacked_shape(&dims, &sub_local_params)
+                                    .filter(|d| !d.is_empty())
+                                {
+                                    register_fixed_unpacked_array(
+                                        elab,
+                                        &sig_name,
+                                        &shape,
+                                        width,
+                                        is_type_two_state_resolved(
+                                            &pd.data_type,
+                                            &elab.typedef_types,
+                                        ),
+                                    );
+                                    if let Some(declared) =
+                                        declared_unpacked_dims(&dims, &sub_local_params)
+                                    {
+                                        if declared.first().is_some_and(|(l, r)| l > r) {
+                                            elab.descending_arrays.insert(sig_name.clone());
+                                        }
+                                        elab.unpacked_decl_dims.insert(sig_name.clone(), declared);
+                                    }
+                                    elab.var_decl_types.insert(
+                                        sig_name.clone(),
+                                        scope_local_typerefs(
+                                            &pd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        ),
+                                    );
+                                }
+                                // §7.4.1: a non-ANSI PORT of a packed
+                                // multi-D / packed-struct type needs the
+                                // same shape registrations a variable
+                                // declaration gets. Without them
+                                // `assign o[1] = v;` on a
+                                // `output logic [3:0][9:0] o;` inlined
+                                // port degraded to a bit-window write, and
+                                // struct-port member assigns lost the
+                                // layout.
+                                if let Some(ew) = packed_inner_elem_width(
+                                    &pd.data_type,
+                                    &sub_local_params,
+                                    &elab.typedefs,
+                                ) {
+                                    elab.packed_signal_elem_widths
+                                        .entry(sig_name.clone())
+                                        .or_insert(ew);
+                                }
+                                if let Some(fd) =
+                                    packed_full_dims_of(&pd.data_type, &sub_local_params)
+                                {
+                                    elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
+                                }
+                                if let Some(fields) = packed_struct_field_layout(
+                                    &pd.data_type,
+                                    &sub_local_params,
+                                    &elab.typedefs,
+                                    &elab.typedef_types,
+                                ) {
+                                    if !fields.is_empty() {
+                                        tls_register_struct_layout(&sig_name, &fields);
+                                        elab.packed_struct_fields
+                                            .entry(sig_name.clone())
+                                            .or_insert(fields);
+                                    }
+                                }
+                                // §6.6.7: resolve REALNESS through the
+                                // typedef table — a nettype port formal
+                                // (`inout rnet p`, rnet = `nettype real`)
+                                // is a real signal. The bare is_type_real
+                                // left it integral, so `%f` on the formal
+                                // printed raw bits and any true real
+                                // consumer read 0.0 (reads only worked
+                                // when both sides were bit-identical).
+                                let port_is_real =
+                                    is_type_real_resolved(&pd.data_type, &elab.typedef_types);
+                                signals_insert_traced(
+                                    &mut elab.signals,
+                                    line!(),
+                                    sig_name.clone(),
+                                    Signal {
+                                        is_const: false,
+                                        name: sig_name.clone().into(),
+                                        width,
+                                        is_signed,
+                                        direction: Some(pd.direction),
+                                        value: default_port_value(
+                                            Some(pd.direction),
+                                            Some(&pd.data_type),
+                                            width,
+                                            port_is_real,
+                                            port_decl_net_type(pd),
+                                        ),
+                                        is_real: port_is_real,
+                                        type_name: scope_local_type_name(
+                                            get_type_name(&pd.data_type),
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        ),
+                                    },
+                                );
+                                if let Some(net_type) = port_decl_net_type(pd) {
+                                    register_net_type(elab, &sig_name, net_type);
+                                }
+                            }
                         }
                     }
                 }
