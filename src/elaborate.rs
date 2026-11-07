@@ -1455,6 +1455,19 @@ pub struct UpwardScopes {
     /// §26.3: package names — `pkg.member` is the inliner's spelling of a
     /// package constant, never a scope path.
     packages: HashSet<String>,
+    /// §23.8.1: instance path → where its instantiation sits in its parent.
+    parents: HashMap<String, InstanceParent>,
+}
+
+/// The scope of the parent definition holding an instantiation.
+#[derive(Debug)]
+struct InstanceParent {
+    /// The instance's own definition.
+    def: String,
+    path: String,
+    tree: Rc<crate::scope_tree::ScopeTree>,
+    scope: crate::ast::binding::ScopeId,
+    indices: Vec<i64>,
 }
 
 impl UpwardScopes {
@@ -1470,6 +1483,61 @@ impl UpwardScopes {
             .or_default()
             .push((leaf.to_string(), def.to_string()));
         self.defs.insert(path.to_string(), def.to_string());
+    }
+
+    /// Record where instance `path` is declared in its parent `parent`, an
+    /// instance of `def`. An instantiation the binder did not visit (a bind
+    /// target's, §23.11) sits at the definition scope.
+    fn add_parent(
+        &mut self,
+        parent: &str,
+        path: &str,
+        def: &str,
+        inst: &ModuleInstantiation,
+        hi: &HierarchicalInstance,
+    ) {
+        let Some(tree) = crate::scope_tree::tree_of(def) else {
+            return;
+        };
+        let scope = inst.scope.unwrap_or(tree.root);
+        if scope.0 as usize >= tree.scopes.len() {
+            return;
+        }
+        self.parents.insert(
+            path.to_string(),
+            InstanceParent {
+                def: inst.module_name.name.clone(),
+                path: parent.to_string(),
+                tree,
+                scope,
+                indices: hi.gen_indices.clone(),
+            },
+        );
+    }
+
+    /// §23.8.1 steps b) and c): the subroutine a bare `name` called in
+    /// instance `inst` names, from the scope of the instantiation up through
+    /// each enclosing instance. `None` when the first declaration of `name`
+    /// found is not a function or task, or none is. §26.3: imports of an
+    /// enclosing scope are not visible to it.
+    fn subroutine_key(&self, inst: &str, name: &str) -> Option<String> {
+        use crate::ast::binding::DeclKind;
+        let mut at = inst;
+        while let Some(up) = self.parents.get(at) {
+            if let Some(d) = up.tree.lookup(up.scope, name) {
+                let decl = &up.tree.decls[d.0 as usize];
+                if !matches!(decl.kind, DeclKind::Function | DeclKind::Task) {
+                    return None;
+                }
+                let key = up.tree.key(decl.scope, name, &up.indices);
+                return Some(match up.path.is_empty() {
+                    true => key,
+                    false => format!("{}.{key}", up.path),
+                });
+            }
+            at = &up.path;
+        }
+        None
     }
 
     fn declare(&mut self, def: &Definition) {
@@ -34471,7 +34539,8 @@ fn gen_scope_name(label: Option<&String>, implicit: &str) -> String {
 ///
 /// Also sets the `gen_scope` field on AlwaysConstruct and InitialConstruct
 /// so that %m reports the full hierarchical path including generate block names.
-fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
+/// `index` is a generate-for block's loop index, recorded on its instances.
+fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str, index: Option<i64>) {
     for item in items.iter_mut() {
         match item {
             ModuleItem::Bind(b) => {
@@ -34484,6 +34553,10 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &mut inst.instances {
                     hi.name.name = format!("{}.{}", scope, hi.name.name);
+                    // Inner blocks were expanded first.
+                    if let Some(i) = index {
+                        hi.gen_indices.insert(0, i);
+                    }
                 }
             }
             ModuleItem::GateInstantiation(g) => {
@@ -34711,7 +34784,7 @@ fn collect_effective_items(
                             }
                         };
                         let mut inner = collect_effective_items(&scoped_items, params);
-                        prefix_gen_scope(&mut inner, &scope);
+                        prefix_gen_scope(&mut inner, &scope, None);
                         result.extend(inner);
                         matched = true;
                         break;
@@ -34750,7 +34823,7 @@ fn collect_effective_items(
                         None => rename_decls_in_iter(&arm.items, &GenRename::Subroutines(&scope)),
                     };
                     let mut inner = collect_effective_items(&arm_items, params);
-                    prefix_gen_scope(&mut inner, &scope);
+                    prefix_gen_scope(&mut inner, &scope, None);
                     result.extend(inner);
                 }
             }
@@ -34787,7 +34860,7 @@ fn collect_effective_items(
                     );
                     let subst = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
                     let mut inner = collect_effective_items(&subst, &local_params);
-                    prefix_gen_scope(&mut inner, &scope);
+                    prefix_gen_scope(&mut inner, &scope, Some(i));
                     result.extend(inner);
                     match &gf.incr.kind {
                         ExprKind::Unary {
@@ -35473,6 +35546,7 @@ fn ai_expand_instances(
                 name: ident,
                 dimensions: vec![],
                 connections: new_conns,
+                gen_indices: hi.gen_indices.clone(),
                 span: hi.span,
             });
         }
@@ -37661,6 +37735,13 @@ fn inline_module_items(
                 let __th = iprof_now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                elab.upward_scopes.borrow_mut().add_parent(
+                    prefix.trim_end_matches('.'),
+                    inst_prefix.trim_end_matches('.'),
+                    source_def.name(),
+                    inst,
+                    hi,
+                );
                 // Bare-name keys this instance adds to the design-wide
                 // geometry tables while its body is processed (see the
                 // DataDeclaration arm below); removed again when the
@@ -48759,6 +48840,28 @@ fn upward_scope_rewrite(hier: &HierarchicalIdentifier, prefix: &str) -> Option<E
     Some(ExprKind::Ident(new_hier))
 }
 
+/// §23.8.1: the key of the subroutine a bare name the binder left to the
+/// hierarchy (`Bound::UPWARD`) calls from the instance at `prefix`, when it
+/// differs from the name.
+fn upward_subroutine_key(hier: &HierarchicalIdentifier, prefix: &str) -> Option<String> {
+    if !hier.bound.is_upward() || hier.path.len() != 1 || !hier.path[0].selects.is_empty() {
+        return None;
+    }
+    let scopes = UPWARD_SCOPES_TLS.with(|c| c.borrow().clone())?;
+    let scopes = scopes.borrow();
+    let name = hier.path[0].name.name.as_str();
+    let inst = prefix.trim_end_matches('.');
+    let key = scopes.subroutine_key(inst, name)?;
+    if bind::audit_enabled() {
+        let def = scopes.parents.get(inst).map_or("", |up| up.def.as_str());
+        eprintln!(
+            "[bind-audit] upward {} {name} in {inst} -> {key}",
+            audit_location(def, hier.span)
+        );
+    }
+    (key != name).then_some(key)
+}
+
 /// §23.8 / §23.10.1: a port actual `dut.gclk_a` whose first segment names
 /// no local, port, interface or child instance of the current scope but IS
 /// the definition name of an enclosing instance (the harness is bound into
@@ -49194,6 +49297,12 @@ fn rewrite_expr_impl(
             if local_names.contains(name) {
                 let mut new_hier = hier.clone();
                 new_hier.path[0].name.name = cat2(&prefix, &name);
+                ExprKind::Ident(new_hier)
+            } else if let Some(key) = upward_subroutine_key(hier, prefix) {
+                let mut new_hier = hier.clone();
+                new_hier.path[0].name.name = key;
+                new_hier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                new_hier.cached_resolved_name = crate::ast::cache::NameCache::new();
                 ExprKind::Ident(new_hier)
             } else if let Some(upward) = upward_scope_rewrite(hier, prefix) {
                 // §23.8: a name headed by an enclosing scope (the bind

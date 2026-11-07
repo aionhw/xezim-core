@@ -4721,6 +4721,7 @@ impl Parser {
                     name,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 });
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4732,6 +4733,7 @@ impl Parser {
                 module_name: first_name,
                 params,
                 instances,
+                scope: None,
                 span: self.span_from(start),
             });
         }
@@ -4759,6 +4761,7 @@ impl Parser {
                     name: iname,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 });
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4801,6 +4804,7 @@ impl Parser {
                     module_name: first_name,
                     params,
                     instances,
+                    scope: None,
                     span: self.span_from(start),
                 })
             }
