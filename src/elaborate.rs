@@ -45579,9 +45579,44 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     let mut delays: HashMap<String, u64> = HashMap::default();
     let mut kept: Vec<ContinuousAssignment> = Vec::new();
 
+    // Member-wise drivers of resolver-less nets: net -> member -> count.
+    let mut member_drivers: HashMap<String, HashMap<String, usize>> = HashMap::default();
+    // The nettype net a member path (`u.p.V`) belongs to, and the member.
+    let net_member = |name: &str| -> Option<(String, String)> {
+        name.match_indices('.')
+            .map(|(i, _)| (&name[..i], &name[i + 1..]))
+            .find(|(net, _)| net_resolver.contains_key(*net))
+            .map(|(net, m)| (net.to_string(), m.to_string()))
+    };
     for ca in std::mem::take(&mut elab.continuous_assigns) {
         let Some(lhs_name) = ident_flat_name(&ca.lhs).filter(|n| net_resolver.contains_key(n))
         else {
+            // §6.6.7, §23.3.3: a port connection of a resolver-less
+            // unpacked-struct net arrives member by member (`n.V = u.p.V`).
+            // It joins the two nets for the one-driver count, as the
+            // whole-net link below does, and stays an ordinary assignment.
+            let joined = ident_flat_name(&ca.lhs)
+                .and_then(|l| net_member(&l))
+                .zip(ident_flat_name(&ca.rhs).and_then(|r| net_member(&r)))
+                .filter(|((ln, lm), (rn, rm))| {
+                    lm == rm
+                        && ln != rn
+                        && net_resolver[ln].is_empty()
+                        && net_resolver[rn].is_empty()
+                });
+            if let Some(((ln, _), (rn, _))) = joined {
+                let a = find(&mut parent, &ln);
+                let b = find(&mut parent, &rn);
+                if a != b {
+                    parent.insert(a, b);
+                }
+            } else if let Some((net, m)) = ident_flat_name(&ca.lhs)
+                .and_then(|l| net_member(&l))
+                .filter(|(net, _)| net_resolver[net].is_empty())
+            {
+                // A whole-net driver an earlier pass already took apart.
+                *member_drivers.entry(net).or_default().entry(m).or_insert(0) += 1;
+            }
             kept.push(ca);
             continue;
         };
@@ -45636,6 +45671,31 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     for n in &all_nets {
         let root = find(&mut parent, n);
         comp_members.entry(root).or_default().push(n.clone());
+    }
+
+    // §6.6.7: count the drivers of each resolver-less net over its whole
+    // component, member-wise ones included (a driver taken apart counts once,
+    // as its most-driven member).
+    for n in &all_nets {
+        let root = find(&mut parent, n);
+        if root != *n || !net_resolver[&root].is_empty() {
+            continue;
+        }
+        let members = &comp_members[&root];
+        let mut per_member: HashMap<&str, usize> = HashMap::default();
+        for net in members {
+            for (m, c) in member_drivers.get(net).into_iter().flatten() {
+                *per_member.entry(m.as_str()).or_insert(0) += c;
+            }
+        }
+        let total = comp_drivers.get(&root).map_or(0, |d| d.len())
+            + per_member.values().copied().max().unwrap_or(0);
+        if total > 1 {
+            return Err(format!(
+                "net '{}' of an unresolved nettype has {} continuous drivers; a nettype declared without a resolution function permits only one (IEEE 1800-2017 6.6.7)",
+                root, total
+            ));
+        }
     }
 
     // Struct members of a nettype net, or None for a scalar one.
