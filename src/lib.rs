@@ -2662,6 +2662,9 @@ fn parse_and_elaborate(
     // as the top and run. An include dir is a search path, not a compile list.
     let explicit_def_names: std::collections::HashSet<String> =
         definitions.keys().cloned().collect();
+    // A previous elaboration's library files on this thread must not locate
+    // this design's spans.
+    elaborate::set_elab_library_sources(Default::default());
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(
             &mut definitions,
@@ -3784,6 +3787,10 @@ fn resolve_library_modules(
     let mut parse_issue_files: Vec<std::path::PathBuf> = Vec::new();
     let mut lib_origins: crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)> =
         Default::default();
+    // Every indexed file's preprocessed text and line map (by definition
+    // name), so a diagnostic inside an ADOPTED definition names its own file;
+    // and the packages library files declared, which are never compiled.
+    let mut lib_sources = elaborate::LibrarySources::default();
     #[allow(clippy::too_many_arguments)]
     fn index_library_file(
         path: std::path::PathBuf,
@@ -3796,6 +3803,7 @@ fn resolve_library_modules(
         scanned_paths: &mut Vec<std::path::PathBuf>,
         parse_issue_files: &mut Vec<std::path::PathBuf>,
         lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
+        lib_sources: &mut elaborate::LibrarySources,
     ) {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -3928,6 +3936,8 @@ fn resolve_library_modules(
                 _ => None,
             })
             .collect();
+        let file_index = lib_sources.files.len() as u32;
+        let mut defined: Vec<String> = Vec::new();
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(mut m) => {
@@ -3937,6 +3947,7 @@ fn resolve_library_modules(
                             m.items.insert(0, sub.clone());
                         }
                         lib.insert(name.clone(), SourceDefinition::Module(Rc::new(m)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "module"));
                     }
                 }
@@ -3944,6 +3955,7 @@ fn resolve_library_modules(
                     let name = i.name.name.clone();
                     if !lib.contains_key(&name) {
                         lib.insert(name.clone(), SourceDefinition::Interface(Rc::new(i)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "interface"));
                     }
                 }
@@ -3951,6 +3963,7 @@ fn resolve_library_modules(
                     let name = p.name.name.clone();
                     if !lib.contains_key(&name) {
                         lib.insert(name.clone(), SourceDefinition::Program(Rc::new(p)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "program"));
                     }
                 }
@@ -3961,17 +3974,40 @@ fn resolve_library_modules(
                 ast::Description::TypedefDecl(t) if !t.forward => {
                     lib_typedefs.push(Rc::new(t));
                 }
+                // A library file supplies definitions to unresolved
+                // instantiations only; its packages are not compiled. Keep
+                // where one was declared, for the "not found" error of an
+                // import that expected it.
+                ast::Description::Package(p) => {
+                    let at = line_map
+                        .as_ref()
+                        .and_then(|m| m.location_string(&result.source_text, p.name.span))
+                        .unwrap_or_else(|| file_label.clone());
+                    lib_sources
+                        .ignored_packages
+                        .entry(p.name.name.clone())
+                        .or_insert((at, file_label.clone()));
+                }
                 // §29: a UDP defined in a `-v`/`-y` library file (vendor
                 // stdcell). Adopted on demand like a library module.
                 ast::Description::Udp(u) => {
                     let name = u.name.name.clone();
                     if !lib.contains_key(&name) {
                         lib.insert(name.clone(), SourceDefinition::Udp(Rc::new(u)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "UDP"));
                     }
                 }
                 _ => {}
             }
+        }
+        if !defined.is_empty() {
+            for name in defined {
+                lib_sources.def_file.insert(name, file_index);
+            }
+            lib_sources
+                .files
+                .push((file_label, result.source_text, line_map));
         }
     }
 
@@ -3987,6 +4023,7 @@ fn resolve_library_modules(
             &mut scanned_paths,
             &mut parse_issue_files,
             &mut lib_origins,
+            &mut lib_sources,
         );
     }
 
@@ -4032,6 +4069,7 @@ fn resolve_library_modules(
     let mut work: Vec<String> = seed.into_iter().collect();
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut adopted_from_v = 0usize;
+    let mut adopted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut full_scan_done = false;
     while let Some(name) = work.pop() {
         if definitions.contains_key(&name) {
@@ -4063,6 +4101,7 @@ fn resolve_library_modules(
                     &mut scanned_paths,
                     &mut parse_issue_files,
                     &mut lib_origins,
+                    &mut lib_sources,
                 );
             }
             if !lib.contains_key(&name) && !full_scan_done {
@@ -4079,6 +4118,7 @@ fn resolve_library_modules(
                         &mut scanned_paths,
                         &mut parse_issue_files,
                         &mut lib_origins,
+                        &mut lib_sources,
                     );
                 }
             }
@@ -4104,6 +4144,7 @@ fn resolve_library_modules(
             let mut more = std::collections::HashSet::new();
             instantiations(def, &mut more);
             definitions.insert(name.clone(), def.clone());
+            adopted.insert(name.clone());
             for n in more {
                 referrers.entry(n.clone()).or_default().insert(name.clone());
                 if !definitions.contains_key(&n) {
@@ -4224,6 +4265,7 @@ fn resolve_library_modules(
                 &mut scanned_paths,
                 &mut parse_issue_files,
                 &mut lib_origins,
+                &mut lib_sources,
             );
         }
     }
@@ -4236,6 +4278,34 @@ fn resolve_library_modules(
             definitions.insert(name, SourceDefinition::Typedef(t));
         }
     }
+    // Publish only the files an adopted definition came from.
+    let mut slots: Vec<Option<(String, String, Option<sv_parser::source_map::LineMap>)>> =
+        std::mem::take(&mut lib_sources.files)
+            .into_iter()
+            .map(Some)
+            .collect();
+    let mut renumber: crate::hasher::HashMap<u32, u32> = Default::default();
+    let mut def_file: crate::hasher::HashMap<String, u32> = Default::default();
+    for (name, i) in std::mem::take(&mut lib_sources.def_file) {
+        if !adopted.contains(&name) {
+            continue;
+        }
+        let j = match renumber.get(&i) {
+            Some(&j) => j,
+            None => {
+                let Some(file) = slots.get_mut(i as usize).and_then(Option::take) else {
+                    continue;
+                };
+                let j = lib_sources.files.len() as u32;
+                lib_sources.files.push(file);
+                renumber.insert(i, j);
+                j
+            }
+        };
+        def_file.insert(name, j);
+    }
+    lib_sources.def_file = def_file;
+    elaborate::set_elab_library_sources(lib_sources);
     Ok(())
 }
 

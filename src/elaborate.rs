@@ -35564,15 +35564,18 @@ impl InlineCache {
     #[cfg(test)]
     fn len(&self) -> usize { self.prepared.len() }
 
-    /// §26.3: the typedefs the imports of `def` bind, in binding order.
+    /// §26.3: the typedefs the imports of `def` bind, in binding order. An
+    /// import of a package the design does not declare is an error, at that
+    /// import (the built-in `std` binds no typedefs).
     fn imported_typedefs(
         &mut self,
+        elab: &ElaboratedModule,
         def: Definition,
         definitions: &HashMap<String, Definition>,
-    ) -> Rc<[ImportedTypedefs]> {
+    ) -> Result<Rc<[ImportedTypedefs]>, String> {
         let key = param_scope::def_key(&def);
         if let Some(lists) = self.imports.get(&key) {
-            return Rc::clone(lists);
+            return Ok(Rc::clone(lists));
         }
         let mut lists = Vec::new();
         for item in def.items() {
@@ -35582,7 +35585,15 @@ impl InlineCache {
             for ii in &imp.items {
                 let pkg = &ii.package.name;
                 if !matches!(definitions.get(pkg), Some(Definition::Package(_))) {
-                    continue;
+                    if pkg == "std" {
+                        continue;
+                    }
+                    let msg = format!("Package '{}' not found", pkg);
+                    return Err(format!(
+                        "{}{}",
+                        span_error_of(elab, ii.package.span, def.name(), &msg),
+                        ignored_library_package_note(pkg)
+                    ));
                 }
                 lists.push(match &ii.item {
                     Some(sym) => Rc::from([(sym.name.clone(), format!("{pkg}::{}", sym.name))]),
@@ -35599,7 +35610,7 @@ impl InlineCache {
         }
         let lists: Rc<[ImportedTypedefs]> = lists.into();
         self.imports.insert(key, Rc::clone(&lists));
-        lists
+        Ok(lists)
     }
 }
 
@@ -36961,7 +36972,8 @@ fn inline_module_items(
     // (`elaborate_module_with_defs`); the inlined-instance path never processed
     // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
     // took whichever package last hoisted that bare name.
-    rebind_imported_typedefs(elab, &cache.imported_typedefs(source_def, definitions));
+    let imports = cache.imported_typedefs(elab, source_def, definitions)?;
+    rebind_imported_typedefs(elab, &imports);
     INLINE_CHAIN_TLS.with(|c| {
         c.borrow_mut()
             .push((prefix.to_string(), source_def.name().to_string()))
@@ -37274,7 +37286,8 @@ fn inline_module_items(
                 // parent's walk, so rebinding at the recursive call would be too
                 // late — an unqualified `T [1:0] s;` in a module that imports
                 // `P::*` took whichever package last hoisted that bare name.
-                rebind_imported_typedefs(elab, &cache.imported_typedefs(sub_mod, definitions));
+                let imports = cache.imported_typedefs(elab, sub_mod, definitions)?;
+                rebind_imported_typedefs(elab, &imports);
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -44978,6 +44991,63 @@ thread_local! {
     /// Line maps of the published sources (parallel to them).
     static ELAB_LINE_MAPS_TLS: std::cell::RefCell<Vec<Option<sv_parser::source_map::LineMap>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The `-v`/`-y` library files a definition was adopted from. They are
+    /// not among the published sources, so a span inside an adopted module
+    /// fitted some PRIMARY file instead and was reported there.
+    static ELAB_LIB_SOURCES_TLS: std::cell::RefCell<LibrarySources> =
+        std::cell::RefCell::new(LibrarySources::default());
+}
+
+/// The library files adopted definitions came from, and the packages those
+/// files declared (a library file supplies no packages).
+#[derive(Default)]
+pub struct LibrarySources {
+    /// (file label, preprocessed text, line map) per adopted library file.
+    pub files: Vec<(String, String, Option<sv_parser::source_map::LineMap>)>,
+    /// Adopted definition name -> index into `files`.
+    pub def_file: HashMap<String, u32>,
+    /// Package name -> where a library file declared it, as
+    /// (`file:line:col` of the declaration, library file label).
+    pub ignored_packages: HashMap<String, (String, String)>,
+}
+
+/// Publish the library files of this run's adopted definitions.
+pub fn set_elab_library_sources(lib: LibrarySources) {
+    ELAB_LIB_SOURCES_TLS.with(|c| *c.borrow_mut() = lib);
+}
+
+/// The note for a package that is missing because only a library file
+/// declared it, or an empty string.
+fn ignored_library_package_note(pkg: &str) -> String {
+    ELAB_LIB_SOURCES_TLS.with(|c| match c.borrow().ignored_packages.get(pkg) {
+        Some((at, lib)) => format!(
+            "\nnote: package '{pkg}' is declared at {at}, in library file '{lib}'; a -v/-y \
+             library file supplies only modules, interfaces, programs and primitives, so the \
+             package was not compiled. Pass that file as a source file"
+        ),
+        None => String::new(),
+    })
+}
+
+/// The location of `span` inside the library file definition `owner` was
+/// adopted from, when it was adopted from one.
+fn library_span_locate(owner: &str, span: Span) -> Option<Option<SpanLoc>> {
+    ELAB_LIB_SOURCES_TLS.with(|c| {
+        let lib = c.borrow();
+        let i = *lib.def_file.get(owner)? as usize;
+        let (file, text, map) = lib.files.get(i)?;
+        if span.start >= text.len() {
+            return Some(None);
+        }
+        if let Some(loc) = map.as_ref().and_then(|m| m.locate(text, span)) {
+            return Some(Some(SpanLoc::Mapped(loc)));
+        }
+        let line = 1 + text.as_bytes()[..span.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        Some(Some(SpanLoc::Plain(format!("{}:{}", file, line))))
+    })
 }
 
 /// Publish the line maps of the sources passed to `set_elab_sources`.
@@ -45076,6 +45146,12 @@ fn span_locate_owned(
     // which is every real one. Prefer the file that actually defines this
     // module and fall back to the scan only when it is unknown.
     let hint_name: &str = owner.unwrap_or(elab.name.as_str());
+    // A definition adopted from a library file: its spans index THAT file.
+    if hint && !hint_name.is_empty() {
+        if let Some(loc) = library_span_locate(hint_name, span) {
+            return loc;
+        }
+    }
     let preferred: Option<usize> = if !hint || hint_name.is_empty() {
         None
     } else {
@@ -51766,8 +51842,12 @@ fn process_import(
                     r
                 })?;
             }
-        } else {
-            return Err(format!("Package '{}' not found", pkg_name));
+        } else if pkg_name != "std" {
+            return Err(format!(
+                "Package '{}' not found{}",
+                pkg_name,
+                ignored_library_package_note(pkg_name)
+            ));
         }
     }
     Ok(())
