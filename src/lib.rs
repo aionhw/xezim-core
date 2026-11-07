@@ -1333,11 +1333,73 @@ pub fn parse_and_elaborate_multi_preprocessed(
             pp.module_ts_own_file.clone(),
         ),
     };
+    // A `-v` library file supplies only modules, interfaces, programs and
+    // primitives, so its packages are not compiled (#937). With
+    // `--relax-library-packages` they are, as if the file were also a source
+    // file: they join the design here, before anything imports them. A
+    // package a source file declares wins.
+    let mut source_files = source_files.to_vec();
+    let mut extra_orig_lines: Vec<u32> = Vec::new();
+    if sv_parser::RELAX_LIBRARY_PACKAGES.get() {
+        let lib_files = library_cli_cell()
+            .lock()
+            .map(|c| c.lib_files.clone())
+            .unwrap_or_default();
+        let mut declared: std::collections::HashSet<String> = all_descriptions
+            .iter()
+            .filter_map(|d| match d {
+                ast::Description::Package(p) => Some(p.name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        for file in lib_files {
+            let path = std::path::PathBuf::from(&file);
+            // An unreadable file is reported when the library is indexed.
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lpp = preprocessor::Preprocessor::new();
+            for dir in include_dirs {
+                lpp.add_include_dir(std::path::PathBuf::from(dir));
+            }
+            for (name, def) in &lib_defines {
+                lpp.define(name.clone(), def.clone());
+            }
+            let preprocessed = lpp.preprocess_file(&text, Some(&path));
+            let line_map = lpp.take_line_map();
+            let result = sv_parser::parse(&preprocessed);
+            let line_map = line_map.filter(|_| result.source_text == preprocessed);
+            let packages: Vec<ast::Description> = result
+                .source
+                .descriptions
+                .into_iter()
+                .filter(|d| {
+                    matches!(d, ast::Description::Package(p) if declared.insert(p.name.name.clone()))
+                })
+                .collect();
+            if packages.is_empty() {
+                continue;
+            }
+            let index = preprocessed_texts.len() as u32;
+            for d in &packages {
+                if let ast::Description::Package(p) = d {
+                    src_file_of_module
+                        .entry(p.name.name.clone())
+                        .or_insert(index);
+                }
+            }
+            all_descriptions.extend(packages);
+            preprocessed_texts.push(result.source_text);
+            line_maps.push(line_map);
+            source_files.push(file);
+            extra_orig_lines.push(text.lines().count() as u32);
+        }
+    }
     // Publish the sources BEFORE elaborating so an error raised during
     // elaboration (e.g. a duplicate declaration) can report `file:line`;
     // `elab.source_texts` below is assigned too late for that. Moved, not
     // cloned, then moved back out.
-    elaborate::set_elab_sources(preprocessed_texts, source_files.to_vec());
+    elaborate::set_elab_sources(preprocessed_texts, source_files.clone());
     elaborate::set_elab_line_maps(line_maps);
     elaborate::set_elab_module_files(src_file_of_module.clone());
     if !compile_verbose() {
@@ -1367,6 +1429,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     // Captured from the RAW sources — the only place the pre-preprocessing
     // line counts are still known.
     elab.source_orig_lines = sources.iter().map(|s| s.lines().count() as u32).collect();
+    elab.source_orig_lines.extend(extra_orig_lines);
     Ok((defs, elab))
 }
 
@@ -3978,7 +4041,9 @@ fn resolve_library_modules(
                 // instantiations only; its packages are not compiled. Keep
                 // where one was declared, for the "not found" error of an
                 // import that expected it.
-                ast::Description::Package(p) => {
+                ast::Description::Package(p)
+                    if !(explicit_v && sv_parser::RELAX_LIBRARY_PACKAGES.get()) =>
+                {
                     let at = line_map
                         .as_ref()
                         .and_then(|m| m.location_string(&result.source_text, p.name.span))

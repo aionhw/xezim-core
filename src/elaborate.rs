@@ -45033,7 +45033,8 @@ fn ignored_library_package_note(pkg: &str) -> String {
         Some((at, lib)) => format!(
             "\nnote: package '{pkg}' is declared at {at}, in library file '{lib}'; a -v/-y \
              library file supplies only modules, interfaces, programs and primitives, so the \
-             package was not compiled. Pass that file as a source file"
+             package was not compiled. Pass that file as a source file, or, for a -v file, \
+             compile its packages with --relax-library-packages"
         ),
         None => String::new(),
     })

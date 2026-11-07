@@ -382,8 +382,17 @@ pub static RELAX_USE_BEFORE_DECL: RelaxFlag = RelaxFlag::new(
     "accept a net or variable that a module reads or writes ahead of its declaration (§6.5)",
 );
 
+/// A `-v` library file's packages are compiled (a library file otherwise
+/// supplies only modules, interfaces, programs and primitives; checked when
+/// the design is parsed, the flag lives here with the others).
+pub static RELAX_LIBRARY_PACKAGES: RelaxFlag = RelaxFlag::new(
+    "library-packages",
+    "XEZIM_RELAX_LIBRARY_PACKAGES",
+    "compile the packages a -v library file declares, as if the file were also a source file",
+);
+
 /// Every parser relaxation, for command-line options and cache keys.
-pub fn relax_flags() -> [&'static RelaxFlag; 9] {
+pub fn relax_flags() -> [&'static RelaxFlag; 10] {
     [
         &RELAX_DUPLICATE_DECLS,
         &RELAX_ENUM_NO_BASE,
@@ -394,6 +403,7 @@ pub fn relax_flags() -> [&'static RelaxFlag; 9] {
         &RELAX_NUL_BYTES,
         &RELAX_CROSS_HIER_ITEM,
         &RELAX_USE_BEFORE_DECL,
+        &RELAX_LIBRARY_PACKAGES,
     ]
 }
 
