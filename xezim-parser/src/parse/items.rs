@@ -3245,7 +3245,7 @@ impl Parser {
                     }
                 };
                 self.expect(TokenKind::RParen);
-                let (items, name) = self.parse_generate_branch_items_named();
+                let (items, name, _) = self.parse_generate_branch_items_named();
                 Some(ModuleItem::GenerateFor(GenerateFor {
                     var: var_name,
                     init_val,
@@ -3254,6 +3254,7 @@ impl Parser {
                     incr,
                     items,
                     name,
+                    implicit_name: String::new(),
                     span: self.span_from(s),
                 }))
             }
@@ -3657,32 +3658,38 @@ impl Parser {
     fn parse_generate_if(&mut self, start: usize) -> ModuleItem {
         let mut branches = Vec::new();
         let mut branch_labels = Vec::new();
+        let mut branch_direct = Vec::new();
         self.bump();
         self.expect(TokenKind::LParen);
         let cond = self.parse_expression();
         self.expect(TokenKind::RParen);
-        let (items, label) = self.parse_generate_branch_items_named();
+        let (items, label, direct) = self.parse_generate_branch_items_named();
         branches.push((Some(cond), items));
         branch_labels.push(label);
+        branch_direct.push(direct);
         while self.eat(TokenKind::KwElse).is_some() {
             if self.at(TokenKind::KwIf) {
                 self.bump();
                 self.expect(TokenKind::LParen);
                 let c = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                let (items, label) = self.parse_generate_branch_items_named();
+                let (items, label, direct) = self.parse_generate_branch_items_named();
                 branches.push((Some(c), items));
                 branch_labels.push(label);
+                branch_direct.push(direct);
             } else {
-                let (items, label) = self.parse_generate_branch_items_named();
+                let (items, label, direct) = self.parse_generate_branch_items_named();
                 branches.push((None, items));
                 branch_labels.push(label);
+                branch_direct.push(direct);
                 break;
             }
         }
         ModuleItem::GenerateIf(GenerateIf {
             branches,
             branch_labels,
+            branch_direct,
+            implicit_name: String::new(),
             span: self.span_from(start),
         })
     }
@@ -3708,17 +3715,19 @@ impl Parser {
                 }
                 self.expect(TokenKind::Colon);
             }
-            let (items, label) = self.parse_generate_branch_items_named();
+            let (items, label, direct) = self.parse_generate_branch_items_named();
             arms.push(GenerateCaseArm {
                 values,
                 items,
                 label,
+                direct,
             });
         }
         self.expect(TokenKind::KwEndcase);
         ModuleItem::GenerateCase(GenerateCase {
             selector,
             arms,
+            implicit_name: String::new(),
             span: self.span_from(start),
         })
     }
@@ -4228,7 +4237,7 @@ impl Parser {
 
     /// Like `parse_generate_branch_items` but also returns the optional
     /// `begin : <label>` block name (needed to namespace generate-for renames).
-    fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>) {
+    fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>, bool) {
         self.generate_depth += 1;
         // §27.5: a generate block is a scope, for lets too (§11.13).
         self.push_let_scope();
@@ -4243,9 +4252,15 @@ impl Parser {
             {
                 self.unnamed_block_end_label(&l);
             }
-            (items, label)
+            (items, label, false)
         } else {
-            (self.parse_module_item().into_iter().collect(), None)
+            let items: Vec<ModuleItem> = self.parse_module_item().into_iter().collect();
+            // §27.5: without `begin`, a lone conditional generate is directly nested.
+            let direct = matches!(
+                items.as_slice(),
+                [ModuleItem::GenerateIf(_) | ModuleItem::GenerateCase(_)]
+            );
+            (items, None, direct)
         };
         self.pop_let_scope();
         self.generate_depth -= 1;

@@ -1249,6 +1249,13 @@ pub struct GenerateIf {
     /// Empty (older cached ASTs) means all branches are unnamed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub branch_labels: Vec<Option<String>>,
+    /// §27.5 per branch (parallel to `branches`): no `begin`, and the one item
+    /// is a conditional generate, so the branch is not a scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub branch_direct: Vec<bool>,
+    /// §27.6 name of an unnamed block of this construct, from the scope tree.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub implicit_name: String,
     pub span: Span,
 }
 
@@ -1264,6 +1271,10 @@ pub struct GenerateCaseArm {
     /// §27.6 `begin : label` block name for this arm.
     #[cfg_attr(feature = "serde", serde(default))]
     pub label: Option<String>,
+    /// §27.5: no `begin`, and the one item is a conditional generate, so the
+    /// arm is not a scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub direct: bool,
 }
 
 /// A generate-case construct: case (selector) <arm>* endcase
@@ -1272,6 +1283,9 @@ pub struct GenerateCaseArm {
 pub struct GenerateCase {
     pub selector: super::expr::Expression,
     pub arms: Vec<GenerateCaseArm>,
+    /// §27.6 name of an unnamed block of this construct, from the scope tree.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub implicit_name: String,
     pub span: Span,
 }
 
@@ -1300,6 +1314,9 @@ pub struct GenerateFor {
     /// don't collide on `sig__gf_i_<n>_`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub name: Option<String>,
+    /// §27.6 name of the block when unnamed, from the scope tree.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub implicit_name: String,
     pub span: Span,
 }
 

@@ -1,5 +1,6 @@
 //! Abstract Syntax Tree definitions for SystemVerilog IEEE 1800-2017/2023.
 
+pub mod binding;
 pub mod cache;
 pub mod decl;
 pub mod expr;

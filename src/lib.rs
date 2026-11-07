@@ -74,6 +74,7 @@ pub mod elaborate;
 pub mod packed_value;
 mod body_type_params;
 mod param_override_lists;
+pub mod scope_tree;
 pub mod shared_names;
 mod unit_subroutine_usage;
 pub mod pkg_scope;
@@ -198,7 +199,9 @@ pub use value::Value;
 /// entry is 2-state (§23.3.3).
 /// \x3a = \x39 + the formal's path, not its instance's, in
 /// ElaboratedModule.input_port_actuals.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3a";
+/// \x3b = \x3a + the direct-nesting flags and implicit names of generate
+/// constructs.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3b";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1737,6 +1740,7 @@ fn parse_and_elaborate(
     body_type_params::normalize(&mut all_descriptions);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
+    scope_tree::build_design(&mut all_descriptions);
     let cli = module_timescale_cli();
     // Deterministic: `module_timescale_exp` is filled by walking this map,
     // and its serialized order follows the order entries are inserted in.
@@ -4219,7 +4223,9 @@ fn resolve_library_modules(
             }
             let mut more = std::collections::HashSet::new();
             instantiations(def, &mut more);
-            definitions.insert(name.clone(), def.clone());
+            let mut def = def.clone();
+            scope_tree::adopt(&mut def);
+            definitions.insert(name.clone(), def);
             adopted.insert(name.clone());
             for n in more {
                 referrers.entry(n.clone()).or_default().insert(name.clone());
