@@ -1350,6 +1350,10 @@ pub struct FunctionDeclaration {
     /// it. The elaborator fills `ports` in from the base chain.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_args: bool,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1368,6 +1372,10 @@ pub struct TaskDeclaration {
     /// only for the strict-check pass. Not consumed by elaboration.
     #[cfg_attr(feature = "serde", serde(default))]
     pub strict_body_ports: Vec<Identifier>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 

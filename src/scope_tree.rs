@@ -31,6 +31,16 @@ pub enum ScopeKind {
     },
 }
 
+/// The last segment of a named type, which may be a class.
+pub(crate) fn class_type_name(dt: &DataType) -> Option<String> {
+    match dt {
+        DataType::TypeReference { name, .. } => {
+            name.name.name.rsplit("::").next().map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Decl {
     pub kind: DeclKind,
@@ -62,6 +72,8 @@ pub struct ScopeTree {
     pub root: ScopeId,
     pub scopes: Vec<Scope>,
     pub decls: Vec<Decl>,
+    /// The class a data or port declaration's type may name (§8.3).
+    pub decl_types: HashMap<DeclId, String>,
 }
 
 impl ScopeTree {
@@ -80,6 +92,7 @@ impl ScopeTree {
                 root: ScopeId(0),
                 scopes: Vec::new(),
                 decls: Vec::new(),
+                decl_types: HashMap::default(),
             },
             groups: 0,
             others,
@@ -92,7 +105,10 @@ impl ScopeTree {
             PortList::Empty => {}
             PortList::Ansi(ps) => {
                 for p in ps {
-                    b.declare(root, DeclKind::Data, &p.name.name, p.name.span);
+                    match &p.data_type {
+                        Some(dt) => b.declare_typed(root, &p.name.name, p.name.span, dt),
+                        None => b.declare(root, DeclKind::Data, &p.name.name, p.name.span),
+                    }
                 }
             }
             PortList::NonAnsi(ids) => {
@@ -222,6 +238,17 @@ impl Builder<'_> {
         scope.by_name.insert(name.to_string(), id);
     }
 
+    /// A data declaration, with the class its type may name.
+    fn declare_typed(&mut self, s: ScopeId, name: &str, span: Span, dt: &DataType) {
+        let at = self.tree.decls.len();
+        self.declare(s, DeclKind::Data, name, span);
+        if self.tree.decls.len() > at
+            && let Some(class) = class_type_name(dt)
+        {
+            self.tree.decl_types.insert(DeclId(at as u32), class);
+        }
+    }
+
     fn declare_param(&mut self, s: ScopeId, p: &ParameterDeclaration) {
         match &p.kind {
             ParameterKind::Data {
@@ -257,7 +284,7 @@ impl Builder<'_> {
                 ModuleItem::PortDeclaration(d) => {
                     self.declare_enum_members(s, &d.data_type);
                     for v in &d.declarators {
-                        self.declare(s, K::Data, &v.name.name, v.name.span);
+                        self.declare_typed(s, &v.name.name, v.name.span, &d.data_type);
                     }
                 }
                 ModuleItem::NetDeclaration(d) => {
@@ -269,7 +296,7 @@ impl Builder<'_> {
                 ModuleItem::DataDeclaration(d) => {
                     self.declare_enum_members(s, &d.data_type);
                     for v in &d.declarators {
-                        self.declare(s, K::Data, &v.name.name, v.name.span);
+                        self.declare_typed(s, &v.name.name, v.name.span, &d.data_type);
                     }
                 }
                 ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {

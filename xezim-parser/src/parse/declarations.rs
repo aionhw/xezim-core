@@ -554,6 +554,7 @@ impl Parser {
             endlabel,
             strict_body_ports,
             default_args,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -696,6 +697,7 @@ impl Parser {
             items: items.into(),
             endlabel,
             strict_body_ports,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -1001,6 +1003,7 @@ impl Parser {
             endlabel: None,
             strict_body_ports: Vec::new(),
             default_args,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -1021,6 +1024,7 @@ impl Parser {
             items: Default::default(),
             endlabel: None,
             strict_body_ports: Vec::new(),
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }

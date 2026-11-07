@@ -19,7 +19,9 @@ use crate::ast::stmt::*;
 use crate::ast::types::{DataType, PackedDimension, UnpackedDimension};
 use crate::ast::{Description, Identifier, Span};
 use crate::hasher::{HashMap, HashSet};
-use crate::scope_tree::{ScopeKind, ScopeTree, for_each_block_label, for_each_enum_member};
+use crate::scope_tree::{
+    ScopeKind, ScopeTree, class_type_name, for_each_block_label, for_each_enum_member,
+};
 
 pub fn audit_enabled() -> bool {
     std::env::var_os("XEZIM_BIND_AUDIT").is_some()
@@ -143,7 +145,10 @@ impl DesignNames {
             members.insert(n.to_string());
         });
         self.any_member.extend(members.iter().cloned());
-        let base = c.extends.as_ref().map(|e| e.name.name.clone());
+        let base = c
+            .extends
+            .as_ref()
+            .and_then(|e| e.name.name.rsplit("::").next().map(str::to_string));
         self.classes
             .insert(c.name.name.clone(), ClassNames { base, members });
         for item in &c.items {
@@ -324,6 +329,8 @@ struct Mention {
     want: Option<String>,
     /// The spellings of this name in the scopes around its declaration.
     outer_keys: Vec<String>,
+    /// What the tree declares under this name, hiding aside.
+    target: Option<DeclKind>,
     pos: &'static str,
 }
 
@@ -355,6 +362,18 @@ const UNVISITED: &[&str] = &[
     "wait-order",
 ];
 
+/// A hidden name, why, and the class its declared type may name.
+type Hidden = (String, Hide, Option<String>);
+
+/// The class `randomize() with` searches first (§18.7).
+enum Receiver {
+    /// Scope randomization or a bare call (§18.12).
+    None,
+    Class(String),
+    /// An object whose class is not looked up.
+    Unknown,
+}
+
 /// The walk over one definition.
 struct Binder<'a> {
     tree: &'a ScopeTree,
@@ -365,7 +384,7 @@ struct Binder<'a> {
     /// Per scope, the next child block: the walk visits generate blocks in
     /// the order the tree was built.
     next_child: Vec<u32>,
-    hidden: Vec<(String, Hide)>,
+    hidden: Vec<Hidden>,
     /// Depth of class bodies with an unknown base and inline constraints.
     unknown_members: u32,
     pos: &'static str,
@@ -380,11 +399,18 @@ impl Binder<'_> {
     }
 
     fn hide(&mut self, name: &str, why: Hide) {
-        self.hidden.push((name.to_string(), why));
+        self.hidden.push((name.to_string(), why, None));
+    }
+
+    fn hide_typed(&mut self, name: &str, why: Hide, dt: &DataType) {
+        self.hidden
+            .push((name.to_string(), why, class_type_name(dt)));
     }
 
     fn hide_enums(&mut self, dt: &DataType) {
-        for_each_enum_member(dt, &mut |n| self.hidden.push((n.name.clone(), Hide::Type)));
+        for_each_enum_member(dt, &mut |n| {
+            self.hidden.push((n.name.clone(), Hide::Type, None))
+        });
     }
 
     /// §23.9: innermost first. §26.3: at each scope, its declarations, then
@@ -395,7 +421,7 @@ impl Binder<'_> {
         {
             return Outcome::None(Hide::Qualified);
         }
-        if let Some((_, why)) = self.hidden.iter().rev().find(|(h, _)| h == name) {
+        if let Some((_, why, _)) = self.hidden.iter().rev().find(|(h, ..)| h == name) {
             return Outcome::None(*why);
         }
         if self.unknown_members > 0 && self.names.any_member.contains(name) {
@@ -430,6 +456,10 @@ impl Binder<'_> {
     fn note(&mut self, span: Span, name: &str, outcome: Outcome) {
         let pos = self.pos;
         let tree = self.tree;
+        let bare = crate::sv_parser::strip_unit_scope_name(name).unwrap_or(name);
+        let target = tree
+            .lookup(self.scope, bare)
+            .map(|d| tree.decls[d.0 as usize].kind);
         if let Some(m) = &mut self.mentions {
             let (want, outer_keys) = match outcome {
                 Outcome::Decl(d) => {
@@ -448,6 +478,7 @@ impl Binder<'_> {
                 binding: binding_text(tree, outcome),
                 want,
                 outer_keys,
+                target,
                 pos,
             });
         }
@@ -461,7 +492,8 @@ impl Binder<'_> {
 
     fn head(&mut self, h: &mut HierarchicalIdentifier) {
         let Some(first) = h.path.first() else { return };
-        let outcome = if h.root.is_some() {
+        // `NO_TARGET` here is the parser's `$unit::f(...)` (§3.12.1).
+        let outcome = if h.root.is_some() || h.bound == Bound::NO_TARGET {
             Outcome::None(Hide::Qualified)
         } else {
             self.resolve(&first.name.name)
@@ -474,6 +506,36 @@ impl Binder<'_> {
         if self.mentions.is_some() {
             let name = first.name.name.clone();
             self.note(h.span, &name, outcome);
+        }
+    }
+
+    /// The current scope's declaration of `name`.
+    fn own_decl(&self, name: &str) -> Bound {
+        self.tree.scopes[self.scope.0 as usize]
+            .by_name
+            .get(name)
+            .map_or(Bound::UNSET, |d| Bound::decl(*d))
+    }
+
+    /// The class of a `randomize` receiver that is one name: a local, a
+    /// formal or block-level data, declared with a class's own name.
+    fn receiver(&self, call: &Expression) -> Receiver {
+        if !has_receiver(call) {
+            return Receiver::None;
+        }
+        let Some(name) = receiver_name(call) else {
+            return Receiver::Unknown;
+        };
+        let class = match self.hidden.iter().rev().find(|(h, ..)| h == name) {
+            Some((_, _, class)) => class.clone(),
+            None => match self.resolve(name) {
+                Outcome::Decl(d) => self.tree.decl_types.get(&d).cloned(),
+                _ => None,
+            },
+        };
+        match class {
+            Some(c) if self.names.classes.contains_key(&c) => Receiver::Class(c),
+            _ => Receiver::Unknown,
         }
     }
 
@@ -617,6 +679,7 @@ impl Binder<'_> {
             }
             ModuleItem::FunctionDeclaration(f) => {
                 if f.name.scopes.is_empty() {
+                    f.decl = self.own_decl(&f.name.name.name);
                     self.with_pos("subroutine", |b| b.function(f));
                 } else {
                     self.out_of_block(&f.name.scopes[0].name.name.clone(), |b| b.function(f));
@@ -624,6 +687,7 @@ impl Binder<'_> {
             }
             ModuleItem::TaskDeclaration(t) => {
                 if t.name.scopes.is_empty() {
+                    t.decl = self.own_decl(&t.name.name.name);
                     self.with_pos("subroutine", |b| b.task(t));
                 } else {
                     self.out_of_block(&t.name.scopes[0].name.name.clone(), |b| b.task(t));
@@ -756,7 +820,7 @@ impl Binder<'_> {
                 return;
             };
             self.hidden
-                .extend(c.members.iter().map(|m| (m.clone(), Hide::Member)));
+                .extend(c.members.iter().map(|m| (m.clone(), Hide::Member, None)));
             at = c.base.clone();
         }
     }
@@ -764,7 +828,7 @@ impl Binder<'_> {
     fn class(&mut self, c: &mut ClassDeclaration) {
         let mark = self.hidden.len();
         let unknown = self.unknown_members;
-        class_member_names(c, &mut |n| self.hidden.push((n.to_string(), Hide::Member)));
+        class_member_names(c, &mut |n| self.hide(n, Hide::Member));
         // A type parameter as base is not a class of the design either way.
         self.hide_class_chain(c.extends.as_ref().map(|e| e.name.name.clone()));
         for p in &mut c.params {
@@ -803,7 +867,7 @@ impl Binder<'_> {
                         if it.item.is_none() {
                             if let Some(names) = self.names.packages.get(&it.package.name) {
                                 self.hidden
-                                    .extend(names.iter().map(|n| (n.clone(), Hide::Import)));
+                                    .extend(names.iter().map(|n| (n.clone(), Hide::Import, None)));
                             }
                         }
                     }
@@ -880,7 +944,7 @@ impl Binder<'_> {
         let mark = self.hidden.len();
         self.formal_types(ports);
         for p in ports.iter() {
-            self.hide(&p.name.name, Hide::Formal);
+            self.hide_typed(&p.name.name, Hide::Formal, &p.data_type);
         }
         for p in strict {
             self.hide(&p.name, Hide::Formal);
@@ -1099,7 +1163,7 @@ impl Binder<'_> {
     fn block_labels(&mut self, stmts: &[Statement]) {
         for s in stmts {
             for_each_block_label(s, &mut |n| {
-                self.hidden.push((n.name.clone(), Hide::Label));
+                self.hide(&n.name, Hide::Label);
             });
         }
     }
@@ -1176,7 +1240,7 @@ impl Binder<'_> {
                         } => {
                             self.with_pos("local-dim", |b| b.data_type(data_type));
                             self.expr(init);
-                            self.hide(&name.name, Hide::Loop);
+                            self.hide_typed(&name.name, Hide::Loop, data_type);
                         }
                         ForInit::Assign { lvalue, rvalue } => {
                             self.expr(lvalue);
@@ -1271,7 +1335,7 @@ impl Binder<'_> {
                     if let Some(init) = &mut d.init {
                         self.expr(init);
                     }
-                    self.hide(&d.name.name, Hide::Local);
+                    self.hide_typed(&d.name.name, Hide::Local, data_type);
                 }
                 self.hide_enums(data_type);
                 return;
@@ -1551,15 +1615,20 @@ impl Binder<'_> {
                 self.expr(filter);
                 self.hidden.truncate(mark);
             }
-            // §18.7: an object's class comes first. Its class is not known
-            // here, so any name a class declares stays unbound. §18.12: scope
-            // randomization and a bare call have no other class to search.
+            // §18.7: an object's class comes first. Where the class is not
+            // found, any name a class declares stays unbound.
             ExprKind::RandomizeWith { call, constraints } => {
                 self.expr(call);
-                let receiver = has_receiver(call);
-                self.unknown_members += receiver as u32;
+                let mark = self.hidden.len();
+                let unknown = self.unknown_members;
+                match self.receiver(call) {
+                    Receiver::None => {}
+                    Receiver::Class(c) => self.hide_class_chain(Some(c)),
+                    Receiver::Unknown => self.unknown_members += 1,
+                }
                 self.constraints(constraints);
-                self.unknown_members -= receiver as u32;
+                self.unknown_members = unknown;
+                self.hidden.truncate(mark);
             }
             ExprKind::AssignExpr { lvalue, rvalue } => {
                 self.expr(lvalue);
@@ -1653,9 +1722,29 @@ fn has_receiver(call: &Expression) -> bool {
     }
 }
 
-fn pattern_vars(p: &Pattern, out: &mut Vec<(String, Hide)>) {
+/// The receiver of `r.randomize()`, when it is one name with no select.
+fn receiver_name(call: &Expression) -> Option<&str> {
+    let ExprKind::Call { func, .. } = &call.kind else {
+        return None;
+    };
+    let head = |h: &'_ HierarchicalIdentifier| h.root.is_none() && h.path[0].selects.is_empty();
+    match &func.kind {
+        ExprKind::Ident(h)
+            if h.path.len() == 2 && h.path[1].name.name == "randomize" && head(h) =>
+        {
+            Some(&h.path[0].name.name)
+        }
+        ExprKind::MemberAccess { expr, member } if member.name == "randomize" => match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && head(h) => Some(&h.path[0].name.name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn pattern_vars(p: &Pattern, out: &mut Vec<Hidden>) {
     match p {
-        Pattern::Binding(n) => out.push((n.name.clone(), Hide::Pattern)),
+        Pattern::Binding(n) => out.push((n.name.clone(), Hide::Pattern, None)),
         Pattern::Tagged { inner: Some(i), .. } => pattern_vars(i, out),
         Pattern::Struct(items) => items.iter().for_each(|(_, i)| pattern_vars(i, out)),
         Pattern::Wildcard | Pattern::Tagged { .. } | Pattern::Expr(_) => {}
@@ -1831,6 +1920,8 @@ pub struct AuditLine {
     /// What the rename made of the name, when it changed it.
     pub renamed: Option<String>,
     pub pos: &'static str,
+    /// What the tree declares under this name, hiding aside.
+    pub target: Option<DeclKind>,
     pub disagree: Option<Disagree>,
 }
 
@@ -1842,6 +1933,10 @@ impl AuditLine {
             None => s.push_str(" rename: no"),
         }
         s.push_str(&format!(" pos={}", self.pos));
+        match self.target {
+            Some(k) => s.push_str(&format!(" target={k:?}")),
+            None => s.push_str(" target=-"),
+        }
         if let Outcome::None(why) = self.outcome {
             s.push_str(&format!(" why={why:?}"));
         }
@@ -1939,6 +2034,7 @@ fn compare(def: &str, before: Vec<Mention>, after: Vec<Mention>) -> Vec<AuditLin
                 outcome: m.outcome,
                 renamed,
                 pos: m.pos,
+                target: m.target,
                 disagree,
             }
         })
