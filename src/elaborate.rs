@@ -21158,6 +21158,13 @@ fn literalize_stmt_decl_dims(items: &mut [ModuleItem], params: &HashMap<String, 
     let mut tds: HashMap<String, DataType> = HashMap::default();
     for item in items.iter() {
         if let ModuleItem::TypedefDeclaration(td) = item {
+            // §6.18: an UNPACKED-array typedef (`typedef u8_t u8a_t [0:7]`)
+            // keeps its name like every unpacked aggregate: its dimensions
+            // are on the declaration, not in `data_type`, so substituting
+            // the element type made `u8a_t r;` a single element.
+            if !td.dimensions.is_empty() {
+                continue;
+            }
             let mut dt = td.data_type.clone();
             lsdd_data_type(&mut dt, params);
             tds.insert(td.name.name.clone(), dt);
@@ -36812,6 +36819,52 @@ fn scope_local_type_name(
     })
 }
 
+/// Retype every local declaration in a subroutine body (`T v;` in any
+/// nested block) for which `rename` returns a type.
+fn scope_local_decl_types(stmts: &mut [Statement], rename: &dyn Fn(&DataType) -> Option<DataType>) {
+    for s in stmts {
+        scope_local_decl_types_in(s, rename);
+    }
+}
+
+fn scope_local_decl_types_in(s: &mut Statement, rename: &dyn Fn(&DataType) -> Option<DataType>) {
+    match &mut s.kind {
+        StatementKind::VarDecl { data_type, .. } => {
+            if let Some(dt) = rename(data_type) {
+                *data_type = dt;
+            }
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            scope_local_decl_types(stmts, rename)
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            scope_local_decl_types_in(then_stmt, rename);
+            if let Some(e) = else_stmt {
+                scope_local_decl_types_in(e, rename);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                scope_local_decl_types_in(&mut it.stmt, rename);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => scope_local_decl_types_in(body, rename),
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            scope_local_decl_types_in(stmt, rename)
+        }
+        _ => {}
+    }
+}
+
 /// One typedef step of a BARE reference with no dimensions of its own:
 /// `w_t` gives `b_t [0:3]` for `typedef b_t [0:3] w_t;`. A reference that
 /// carries dims keeps them for the chained walk instead.
@@ -38217,6 +38270,10 @@ fn inline_module_items(
                 // recursion into ITS sub-instances, so `.T(type_t)` chains
                 // resolve). Prior same-named entries saved for restore.
                 let mut saved_type_binds: Vec<(String, Option<u32>, Option<DataType>)> = Vec::new();
+                // Bare `typedef_unpacked_dims` entries this instance's own
+                // typedefs shadow while it is inlined, restored after it.
+                let mut saved_unpacked_dims: Vec<(String, Option<Vec<UnpackedDimension>>)> =
+                    Vec::new();
                 // §20.7: the constant array queries (`localparam L = $left(T)`)
                 // read a type's full definition from TYPEDEF_SHAPES_TLS, where
                 // an instance's type parameters never went: they answered
@@ -40320,6 +40377,49 @@ fn inline_module_items(
                                         &inst_prefix,
                                     )
                                 });
+                            // §6.18/§7.4: its UNPACKED dimensions under the
+                            // instance-scoped key as well, which is what this
+                            // instance's subroutine signatures name. Missing,
+                            // a function returning `typedef u8_t u8a_t [0:7]`
+                            // returned one element and `f = mk(v)` read x.
+                            let scoped = cat2(&inst_prefix, &td.name.name);
+                            let mut udims = td.dimensions.clone();
+                            if let DataType::TypeReference {
+                                name, dimensions, ..
+                            } = &td.data_type
+                                && dimensions.is_empty()
+                            {
+                                let base = name
+                                    .scopes
+                                    .is_empty()
+                                    .then(|| {
+                                        elab.typedef_unpacked_dims
+                                            .get(&cat2(&inst_prefix, &name.name.name))
+                                    })
+                                    .flatten()
+                                    .or_else(|| {
+                                        lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                    });
+                                if let Some(bd) = base {
+                                    udims.extend(bd.iter().cloned());
+                                }
+                            }
+                            // The BARE key holds them for the duration of the
+                            // inlining too, like the width and type slots
+                            // above: the body's declarations (`u8a_t g;`) look
+                            // the bare name up, and another module's same-named
+                            // typedef must not shape them.
+                            saved_unpacked_dims.push((
+                                td.name.name.clone(),
+                                elab.typedef_unpacked_dims.get(&td.name.name).cloned(),
+                            ));
+                            if udims.is_empty() {
+                                elab.typedef_unpacked_dims.remove(&td.name.name);
+                            } else {
+                                elab.typedef_unpacked_dims
+                                    .insert(td.name.name.clone(), udims.clone());
+                                elab.typedef_unpacked_dims.insert(scoped, udims);
+                            }
                         }
                     }
                 }
@@ -42446,6 +42546,30 @@ fn inline_module_items(
                     }
                     dt.clone()
                 };
+                // §6.18/§23.9: a subroutine-local declaration typed by this
+                // instance's own unpacked-array typedef (`u8a_t r;` with
+                // `typedef u8_t u8a_t [0:7]`) names the instance-scoped key,
+                // as the signature does; the bare key is not this instance's.
+                let local_array_typedefs: std::collections::HashSet<&String> = sub_typedef_names
+                    .iter()
+                    .filter(|n| {
+                        elab.typedef_unpacked_dims
+                            .contains_key(&cat2(&inst_prefix, n))
+                    })
+                    .collect();
+                let scope_array_typedef = |dt: &DataType| -> Option<DataType> {
+                    match dt {
+                        DataType::TypeReference {
+                            name, dimensions, ..
+                        } if name.scopes.is_empty()
+                            && dimensions.is_empty()
+                            && local_array_typedefs.contains(&name.name.name) =>
+                        {
+                            Some(scope_local_typeref(dt))
+                        }
+                        _ => None,
+                    }
+                };
                 let bake_formal_type = |p: &mut FunctionPort| {
                     p.data_type = scope_local_typeref(&rewrite_data_type_genvar(
                         &p.data_type,
@@ -42526,21 +42650,24 @@ fn inline_module_items(
                         }
                         let formal_names: Vec<&str> =
                             fd.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        new_fd.items = crate::ast::cache::without_scope_caches(|| with_shadowed(
-                            &formal_names,
-                            &rewrite_port_map,
-                            &fn_locals,
-                            |ports, locals| {
-                                rewrite_stmt_list_scoped(
-                                    &fd.items,
-                                    &inst_prefix,
-                                    ports,
-                                    locals,
-                                    &sub_interface_map,
-                                )
-                            },
-                        )).into();
-                        new_fd.items = cache.callable_bodies.intern(new_fd.items);
+                        let mut items = crate::ast::cache::without_scope_caches(|| {
+                            with_shadowed(
+                                &formal_names,
+                                &rewrite_port_map,
+                                &fn_locals,
+                                |ports, locals| {
+                                    rewrite_stmt_list_scoped(
+                                        &fd.items,
+                                        &inst_prefix,
+                                        ports,
+                                        locals,
+                                        &sub_interface_map,
+                                    )
+                                },
+                            )
+                        });
+                        scope_local_decl_types(&mut items, &scope_array_typedef);
+                        new_fd.items = cache.callable_bodies.intern(items.into());
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
                     // §16.6/§16.8: a named property or sequence of an INLINED
@@ -42628,21 +42755,24 @@ fn inline_module_items(
                         }
                         let formal_names: Vec<&str> =
                             td.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        new_td.items = crate::ast::cache::without_scope_caches(|| with_shadowed(
-                            &formal_names,
-                            &rewrite_port_map,
-                            &task_locals,
-                            |ports, locals| {
-                                rewrite_stmt_list_scoped(
-                                    &td.items,
-                                    &inst_prefix,
-                                    ports,
-                                    locals,
-                                    &sub_interface_map,
-                                )
-                            },
-                        )).into();
-                        new_td.items = cache.callable_bodies.intern(new_td.items);
+                        let mut items = crate::ast::cache::without_scope_caches(|| {
+                            with_shadowed(
+                                &formal_names,
+                                &rewrite_port_map,
+                                &task_locals,
+                                |ports, locals| {
+                                    rewrite_stmt_list_scoped(
+                                        &td.items,
+                                        &inst_prefix,
+                                        ports,
+                                        locals,
+                                        &sub_interface_map,
+                                    )
+                                },
+                            )
+                        });
+                        scope_local_decl_types(&mut items, &scope_array_typedef);
+                        new_td.items = cache.callable_bodies.intern(items.into());
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
@@ -43082,6 +43212,16 @@ fn inline_module_items(
 
                 for (tp_name, saved) in saved_type_shapes.into_iter().rev() {
                     tls_restore_typedef_shape(&tp_name, saved);
+                }
+                for (name, prev) in saved_unpacked_dims.into_iter().rev() {
+                    match prev {
+                        Some(d) => {
+                            elab.typedef_unpacked_dims.insert(name, d);
+                        }
+                        None => {
+                            elab.typedef_unpacked_dims.remove(&name);
+                        }
+                    }
                 }
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.
