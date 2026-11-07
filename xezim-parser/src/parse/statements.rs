@@ -355,16 +355,8 @@ impl Parser {
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::DisableFork, self.span_from(start))
                 } else {
-                    // §9.6.2: the disable target may be a HIERARCHICAL block or
-                    // task name (`disable top.be_name`). Runtime resolution is by
-                    // the block LABEL (the leaf), so consume the dotted path and
-                    // keep its last segment. Previously a `.` after the first
-                    // identifier errored ("expected Semicolon, found Dot").
-                    let mut name = self.parse_identifier();
-                    while self.at(TokenKind::Dot) {
-                        self.bump();
-                        name = self.parse_identifier();
-                    }
+                    // §9.6.2: a task or block name, possibly hierarchical.
+                    let name = self.parse_hierarchical_identifier();
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::Disable(name), self.span_from(start))
                 }

@@ -1,7 +1,8 @@
 //! §23.9, §26.3, §23.8.1: bind each simple name of a definition to the
 //! declaration it names, in every position, before expansion. The head of a
-//! `HierarchicalIdentifier` gets `bound`. Names in other AST shapes (`disable`
-//! targets, type names, event identifiers) are only reported by the audit.
+//! `HierarchicalIdentifier` gets `bound`, a `disable` target its task. Names in
+//! other AST shapes (type names, event identifiers) are only reported by the
+//! audit.
 //!
 //! Procedural, subroutine and class scopes are not tree scopes: nothing outside
 //! them can name their contents by a simple name, so the walk tracks them as
@@ -13,7 +14,10 @@
 use super::{GenRename, gen_scope_name, rename_decls_in_iter};
 use crate::ast::binding::{Bound, DeclId, DeclKind, ScopeId};
 use crate::ast::decl::*;
-use crate::ast::expr::{AssignmentPatternItem, ExprKind, Expression, HierarchicalIdentifier};
+use crate::ast::expr::{
+    AssignmentPatternItem, ExprKind, Expression, HierPathSegment, HierarchicalIdentifier,
+    NumberBase, NumberLiteral,
+};
 use crate::ast::module::PortList;
 use crate::ast::stmt::*;
 use crate::ast::types::{DataType, PackedDimension, UnpackedDimension};
@@ -511,6 +515,91 @@ impl Binder<'_> {
         if self.mentions.is_some() {
             let name = first.name.name.clone();
             self.note(h.span, &name, outcome);
+        }
+    }
+
+    /// §9.6.2, §23.9: a `disable` target, resolved from where it is written.
+    /// A task (or, ill-formed, a function) gets `bound`, its declaration. A
+    /// path through generate blocks to a task becomes one segment, the task's
+    /// key in the definition (`g.t`, `g[1].h.t`). A block, a path the tree
+    /// cannot follow, or one whose head is found inside a loop block, is
+    /// `NO_TARGET` and keeps its spelling.
+    fn disable(&mut self, h: &mut HierarchicalIdentifier) {
+        let tree = self.tree;
+        // Already keyed: the audit's walk after the rename.
+        if let [seg] = &h.path[..]
+            && let Some(d) = h.bound.as_decl()
+            && tree.decls[d.0 as usize].name != seg.name.name
+        {
+            let key = seg.name.name.clone();
+            self.note_key(h.span, &key, d);
+            return;
+        }
+        let Some(first) = h.path.first() else { return };
+        let head = first.name.name.clone();
+        let outcome = if h.root.is_some() {
+            Outcome::None(Hide::Qualified)
+        } else {
+            self.resolve(&head)
+        };
+        if h.path.len() == 1 {
+            h.bound = match outcome {
+                Outcome::Decl(d)
+                    if matches!(
+                        tree.decls[d.0 as usize].kind,
+                        DeclKind::Task | DeclKind::Function
+                    ) =>
+                {
+                    Bound::decl(d)
+                }
+                Outcome::Upward => Bound::UPWARD,
+                _ => Bound::NO_TARGET,
+            };
+            self.note(h.span, &head, outcome);
+            return;
+        }
+        h.bound = Bound::NO_TARGET;
+        let Outcome::Decl(at) = outcome else { return };
+        let from = tree.decls[at.0 as usize].scope;
+        let Some((d, key)) = path_task(tree, from, &h.path) else {
+            return;
+        };
+        let mut up = Some(from);
+        while let Some(s) = up {
+            let sc = &tree.scopes[s.0 as usize];
+            if matches!(sc.kind, ScopeKind::Generate { indexed: true, .. }) {
+                return;
+            }
+            up = sc.parent;
+        }
+        let outer = tree.path(from);
+        let key = if outer.is_empty() {
+            key
+        } else {
+            format!("{outer}.{key}")
+        };
+        h.path.truncate(1);
+        h.path[0].name.name = key.clone();
+        h.path[0].selects.clear();
+        h.bound = Bound::decl(d);
+        self.note_key(h.span, &key, d);
+    }
+
+    /// A `disable` target that is the key `key` of task `d`: the rename leaves
+    /// it as it is.
+    fn note_key(&mut self, span: Span, key: &str, d: DeclId) {
+        let (pos, tree) = (self.pos, self.tree);
+        if let Some(m) = &mut self.mentions {
+            m.push(Mention {
+                span,
+                name: key.to_string(),
+                outcome: Outcome::Decl(d),
+                binding: binding_text(tree, Outcome::Decl(d)),
+                want: None,
+                outer_keys: Vec::new(),
+                target: Some(DeclKind::Task),
+                pos,
+            });
         }
     }
 
@@ -1312,8 +1401,7 @@ impl Binder<'_> {
                 self.expr(condition);
                 self.stmt(stmt);
             }
-            // §9.6.2: the parser keeps the last segment of a path.
-            StatementKind::Disable(id) => self.ident(id),
+            StatementKind::Disable(h) => self.disable(h),
             StatementKind::Return(e) => {
                 if let Some(e) = e {
                     self.expr(e);
@@ -1901,6 +1989,65 @@ fn rename_arm(items: &[ModuleItem], label: Option<&String>, implicit: &str) -> V
             let scope = gen_scope_name(None, implicit);
             rename_decls_in_iter(items, &GenRename::Subroutines(&scope))
         }
+    }
+}
+
+/// §27.5: the task `path` names from scope `from`: each segment but the last
+/// a generate block of the scope before (any arm of that label), a loop
+/// block with one literal index (§27.4). With the path joined as the key.
+fn path_task(
+    tree: &ScopeTree,
+    from: ScopeId,
+    path: &[HierPathSegment],
+) -> Option<(DeclId, String)> {
+    let (last, blocks) = path.split_last()?;
+    let mut scopes = vec![from];
+    let mut key = Vec::new();
+    for seg in blocks {
+        let name = seg.name.name.as_str();
+        let index = match &seg.selects[..] {
+            [] => None,
+            [e] => Some(literal_index(e)?),
+            _ => return None,
+        };
+        scopes = scopes
+            .iter()
+            .flat_map(|s| tree.scopes[s.0 as usize].children.iter().copied())
+            .filter(|c| {
+                let sc = &tree.scopes[c.0 as usize];
+                sc.seg.as_deref() == Some(name)
+                    && matches!(sc.kind, ScopeKind::Generate { indexed, .. } if indexed == index.is_some())
+            })
+            .collect();
+        key.push(match index {
+            Some(i) => format!("{name}[{i}]"),
+            None => name.to_string(),
+        });
+    }
+    if !last.selects.is_empty() || scopes.iter().all(|s| *s == from) {
+        return None;
+    }
+    let d = scopes.iter().find_map(|s| {
+        tree.scopes[s.0 as usize]
+            .by_name
+            .get(&last.name.name)
+            .copied()
+            .filter(|d| tree.decls[d.0 as usize].kind == DeclKind::Task)
+    })?;
+    key.push(last.name.name.clone());
+    Some((d, key.join(".")))
+}
+
+/// An unsized decimal literal.
+fn literal_index(e: &Expression) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Number(NumberLiteral::Integer {
+            size: None,
+            base: NumberBase::Decimal,
+            value,
+            ..
+        }) => value.replace('_', "").parse().ok(),
+        _ => None,
     }
 }
 

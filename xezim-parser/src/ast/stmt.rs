@@ -1,6 +1,6 @@
 //! SystemVerilog statements (IEEE 1800-2017 §A.6)
 
-use super::expr::Expression;
+use super::expr::{Expression, HierarchicalIdentifier};
 use super::types::{DataType, Lifetime, UnpackedDimension};
 use super::{Identifier, Span};
 
@@ -15,6 +15,13 @@ impl Statement {
     pub fn new(kind: StatementKind, span: Span) -> Self {
         Self { kind, span }
     }
+}
+
+/// §9.6.2: the name a `disable` target is matched by at run time: the key
+/// elaboration wrote for a task, else the last segment (a block's label or a
+/// task's name).
+pub fn disable_name(target: &HierarchicalIdentifier) -> &str {
+    target.path.last().map_or("", |s| s.name.name.as_str())
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +164,8 @@ pub enum StatementKind {
         stmt: Box<Statement>,
     },
     WaitFork,
-    Disable(Identifier),
+    /// §9.6.2: the task or block, as written.
+    Disable(HierarchicalIdentifier),
     Return(Option<Expression>),
     Break,
     Continue,
