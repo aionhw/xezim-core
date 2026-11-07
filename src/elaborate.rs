@@ -32288,8 +32288,12 @@ fn inline_instantiations_inner(
                                 // module-scope path does. Only the first
                                 // dimension was registered, so `v[i][j]` was a
                                 // bit-select and `foreach (v[i, j])` walked bits.
-                                if decl.dimensions.len() >= 2
-                                    && decl.dimensions.iter().all(|d| {
+                                // Read the normalized dimensions: the parser
+                                // gives `[N]` as an associative dimension keyed
+                                // by "type" `N`, so `d [N][2]` failed this check
+                                // and was registered one-dimensional.
+                                if shape_dims.len() >= 2
+                                    && shape_dims.iter().all(|d| {
                                         matches!(
                                             d,
                                             UnpackedDimension::Range { .. }
@@ -32297,8 +32301,7 @@ fn inline_instantiations_inner(
                                         )
                                     })
                                 {
-                                    let shape: Option<Vec<(i64, i64)>> = decl
-                                        .dimensions
+                                    let shape: Option<Vec<(i64, i64)>> = shape_dims
                                         .iter()
                                         .map(|d| {
                                             extract_array_range(
