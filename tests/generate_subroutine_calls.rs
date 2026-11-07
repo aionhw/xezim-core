@@ -116,7 +116,7 @@ fn call_names(stmts: &[xezim_core::ast::stmt::Statement]) -> Vec<String> {
                 }
             }
             SK::TimingControl { stmt, .. } => in_stmt(stmt, out),
-            SK::Disable(id) => out.push(format!("disable {}", id.name)),
+            SK::Disable(h) => out.push(format!("disable {}", xezim_core::ast::stmt::disable_name(h))),
             _ => {}
         }
     }
@@ -309,6 +309,28 @@ fn disable_of_a_block_task_names_the_blocks_copy() {
         call_names(std::slice::from_ref(&d.initial_blocks[0].stmt)),
         ["g_a.t", "disable g_a.t"]
     );
+}
+
+#[test]
+fn a_disable_by_path_names_the_block_tasks_key_and_a_label_keeps_its_name() {
+    // §9.6.2, §23.9, §9.3.4.
+    let d = design(
+        "module t;
+           if (1) begin : g
+             if (1) begin : h task automatic t(); endtask end
+             task automatic t(); endtask
+             initial begin disable h.t; fork begin : t #1; end join_none disable t; end
+           end
+           initial disable g.h.t;
+         endmodule",
+    );
+    let mut got: Vec<String> = d
+        .initial_blocks
+        .iter()
+        .flat_map(|b| call_names(std::slice::from_ref(&b.stmt)))
+        .collect();
+    got.sort();
+    assert_eq!(got, ["disable g.h.t", "disable g.h.t", "disable t"]);
 }
 
 #[test]

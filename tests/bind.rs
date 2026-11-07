@@ -506,7 +506,7 @@ fn header_parameters_and_ports_bind_in_the_definition() {
 }
 
 // Hiding: a subroutine name an inner scope hides keeps its spelling. Group A:
-// the rename still rewrites hidden data and a `disable` target.
+// the rename still rewrites hidden data.
 
 #[test]
 fn a_block_local_hides_a_block_function_of_the_same_name() {
@@ -637,7 +637,7 @@ fn a_named_block_hides_a_block_task_for_a_disable_inside_it() {
       end endmodule";
     let l = at_outcome(src, "t");
     assert_eq!(l.outcome, Outcome::None(Hide::Label));
-    check(&l, "none", Some("g.t"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -981,13 +981,69 @@ fn a_disable_inside_the_block_binds_to_its_task() {
 }
 
 #[test]
-fn a_disable_by_path_records_only_the_last_segment_the_parser_keeps() {
-    // §9.6.2: `g` is lost in the parser.
+fn a_disable_by_path_names_the_block_task_by_its_key() {
+    // §9.6.2, §23.9.
     let src = "module top; if (1) begin : g task automatic t(); endtask end
       initial disable g.t; endmodule";
-    let l = audit(src);
-    assert!(l.iter().all(|m| m.name != "g"), "{l:#?}");
-    check(at(&l, "t", 0), "Upward", None, None);
+    check(at(&audit(src), "g.t", 0), "Decl(top.g, Task)", None, None);
+}
+
+#[test]
+fn a_disable_by_path_from_inside_a_block_names_the_key_from_the_definition() {
+    // §9.6.2, §23.9: `h.t` from `g` is `g.h.t`.
+    let src = "module top; if (1) begin : g
+        if (1) begin : h task automatic t(); endtask end
+        initial disable h.t;
+      end endmodule";
+    check(at(&audit(src), "g.h.t", 0), "Decl(top.g.h, Task)", None, None);
+}
+
+#[test]
+fn a_disable_by_path_into_a_loop_block_takes_the_literal_index() {
+    // §9.6.2, §27.4.
+    let src = "module top; for (genvar i = 0; i < 2; i++) begin : g
+        task automatic t(); endtask
+      end
+      initial disable g[1].t; endmodule";
+    check(at(&audit(src), "g[1].t", 0), "Decl(top.g[@], Task)", None, None);
+}
+
+#[test]
+fn a_disable_of_a_block_by_path_keeps_its_path() {
+    // §9.6.2: a named block, not a task.
+    let src = "module top; initial begin : b #1; end
+      if (1) begin : g initial begin : c #1; end end
+      initial begin disable b; disable g.c; disable u.t; end endmodule";
+    let parsed = xezim_core::parse(src);
+    let mut descs = parsed.source.descriptions;
+    build_design(&mut descs);
+    let Description::Module(m) = &descs[0] else {
+        panic!("a module")
+    };
+    let ModuleItem::InitialConstruct(ic) = &m.items[2] else {
+        panic!("the process")
+    };
+    let StatementKind::SeqBlock { stmts, .. } = &ic.stmt.kind else {
+        panic!("the block")
+    };
+    let paths: Vec<(Vec<&str>, Bound)> = stmts
+        .iter()
+        .map(|s| match &s.kind {
+            StatementKind::Disable(h) => (
+                h.path.iter().map(|p| p.name.name.as_str()).collect(),
+                h.bound,
+            ),
+            k => panic!("{k:?}"),
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            (vec!["b"], Bound::NO_TARGET),
+            (vec!["g", "c"], Bound::NO_TARGET),
+            (vec!["u", "t"], Bound::NO_TARGET),
+        ]
+    );
 }
 
 // The field.
@@ -1074,7 +1130,7 @@ fn a_named_block_under_an_unnamed_fork_is_a_name_of_the_enclosing_block() {
       end endmodule";
     let l = at_outcome(src, "t");
     assert_eq!(l.outcome, Outcome::None(Hide::Label));
-    check(&l, "none", Some("g.t"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -1089,7 +1145,7 @@ fn a_named_block_under_an_unnamed_begin_is_a_name_of_the_enclosing_block() {
       end endmodule";
     let l = at_outcome(src, "t");
     assert_eq!(l.outcome, Outcome::None(Hide::Label));
-    check(&l, "none", Some("g.t"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
