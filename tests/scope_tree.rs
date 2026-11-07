@@ -285,8 +285,8 @@ fn nested_modules_and_checkers_have_trees_of_their_own() {
          endmodule",
     );
     let of = |n: &str| ts.iter().find(|t| t.def == n).expect(n);
-    assert_eq!(paths(of("inner")), ["genblk1"]);
-    assert_eq!(paths(of("ck")), ["genblk1"]);
+    assert_eq!(paths(of("outer.inner")), ["genblk1"]);
+    assert_eq!(paths(of("outer.ck")), ["genblk1"]);
     assert_eq!(paths(of("outer")), ["genblk01"]);
 }
 
