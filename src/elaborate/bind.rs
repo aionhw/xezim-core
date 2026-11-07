@@ -339,27 +339,32 @@ struct Mention {
 const UNVISITED: &[&str] = &[
     "alias",
     "assign-delay",
-    "class",
-    "clocking",
-    "covergroup",
     "defparam",
     "dpi-export",
     "dpi-import",
-    "final",
-    "gate",
     "instance-dim",
-    "let",
     "local-dim",
     "modport",
     "nettype",
     "tagged",
     "shallow-copy",
-    "property",
-    "sequence",
     "specify",
     "typedef",
     "event-name",
     "wait-order",
+];
+
+/// Positions the rename rewrites for subroutine names only. Data there is
+/// group B.
+const SUBROUTINES_ONLY: &[&str] = &[
+    "class",
+    "clocking",
+    "covergroup",
+    "final",
+    "gate",
+    "let",
+    "property",
+    "sequence",
 ];
 
 /// A hidden name, why, and the class its declared type may name.
@@ -2025,6 +2030,12 @@ fn compare(def: &str, before: Vec<Mention>, after: Vec<Mention>) -> Vec<AuditLin
                     _ => Disagree::Other,
                 }),
                 (None, Some(_)) if UNVISITED.contains(&m.pos) => Some(Disagree::Unvisited),
+                (None, Some(_))
+                    if SUBROUTINES_ONLY.contains(&m.pos)
+                        && !matches!(m.target, Some(DeclKind::Function | DeclKind::Task)) =>
+                {
+                    Some(Disagree::Unvisited)
+                }
                 (None, Some(_)) => Some(Disagree::Other),
             };
             AuditLine {

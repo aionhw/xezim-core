@@ -33648,7 +33648,236 @@ fn rename_item_decls(
                 .collect();
             ModuleItem::GenerateFor(new_gf)
         }
+        ModuleItem::FinalConstruct(_)
+        | ModuleItem::GateInstantiation(_)
+        | ModuleItem::PropertyDeclaration(_)
+        | ModuleItem::SequenceDeclaration(_)
+        | ModuleItem::LetDeclaration(_)
+        | ModuleItem::CovergroupDeclaration(_)
+        | ModuleItem::ClockingDeclaration(_)
+        | ModuleItem::ClassDeclaration(_)
+        | ModuleItem::OutOfClassConstraint { .. } => {
+            let subs = gen_rename_subroutine_map(port_map);
+            if subs.is_empty() {
+                item.clone()
+            } else {
+                rename_subroutine_refs(item, &subs, local_names, interface_map)
+            }
+        }
         other => other.clone(),
+    }
+}
+
+/// The references of `port_map` that name a subroutine of the rename in
+/// progress. Data of the block at the positions below keeps its bare name.
+fn gen_rename_subroutine_map(
+    port_map: &HashMap<String, Expression>,
+) -> HashMap<String, Expression> {
+    GEN_RENAME_TLS.with(|g| {
+        let g = g.borrow();
+        let Some(gate) = g.last() else {
+            return HashMap::default();
+        };
+        port_map
+            .iter()
+            .filter(|(n, _)| gate.sub_names.contains(*n))
+            .map(|(n, e)| (n.clone(), e.clone()))
+            .collect()
+    })
+}
+
+/// §23.9: a final block (§9.2.3), gate (§28), property or sequence (§16),
+/// let (§11.13), covergroup (§19), clocking block (§14.3) or class (§8) in a
+/// generate block calls the block's subroutines by their renamed keys. The
+/// gate in `rewrite_expr_impl` decides each reference by its binding. A class
+/// body gets the definition-relative key; the runtime adds the instance from
+/// `this`.
+fn rename_subroutine_refs(
+    item: &ModuleItem,
+    subs: &HashMap<String, Expression>,
+    locals: &std::collections::HashSet<String>,
+    ifaces: &HashMap<String, String>,
+) -> ModuleItem {
+    let rx =
+        |e: &Expression, m: &HashMap<String, Expression>| rewrite_expr(e, "", m, locals, ifaces);
+    let without = |names: &mut dyn Iterator<Item = &str>| {
+        let mut m = subs.clone();
+        for n in names {
+            m.remove(n);
+        }
+        m
+    };
+    let mut out = item.clone();
+    match &mut out {
+        ModuleItem::FinalConstruct(fc) => {
+            fc.stmt = rewrite_stmt(&fc.stmt, "", subs, locals, ifaces)
+        }
+        ModuleItem::GateInstantiation(g) => {
+            for d in [&mut g.delay, &mut g.delay_fall].into_iter().flatten() {
+                *d = rx(d, subs);
+            }
+            for t in g.instances.iter_mut().flat_map(|i| i.terminals.iter_mut()) {
+                *t = rx(t, subs);
+            }
+        }
+        // §16.8: formals stay bare for the call-site substitution.
+        ModuleItem::PropertyDeclaration(p) => {
+            let m = without(&mut p.ports.iter().map(|n| n.name.as_str()));
+            for s in &mut p.items {
+                *s = rewrite_stmt(s, "", &m, locals, ifaces);
+            }
+            p.body = p.body.as_ref().map(|b| rx(b, &m));
+        }
+        ModuleItem::SequenceDeclaration(p) => {
+            let m = without(&mut p.ports.iter().map(|n| n.name.as_str()));
+            for s in &mut p.items {
+                *s = rewrite_stmt(s, "", &m, locals, ifaces);
+            }
+            p.body = p.body.as_ref().map(|b| rx(b, &m));
+        }
+        ModuleItem::LetDeclaration(l) => {
+            let m = match &mut l.ports {
+                PortList::Empty => subs.clone(),
+                PortList::NonAnsi(ids) => without(&mut ids.iter().map(|n| n.name.as_str())),
+                PortList::Ansi(ps) => {
+                    for p in ps.iter_mut() {
+                        if let Some(d) = &p.default {
+                            p.default = Some(rx(d, subs));
+                        }
+                    }
+                    without(&mut ps.iter().map(|p| p.name.name.as_str()))
+                }
+            };
+            l.expr = rx(&l.expr, &m);
+        }
+        ModuleItem::CovergroupDeclaration(c) => rename_covergroup_refs(c, subs, locals, ifaces),
+        ModuleItem::ClockingDeclaration(c) => {
+            for d in [&mut c.default_input_skew, &mut c.default_output_skew]
+                .into_iter()
+                .flatten()
+            {
+                *d = rx(d, subs);
+            }
+            for s in &mut c.signals {
+                for e in [&mut s.skew, &mut s.bound_to].into_iter().flatten() {
+                    *e = rx(e, subs);
+                }
+            }
+            for s in &mut c.items {
+                *s = rewrite_stmt(s, "", subs, locals, ifaces);
+            }
+        }
+        ModuleItem::ClassDeclaration(c) => rename_class_refs(c, subs, locals, ifaces),
+        ModuleItem::OutOfClassConstraint { items, .. } => {
+            for c in items {
+                *c = rewrite_constraint_item(c, "", subs, locals, ifaces);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// §19.3, §19.8.1: the formals hide outer names in the body.
+fn rename_covergroup_refs(
+    c: &mut CovergroupDeclaration,
+    subs: &HashMap<String, Expression>,
+    locals: &std::collections::HashSet<String>,
+    ifaces: &HashMap<String, String>,
+) {
+    rename_subroutine_ports(&mut c.ports, subs, locals, ifaces);
+    rename_subroutine_ports(&mut c.sample_ports, subs, locals, ifaces);
+    let mut m = subs.clone();
+    for p in c.ports.iter().chain(&c.sample_ports) {
+        m.remove(&p.name.name);
+    }
+    c.for_each_expr_mut(&mut |e| *e = rewrite_expr(e, "", &m, locals, ifaces));
+    // §19.5.1.1: `with` binds `item`.
+    m.remove("item");
+    for it in &mut c.items {
+        if let CovergroupItem::Coverpoint(p) = it {
+            for b in &mut p.bins {
+                for e in [&mut b.with_filter, &mut b.iff_guard].into_iter().flatten() {
+                    *e = rewrite_expr(e, "", &m, locals, ifaces);
+                }
+            }
+        }
+    }
+}
+
+/// §8.3: a class body sees the names around its declaration, after its own
+/// members and those of its bases, which the binding reports.
+fn rename_class_refs(
+    c: &mut ClassDeclaration,
+    subs: &HashMap<String, Expression>,
+    locals: &std::collections::HashSet<String>,
+    ifaces: &HashMap<String, String>,
+) {
+    let rx = |e: &Expression| rewrite_expr(e, "", subs, locals, ifaces);
+    let rt = |t: &DataType| rewrite_data_type_genvar(t, subs, locals, ifaces);
+    let rd = |d: &[UnpackedDimension]| rewrite_unpacked_dims_genvar(d, subs, locals, ifaces);
+    let param = |p: &mut ParameterDeclaration| match &mut p.kind {
+        ParameterKind::Data {
+            data_type,
+            assignments,
+        } => {
+            *data_type = rt(data_type);
+            for a in assignments {
+                a.dimensions = rd(&a.dimensions);
+                a.init = a.init.as_ref().map(rx);
+            }
+        }
+        ParameterKind::Type { assignments } => {
+            for a in assignments {
+                a.init = a.init.as_ref().map(rt);
+            }
+        }
+    };
+    c.params.iter_mut().for_each(param);
+    if let Some(e) = &mut c.extends {
+        for a in &mut e.args {
+            match a {
+                ParamValue::Expr(x) => *x = rx(x),
+                ParamValue::Type(t) => *t = rt(t),
+            }
+        }
+    }
+    for item in &mut c.items {
+        match item {
+            ClassItem::Property(p) => {
+                p.data_type = rt(&p.data_type);
+                for d in &mut p.declarators {
+                    d.dimensions = rd(&d.dimensions);
+                    d.init = d.init.as_ref().map(rx);
+                }
+            }
+            ClassItem::Method(m) => match &mut m.kind {
+                ClassMethodKind::Function(f)
+                | ClassMethodKind::PureVirtual(f)
+                | ClassMethodKind::Extern(f) => {
+                    f.return_type = rt(&f.return_type);
+                    rename_subroutine_ports(&mut f.ports, subs, locals, ifaces);
+                    f.items = rename_subroutine_body(&f.items, &f.ports, subs, locals, ifaces);
+                }
+                ClassMethodKind::Task(t) => {
+                    rename_subroutine_ports(&mut t.ports, subs, locals, ifaces);
+                    t.items = rename_subroutine_body(&t.items, &t.ports, subs, locals, ifaces);
+                }
+            },
+            ClassItem::Constraint(k) => {
+                for i in &mut k.items {
+                    *i = rewrite_constraint_item(i, "", subs, locals, ifaces);
+                }
+            }
+            ClassItem::Typedef(t) => {
+                t.data_type = rt(&t.data_type);
+                t.dimensions = rd(&t.dimensions);
+            }
+            ClassItem::Parameter(p) => param(p),
+            ClassItem::Class(i) => rename_class_refs(i, subs, locals, ifaces),
+            ClassItem::Covergroup(g) => rename_covergroup_refs(g, subs, locals, ifaces),
+            ClassItem::Import(_) | ClassItem::Empty => {}
+        }
     }
 }
 
