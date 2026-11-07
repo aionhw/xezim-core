@@ -505,7 +505,8 @@ fn header_parameters_and_ports_bind_in_the_definition() {
     check(at(&l, "A", 1), "Decl(top, Param)", None, None);
 }
 
-// Group A: the rename rewrites a name an inner scope hides.
+// Hiding: a subroutine name an inner scope hides keeps its spelling. Group A:
+// the rename still rewrites hidden data and a `disable` target.
 
 #[test]
 fn a_block_local_hides_a_block_function_of_the_same_name() {
@@ -515,7 +516,7 @@ fn a_block_local_hides_a_block_function_of_the_same_name() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Local));
-    check(&l, "none", Some("g.f"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -528,7 +529,8 @@ fn a_local_hides_only_from_its_declaration() {
     let l = audit(&src);
     check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"), None);
     assert_eq!(at(&l, "f", 1).outcome, Outcome::None(Hide::Local));
-    assert_eq!(at(&l, "f", 1).disagree, Some(Disagree::Hiding));
+    assert_eq!(at(&l, "f", 1).renamed, None);
+    assert_eq!(at(&l, "f", 1).disagree, None);
 }
 
 #[test]
@@ -548,7 +550,7 @@ fn a_local_enum_label_hides_a_block_function() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Type));
-    check(&l, "none", Some("g.f"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -561,8 +563,8 @@ fn an_enum_label_of_an_inner_block_hides_a_block_function() {
     check(
         at(&audit(&src), "f", 0),
         "Decl(top.g.h, EnumMember)",
-        Some("g.f"),
-        Some(Disagree::Hiding),
+        None,
+        None,
     );
 }
 
@@ -591,7 +593,7 @@ fn an_explicit_import_in_an_inner_block_hides_a_block_function() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Import));
-    check(&l, "none", Some("g.f"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -605,7 +607,7 @@ fn a_wildcard_import_in_an_inner_block_comes_before_the_outer_block() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Import));
-    check(&l, "none", Some("g.f"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -623,12 +625,7 @@ fn an_inner_clocking_block_hides_a_block_function() {
         .iter()
         .find(|m| m.name == "f" && m.pos == "process")
         .expect("the event");
-    check(
-        m,
-        "Decl(top.g.h, Clocking)",
-        Some("g.f"),
-        Some(Disagree::Hiding),
-    );
+    check(m, "Decl(top.g.h, Clocking)", None, None);
 }
 
 #[test]
@@ -655,7 +652,7 @@ fn a_class_member_wins_over_a_block_function_in_a_randomize_with() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Member));
-    check(&l, "none", Some("g.f"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -1090,4 +1087,261 @@ fn a_definition_adopted_from_a_library_is_bound_with_its_own_tree() {
     let d = h.bound.as_decl().expect("a declaration");
     assert_eq!(t.decls[d.0 as usize].name, "x");
     assert_eq!(t.path(t.decls[d.0 as usize].scope), "g");
+}
+
+#[test]
+fn a_hidden_mention_reports_the_subroutine_it_hides_as_its_target() {
+    let src = format!(
+        "module top; if (1) begin : g {BLOCK_F}
+           initial begin int f = 7; $display(f); end end endmodule"
+    );
+    assert_eq!(at_outcome(&src, "f").target, Some(DeclKind::Function));
+}
+
+#[test]
+fn a_mention_reports_the_innermost_declaration_as_its_target() {
+    let src = format!(
+        "module top; if (1) begin : g {BLOCK_F}
+           if (1) begin : h typedef enum {{f = 9}} e_t; initial $display(f); end
+         end endmodule"
+    );
+    assert_eq!(at_outcome(&src, "f").target, Some(DeclKind::EnumMember));
+}
+
+#[test]
+fn a_name_the_tree_does_not_declare_has_no_target() {
+    let src = "module top; initial begin int x = 7; $display(x); end endmodule";
+    assert_eq!(at_outcome(src, "x").target, None);
+}
+
+#[test]
+fn a_local_hides_the_innermost_of_two_block_functions_and_keeps_its_spelling() {
+    // §23.9, §6.21.
+    let src = format!(
+        "module top; if (1) begin : g {BLOCK_F}
+           if (1) begin : h {BLOCK_F}
+             initial begin int f = 7; $display(f); end
+             initial $display(f());
+           end
+         end endmodule"
+    );
+    let l = audit(&src);
+    let f: Vec<_> = l.iter().filter(|m| m.name == "f").collect();
+    check(f[0], "none", None, None);
+    check(f[1], "Decl(top.g.h, Function)", Some("g.h.f"), None);
+}
+
+#[test]
+fn nested_block_data_named_like_an_outer_block_function_is_renamed() {
+    // §23.9: `f` in `h` binds to `h`'s data.
+    let src = format!(
+        "module top; if (1) begin : g {BLOCK_F}
+           if (1) begin : h int f = 3; initial $display(f); end
+         end endmodule"
+    );
+    check(
+        at(&audit(&src), "f", 0),
+        "Decl(top.g.h, Data)",
+        Some("g.h.f"),
+        None,
+    );
+}
+
+#[test]
+fn a_unit_scoped_call_in_a_block_that_declares_the_name_is_not_renamed() {
+    // §3.12.1.
+    let src = format!(
+        "function automatic int f(); return 42; endfunction
+         module top; if (1) begin : g {BLOCK_F}
+           initial $display($unit::f());
+         end endmodule"
+    );
+    let l = audit(&src);
+    let m = l.iter().find(|m| m.name.ends_with("f")).expect("the call");
+    check(m, "none", None, None);
+}
+
+#[test]
+fn a_subroutine_declaration_carries_the_id_its_references_bind_to() {
+    let parsed = xezim_core::parse(
+        "module top; if (1) begin : g
+           function automatic int f(); return 5; endfunction
+           task automatic t(); endtask
+           initial f();
+         end endmodule",
+    );
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let mut descs = parsed.source.descriptions;
+    build_design(&mut descs);
+    let Description::Module(m) = &descs[0] else {
+        panic!("a module")
+    };
+    let ModuleItem::GenerateIf(gi) = &m.items[0] else {
+        panic!("the generate block")
+    };
+    let items = &gi.branches[0].1;
+    let ModuleItem::FunctionDeclaration(f) = &items[0] else {
+        panic!("the function")
+    };
+    let ModuleItem::TaskDeclaration(t) = &items[1] else {
+        panic!("the task")
+    };
+    let ModuleItem::InitialConstruct(ic) = &items[2] else {
+        panic!("the process")
+    };
+    let StatementKind::Expr(e) = &ic.stmt.kind else {
+        panic!("the enable: {:?}", ic.stmt.kind)
+    };
+    let ExprKind::Call { func, .. } = &e.kind else {
+        panic!("the call: {:?}", e.kind)
+    };
+    let ExprKind::Ident(h) = &func.kind else {
+        panic!("the callee: {:?}", func.kind)
+    };
+    assert_eq!(h.bound, f.decl);
+    let tree = tree_of("top").expect("the tree of top");
+    let kind = |b: Bound| tree.decls[b.as_decl().expect("a stamp").0 as usize].kind;
+    assert_eq!(kind(f.decl), DeclKind::Function);
+    assert_eq!(kind(t.decl), DeclKind::Task);
+}
+
+const OTHER_F: &str = "class Other; function int f(); return 1; endfunction endclass";
+
+#[test]
+fn a_known_receiver_without_the_name_leaves_it_to_the_block() {
+    // §18.7.
+    let src = format!(
+        "{OTHER_F} class R; rand int x; endclass
+         module top; if (1) begin : g {BLOCK_F}
+           initial begin R r = new; void'(r.randomize() with {{ x == f(); }}); end
+         end endmodule"
+    );
+    check(
+        at(&audit(&src), "f", 0),
+        "Decl(top.g, Function)",
+        Some("g.f"),
+        None,
+    );
+}
+
+#[test]
+fn a_block_level_handle_declared_after_its_use_is_a_known_receiver() {
+    // §18.7, §23.9.
+    let src = format!(
+        "{OTHER_F} class R; rand int x; endclass
+         module top; if (1) begin : g {BLOCK_F}
+           initial void'(r.randomize() with {{ x == f(); }});
+           R r = new;
+         end endmodule"
+    );
+    check(
+        at(&audit(&src), "f", 0),
+        "Decl(top.g, Function)",
+        Some("g.f"),
+        None,
+    );
+}
+
+#[test]
+fn a_formal_handle_is_a_known_receiver() {
+    // §18.7, §13.5.
+    let src = format!(
+        "{OTHER_F} class R; rand int x; endclass
+         module top; if (1) begin : g {BLOCK_F}
+           task automatic t(R r); void'(r.randomize() with {{ x == f(); }}); endtask
+         end endmodule"
+    );
+    check(
+        at(&audit(&src), "f", 0),
+        "Decl(top.g, Function)",
+        Some("g.f"),
+        None,
+    );
+}
+
+#[test]
+fn a_member_of_a_known_receivers_class_wins_over_the_block() {
+    // §18.7.
+    let src = format!(
+        "class R; rand int x; function int f(); return 9; endfunction endclass
+         module top; if (1) begin : g {BLOCK_F}
+           initial begin R r = new; void'(r.randomize() with {{ x == f(); }}); end
+         end endmodule"
+    );
+    let l = at_outcome(&src, "f");
+    assert_eq!(l.outcome, Outcome::None(Hide::Member));
+    check(&l, "none", None, None);
+}
+
+#[test]
+fn a_member_inherited_through_a_package_qualified_base_wins_over_the_block() {
+    // §18.7, §8.13.
+    let src = format!(
+        "package pk; class B; function int f(); return 9; endfunction endclass endpackage
+         class R extends pk::B; rand int x; endclass
+         module top; if (1) begin : g {BLOCK_F}
+           initial begin R r = new; void'(r.randomize() with {{ x == f(); }}); end
+         end endmodule"
+    );
+    let l = at_outcome(&src, "f");
+    assert_eq!(l.outcome, Outcome::None(Hide::Member));
+    check(&l, "none", None, None);
+}
+
+#[test]
+fn a_known_receiver_with_an_unknown_base_leaves_the_name_to_a_member() {
+    // §18.7, §8.13: the base may declare it.
+    let src = format!(
+        "{OTHER_F} class R extends Missing; rand int x; endclass
+         module top; if (1) begin : g {BLOCK_F}
+           initial begin R r = new; void'(r.randomize() with {{ x == f(); }}); end
+         end endmodule"
+    );
+    let l = at_outcome(&src, "f");
+    assert_eq!(l.outcome, Outcome::None(Hide::Member));
+    check(&l, "none", None, None);
+}
+
+#[test]
+fn a_member_handle_receiver_stays_unknown() {
+    // §18.7: the handle's class is not looked up.
+    let src = format!(
+        "{OTHER_F} class R; rand int x; endclass class H; R r; endclass
+         module top; if (1) begin : g {BLOCK_F}
+           initial begin H h = new; void'(h.r.randomize() with {{ x == f(); }}); end
+         end endmodule"
+    );
+    assert_eq!(at_outcome(&src, "f").outcome, Outcome::None(Hide::Member));
+}
+
+#[test]
+fn std_randomize_searches_no_class() {
+    // §18.12.
+    let src = format!(
+        "{OTHER_F}
+         module top; if (1) begin : g {BLOCK_F}
+           int x;
+           initial void'(std::randomize(x) with {{ x == f(); }});
+         end endmodule"
+    );
+    check(
+        at(&audit(&src), "f", 0),
+        "Decl(top.g, Function)",
+        Some("g.f"),
+        None,
+    );
+}
+
+#[test]
+fn nested_data_named_like_a_subroutine_of_an_unlabelled_block_follows_its_name() {
+    // §23.9, §27.6.
+    let src = format!(
+        "module top; if (1) begin {BLOCK_F}
+           if (1) begin : h int f = 3; initial $display(f); end
+         end endmodule"
+    );
+    assert_eq!(
+        at(&audit(&src), "f", 0).renamed.as_deref(),
+        Some("genblk1.h.f")
+    );
 }
