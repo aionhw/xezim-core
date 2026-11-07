@@ -750,12 +750,7 @@ fn a_type_parameter_base_leaves_only_a_name_some_class_declares_unbound() {
     );
     let l = audit(&src);
     assert_eq!(at(&l, "f", 0).outcome, Outcome::None(Hide::Member));
-    check(
-        at(&l, "h", 0),
-        "Decl(top.g, Function)",
-        None,
-        Some(Disagree::Unvisited),
-    );
+    check(at(&l, "h", 0), "Decl(top.g, Function)", Some("g.h"), None);
 }
 
 #[test]
@@ -791,17 +786,12 @@ fn a_constraint_binds_class_members_first_and_then_the_block() {
         None,
         Some(Disagree::Unvisited),
     );
-    check(
-        at(&l, "f", 0),
-        "Decl(top.g, Function)",
-        None,
-        Some(Disagree::Unvisited),
-    );
+    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"), None);
 }
 
-// Group B: positions the rename does not reach.
+// §23.9: positions the rename reaches for subroutine names only.
 
-fn expect_unvisited(body: &str, pos: &str) {
+fn expect_renamed(body: &str, pos: &str) {
     let src = format!(
         "module top; wire a, b; logic clk; if (1) begin : g {BLOCK_F} {body} end endmodule"
     );
@@ -810,54 +800,148 @@ fn expect_unvisited(body: &str, pos: &str) {
         .iter()
         .find(|m| m.name == "f" && m.pos == pos)
         .unwrap_or_else(|| panic!("no {pos} mention in {l:#?}"));
-    check(m, "Decl(top.g, Function)", None, Some(Disagree::Unvisited));
+    check(m, "Decl(top.g, Function)", Some("g.f"), None);
 }
 
 #[test]
-fn a_call_in_a_class_body_binds_to_the_block_function_the_rename_misses() {
-    expect_unvisited(
+fn a_call_in_a_class_body_is_renamed_to_the_block_function() {
+    expect_renamed(
         "class C; function int m(); return f(); endfunction endclass",
         "class",
     );
 }
 
 #[test]
-fn a_call_in_a_final_block_binds_to_the_block_function_the_rename_misses() {
-    expect_unvisited("final $display(f());", "final");
+fn a_call_in_a_final_block_is_renamed_to_the_block_function() {
+    expect_renamed("final $display(f());", "final");
 }
 
 #[test]
-fn a_gate_terminal_binds_to_the_block_function_the_rename_misses() {
-    expect_unvisited("buf u(a, f());", "gate");
+fn a_gate_terminal_is_renamed_to_the_block_function() {
+    expect_renamed("buf u(a, f());", "gate");
 }
 
 #[test]
-fn a_named_property_binds_to_the_block_function_the_rename_misses() {
-    expect_unvisited(
+fn a_named_property_is_renamed_to_the_block_function() {
+    expect_renamed(
         "property p; @(posedge clk) f() == 5; endproperty",
         "property",
     );
 }
 
 #[test]
-fn a_named_sequence_binds_to_the_block_function_the_rename_misses() {
-    expect_unvisited(
+fn a_named_sequence_is_renamed_to_the_block_function() {
+    expect_renamed(
         "sequence s; @(posedge clk) f() == 5; endsequence",
         "sequence",
     );
 }
 
 #[test]
-fn a_let_body_binds_to_the_block_function_the_rename_misses() {
-    expect_unvisited("let l(x) = f() + x;", "let");
+fn a_let_body_is_renamed_to_the_block_function() {
+    expect_renamed("let l(x) = f() + x;", "let");
 }
 
 #[test]
-fn a_covergroup_binds_to_the_block_function_the_rename_misses() {
-    expect_unvisited(
+fn a_covergroup_is_renamed_to_the_block_function() {
+    expect_renamed(
         "covergroup cg @(posedge clk); coverpoint f(); endgroup",
         "covergroup",
     );
+}
+
+#[test]
+fn a_clocking_signal_expression_is_renamed_to_the_block_function() {
+    expect_renamed(
+        "clocking cb @(posedge clk); input i = f(); endclocking",
+        "clocking",
+    );
+}
+
+#[test]
+fn a_method_default_a_property_initializer_and_a_nested_class_are_renamed() {
+    // §8.8, §8.23, §13.5.3.
+    let src = format!(
+        "module top; if (1) begin : g {BLOCK_F}
+           class C; int v = f(); task t(int a = f()); endtask
+             class I; function int m(); return f(); endfunction endclass
+           endclass
+         end endmodule"
+    );
+    let l = audit(&src);
+    for n in 0..3 {
+        check(at(&l, "f", n), "Decl(top.g, Function)", Some("g.f"), None);
+    }
+}
+
+#[test]
+fn a_class_in_a_nested_block_is_renamed_to_the_nearest_function() {
+    // §23.9.
+    let src = format!(
+        "module top; if (1) begin : g {BLOCK_F}
+           if (1) begin : h {BLOCK_F}
+             class C; function int m(); return f(); endfunction endclass
+           end
+         end endmodule"
+    );
+    check(
+        at(&audit(&src), "f", 0),
+        "Decl(top.g.h, Function)",
+        Some("g.h.f"),
+        None,
+    );
+}
+
+#[test]
+fn a_member_a_local_and_a_formal_of_a_class_keep_the_name_of_a_block_function() {
+    // §8.3, §13.5, §6.21.
+    let src = format!(
+        "module top; if (1) begin : g {BLOCK_F}
+           class M; int f; function int m(); return f; endfunction endclass
+           class L; function int m(); int f = 1; return f; endfunction endclass
+           class P; function int m(int f); return f; endfunction endclass
+         end endmodule"
+    );
+    let l = audit(&src);
+    for n in 0..3 {
+        let m = at(&l, "f", n);
+        assert_eq!(m.renamed, None, "{m:?}");
+        assert_eq!(m.disagree, None, "{m:?}");
+    }
+}
+
+#[test]
+fn a_formal_of_a_property_a_sequence_and_a_let_keeps_the_name_of_a_block_function() {
+    // §16.8, §16.12, §11.13.
+    let src = format!(
+        "module top; logic clk; if (1) begin : g {BLOCK_F}
+           property p(f); @(posedge clk) f; endproperty
+           sequence s(f); @(posedge clk) f; endsequence
+           let l(f) = f + 1;
+         end endmodule"
+    );
+    let l = audit(&src);
+    for n in 0..3 {
+        let m = at(&l, "f", n);
+        assert_eq!(m.renamed, None, "{m:?}");
+        assert_eq!(m.disagree, None, "{m:?}");
+    }
+}
+
+#[test]
+fn block_data_read_from_a_final_block_or_a_class_stays_in_group_b() {
+    // §23.9: the bare name is what the rename leaves at these positions.
+    let src = "module top; if (1) begin : g int v;
+        function automatic int f(); return v; endfunction
+        final $display(v);
+        class C; function int m(); return v; endfunction endclass
+      end endmodule";
+    let l = audit(src);
+    for (n, pos) in [(1, "final"), (2, "class")] {
+        let m = at(&l, "v", n);
+        assert_eq!(m.pos, pos);
+        check(m, "Decl(top.g, Data)", None, Some(Disagree::Unvisited));
+    }
 }
 
 #[test]
