@@ -7,7 +7,6 @@
 //! name, so one rule names a scope everywhere.
 
 use crate::ast::Description;
-use crate::ast::Span;
 use crate::ast::binding::{DeclId, DeclKind, ScopeId};
 use crate::ast::decl::{
     DPIProto, GenerateCase, GenerateIf, ModuleItem, PackageItem, ParameterDeclaration,
@@ -16,6 +15,8 @@ use crate::ast::decl::{
 use crate::ast::module::PortList;
 use crate::ast::stmt::{Statement, StatementKind};
 use crate::ast::types::DataType;
+use crate::ast::{Identifier, Span};
+use crate::elaborate::bind::{self, DesignNames};
 use crate::hasher::HashMap;
 use std::rc::Rc;
 
@@ -116,6 +117,12 @@ impl ScopeTree {
             at = scope.parent;
         }
         None
+    }
+
+    /// §23.4: a nested definition's tree is keyed by where it is declared, so
+    /// same-named nested modules of two parents stay apart.
+    pub fn nested_def(&self, s: ScopeId, name: &str) -> String {
+        format!("{}.{}", self.def, self.key(s, name, &[]))
     }
 
     /// Scope path from the definition, `[@]` for an indexed scope: `g[@].h`.
@@ -228,18 +235,16 @@ impl Builder<'_> {
             }
             ParameterKind::Type { assignments } => {
                 for a in assignments {
-                    self.declare(s, DeclKind::Param, &a.name.name, a.name.span);
+                    self.declare(s, DeclKind::TypeParam, &a.name.name, a.name.span);
                 }
             }
         }
     }
 
     fn declare_enum_members(&mut self, s: ScopeId, dt: &DataType) {
-        if let DataType::Enum(e) = dt {
-            for m in &e.members {
-                self.declare(s, DeclKind::EnumMember, &m.name.name, m.name.span);
-            }
-        }
+        for_each_enum_member(dt, &mut |n| {
+            self.declare(s, DeclKind::EnumMember, &n.name, n.span)
+        });
     }
 
     /// The names `items` declare in scope `s`. A generate region (§27.3) opens
@@ -256,6 +261,7 @@ impl Builder<'_> {
                     }
                 }
                 ModuleItem::NetDeclaration(d) => {
+                    self.declare_enum_members(s, &d.data_type);
                     for v in &d.declarators {
                         self.declare(s, K::Net, &v.name.name, v.name.span);
                     }
@@ -285,7 +291,7 @@ impl Builder<'_> {
                 }
                 ModuleItem::GateInstantiation(g) => {
                     for n in g.instances.iter().filter_map(|i| i.name.as_ref()) {
-                        self.declare(s, K::Instance, &n.name, n.span);
+                        self.declare(s, K::Gate, &n.name, n.span);
                     }
                 }
                 // An out-of-block class method belongs to the class.
@@ -324,7 +330,14 @@ impl Builder<'_> {
                     self.declare(s, K::Sequence, &q.name.name, q.name.span)
                 }
                 ModuleItem::NettypeDeclaration(n) => {
+                    self.declare_enum_members(s, &n.data_type);
                     self.declare(s, K::Nettype, &n.name.name, n.name.span)
+                }
+                // §16.2: a module-level assertion's label names a scope.
+                ModuleItem::AssertionItem(a) => {
+                    if let Some(l) = &a.label {
+                        self.declare(s, K::Label, &l.name, l.span);
+                    }
                 }
                 ModuleItem::ModportDeclaration(m) => {
                     for i in &m.items {
@@ -383,14 +396,9 @@ impl Builder<'_> {
 
     /// §9.3.4: a process's named block is a name in the enclosing scope.
     fn declare_block_name(&mut self, s: ScopeId, stmt: &Statement) {
-        match &stmt.kind {
-            StatementKind::SeqBlock { name: Some(n), .. }
-            | StatementKind::ParBlock { name: Some(n), .. } => {
-                self.declare(s, DeclKind::Label, &n.name, n.span)
-            }
-            StatementKind::TimingControl { stmt, .. } => self.declare_block_name(s, stmt),
-            _ => {}
-        }
+        for_each_block_label(stmt, &mut |n| {
+            self.declare(s, DeclKind::Label, &n.name, n.span)
+        });
     }
 
     /// §27.6: `genblk<n>`, with leading zeros on `n` until no explicitly
@@ -430,18 +438,14 @@ impl Builder<'_> {
                     self.fill(child, &mut g.items);
                 }
                 ModuleItem::NestedModule(m) => {
-                    let tree = ScopeTree::build(
-                        &m.name.name,
-                        &m.params,
-                        &m.ports,
-                        &mut m.items,
-                        self.others,
-                    );
+                    let def = self.tree.nested_def(s, &m.name.name);
+                    let tree =
+                        ScopeTree::build(&def, &m.params, &m.ports, &mut m.items, self.others);
                     self.others.push(tree);
                 }
                 ModuleItem::CheckerDeclaration(c) => {
-                    let tree =
-                        ScopeTree::build(&c.name.name, &[], &c.ports, &mut c.items, self.others);
+                    let def = self.tree.nested_def(s, &c.name.name);
+                    let tree = ScopeTree::build(&def, &[], &c.ports, &mut c.items, self.others);
                     self.others.push(tree);
                 }
                 _ => {}
@@ -517,10 +521,53 @@ impl Builder<'_> {
     }
 }
 
+/// §9.3.4: the named blocks `stmt` declares in the scope around it. An unnamed
+/// block opens a scope only if it directly holds a block item declaration.
+pub(crate) fn for_each_block_label(stmt: &Statement, f: &mut dyn FnMut(&Identifier)) {
+    match &stmt.kind {
+        StatementKind::SeqBlock { name: Some(n), .. }
+        | StatementKind::ParBlock { name: Some(n), .. } => f(n),
+        StatementKind::SeqBlock { name: None, stmts }
+        | StatementKind::ParBlock {
+            name: None, stmts, ..
+        } => {
+            let opens_scope = stmts.iter().any(|s| {
+                matches!(
+                    s.kind,
+                    StatementKind::VarDecl { .. } | StatementKind::Typedef(_)
+                )
+            });
+            if !opens_scope {
+                stmts.iter().for_each(|s| for_each_block_label(s, f));
+            }
+        }
+        StatementKind::TimingControl { stmt, .. } => for_each_block_label(stmt, f),
+        _ => {}
+    }
+}
+
+/// §6.19: the labels of `dt`'s enums, struct members included. They are names
+/// of the scope that declares the type.
+pub(crate) fn for_each_enum_member(dt: &DataType, f: &mut dyn FnMut(&Identifier)) {
+    match dt {
+        DataType::Enum(e) => e.members.iter().for_each(|m| f(&m.name)),
+        DataType::Struct(s) => {
+            for m in &s.members {
+                for_each_enum_member(&m.data_type, f);
+            }
+        }
+        _ => {}
+    }
+}
+
 thread_local! {
-    /// The trees of the design being elaborated, by definition name.
+    /// The trees of the design being elaborated, by definition path: `top`,
+    /// `top.inner` for a nested definition.
     static DESIGN_TREES: std::cell::RefCell<HashMap<String, Rc<ScopeTree>>> =
         std::cell::RefCell::new(HashMap::default());
+    /// What binding reads beyond one definition, for a library adopted later.
+    static DESIGN_NAMES: std::cell::RefCell<Rc<DesignNames>> =
+        std::cell::RefCell::new(Rc::default());
 }
 
 /// The tree of a definition of the design elaborated last.
@@ -528,60 +575,83 @@ pub fn tree_of(def: &str) -> Option<Rc<ScopeTree>> {
     DESIGN_TREES.with(|t| t.borrow().get(def).cloned())
 }
 
+/// The tree of one description that is a definition. Trees of nested
+/// definitions go to `others`.
+pub(crate) fn build_one(d: &mut Description, others: &mut Vec<ScopeTree>) -> Option<ScopeTree> {
+    let (def, params, ports, items) = match d {
+        Description::Module(m) => (&m.name, &m.params[..], &m.ports, &mut m.items),
+        Description::Interface(m) => (&m.name, &m.params[..], &m.ports, &mut m.items),
+        Description::Program(m) => (&m.name, &m.params[..], &m.ports, &mut m.items),
+        // A compilation-unit checker elaborates as a definition (§17.2).
+        Description::PackageItem(PackageItem::Checker(c)) => {
+            (&c.name, &[][..], &c.ports, &mut c.items)
+        }
+        _ => return None,
+    };
+    Some(ScopeTree::build(&def.name, params, ports, items, others))
+}
+
 /// Build the tree of every definition in `descs` and stamp the constructs.
 pub fn build_all(descs: &mut [Description]) -> Vec<ScopeTree> {
     let mut trees = Vec::new();
     for d in descs.iter_mut() {
-        let tree = match d {
-            Description::Module(m) => {
-                ScopeTree::build(&m.name.name, &m.params, &m.ports, &mut m.items, &mut trees)
-            }
-            Description::Interface(m) => {
-                ScopeTree::build(&m.name.name, &m.params, &m.ports, &mut m.items, &mut trees)
-            }
-            Description::Program(m) => {
-                ScopeTree::build(&m.name.name, &m.params, &m.ports, &mut m.items, &mut trees)
-            }
-            // A compilation-unit checker elaborates as a definition (§17.2).
-            Description::PackageItem(PackageItem::Checker(c)) => {
-                ScopeTree::build(&c.name.name, &[], &c.ports, &mut c.items, &mut trees)
-            }
-            _ => continue,
-        };
-        trees.push(tree);
+        if let Some(tree) = build_one(d, &mut trees) {
+            trees.push(tree);
+        }
     }
     trees
 }
 
-/// `build_all`, keeping the trees for the design. A later definition of a
-/// name replaces an earlier one, as in the definitions map (§3.3).
+/// Build and keep the trees of a design and bind its definitions. A later
+/// definition of a name replaces an earlier one, as in the definitions map
+/// (§3.3).
 pub fn build_design(descs: &mut [Description]) {
-    let trees = build_all(descs);
+    let names = Rc::new(DesignNames::collect(descs));
+    let audit = bind::audit_enabled();
+    let mut all = Vec::new();
+    for i in 0..descs.len() {
+        let mut trees = Vec::new();
+        if let Some(tree) = build_one(&mut descs[i], &mut trees) {
+            trees.push(tree);
+            bind::bind_description(&mut descs[i], &trees, &names, audit);
+            all.append(&mut trees);
+        }
+    }
     DESIGN_TREES.with(|t| t.borrow_mut().clear());
-    keep(trees);
+    DESIGN_NAMES.with(|n| *n.borrow_mut() = names);
+    keep(all);
 }
 
-/// Stamp a definition adopted from a library after `build_design`, and keep
-/// its tree.
+/// Stamp and bind a definition adopted from a library after `build_design`,
+/// and keep its tree: a reader of its bindings needs it as for any other.
 pub fn adopt(def: &mut crate::SourceDefinition) {
     use crate::SourceDefinition as D;
     let mut trees = Vec::new();
-    let tree = match def {
-        D::Module(m) => {
-            let m = Rc::make_mut(m);
-            ScopeTree::build(&m.name.name, &m.params, &m.ports, &mut m.items, &mut trees)
-        }
-        D::Interface(m) => {
-            let m = Rc::make_mut(m);
-            ScopeTree::build(&m.name.name, &m.params, &m.ports, &mut m.items, &mut trees)
-        }
-        D::Program(m) => {
-            let m = Rc::make_mut(m);
-            ScopeTree::build(&m.name.name, &m.params, &m.ports, &mut m.items, &mut trees)
-        }
+    let names = DESIGN_NAMES.with(|n| n.borrow().clone());
+    let audit = bind::audit_enabled();
+    macro_rules! adopt_definition {
+        ($m:expr) => {{
+            let m = Rc::make_mut($m);
+            let tree =
+                ScopeTree::build(&m.name.name, &m.params, &m.ports, &mut m.items, &mut trees);
+            trees.push(tree);
+            bind::bind_definition(
+                &m.name.name,
+                &mut m.params,
+                &mut m.ports,
+                &mut m.items,
+                &trees,
+                &names,
+                audit,
+            );
+        }};
+    }
+    match def {
+        D::Module(m) => adopt_definition!(m),
+        D::Interface(m) => adopt_definition!(m),
+        D::Program(m) => adopt_definition!(m),
         _ => return,
-    };
-    trees.push(tree);
+    }
     keep(trees);
 }
 

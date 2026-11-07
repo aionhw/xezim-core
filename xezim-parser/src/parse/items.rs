@@ -60,6 +60,7 @@ impl Parser {
                     span: sp,
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 return Some(Expression::new(ExprKind::Ident(hier), sp));
             }
@@ -88,6 +89,7 @@ impl Parser {
                 span: sp,
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             };
             return Some(Expression::new(ExprKind::Ident(hier), sp));
         }
@@ -750,6 +752,7 @@ impl Parser {
                 span,
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         )
@@ -1721,6 +1724,7 @@ impl Parser {
                 span,
                 cached_signal_id: crate::ast::cache::SignalCache::new(None),
                 cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         );
@@ -4405,6 +4409,7 @@ impl Parser {
             span,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         Some(Expression::new(ExprKind::Ident(hier), span))
     }
@@ -6190,6 +6195,7 @@ impl Parser {
                     span,
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 span,
             )

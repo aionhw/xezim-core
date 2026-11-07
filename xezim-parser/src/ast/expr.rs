@@ -334,6 +334,10 @@ pub struct HierarchicalIdentifier {
     /// memory-init loops and `arr[i]` accesses in hot paths.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub cached_resolved_name: NameCache,
+    /// §23.9: the binding of the head segment, decided per definition before
+    /// expansion.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
 }
 
 impl std::fmt::Debug for HierarchicalIdentifier {

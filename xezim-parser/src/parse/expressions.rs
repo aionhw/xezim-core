@@ -1672,6 +1672,7 @@ impl Parser {
                     span: self.span_from(start),
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -1740,6 +1741,7 @@ impl Parser {
                     span: self.span_from(start),
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let mut expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 if let Some(text) = spec_text {
@@ -1953,6 +1955,7 @@ impl Parser {
                     span: self.span_from(start),
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let new_expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 // `new <expr>` shallow-copy constructor (SV 8.8, Syntax 8-2):
@@ -2542,6 +2545,7 @@ impl Parser {
                     span,
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 args.push(Expression::new(
                     ExprKind::Ident(ident),
@@ -2833,6 +2837,7 @@ impl Parser {
             span: self.span_from(start),
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }
     }
     /// §A.2.2.3 `delay_value` after a bare `#`: a number, a time literal or an
@@ -2862,6 +2867,7 @@ impl Parser {
                     span: self.span_from(start),
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -2882,6 +2888,7 @@ impl Parser {
             span: self.span_from(start),
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         let mut res = Expression::new(ExprKind::Ident(hier), self.span_from(start));
 
