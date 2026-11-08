@@ -667,7 +667,8 @@ pub(crate) fn for_each_enum_member(dt: &DataType, f: &mut dyn FnMut(&Identifier)
 /// The names `items` use at the positions of §6.10 and §31.9 in the scope
 /// they belong to.
 fn implicit_net_uses<'i>(items: &'i [ModuleItem], out: &mut Vec<(&'i str, Span)>) {
-    fn bare(e: &Expression) -> Option<(&str, Span)> {
+    /// A bare name, or each of a concatenation's (`assign {co, s} = ...`).
+    fn bare<'e>(e: &'e Expression, out: &mut Vec<(&'e str, Span)>) {
         match &e.kind {
             ExprKind::Ident(h)
                 if h.root.is_none()
@@ -675,31 +676,29 @@ fn implicit_net_uses<'i>(items: &'i [ModuleItem], out: &mut Vec<(&'i str, Span)>
                     && h.path[0].selects.is_empty()
                     && !h.path[0].name.name.contains("::") =>
             {
-                Some((h.path[0].name.name.as_str(), h.path[0].name.span))
+                out.push((h.path[0].name.name.as_str(), h.path[0].name.span))
             }
-            _ => None,
+            ExprKind::Concatenation(parts) => parts.iter().for_each(|p| bare(p, out)),
+            _ => {}
         }
     }
     for item in items {
         match item {
-            ModuleItem::ContinuousAssign(c) => {
-                out.extend(c.assignments.iter().filter_map(|(l, _)| bare(l)))
-            }
+            ModuleItem::ContinuousAssign(c) => c.assignments.iter().for_each(|(l, _)| bare(l, out)),
             ModuleItem::ModuleInstantiation(m) => {
                 for c in m.instances.iter().flat_map(|i| &i.connections) {
                     if let PortConnection::Named { expr: Some(e), .. }
                     | PortConnection::Ordered(Some(e)) = c
                     {
-                        out.extend(bare(e));
+                        bare(e, out);
                     }
                 }
             }
-            ModuleItem::GateInstantiation(g) => out.extend(
-                g.instances
-                    .iter()
-                    .flat_map(|i| &i.terminals)
-                    .filter_map(bare),
-            ),
+            ModuleItem::GateInstantiation(g) => g
+                .instances
+                .iter()
+                .flat_map(|i| &i.terminals)
+                .for_each(|t| bare(t, out)),
             ModuleItem::SpecifyBlock(b) => {
                 for (net, _) in &b.delayed_nets {
                     out.push((net.as_str(), b.span));

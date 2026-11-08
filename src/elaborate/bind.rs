@@ -37,6 +37,8 @@ pub struct DesignNames {
     /// §26.2: names each package declares, and the packages it exports from.
     packages: HashMap<String, HashSet<String>>,
     exports: HashMap<String, Vec<(String, Option<String>)>>,
+    /// The packages each package imports from, which `export *::*` names.
+    imports: HashMap<String, Vec<String>>,
     /// §3.12.1: names of the compilation unit, and its wildcard imports.
     unit: HashSet<String>,
     unit_wildcards: Vec<String>,
@@ -73,7 +75,11 @@ impl DesignNames {
                 Description::Package(p) => {
                     let mut names = HashSet::default();
                     let mut exports = Vec::new();
+                    let mut imports = Vec::new();
                     for item in &p.items {
+                        if let PackageItem::Import(i) = item {
+                            imports.extend(i.items.iter().map(|it| it.package.name.clone()));
+                        }
                         if let PackageItem::Export(e) = item {
                             exports.extend(e.items.iter().map(|i| {
                                 (
@@ -87,6 +93,7 @@ impl DesignNames {
                     }
                     n.packages.insert(p.name.name.clone(), names);
                     n.exports.insert(p.name.name.clone(), exports);
+                    n.imports.insert(p.name.name.clone(), imports);
                 }
                 Description::Module(m) => n.classes_in_items(&m.items),
                 Description::Interface(m) => n.classes_in_items(&m.items),
@@ -188,11 +195,18 @@ impl DesignNames {
         if depth > 16 {
             return false;
         }
+        // §26.6: `export *::*` exports from every package it imports from.
+        let imported = self.imports.get(package).map(Vec::as_slice).unwrap_or(&[]);
         self.exports.get(package).is_some_and(|ex| {
             ex.iter().any(|(from, item)| {
-                from != package
-                    && item.as_ref().is_none_or(|i| i == name)
-                    && self.package_declares_at(from, name, depth + 1)
+                let froms = match from.as_str() {
+                    "*" => imported,
+                    _ => std::slice::from_ref(from),
+                };
+                item.as_ref().is_none_or(|i| i == name)
+                    && froms
+                        .iter()
+                        .any(|f| f != package && self.package_declares_at(f, name, depth + 1))
             })
         })
     }
@@ -557,7 +571,8 @@ impl<'a> Binder<'a> {
 
     fn head(&mut self, h: &mut HierarchicalIdentifier) {
         let Some(first) = h.path.first() else { return };
-        // `NO_TARGET` here is the parser's `$unit::f(...)` (§3.12.1).
+        // `NO_TARGET` here is the parser's `$unit::f(...)` (§3.12.1) or a
+        // randsequence production's value (§18.17.7).
         let outcome = if h.root.is_some() || h.bound == Bound::NO_TARGET {
             Outcome::None(Hide::Qualified)
         } else {
@@ -1905,8 +1920,8 @@ impl<'a> Binder<'a> {
     }
 }
 
-/// A keyword the parser hands over as a name: a built-in method, or a built-in
-/// type as a class type argument (`K #(int)`).
+/// A keyword the parser hands over as a name: a built-in method (§18.8,
+/// §18.9, §18.13), or a built-in type as a class type argument (`K #(int)`).
 fn is_keyword_name(name: &str) -> bool {
     matches!(
         name,
@@ -1914,6 +1929,11 @@ fn is_keyword_name(name: &str) -> bool {
             | "super"
             | "new"
             | "randomize"
+            | "srandom"
+            | "get_randstate"
+            | "set_randstate"
+            | "rand_mode"
+            | "constraint_mode"
             | "bit"
             | "logic"
             | "reg"
