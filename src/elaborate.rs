@@ -20200,7 +20200,7 @@ fn elaborate_generate_if(
         let scope = gen_scope_name(label, &gi.implicit_name);
         let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(&scope));
         stamp_gen_scope(&mut renamed, &scope);
-        elaborate_items(&renamed, elab, all_defs)
+        elaborate_block_items(&renamed, elab, all_defs)
     };
     for (bi, (cond, items)) in gi.branches.iter().enumerate() {
         match cond {
@@ -20275,7 +20275,7 @@ fn elaborate_generate_case_arm(
     let scope = gen_scope_name(arm.label.as_ref(), &gc.implicit_name);
     let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(&scope));
     stamp_gen_scope(&mut renamed, &scope);
-    elaborate_items(&renamed, elab, all_defs)
+    elaborate_block_items(&renamed, elab, all_defs)
 }
 
 /// §21.2.1.7: the processes of a generate block of the ROOT module run in
@@ -20347,7 +20347,7 @@ fn elaborate_generate_for(
         );
         let mut renamed = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
         stamp_gen_scope(&mut renamed, &scope);
-        elaborate_items(&renamed, elab, all_defs)?;
+        elaborate_block_items(&renamed, elab, all_defs)?;
         if trace && (iter_count % 8) == 0 {
             let rss = std::fs::read_to_string("/proc/self/statm")
                 .ok()
@@ -24954,8 +24954,12 @@ thread_local! {
         = const { std::cell::RefCell::new(None) };
     /// Built declared-shape tables, keyed by definition (name and source
     /// identity) — see `install_decl_shapes`.
-    static DECL_SHAPES_CACHE: std::cell::RefCell<HashMap<(String, usize, usize), std::rc::Rc<HashMap<String, DeclShape>>>>
+    static DECL_SHAPES_CACHE: std::cell::RefCell<HashMap<(String, usize, usize), DeclShapeTable>>
         = std::cell::RefCell::new(HashMap::default());
+    /// The generate blocks being elaborated in that scope (see
+    /// `elaborate_block_items`) and the type parameters visible there.
+    static DECL_SHAPE_LAYERS_TLS: std::cell::RefCell<DeclShapeLayers>
+        = std::cell::RefCell::new(DeclShapeLayers::default());
     /// Full definitions of the typedefs seen so far (data type and unpacked
     /// dimensions), mirroring `typedef_types` / `typedef_unpacked_dims` for
     /// const-eval, which otherwise only knows a typedef's width.
@@ -25093,14 +25097,80 @@ fn tls_restore_typedef_shape(name: &str, saved: TypedefShapeSave) {
     });
 }
 
-/// Restores the previously installed declared-shape table on drop.
-pub struct DeclShapesGuard(Option<std::rc::Rc<HashMap<String, DeclShape>>>);
+/// Declared shapes layered over a scope's own table: one per generate block
+/// being elaborated, innermost last (§27: a block's declarations hide the
+/// enclosing ones), and the type parameters a declaration there may name.
+#[derive(Default)]
+struct DeclShapeLayers {
+    type_params: std::rc::Rc<HashSet<String>>,
+    blocks: Vec<std::rc::Rc<HashMap<String, DeclShape>>>,
+}
+
+/// A definition's declared shapes and the names of its type parameters.
+type DeclShapeTable = (
+    std::rc::Rc<HashMap<String, DeclShape>>,
+    std::rc::Rc<HashSet<String>>,
+);
+
+/// Restores the previously installed declared-shape table, and the block
+/// layers over it, on drop.
+pub struct DeclShapesGuard(
+    Option<std::rc::Rc<HashMap<String, DeclShape>>>,
+    DeclShapeLayers,
+);
 
 impl Drop for DeclShapesGuard {
     fn drop(&mut self) {
         let prev = self.0.take();
         DECL_SHAPES_TLS.with(|c| *c.borrow_mut() = prev);
+        let layers = std::mem::take(&mut self.1);
+        DECL_SHAPE_LAYERS_TLS.with(|c| *c.borrow_mut() = layers);
     }
+}
+
+/// The declared shape of `name` in the scope being elaborated: the innermost
+/// generate block that declares it, else the module or instance.
+fn decl_shape_of(name: &str) -> Option<DeclShape> {
+    DECL_SHAPE_LAYERS_TLS
+        .with(|c| {
+            c.borrow()
+                .blocks
+                .iter()
+                .rev()
+                .find_map(|m| m.get(name).cloned())
+        })
+        .or_else(|| {
+            DECL_SHAPES_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))
+        })
+}
+
+/// §20.7, §20.6.2, §27: the array queries and `$bits` over a generate block's
+/// own declarations are constant, as over the module's. Elaborate the block's
+/// (already renamed) items with their declared shapes layered over the
+/// enclosing ones; a nested block adds its own when it is reached.
+fn elaborate_block_items(
+    items: &[ModuleItem],
+    elab: &mut ElaboratedModule,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Result<(), String> {
+    let outer = DECL_SHAPE_LAYERS_TLS.with(|c| c.borrow().type_params.clone());
+    let (shapes, type_params) = collect_decl_shapes(&PortList::Empty, items, &[], &outer);
+    if shapes.is_empty() && type_params.len() == outer.len() {
+        return elaborate_items(items, elab, all_defs);
+    }
+    let type_params = std::rc::Rc::new(type_params);
+    DECL_SHAPE_LAYERS_TLS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.type_params = type_params;
+        c.blocks.push(std::rc::Rc::new(shapes));
+    });
+    let r = elaborate_items(items, elab, all_defs);
+    DECL_SHAPE_LAYERS_TLS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.blocks.pop();
+        c.type_params = outer;
+    });
+    r
 }
 
 /// `arr[N]` with `N` a parameter parses as an associative dimension keyed by a
@@ -25150,34 +25220,64 @@ fn decl_shape_is_fixed(dt: &DataType, dims: &[UnpackedDimension]) -> bool {
 pub fn install_decl_shapes(def: Definition) -> DeclShapesGuard {
     let items = def.items();
     let key = (def.name().to_string(), items.as_ptr() as usize, items.len());
-    let m = match DECL_SHAPES_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        Some(m) => m,
+    let (m, type_params) = match DECL_SHAPES_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        Some(e) => e,
         None => {
-            let m = std::rc::Rc::new(collect_decl_shapes(def.ports(), items, def.params()));
-            DECL_SHAPES_CACHE.with(|c| c.borrow_mut().insert(key, m.clone()));
-            m
+            let (m, tp) =
+                collect_decl_shapes(def.ports(), items, def.params(), &HashSet::default());
+            let e = (std::rc::Rc::new(m), std::rc::Rc::new(tp));
+            DECL_SHAPES_CACHE.with(|c| c.borrow_mut().insert(key, e.clone()));
+            e
         }
     };
     let prev = DECL_SHAPES_TLS.with(|c| c.borrow_mut().replace(m));
-    DeclShapesGuard(prev)
+    // A generate block of the enclosing scope does not reach into this one.
+    let layers = DECL_SHAPE_LAYERS_TLS.with(|c| {
+        std::mem::replace(
+            &mut *c.borrow_mut(),
+            DeclShapeLayers {
+                type_params,
+                blocks: Vec::new(),
+            },
+        )
+    });
+    DeclShapesGuard(prev, layers)
 }
 
+/// The items of a scope, with those of its `generate` regions in place: a
+/// region is not a scope (§27.3).
+fn scope_items(items: &[ModuleItem]) -> Vec<&ModuleItem> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            ModuleItem::GenerateRegion(gr) => out.extend(scope_items(&gr.items)),
+            _ => out.push(it),
+        }
+    }
+    out
+}
+
+/// The declared shapes of a scope's ports and declarations, and the type
+/// parameters visible in it: `outer_type_params` (an enclosing scope's) and
+/// its own.
 fn collect_decl_shapes(
     ports: &PortList,
     items: &[ModuleItem],
     header_params: &[ParameterDeclaration],
-) -> HashMap<String, DeclShape> {
+    outer_type_params: &HashSet<String>,
+) -> (HashMap<String, DeclShape>, HashSet<String>) {
+    let items = scope_items(items);
     // A variable typed by one of the module's own TYPE parameters takes the
     // instance's binding; it is sized from that width alone, never from a
     // same-named typedef elsewhere.
-    let mut type_params: HashSet<&str> = HashSet::default();
+    let mut type_params: HashSet<String> = outer_type_params.clone();
     let body_params = items.iter().filter_map(|it| match it {
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
         _ => None,
     });
     for pd in header_params.iter().chain(body_params) {
         if let ParameterKind::Type { assignments } = &pd.kind {
-            type_params.extend(assignments.iter().map(|a| a.name.name.as_str()));
+            type_params.extend(assignments.iter().map(|a| a.name.name.clone()));
         }
     }
     let by_type_param = |dt: &DataType| {
@@ -25236,7 +25336,7 @@ fn collect_decl_shapes(
             });
         }
     }
-    m
+    (m, type_params)
 }
 
 /// `[l:r]` / `[n]` bounds of fixed unpacked dimensions, declared order. None
@@ -25287,7 +25387,7 @@ fn decl_shape_query(
     if params.is_some_and(|p| p.contains_key(name)) {
         return None;
     }
-    let shape = DECL_SHAPES_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))?;
+    let shape = decl_shape_of(name)?;
     let mut q = TypeQueryDims {
         dims: fixed_unpacked_bounds(&shape.unpacked, params)?,
         unpacked: shape.unpacked.len(),
@@ -25469,11 +25569,7 @@ fn decl_has_unpacked_dims(arg: &Expression) -> bool {
     let ExprKind::Ident(h) = &arg.kind else {
         return false;
     };
-    let Some(shape) = DECL_SHAPES_TLS.with(|c| {
-        c.borrow()
-            .as_ref()
-            .and_then(|m| m.get(&h.path.last()?.name.name).cloned())
-    }) else {
+    let Some(shape) = h.path.last().and_then(|s| decl_shape_of(&s.name.name)) else {
         return false;
     };
     !shape.unpacked.is_empty()
@@ -25489,11 +25585,7 @@ fn is_decl_shape_operand(arg: &Expression) -> bool {
         ExprKind::Ident(h)
             if h.path.len() == 1 && h.path[0].selects.is_empty() && h.root.is_none() =>
         {
-            let Some(shape) = DECL_SHAPES_TLS.with(|c| {
-                c.borrow()
-                    .as_ref()
-                    .and_then(|m| m.get(&h.path[0].name.name).cloned())
-            }) else {
+            let Some(shape) = decl_shape_of(&h.path[0].name.name) else {
                 return false;
             };
             // `[K]` naming a TYPE is a real associative dimension.
