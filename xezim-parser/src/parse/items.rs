@@ -2746,6 +2746,7 @@ impl Parser {
                 Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
                     name: id,
                     clock_signal: clock_signal_id,
+                    clock_bound: Default::default(),
                     clock_edge,
                     default_input_skew,
                     default_output_skew,
@@ -2867,6 +2868,7 @@ impl Parser {
                     body: body_expr,
                     endlabel,
                     span: self.span_from(start),
+                    decl: Default::default(),
                 }))
             }
             TokenKind::KwSequence => {
@@ -2942,6 +2944,7 @@ impl Parser {
                     body: body_expr,
                     endlabel,
                     span: self.span_from(start),
+                    decl: Default::default(),
                 }))
             }
             TokenKind::KwCovergroup => Some(ModuleItem::CovergroupDeclaration(
@@ -2968,6 +2971,7 @@ impl Parser {
                         return Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
                             name,
                             clock_signal: None,
+                            clock_bound: Default::default(),
                             clock_edge: None,
                             default_input_skew: None,
                             default_output_skew: None,
@@ -4534,6 +4538,7 @@ impl Parser {
                     scopes,
                     name: second_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args,
@@ -4650,6 +4655,7 @@ impl Parser {
                     scopes,
                     name: tn_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args: Vec::new(),
@@ -4686,6 +4692,7 @@ impl Parser {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args,
@@ -4787,6 +4794,7 @@ impl Parser {
                         scopes: Vec::new(),
                         name: first_name,
                         span: self.span_from(start),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args,
@@ -4819,6 +4827,7 @@ impl Parser {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
@@ -5077,6 +5086,7 @@ impl Parser {
                 span: self.span_from(ext_start),
                 scopes: base_scopes,
                 default_args: ext_default_args,
+                bound: Default::default(),
             })
         } else {
             None

@@ -8,10 +8,10 @@
 //! them can name their contents by a simple name, so the walk tracks them as
 //! hidden names, and such a reference has no `bound`.
 //!
-//! `XEZIM_BIND_AUDIT` compares each binding with the generate rename
-//! (`rename_decls_in_iter`), run over a copy of the definition.
+//! `XEZIM_BIND_AUDIT` prints each binding with the key the generate rename
+//! gives it (`rename_decls_in_iter`).
 
-use super::{GenRename, gen_scope_name, rename_decls_in_iter};
+use super::{constraint_takes, local_type_takes};
 use crate::ast::binding::{Bound, DeclId, DeclKind, ScopeId};
 use crate::ast::decl::*;
 use crate::ast::expr::{
@@ -351,26 +351,18 @@ pub enum Outcome {
     None(Hide),
 }
 
-/// One name position the walk visited.
-#[derive(Debug, Clone)]
-struct Mention {
-    span: Span,
-    name: String,
-    outcome: Outcome,
-    binding: String,
-    /// The spelling the rename should give the name's declaration.
-    want: Option<String>,
-    /// The spellings of this name in the scopes around its declaration.
-    outer_keys: Vec<String>,
-    /// What the tree declares under this name, hiding aside.
-    target: Option<DeclKind>,
-    pos: &'static str,
-    /// The name is the callee of a call.
-    call: bool,
+impl Outcome {
+    fn bound(self) -> Bound {
+        match self {
+            Outcome::Decl(d) => Bound::decl(d),
+            Outcome::Upward => Bound::UPWARD,
+            Outcome::None(_) => Bound::NO_TARGET,
+        }
+    }
 }
 
 /// Positions the rename never rewrites: items `rename_item_decls` copies and
-/// parts `rewrite_stmt` and `rewrite_expr` copy. Group B of the audit.
+/// parts `rewrite_stmt` and `rewrite_expr` copy.
 const UNVISITED: &[&str] = &[
     "alias",
     "assign-delay",
@@ -388,18 +380,14 @@ const UNVISITED: &[&str] = &[
     "wait-order",
 ];
 
-/// Positions the rename gives part of a block's names: a declared constraint
-/// its subroutines and types (§18.5), a process local's type its parameters
-/// and types (§6.21).
-/// The rest there is group B.
-fn partly_renamed(pos: &str, target: Option<DeclKind>) -> bool {
+/// Whether the rename rewrites a name of kind `k` at `pos`: a declared
+/// constraint takes a block's subroutines and types, a process local's type
+/// its parameters and types.
+fn rewritten(pos: &str, k: DeclKind) -> bool {
     match pos {
-        "constraint" => !matches!(
-            target,
-            Some(DeclKind::Function | DeclKind::Task | DeclKind::Typedef)
-        ),
-        "local-dim" => !matches!(target, Some(DeclKind::Param | DeclKind::Typedef)),
-        _ => false,
+        "constraint" => constraint_takes(k),
+        "local-dim" => local_type_takes(k),
+        _ => !UNVISITED.contains(&pos),
     }
 }
 
@@ -435,7 +423,7 @@ struct Binder<'a> {
     /// The next head is the callee of a call.
     callee: bool,
     pos: &'static str,
-    mentions: Option<Vec<Mention>>,
+    mentions: Option<Vec<AuditLine>>,
 }
 
 /// §26.7, Annex G: the classes of `std`, wildcard imported into every
@@ -539,34 +527,33 @@ impl<'a> Binder<'a> {
             .lookup(self.scope, bare)
             .map(|d| tree.decls[d.0 as usize].kind);
         if let Some(m) = &mut self.mentions {
-            let (want, outer_keys) = match outcome {
+            let renamed = match outcome {
                 Outcome::Decl(d) => {
                     let decl = &tree.decls[d.0 as usize];
-                    (
-                        renamed_key(tree, decl.scope, &decl.name, decl.kind),
-                        outer_keys(tree, decl.scope, &decl.name),
-                    )
+                    renamed_key(tree, decl.scope, &decl.name, decl.kind)
+                        .filter(|_| rewritten(pos, decl.kind))
                 }
-                _ => (None, Vec::new()),
+                _ => None,
             };
-            m.push(Mention {
+            m.push(AuditLine {
                 span,
                 name: name.to_string(),
-                outcome,
                 binding: binding_text(tree, outcome),
-                want,
-                outer_keys,
-                target,
+                outcome,
+                renamed,
                 pos,
                 call: self.callee,
+                target,
             });
         }
     }
 
-    /// A name with no `bound` field to write.
-    fn ident(&mut self, id: &Identifier) {
+    /// A name with no `bound` field of its own; the caller may keep the
+    /// binding.
+    fn ident(&mut self, id: &Identifier) -> Bound {
         let outcome = self.resolve(&id.name);
         self.note(id.span, &id.name, outcome);
+        outcome.bound()
     }
 
     fn head(&mut self, h: &mut HierarchicalIdentifier) {
@@ -578,11 +565,7 @@ impl<'a> Binder<'a> {
         } else {
             self.resolve(&first.name.name)
         };
-        h.bound = match outcome {
-            Outcome::Decl(d) => Bound::decl(d),
-            Outcome::Upward => Bound::UPWARD,
-            Outcome::None(_) => Bound::NO_TARGET,
-        };
+        h.bound = outcome.bound();
         if self.mentions.is_some() {
             let name = first.name.name.clone();
             self.note(h.span, &name, outcome);
@@ -598,15 +581,6 @@ impl<'a> Binder<'a> {
     /// `NO_TARGET` and keeps its spelling.
     fn disable(&mut self, h: &mut HierarchicalIdentifier) {
         let tree = self.tree;
-        // Already keyed: the audit's walk after the rename.
-        if let [seg] = &h.path[..]
-            && let Some(d) = h.bound.as_decl()
-            && tree.decls[d.0 as usize].name != seg.name.name
-        {
-            let key = seg.name.name.clone();
-            self.note_key(h.span, &key, d);
-            return;
-        }
         let Some(first) = h.path.first() else { return };
         let head = first.name.name.clone();
         let outcome = if h.root.is_some() {
@@ -672,16 +646,15 @@ impl<'a> Binder<'a> {
     fn note_key(&mut self, span: Span, key: &str, d: DeclId) {
         let (pos, tree) = (self.pos, self.tree);
         if let Some(m) = &mut self.mentions {
-            m.push(Mention {
+            m.push(AuditLine {
                 span,
                 name: key.to_string(),
-                outcome: Outcome::Decl(d),
                 binding: binding_text(tree, Outcome::Decl(d)),
-                want: None,
-                outer_keys: Vec::new(),
-                target: Some(DeclKind::Task),
+                outcome: Outcome::Decl(d),
+                renamed: None,
                 pos,
                 call: false,
+                target: Some(DeclKind::Task),
             });
         }
     }
@@ -790,6 +763,7 @@ impl<'a> Binder<'a> {
                 self.parameter(p)
             }
             ModuleItem::TypedefDeclaration(t) => {
+                t.decl = self.own_decl(&t.name.name);
                 self.with_pos("typedef", |b| {
                     b.data_type(&mut t.data_type);
                     b.unpacked(&mut t.dimensions);
@@ -903,12 +877,18 @@ impl<'a> Binder<'a> {
                     }
                 }
             }),
-            ModuleItem::PropertyDeclaration(p) => self.with_pos("property", |b| {
-                b.assertion_decl(&p.ports, &mut p.items, &mut p.body)
-            }),
-            ModuleItem::SequenceDeclaration(s) => self.with_pos("sequence", |b| {
-                b.assertion_decl(&s.ports, &mut s.items, &mut s.body)
-            }),
+            ModuleItem::PropertyDeclaration(p) => {
+                p.decl = self.own_decl(&p.name.name);
+                self.with_pos("property", |b| {
+                    b.assertion_decl(&p.ports, &mut p.items, &mut p.body)
+                })
+            }
+            ModuleItem::SequenceDeclaration(s) => {
+                s.decl = self.own_decl(&s.name.name);
+                self.with_pos("sequence", |b| {
+                    b.assertion_decl(&s.ports, &mut s.items, &mut s.body)
+                })
+            }
             ModuleItem::CovergroupDeclaration(c) => {
                 self.with_pos("covergroup", |b| b.covergroup(c))
             }
@@ -1034,6 +1014,10 @@ impl<'a> Binder<'a> {
     }
 
     fn class(&mut self, c: &mut ClassDeclaration) {
+        // §6.18: a base may be a typedef of the enclosing scope.
+        if let Some(e) = c.extends.as_mut().filter(|e| e.scopes.is_empty()) {
+            e.bound = self.resolve(&e.name.name).bound();
+        }
         let mark = self.hidden.len();
         let unknown = self.unknown_members;
         class_member_names(c, &mut |n| self.hide(n, Hide::Member));
@@ -1216,7 +1200,7 @@ impl<'a> Binder<'a> {
 
     fn clocking(&mut self, c: &mut ClockingDeclaration) {
         if let Some(s) = &c.clock_signal {
-            self.ident(s);
+            c.clock_bound = self.ident(s);
         }
         [&mut c.default_input_skew, &mut c.default_output_skew]
             .into_iter()
@@ -1229,7 +1213,7 @@ impl<'a> Binder<'a> {
             match &mut s.bound_to {
                 Some(e) => self.expr(e),
                 // §14.3: the clockvar names its signal; the rename keeps it.
-                None => self.with_pos("clocking-signal", |b| b.ident(&s.name)),
+                None => self.with_pos("clocking-signal", |b| _ = b.ident(&s.name)),
             }
         }
         c.items.iter_mut().for_each(|s| self.stmt(s));
@@ -1326,7 +1310,7 @@ impl<'a> Binder<'a> {
                 ..
             } => {
                 if name.scopes.is_empty() {
-                    self.ident(&name.name);
+                    name.bound = self.ident(&name.name);
                 }
                 for s in &mut name.scopes {
                     s.type_args.iter_mut().for_each(|a| self.expr(a));
@@ -1514,7 +1498,7 @@ impl<'a> Binder<'a> {
             }
             StatementKind::EventTrigger { name, target, .. } => match target {
                 Some(t) => self.expr(t),
-                None => self.with_pos("event-name", |b| b.ident(name)),
+                None => self.with_pos("event-name", |b| _ = b.ident(name)),
             },
             StatementKind::Wait { condition, stmt } => {
                 self.expr(condition);
@@ -1576,7 +1560,7 @@ impl<'a> Binder<'a> {
             StatementKind::WaitOrder {
                 events, pass, fail, ..
             } => {
-                self.with_pos("wait-order", |b| events.iter().for_each(|e| b.ident(e)));
+                self.with_pos("wait-order", |b| events.iter().for_each(|e| _ = b.ident(e)));
                 if let Some(s) = pass {
                     self.stmt(s);
                 }
@@ -1622,7 +1606,7 @@ impl<'a> Binder<'a> {
     fn event_control(&mut self, ev: &mut EventControl) {
         match ev {
             EventControl::Star | EventControl::ParenStar => {}
-            EventControl::Identifier(id) => self.ident(id),
+            EventControl::Identifier(id) => _ = self.ident(id),
             EventControl::HierIdentifier(e) => self.expr(e),
             EventControl::EventExpr(list) => list.iter_mut().for_each(|e| self.event_expr(e)),
         }
@@ -2072,8 +2056,7 @@ pub fn bind_definition(
     names: &DesignNames,
     audit: bool,
 ) {
-    let lines = bind_and_compare(params, ports, items, trees, names, audit);
-    for l in &lines {
+    for l in &bind_lines(params, ports, items, trees, names, audit) {
         eprintln!(
             "[bind-audit] {}",
             l.render(&super::audit_location(name, l.span))
@@ -2081,7 +2064,7 @@ pub fn bind_definition(
     }
 }
 
-fn bind_and_compare(
+fn bind_lines(
     params: &mut [ParameterDeclaration],
     ports: &mut PortList,
     items: &mut [ModuleItem],
@@ -2094,58 +2077,7 @@ fn bind_and_compare(
     };
     let mut b = run(tree, others, names, audit);
     b.definition(params, ports, items);
-    let Some(mentions) = b.mentions.take() else {
-        return Vec::new();
-    };
-    let mut copy = items.to_vec();
-    rename_like_expansion(&mut copy);
-    let mut after = run(tree, others, names, true);
-    after.definition(&mut params.to_vec(), &mut ports.clone(), &mut copy);
-    compare(
-        &tree.def,
-        mentions,
-        after.mentions.take().unwrap_or_default(),
-    )
-}
-
-/// Run the generate rename over `items` as expansion does: each block of each
-/// arm, outermost first, with `[@]` for a loop index (§27.4). Dead arms too,
-/// and without the genvar substitution, which changes no name position.
-fn rename_like_expansion(items: &mut Vec<ModuleItem>) {
-    for item in items.iter_mut() {
-        match item {
-            ModuleItem::GenerateRegion(g) => rename_like_expansion(&mut g.items),
-            ModuleItem::NestedModule(m) => rename_like_expansion(&mut m.items),
-            ModuleItem::CheckerDeclaration(c) => rename_like_expansion(&mut c.items),
-            ModuleItem::GenerateIf(g) => {
-                for (bi, (_, branch)) in g.branches.iter_mut().enumerate() {
-                    if g.branch_direct.get(bi) != Some(&true) {
-                        let label = g.branch_labels.get(bi).cloned().flatten();
-                        *branch = rename_arm(branch, label.as_ref(), &g.implicit_name);
-                    }
-                    rename_like_expansion(branch);
-                }
-            }
-            ModuleItem::GenerateCase(g) => {
-                for arm in &mut g.arms {
-                    if !arm.direct {
-                        arm.items = rename_arm(&arm.items, arm.label.as_ref(), &g.implicit_name);
-                    }
-                    rename_like_expansion(&mut arm.items);
-                }
-            }
-            ModuleItem::GenerateFor(g) => {
-                let scope = format!("{}[@]", gen_scope_name(g.name.as_ref(), &g.implicit_name));
-                g.items = rename_decls_in_iter(&g.items, &GenRename::Scope(&scope));
-                rename_like_expansion(&mut g.items);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn rename_arm(items: &[ModuleItem], label: Option<&String>, implicit: &str) -> Vec<ModuleItem> {
-    rename_decls_in_iter(items, &GenRename::Scope(&gen_scope_name(label, implicit)))
+    b.mentions.take().unwrap_or_default()
 }
 
 /// §27.5: the task `path` names from scope `from`: each segment but the last
@@ -2207,18 +2139,6 @@ fn literal_index(e: &Expression) -> Option<i64> {
     }
 }
 
-/// The verdict on one name: which way the rename and the binding differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disagree {
-    /// The rename rewrites a name to an outer declaration: a hiding name has
-    /// no tree binding, or its declaration is deeper than the rename's key.
-    Hiding,
-    /// The rename does not reach a name that binds to a renamed declaration.
-    Unvisited,
-    /// Neither.
-    Other,
-}
-
 /// One line of the audit.
 #[derive(Debug, Clone)]
 pub struct AuditLine {
@@ -2227,14 +2147,13 @@ pub struct AuditLine {
     /// `Decl(<def>[.<scope path>], <kind>)`, `Upward` or `none`.
     pub binding: String,
     pub outcome: Outcome,
-    /// What the rename made of the name, when it changed it.
+    /// The key the rename gives the name, when it changes it.
     pub renamed: Option<String>,
     pub pos: &'static str,
     /// The name is the callee of a call.
     pub call: bool,
     /// What the tree declares under this name, hiding aside.
     pub target: Option<DeclKind>,
-    pub disagree: Option<Disagree>,
 }
 
 impl AuditLine {
@@ -2254,12 +2173,6 @@ impl AuditLine {
         }
         if let Outcome::None(why) = self.outcome {
             s.push_str(&format!(" why={why:?}"));
-        }
-        match self.disagree {
-            Some(Disagree::Hiding) => s.push_str(" disagree=A"),
-            Some(Disagree::Unvisited) => s.push_str(" disagree=B"),
-            Some(Disagree::Other) => s.push_str(" disagree=?"),
-            None => {}
         }
         s
     }
@@ -2282,58 +2195,6 @@ fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> 
         _ => return None,
     };
     (key != name).then_some(key)
-}
-
-fn outer_keys(tree: &ScopeTree, s: ScopeId, name: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut at = tree.scopes[s.0 as usize].parent;
-    while let Some(a) = at {
-        keys.push(tree.key(a, name, &[]));
-        at = tree.scopes[a.0 as usize].parent;
-    }
-    keys
-}
-
-fn compare(def: &str, before: Vec<Mention>, after: Vec<Mention>) -> Vec<AuditLine> {
-    if before.len() != after.len() {
-        eprintln!(
-            "[bind-audit] unaligned {def} {} {}",
-            before.len(),
-            after.len()
-        );
-    }
-    before
-        .into_iter()
-        .zip(after)
-        .map(|(m, a)| {
-            // §3.12.1: the rewrite drops a `$unit::` it finds unshadowed.
-            let bare = crate::sv_parser::strip_unit_scope_name(&m.name).unwrap_or(&m.name);
-            let renamed = (a.name != m.name && a.name != bare).then(|| a.name.clone());
-            let disagree = match (&renamed, &m.want) {
-                (None, None) => None,
-                (Some(r), Some(w)) if r == w => None,
-                (Some(r), _) => Some(match m.outcome {
-                    Outcome::None(why) if why != Hide::Qualified => Disagree::Hiding,
-                    Outcome::Decl(_) if m.outer_keys.contains(r) => Disagree::Hiding,
-                    _ => Disagree::Other,
-                }),
-                (None, Some(_)) if UNVISITED.contains(&m.pos) => Some(Disagree::Unvisited),
-                (None, Some(_)) if partly_renamed(m.pos, m.target) => Some(Disagree::Unvisited),
-                (None, Some(_)) => Some(Disagree::Other),
-            };
-            AuditLine {
-                span: m.span,
-                name: m.name,
-                binding: m.binding,
-                outcome: m.outcome,
-                renamed,
-                pos: m.pos,
-                call: m.call,
-                target: m.target,
-                disagree,
-            }
-        })
-        .collect()
 }
 
 fn binding_text(tree: &ScopeTree, o: Outcome) -> String {
@@ -2365,7 +2226,7 @@ pub fn audit_design(descs: &mut [Description]) -> Vec<AuditLine> {
         let Some((_, params, ports, items)) = definition_parts(d) else {
             continue;
         };
-        out.extend(bind_and_compare(params, ports, items, &trees, &names, true));
+        out.extend(bind_lines(params, ports, items, &trees, &names, true));
     }
     out
 }

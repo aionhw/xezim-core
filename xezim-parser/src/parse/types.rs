@@ -241,6 +241,7 @@ impl Parser {
                             scopes: Vec::new(),
                             name: crate::ast::Identifier { name: cls, span },
                             span,
+                            bound: Default::default(),
                         };
                         return DataType::TypeReference {
                             name,
@@ -533,6 +534,7 @@ impl Parser {
             scopes,
             name,
             span: self.span_from(start),
+            bound: Default::default(),
         }
     }
 
