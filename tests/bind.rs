@@ -1787,3 +1787,78 @@ fn the_audit_marks_callees_and_the_assign_and_port_positions() {
         assert_eq!((f.pos, f.call), (pos, true), "{f:?}");
     }
 }
+
+#[test]
+fn a_randsequence_production_value_has_no_target() {
+    // §18.17.7: a code block reads each production of its rule as a
+    // variable. A production of another rule is not one.
+    let src = "module top; int n, k;
+        initial randsequence (vr)
+          void vr : r1 r2 { n = r1 + r2 + r3; k = n; };
+          int r1 : { return 5; };
+          int r2 : { return 6; };
+          int r3 : { return 7; };
+        endsequence
+      endmodule";
+    let l = audit(src);
+    assert_eq!(why(at(&l, "r1", 0)), Hide::Qualified);
+    assert_eq!(why(at(&l, "r2", 0)), Hide::Qualified);
+    assert_eq!(at(&l, "r3", 0).outcome, Outcome::Upward);
+    assert_eq!(at(&l, "k", 0).binding, "Decl(top, Data)");
+}
+
+#[test]
+fn each_name_of_a_concatenation_at_an_implicit_net_position_is_declared() {
+    // §6.10, §11.4.12: the members of a concatenation on the left-hand side
+    // or as a port actual.
+    let src = "module m(output logic [1:0] z); assign z = 2'b01; endmodule
+      module top; logic [3:0] a, b;
+        assign {cout, sum} = a + b;
+        m u(.z({z1, z0}));
+        initial $display(cout, sum, z1, z0);
+      endmodule";
+    let l = audit(src);
+    for name in ["cout", "sum", "z1", "z0"] {
+        for n in [0, 1] {
+            check(at(&l, name, n), "Decl(top, ImplicitNet)", None, None);
+        }
+    }
+}
+
+#[test]
+fn a_bare_built_in_randomization_method_is_not_a_name() {
+    // §18.8 rand_mode, §18.9 constraint_mode, §18.13 srandom, get_randstate,
+    // set_randstate, called bare in a method of the class.
+    let src = "module top; class C; rand int x; string st;
+        function void go();
+          rand_mode(0); constraint_mode(1); srandom(3);
+          st = get_randstate(); set_randstate(st);
+        endfunction
+      endclass endmodule";
+    let l = audit(src);
+    for name in [
+        "rand_mode",
+        "constraint_mode",
+        "srandom",
+        "get_randstate",
+        "set_randstate",
+    ] {
+        assert_eq!(why(at(&l, name, 0)), Hide::Qualified, "{name}");
+    }
+}
+
+#[test]
+fn export_star_star_re_exports_each_imported_package() {
+    // §26.6: `export *::*` exports from all packages from which imports occur.
+    let src = "package p1; localparam int A = 1; endpackage
+      package p2; localparam int B = 2; endpackage
+      package q; localparam int Z = 9; endpackage
+      package both; import p1::*; import p2::*; export *::*; localparam int C = A + B; endpackage
+      package none; import q::*; localparam int D = Z; endpackage
+      module top; import both::*; import none::*; initial $display(A, B, C, Z); endmodule";
+    let l = audit(src);
+    for name in ["A", "B"] {
+        assert_eq!(why(at(&l, name, 0)), Hide::Import, "{name}");
+    }
+    assert_eq!(at(&l, "Z", 0).outcome, Outcome::Upward);
+}
