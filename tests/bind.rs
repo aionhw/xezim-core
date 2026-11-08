@@ -204,7 +204,12 @@ fn a_gate_instance_is_a_name_the_rename_leaves_alone_and_a_type_takes_the_blocks
         initial $display(u.n);
       end endmodule";
     let l = audit(src);
-    check(at(&l, "t_t", 0), "Decl(top.g, Typedef)", Some("g.t_t"), None);
+    check(
+        at(&l, "t_t", 0),
+        "Decl(top.g, Typedef)",
+        Some("g.t_t"),
+        None,
+    );
     check(at(&l, "u", 0), "Decl(top.g, Gate)", None, None);
 }
 
@@ -418,9 +423,24 @@ fn a_name_nothing_declares_binds_upward() {
 }
 
 #[test]
-fn a_nested_module_finds_the_enclosing_modules_names_upward() {
-    let src = "module top; int x; module inner; initial x = 1; endmodule inner u(); endmodule";
-    check(at(&audit(src), "x", 0), "Upward", None, None);
+fn a_nested_module_reads_the_outer_modules_names() {
+    // §23.4: the outer name space is visible to the inner module. A call
+    // still finds its subroutine upward (§23.8.1).
+    let src = "module top; int x; if (1) begin : g int y; end
+        function automatic int f(); return 1; endfunction
+        module inner; initial x = g.y + f(); endmodule
+        inner u();
+      endmodule";
+    let l = audit(src);
+    for name in ["x", "g"] {
+        assert_eq!(
+            at(&l, name, 0).outcome,
+            Outcome::None(Hide::Outer),
+            "{name}"
+        );
+        check(at(&l, name, 0), "none", None, None);
+    }
+    check(at(&l, "f", 0), "Upward", None, None);
 }
 
 #[test]
@@ -1051,7 +1071,12 @@ fn a_disable_by_path_from_inside_a_block_names_the_key_from_the_definition() {
         if (1) begin : h task automatic t(); endtask end
         initial disable h.t;
       end endmodule";
-    check(at(&audit(src), "g.h.t", 0), "Decl(top.g.h, Task)", None, None);
+    check(
+        at(&audit(src), "g.h.t", 0),
+        "Decl(top.g.h, Task)",
+        None,
+        None,
+    );
 }
 
 #[test]
@@ -1061,7 +1086,12 @@ fn a_disable_by_path_into_a_loop_block_takes_the_literal_index() {
         task automatic t(); endtask
       end
       initial disable g[1].t; endmodule";
-    check(at(&audit(src), "g[1].t", 0), "Decl(top.g[@], Task)", None, None);
+    check(
+        at(&audit(src), "g[1].t", 0),
+        "Decl(top.g[@], Task)",
+        None,
+        None,
+    );
 }
 
 #[test]
@@ -1540,4 +1570,220 @@ fn nested_data_named_like_a_subroutine_of_an_unlabelled_block_follows_its_name()
         at(&audit(&src), "f", 0).renamed.as_deref(),
         Some("genblk1.h.f")
     );
+}
+
+// Every legal bare name binds: what is left `Upward` in a value position is
+// declared nowhere.
+
+fn why(l: &AuditLine) -> Hide {
+    match l.outcome {
+        Outcome::None(w) => w,
+        o => panic!("{o:?} in {l:?}"),
+    }
+}
+
+#[test]
+fn the_std_classes_bind_as_imports() {
+    // §26.7: `std` is wildcard imported into every compilation unit.
+    let src = "module top;
+        initial begin process p = process::self(); mailbox #(int) m = new; semaphore s = new(1); end
+      endmodule";
+    let l = audit(src);
+    for name in ["process", "mailbox", "semaphore"] {
+        assert_eq!(why(at(&l, name, 0)), Hide::Import, "{name}");
+        check(at(&l, name, 0), "none", None, None);
+    }
+}
+
+#[test]
+fn a_user_class_named_like_a_std_class_is_found_first() {
+    // §26.7: user code can redefine the names of `std`.
+    let src = "class mailbox; int n; endclass
+      module top; class semaphore; endclass initial begin mailbox m; semaphore s; end endmodule";
+    let l = audit(src);
+    assert_eq!(why(at(&l, "mailbox", 0)), Hide::Import);
+    check(at(&l, "semaphore", 0), "Decl(top, Class)", None, None);
+}
+
+#[test]
+fn a_design_unit_name_is_a_qualified_head() {
+    // §23.9: a path can start with a module name; a port names an interface.
+    let src = "interface bus_if; logic v; endinterface
+      module p(bus_if b); endmodule
+      module top; bus_if i(); p u(.b(i)); initial $dumpvars(0, top); endmodule";
+    let l = audit(src);
+    for name in ["bus_if", "top"] {
+        assert_eq!(why(at(&l, name, 0)), Hide::Qualified, "{name}");
+    }
+}
+
+#[test]
+fn a_call_named_like_a_design_unit_is_still_found_upward() {
+    // §23.8.1.
+    let src = "module f; endmodule
+      module c; initial $display(f()); endmodule
+      module top; function automatic int f(); return 1; endfunction c u(); endmodule";
+    check(at(&audit(src), "f", 0), "Upward", None, None);
+}
+
+#[test]
+fn an_implicit_net_is_declared_in_the_scope_of_its_first_reference() {
+    // §6.10: a port connection, a gate terminal and the left-hand side of a
+    // continuous assignment; §31.9: a delayed signal of a timing check.
+    let src = "module w(output logic o); assign o = 1; endmodule
+      module top(input logic ck, input logic d);
+        w u(.o(p_net));
+        buf b(g_net, p_net);
+        assign a_net = g_net;
+        specify $setuphold(posedge ck, d, 1, 1, , , , d_ck, d_d); endspecify
+        if (1) begin : g w v(.o(b_net)); initial $display(b_net); end
+        initial $display(p_net, g_net, a_net, d_ck, d_d);
+      endmodule";
+    let l = audit(src);
+    for name in ["p_net", "g_net", "a_net", "d_ck", "d_d"] {
+        let last = l.iter().filter(|m| m.name == name).count() - 1;
+        for n in [0, last] {
+            check(at(&l, name, n), "Decl(top, ImplicitNet)", None, None);
+        }
+    }
+    check(at(&l, "b_net", 0), "Decl(top.g, ImplicitNet)", None, None);
+    check(at(&l, "b_net", 1), "Decl(top.g, ImplicitNet)", None, None);
+}
+
+#[test]
+fn an_implicit_net_of_a_block_is_not_a_name_of_the_module() {
+    // §6.10: the net belongs to the block that references it.
+    let src = "module w(output logic o); assign o = 1; endmodule
+      module top; if (1) begin : g w v(.o(n)); end initial $display(n); endmodule";
+    let l = audit(src);
+    check(at(&l, "n", 0), "Decl(top.g, ImplicitNet)", None, None);
+    check(at(&l, "n", 1), "Upward", None, None);
+}
+
+#[test]
+fn a_name_found_another_way_is_not_an_implicit_net() {
+    // §6.10: only an identifier not declared in a visible scope; §26.3 and
+    // §27.4: an import and a loop variable are.
+    let src = "package q; parameter int K = 3; endpackage
+      module m(input logic [1:0] i); endmodule
+      module top; import q::*; m u(.i(K));
+        for (genvar j = 0; j < 2; j++) begin : l m v(.i(j)); end
+      endmodule";
+    let l = audit(src);
+    assert_eq!(why(at(&l, "K", 0)), Hide::Import);
+    assert_eq!(why(at(&l, "j", 2)), Hide::Loop);
+    assert_eq!(at(&l, "j", 2).target, None);
+}
+
+#[test]
+fn a_property_local_variable_is_visible_in_its_body() {
+    // §16.10.
+    let src = "module top; logic clk, a, b; int d;
+        property p_lv; int x; @(posedge clk) (a, x = d) |-> ##1 (b && d == x + 1); endproperty
+        sequence s_lv; int v = 0; (a, v = d) ##1 (d == v); endsequence
+      endmodule";
+    let l = audit(src);
+    for (name, uses) in [("x", 3), ("v", 3)] {
+        for n in 0..uses {
+            assert_eq!(why(at(&l, name, n)), Hide::Local, "{name} {n}");
+        }
+    }
+}
+
+#[test]
+fn randomize_arguments_name_members_of_the_receiver() {
+    // §18.11, also on an indexed receiver (§18.7).
+    let src = "module top; class c; rand int a, b; endclass c one; c many[2];
+        initial begin
+          void'(one.randomize(a, b));
+          void'(many[0].randomize(a));
+          void'(many[1].randomize with { b == 2; });
+        end
+      endmodule";
+    let l = audit(src);
+    for (name, n) in [("a", 0), ("b", 0), ("a", 1), ("b", 1)] {
+        assert_eq!(why(at(&l, name, n)), Hide::Member, "{name} {n}");
+    }
+}
+
+#[test]
+fn a_formal_default_sees_the_formals_before_it() {
+    // §13.5.3: a default binds in the declaring scope; a name found nowhere
+    // there names an earlier formal.
+    let src = "module top; int c = 4;
+        function automatic int f(int a = 1, int b = a + 1, int c = 2, int d = c);
+          return a + b + c + d;
+        endfunction
+      endmodule";
+    let l = audit(src);
+    assert_eq!(why(at(&l, "a", 0)), Hide::Formal);
+    check(at(&l, "c", 0), "Decl(top, Data)", None, None);
+}
+
+#[test]
+fn a_ranged_enum_declares_each_member() {
+    // §6.19.2, Table 6-10.
+    let src = "module top; typedef enum {A[3], B[2:4], C[1:0]} e_t;
+        initial $display(A0, A2, B2, B4, C0, C1);
+      endmodule";
+    let l = audit(src);
+    for name in ["A0", "A2", "B2", "B4", "C0", "C1"] {
+        check(at(&l, name, 0), "Decl(top, EnumMember)", None, None);
+    }
+}
+
+#[test]
+fn an_implicit_generate_name_is_a_label_of_its_scope() {
+    // §27.6: `genblk1` names the unnamed block; no construct is numbered 7.
+    let src = "module top; if (1) begin int x; end if (1) begin : g int y; end
+        initial $display(genblk1.x, genblk7.x);
+      endmodule";
+    let l = audit(src);
+    check(at(&l, "genblk1", 0), "Decl(top, Label)", None, None);
+    check(at(&l, "genblk7", 0), "Upward", None, None);
+}
+
+#[test]
+fn an_implicit_name_with_only_labelled_arms_names_no_block() {
+    // §27.6: only an unnamed block takes the construct's name.
+    let src = "module top; if (1) begin : a int x; end else begin : b int x; end
+        initial $display(genblk1.x);
+      endmodule";
+    check(at(&audit(src), "genblk1", 0), "Upward", None, None);
+}
+
+#[test]
+fn a_1step_delay_is_not_a_name() {
+    // §14.4, A.2.2.3.
+    let src = "module top; logic clk, d, w;
+        clocking cb @(posedge clk); default input #1step output #0; input d; endclocking
+        assign #1step w = d;
+        initial #1step $display(d);
+      endmodule";
+    let l = audit(src);
+    let steps: Vec<_> = l.iter().filter(|m| m.name == "1step").collect();
+    assert_eq!(steps.len(), 3, "{l:#?}");
+    for m in steps {
+        assert_eq!(why(m), Hide::Qualified);
+    }
+}
+
+#[test]
+fn the_audit_marks_callees_and_the_assign_and_port_positions() {
+    let src = "module w(input logic i); endmodule
+      module top; logic a, b;
+        function automatic logic f(); return 1; endfunction
+        assign a = f();
+        w u(.i(b));
+        initial $display(f());
+      endmodule";
+    let l = audit(src);
+    let a = at(&l, "a", 0);
+    assert_eq!((a.pos, a.call), ("assign-lhs", false));
+    let b = at(&l, "b", 0);
+    assert_eq!((b.pos, b.call), ("port", false));
+    for (n, pos) in [(0, "process"), (1, "process")] {
+        let f = at(&l, "f", n);
+        assert_eq!((f.pos, f.call), (pos, true), "{f:?}");
+    }
 }
