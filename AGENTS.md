@@ -24,20 +24,55 @@ Two crates in one repo:
 
 `xezim` consumes this repo as a **git dependency pinned by `rev`** — each
 xezim revision names the exact core revision it was tested against, so bare
-clones and release tags always build the verified pair. After pushing core
-changes that xezim depends on, bump both `rev = ...` fields in
-`../xezim/Cargo.toml` in the same xezim push. For local co-development run
-`../xezim/scripts/use-local-core.sh` once (plain `cargo build` then uses the
-local checkout, no network) — see "Modifying xezim-core" in
-`../xezim/README.md`. It is **not** a submodule. The simulators run **elaborated**
-designs, so most wrong-result bugs live in `xezim`'s VM — a change here only helps
-when the symptom is parse/elaboration/formatting.
+clones and release tags always build the verified pair. It is **not** a
+submodule. See "Keeping xezim and xezim-core in sync" below before pushing
+anything here. The simulators run **elaborated** designs, so most
+wrong-result bugs live in `xezim`'s VM — a change here only helps when the
+symptom is parse/elaboration/formatting.
 
 **One version for all three crates.** `xezim-core` (`Cargo.toml`), `sv-parser`
 (`xezim-parser/Cargo.toml`) and `xezim` (`../xezim/Cargo.toml`) always carry the
 same `version`. A release bumps all three in step: commit and push core first,
 then repin xezim to that core commit. `sv-parser` is not a separately versioned
 crate; never leave it behind.
+
+## Keeping xezim and xezim-core in sync
+
+The same section is in `../xezim/AGENTS.md`; change both together.
+
+- **The pin is the two `rev =` lines** in `../xezim/Cargo.toml`
+  (`xezim-core` and `sv-parser`). Both name the same full 40-character core
+  commit. `Cargo.lock` is git-ignored in xezim, so nothing else pins core.
+- **xezim CI builds the pinned core, not core `main`.** A core change is
+  untested by xezim CI, and invisible to xezim users, until the pin moves to
+  it. Core's own CI runs only the core and parser tests.
+- **Develop against the local checkout.** Run `../xezim/scripts/use-local-core.sh`
+  once; plain `cargo build`/`cargo test` in xezim then uses this checkout
+  through a git-ignored `.cargo/config.toml` `[patch]`. `cargo tree -p xezim-core`
+  in xezim shows a path when the patch is active.
+- **Validate the exact commit you will pin.** Commit everything here first
+  (`git status` clean), then run this repo's tests (`cargo test` and
+  `cargo test --manifest-path xezim-parser/Cargo.toml`) and the full xezim
+  suite against it. Uncommitted core edits make the tested tree differ from
+  the pinned one.
+- **Push order:**
+  1. Push core to `main`.
+  2. In xezim, add a commit `Sync core revision` that changes only both
+     `rev =` lines to the pushed core `HEAD`
+     (`git -C ../xezim-core rev-parse HEAD`).
+  3. Check that the pin resolves without the local patch: move
+     `.cargo/config.toml` aside, run `cargo fetch` in xezim, put it back.
+  4. Push xezim, with the commits that need the new core in the same push.
+- **Never pin a core commit that is not on core's `origin/main`**
+  (`git -C ../xezim-core merge-base --is-ancestor <rev> origin/main`). A
+  local-only or force-pushed-away commit breaks every bare clone and CI run.
+  Never rewrite pushed core history for the same reason: old xezim pins
+  point into it.
+- **A core push that xezim does not need yet** (docs, a core-only test)
+  still gets a `Sync core revision` in the next xezim push, so the pin does
+  not fall behind `main`.
+- **Releases:** all three crates carry the same `version` (above). Push the
+  core version bump, then pin xezim to that commit in the release push.
 
 ## Repository map
 
@@ -195,5 +230,6 @@ citing the LRM § → document any new flag/env knob in the `xezim` README.
 ## Resources
 
 - `../xezim/AGENTS.md` — the interpreter/simulator repo this library feeds
-- `../xezim/docs/dev/*` — architecture, debugging, testing, gotchas
+- `../xezim/docs/building.md` ("Working on xezim-core"), `../xezim/CONTRIBUTING.md`
+  (test suites), `../xezim/docs/DEBUGGING.md`
 - `xezim-parser/` crate docs (`cargo doc -p sv-parser`) — lexer/parser/AST
