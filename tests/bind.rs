@@ -195,7 +195,8 @@ fn an_instance_in_a_block_binds_as_a_path_head() {
 }
 
 #[test]
-fn a_gate_instance_and_a_type_are_names_the_rename_leaves_alone() {
+fn a_gate_instance_is_a_name_the_rename_leaves_alone_and_a_type_takes_the_blocks_key() {
+    // §6.18, §23.9.
     let src = "module top; wire a, b;
       if (1) begin : g
         typedef int t_t; t_t v;
@@ -203,8 +204,52 @@ fn a_gate_instance_and_a_type_are_names_the_rename_leaves_alone() {
         initial $display(u.n);
       end endmodule";
     let l = audit(src);
-    check(at(&l, "t_t", 0), "Decl(top.g, Typedef)", None, None);
+    check(at(&l, "t_t", 0), "Decl(top.g, Typedef)", Some("g.t_t"), None);
     check(at(&l, "u", 0), "Decl(top.g, Gate)", None, None);
+}
+
+#[test]
+fn a_typedefs_dimension_takes_the_blocks_parameter() {
+    // §6.18, §23.9.
+    let src = "module top; if (1) begin : g localparam W = 4;
+        typedef logic [W-1:0] t; t v;
+      end endmodule";
+    let l = audit(src);
+    let w = at(&l, "W", 0);
+    assert_eq!(w.pos, "typedef");
+    check(w, "Decl(top.g, Param)", Some("g.W"), None);
+    check(at(&l, "t", 0), "Decl(top.g, Typedef)", Some("g.t"), None);
+}
+
+#[test]
+fn a_loop_variable_a_constraint_cast_and_a_local_typedef_name_the_blocks_type() {
+    // §12.7.1, §18.5, §6.18: a local typedef hides the block's after it.
+    let src = "module top; if (1) begin : g typedef int t;
+        class C; rand int x; constraint k { x == t'(1); } endclass
+        initial begin for (t i = 0; i < 2; i++) ; end
+        initial begin typedef logic [1:0] t; t v; end
+      end endmodule";
+    let l = audit(src);
+    let k = at(&l, "t", 0);
+    assert_eq!(k.pos, "constraint");
+    check(k, "Decl(top.g, Typedef)", Some("g.t"), None);
+    let f = at(&l, "t", 1);
+    assert_eq!(f.pos, "local-dim");
+    check(f, "Decl(top.g, Typedef)", Some("g.t"), None);
+    let v = at(&l, "t", 2);
+    assert_eq!(v.outcome, Outcome::None(Hide::Type));
+    check(v, "none", None, None);
+}
+
+#[test]
+fn a_forward_class_typedef_and_its_class_keep_their_name() {
+    // §6.18, §8.3: classes keep their name; so does the forward declaration.
+    let src = "module top; if (1) begin : g typedef class C;
+        class D; C c; endclass
+        class C; endclass
+      end endmodule";
+    let l = audit(src);
+    check(at(&l, "C", 0), "Decl(top.g, Class)", None, None);
 }
 
 #[test]
