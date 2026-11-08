@@ -1522,6 +1522,24 @@ impl UpwardScopes {
     /// found first (keyed globally), or nothing is. §26.3: imports of an
     /// enclosing scope are not visible to it.
     fn subroutine_key(&self, inst: &str, name: &str) -> Option<String> {
+        let (up, s, dpi) = self.find_subroutine(inst, name)?;
+        if dpi {
+            return None;
+        }
+        let key = up.tree.key(s, name, &up.indices);
+        Some(match up.path.is_empty() {
+            true => key,
+            false => format!("{}.{key}", up.path),
+        })
+    }
+
+    /// The `subroutine_key` search: the parent and scope declaring `name`,
+    /// and whether it is a DPI import.
+    fn find_subroutine(
+        &self,
+        inst: &str,
+        name: &str,
+    ) -> Option<(&InstanceParent, crate::ast::binding::ScopeId, bool)> {
         use crate::ast::binding::DeclKind;
         let mut at = inst;
         while let Some(up) = self.parents.get(at) {
@@ -1530,14 +1548,8 @@ impl UpwardScopes {
                 let sc = &up.tree.scopes[s.0 as usize];
                 if let Some(d) = sc.by_name.get(name) {
                     match up.tree.decls[d.0 as usize].kind {
-                        DeclKind::Function | DeclKind::Task => {
-                            let key = up.tree.key(s, name, &up.indices);
-                            return Some(match up.path.is_empty() {
-                                true => key,
-                                false => format!("{}.{key}", up.path),
-                            });
-                        }
-                        DeclKind::DpiImport => return None,
+                        DeclKind::Function | DeclKind::Task => return Some((up, s, false)),
+                        DeclKind::DpiImport => return Some((up, s, true)),
                         _ => {}
                     }
                 }
@@ -1546,6 +1558,13 @@ impl UpwardScopes {
             at = &up.path;
         }
         None
+    }
+
+    /// §23.8.1: a bare call of `name` in a body of definition `def` finds a
+    /// subroutine upward from every instance of `def`. The top finds none.
+    fn every_instance_finds(&self, def: &str, name: &str) -> bool {
+        let mut insts = self.defs.iter().filter(|(_, d)| *d == def).peekable();
+        insts.peek().is_some() && insts.all(|(p, _)| self.find_subroutine(p, name).is_some())
     }
 
     fn declare(&mut self, def: &Definition) {
@@ -17643,6 +17662,16 @@ fn validate_expr_idents(
     elab: &ElaboratedModule,
     locals: &HashSet<String>,
 ) -> Result<(), String> {
+    validate_expr_idents_as(expr, elab, locals, HeadRole::Value)
+}
+
+/// `validate_expr_idents` for an expression whose head is written as `role`.
+fn validate_expr_idents_as(
+    expr: &Expression,
+    elab: &ElaboratedModule,
+    locals: &HashSet<String>,
+    role: HeadRole,
+) -> Result<(), String> {
     fn root_ident_name(expr: &Expression) -> Option<&str> {
         match &expr.kind {
             ExprKind::Ident(hier) if hier.path.len() == 1 => Some(hier.path[0].name.name.as_str()),
@@ -17687,16 +17716,6 @@ fn validate_expr_idents(
                 {
                     return Ok(());
                 }
-                // §27.6: `genblk<N>` — the implicit name of an unnamed
-                // generate block, legal as a hierarchical-reference root.
-                // (The simulator resolves through it by stripping the
-                // implicit segment; unnamed-block decls keep bare names.)
-                if name.starts_with("genblk")
-                    && name.len() > 6
-                    && name[6..].chars().all(|c| c.is_ascii_digit())
-                {
-                    return Ok(());
-                }
                 // A built-in type keyword captured as an Ident — only the
                 // parser's `$bits(<type>)` / `$size(<type>)` type-argument path
                 // produces these, so it's a type reference, not a signal.
@@ -17711,6 +17730,18 @@ fn validate_expr_idents(
                     .is_some_and(|(p, _)| elab.packages.contains(p))
                 {
                     return Ok(());
+                }
+                match head_verdict(hier, role) {
+                    HeadVerdict::Declared => return Ok(()),
+                    HeadVerdict::Unbound => {}
+                    // §23.8.1: the top has no upward scope to find a call in.
+                    HeadVerdict::Undeclared | HeadVerdict::UpwardCall => {
+                        return Err(span_error(
+                            elab,
+                            expr.span,
+                            &format!("Undeclared identifier '{}'", name),
+                        ));
+                    }
                 }
                 if !elab.signals.contains_key(name) && !elab.parameters.contains_key(name) &&
                    !elab.functions.contains_key(name) && !elab.tasks.contains_key(name) &&
@@ -17729,6 +17760,15 @@ fn validate_expr_idents(
                        &format!("Undeclared identifier '{}'", name),
                    ));
                 }            }
+        ExprKind::Ident(hier) => {
+            if let HeadVerdict::Undeclared = head_verdict(hier, role) {
+                return Err(span_error(
+                    elab,
+                    expr.span,
+                    &format!("Undeclared identifier '{}'", hier.path[0].name.name),
+                ));
+            }
+        }
         ExprKind::Unary { operand, .. } => validate_expr_idents(operand, elab, locals)?,
         ExprKind::Binary { left, right, .. } => { validate_expr_idents(left, elab, locals)?; validate_expr_idents(right, elab, locals)?; }
         ExprKind::Conditional { condition, then_expr, else_expr } => {
@@ -17774,7 +17814,11 @@ fn validate_expr_idents(
                     }
                 }
             }
-            validate_expr_idents(expr, elab, locals)?;
+            let base = match role {
+                HeadRole::Path => HeadRole::Path,
+                _ => HeadRole::Value,
+            };
+            validate_expr_idents_as(expr, elab, locals, base)?;
             validate_expr_idents(index, elab, locals)?;
         }
         ExprKind::RangeSelect { expr, left, right, .. } => {
@@ -17864,10 +17908,10 @@ fn validate_expr_idents(
                 if root == elab.name || elab.packages.contains(root) {
                     // scope / hierarchy reference, not a value lookup
                 } else {
-                    validate_expr_idents(expr, elab, locals)?;
+                    validate_expr_idents_as(expr, elab, locals, HeadRole::Path)?;
                 }
             } else {
-                validate_expr_idents(expr, elab, locals)?;
+                validate_expr_idents_as(expr, elab, locals, HeadRole::Path)?;
             }
         }
         ExprKind::WithClause { expr, filter } => {
@@ -31230,6 +31274,95 @@ fn resolve_name_class(
     }
 }
 
+/// §23.9, §23.8.1, §27.6: what the binding of a name's head says to the
+/// undeclared-name checks.
+enum HeadVerdict {
+    /// Not bound (a synthesized or unanalysed position), or the head of an
+    /// upward path: the name tables decide.
+    Unbound,
+    Declared,
+    /// A bare call nothing declares lexically: legal if found upward.
+    UpwardCall,
+    Undeclared,
+}
+
+/// Where a single-segment head is written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadRole {
+    Value,
+    Callee,
+    /// The base of a member select, `a.b` or `a[i].b`.
+    Path,
+}
+
+fn head_verdict(h: &HierarchicalIdentifier, role: HeadRole) -> HeadVerdict {
+    if h.root.is_some() || h.path.is_empty() {
+        return HeadVerdict::Declared;
+    }
+    if h.bound.is_unset() {
+        return HeadVerdict::Unbound;
+    }
+    if !h.bound.is_upward() {
+        return HeadVerdict::Declared;
+    }
+    let path = h.path.len() > 1 || role == HeadRole::Path;
+    match role {
+        // §27.6: an implicit block name is a name of its own scope only.
+        _ if path && is_implicit_block_name(&h.path[0].name.name) => HeadVerdict::Undeclared,
+        // §23.8: a hierarchical path, for the hierarchical-reference lint.
+        _ if h.path.len() > 1 => HeadVerdict::Declared,
+        HeadRole::Path => HeadVerdict::Unbound,
+        HeadRole::Callee => HeadVerdict::UpwardCall,
+        HeadRole::Value => HeadVerdict::Undeclared,
+    }
+}
+
+/// The role of each head `for_each_sub_expr` visits, which sees a call or
+/// a member select before its callee or base.
+struct HeadRoles {
+    callee: *const Expression,
+    base: *const Expression,
+}
+
+impl HeadRoles {
+    fn new() -> Self {
+        HeadRoles {
+            callee: std::ptr::null(),
+            base: std::ptr::null(),
+        }
+    }
+
+    fn note(&mut self, x: &Expression) {
+        match &x.kind {
+            ExprKind::Call { func, .. } => self.callee = &**func,
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut b = &**expr;
+                while let ExprKind::Index { expr, .. } = &b.kind {
+                    b = expr;
+                }
+                self.base = b;
+            }
+            _ => {}
+        }
+    }
+
+    fn role(&self, x: &Expression) -> HeadRole {
+        if std::ptr::eq(x, self.callee) {
+            HeadRole::Callee
+        } else if std::ptr::eq(x, self.base) {
+            HeadRole::Path
+        } else {
+            HeadRole::Value
+        }
+    }
+}
+
+/// §27.6 `genblk<n>`.
+fn is_implicit_block_name(name: &str) -> bool {
+    name.strip_prefix("genblk")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
 /// An identifier or call in an inlined sub-instance body that NOTHING in the
 /// design declares is an error — the reference tooling rejects it at
 /// elaboration. The per-module validator only ever saw the TOP module's
@@ -31238,11 +31371,11 @@ fn resolve_name_class(
 /// it simply never ran (assertions silently vanished), and a typo'd signal in
 /// a child read x for the whole run.
 ///
-/// The bar is deliberately "declared nowhere": a bare name is accepted if the
-/// instance's own module declares it (`local_names`, ports, interfaces), the
-/// body declares it, any elaborated table knows it under any scope, or any
-/// definition in the design declares it. Scope resolution is the runtime's
-/// job; this only catches names that cannot resolve anywhere.
+/// §23.9, §23.8.1: the binding of a head decides (`head_verdict`). A head the
+/// binder did not walk, or an upward path head, keeps the "declared nowhere"
+/// bar: a bare name is accepted if the instance's own module declares it
+/// (`local_names`, ports, interfaces), the body declares it, any elaborated
+/// table knows it under any scope, or any definition in the design declares it.
 fn validate_inlined_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
@@ -31339,56 +31472,79 @@ fn validate_inlined_bodies(
     };
     // One check per distinct source body: sibling instances share the Rc.
     let mut seen: HashSet<usize> = HashSet::default();
+    // Per body, its calls the binding leaves upward, checked per instance.
+    let mut upward_calls: HashMap<usize, Vec<(String, Span)>> = HashMap::default();
     let mut first: Option<(String, Span, String)> = None;
     let mut check_body =
         |source_ptr: usize,
          ctx: &RewriteCtx,
          locals: &HashSet<String>,
          visit: &mut dyn FnMut(&mut dyn FnMut(&Expression))| {
-            if first.is_some() || !seen.insert(source_ptr) {
+            if first.is_some() {
                 return;
             }
-            let mut check_expr = |e: &Expression| {
-                for_each_sub_expr(e, &mut |x| {
-                    if first.is_some() {
-                        return;
-                    }
-                    let h = match &x.kind {
-                        ExprKind::Ident(h) => h,
-                        ExprKind::Call { func, .. } => match &func.kind {
-                            ExprKind::Ident(h) => h,
-                            _ => return,
-                        },
-                        _ => return,
-                    };
-                    if h.root.is_some() || h.path.len() != 1 {
-                        return;
-                    }
-                    let raw = h.path[0].name.name.as_str();
-                    let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
-                    if name.starts_with('$')
-                        || name.contains('.')
-                        || matches!(
-                            name,
-                            "new" | "super" | "this" | "randomize" | "std" | "process" | "null"
-                        )
-                        || is_builtin_type_keyword(name)
-                        || (name.starts_with("genblk")
-                            && name.len() > 6
-                            && name[6..].chars().all(|c| c.is_ascii_digit()))
-                        || ctx.local_names.contains(name)
-                        || ctx.port_map.contains_key(name)
-                        || ctx.interface_map.contains_key(name)
-                        || ctx.type_binds.contains_key(name)
-                        || locals.contains(name)
-                        || known.contains(name)
-                    {
-                        return;
-                    }
-                    first = Some((name.to_string(), x.span, ctx.owner.clone()));
-                });
-            };
-            visit(&mut check_expr);
+            if seen.insert(source_ptr) {
+                let calls = upward_calls.entry(source_ptr).or_default();
+                let mut roles = HeadRoles::new();
+                let mut check_expr = |e: &Expression| {
+                    for_each_sub_expr(e, &mut |x| {
+                        if first.is_some() {
+                            return;
+                        }
+                        roles.note(x);
+                        let ExprKind::Ident(h) = &x.kind else { return };
+                        let Some(head) = h.path.first() else { return };
+                        let raw = head.name.name.as_str();
+                        let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+                        if name.starts_with('$')
+                            || name.contains('.')
+                            || matches!(
+                                name,
+                                "new" | "super" | "this" | "randomize" | "std" | "process" | "null"
+                            )
+                            || is_builtin_type_keyword(name)
+                        {
+                            return;
+                        }
+                        match head_verdict(h, roles.role(x)) {
+                            HeadVerdict::Declared => return,
+                            HeadVerdict::UpwardCall => {
+                                calls.push((name.to_string(), x.span));
+                                return;
+                            }
+                            HeadVerdict::Undeclared => {
+                                first = Some((name.to_string(), x.span, ctx.owner.clone()));
+                                return;
+                            }
+                            HeadVerdict::Unbound => {}
+                        }
+                        if h.root.is_some()
+                            || h.path.len() != 1
+                            || ctx.local_names.contains(name)
+                            || ctx.port_map.contains_key(name)
+                            || ctx.interface_map.contains_key(name)
+                            || ctx.type_binds.contains_key(name)
+                            || locals.contains(name)
+                            || known.contains(name)
+                        {
+                            return;
+                        }
+                        first = Some((name.to_string(), x.span, ctx.owner.clone()));
+                    });
+                };
+                visit(&mut check_expr);
+            }
+            // §23.8.1: each instance searches upward from where it sits.
+            let inst = ctx.prefix.trim_end_matches('.');
+            let upward = ctx.upward.borrow();
+            if let Some((name, span)) = upward_calls
+                .get(&source_ptr)
+                .into_iter()
+                .flatten()
+                .find(|(n, _)| upward.find_subroutine(inst, n).is_none())
+            {
+                first.get_or_insert((name.clone(), *span, ctx.owner.clone()));
+            }
         };
     for p in &elab.pending_always {
         let mut locals = HashSet::default();
@@ -31724,11 +31880,16 @@ fn validate_subroutine_bodies(
         if !class.is_empty() && !bases_declared(class) {
             continue;
         }
+        let upward = |n: &str| {
+            elab.upward_scopes
+                .borrow()
+                .every_instance_finds(body.owner, n)
+        };
         let found = if class.is_empty() {
-            first_undeclared_in_subroutine(body, known, None)
+            first_undeclared_in_subroutine(body, known, None, &upward)
         } else {
             let scope = scopes.entry(class).or_insert_with(|| class_scope(class));
-            first_undeclared_in_subroutine(body, outside_classes, Some(scope))
+            first_undeclared_in_subroutine(body, outside_classes, Some(scope), &upward)
         };
         if let Some((name, span)) = found {
             return Err(span_error_of(
@@ -31742,13 +31903,16 @@ fn validate_subroutine_bodies(
     Ok(())
 }
 
-/// The first bare identifier (or called name) in a subroutine body that is
+/// The first bare identifier (or called name) in a subroutine body that the
+/// binding leaves undeclared, or, where the binder did not walk, that is
 /// neither local to it — a formal, the function's own name, a body-local
 /// declaration, a `with` iterator — nor declared anywhere in the design.
+/// `upward` says whether a bare call the binding leaves upward is found.
 fn first_undeclared_in_subroutine(
     body: &SubroutineBody,
     known: &HashSet<String>,
     class_scope: Option<&HashSet<String>>,
+    upward: &dyn Fn(&str) -> bool,
 ) -> Option<(String, Span)> {
     let mut locals: HashSet<String> = HashSet::default();
     locals.insert(body.name.to_string());
@@ -31762,31 +31926,35 @@ fn first_undeclared_in_subroutine(
         add_construct_bound_names(s, &mut locals);
     }
     let mut first: Option<(String, Span)> = None;
+    let mut roles = HeadRoles::new();
     for s in body.items {
         for_each_stmt_expr(s, &mut |e| {
             for_each_sub_expr(e, &mut |x| {
                 if first.is_some() {
                     return;
                 }
-                let h = match &x.kind {
-                    ExprKind::Ident(h) => h,
-                    ExprKind::Call { func, .. } => match &func.kind {
-                        ExprKind::Ident(h) => h,
-                        _ => return,
-                    },
-                    _ => return,
-                };
-                if h.root.is_some() || h.path.len() != 1 {
+                roles.note(x);
+                let ExprKind::Ident(h) = &x.kind else { return };
+                let Some(head) = h.path.first() else { return };
+                let raw = head.name.name.as_str();
+                let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+                if name.starts_with('$') || name.contains('.') || is_builtin_bare_name(name) {
                     return;
                 }
-                let raw = h.path[0].name.name.as_str();
-                let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
-                if name.starts_with('$')
-                    || name.contains('.')
+                match head_verdict(h, roles.role(x)) {
+                    HeadVerdict::Declared => return,
+                    HeadVerdict::UpwardCall if upward(name) => return,
+                    HeadVerdict::UpwardCall | HeadVerdict::Undeclared => {
+                        first = Some((name.to_string(), x.span));
+                        return;
+                    }
+                    HeadVerdict::Unbound => {}
+                }
+                if h.root.is_some()
+                    || h.path.len() != 1
                     || locals.contains(name)
                     || known.contains(name)
                     || class_scope.is_some_and(|c| c.contains(name))
-                    || is_builtin_bare_name(name)
                 {
                     return;
                 }
@@ -31802,8 +31970,8 @@ fn first_undeclared_in_subroutine(
 
 /// Names legal as a bare identifier without any declaration: `this`/`super`,
 /// the built-in `std` package and `process` class, the §18 built-in class
-/// methods callable unqualified inside a method, the implicit `genblk<N>`
-/// generate-scope names, and built-in type keywords (`$bits(int)`).
+/// methods callable unqualified inside a method, and built-in type keywords
+/// (`$bits(int)`).
 fn is_builtin_bare_name(name: &str) -> bool {
     matches!(
         name,
@@ -31836,9 +32004,7 @@ fn is_builtin_bare_name(name: &str) -> bool {
             | "string"
             | "chandle"
             | "void"
-    ) || (name.starts_with("genblk")
-        && name.len() > 6
-        && name[6..].chars().all(|c| c.is_ascii_digit()))
+    )
 }
 
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.

@@ -69,6 +69,9 @@ pub struct Parser {
     /// last (see `lets.rs`), and how many lets they hold in all.
     pub(super) let_scopes: Vec<lets::LetScope>,
     pub(super) let_live: usize,
+    /// §18.17.7: the productions of the randsequence rule being parsed. A
+    /// code block of the rule reads each as an implicit variable.
+    pub(super) rs_values: Vec<String>,
 }
 
 impl Parser {
@@ -143,6 +146,7 @@ impl Parser {
             port_exprs: Vec::new(),
             let_scopes: Vec::new(),
             let_live: 0,
+            rs_values: Vec::new(),
         }
     }
 

@@ -2529,6 +2529,7 @@ impl Parser {
 
     fn parse_rs_seq(&mut self) -> RsSeq {
         let mut items = Vec::new();
+        let mark = self.rs_values.len();
         loop {
             match self.current_kind() {
                 TokenKind::BitOr
@@ -2543,8 +2544,12 @@ impl Parser {
                 _ => {}
             }
             let item = self.parse_rs_prod();
+            if let RsProd::Ref(name, _) = &item {
+                self.rs_values.push(name.clone());
+            }
             items.push(item);
         }
+        self.rs_values.truncate(mark);
         RsSeq { items }
     }
 

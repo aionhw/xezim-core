@@ -1733,6 +1733,11 @@ impl Parser {
                         spec_text = Some(text);
                     }
                 }
+                // §18.17.7: a production's value variable has no lexical target.
+                let bound = match self.rs_values.contains(&id.name) {
+                    true => crate::ast::binding::Bound::NO_TARGET,
+                    false => crate::ast::binding::Bound::UNSET,
+                };
                 let hier = HierarchicalIdentifier {
                     root: None,
                     path: vec![HierPathSegment {
@@ -1742,7 +1747,7 @@ impl Parser {
                     span: self.span_from(start),
                     cached_signal_id: crate::ast::cache::SignalCache::new(None),
                     cached_resolved_name: crate::ast::cache::NameCache::new(),
-                    bound: crate::ast::binding::Bound::UNSET,
+                    bound,
                 };
                 let mut expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 if let Some(text) = spec_text {
