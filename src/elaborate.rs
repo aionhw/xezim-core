@@ -32954,9 +32954,9 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
 }
 
 /// The declarations a generate rename applies to: data, nets, parameters,
-/// instances and subroutines (§23.9, §27.5: a generate block's declarations
-/// belong to its scope, so `g_a.look` and `g_b.look` are two tasks). `visit`
-/// gets the name, the declaration's own id, and its kind.
+/// instances, subroutines and typedefs (§23.9, §27.5: a generate block's
+/// declarations belong to its scope, so `g_a.look` and `g_b.look` are two
+/// tasks). `visit` gets the name, the declaration's own id, and its kind.
 fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, RenamedKind)) {
     for item in items {
         match item {
@@ -33002,6 +33002,11 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
             ModuleItem::SequenceDeclaration(p) => {
                 visit(&p.name.name, Bound::UNSET, RenamedKind::Other)
             }
+            // §6.18: typedefs, by name. A forward declaration keeps its
+            // name: it may name a class, and classes keep theirs.
+            ModuleItem::TypedefDeclaration(t) if !matches!(t.data_type, DataType::Void(_)) => {
+                visit(&t.name.name, Bound::UNSET, RenamedKind::Type)
+            }
             // Nested generate constructs declare their own scope; we recurse
             // and rename names declared in the unconditional bodies, since a
             // nested generate-if may declare a name that the parent's other
@@ -33035,6 +33040,7 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
 enum RenamedKind {
     Subroutine,
     Param,
+    Type,
     Other,
 }
 
@@ -33045,10 +33051,14 @@ struct GenRenameGate {
     /// The renamed declarations.
     renamed: HashSet<DeclId>,
     names: HashSet<String>,
-    /// The renamed subroutines' names: all a constraint takes (§18.5).
-    subroutines: HashSet<String>,
-    /// The renamed parameters' names: all a process local's type takes.
-    params: HashSet<String>,
+    /// The renamed subroutines' and typedefs' names: all a constraint takes
+    /// (§18.5).
+    constraint: HashSet<String>,
+    /// The renamed parameters' and typedefs' names: all a process local's
+    /// type takes.
+    local_type: HashSet<String>,
+    /// The renamed typedefs' names (§6.18).
+    types: HashSet<String>,
     /// Names with an unbound renamed declaration.
     ungated: HashSet<String>,
 }
@@ -33057,8 +33067,13 @@ impl GenRenameGate {
     fn add(&mut self, name: &str, stamp: Bound, kind: RenamedKind) {
         self.names.insert(name.to_string());
         match kind {
-            RenamedKind::Subroutine => self.subroutines.insert(name.to_string()),
-            RenamedKind::Param => self.params.insert(name.to_string()),
+            RenamedKind::Subroutine => self.constraint.insert(name.to_string()),
+            RenamedKind::Param => self.local_type.insert(name.to_string()),
+            RenamedKind::Type => {
+                self.types.insert(name.to_string());
+                self.constraint.insert(name.to_string());
+                self.local_type.insert(name.to_string())
+            }
             RenamedKind::Other => false,
         };
         match stamp.as_decl() {
@@ -33579,6 +33594,19 @@ fn rename_item_decls(
                 rename_subroutine_body(&td.items, &td.ports, port_map, local_names, interface_map);
             ModuleItem::TaskDeclaration(new_td)
         }
+        // §6.18: a block's typedef is the block's (`a.t`); its type reads the
+        // block's parameters and types.
+        ModuleItem::TypedefDeclaration(td) => {
+            let mut new_td = td.clone();
+            if rename_set.contains(&td.name.name) {
+                new_td.name.name = rename.apply(&td.name.name);
+            }
+            new_td.data_type =
+                rewrite_data_type_genvar(&td.data_type, port_map, local_names, interface_map);
+            new_td.dimensions =
+                rewrite_unpacked_dims_genvar(&td.dimensions, port_map, local_names, interface_map);
+            ModuleItem::TypedefDeclaration(new_td)
+        }
         ModuleItem::ContinuousAssign(ca) => {
             let mut new_ca = ca.clone();
             new_ca.assignments = ca
@@ -33735,12 +33763,26 @@ fn gen_rename_part(
     })
 }
 
-/// The references of `port_map` a constraint takes: the block's subroutines.
-/// The constraint solver resolves data by its bare name (§18.5).
+/// §6.18: the key the generate rename in progress gives the type `name`,
+/// when `port_map` maps it.
+fn gen_renamed_type(name: &str, port_map: &HashMap<String, Expression>) -> Option<String> {
+    let renamed = GEN_RENAME_TLS.with(|g| {
+        g.borrow()
+            .last()
+            .is_some_and(|gate| gate.types.contains(name))
+    });
+    port_map
+        .get(name)
+        .filter(|_| renamed)
+        .and_then(whole_net_ident_name)
+}
+
+/// The references of `port_map` a constraint takes: the block's subroutines
+/// and types. The constraint solver resolves data by its bare name (§18.5).
 fn gen_rename_constraint_map(
     port_map: &HashMap<String, Expression>,
 ) -> HashMap<String, Expression> {
-    gen_rename_part(port_map, |g| &g.subroutines)
+    gen_rename_part(port_map, |g| &g.constraint)
 }
 
 /// §23.9: a final block (§9.2.3), gate (§28), property or sequence (§16),
@@ -33896,6 +33938,13 @@ fn rename_class_refs(
     };
     c.params.iter_mut().for_each(param);
     if let Some(e) = &mut c.extends {
+        let head = match e.scopes.first_mut() {
+            Some(scope) => &mut scope.name,
+            None => &mut e.name.name,
+        };
+        if let Some(key) = gen_renamed_type(head, map) {
+            *head = key;
+        }
         for a in &mut e.args {
             match a {
                 ParamValue::Expr(x) => *x = rx(x),
@@ -33973,6 +34022,7 @@ fn rename_subroutine_body(
 ) -> crate::ast::shared_vec::SharedVec<Statement> {
     let mut bound: Vec<&str> = ports.iter().map(|p| p.name.name.as_str()).collect();
     bound.extend(stmt_list_declared_names(items));
+    bound.extend(stmt_list_typedef_names(items));
     with_shadowed(&bound, port_map, local_names, |ports, locals| {
         items
             .iter()
@@ -34149,21 +34199,44 @@ fn rewrite_data_type_scoped(
             dimensions,
             type_args,
             span,
-        } => DataType::TypeReference {
-            name: name.clone(),
-            dimensions: rewrite_packed_dims_scoped(
-                dimensions,
-                prefix,
-                port_map,
-                local_names,
-                interface_map,
-            ),
-            type_args: type_args
-                .iter()
-                .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map))
-                .collect(),
-            span: *span,
-        },
+        } => {
+            let mut name = name.clone();
+            let head = match name.scopes.first_mut() {
+                Some(scope) => &mut scope.name.name,
+                None => &mut name.name.name,
+            };
+            if let Some(key) = gen_renamed_type(head, port_map) {
+                *head = key;
+            }
+            DataType::TypeReference {
+                name,
+                dimensions: rewrite_packed_dims_scoped(
+                    dimensions,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                ),
+                type_args: type_args
+                    .iter()
+                    .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map))
+                    .collect(),
+                span: *span,
+            }
+        }
+        DataType::Enum(e) => {
+            let mut e = e.clone();
+            if let Some(b) = &e.base_type {
+                e.base_type = Some(Box::new(rewrite_data_type_scoped(
+                    b,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                )));
+            }
+            DataType::Enum(e)
+        }
         DataType::Implicit {
             signing,
             dimensions,
@@ -36111,13 +36184,6 @@ fn prepare_module_items(
     }
     note_prep_lookup(false, cache_key.as_ref().map_or(0, |(_, bytes)| *bytes));
 
-    let mut local_typedefs = std::collections::HashSet::default();
-    for item in source_def.items() {
-        if let ModuleItem::TypedefDeclaration(td) = item {
-            local_typedefs.insert(td.name.name.clone());
-        }
-    }
-
     let mut interface_ports = std::collections::HashSet::default();
     if let PortList::Ansi(ports) = source_def.ports() {
         for port in ports {
@@ -36130,6 +36196,14 @@ fn prepare_module_items(
     }
 
     let mut effective_items = collect_effective_items(source_def.items(), local_params);
+    // §6.18: a generate block's typedef is the module's under its block key.
+    let local_typedefs: std::collections::HashSet<String> = effective_items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::TypedefDeclaration(td) => Some(td.name.name.clone()),
+            _ => None,
+        })
+        .collect();
 
     // Bind this instance's parameters into statement-local declarations while
     // they are still resolvable by their bare names — after elaboration only
@@ -43171,29 +43245,12 @@ fn inline_module_items(
                         // §8.3, §23.9: a class of a generate block reads the
                         // block's data by its key, this instance's (`u.a.k`).
                         let mut bindings = class_bindings.clone();
-                        let mut visit = |n: &str| {
-                            if n.contains('.') {
+                        visit_renamed_decls(&prepared_sub.effective_items, &mut |n, _, kind| {
+                            if n.contains('.') && kind != RenamedKind::Subroutine {
                                 let key = make_ident_expr(&cat2(&inst_prefix, n));
                                 bindings.entry(n.to_string()).or_insert(key);
                             }
-                        };
-                        for it in prepared_sub.effective_items.iter() {
-                            match it {
-                                ModuleItem::DataDeclaration(dd) => {
-                                    dd.declarators.iter().for_each(|d| visit(&d.name.name))
-                                }
-                                ModuleItem::NetDeclaration(nd) => {
-                                    nd.declarators.iter().for_each(|d| visit(&d.name.name))
-                                }
-                                ModuleItem::ParameterDeclaration(pd)
-                                | ModuleItem::LocalparamDeclaration(pd) => {
-                                    if let ParameterKind::Data { assignments, .. } = &pd.kind {
-                                        assignments.iter().for_each(|a| visit(&a.name.name));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                        });
                         let mut scoped = module_class_scope::class(cd, &inst_prefix, &bindings);
                         for item in &mut scoped.items {
                             if let ClassItem::Method(method) = item {
@@ -50772,6 +50829,43 @@ fn stmt_list_declared_names(stmts: &[Statement]) -> Vec<&str> {
     out
 }
 
+/// §6.21, §23.9: what a process local's type and dimensions take of the
+/// generate rename in progress: the block's parameters and types.
+fn gen_rename_local_map(
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+) -> HashMap<String, Expression> {
+    match prefix.is_empty() {
+        true => gen_rename_part(port_map, |g| &g.local_type),
+        false => HashMap::default(),
+    }
+}
+
+/// A process local's type: class and type keys of the instance, then the
+/// generate rename's part `renamed` (`gen_rename_local_map`).
+fn rewrite_local_type(
+    dt: &DataType,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    renamed: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> DataType {
+    let dt = module_class_scope::data_type(dt, prefix, port_map);
+    match renamed.is_empty() {
+        true => dt,
+        false => rewrite_data_type_genvar(&dt, renamed, local_names, interface_map),
+    }
+}
+
+/// §6.18, §23.9: the types a statement list declares.
+fn stmt_list_typedef_names(stmts: &[Statement]) -> impl Iterator<Item = &str> {
+    stmts.iter().filter_map(|st| match &st.kind {
+        StatementKind::Typedef(td) => Some(td.name.name.as_str()),
+        _ => None,
+    })
+}
+
 /// Rewrite a statement list where each `VarDecl` shadows the module names
 /// for the statements AFTER it (its own initialiser still sees the outer
 /// set).
@@ -50801,6 +50895,14 @@ fn rewrite_stmt_list_scoped(
         let names = cur.as_ref().unwrap_or(local_names);
         let ports = cur_ports.as_ref().unwrap_or(port_map);
         out.push(rewrite_stmt(st, prefix, ports, names, interface_map));
+        // A local typedef hides a block's type of its name for the rest.
+        if let StatementKind::Typedef(td) = &st.kind {
+            if prefix.is_empty() && gen_renamed_type(&td.name.name, ports).is_some() {
+                cur_ports
+                    .get_or_insert_with(|| port_map.clone())
+                    .remove(&td.name.name);
+            }
+        }
         if let StatementKind::VarDecl { declarators, .. } = &st.kind {
             if let Some(reduced) =
                 without_declared(names, declarators.iter().map(|d| d.name.name.as_str()))
@@ -50944,6 +51046,7 @@ fn rewrite_stmt(
                     _ => None,
                 })
                 .collect();
+            let types = gen_rename_local_map(prefix, port_map);
             with_shadowed(&bound, port_map, local_names, |inner_ports, inner| {
                 StatementKind::For {
                     init: init
@@ -50954,7 +51057,14 @@ fn rewrite_stmt(
                                 name,
                                 init,
                             } => ForInit::VarDecl {
-                                data_type: data_type.clone(),
+                                data_type: rewrite_local_type(
+                                    data_type,
+                                    prefix,
+                                    port_map,
+                                    &types,
+                                    local_names,
+                                    interface_map,
+                                ),
                                 name: name.clone(),
                                 init: rewrite_expr(
                                     init,
@@ -51090,23 +51200,24 @@ fn rewrite_stmt(
         }
         // Declared names stay untouched (the declaration introduces them).
         // §6.21, §23.9: in a generate rename the type and dimensions read the
-        // block's parameters; elsewhere only the initializer reads outer names.
+        // block's parameters and types; elsewhere only the initializer reads
+        // outer names.
         // Block data there keeps its bare name, which the instance resolves.
         StatementKind::VarDecl {
             data_type,
             lifetime,
             declarators,
         } => {
-            let params = match prefix.is_empty() {
-                true => gen_rename_part(port_map, |g| &g.params),
-                false => HashMap::default(),
-            };
+            let params = gen_rename_local_map(prefix, port_map);
             let renaming = !params.is_empty();
-            let mut data_type = module_class_scope::data_type(data_type, prefix, port_map);
-            if renaming {
-                data_type =
-                    rewrite_data_type_genvar(&data_type, &params, local_names, interface_map);
-            }
+            let data_type = rewrite_local_type(
+                data_type,
+                prefix,
+                port_map,
+                &params,
+                local_names,
+                interface_map,
+            );
             StatementKind::VarDecl {
                 data_type,
                 lifetime: *lifetime,
@@ -51132,6 +51243,22 @@ fn rewrite_stmt(
                     })
                     .collect(),
             }
+        }
+        // A process-local typedef's type reads as a local's does.
+        StatementKind::Typedef(td) if prefix.is_empty() => {
+            let types = gen_rename_local_map(prefix, port_map);
+            let mut td = td.clone();
+            if !types.is_empty() {
+                td.data_type =
+                    rewrite_data_type_genvar(&td.data_type, &types, local_names, interface_map);
+                td.dimensions = rewrite_unpacked_dims_genvar(
+                    &td.dimensions,
+                    &types,
+                    local_names,
+                    interface_map,
+                );
+            }
+            StatementKind::Typedef(td)
         }
         StatementKind::RandCase { items } => StatementKind::RandCase {
             items: items

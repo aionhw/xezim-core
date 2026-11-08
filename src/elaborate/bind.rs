@@ -353,18 +353,21 @@ const UNVISITED: &[&str] = &[
     "tagged",
     "shallow-copy",
     "specify",
-    "typedef",
     "event-name",
     "wait-order",
 ];
 
 /// Positions the rename gives part of a block's names: a declared constraint
-/// its subroutines (§18.5), a process local's type its parameters (§6.21).
+/// its subroutines and types (§18.5), a process local's type its parameters
+/// and types (§6.21).
 /// The rest there is group B.
 fn partly_renamed(pos: &str, target: Option<DeclKind>) -> bool {
     match pos {
-        "constraint" => !matches!(target, Some(DeclKind::Function | DeclKind::Task)),
-        "local-dim" => target != Some(DeclKind::Param),
+        "constraint" => !matches!(
+            target,
+            Some(DeclKind::Function | DeclKind::Task | DeclKind::Typedef)
+        ),
+        "local-dim" => !matches!(target, Some(DeclKind::Param | DeclKind::Typedef)),
         _ => false,
     }
 }
@@ -1458,7 +1461,7 @@ impl Binder<'_> {
                 }
             }
             StatementKind::Typedef(t) => {
-                self.with_pos("typedef", |b| {
+                self.with_pos("local-dim", |b| {
                     b.data_type(&mut t.data_type);
                     b.unpacked(&mut t.dimensions);
                 });
@@ -2115,8 +2118,8 @@ impl AuditLine {
 }
 
 /// The name the rename gives a declaration, when it renames that kind: a
-/// block's subroutines, data, nets, parameters, instances, properties and
-/// sequences (§27.5, §27.6).
+/// block's subroutines, data, nets, parameters, instances, properties,
+/// sequences and typedefs (§27.5, §27.6).
 fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> Option<String> {
     let key = match kind {
         DeclKind::Function
@@ -2126,7 +2129,8 @@ fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> 
         | DeclKind::Param
         | DeclKind::Instance
         | DeclKind::Property
-        | DeclKind::Sequence => tree.key(scope, name, &[]),
+        | DeclKind::Sequence
+        | DeclKind::Typedef => tree.key(scope, name, &[]),
         _ => return None,
     };
     (key != name).then_some(key)
