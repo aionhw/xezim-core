@@ -48,24 +48,26 @@ impl Bound {
     pub const NO_TARGET: Bound = Bound(1);
     /// Nothing declares it lexically: resolved through the hierarchy (§23.8.1).
     pub const UPWARD: Bound = Bound(2);
+    /// §27.4: a generate loop's genvar, a localparam of each iteration.
+    pub const GENVAR: Bound = Bound(3);
 
     /// The tag of a §6.10 implicit net that a generate block declares.
     const BLOCK_IMPLICIT_NET: u32 = 1 << 31;
 
     pub fn decl(d: DeclId) -> Bound {
-        Bound(d.0 + 3)
+        Bound(d.0 + 4)
     }
 
     /// §6.10, §27: a declaration that is an implicit net of a generate
     /// block, which the block's rename keys like its declared nets.
     pub fn block_implicit_net(d: DeclId) -> Bound {
-        Bound((d.0 + 3) | Self::BLOCK_IMPLICIT_NET)
+        Bound((d.0 + 4) | Self::BLOCK_IMPLICIT_NET)
     }
 
     /// The declaration in this definition's tree.
     pub fn as_decl(self) -> Option<DeclId> {
         (self.0 & !Self::BLOCK_IMPLICIT_NET)
-            .checked_sub(3)
+            .checked_sub(4)
             .map(DeclId)
     }
 
