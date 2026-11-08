@@ -129,7 +129,7 @@ fn a_generate_loop_scope_is_indexed_and_its_variable_is_not_bound() {
     let l = audit(src);
     check(at(&l, "x", 0), "Decl(top.g[@], Data)", Some("g[@].x"));
     check(at(&l, "f", 0), "Decl(top.g[@], Function)", Some("g[@].f"));
-    assert_eq!(at(&l, "i", 0).outcome, Outcome::None(Hide::Loop));
+    assert_eq!(at(&l, "i", 0).outcome, Outcome::None(Hide::Genvar));
 }
 
 #[test]
@@ -306,6 +306,22 @@ fn a_for_variable_hides_a_block_declaration_in_the_loop() {
         assert_eq!(at(&l, "i", nth).outcome, Outcome::None(Hide::Loop));
         check(at(&l, "i", nth), "none", None);
     }
+}
+
+#[test]
+fn a_class_member_and_a_property_formal_hide_the_generate_loops_genvar() {
+    // §8.3, §16.8, §27.4.
+    let src = "module top; for (genvar i = 0; i < 2; i++) begin : g
+        class C; int i; function int f(); return i; endfunction endclass
+        property p(int i); i; endproperty
+        initial $display(i);
+      end endmodule";
+    let l = audit(src);
+    let why = |nth| at(&l, "i", nth).outcome;
+    let n = l.iter().filter(|m| m.name == "i").count();
+    assert_eq!(why(n - 3), Outcome::None(Hide::Member));
+    assert_eq!(why(n - 2), Outcome::None(Hide::Formal));
+    assert_eq!(why(n - 1), Outcome::None(Hide::Genvar));
 }
 
 #[test]
@@ -1587,7 +1603,7 @@ fn a_name_found_another_way_is_not_an_implicit_net() {
       endmodule";
     let l = audit(src);
     assert_eq!(why(at(&l, "K", 0)), Hide::Import);
-    assert_eq!(why(at(&l, "j", 2)), Hide::Loop);
+    assert_eq!(why(at(&l, "j", 2)), Hide::Genvar);
     assert_eq!(at(&l, "j", 2).target, None);
 }
 
