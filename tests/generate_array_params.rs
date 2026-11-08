@@ -149,9 +149,9 @@ fn data_array_sized_by_a_module_level_parameter() {
         endmodule",
     );
     assert_eq!(design.arrays.get("g.r"), design.arrays.get("m"));
-    assert_eq!(design.arrays.get("s"), design.arrays.get("m"));
+    assert_eq!(design.arrays.get("genblk2.s"), design.arrays.get("m"));
     assert!(!design.associative_arrays.contains_key("g.r"));
-    assert!(!design.associative_arrays.contains_key("s"));
+    assert!(!design.associative_arrays.contains_key("genblk2.s"));
 }
 
 #[test]
