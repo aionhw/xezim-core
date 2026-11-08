@@ -163,6 +163,7 @@ impl Parser {
                 None
             };
             assignments.push(ParamAssignment {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -474,6 +475,7 @@ impl Parser {
                 None
             };
             decls.push(VarDeclarator {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -1552,6 +1554,7 @@ impl Parser {
                         .declarators
                         .into_iter()
                         .map(|d| VarDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             // §6.6: an undriven net holds z (a supply net its
                             // constant), where a package variable would start
                             // at its type's default.

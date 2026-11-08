@@ -1517,23 +1517,31 @@ impl UpwardScopes {
 
     /// §23.8.1 steps b) and c): the subroutine a bare `name` called in
     /// instance `inst` names, from the scope of the instantiation up through
-    /// each enclosing instance. `None` when the first declaration of `name`
-    /// found is not a function or task, or none is. §26.3: imports of an
+    /// each enclosing instance. The search is for a scope named `name`, so a
+    /// variable of that name does not end it. `None` when a DPI import is
+    /// found first (keyed globally), or nothing is. §26.3: imports of an
     /// enclosing scope are not visible to it.
     fn subroutine_key(&self, inst: &str, name: &str) -> Option<String> {
         use crate::ast::binding::DeclKind;
         let mut at = inst;
         while let Some(up) = self.parents.get(at) {
-            if let Some(d) = up.tree.lookup(up.scope, name) {
-                let decl = &up.tree.decls[d.0 as usize];
-                if !matches!(decl.kind, DeclKind::Function | DeclKind::Task) {
-                    return None;
+            let mut scope = Some(up.scope);
+            while let Some(s) = scope {
+                let sc = &up.tree.scopes[s.0 as usize];
+                if let Some(d) = sc.by_name.get(name) {
+                    match up.tree.decls[d.0 as usize].kind {
+                        DeclKind::Function | DeclKind::Task => {
+                            let key = up.tree.key(s, name, &up.indices);
+                            return Some(match up.path.is_empty() {
+                                true => key,
+                                false => format!("{}.{key}", up.path),
+                            });
+                        }
+                        DeclKind::DpiImport => return None,
+                        _ => {}
+                    }
                 }
-                let key = up.tree.key(decl.scope, name, &up.indices);
-                return Some(match up.path.is_empty() {
-                    true => key,
-                    false => format!("{}.{key}", up.path),
-                });
+                scope = sc.parent;
             }
             at = &up.path;
         }
@@ -32942,50 +32950,57 @@ fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Ve
 /// that 20 copies of `logic valid_q;` don't collapse into a single flat
 /// signal. Nested generate bodies are included (see the comments inside).
 fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
-    visit_renamed_decls(items, &mut |n, _| names.push(n.to_string()));
+    visit_renamed_decls(items, &mut |n, _, _| names.push(n.to_string()));
 }
 
 /// The declarations a generate rename applies to: data, nets, parameters,
 /// instances and subroutines (§23.9, §27.5: a generate block's declarations
 /// belong to its scope, so `g_a.look` and `g_b.look` are two tasks). `visit`
-/// gets the name, and a subroutine's own id.
-fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Option<Bound>)) {
+/// gets the name, the declaration's own id, and its kind.
+fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, RenamedKind)) {
     for item in items {
         match item {
             ModuleItem::DataDeclaration(dd) => {
                 for d in &dd.declarators {
-                    visit(&d.name.name, None);
+                    visit(&d.name.name, d.decl, RenamedKind::Other);
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
                 for d in &nd.declarators {
-                    visit(&d.name.name, None);
+                    visit(&d.name.name, d.decl, RenamedKind::Other);
                 }
             }
             ModuleItem::PortDeclaration(pd) => {
                 for d in &pd.declarators {
-                    visit(&d.name.name, None);
+                    visit(&d.name.name, d.decl, RenamedKind::Other);
                 }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                 if let ParameterKind::Data { assignments, .. } = &pd.kind {
                     for a in assignments {
-                        visit(&a.name.name, None);
+                        visit(&a.name.name, a.decl, RenamedKind::Param);
                     }
                 }
             }
             ModuleItem::ModuleInstantiation(mi) => {
                 for hi in &mi.instances {
-                    visit(&hi.name.name, None);
+                    visit(&hi.name.name, hi.decl, RenamedKind::Other);
                 }
             }
             // An out-of-block class method (`function C::m`) is the class's,
             // not the block's.
             ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
-                visit(&fd.name.name.name, Some(fd.decl));
+                visit(&fd.name.name.name, fd.decl, RenamedKind::Subroutine);
             }
             ModuleItem::TaskDeclaration(td) if td.name.scopes.is_empty() => {
-                visit(&td.name.name.name, Some(td.decl));
+                visit(&td.name.name.name, td.decl, RenamedKind::Subroutine);
+            }
+            // §16.12, §16.8: named properties and sequences, by name.
+            ModuleItem::PropertyDeclaration(p) => {
+                visit(&p.name.name, Bound::UNSET, RenamedKind::Other)
+            }
+            ModuleItem::SequenceDeclaration(p) => {
+                visit(&p.name.name, Bound::UNSET, RenamedKind::Other)
             }
             // Nested generate constructs declare their own scope; we recurse
             // and rename names declared in the unconditional bodies, since a
@@ -33016,21 +33031,36 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Option<
     }
 }
 
-/// §23.9, §26.3: which references a generate rename may rewrite to a
-/// subroutine of the block, decided by the binding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenamedKind {
+    Subroutine,
+    Param,
+    Other,
+}
+
+/// §23.9, §6.21, §26.3: which references a generate rename may rewrite to a
+/// declaration of the block, decided by the binding.
 #[derive(Default)]
 struct GenRenameGate {
-    /// The renamed subroutines.
+    /// The renamed declarations.
     renamed: HashSet<DeclId>,
-    sub_names: HashSet<String>,
-    data_names: HashSet<String>,
-    /// Names with an unbound renamed subroutine.
+    names: HashSet<String>,
+    /// The renamed subroutines' names: all a constraint takes (§18.5).
+    subroutines: HashSet<String>,
+    /// The renamed parameters' names: all a process local's type takes.
+    params: HashSet<String>,
+    /// Names with an unbound renamed declaration.
     ungated: HashSet<String>,
 }
 
 impl GenRenameGate {
-    fn add_subroutine(&mut self, name: &str, stamp: Bound) {
-        self.sub_names.insert(name.to_string());
+    fn add(&mut self, name: &str, stamp: Bound, kind: RenamedKind) {
+        self.names.insert(name.to_string());
+        match kind {
+            RenamedKind::Subroutine => self.subroutines.insert(name.to_string()),
+            RenamedKind::Param => self.params.insert(name.to_string()),
+            RenamedKind::Other => false,
+        };
         match stamp.as_decl() {
             Some(d) => {
                 self.renamed.insert(d);
@@ -33041,18 +33071,18 @@ impl GenRenameGate {
         }
     }
 
-    /// Whether a reference bound as `bound` hides the renamed subroutine
+    /// Whether a reference bound as `bound` hides the renamed declaration
     /// `name`: it binds to a formal, local, member, import, label or `$unit`
-    /// name, or to a deeper declaration that is no subroutine of this rename.
+    /// name, or to a declaration this rename does not rename.
     ///
-    /// Fallbacks to the name-based rule: data names, an unbound definition
-    /// and an unanalysed reference.
+    /// Fallbacks to the name-based rule: an unbound declaration and an
+    /// unanalysed reference.
     fn hides(&self, name: &str, bound: Bound) -> bool {
-        if !self.sub_names.contains(name) || self.ungated.contains(name) || bound.is_unset() {
+        if !self.names.contains(name) || self.ungated.contains(name) || bound.is_unset() {
             return false;
         }
         match bound.as_decl() {
-            Some(d) => !self.renamed.contains(&d) && !self.data_names.contains(name),
+            Some(d) => !self.renamed.contains(&d),
             None => true,
         }
     }
@@ -33180,14 +33210,9 @@ impl GenRename<'_> {
 fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleItem> {
     let mut names = Vec::new();
     let mut gate = GenRenameGate::default();
-    visit_renamed_decls(items, &mut |n, stamp| {
+    visit_renamed_decls(items, &mut |n, stamp, kind| {
         names.push(n.to_string());
-        match stamp {
-            Some(stamp) => gate.add_subroutine(n, stamp),
-            None => {
-                gate.data_names.insert(n.to_string());
-            }
-        }
+        gate.add(n, stamp, kind);
     });
     if names.is_empty() {
         return items.to_vec();
@@ -33674,21 +33699,28 @@ fn rename_item_decls(
         | ModuleItem::ClockingDeclaration(_)
         | ModuleItem::ClassDeclaration(_)
         | ModuleItem::OutOfClassConstraint { .. } => {
-            let subs = gen_rename_subroutine_map(port_map);
-            if subs.is_empty() {
-                item.clone()
-            } else {
-                rename_subroutine_refs(item, &subs, local_names, interface_map)
+            let mut out = match port_map.is_empty() {
+                true => item.clone(),
+                false => rename_item_refs(item, port_map, local_names, interface_map),
+            };
+            let name = match &mut out {
+                ModuleItem::PropertyDeclaration(p) => Some(&mut p.name.name),
+                ModuleItem::SequenceDeclaration(p) => Some(&mut p.name.name),
+                _ => None,
+            };
+            if let Some(n) = name.filter(|n| rename_set.contains(n.as_str())) {
+                *n = rename.apply(n);
             }
+            out
         }
         other => other.clone(),
     }
 }
 
-/// The references of `port_map` that name a subroutine of the rename in
-/// progress. Data of the block at the positions below keeps its bare name.
-fn gen_rename_subroutine_map(
+/// The references of `port_map` to the rename's names `pick` selects.
+fn gen_rename_part(
     port_map: &HashMap<String, Expression>,
+    pick: fn(&GenRenameGate) -> &HashSet<String>,
 ) -> HashMap<String, Expression> {
     GEN_RENAME_TLS.with(|g| {
         let g = g.borrow();
@@ -33697,28 +33729,35 @@ fn gen_rename_subroutine_map(
         };
         port_map
             .iter()
-            .filter(|(n, _)| gate.sub_names.contains(*n))
+            .filter(|(n, _)| pick(gate).contains(*n))
             .map(|(n, e)| (n.clone(), e.clone()))
             .collect()
     })
 }
 
+/// The references of `port_map` a constraint takes: the block's subroutines.
+/// The constraint solver resolves data by its bare name (§18.5).
+fn gen_rename_constraint_map(
+    port_map: &HashMap<String, Expression>,
+) -> HashMap<String, Expression> {
+    gen_rename_part(port_map, |g| &g.subroutines)
+}
+
 /// §23.9: a final block (§9.2.3), gate (§28), property or sequence (§16),
 /// let (§11.13), covergroup (§19), clocking block (§14.3) or class (§8) in a
-/// generate block calls the block's subroutines by their renamed keys. The
+/// generate block names the block's declarations by their renamed keys. The
 /// gate in `rewrite_expr_impl` decides each reference by its binding. A class
-/// body gets the definition-relative key; the runtime adds the instance from
-/// `this`.
-fn rename_subroutine_refs(
+/// body gets the definition-relative key; the inliner adds the instance.
+fn rename_item_refs(
     item: &ModuleItem,
-    subs: &HashMap<String, Expression>,
+    map: &HashMap<String, Expression>,
     locals: &std::collections::HashSet<String>,
     ifaces: &HashMap<String, String>,
 ) -> ModuleItem {
     let rx =
         |e: &Expression, m: &HashMap<String, Expression>| rewrite_expr(e, "", m, locals, ifaces);
     let without = |names: &mut dyn Iterator<Item = &str>| {
-        let mut m = subs.clone();
+        let mut m = map.clone();
         for n in names {
             m.remove(n);
         }
@@ -33726,15 +33765,13 @@ fn rename_subroutine_refs(
     };
     let mut out = item.clone();
     match &mut out {
-        ModuleItem::FinalConstruct(fc) => {
-            fc.stmt = rewrite_stmt(&fc.stmt, "", subs, locals, ifaces)
-        }
+        ModuleItem::FinalConstruct(fc) => fc.stmt = rewrite_stmt(&fc.stmt, "", map, locals, ifaces),
         ModuleItem::GateInstantiation(g) => {
             for d in [&mut g.delay, &mut g.delay_fall].into_iter().flatten() {
-                *d = rx(d, subs);
+                *d = rx(d, map);
             }
             for t in g.instances.iter_mut().flat_map(|i| i.terminals.iter_mut()) {
-                *t = rx(t, subs);
+                *t = rx(t, map);
             }
         }
         // §16.8: formals stay bare for the call-site substitution.
@@ -33754,12 +33791,12 @@ fn rename_subroutine_refs(
         }
         ModuleItem::LetDeclaration(l) => {
             let m = match &mut l.ports {
-                PortList::Empty => subs.clone(),
+                PortList::Empty => map.clone(),
                 PortList::NonAnsi(ids) => without(&mut ids.iter().map(|n| n.name.as_str())),
                 PortList::Ansi(ps) => {
                     for p in ps.iter_mut() {
                         if let Some(d) = &p.default {
-                            p.default = Some(rx(d, subs));
+                            p.default = Some(rx(d, map));
                         }
                     }
                     without(&mut ps.iter().map(|p| p.name.name.as_str()))
@@ -33767,27 +33804,34 @@ fn rename_subroutine_refs(
             };
             l.expr = rx(&l.expr, &m);
         }
-        ModuleItem::CovergroupDeclaration(c) => rename_covergroup_refs(c, subs, locals, ifaces),
+        ModuleItem::CovergroupDeclaration(c) => rename_covergroup_refs(c, map, locals, ifaces),
         ModuleItem::ClockingDeclaration(c) => {
+            // §14.3: the clocking event is an expression of the block.
+            if let Some(clk) = &mut c.clock_signal {
+                if let Some(n) = map.get(&clk.name).and_then(whole_net_ident_name) {
+                    clk.name = n;
+                }
+            }
             for d in [&mut c.default_input_skew, &mut c.default_output_skew]
                 .into_iter()
                 .flatten()
             {
-                *d = rx(d, subs);
+                *d = rx(d, map);
             }
             for s in &mut c.signals {
                 for e in [&mut s.skew, &mut s.bound_to].into_iter().flatten() {
-                    *e = rx(e, subs);
+                    *e = rx(e, map);
                 }
             }
             for s in &mut c.items {
-                *s = rewrite_stmt(s, "", subs, locals, ifaces);
+                *s = rewrite_stmt(s, "", map, locals, ifaces);
             }
         }
-        ModuleItem::ClassDeclaration(c) => rename_class_refs(c, subs, locals, ifaces),
+        ModuleItem::ClassDeclaration(c) => rename_class_refs(c, map, locals, ifaces),
         ModuleItem::OutOfClassConstraint { items, .. } => {
+            let m = gen_rename_constraint_map(map);
             for c in items {
-                *c = rewrite_constraint_item(c, "", subs, locals, ifaces);
+                *c = rewrite_constraint_item(c, "", &m, locals, ifaces);
             }
         }
         _ => {}
@@ -33798,13 +33842,13 @@ fn rename_subroutine_refs(
 /// §19.3, §19.8.1: the formals hide outer names in the body.
 fn rename_covergroup_refs(
     c: &mut CovergroupDeclaration,
-    subs: &HashMap<String, Expression>,
+    map: &HashMap<String, Expression>,
     locals: &std::collections::HashSet<String>,
     ifaces: &HashMap<String, String>,
 ) {
-    rename_subroutine_ports(&mut c.ports, subs, locals, ifaces);
-    rename_subroutine_ports(&mut c.sample_ports, subs, locals, ifaces);
-    let mut m = subs.clone();
+    rename_subroutine_ports(&mut c.ports, map, locals, ifaces);
+    rename_subroutine_ports(&mut c.sample_ports, map, locals, ifaces);
+    let mut m = map.clone();
     for p in c.ports.iter().chain(&c.sample_ports) {
         m.remove(&p.name.name);
     }
@@ -33826,13 +33870,13 @@ fn rename_covergroup_refs(
 /// members and those of its bases, which the binding reports.
 fn rename_class_refs(
     c: &mut ClassDeclaration,
-    subs: &HashMap<String, Expression>,
+    map: &HashMap<String, Expression>,
     locals: &std::collections::HashSet<String>,
     ifaces: &HashMap<String, String>,
 ) {
-    let rx = |e: &Expression| rewrite_expr(e, "", subs, locals, ifaces);
-    let rt = |t: &DataType| rewrite_data_type_genvar(t, subs, locals, ifaces);
-    let rd = |d: &[UnpackedDimension]| rewrite_unpacked_dims_genvar(d, subs, locals, ifaces);
+    let rx = |e: &Expression| rewrite_expr(e, "", map, locals, ifaces);
+    let rt = |t: &DataType| rewrite_data_type_genvar(t, map, locals, ifaces);
+    let rd = |d: &[UnpackedDimension]| rewrite_unpacked_dims_genvar(d, map, locals, ifaces);
     let param = |p: &mut ParameterDeclaration| match &mut p.kind {
         ParameterKind::Data {
             data_type,
@@ -33873,17 +33917,18 @@ fn rename_class_refs(
                 | ClassMethodKind::PureVirtual(f)
                 | ClassMethodKind::Extern(f) => {
                     f.return_type = rt(&f.return_type);
-                    rename_subroutine_ports(&mut f.ports, subs, locals, ifaces);
-                    f.items = rename_subroutine_body(&f.items, &f.ports, subs, locals, ifaces);
+                    rename_subroutine_ports(&mut f.ports, map, locals, ifaces);
+                    f.items = rename_subroutine_body(&f.items, &f.ports, map, locals, ifaces);
                 }
                 ClassMethodKind::Task(t) => {
-                    rename_subroutine_ports(&mut t.ports, subs, locals, ifaces);
-                    t.items = rename_subroutine_body(&t.items, &t.ports, subs, locals, ifaces);
+                    rename_subroutine_ports(&mut t.ports, map, locals, ifaces);
+                    t.items = rename_subroutine_body(&t.items, &t.ports, map, locals, ifaces);
                 }
             },
             ClassItem::Constraint(k) => {
+                let m = gen_rename_constraint_map(map);
                 for i in &mut k.items {
-                    *i = rewrite_constraint_item(i, "", subs, locals, ifaces);
+                    *i = rewrite_constraint_item(i, "", &m, locals, ifaces);
                 }
             }
             ClassItem::Typedef(t) => {
@@ -33891,8 +33936,8 @@ fn rename_class_refs(
                 t.dimensions = rd(&t.dimensions);
             }
             ClassItem::Parameter(p) => param(p),
-            ClassItem::Class(i) => rename_class_refs(i, subs, locals, ifaces),
-            ClassItem::Covergroup(g) => rename_covergroup_refs(g, subs, locals, ifaces),
+            ClassItem::Class(i) => rename_class_refs(i, map, locals, ifaces),
+            ClassItem::Covergroup(g) => rename_covergroup_refs(g, map, locals, ifaces),
             ClassItem::Import(_) | ClassItem::Empty => {}
         }
     }
@@ -35487,6 +35532,7 @@ fn ai_expand_instances(
                 let _ = write!(ident.name, "[{index}]");
             }
             out.push(HInst {
+                decl: hi.decl,
                 name: ident,
                 dimensions: vec![],
                 connections: new_conns,
@@ -43122,7 +43168,33 @@ fn inline_module_items(
                             Some(&elab),
                             Some(&inst_prefix),
                         )?;
-                        let mut scoped = module_class_scope::class(cd, &inst_prefix, &class_bindings);
+                        // §8.3, §23.9: a class of a generate block reads the
+                        // block's data by its key, this instance's (`u.a.k`).
+                        let mut bindings = class_bindings.clone();
+                        let mut visit = |n: &str| {
+                            if n.contains('.') {
+                                let key = make_ident_expr(&cat2(&inst_prefix, n));
+                                bindings.entry(n.to_string()).or_insert(key);
+                            }
+                        };
+                        for it in prepared_sub.effective_items.iter() {
+                            match it {
+                                ModuleItem::DataDeclaration(dd) => {
+                                    dd.declarators.iter().for_each(|d| visit(&d.name.name))
+                                }
+                                ModuleItem::NetDeclaration(nd) => {
+                                    nd.declarators.iter().for_each(|d| visit(&d.name.name))
+                                }
+                                ModuleItem::ParameterDeclaration(pd)
+                                | ModuleItem::LocalparamDeclaration(pd) => {
+                                    if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                                        assignments.iter().for_each(|a| visit(&a.name.name));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let mut scoped = module_class_scope::class(cd, &inst_prefix, &bindings);
                         for item in &mut scoped.items {
                             if let ClassItem::Method(method) = item {
                                 let body = match &mut method.kind {
@@ -51016,28 +51088,51 @@ fn rewrite_stmt(
                 )),
             })
         }
-        // Declared names and dimensions stay untouched (they are introduced
-        // by the declaration itself); only the initializer reads outer names.
+        // Declared names stay untouched (the declaration introduces them).
+        // §6.21, §23.9: in a generate rename the type and dimensions read the
+        // block's parameters; elsewhere only the initializer reads outer names.
+        // Block data there keeps its bare name, which the instance resolves.
         StatementKind::VarDecl {
             data_type,
             lifetime,
             declarators,
-        } => StatementKind::VarDecl {
-            data_type: module_class_scope::data_type(data_type, prefix, port_map),
-            lifetime: *lifetime,
-            declarators: declarators
-                .iter()
-                .map(|d| crate::ast::stmt::VarDeclarator {
-                    name: d.name.clone(),
-                    dimensions: d.dimensions.clone(),
-                    init: d
-                        .init
-                        .as_ref()
-                        .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
-                    span: d.span,
-                })
-                .collect(),
-        },
+        } => {
+            let params = match prefix.is_empty() {
+                true => gen_rename_part(port_map, |g| &g.params),
+                false => HashMap::default(),
+            };
+            let renaming = !params.is_empty();
+            let mut data_type = module_class_scope::data_type(data_type, prefix, port_map);
+            if renaming {
+                data_type =
+                    rewrite_data_type_genvar(&data_type, &params, local_names, interface_map);
+            }
+            StatementKind::VarDecl {
+                data_type,
+                lifetime: *lifetime,
+                declarators: declarators
+                    .iter()
+                    .map(|d| crate::ast::stmt::VarDeclarator {
+                        decl: d.decl,
+                        name: d.name.clone(),
+                        dimensions: match renaming {
+                            true => rewrite_unpacked_dims_genvar(
+                                &d.dimensions,
+                                &params,
+                                local_names,
+                                interface_map,
+                            ),
+                            false => d.dimensions.clone(),
+                        },
+                        init: d
+                            .init
+                            .as_ref()
+                            .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+                        span: d.span,
+                    })
+                    .collect(),
+            }
+        }
         StatementKind::RandCase { items } => StatementKind::RandCase {
             items: items
                 .iter()

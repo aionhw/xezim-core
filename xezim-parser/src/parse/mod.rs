@@ -276,6 +276,7 @@ impl Parser {
                 self.bump();
                 let span = self.span_from(start_byte);
                 let instance = crate::ast::decl::HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: iname,
                     dimensions: dims,
                     connections: conns,

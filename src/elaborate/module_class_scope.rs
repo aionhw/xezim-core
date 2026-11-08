@@ -194,6 +194,12 @@ pub(super) fn data_type(
     }
 }
 
+/// §23.9: a nearer declaration of `name` hides it and every block key it
+/// heads (`name.k`, `name[0].k`).
+fn hide(bindings: &mut HashMap<String, Expression>, name: &str) {
+    bindings.retain(|k, _| k.split(['.', '[']).next() != Some(name));
+}
+
 pub(super) fn class(
     cd: &ClassDeclaration,
     prefix: &str,
@@ -207,12 +213,12 @@ pub(super) fn class(
         match &parameter.kind {
             ParameterKind::Type { assignments } => {
                 for a in assignments {
-                    bindings.remove(&a.name.name);
+                    hide(&mut bindings, &a.name.name);
                 }
             }
             ParameterKind::Data { assignments, .. } => {
                 for a in assignments {
-                    bindings.remove(&a.name.name);
+                    hide(&mut bindings, &a.name.name);
                 }
             }
         }
@@ -236,10 +242,16 @@ pub(super) fn class(
     for item in &cd.items {
         match item {
             ClassItem::Typedef(t) => {
-                body_bindings.remove(&t.name.name);
+                hide(&mut body_bindings, &t.name.name);
             }
             ClassItem::Class(c) => {
-                body_bindings.remove(&c.name.name);
+                hide(&mut body_bindings, &c.name.name);
+            }
+            // §8.3: a property hides a block's data of its name (`cfg.depth`).
+            ClassItem::Property(p) => {
+                for d in &p.declarators {
+                    hide(&mut body_bindings, &d.name.name);
+                }
             }
             _ => {}
         }
@@ -277,7 +289,7 @@ pub(super) fn class(
                 let mut method_bindings = bindings.clone();
                 for port in ports {
                     port.data_type = data_type(&port.data_type, prefix, bindings);
-                    method_bindings.remove(&port.name.name);
+                    hide(&mut method_bindings, &port.name.name);
                     if let Some(e) = &port.default {
                         port.default = Some(rewrite_expr(
                             e,
@@ -289,7 +301,7 @@ pub(super) fn class(
                     }
                 }
                 for name in stmt_list_declared_names(body) {
-                    method_bindings.remove(name);
+                    hide(&mut method_bindings, name);
                 }
                 // §8.3/§13.4: rewrite from the shared source directly. Mutating
                 // the cloned body first would copy every statement before the

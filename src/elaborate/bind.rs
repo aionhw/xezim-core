@@ -343,11 +343,11 @@ struct Mention {
 const UNVISITED: &[&str] = &[
     "alias",
     "assign-delay",
+    "clocking-signal",
     "defparam",
     "dpi-export",
     "dpi-import",
     "instance-dim",
-    "local-dim",
     "modport",
     "nettype",
     "tagged",
@@ -358,18 +358,16 @@ const UNVISITED: &[&str] = &[
     "wait-order",
 ];
 
-/// Positions the rename rewrites for subroutine names only. Data there is
-/// group B.
-const SUBROUTINES_ONLY: &[&str] = &[
-    "class",
-    "clocking",
-    "covergroup",
-    "final",
-    "gate",
-    "let",
-    "property",
-    "sequence",
-];
+/// Positions the rename gives part of a block's names: a declared constraint
+/// its subroutines (§18.5), a process local's type its parameters (§6.21).
+/// The rest there is group B.
+fn partly_renamed(pos: &str, target: Option<DeclKind>) -> bool {
+    match pos {
+        "constraint" => !matches!(target, Some(DeclKind::Function | DeclKind::Task)),
+        "local-dim" => target != Some(DeclKind::Param),
+        _ => false,
+    }
+}
 
 /// A hidden name, why, and the class its declared type may name.
 type Hidden = (String, Hide, Option<String>);
@@ -664,6 +662,9 @@ impl Binder<'_> {
             ModuleItem::PortDeclaration(d) => {
                 self.data_type(&mut d.data_type);
                 self.var_declarators(&mut d.declarators);
+                for v in &mut d.declarators {
+                    v.decl = self.own_decl(&v.name.name);
+                }
             }
             ModuleItem::NetDeclaration(d) => {
                 self.data_type(&mut d.data_type);
@@ -672,6 +673,7 @@ impl Binder<'_> {
                     .flatten()
                     .for_each(|e| self.expr(e));
                 for v in &mut d.declarators {
+                    v.decl = self.own_decl(&v.name.name);
                     self.unpacked(&mut v.dimensions);
                     if let Some(e) = &mut v.init {
                         self.expr(e);
@@ -681,8 +683,16 @@ impl Binder<'_> {
             ModuleItem::DataDeclaration(d) => {
                 self.data_type(&mut d.data_type);
                 self.var_declarators(&mut d.declarators);
+                for v in &mut d.declarators {
+                    v.decl = self.own_decl(&v.name.name);
+                }
             }
             ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                if let ParameterKind::Data { assignments, .. } = &mut p.kind {
+                    for a in assignments {
+                        a.decl = self.own_decl(&a.name.name);
+                    }
+                }
                 self.parameter(p)
             }
             ModuleItem::TypedefDeclaration(t) => {
@@ -719,6 +729,7 @@ impl Binder<'_> {
                     }
                 }
                 for i in &mut m.instances {
+                    i.decl = self.own_decl(&i.name.name);
                     self.with_pos("instance-dim", |b| b.unpacked(&mut i.dimensions));
                     for c in &mut i.connections {
                         if let PortConnection::Named { expr: Some(e), .. }
@@ -834,7 +845,9 @@ impl Binder<'_> {
                 class_name, items, ..
             } => {
                 let class = class_name.clone();
-                self.out_of_block(&class, |b| b.constraints(items));
+                self.out_of_block(&class, |b| {
+                    b.with_pos("constraint", |b| b.constraints(items))
+                });
             }
             ModuleItem::Defparam(d) => self.with_pos("defparam", |b| {
                 for (l, r) in d {
@@ -950,7 +963,9 @@ impl Binder<'_> {
                     | ClassMethodKind::Extern(f) => self.function(f),
                     ClassMethodKind::Task(t) => self.task(t),
                 },
-                ClassItem::Constraint(k) => self.constraints(&mut k.items),
+                ClassItem::Constraint(k) => {
+                    self.with_pos("constraint", |b| b.constraints(&mut k.items))
+                }
                 ClassItem::Typedef(t) => {
                     self.data_type(&mut t.data_type);
                     self.unpacked(&mut t.dimensions);
@@ -1110,7 +1125,8 @@ impl Binder<'_> {
             }
             match &mut s.bound_to {
                 Some(e) => self.expr(e),
-                None => self.ident(&s.name),
+                // §14.3: the clockvar names its signal; the rename keeps it.
+                None => self.with_pos("clocking-signal", |b| b.ident(&s.name)),
             }
         }
         c.items.iter_mut().for_each(|s| self.stmt(s));
@@ -2099,7 +2115,8 @@ impl AuditLine {
 }
 
 /// The name the rename gives a declaration, when it renames that kind: a
-/// block's subroutines, data, nets, parameters and instances (§27.5, §27.6).
+/// block's subroutines, data, nets, parameters, instances, properties and
+/// sequences (§27.5, §27.6).
 fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> Option<String> {
     let key = match kind {
         DeclKind::Function
@@ -2107,7 +2124,9 @@ fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> 
         | DeclKind::Data
         | DeclKind::Net
         | DeclKind::Param
-        | DeclKind::Instance => tree.key(scope, name, &[]),
+        | DeclKind::Instance
+        | DeclKind::Property
+        | DeclKind::Sequence => tree.key(scope, name, &[]),
         _ => return None,
     };
     (key != name).then_some(key)
@@ -2147,12 +2166,7 @@ fn compare(def: &str, before: Vec<Mention>, after: Vec<Mention>) -> Vec<AuditLin
                     _ => Disagree::Other,
                 }),
                 (None, Some(_)) if UNVISITED.contains(&m.pos) => Some(Disagree::Unvisited),
-                (None, Some(_))
-                    if SUBROUTINES_ONLY.contains(&m.pos)
-                        && !matches!(m.target, Some(DeclKind::Function | DeclKind::Task)) =>
-                {
-                    Some(Disagree::Unvisited)
-                }
+                (None, Some(_)) if partly_renamed(m.pos, m.target) => Some(Disagree::Unvisited),
                 (None, Some(_)) => Some(Disagree::Other),
             };
             AuditLine {
