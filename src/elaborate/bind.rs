@@ -321,8 +321,10 @@ fn class_member_names(c: &ClassDeclaration, f: &mut dyn FnMut(&str)) {
 pub enum Hide {
     /// §13.5: subroutine formals, and those of a let, property or covergroup.
     Formal,
-    /// §12.7, §27.4 and generate loop variables.
+    /// §12.7 loop variables.
     Loop,
+    /// §27.4: a generate loop's genvar.
+    Genvar,
     /// §6.21: a variable of a procedural block.
     Local,
     /// §9.3.5: a block label.
@@ -356,6 +358,7 @@ impl Outcome {
         match self {
             Outcome::Decl(d) => Bound::decl(d),
             Outcome::Upward => Bound::UPWARD,
+            Outcome::None(Hide::Genvar) => Bound::GENVAR,
             Outcome::None(_) => Bound::NO_TARGET,
         }
     }
@@ -376,7 +379,6 @@ const UNVISITED: &[&str] = &[
     "tagged",
     "shallow-copy",
     "specify",
-    "event-name",
     "wait-order",
 ];
 
@@ -843,7 +845,7 @@ impl<'a> Binder<'a> {
             }
             ModuleItem::GenerateFor(g) => {
                 let mark = self.hidden.len();
-                self.hide(&g.var, Hide::Loop);
+                self.hide(&g.var, Hide::Genvar);
                 if let Some(i) = &mut g.init {
                     self.expr(i);
                 }
@@ -1496,10 +1498,9 @@ impl<'a> Binder<'a> {
                 }
                 self.stmt(stmt);
             }
-            StatementKind::EventTrigger { name, target, .. } => match target {
-                Some(t) => self.expr(t),
-                None => self.with_pos("event-name", |b| _ = b.ident(name)),
-            },
+            StatementKind::EventTrigger { target, .. } => {
+                target.iter_mut().for_each(|t| self.expr(t))
+            }
             StatementKind::Wait { condition, stmt } => {
                 self.expr(condition);
                 self.stmt(stmt);

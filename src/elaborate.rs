@@ -33100,19 +33100,19 @@ fn genvar_const_expr(value: i64) -> Expression {
     )
 }
 
-/// Replace bare references to `var` (a genvar) with the given constant
-/// `value` throughout the module items. Walks into nested generate-for /
-/// generate-if / generate-region so the substitution covers the whole
-/// generate subtree before unrolling kicks in.
+/// §27.4: an iteration's genvar is a localparam of its block; replace bare
+/// references to `var` with `value` throughout the items, nested generate
+/// constructs included, before unrolling.
 fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Vec<ModuleItem> {
-    let mut port_map: HashMap<String, Expression> = HashMap::default();
-    port_map.insert(var.to_string(), genvar_const_expr(value));
-    let local_names: std::collections::HashSet<String> = std::collections::HashSet::default();
-    let interface_map: HashMap<String, String> = HashMap::default();
-    items
-        .iter()
-        .map(|item| substitute_in_module_item(item, &port_map, &local_names, &interface_map))
-        .collect()
+    let mut genvar = HashMap::default();
+    genvar.insert(var.to_string(), genvar_const_expr(value));
+    gen_walk(
+        items,
+        GenRename {
+            genvar,
+            ..Default::default()
+        },
+    )
 }
 
 /// The declarations a generate rename applies to: data, nets, parameters,
@@ -33196,14 +33196,20 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
 }
 
 /// §23.9, §27.6: the generate rename in progress: the block's scope and, per
-/// renamed declaration, its kind and its spelling so far.
+/// renamed declaration, its kind and its spelling so far; or an iteration's
+/// genvar substitution.
+#[derive(Default)]
 struct GenRename {
     scope: String,
     renamed: HashMap<DeclId, (DeclKind, String)>,
+    /// §27.4: the iteration's genvar and its value, replaced by name.
+    genvar: HashMap<String, Expression>,
     /// Whether a process local's type can take a renamed declaration.
     local_kinds: bool,
     /// The kinds the position being rewritten takes, when not all.
     part: std::cell::Cell<Option<fn(DeclKind) -> bool>>,
+    /// Whether the position is in a class body.
+    class: std::cell::Cell<bool>,
 }
 
 /// §18.5: a constraint takes a block's subroutines and types; the solver
@@ -33244,6 +33250,14 @@ fn gen_renamed(bound: Bound, name: &str, kinds: fn(DeclKind) -> bool) -> Option<
     })
 }
 
+/// §13.5, §8.3: in a genvar substitution, a name the binding gives another
+/// target (a formal, a class member) keeps it.
+fn genvar_hidden(bound: Bound) -> bool {
+    !bound.is_unset()
+        && bound != Bound::GENVAR
+        && GEN_RENAME_TLS.with(|g| g.borrow().last().is_some_and(|f| !f.genvar.is_empty()))
+}
+
 /// Whether a process local's type is being renamed (`local_type_takes`).
 fn gen_renames_local_types(prefix: &str) -> bool {
     prefix.is_empty() && GEN_RENAME_TLS.with(|g| g.borrow().last().is_some_and(|f| f.local_kinds))
@@ -33259,52 +33273,40 @@ fn with_gen_part<R>(part: fn(DeclKind) -> bool, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// A class body under the genvar substitution keeps its member selects
+/// as written (§8); the rename pass still folds them.
+fn gen_in_class() -> bool {
+    GEN_RENAME_TLS.with(|g| {
+        g.borrow()
+            .last()
+            .is_some_and(|f| f.class.get() && !f.genvar.is_empty())
+    })
+}
+
+/// `f` with the genvar map of the substitution in progress.
+fn with_genvar<R>(f: impl FnOnce(&HashMap<String, Expression>) -> R) -> R {
+    let none = HashMap::default();
+    GEN_RENAME_TLS.with(|g| f(g.borrow().last().map_or(&none, |t| &t.genvar)))
+}
+
 fn gen_expr(e: &Expression) -> Expression {
-    rewrite_expr(
-        e,
-        "",
-        &HashMap::default(),
-        &Default::default(),
-        &HashMap::default(),
-    )
+    with_genvar(|m| rewrite_expr(e, "", m, &Default::default(), &HashMap::default()))
 }
 
 fn gen_stmt(s: &Statement) -> Statement {
-    rewrite_stmt(
-        s,
-        "",
-        &HashMap::default(),
-        &Default::default(),
-        &HashMap::default(),
-    )
+    with_genvar(|m| rewrite_stmt(s, "", m, &Default::default(), &HashMap::default()))
 }
 
 fn gen_type(t: &DataType) -> DataType {
-    rewrite_data_type_genvar(
-        t,
-        &HashMap::default(),
-        &Default::default(),
-        &HashMap::default(),
-    )
+    with_genvar(|m| rewrite_data_type_genvar(t, m, &Default::default(), &HashMap::default()))
 }
 
 fn gen_dims(d: &[UnpackedDimension]) -> Vec<UnpackedDimension> {
-    rewrite_unpacked_dims_genvar(
-        d,
-        &HashMap::default(),
-        &Default::default(),
-        &HashMap::default(),
-    )
+    with_genvar(|m| rewrite_unpacked_dims_genvar(d, m, &Default::default(), &HashMap::default()))
 }
 
 fn gen_constraint(c: &ConstraintItem) -> ConstraintItem {
-    rewrite_constraint_item(
-        c,
-        "",
-        &HashMap::default(),
-        &Default::default(),
-        &HashMap::default(),
-    )
+    with_genvar(|m| rewrite_constraint_item(c, "", m, &Default::default(), &HashMap::default()))
 }
 
 /// A declarator the rename in progress renames gets its key.
@@ -33337,12 +33339,19 @@ fn rename_decls_in_iter(items: &[ModuleItem], scope: &str) -> Vec<ModuleItem> {
         return items.to_vec();
     }
     let local_kinds = renamed.values().any(|(k, _)| local_type_takes(*k));
-    let frame = GenRename {
-        scope: scope.to_string(),
-        renamed,
-        local_kinds,
-        part: std::cell::Cell::new(None),
-    };
+    gen_walk(
+        items,
+        GenRename {
+            scope: scope.to_string(),
+            renamed,
+            local_kinds,
+            ..Default::default()
+        },
+    )
+}
+
+/// `items` through the one generate walker under `frame`.
+fn gen_walk(items: &[ModuleItem], frame: GenRename) -> Vec<ModuleItem> {
     GEN_RENAME_TLS.with(|g| g.borrow_mut().push(frame));
     let out = items.iter().map(rename_item_decls).collect();
     GEN_RENAME_TLS.with(|g| g.borrow_mut().pop());
@@ -33351,6 +33360,15 @@ fn rename_decls_in_iter(items: &[ModuleItem], scope: &str) -> Vec<ModuleItem> {
 
 fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
     match item {
+        ModuleItem::Bind(b) => {
+            let mut b = b.clone();
+            for path in std::iter::once(&mut b.target_path).chain(b.extra_paths.iter_mut()) {
+                for index in path.iter_mut().flat_map(|s| s.selects.iter_mut()) {
+                    *index = gen_expr(index);
+                }
+            }
+            ModuleItem::Bind(b)
+        }
         ModuleItem::DataDeclaration(dd) => {
             let mut new_dd = dd.clone();
             // The RANGE may reference a renamed sibling localparam
@@ -33584,7 +33602,8 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
 
 /// §23.9: a final block (§9.2.3), gate (§28), property or sequence (§16),
 /// let (§11.13), covergroup (§19), clocking block (§14.3) or class (§8) in a
-/// generate block names the block's declarations by their renamed keys.
+/// generate block names the block's declarations by their renamed keys and
+/// the iteration's genvar by its value (§27.4).
 /// Formals keep their names by their bindings (§16.8). A class body gets the
 /// definition-relative key; the inliner adds the instance.
 fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
@@ -33634,7 +33653,12 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
             }
             c.items = c.items.iter().map(gen_stmt).collect();
         }
-        ModuleItem::ClassDeclaration(c) => rename_class_refs(c),
+        ModuleItem::ClassDeclaration(c) => {
+            let in_class = |v| GEN_RENAME_TLS.with(|g| g.borrow().last().map(|t| t.class.set(v)));
+            in_class(true);
+            rename_class_refs(c);
+            in_class(false);
+        }
         ModuleItem::OutOfClassConstraint { items, .. } => {
             *items = with_gen_part(constraint_takes, || {
                 items.iter().map(gen_constraint).collect()
@@ -34031,280 +34055,6 @@ fn rewrite_data_type_scoped(
                 .collect();
             DataType::Struct(new_su)
         }
-        other => other.clone(),
-    }
-}
-
-fn substitute_in_module_item(
-    item: &ModuleItem,
-    port_map: &HashMap<String, Expression>,
-    local_names: &std::collections::HashSet<String>,
-    interface_map: &HashMap<String, String>,
-) -> ModuleItem {
-    match item {
-        ModuleItem::Bind(b) => {
-            let mut b = b.clone();
-            for path in std::iter::once(&mut b.target_path).chain(b.extra_paths.iter_mut()) {
-                for segment in path {
-                    for index in &mut segment.selects {
-                        *index = rewrite_expr(index, "", port_map, local_names, interface_map);
-                    }
-                }
-            }
-            ModuleItem::Bind(b)
-        }
-        // §27.4: each generated assertion and its actions see the
-        // iteration's implicit genvar localparam, like other processes.
-        ModuleItem::AssertionItem(a) => {
-            let stmt = crate::ast::stmt::Statement::new(
-                crate::ast::stmt::StatementKind::Assertion(a.clone()),
-                a.span,
-            );
-            let stmt = rewrite_stmt(&stmt, "", port_map, local_names, interface_map);
-            let crate::ast::stmt::StatementKind::Assertion(a) = stmt.kind else {
-                unreachable!()
-            };
-            ModuleItem::AssertionItem(a)
-        }
-        ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(AlwaysConstruct {
-            kind: ac.kind,
-            stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
-            span: ac.span,
-            gen_scope: ac.gen_scope.clone(),
-        }),
-        ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
-            stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
-            span: ic.span,
-            gen_scope: ic.gen_scope.clone(),
-        }),
-        ModuleItem::FunctionDeclaration(fd) => {
-            let mut new_fd = fd.clone();
-            new_fd.items = fd
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::FunctionDeclaration(new_fd)
-        }
-        ModuleItem::TaskDeclaration(td) => {
-            let mut new_td = td.clone();
-            new_td.items = td
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::TaskDeclaration(new_td)
-        }
-        // §9.2.3: a `final` inside a generate-for must see the genvar's
-        // per-iteration constant, like initial/always do.
-        ModuleItem::FinalConstruct(fc) => ModuleItem::FinalConstruct(FinalConstruct {
-            stmt: rewrite_stmt(&fc.stmt, "", port_map, local_names, interface_map),
-            span: fc.span,
-        }),
-        ModuleItem::ContinuousAssign(ca) => {
-            let mut new_ca = ca.clone();
-            new_ca.assignments = ca
-                .assignments
-                .iter()
-                .map(|(l, r)| {
-                    (
-                        rewrite_expr(l, "", port_map, local_names, interface_map),
-                        rewrite_expr(r, "", port_map, local_names, interface_map),
-                    )
-                })
-                .collect();
-            ModuleItem::ContinuousAssign(new_ca)
-        }
-        ModuleItem::ModuleInstantiation(inst) => {
-            let mut new_inst = inst.clone();
-            for hi in &mut new_inst.instances {
-                for conn in &mut hi.connections {
-                    match conn {
-                        PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) => {
-                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(params) = &mut new_inst.params {
-                for pc in params.iter_mut() {
-                    match pc {
-                        ParamConnection::Named {
-                            value: Some(ParamValue::Expr(e)),
-                            ..
-                        }
-                        | ParamConnection::Ordered(Some(ParamValue::Expr(e))) => {
-                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
-                        }
-                        // §27.4: a genvar in a TYPE override's dimensions
-                        // (`.T(logic [g*2-1:0])`) kept the bare ident, so
-                        // every iteration bound the same wrong width.
-                        ParamConnection::Named {
-                            value: Some(ParamValue::Type(dt)),
-                            ..
-                        }
-                        | ParamConnection::Ordered(Some(ParamValue::Type(dt))) => {
-                            *dt =
-                                rewrite_data_type_genvar(dt, port_map, local_names, interface_map);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            ModuleItem::ModuleInstantiation(new_inst)
-        }
-        ModuleItem::GenerateRegion(gr) => {
-            let mut new_gr = gr.clone();
-            new_gr.items = gr
-                .items
-                .iter()
-                .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::GenerateRegion(new_gr)
-        }
-        ModuleItem::GenerateIf(gi) => {
-            let mut new_gi = gi.clone();
-            new_gi.branches = gi
-                .branches
-                .iter()
-                .map(|(cond, branch_items)| {
-                    let new_cond = cond
-                        .as_ref()
-                        .map(|c| rewrite_expr(c, "", port_map, local_names, interface_map));
-                    let new_items: Vec<ModuleItem> = branch_items
-                        .iter()
-                        .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                        .collect();
-                    (new_cond, new_items)
-                })
-                .collect();
-            ModuleItem::GenerateIf(new_gi)
-        }
-        ModuleItem::GenerateCase(gc) => {
-            let new_arms: Vec<GenerateCaseArm> = gc
-                .arms
-                .iter()
-                .map(|arm| GenerateCaseArm {
-                    values: arm
-                        .values
-                        .iter()
-                        .map(|v| rewrite_expr(v, "", port_map, local_names, interface_map))
-                        .collect(),
-                    items: arm
-                        .items
-                        .iter()
-                        .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                        .collect(),
-                    label: arm.label.clone(),
-                    direct: arm.direct,
-                })
-                .collect();
-            ModuleItem::GenerateCase(GenerateCase {
-                selector: rewrite_expr(&gc.selector, "", port_map, local_names, interface_map),
-                arms: new_arms,
-                implicit_name: gc.implicit_name.clone(),
-                span: gc.span,
-            })
-        }
-        ModuleItem::GenerateFor(gf) => {
-            let mut new_gf = gf.clone();
-            new_gf.init = gf
-                .init
-                .as_ref()
-                .map(|e| rewrite_expr(e, "", port_map, local_names, interface_map));
-            new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
-            new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
-            new_gf.items = gf
-                .items
-                .iter()
-                .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::GenerateFor(new_gf)
-        }
-        // A localparam/parameter declared inside a generate-for can size or
-        // value itself from the genvar — e.g. rr_arb_tree's
-        // `localparam int Idx0 = 2**level-1+l;` per tree node. Without genvar
-        // substitution here the init keeps the bare `level`/`l` idents and
-        // every iteration's Idx0 collapses to X/0, so `assign vec[Idx0]` all
-        // target bit 0 and the arbiter never routes (floo_router forwarding
-        // loss). Substitute the init and dimension expressions.
-        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
-            let mut new_pd = pd.clone();
-            if let ParameterKind::Data {
-                data_type,
-                assignments,
-            } = &mut new_pd.kind
-            {
-                *data_type =
-                    rewrite_data_type_genvar(data_type, port_map, local_names, interface_map);
-                for a in assignments.iter_mut() {
-                    a.dimensions = rewrite_unpacked_dims_genvar(
-                        &a.dimensions,
-                        port_map,
-                        local_names,
-                        interface_map,
-                    );
-                    if let Some(init) = &a.init {
-                        a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                    }
-                }
-            }
-            match item {
-                ModuleItem::ParameterDeclaration(_) => ModuleItem::ParameterDeclaration(new_pd),
-                _ => ModuleItem::LocalparamDeclaration(new_pd),
-            }
-        }
-        // A variable/net declared inside a generate-for can size itself from
-        // the genvar (`logic [i*W-1:0] slice_i;`) or initialise from it. Same
-        // fall-through hazard as the parameter case above.
-        ModuleItem::DataDeclaration(dd) => {
-            let mut new_dd = dd.clone();
-            new_dd.data_type =
-                rewrite_data_type_genvar(&dd.data_type, port_map, local_names, interface_map);
-            for d in new_dd.declarators.iter_mut() {
-                d.dimensions = rewrite_unpacked_dims_genvar(
-                    &d.dimensions,
-                    port_map,
-                    local_names,
-                    interface_map,
-                );
-                if let Some(init) = &d.init {
-                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                }
-            }
-            ModuleItem::DataDeclaration(new_dd)
-        }
-        ModuleItem::NetDeclaration(nd) => {
-            let mut new_nd = nd.clone();
-            new_nd.data_type =
-                rewrite_data_type_genvar(&nd.data_type, port_map, local_names, interface_map);
-            for d in [
-                &mut new_nd.delay,
-                &mut new_nd.delay_fall,
-                &mut new_nd.delay_off,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                *d = rewrite_expr(d, "", port_map, local_names, interface_map);
-            }
-            for d in new_nd.declarators.iter_mut() {
-                d.dimensions = rewrite_unpacked_dims_genvar(
-                    &d.dimensions,
-                    port_map,
-                    local_names,
-                    interface_map,
-                );
-                if let Some(init) = &d.init {
-                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                }
-            }
-            ModuleItem::NetDeclaration(new_nd)
-        }
-        // Remaining module-level items don't carry genvar-dependent
-        // expressions; pass through unchanged.
         other => other.clone(),
     }
 }
@@ -48925,7 +48675,7 @@ fn rewrite_expr_impl(
                 h.span = Span::dummy();
                 return Expression::new(ExprKind::Ident(h), Span::dummy());
             }
-            if let Some(mapped) = port_map.get(name) {
+            if let Some(mapped) = port_map.get(name).filter(|_| !genvar_hidden(hier.bound)) {
                 // §25.5.4: `p.b` through a modport-typed port whose actual is
                 // an interface instance — a modport EXPRESSION member
                 // substitutes its registered expression (see
@@ -49374,15 +49124,16 @@ fn rewrite_expr_impl(
             let rewritten_base =
                 rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             // `flatten_pkg_member_refs`: only a package-headed `P::m` folds.
-            let keep = PKG_FLATTEN_ONLY.with(|s| {
-                s.borrow().as_ref().is_some_and(|pkgs| {
-                    !matches!(&rewritten_base.kind, ExprKind::Ident(h)
-                        if h.root.is_none()
-                            && h.path.len() == 1
-                            && h.path[0].selects.is_empty()
-                            && pkgs.contains(&h.path[0].name.name))
-                })
-            });
+            let keep = gen_in_class()
+                || PKG_FLATTEN_ONLY.with(|s| {
+                    s.borrow().as_ref().is_some_and(|pkgs| {
+                        !matches!(&rewritten_base.kind, ExprKind::Ident(h)
+                            if h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty()
+                                && pkgs.contains(&h.path[0].name.name))
+                    })
+                });
             if keep {
                 return Expression::new(
                     ExprKind::MemberAccess {

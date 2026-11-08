@@ -48,14 +48,16 @@ impl Bound {
     pub const NO_TARGET: Bound = Bound(1);
     /// Nothing declares it lexically: resolved through the hierarchy (§23.8.1).
     pub const UPWARD: Bound = Bound(2);
+    /// §27.4: a generate loop's genvar, a localparam of each iteration.
+    pub const GENVAR: Bound = Bound(3);
 
     pub fn decl(d: DeclId) -> Bound {
-        Bound(d.0 + 3)
+        Bound(d.0 + 4)
     }
 
     /// The declaration in this definition's tree.
     pub fn as_decl(self) -> Option<DeclId> {
-        self.0.checked_sub(3).map(DeclId)
+        self.0.checked_sub(4).map(DeclId)
     }
 
     pub fn is_unset(self) -> bool {
