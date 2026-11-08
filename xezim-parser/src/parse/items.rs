@@ -1692,6 +1692,7 @@ impl Parser {
                         delay_fall: None,
                         delay_off: None,
                         declarators: vec![NetDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             name: v.name,
                             dimensions: v.dimensions,
                             init: None,
@@ -1743,6 +1744,7 @@ impl Parser {
                     span,
                 },
                 declarators: vec![crate::ast::stmt::VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: port.clone(),
                     dimensions: Vec::new(),
                     init: None,
@@ -3533,6 +3535,7 @@ impl Parser {
                 None
             };
             decls.push(NetDeclarator {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -4718,6 +4721,7 @@ impl Parser {
                 let dims = self.parse_unpacked_dimensions();
                 let conns = self.parse_port_connections();
                 instances.push(HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name,
                     dimensions: dims,
                     connections: conns,
@@ -4758,6 +4762,7 @@ impl Parser {
                 let dims = self.parse_unpacked_dimensions();
                 let conns = self.parse_port_connections();
                 instances.push(HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: iname,
                     dimensions: dims,
                     connections: conns,

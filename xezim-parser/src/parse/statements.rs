@@ -142,6 +142,7 @@ impl Parser {
                     let declarators: Vec<VarDeclarator> = assignments
                         .into_iter()
                         .map(|a| VarDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             name: a.name,
                             dimensions: a.dimensions,
                             init: a.init,
@@ -326,6 +327,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -792,6 +794,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -834,6 +837,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -878,6 +882,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -931,6 +936,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -1011,6 +1017,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -2810,6 +2817,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
             let mut stmts: Vec<Statement> = Vec::new();
             for ((dt, pname), arg) in params.iter().zip(args.iter()) {
                 let declarator = VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: crate::ast::Identifier {
                         name: pname.clone(),
                         span,

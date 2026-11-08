@@ -1049,6 +1049,10 @@ pub struct NetDeclarator {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
     pub init: Option<Expression>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1100,6 +1104,10 @@ pub struct ParamAssignment {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
     pub init: Option<Expression>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -1221,6 +1229,10 @@ pub struct HierarchicalInstance {
     /// definition, outermost first. Written by generate expansion.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub gen_indices: Vec<i64>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
