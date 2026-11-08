@@ -302,6 +302,9 @@ impl Builder<'_> {
                 ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
                     self.declare_param(s, p)
                 }
+                // §6.18: a forward declaration names the type a later
+                // typedef or class declares.
+                ModuleItem::TypedefDeclaration(t) if matches!(t.data_type, DataType::Void(_)) => {}
                 ModuleItem::TypedefDeclaration(t) => {
                     self.declare_enum_members(s, &t.data_type);
                     self.declare(s, K::Typedef, &t.name.name, t.name.span);
