@@ -31,6 +31,8 @@ pub enum DeclKind {
     EnumMember,
     Label,
     Nettype,
+    /// §6.10, §31.9: a net declared by its use.
+    ImplicitNet,
 }
 
 /// §23.9, §26.3, §23.8.1: what the head of a name resolves to in its definition,

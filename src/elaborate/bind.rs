@@ -44,6 +44,9 @@ pub struct DesignNames {
     /// Every class member of the design: a receiver or base unknown here may
     /// declare any of them (§18.7, §8.25).
     any_member: HashSet<String>,
+    /// §23.9: module, interface, program, package, checker and primitive
+    /// names, which can start a path.
+    definitions: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -56,6 +59,16 @@ impl DesignNames {
     pub fn collect(descs: &[Description]) -> Self {
         let mut n = Self::default();
         for d in descs {
+            let def = match d {
+                Description::Module(m) => Some(&m.name),
+                Description::Interface(m) => Some(&m.name),
+                Description::Program(m) => Some(&m.name),
+                Description::Package(p) => Some(&p.name),
+                Description::PackageItem(PackageItem::Checker(c)) => Some(&c.name),
+                Description::Udp(u) => Some(&u.name),
+                _ => None,
+            };
+            n.definitions.extend(def.map(|i| i.name.clone()));
             match d {
                 Description::Package(p) => {
                     let mut names = HashSet::default();
@@ -312,6 +325,8 @@ pub enum Hide {
     Import,
     /// A scoped, rooted or built-in name: no lexical lookup applies.
     Qualified,
+    /// §23.4: a name of the definition a nested one is declared in.
+    Outer,
 }
 
 /// The outcome of resolving one name.
@@ -336,6 +351,8 @@ struct Mention {
     /// What the tree declares under this name, hiding aside.
     target: Option<DeclKind>,
     pos: &'static str,
+    /// The name is the callee of a call.
+    call: bool,
 }
 
 /// Positions the rename never rewrites: items `rename_item_decls` copies and
@@ -397,11 +414,21 @@ struct Binder<'a> {
     hidden: Vec<Hidden>,
     /// Depth of class bodies with an unknown base and inline constraints.
     unknown_members: u32,
+    /// §23.4: the scopes a nested definition is declared in, innermost last.
+    outer: Vec<(&'a ScopeTree, ScopeId)>,
+    /// The formals before the default being visited (§13.5.3).
+    formals: Vec<String>,
+    /// The next head is the callee of a call.
+    callee: bool,
     pos: &'static str,
     mentions: Option<Vec<Mention>>,
 }
 
-impl Binder<'_> {
+/// §26.7, Annex G: the classes of `std`, wildcard imported into every
+/// compilation unit.
+const STD_CLASSES: &[&str] = &["process", "mailbox", "semaphore", "weak_reference"];
+
+impl<'a> Binder<'a> {
     fn with_pos(&mut self, pos: &'static str, f: impl FnOnce(&mut Self)) {
         let old = std::mem::replace(&mut self.pos, pos);
         f(self);
@@ -427,7 +454,12 @@ impl Binder<'_> {
     /// its explicit imports, then its wildcard imports. Then `$unit`, then
     /// the hierarchy (§23.8.1).
     fn resolve(&self, name: &str) -> Outcome {
-        if name.is_empty() || name.contains("::") || name.starts_with('$') || is_keyword_name(name)
+        // A.2.2.3: the delay value `1step` is carried as a name.
+        if name.is_empty()
+            || name.contains("::")
+            || name.starts_with('$')
+            || is_keyword_name(name)
+            || name == crate::ast::decl::CLOCKING_ONE_STEP
         {
             return Outcome::None(Hide::Qualified);
         }
@@ -437,28 +469,50 @@ impl Binder<'_> {
         if self.unknown_members > 0 && self.names.any_member.contains(name) {
             return Outcome::None(Hide::Member);
         }
-        let mut at = Some(self.scope);
-        while let Some(s) = at {
-            let scope = &self.tree.scopes[s.0 as usize];
-            if let Some(d) = scope.by_name.get(name) {
-                return Outcome::Decl(*d);
+        // §6.10: an implicit net is declared only where no other name is
+        // found.
+        let mut implicit = None;
+        let chains =
+            std::iter::once((self.tree, self.scope)).chain(self.outer.iter().rev().copied());
+        for (depth, (tree, from)) in chains.enumerate() {
+            let mut at = Some(from);
+            while let Some(s) = at {
+                let scope = &tree.scopes[s.0 as usize];
+                if let Some(d) = scope.by_name.get(name) {
+                    match tree.decls[d.0 as usize].kind {
+                        DeclKind::ImplicitNet if depth == 0 => implicit = Some(*d),
+                        _ if depth == 0 => return Outcome::Decl(*d),
+                        // §23.8.1: a call finds the subroutine upward.
+                        DeclKind::Function | DeclKind::Task => return Outcome::Upward,
+                        _ => return Outcome::None(Hide::Outer),
+                    }
+                }
+                if scope.explicit_imports.contains_key(name)
+                    || scope
+                        .wildcard_imports
+                        .iter()
+                        .any(|p| self.names.package_declares(p, name))
+                {
+                    return Outcome::None(Hide::Import);
+                }
+                at = scope.parent;
             }
-            if scope.explicit_imports.contains_key(name)
-                || scope
-                    .wildcard_imports
-                    .iter()
-                    .any(|p| self.names.package_declares(p, name))
-            {
-                return Outcome::None(Hide::Import);
-            }
-            at = scope.parent;
         }
-        if self.names.unit_declares(name) {
+        if self.names.unit_declares(name) || STD_CLASSES.contains(&name) {
             return Outcome::None(Hide::Import);
         }
         // §26.3: `p::x` reaches here with the package as its head.
-        if name == "std" || self.names.packages.contains_key(name) {
+        if name == "std"
+            || self.names.packages.contains_key(name)
+            || (!self.callee && self.names.definitions.contains(name))
+        {
             return Outcome::None(Hide::Qualified);
+        }
+        if let Some(d) = implicit {
+            return Outcome::Decl(d);
+        }
+        if self.formals.iter().any(|f| f == name) {
+            return Outcome::None(Hide::Formal);
         }
         Outcome::Upward
     }
@@ -490,6 +544,7 @@ impl Binder<'_> {
                 outer_keys,
                 target,
                 pos,
+                call: self.callee,
             });
         }
     }
@@ -517,6 +572,7 @@ impl Binder<'_> {
             let name = first.name.name.clone();
             self.note(h.span, &name, outcome);
         }
+        self.callee = false;
     }
 
     /// §9.6.2, §23.9: a `disable` target, resolved from where it is written.
@@ -562,6 +618,16 @@ impl Binder<'_> {
         h.bound = Bound::NO_TARGET;
         let Outcome::Decl(at) = outcome else { return };
         let from = tree.decls[at.0 as usize].scope;
+        // §27.6: a path through an implicit block name keeps its spelling.
+        if tree.decls[at.0 as usize].kind == DeclKind::Label
+            && tree.scopes[from.0 as usize].children.iter().any(|c| {
+                let sc = &tree.scopes[c.0 as usize];
+                sc.seg.as_deref() == Some(head.as_str())
+                    && matches!(sc.kind, ScopeKind::Generate { label: None, .. })
+            })
+        {
+            return;
+        }
         let Some((d, key)) = path_task(tree, from, &h.path) else {
             return;
         };
@@ -600,6 +666,7 @@ impl Binder<'_> {
                 outer_keys: Vec::new(),
                 target: Some(DeclKind::Task),
                 pos,
+                call: false,
             });
         }
     }
@@ -631,6 +698,15 @@ impl Binder<'_> {
         match class {
             Some(c) if self.names.classes.contains_key(&c) => Receiver::Class(c),
             _ => Receiver::Unknown,
+        }
+    }
+
+    /// Hide the members of a `randomize` receiver's class (§18.7, §18.11).
+    fn receiver_members(&mut self, target: &Expression) {
+        match self.receiver(target) {
+            Receiver::None => {}
+            Receiver::Class(c) => self.hide_class_chain(Some(c)),
+            Receiver::Unknown => self.unknown_members += 1,
         }
     }
 
@@ -713,7 +789,7 @@ impl Binder<'_> {
                     .flatten()
                     .for_each(|e| self.with_pos("assign-delay", |b| b.expr(e)));
                 for (l, r) in &mut c.assignments {
-                    self.expr(l);
+                    self.with_pos("assign-lhs", |b| b.expr(l));
                     self.expr(r);
                 }
             }
@@ -738,7 +814,7 @@ impl Binder<'_> {
                         if let PortConnection::Named { expr: Some(e), .. }
                         | PortConnection::Ordered(Some(e)) = c
                         {
-                            self.expr(e);
+                            self.with_pos("port", |b| b.expr(e));
                         }
                     }
                 }
@@ -892,6 +968,8 @@ impl Binder<'_> {
             return;
         };
         let mentions = self.mentions.take();
+        let mut outer = self.outer.clone();
+        outer.push((self.tree, self.scope));
         let mut inner = Binder {
             tree,
             names: self.names,
@@ -900,6 +978,9 @@ impl Binder<'_> {
             next_child: vec![0; tree.scopes.len()],
             hidden: Vec::new(),
             unknown_members: 0,
+            outer,
+            formals: Vec::new(),
+            callee: false,
             pos: self.pos,
             mentions,
         };
@@ -1026,15 +1107,19 @@ impl Binder<'_> {
         }
     }
 
-    /// §13.5.3: types and defaults bind in the declaring scope.
+    /// §13.5.3: types and defaults bind in the declaring scope. A name
+    /// found nowhere there may be a formal before it.
     fn formal_types(&mut self, ports: &mut [FunctionPort]) {
+        let mark = self.formals.len();
         for p in ports {
             self.data_type(&mut p.data_type);
             self.unpacked(&mut p.dimensions);
             if let Some(d) = &mut p.default {
                 self.expr(d);
             }
+            self.formals.push(p.name.name.clone());
         }
+        self.formals.truncate(mark);
     }
 
     fn function(&mut self, f: &mut FunctionDeclaration) {
@@ -1676,10 +1761,39 @@ impl Binder<'_> {
                 }
             }
             ExprKind::Call { func, args } => {
+                self.callee = matches!(func.kind, ExprKind::Ident(_));
                 self.expr(func);
+                self.callee = false;
+                // §18.11: the arguments of `obj.randomize(a)` name its members.
+                let mark = self.hidden.len();
+                let unknown = self.unknown_members;
+                if is_randomize(func) {
+                    self.receiver_members(func);
+                }
                 args.iter_mut().for_each(|a| self.expr(a));
+                self.unknown_members = unknown;
+                self.hidden.truncate(mark);
             }
-            ExprKind::SystemCall { args, .. } => args.iter_mut().for_each(|a| self.expr(a)),
+            // §16.10: `$sva_locals(<locals>..., body)` carries an assertion's
+            // local variables, each visible after its declaration.
+            ExprKind::SystemCall { name, args } => {
+                let mark = self.hidden.len();
+                for a in args.iter_mut() {
+                    if let ExprKind::SystemCall {
+                        name: n,
+                        args: decl,
+                    } = &a.kind
+                        && n == "$sva_local"
+                        && name == "$sva_locals"
+                        && let Some(ExprKind::Ident(h)) = decl.get(1).map(|d| &d.kind)
+                    {
+                        let local = h.path[0].name.name.clone();
+                        self.hide(&local, Hide::Local);
+                    }
+                    self.expr(a);
+                }
+                self.hidden.truncate(mark);
+            }
             ExprKind::NamedArg { expr, .. } => {
                 if let Some(v) = expr {
                     self.expr(v);
@@ -1735,11 +1849,7 @@ impl Binder<'_> {
                 self.expr(call);
                 let mark = self.hidden.len();
                 let unknown = self.unknown_members;
-                match self.receiver(call) {
-                    Receiver::None => {}
-                    Receiver::Class(c) => self.hide_class_chain(Some(c)),
-                    Receiver::Unknown => self.unknown_members += 1,
-                }
+                self.receiver_members(randomize_target(call));
                 self.constraints(constraints);
                 self.unknown_members = unknown;
                 self.hidden.truncate(mark);
@@ -1822,12 +1932,25 @@ fn is_keyword_name(name: &str) -> bool {
     )
 }
 
-/// Whether a `randomize` call is on an object, not `std::randomize` or bare.
-fn has_receiver(call: &Expression) -> bool {
-    let ExprKind::Call { func, .. } = &call.kind else {
-        return false;
-    };
-    match &func.kind {
+/// The method a `randomize` call or a bare `obj.randomize` names.
+fn randomize_target(call: &Expression) -> &Expression {
+    match &call.kind {
+        ExprKind::Call { func, .. } => func,
+        _ => call,
+    }
+}
+
+fn is_randomize(target: &Expression) -> bool {
+    match &target.kind {
+        ExprKind::Ident(h) => h.path.last().is_some_and(|s| s.name.name == "randomize"),
+        ExprKind::MemberAccess { member, .. } => member.name == "randomize",
+        _ => false,
+    }
+}
+
+/// Whether a `randomize` method is on an object, not `std::randomize` or bare.
+fn has_receiver(target: &Expression) -> bool {
+    match &target.kind {
         ExprKind::Ident(h) => h.path.len() > 1 && h.path[0].name.name != "std",
         ExprKind::MemberAccess { expr, .. } => {
             !matches!(&expr.kind, ExprKind::Ident(h) if h.path[0].name.name == "std")
@@ -1837,12 +1960,9 @@ fn has_receiver(call: &Expression) -> bool {
 }
 
 /// The receiver of `r.randomize()`, when it is one name with no select.
-fn receiver_name(call: &Expression) -> Option<&str> {
-    let ExprKind::Call { func, .. } = &call.kind else {
-        return None;
-    };
+fn receiver_name(target: &Expression) -> Option<&str> {
     let head = |h: &'_ HierarchicalIdentifier| h.root.is_none() && h.path[0].selects.is_empty();
-    match &func.kind {
+    match &target.kind {
         ExprKind::Ident(h)
             if h.path.len() == 2 && h.path[1].name.name == "randomize" && head(h) =>
         {
@@ -1879,6 +1999,9 @@ fn run<'a>(
         next_child: vec![0; tree.scopes.len()],
         hidden: Vec::new(),
         unknown_members: 0,
+        outer: Vec::new(),
+        formals: Vec::new(),
+        callee: false,
         pos: "process",
         mentions: record.then(Vec::new),
     }
@@ -2087,6 +2210,8 @@ pub struct AuditLine {
     /// What the rename made of the name, when it changed it.
     pub renamed: Option<String>,
     pub pos: &'static str,
+    /// The name is the callee of a call.
+    pub call: bool,
     /// What the tree declares under this name, hiding aside.
     pub target: Option<DeclKind>,
     pub disagree: Option<Disagree>,
@@ -2100,6 +2225,9 @@ impl AuditLine {
             None => s.push_str(" rename: no"),
         }
         s.push_str(&format!(" pos={}", self.pos));
+        if self.call {
+            s.push_str("/call");
+        }
         match self.target {
             Some(k) => s.push_str(&format!(" target={k:?}")),
             None => s.push_str(" target=-"),
@@ -2180,6 +2308,7 @@ fn compare(def: &str, before: Vec<Mention>, after: Vec<Mention>) -> Vec<AuditLin
                 outcome: m.outcome,
                 renamed,
                 pos: m.pos,
+                call: m.call,
                 target: m.target,
                 disagree,
             }
