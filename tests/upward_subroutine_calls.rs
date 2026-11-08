@@ -109,7 +109,7 @@ fn a_call_from_a_grandchild_and_a_bound_instance_searches_each_enclosing_instanc
 }
 
 #[test]
-fn the_unit_an_import_and_a_parents_data_stop_the_upward_search() {
+fn the_unit_and_an_import_stop_the_upward_search_and_a_parents_data_does_not() {
     let m = elab(
         "package p; function automatic int f(); return 7; endfunction endpackage
          function automatic int h(); return 42; endfunction
@@ -127,8 +127,22 @@ fn the_unit_an_import_and_a_parents_data_stop_the_upward_search() {
     // The unit function is spelled as the child's own copy, not the block's.
     assert_ne!(callee_of(&m, "g.x.w"), "g.h");
     assert_eq!(callee_of(&m, "g.y.w"), "f");
-    // The first `f` found is data, not a subroutine: left as it was.
+    // §23.8.1: the search is for a scope named `f`; `md`'s data is none, so
+    // it goes on to the top's `f`, whose key is its name.
     assert_eq!(callee_of(&m, "u.x.w"), "f");
+}
+
+#[test]
+fn a_variable_in_the_parents_block_does_not_stop_the_upward_search() {
+    // §23.8.1: `m`'s function, past the block's `int f`.
+    let m = elab(
+        "module cd; wire [7:0] w; assign w = f(); endmodule
+         module m; function automatic int f(); return 3; endfunction
+           if (1) begin : g int f = 9; cd x(); end endmodule
+         module top; function automatic int f(); return 100; endfunction
+           m u(); endmodule",
+    );
+    assert_eq!(callee_of(&m, "u.g.x.w"), "u.f");
 }
 
 #[test]

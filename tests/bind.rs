@@ -458,18 +458,14 @@ fn a_path_through_the_outer_block_binds_at_its_head_and_the_rename_takes_it_for_
 }
 
 #[test]
-fn a_local_data_type_and_a_shallow_copy_are_positions_the_rename_misses() {
+fn a_local_data_type_takes_the_blocks_parameter_and_a_shallow_copy_is_missed() {
+    // §6.21, §23.9.
     let src = "module top; if (1) begin : g
         localparam W = 2; class C; endclass C o;
         initial begin logic [W:0] v; C n; n = new o; end
       end endmodule";
     let l = audit(src);
-    check(
-        at(&l, "W", 0),
-        "Decl(top.g, Param)",
-        None,
-        Some(Disagree::Unvisited),
-    );
+    check(at(&l, "W", 0), "Decl(top.g, Param)", Some("g.W"), None);
     assert_eq!(at(&l, "W", 0).pos, "local-dim");
     check(
         at(&l, "o", 0),
@@ -478,6 +474,19 @@ fn a_local_data_type_and_a_shallow_copy_are_positions_the_rename_misses() {
         Some(Disagree::Unvisited),
     );
     assert_eq!(at(&l, "o", 0).pos, "shallow-copy");
+}
+
+#[test]
+fn block_data_in_a_local_data_type_keeps_its_bare_name() {
+    // The instance resolves `mem` in the block's scope; only parameters are
+    // renamed in a local's type.
+    let src = "module top; if (1) begin : g int mem [3];
+        initial begin logic [$size(mem):0] v; end
+      end endmodule";
+    let l = audit(src);
+    let m = at(&l, "mem", 0);
+    assert_eq!(m.pos, "local-dim");
+    check(m, "Decl(top.g, Data)", None, Some(Disagree::Unvisited));
 }
 
 #[test]
@@ -505,8 +514,7 @@ fn header_parameters_and_ports_bind_in_the_definition() {
     check(at(&l, "A", 1), "Decl(top, Param)", None, None);
 }
 
-// Hiding: a subroutine name an inner scope hides keeps its spelling. Group A:
-// the rename still rewrites hidden data.
+// Hiding: a name an inner scope hides keeps its spelling (§23.9, §6.21).
 
 #[test]
 fn a_block_local_hides_a_block_function_of_the_same_name() {
@@ -539,7 +547,7 @@ fn a_block_local_hides_block_data_of_the_same_name() {
         initial begin int x = 7; $display(x); end end endmodule";
     let l = at_outcome(src, "x");
     assert_eq!(l.outcome, Outcome::None(Hide::Local));
-    check(&l, "none", Some("g.x"), Some(Disagree::Hiding));
+    check(&l, "none", None, None);
 }
 
 #[test]
@@ -780,16 +788,18 @@ fn a_constraint_binds_class_members_first_and_then_the_block() {
     );
     let l = audit(&src);
     assert_eq!(at(&l, "x", 0).outcome, Outcome::None(Hide::Member));
+    // The solver resolves block data by its bare name.
     check(
         at(&l, "lim", 0),
         "Decl(top.g, Data)",
         None,
         Some(Disagree::Unvisited),
     );
+    assert_eq!(at(&l, "lim", 0).pos, "constraint");
     check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"), None);
 }
 
-// §23.9: positions the rename reaches for subroutine names only.
+// §23.9: positions outside processes and subroutines.
 
 fn expect_renamed(body: &str, pos: &str) {
     let src = format!(
@@ -929,8 +939,8 @@ fn a_formal_of_a_property_a_sequence_and_a_let_keeps_the_name_of_a_block_functio
 }
 
 #[test]
-fn block_data_read_from_a_final_block_or_a_class_stays_in_group_b() {
-    // §23.9: the bare name is what the rename leaves at these positions.
+fn block_data_read_from_a_final_block_or_a_class_takes_the_blocks_key() {
+    // §9.2.3, §8.3, §23.9.
     let src = "module top; if (1) begin : g int v;
         function automatic int f(); return v; endfunction
         final $display(v);
@@ -940,19 +950,20 @@ fn block_data_read_from_a_final_block_or_a_class_stays_in_group_b() {
     for (n, pos) in [(1, "final"), (2, "class")] {
         let m = at(&l, "v", n);
         assert_eq!(m.pos, pos);
-        check(m, "Decl(top.g, Data)", None, Some(Disagree::Unvisited));
+        check(m, "Decl(top.g, Data)", Some("g.v"), None);
     }
 }
 
 #[test]
-fn a_clocking_event_binds_to_the_block_data_the_rename_misses() {
+fn a_clocking_event_names_the_block_data_by_its_key() {
+    // §14.3, §23.9.
     let src = "module top; logic k; if (1) begin : g logic c; int v;
         clocking cb @(posedge c); input v; endclocking
       end endmodule";
     let l = audit(src);
     let m = l.iter().find(|m| m.name == "c").expect("the clock");
     assert_eq!(m.pos, "clocking");
-    check(m, "Decl(top.g, Data)", None, Some(Disagree::Unvisited));
+    check(m, "Decl(top.g, Data)", Some("g.c"), None);
 }
 
 #[test]
