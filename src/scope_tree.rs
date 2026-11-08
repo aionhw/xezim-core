@@ -10,8 +10,9 @@ use crate::ast::Description;
 use crate::ast::binding::{DeclId, DeclKind, ScopeId};
 use crate::ast::decl::{
     DPIProto, GenerateCase, GenerateIf, ModuleItem, PackageItem, ParameterDeclaration,
-    ParameterKind,
+    ParameterKind, PortConnection,
 };
+use crate::ast::expr::{ExprKind, Expression};
 use crate::ast::module::PortList;
 use crate::ast::stmt::{Statement, StatementKind};
 use crate::ast::types::DataType;
@@ -95,6 +96,7 @@ impl ScopeTree {
                 decl_types: HashMap::default(),
             },
             groups: 0,
+            loop_vars: Vec::new(),
             others,
         };
         let root = b.open(None, ScopeKind::Definition, None, None);
@@ -185,6 +187,8 @@ impl ScopeTree {
 struct Builder<'a> {
     tree: ScopeTree,
     groups: u32,
+    /// Generate loop variables of the enclosing loops (§27.4).
+    loop_vars: Vec<String>,
     others: &'a mut Vec<ScopeTree>,
 }
 
@@ -218,8 +222,27 @@ impl Builder<'_> {
     /// with its implicit name (§27.6).
     fn fill(&mut self, s: ScopeId, items: &mut [ModuleItem]) {
         self.declare_items(s, items);
+        self.declare_implicit_nets(s, items);
         let mut next = 0;
-        self.number_items(s, items, &mut next);
+        let mut implicit = Vec::new();
+        self.number_items(s, items, &mut next, &mut implicit);
+        // §27.6: an unnamed block's implicit name is a name of the scope.
+        for (name, span) in implicit {
+            self.declare(s, DeclKind::Label, &name, span);
+        }
+    }
+
+    /// §6.10: a name in a port connection, a gate terminal or the left-hand
+    /// side of a continuous assignment, and §31.9 a delayed signal, that no
+    /// scope on the chain declares is an implicit net of this scope.
+    fn declare_implicit_nets(&mut self, s: ScopeId, items: &[ModuleItem]) {
+        let mut uses = Vec::new();
+        implicit_net_uses(items, &mut uses);
+        for (name, span) in uses {
+            if !self.loop_vars.iter().any(|v| v == name) && self.tree.lookup(s, name).is_none() {
+                self.declare(s, DeclKind::ImplicitNet, name, span);
+            }
+        }
     }
 
     fn declare(&mut self, s: ScopeId, kind: DeclKind, name: &str, span: Span) {
@@ -435,29 +458,61 @@ impl Builder<'_> {
     /// declared name of the scope conflicts.
     fn implicit_name(&self, s: ScopeId, ordinal: u32) -> String {
         let by_name = &self.tree.scopes[s.0 as usize].by_name;
+        let explicit = |n: &str| {
+            by_name
+                .get(n)
+                .is_some_and(|d| self.tree.decls[d.0 as usize].kind != DeclKind::ImplicitNet)
+        };
         let mut name = format!("genblk{ordinal}");
-        while by_name.contains_key(&name) {
+        while explicit(&name) {
             name.insert(6, '0');
         }
         name
     }
 
     /// §27.6: each construct of the scope takes the next number, in source
-    /// order, through generate regions (§27.3).
-    fn number_items(&mut self, s: ScopeId, items: &mut [ModuleItem], next: &mut u32) {
+    /// order, through generate regions (§27.3). `implicit` gets the names
+    /// that name a block.
+    fn number_items(
+        &mut self,
+        s: ScopeId,
+        items: &mut [ModuleItem],
+        next: &mut u32,
+        implicit: &mut Vec<(String, Span)>,
+    ) {
         for item in items {
             match item {
-                ModuleItem::GenerateRegion(g) => self.number_items(s, &mut g.items, next),
+                ModuleItem::GenerateRegion(g) => self.number_items(s, &mut g.items, next, implicit),
                 ModuleItem::GenerateIf(_) | ModuleItem::GenerateCase(_) => {
                     *next += 1;
                     let name = self.implicit_name(s, *next);
                     self.groups += 1;
                     let group = self.groups;
+                    let span = match item {
+                        ModuleItem::GenerateIf(g) => g.span,
+                        ModuleItem::GenerateCase(g) => g.span,
+                        _ => unreachable!(),
+                    };
+                    let before = self.tree.scopes[s.0 as usize].children.len();
                     self.conditional(s, item, *next, &name, group);
+                    let unnamed = self.tree.scopes[s.0 as usize].children[before..]
+                        .iter()
+                        .any(|c| {
+                            matches!(
+                                self.tree.scopes[c.0 as usize].kind,
+                                ScopeKind::Generate { label: None, .. }
+                            )
+                        });
+                    if unnamed {
+                        implicit.push((name, span));
+                    }
                 }
                 ModuleItem::GenerateFor(g) => {
                     *next += 1;
                     g.implicit_name = self.implicit_name(s, *next);
+                    if g.name.is_none() {
+                        implicit.push((g.implicit_name.clone(), g.span));
+                    }
                     let seg = g.name.clone().unwrap_or_else(|| g.implicit_name.clone());
                     let kind = ScopeKind::Generate {
                         label: g.name.clone(),
@@ -465,7 +520,9 @@ impl Builder<'_> {
                         indexed: true,
                     };
                     let child = self.open(Some(s), kind, Some(seg), None);
+                    self.loop_vars.push(g.var.clone());
                     self.fill(child, &mut g.items);
+                    self.loop_vars.pop();
                 }
                 ModuleItem::NestedModule(m) => {
                     let def = self.tree.nested_def(s, &m.name.name);
@@ -580,13 +637,89 @@ pub(crate) fn for_each_block_label(stmt: &Statement, f: &mut dyn FnMut(&Identifi
 /// of the scope that declares the type.
 pub(crate) fn for_each_enum_member(dt: &DataType, f: &mut dyn FnMut(&Identifier)) {
     match dt {
-        DataType::Enum(e) => e.members.iter().for_each(|m| f(&m.name)),
+        DataType::Enum(e) => {
+            for m in &e.members {
+                let Some((lo, hi)) = &m.range else {
+                    f(&m.name);
+                    continue;
+                };
+                // §6.19.2: `A[N]` names A0 to A(N-1), `A[N:M]` AN to AM.
+                let eval = |e| crate::elaborate::const_eval_i64_with_params(e, None);
+                let Some(lo) = eval(lo) else { continue };
+                let hi = eval(hi).unwrap_or(lo);
+                for i in lo.min(hi)..=lo.max(hi) {
+                    f(&Identifier {
+                        name: format!("{}{i}", m.name.name),
+                        span: m.name.span,
+                    });
+                }
+            }
+        }
         DataType::Struct(s) => {
             for m in &s.members {
                 for_each_enum_member(&m.data_type, f);
             }
         }
         _ => {}
+    }
+}
+
+/// The names `items` use at the positions of §6.10 and §31.9 in the scope
+/// they belong to.
+fn implicit_net_uses<'i>(items: &'i [ModuleItem], out: &mut Vec<(&'i str, Span)>) {
+    fn bare(e: &Expression) -> Option<(&str, Span)> {
+        match &e.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && !h.path[0].name.name.contains("::") =>
+            {
+                Some((h.path[0].name.name.as_str(), h.path[0].name.span))
+            }
+            _ => None,
+        }
+    }
+    for item in items {
+        match item {
+            ModuleItem::ContinuousAssign(c) => {
+                out.extend(c.assignments.iter().filter_map(|(l, _)| bare(l)))
+            }
+            ModuleItem::ModuleInstantiation(m) => {
+                for c in m.instances.iter().flat_map(|i| &i.connections) {
+                    if let PortConnection::Named { expr: Some(e), .. }
+                    | PortConnection::Ordered(Some(e)) = c
+                    {
+                        out.extend(bare(e));
+                    }
+                }
+            }
+            ModuleItem::GateInstantiation(g) => out.extend(
+                g.instances
+                    .iter()
+                    .flat_map(|i| &i.terminals)
+                    .filter_map(bare),
+            ),
+            ModuleItem::SpecifyBlock(b) => {
+                for (net, _) in &b.delayed_nets {
+                    out.push((net.as_str(), b.span));
+                }
+            }
+            ModuleItem::GenerateRegion(g) => implicit_net_uses(&g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (bi, (_, branch)) in g.branches.iter().enumerate() {
+                    if g.branch_direct.get(bi) == Some(&true) {
+                        implicit_net_uses(branch, out);
+                    }
+                }
+            }
+            ModuleItem::GenerateCase(g) => {
+                for arm in g.arms.iter().filter(|a| a.direct) {
+                    implicit_net_uses(&arm.items, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
