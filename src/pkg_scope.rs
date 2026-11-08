@@ -497,6 +497,7 @@ fn arg_type(e: &Expression) -> Option<DataType> {
                         span: e.span,
                     },
                     span: e.span,
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),

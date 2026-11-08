@@ -1112,6 +1112,7 @@ impl Parser {
                     .collect(),
                 name,
                 span: ty_expr.span,
+                bound: Default::default(),
             },
             dimensions: Vec::new(),
             type_args: Vec::new(),

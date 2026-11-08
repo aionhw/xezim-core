@@ -72,6 +72,9 @@ pub struct TypeName {
     pub scopes: Vec<TypeScope>,
     pub name: Identifier,
     pub span: Span,
+    /// §23.9: the binding of an unscoped name.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
 }
 
 impl TypeName {

@@ -267,6 +267,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: false, // forward CLASS — resolved via a class decl, not checked here
+                decl: Default::default(),
             };
         }
         // §6.18: KEYWORD-qualified forward form — `typedef struct T;`,
@@ -295,6 +296,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                decl: Default::default(),
             };
         }
         // IEEE 1800-2017 §6.18: bare forward type declaration `typedef name;`
@@ -310,6 +312,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                decl: Default::default(),
             };
         }
         let data_type = self.parse_data_type();
@@ -322,6 +325,7 @@ impl Parser {
             dimensions,
             span: self.span_from(start),
             forward: false,
+            decl: Default::default(),
         }
     }
 
@@ -930,6 +934,7 @@ impl Parser {
             scopes,
             name,
             span: self.span_from(start),
+            bound: Default::default(),
         }
     }
     /// The return type of a function declaration or prototype: an explicit
@@ -1210,6 +1215,7 @@ impl Parser {
                         scopes: Vec::new(),
                         name: iface_name,
                         span: self.span_from(start),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args: Vec::new(),

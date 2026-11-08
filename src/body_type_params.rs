@@ -47,6 +47,7 @@ fn aliases(pd: &ParameterDeclaration) -> Option<Vec<TypedefDeclaration>> {
                 dimensions: Vec::new(),
                 span: pd.span,
                 forward: false,
+                decl: Default::default(),
             })
         })
         .collect()

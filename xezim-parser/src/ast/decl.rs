@@ -575,6 +575,9 @@ pub struct ClockingDeclaration {
     /// was declared without an event — implementation-defined behavior.
     #[cfg_attr(feature = "serde", serde(default))]
     pub clock_signal: Option<Identifier>,
+    /// §23.9: the binding of `clock_signal`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub clock_bound: super::binding::Bound,
     /// LRM §14.3: the clock event's EDGE (`posedge`/`negedge`/`edge`). `None`
     /// when unspecified — the simulator defaults to posedge. Without this the
     /// block would always sync on posedge even for `@(negedge clk)`.
@@ -905,6 +908,9 @@ pub struct PropertyDeclaration {
     pub body: Option<super::expr::Expression>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
+    /// The declaration's id in its definition's tree, from the binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +929,9 @@ pub struct SequenceDeclaration {
     pub body: Option<super::expr::Expression>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
+    /// The declaration's id in its definition's tree, from the binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
 }
 
 #[derive(Debug, Clone)]
@@ -1134,6 +1143,9 @@ pub struct TypedefDeclaration {
     /// full typedef in the same scope; elaboration errors otherwise.
     #[cfg_attr(feature = "serde", serde(default))]
     pub forward: bool,
+    /// The declaration's id in its definition's tree, from the binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1470,6 +1482,10 @@ pub struct ClassExtends {
     /// constructor's arguments are forwarded to the superclass constructor.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_args: bool,
+    /// §6.18, §8.13: the binding of an unscoped base's name (a typedef may
+    /// name the class).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
 }
 
 /// Items that can appear inside a class body.
