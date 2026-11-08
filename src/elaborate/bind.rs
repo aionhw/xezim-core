@@ -1983,13 +1983,7 @@ fn rename_like_expansion(items: &mut Vec<ModuleItem>) {
 }
 
 fn rename_arm(items: &[ModuleItem], label: Option<&String>, implicit: &str) -> Vec<ModuleItem> {
-    match label {
-        Some(l) => rename_decls_in_iter(items, &GenRename::Scope(l)),
-        None => {
-            let scope = gen_scope_name(None, implicit);
-            rename_decls_in_iter(items, &GenRename::Subroutines(&scope))
-        }
-    }
+    rename_decls_in_iter(items, &GenRename::Scope(&gen_scope_name(label, implicit)))
 }
 
 /// §27.5: the task `path` names from scope `from`: each segment but the last
@@ -2105,43 +2099,18 @@ impl AuditLine {
 }
 
 /// The name the rename gives a declaration, when it renames that kind: a
-/// block's subroutines always; its data, parameters and instances unless the
-/// block is unlabelled, where they keep the enclosing spelling (§27.6).
+/// block's subroutines, data, nets, parameters and instances (§27.5, §27.6).
 fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> Option<String> {
     let key = match kind {
-        DeclKind::Function | DeclKind::Task => tree.key(scope, name, &[]),
-        DeclKind::Data | DeclKind::Net | DeclKind::Param | DeclKind::Instance => {
-            data_key(tree, scope, name)
-        }
+        DeclKind::Function
+        | DeclKind::Task
+        | DeclKind::Data
+        | DeclKind::Net
+        | DeclKind::Param
+        | DeclKind::Instance => tree.key(scope, name, &[]),
         _ => return None,
     };
     (key != name).then_some(key)
-}
-
-/// The rename's spelling of data of scope `s`, unlabelled blocks left out.
-fn data_key(tree: &ScopeTree, s: ScopeId, name: &str) -> String {
-    let mut segs = Vec::new();
-    let mut at = Some(s);
-    while let Some(s) = at {
-        let sc = &tree.scopes[s.0 as usize];
-        match &sc.kind {
-            ScopeKind::Generate {
-                label: None,
-                indexed: false,
-                ..
-            }
-            | ScopeKind::Definition => {}
-            ScopeKind::Generate { indexed, .. } => segs.push(match (&sc.seg, indexed) {
-                (Some(g), true) => format!("{g}[@]"),
-                (Some(g), false) => g.clone(),
-                (None, _) => String::new(),
-            }),
-        }
-        at = sc.parent;
-    }
-    segs.reverse();
-    segs.push(name.to_string());
-    segs.join(".")
 }
 
 fn outer_keys(tree: &ScopeTree, s: ScopeId, name: &str) -> Vec<String> {
@@ -2149,7 +2118,6 @@ fn outer_keys(tree: &ScopeTree, s: ScopeId, name: &str) -> Vec<String> {
     let mut at = tree.scopes[s.0 as usize].parent;
     while let Some(a) = at {
         keys.push(tree.key(a, name, &[]));
-        keys.push(data_key(tree, a, name));
         at = tree.scopes[a.0 as usize].parent;
     }
     keys
