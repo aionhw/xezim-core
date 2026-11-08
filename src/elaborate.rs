@@ -52888,7 +52888,9 @@ mod generated_instance_tests {
                 "module top; for(genvar {loop_header}) begin: bank mem m(); end endmodule"
             ));
             assert!(result.errors.is_empty(), "{:?}", result.errors);
-            let crate::ast::Description::Module(module) = &result.source.descriptions[0] else {
+            let mut descs = result.source.descriptions;
+            crate::scope_tree::build_design(&mut descs);
+            let crate::ast::Description::Module(module) = &descs[0] else {
                 panic!("missing top");
             };
             let items = collect_effective_items(&module.items, &HashMap::default());

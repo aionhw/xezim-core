@@ -1,13 +1,13 @@
 //! Lexical binding: §23.9 innermost scope first, §26.3 imports, §8 and §13 hiding,
-//! §23.8.1 upward. Each test asserts what a name binds to and what the generate
-//! rename made of it. `disagree` marks where the two differ.
+//! §23.8.1 upward. Each test asserts what a name binds to and the key the
+//! generate rename gives it.
 
 use xezim_core::ast::Description;
 use xezim_core::ast::binding::{Bound, DeclKind};
 use xezim_core::ast::decl::ModuleItem;
 use xezim_core::ast::expr::ExprKind;
 use xezim_core::ast::stmt::StatementKind;
-use xezim_core::elaborate::bind::{AuditLine, Disagree, Hide, Outcome, audit_design};
+use xezim_core::elaborate::bind::{AuditLine, Hide, Outcome, audit_design};
 use xezim_core::scope_tree::{build_design, tree_of};
 
 fn audit(src: &str) -> Vec<AuditLine> {
@@ -26,10 +26,9 @@ fn at<'a>(lines: &'a [AuditLine], name: &str, nth: usize) -> &'a AuditLine {
         .unwrap_or_else(|| panic!("mention {nth} of {name} not in {lines:#?}"))
 }
 
-fn check(l: &AuditLine, binding: &str, renamed: Option<&str>, disagree: Option<Disagree>) {
+fn check(l: &AuditLine, binding: &str, renamed: Option<&str>) {
     assert_eq!(l.binding, binding, "{l:?}");
     assert_eq!(l.renamed.as_deref(), renamed, "{l:?}");
-    assert_eq!(l.disagree, disagree, "{l:?}");
 }
 
 const BLOCK_F: &str = "function automatic int f(); return 5; endfunction";
@@ -44,7 +43,6 @@ fn a_bare_call_binds_to_the_function_of_its_block() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -63,14 +61,9 @@ fn the_innermost_block_that_declares_the_name_wins() {
       initial $display(f());
     endmodule";
     let l = audit(src);
-    check(
-        at(&l, "f", 0),
-        "Decl(top.g.h, Function)",
-        Some("g.h.f"),
-        None,
-    );
-    check(at(&l, "f", 1), "Decl(top.g, Function)", Some("g.f"), None);
-    check(at(&l, "f", 2), "Decl(top, Function)", None, None);
+    check(at(&l, "f", 0), "Decl(top.g.h, Function)", Some("g.h.f"));
+    check(at(&l, "f", 1), "Decl(top.g, Function)", Some("g.f"));
+    check(at(&l, "f", 2), "Decl(top, Function)", None);
 }
 
 #[test]
@@ -82,7 +75,6 @@ fn a_call_from_a_nested_block_binds_to_the_enclosing_blocks_function() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -93,7 +85,6 @@ fn a_subroutine_of_an_unlabelled_block_is_named_by_its_implicit_scope() {
         at(&audit(&src), "f", 0),
         "Decl(top.genblk1, Function)",
         Some("genblk1.f"),
-        None,
     );
 }
 
@@ -104,7 +95,6 @@ fn data_of_an_unlabelled_block_is_named_by_its_implicit_scope() {
         at(&audit(src), "x", 0),
         "Decl(top.genblk1, Data)",
         Some("genblk1.x"),
-        None,
     );
 }
 
@@ -115,7 +105,6 @@ fn data_of_a_labelled_block_inside_an_unlabelled_one_takes_both_scopes() {
         at(&audit(src), "x", 0),
         "Decl(top.genblk1.h, Data)",
         Some("genblk1.h.x"),
-        None,
     );
 }
 
@@ -128,7 +117,6 @@ fn a_directly_nested_branch_opens_no_scope() {
         at(&audit(&src), "f", 0),
         "Decl(top.d, Function)",
         Some("d.f"),
-        None,
     );
 }
 
@@ -139,13 +127,8 @@ fn a_generate_loop_scope_is_indexed_and_its_variable_is_not_bound() {
         initial x = f();
       end endmodule";
     let l = audit(src);
-    check(at(&l, "x", 0), "Decl(top.g[@], Data)", Some("g[@].x"), None);
-    check(
-        at(&l, "f", 0),
-        "Decl(top.g[@], Function)",
-        Some("g[@].f"),
-        None,
-    );
+    check(at(&l, "x", 0), "Decl(top.g[@], Data)", Some("g[@].x"));
+    check(at(&l, "f", 0), "Decl(top.g[@], Function)", Some("g[@].f"));
     assert_eq!(at(&l, "i", 0).outcome, Outcome::None(Hide::Loop));
 }
 
@@ -157,7 +140,6 @@ fn an_unlabelled_loop_renames_data_under_its_implicit_name() {
         at(&audit(src), "x", 0),
         "Decl(top.genblk1[@], Data)",
         Some("genblk1[@].x"),
-        None,
     );
 }
 
@@ -170,16 +152,16 @@ fn a_case_arm_is_a_scope_of_its_own() {
       endcase
     endmodule";
     let l = audit(src);
-    check(at(&l, "x", 0), "Decl(top.a, Data)", Some("a.x"), None);
-    check(at(&l, "x", 1), "Decl(top.b, Data)", Some("b.x"), None);
-    check(at(&l, "P", 0), "Decl(top, Param)", None, None);
+    check(at(&l, "x", 0), "Decl(top.a, Data)", Some("a.x"));
+    check(at(&l, "x", 1), "Decl(top.b, Data)", Some("b.x"));
+    check(at(&l, "P", 0), "Decl(top, Param)", None);
 }
 
 #[test]
 fn a_block_label_binds_in_the_enclosing_scope_as_a_path_head() {
     let src =
         format!("module top; if (1) begin : g {BLOCK_F} end initial $display(g.f()); endmodule");
-    check(at(&audit(&src), "g", 0), "Decl(top, Label)", None, None);
+    check(at(&audit(&src), "g", 0), "Decl(top, Label)", None);
 }
 
 #[test]
@@ -190,7 +172,6 @@ fn an_instance_in_a_block_binds_as_a_path_head() {
         at(&audit(src), "u", 0),
         "Decl(top.g, Instance)",
         Some("g.u"),
-        None,
     );
 }
 
@@ -204,13 +185,8 @@ fn a_gate_instance_is_a_name_the_rename_leaves_alone_and_a_type_takes_the_blocks
         initial $display(u.n);
       end endmodule";
     let l = audit(src);
-    check(
-        at(&l, "t_t", 0),
-        "Decl(top.g, Typedef)",
-        Some("g.t_t"),
-        None,
-    );
-    check(at(&l, "u", 0), "Decl(top.g, Gate)", None, None);
+    check(at(&l, "t_t", 0), "Decl(top.g, Typedef)", Some("g.t_t"));
+    check(at(&l, "u", 0), "Decl(top.g, Gate)", None);
 }
 
 #[test]
@@ -222,8 +198,8 @@ fn a_typedefs_dimension_takes_the_blocks_parameter() {
     let l = audit(src);
     let w = at(&l, "W", 0);
     assert_eq!(w.pos, "typedef");
-    check(w, "Decl(top.g, Param)", Some("g.W"), None);
-    check(at(&l, "t", 0), "Decl(top.g, Typedef)", Some("g.t"), None);
+    check(w, "Decl(top.g, Param)", Some("g.W"));
+    check(at(&l, "t", 0), "Decl(top.g, Typedef)", Some("g.t"));
 }
 
 #[test]
@@ -237,13 +213,13 @@ fn a_loop_variable_a_constraint_cast_and_a_local_typedef_name_the_blocks_type() 
     let l = audit(src);
     let k = at(&l, "t", 0);
     assert_eq!(k.pos, "constraint");
-    check(k, "Decl(top.g, Typedef)", Some("g.t"), None);
+    check(k, "Decl(top.g, Typedef)", Some("g.t"));
     let f = at(&l, "t", 1);
     assert_eq!(f.pos, "local-dim");
-    check(f, "Decl(top.g, Typedef)", Some("g.t"), None);
+    check(f, "Decl(top.g, Typedef)", Some("g.t"));
     let v = at(&l, "t", 2);
     assert_eq!(v.outcome, Outcome::None(Hide::Type));
-    check(v, "none", None, None);
+    check(v, "none", None);
 }
 
 #[test]
@@ -254,7 +230,7 @@ fn a_forward_class_typedef_and_its_class_keep_their_name() {
         class C; endclass
       end endmodule";
     let l = audit(src);
-    check(at(&l, "C", 0), "Decl(top.g, Class)", None, None);
+    check(at(&l, "C", 0), "Decl(top.g, Class)", None);
 }
 
 #[test]
@@ -266,8 +242,8 @@ fn a_function_body_names_its_result_through_the_functions_own_declaration() {
         function automatic int h(); h = 2; endfunction
       end endmodule";
     let l = audit(src);
-    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"), None);
-    check(at(&l, "h", 0), "Decl(top.g, Function)", Some("g.h"), None);
+    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"));
+    check(at(&l, "h", 0), "Decl(top.g, Function)", Some("g.h"));
 }
 
 #[test]
@@ -279,7 +255,6 @@ fn a_recursive_call_binds_to_the_function_itself() {
         at(&audit(src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -291,7 +266,7 @@ fn a_formal_hides_a_block_function_in_the_body() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Formal));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 fn at_outcome(src: &str, name: &str) -> AuditLine {
@@ -305,9 +280,9 @@ fn a_formal_default_binds_in_the_declaring_scope_not_among_the_formals() {
         function automatic int f(int a = b, int b = 1); return a + b; endfunction
       end endmodule";
     let l = audit(src);
-    check(at(&l, "b", 0), "Decl(top.g, Data)", Some("g.b"), None);
+    check(at(&l, "b", 0), "Decl(top.g, Data)", Some("g.b"));
     assert_eq!(at(&l, "b", 1).outcome, Outcome::None(Hide::Formal));
-    check(at(&l, "b", 1), "none", None, None);
+    check(at(&l, "b", 1), "none", None);
 }
 
 #[test]
@@ -318,7 +293,7 @@ fn a_subroutine_local_hides_a_block_function_with_the_rename_agreeing() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Local));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -329,7 +304,7 @@ fn a_for_variable_hides_a_block_declaration_in_the_loop() {
     let l = audit(src);
     for nth in 0..3 {
         assert_eq!(at(&l, "i", nth).outcome, Outcome::None(Hide::Loop));
-        check(at(&l, "i", nth), "none", None, None);
+        check(at(&l, "i", nth), "none", None);
     }
 }
 
@@ -340,8 +315,8 @@ fn a_foreach_variable_hides_a_block_declaration_in_the_loop() {
       end endmodule";
     let l = audit(src);
     assert_eq!(at(&l, "i", 0).outcome, Outcome::None(Hide::Loop));
-    check(at(&l, "i", 0), "none", None, None);
-    check(at(&l, "a", 0), "Decl(top.g, Data)", Some("g.a"), None);
+    check(at(&l, "i", 0), "none", None);
+    check(at(&l, "a", 0), "Decl(top.g, Data)", Some("g.a"));
 }
 
 #[test]
@@ -355,7 +330,6 @@ fn an_inner_block_import_is_found_after_the_blocks_own_names() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -369,7 +343,6 @@ fn the_block_function_wins_over_a_wildcard_import_of_the_module() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -379,8 +352,8 @@ fn a_wildcard_import_answers_only_for_a_name_its_package_declares() {
       module top; import p::*; initial begin $display(f()); $display(q()); end endmodule";
     let l = audit(src);
     assert_eq!(at(&l, "f", 0).outcome, Outcome::None(Hide::Import));
-    check(at(&l, "f", 0), "none", None, None);
-    check(at(&l, "q", 0), "Upward", None, None);
+    check(at(&l, "f", 0), "none", None);
+    check(at(&l, "q", 0), "Upward", None);
 }
 
 #[test]
@@ -419,7 +392,7 @@ fn a_name_nothing_declares_binds_upward() {
     // §23.8.1.
     let src = "module c; initial $display(f()); endmodule
       module top; function automatic int f(); return 1; endfunction c u(); endmodule";
-    check(at(&audit(src), "f", 0), "Upward", None, None);
+    check(at(&audit(src), "f", 0), "Upward", None);
 }
 
 #[test]
@@ -438,9 +411,9 @@ fn a_nested_module_reads_the_outer_modules_names() {
             Outcome::None(Hide::Outer),
             "{name}"
         );
-        check(at(&l, name, 0), "none", None, None);
+        check(at(&l, name, 0), "none", None);
     }
-    check(at(&l, "f", 0), "Upward", None, None);
+    check(at(&l, "f", 0), "Upward", None);
 }
 
 #[test]
@@ -449,8 +422,8 @@ fn same_named_nested_modules_in_two_parents_keep_their_own_trees() {
     let src = "module a; module inner; int x; initial x = 1; endmodule inner u(); endmodule
       module b; module inner; int y; initial y = 1; endmodule inner u(); endmodule";
     let l = audit(src);
-    check(at(&l, "x", 0), "Decl(a.inner, Data)", None, None);
-    check(at(&l, "y", 0), "Decl(b.inner, Data)", None, None);
+    check(at(&l, "x", 0), "Decl(a.inner, Data)", None);
+    check(at(&l, "y", 0), "Decl(b.inner, Data)", None);
 
     let parsed = xezim_core::parse(src);
     let mut descs = parsed.source.descriptions;
@@ -469,8 +442,8 @@ fn a_checker_in_a_generate_block_is_keyed_by_the_block() {
       if (1) begin : h checker ck; int y; initial y = 1; endchecker end
     endmodule";
     let l = audit(src);
-    check(at(&l, "x", 0), "Decl(top.g.ck, Data)", None, None);
-    check(at(&l, "y", 0), "Decl(top.h.ck, Data)", None, None);
+    check(at(&l, "x", 0), "Decl(top.g.ck, Data)", None);
+    check(at(&l, "y", 0), "Decl(top.h.ck, Data)", None);
 }
 
 #[test]
@@ -482,7 +455,6 @@ fn a_subroutine_of_a_block_in_a_nested_module_is_renamed_like_any_other() {
         at(&audit(&src), "f", 0),
         "Decl(top.inner.a, Function)",
         Some("a.f"),
-        None,
     );
 }
 
@@ -499,27 +471,20 @@ fn a_scope_randomization_has_no_class_to_search_first() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
 #[test]
-fn a_path_through_the_outer_block_binds_at_its_head_and_the_rename_takes_it_for_the_inner_function()
-{
-    // The rename's dotted key `g.f` is the inner block's: not a hiding case.
-    // §23.6: `g.f` names the outer function from the inner block.
+fn a_path_through_the_outer_block_binds_at_its_head_and_keeps_its_spelling() {
+    // §23.6: `g.f` names the outer function from the inner block; its head
+    // is the label `g`, which the rename does not rename.
     let src = "module top; if (1) begin : g
         function automatic int f(); return 1; endfunction
         if (1) begin : h
           function automatic int f(); return g.f(); endfunction
         end
       end endmodule";
-    check(
-        at(&audit(src), "g", 0),
-        "Decl(top, Label)",
-        Some("g.h.f"),
-        Some(Disagree::Other),
-    );
+    check(at(&audit(src), "g", 0), "Decl(top, Label)", None);
 }
 
 #[test]
@@ -530,14 +495,9 @@ fn a_local_data_type_takes_the_blocks_parameter_and_a_shallow_copy_is_missed() {
         initial begin logic [W:0] v; C n; n = new o; end
       end endmodule";
     let l = audit(src);
-    check(at(&l, "W", 0), "Decl(top.g, Param)", Some("g.W"), None);
+    check(at(&l, "W", 0), "Decl(top.g, Param)", Some("g.W"));
     assert_eq!(at(&l, "W", 0).pos, "local-dim");
-    check(
-        at(&l, "o", 0),
-        "Decl(top.g, Data)",
-        None,
-        Some(Disagree::Unvisited),
-    );
+    check(at(&l, "o", 0), "Decl(top.g, Data)", None);
     assert_eq!(at(&l, "o", 0).pos, "shallow-copy");
 }
 
@@ -551,7 +511,7 @@ fn block_data_in_a_local_data_type_keeps_its_bare_name() {
     let l = audit(src);
     let m = at(&l, "mem", 0);
     assert_eq!(m.pos, "local-dim");
-    check(m, "Decl(top.g, Data)", None, Some(Disagree::Unvisited));
+    check(m, "Decl(top.g, Data)", None);
 }
 
 #[test]
@@ -565,18 +525,18 @@ fn parameter_values_dimensions_and_generate_conditions_bind_in_the_enclosing_sco
     let l = audit(src);
     assert_eq!(l.iter().filter(|m| m.name == "N").count(), 6);
     for m in l.iter().filter(|m| m.name == "N") {
-        check(m, "Decl(top, Param)", None, None);
+        check(m, "Decl(top, Param)", None);
     }
-    check(at(&l, "M", 0), "Decl(top, Param)", None, None);
-    check(at(&l, "L", 0), "Decl(top.g, Param)", Some("g.L"), None);
+    check(at(&l, "M", 0), "Decl(top, Param)", None);
+    check(at(&l, "L", 0), "Decl(top.g, Param)", Some("g.L"));
 }
 
 #[test]
 fn header_parameters_and_ports_bind_in_the_definition() {
     let src = "module top #(parameter A = 1, parameter B = A) (input logic [A:0] p); endmodule";
     let l = audit(src);
-    check(at(&l, "A", 0), "Decl(top, Param)", None, None);
-    check(at(&l, "A", 1), "Decl(top, Param)", None, None);
+    check(at(&l, "A", 0), "Decl(top, Param)", None);
+    check(at(&l, "A", 1), "Decl(top, Param)", None);
 }
 
 // Hiding: a name an inner scope hides keeps its spelling (§23.9, §6.21).
@@ -589,7 +549,7 @@ fn a_block_local_hides_a_block_function_of_the_same_name() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Local));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -600,10 +560,9 @@ fn a_local_hides_only_from_its_declaration() {
            initial begin int a = f(); int f = 7; $display(a, f); end end endmodule"
     );
     let l = audit(&src);
-    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"), None);
+    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"));
     assert_eq!(at(&l, "f", 1).outcome, Outcome::None(Hide::Local));
     assert_eq!(at(&l, "f", 1).renamed, None);
-    assert_eq!(at(&l, "f", 1).disagree, None);
 }
 
 #[test]
@@ -612,7 +571,7 @@ fn a_block_local_hides_block_data_of_the_same_name() {
         initial begin int x = 7; $display(x); end end endmodule";
     let l = at_outcome(src, "x");
     assert_eq!(l.outcome, Outcome::None(Hide::Local));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -623,7 +582,7 @@ fn a_local_enum_label_hides_a_block_function() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Type));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -633,12 +592,7 @@ fn an_enum_label_of_an_inner_block_hides_a_block_function() {
            if (1) begin : h typedef enum {{f = 9}} e_t; initial $display(f); end
          end endmodule"
     );
-    check(
-        at(&audit(&src), "f", 0),
-        "Decl(top.g.h, EnumMember)",
-        None,
-        None,
-    );
+    check(at(&audit(&src), "f", 0), "Decl(top.g.h, EnumMember)", None);
 }
 
 #[test]
@@ -648,12 +602,7 @@ fn an_enum_label_inside_a_struct_is_a_name_of_the_block() {
         struct { enum { A, B } e; } s;
         initial $display(A);
       end endmodule";
-    check(
-        at(&audit(src), "A", 0),
-        "Decl(top.g, EnumMember)",
-        None,
-        None,
-    );
+    check(at(&audit(src), "A", 0), "Decl(top.g, EnumMember)", None);
 }
 
 #[test]
@@ -666,7 +615,7 @@ fn an_explicit_import_in_an_inner_block_hides_a_block_function() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Import));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -680,7 +629,7 @@ fn a_wildcard_import_in_an_inner_block_comes_before_the_outer_block() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Import));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -698,7 +647,7 @@ fn an_inner_clocking_block_hides_a_block_function() {
         .iter()
         .find(|m| m.name == "f" && m.pos == "process")
         .expect("the event");
-    check(m, "Decl(top.g.h, Clocking)", None, None);
+    check(m, "Decl(top.g.h, Clocking)", None);
 }
 
 #[test]
@@ -710,7 +659,7 @@ fn a_named_block_hides_a_block_task_for_a_disable_inside_it() {
       end endmodule";
     let l = at_outcome(src, "t");
     assert_eq!(l.outcome, Outcome::None(Hide::Label));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -725,7 +674,7 @@ fn a_class_member_wins_over_a_block_function_in_a_randomize_with() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Member));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -738,7 +687,7 @@ fn a_name_no_class_declares_binds_lexically_in_a_randomize_with() {
          end endmodule"
     );
     let l = audit(&src);
-    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"), None);
+    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"));
     assert_eq!(at(&l, "x", 0).outcome, Outcome::None(Hide::Member));
 }
 
@@ -763,7 +712,7 @@ fn a_matches_variable_hides_in_the_true_branch_only() {
       end endmodule";
     let l = audit(src);
     assert_eq!(at(&l, "v", 0).outcome, Outcome::None(Hide::Pattern));
-    check(at(&l, "v", 1), "Decl(top.g, Data)", Some("g.v"), None);
+    check(at(&l, "v", 1), "Decl(top.g, Data)", Some("g.v"));
 }
 
 // Classes.
@@ -781,7 +730,7 @@ fn a_class_member_wins_over_a_block_function() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Member));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -823,7 +772,7 @@ fn a_type_parameter_base_leaves_only_a_name_some_class_declares_unbound() {
     );
     let l = audit(&src);
     assert_eq!(at(&l, "f", 0).outcome, Outcome::None(Hide::Member));
-    check(at(&l, "h", 0), "Decl(top.g, Function)", Some("g.h"), None);
+    check(at(&l, "h", 0), "Decl(top.g, Function)", Some("g.h"));
 }
 
 #[test]
@@ -854,14 +803,9 @@ fn a_constraint_binds_class_members_first_and_then_the_block() {
     let l = audit(&src);
     assert_eq!(at(&l, "x", 0).outcome, Outcome::None(Hide::Member));
     // The solver resolves block data by its bare name.
-    check(
-        at(&l, "lim", 0),
-        "Decl(top.g, Data)",
-        None,
-        Some(Disagree::Unvisited),
-    );
+    check(at(&l, "lim", 0), "Decl(top.g, Data)", None);
     assert_eq!(at(&l, "lim", 0).pos, "constraint");
-    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"), None);
+    check(at(&l, "f", 0), "Decl(top.g, Function)", Some("g.f"));
 }
 
 // §23.9: positions outside processes and subroutines.
@@ -875,7 +819,7 @@ fn expect_renamed(body: &str, pos: &str) {
         .iter()
         .find(|m| m.name == "f" && m.pos == pos)
         .unwrap_or_else(|| panic!("no {pos} mention in {l:#?}"));
-    check(m, "Decl(top.g, Function)", Some("g.f"), None);
+    check(m, "Decl(top.g, Function)", Some("g.f"));
 }
 
 #[test]
@@ -945,7 +889,7 @@ fn a_method_default_a_property_initializer_and_a_nested_class_are_renamed() {
     );
     let l = audit(&src);
     for n in 0..3 {
-        check(at(&l, "f", n), "Decl(top.g, Function)", Some("g.f"), None);
+        check(at(&l, "f", n), "Decl(top.g, Function)", Some("g.f"));
     }
 }
 
@@ -963,7 +907,6 @@ fn a_class_in_a_nested_block_is_renamed_to_the_nearest_function() {
         at(&audit(&src), "f", 0),
         "Decl(top.g.h, Function)",
         Some("g.h.f"),
-        None,
     );
 }
 
@@ -981,7 +924,6 @@ fn a_member_a_local_and_a_formal_of_a_class_keep_the_name_of_a_block_function() 
     for n in 0..3 {
         let m = at(&l, "f", n);
         assert_eq!(m.renamed, None, "{m:?}");
-        assert_eq!(m.disagree, None, "{m:?}");
     }
 }
 
@@ -999,7 +941,6 @@ fn a_formal_of_a_property_a_sequence_and_a_let_keeps_the_name_of_a_block_functio
     for n in 0..3 {
         let m = at(&l, "f", n);
         assert_eq!(m.renamed, None, "{m:?}");
-        assert_eq!(m.disagree, None, "{m:?}");
     }
 }
 
@@ -1015,7 +956,7 @@ fn block_data_read_from_a_final_block_or_a_class_takes_the_blocks_key() {
     for (n, pos) in [(1, "final"), (2, "class")] {
         let m = at(&l, "v", n);
         assert_eq!(m.pos, pos);
-        check(m, "Decl(top.g, Data)", Some("g.v"), None);
+        check(m, "Decl(top.g, Data)", Some("g.v"));
     }
 }
 
@@ -1028,7 +969,7 @@ fn a_clocking_event_names_the_block_data_by_its_key() {
     let l = audit(src);
     let m = l.iter().find(|m| m.name == "c").expect("the clock");
     assert_eq!(m.pos, "clocking");
-    check(m, "Decl(top.g, Data)", Some("g.c"), None);
+    check(m, "Decl(top.g, Data)", Some("g.c"));
 }
 
 #[test]
@@ -1037,7 +978,7 @@ fn a_dpi_export_binds_to_the_block_function_the_rename_misses() {
         "module top; if (1) begin : g {BLOCK_F} export \"DPI-C\" function f; end endmodule"
     );
     let l = at_outcome(&src, "f");
-    check(&l, "Decl(top.g, Function)", None, Some(Disagree::Unvisited));
+    check(&l, "Decl(top.g, Function)", None);
 }
 
 // `disable`.
@@ -1048,12 +989,7 @@ fn a_disable_inside_the_block_binds_to_its_task() {
         task automatic t(); endtask
         initial disable t;
       end endmodule";
-    check(
-        at(&audit(src), "t", 0),
-        "Decl(top.g, Task)",
-        Some("g.t"),
-        None,
-    );
+    check(at(&audit(src), "t", 0), "Decl(top.g, Task)", Some("g.t"));
 }
 
 #[test]
@@ -1061,7 +997,7 @@ fn a_disable_by_path_names_the_block_task_by_its_key() {
     // §9.6.2, §23.9.
     let src = "module top; if (1) begin : g task automatic t(); endtask end
       initial disable g.t; endmodule";
-    check(at(&audit(src), "g.t", 0), "Decl(top.g, Task)", None, None);
+    check(at(&audit(src), "g.t", 0), "Decl(top.g, Task)", None);
 }
 
 #[test]
@@ -1071,12 +1007,7 @@ fn a_disable_by_path_from_inside_a_block_names_the_key_from_the_definition() {
         if (1) begin : h task automatic t(); endtask end
         initial disable h.t;
       end endmodule";
-    check(
-        at(&audit(src), "g.h.t", 0),
-        "Decl(top.g.h, Task)",
-        None,
-        None,
-    );
+    check(at(&audit(src), "g.h.t", 0), "Decl(top.g.h, Task)", None);
 }
 
 #[test]
@@ -1086,12 +1017,7 @@ fn a_disable_by_path_into_a_loop_block_takes_the_literal_index() {
         task automatic t(); endtask
       end
       initial disable g[1].t; endmodule";
-    check(
-        at(&audit(src), "g[1].t", 0),
-        "Decl(top.g[@], Task)",
-        None,
-        None,
-    );
+    check(at(&audit(src), "g[1].t", 0), "Decl(top.g[@], Task)", None);
 }
 
 #[test]
@@ -1216,7 +1142,7 @@ fn a_named_block_under_an_unnamed_fork_is_a_name_of_the_enclosing_block() {
       end endmodule";
     let l = at_outcome(src, "t");
     assert_eq!(l.outcome, Outcome::None(Hide::Label));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -1231,7 +1157,7 @@ fn a_named_block_under_an_unnamed_begin_is_a_name_of_the_enclosing_block() {
       end endmodule";
     let l = at_outcome(src, "t");
     assert_eq!(l.outcome, Outcome::None(Hide::Label));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -1244,12 +1170,7 @@ fn an_unnamed_block_with_a_declaration_keeps_its_labels_to_itself() {
           disable t;
         end
       end endmodule";
-    check(
-        at(&audit(src), "t", 0),
-        "Decl(top.g, Task)",
-        Some("g.t"),
-        None,
-    );
+    check(at(&audit(src), "t", 0), "Decl(top.g, Task)", Some("g.t"));
 }
 
 #[test]
@@ -1259,7 +1180,7 @@ fn a_named_block_under_a_process_level_unnamed_begin_is_a_path_head_of_the_modul
         initial begin begin : b int x; end end
         initial $display(b.x);
       endmodule";
-    check(at(&audit(src), "b", 0), "Decl(top, Label)", None, None);
+    check(at(&audit(src), "b", 0), "Decl(top, Label)", None);
 }
 
 #[test]
@@ -1353,8 +1274,8 @@ fn a_local_hides_the_innermost_of_two_block_functions_and_keeps_its_spelling() {
     );
     let l = audit(&src);
     let f: Vec<_> = l.iter().filter(|m| m.name == "f").collect();
-    check(f[0], "none", None, None);
-    check(f[1], "Decl(top.g.h, Function)", Some("g.h.f"), None);
+    check(f[0], "none", None);
+    check(f[1], "Decl(top.g.h, Function)", Some("g.h.f"));
 }
 
 #[test]
@@ -1369,7 +1290,6 @@ fn nested_block_data_named_like_an_outer_block_function_is_renamed() {
         at(&audit(&src), "f", 0),
         "Decl(top.g.h, Data)",
         Some("g.h.f"),
-        None,
     );
 }
 
@@ -1384,7 +1304,7 @@ fn a_unit_scoped_call_in_a_block_that_declares_the_name_is_not_renamed() {
     );
     let l = audit(&src);
     let m = l.iter().find(|m| m.name.ends_with("f")).expect("the call");
-    check(m, "none", None, None);
+    check(m, "none", None);
 }
 
 #[test]
@@ -1446,7 +1366,6 @@ fn a_known_receiver_without_the_name_leaves_it_to_the_block() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -1464,7 +1383,6 @@ fn a_block_level_handle_declared_after_its_use_is_a_known_receiver() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -1481,7 +1399,6 @@ fn a_formal_handle_is_a_known_receiver() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -1496,7 +1413,7 @@ fn a_member_of_a_known_receivers_class_wins_over_the_block() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Member));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -1511,7 +1428,7 @@ fn a_member_inherited_through_a_package_qualified_base_wins_over_the_block() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Member));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -1525,7 +1442,7 @@ fn a_known_receiver_with_an_unknown_base_leaves_the_name_to_a_member() {
     );
     let l = at_outcome(&src, "f");
     assert_eq!(l.outcome, Outcome::None(Hide::Member));
-    check(&l, "none", None, None);
+    check(&l, "none", None);
 }
 
 #[test]
@@ -1554,7 +1471,6 @@ fn std_randomize_searches_no_class() {
         at(&audit(&src), "f", 0),
         "Decl(top.g, Function)",
         Some("g.f"),
-        None,
     );
 }
 
@@ -1591,7 +1507,7 @@ fn the_std_classes_bind_as_imports() {
     let l = audit(src);
     for name in ["process", "mailbox", "semaphore"] {
         assert_eq!(why(at(&l, name, 0)), Hide::Import, "{name}");
-        check(at(&l, name, 0), "none", None, None);
+        check(at(&l, name, 0), "none", None);
     }
 }
 
@@ -1602,7 +1518,7 @@ fn a_user_class_named_like_a_std_class_is_found_first() {
       module top; class semaphore; endclass initial begin mailbox m; semaphore s; end endmodule";
     let l = audit(src);
     assert_eq!(why(at(&l, "mailbox", 0)), Hide::Import);
-    check(at(&l, "semaphore", 0), "Decl(top, Class)", None, None);
+    check(at(&l, "semaphore", 0), "Decl(top, Class)", None);
 }
 
 #[test]
@@ -1623,7 +1539,7 @@ fn a_call_named_like_a_design_unit_is_still_found_upward() {
     let src = "module f; endmodule
       module c; initial $display(f()); endmodule
       module top; function automatic int f(); return 1; endfunction c u(); endmodule";
-    check(at(&audit(src), "f", 0), "Upward", None, None);
+    check(at(&audit(src), "f", 0), "Upward", None);
 }
 
 #[test]
@@ -1643,11 +1559,11 @@ fn an_implicit_net_is_declared_in_the_scope_of_its_first_reference() {
     for name in ["p_net", "g_net", "a_net", "d_ck", "d_d"] {
         let last = l.iter().filter(|m| m.name == name).count() - 1;
         for n in [0, last] {
-            check(at(&l, name, n), "Decl(top, ImplicitNet)", None, None);
+            check(at(&l, name, n), "Decl(top, ImplicitNet)", None);
         }
     }
-    check(at(&l, "b_net", 0), "Decl(top.g, ImplicitNet)", None, None);
-    check(at(&l, "b_net", 1), "Decl(top.g, ImplicitNet)", None, None);
+    check(at(&l, "b_net", 0), "Decl(top.g, ImplicitNet)", None);
+    check(at(&l, "b_net", 1), "Decl(top.g, ImplicitNet)", None);
 }
 
 #[test]
@@ -1656,8 +1572,8 @@ fn an_implicit_net_of_a_block_is_not_a_name_of_the_module() {
     let src = "module w(output logic o); assign o = 1; endmodule
       module top; if (1) begin : g w v(.o(n)); end initial $display(n); endmodule";
     let l = audit(src);
-    check(at(&l, "n", 0), "Decl(top.g, ImplicitNet)", None, None);
-    check(at(&l, "n", 1), "Upward", None, None);
+    check(at(&l, "n", 0), "Decl(top.g, ImplicitNet)", None);
+    check(at(&l, "n", 1), "Upward", None);
 }
 
 #[test]
@@ -1717,7 +1633,7 @@ fn a_formal_default_sees_the_formals_before_it() {
       endmodule";
     let l = audit(src);
     assert_eq!(why(at(&l, "a", 0)), Hide::Formal);
-    check(at(&l, "c", 0), "Decl(top, Data)", None, None);
+    check(at(&l, "c", 0), "Decl(top, Data)", None);
 }
 
 #[test]
@@ -1728,7 +1644,7 @@ fn a_ranged_enum_declares_each_member() {
       endmodule";
     let l = audit(src);
     for name in ["A0", "A2", "B2", "B4", "C0", "C1"] {
-        check(at(&l, name, 0), "Decl(top, EnumMember)", None, None);
+        check(at(&l, name, 0), "Decl(top, EnumMember)", None);
     }
 }
 
@@ -1739,8 +1655,8 @@ fn an_implicit_generate_name_is_a_label_of_its_scope() {
         initial $display(genblk1.x, genblk7.x);
       endmodule";
     let l = audit(src);
-    check(at(&l, "genblk1", 0), "Decl(top, Label)", None, None);
-    check(at(&l, "genblk7", 0), "Upward", None, None);
+    check(at(&l, "genblk1", 0), "Decl(top, Label)", None);
+    check(at(&l, "genblk7", 0), "Upward", None);
 }
 
 #[test]
@@ -1749,7 +1665,7 @@ fn an_implicit_name_with_only_labelled_arms_names_no_block() {
     let src = "module top; if (1) begin : a int x; end else begin : b int x; end
         initial $display(genblk1.x);
       endmodule";
-    check(at(&audit(src), "genblk1", 0), "Upward", None, None);
+    check(at(&audit(src), "genblk1", 0), "Upward", None);
 }
 
 #[test]
@@ -1820,7 +1736,7 @@ fn each_name_of_a_concatenation_at_an_implicit_net_position_is_declared() {
     let l = audit(src);
     for name in ["cout", "sum", "z1", "z0"] {
         for n in [0, 1] {
-            check(at(&l, name, n), "Decl(top, ImplicitNet)", None, None);
+            check(at(&l, name, n), "Decl(top, ImplicitNet)", None);
         }
     }
 }
@@ -1861,4 +1777,81 @@ fn export_star_star_re_exports_each_imported_package() {
         assert_eq!(why(at(&l, name, 0)), Hide::Import, "{name}");
     }
     assert_eq!(at(&l, "Z", 0).outcome, Outcome::Upward);
+}
+
+// The stamps the generate rename reads.
+
+/// Where `top`'s tree declares the declaration `b` names, and its kind.
+fn stamped(b: Bound) -> (String, DeclKind) {
+    let tree = tree_of("top").expect("the tree of top");
+    let d = b
+        .as_decl()
+        .unwrap_or_else(|| panic!("not a declaration: {b:?}"));
+    let decl = &tree.decls[d.0 as usize];
+    (tree.path(decl.scope), decl.kind)
+}
+
+#[test]
+fn block_typedefs_properties_sequences_type_names_bases_and_clocks_are_stamped() {
+    // §6.18, §8.13, §14.3, §16.8, §16.12, §23.9: each names a declaration of
+    // the nested block `g.h`.
+    let src = "module top;
+      if (1) begin : g if (1) begin : h
+        logic c;
+        typedef logic [7:0] t;
+        t v;
+        property p; @(posedge c) 1; endproperty
+        sequence s; 1; endsequence
+        class B; endclass
+        typedef B base_t;
+        class D extends base_t; endclass
+        clocking cb @(posedge c); endclocking
+      end end endmodule";
+    let parsed = xezim_core::parse(src);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    let mut descs = parsed.source.descriptions;
+    build_design(&mut descs);
+    let Description::Module(m) = &descs[0] else {
+        panic!("a module")
+    };
+    let block = |i: &ModuleItem| match i {
+        ModuleItem::GenerateIf(gi) => gi.branches[0].1.clone(),
+        k => panic!("{k:?}"),
+    };
+    let h = block(&block(&m.items[0])[0]);
+    let mut got = Vec::new();
+    for item in &h {
+        match item {
+            ModuleItem::TypedefDeclaration(t) => got.push((t.name.name.clone(), stamped(t.decl))),
+            ModuleItem::PropertyDeclaration(p) => got.push((p.name.name.clone(), stamped(p.decl))),
+            ModuleItem::SequenceDeclaration(s) => got.push((s.name.name.clone(), stamped(s.decl))),
+            ModuleItem::DataDeclaration(d) => {
+                if let xezim_core::ast::types::DataType::TypeReference { name, .. } = &d.data_type {
+                    got.push(("type of v".to_string(), stamped(name.bound)));
+                }
+            }
+            ModuleItem::ClassDeclaration(c) => {
+                if let Some(e) = &c.extends {
+                    got.push(("base of D".to_string(), stamped(e.bound)));
+                }
+            }
+            ModuleItem::ClockingDeclaration(c) => {
+                got.push(("clock of cb".to_string(), stamped(c.clock_bound)))
+            }
+            _ => {}
+        }
+    }
+    let at = |k| ("g.h".to_string(), k);
+    assert_eq!(
+        got,
+        [
+            ("t".to_string(), at(DeclKind::Typedef)),
+            ("type of v".to_string(), at(DeclKind::Typedef)),
+            ("p".to_string(), at(DeclKind::Property)),
+            ("s".to_string(), at(DeclKind::Sequence)),
+            ("base_t".to_string(), at(DeclKind::Typedef)),
+            ("base of D".to_string(), at(DeclKind::Typedef)),
+            ("clock of cb".to_string(), at(DeclKind::Data)),
+        ]
+    );
 }

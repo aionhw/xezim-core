@@ -223,3 +223,42 @@ fn a_selector_is_outside_the_block_it_selects() {
     assert_eq!(param(&src, "g.h.Y"), 2);
     assert_eq!(param(&src, "g.k.Y"), 3);
 }
+
+/// The names the elaborated triggers fire (§15.5.1).
+fn triggers(source: &str) -> Vec<String> {
+    use xezim_core::ast::stmt::{Statement, StatementKind};
+    fn walk(s: &Statement, out: &mut Vec<String>) {
+        match &s.kind {
+            StatementKind::EventTrigger { name, .. } => out.push(name.name.clone()),
+            StatementKind::TimingControl { stmt, .. } => walk(stmt, out),
+            StatementKind::SeqBlock { stmts, .. } => stmts.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let design = xezim_core::parse_and_elaborate_multi(
+        &[source.to_string()],
+        Some("t"),
+        &[],
+        &["t.sv".to_string()],
+        &[],
+    )
+    .expect("elaborate")
+    .1;
+    let mut out = Vec::new();
+    design
+        .initial_blocks
+        .iter()
+        .for_each(|b| walk(&b.stmt, &mut out));
+    out.sort();
+    out
+}
+
+#[test]
+fn a_trigger_of_a_nested_blocks_event_names_that_events_key() {
+    // §15.5.1, §23.9, §27.6: `-> ev` fires the event of its own block.
+    let src = "module t;
+      if (1) begin : g event ev; initial #1 -> ev;
+        if (1) begin : h event ev; initial #2 -> ev; end
+      end endmodule";
+    assert_eq!(triggers(src), ["g.ev", "g.h.ev"]);
+}
