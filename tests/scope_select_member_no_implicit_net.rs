@@ -3,8 +3,8 @@
 //! implicit net named after the generate block or instance array. The root
 //! of such a path is a scope, never a scalar net; it was collected as an
 //! undeclared identifier, so every such assignment declared a 1-bit net `g`
-//! and warned about it. A name used inside the selects still becomes an
-//! implicit net.
+//! and warned about it. A name used inside the selects is read, not
+//! assigned, so it is not an implicit net either.
 
 fn elaborate(src: &str) -> xezim_core::ElaboratedModule {
     xezim_core::parse_and_elaborate_multi(
@@ -41,7 +41,6 @@ module top;
   assign h[1].q[0].u.a = s;
   assign ua[1].a = s;
   assign z = ua[1].c;
-  assign g[1].u.a[w] = 1'b1;
 endmodule
 "#,
     );
@@ -49,8 +48,30 @@ endmodule
         assert!(!m.implicit_nets.contains(n), "phantom implicit net {n}");
         assert!(!m.nets.contains(n), "phantom net {n}");
     }
-    assert!(
-        m.implicit_nets.contains("w"),
-        "an undeclared select operand is still an implicit net"
-    );
+}
+
+#[test]
+fn an_undeclared_select_operand_on_the_left_hand_side_is_undeclared() {
+    // §6.10: the implicit net is the assigned name; `w` is only read.
+    let err = xezim_core::parse_and_elaborate_multi(
+        &[r#"
+module leaf (input logic [3:0] a, output logic [3:0] c);
+  assign c = a;
+endmodule
+module top;
+  for (genvar i = 0; i < 2; i++) begin : g
+    leaf u (.c());
+  end
+  assign g[1].u.a[w] = 1'b1;
+endmodule
+"#
+        .to_string()],
+        Some("top"),
+        &[],
+        &["top.sv".to_string()],
+        &[],
+    )
+    .err()
+    .expect("w is undeclared");
+    assert!(err.contains("Undeclared identifier 'w'"), "{err}");
 }
