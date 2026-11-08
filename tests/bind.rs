@@ -98,23 +98,23 @@ fn a_subroutine_of_an_unlabelled_block_is_named_by_its_implicit_scope() {
 }
 
 #[test]
-fn data_of_an_unlabelled_block_keeps_its_bare_name_and_that_is_no_disagreement() {
+fn data_of_an_unlabelled_block_is_named_by_its_implicit_scope() {
     let src = "module top; if (1) begin int x; initial x = 1; end endmodule";
     check(
         at(&audit(src), "x", 0),
         "Decl(top.genblk1, Data)",
-        None,
+        Some("genblk1.x"),
         None,
     );
 }
 
 #[test]
-fn data_of_a_labelled_block_inside_an_unlabelled_one_drops_the_implicit_segment() {
+fn data_of_a_labelled_block_inside_an_unlabelled_one_takes_both_scopes() {
     let src = "module top; if (1) begin if (1) begin : h int x; initial x = 1; end end endmodule";
     check(
         at(&audit(src), "x", 0),
         "Decl(top.genblk1.h, Data)",
-        Some("h.x"),
+        Some("genblk1.h.x"),
         None,
     );
 }
