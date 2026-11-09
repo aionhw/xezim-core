@@ -628,7 +628,13 @@ impl<'a> Binder<'a> {
             self.resolve(&first.name.name)
         };
         h.bound = match outcome {
-            Outcome::Decl(d) => Bound::decl(d),
+            Outcome::Decl(d) => {
+                let decl = &self.tree.decls[d.0 as usize];
+                match decl.kind == DeclKind::ImplicitNet && decl.scope != self.tree.root {
+                    true => Bound::block_implicit_net(d),
+                    false => Bound::decl(d),
+                }
+            }
             Outcome::Upward => Bound::UPWARD,
             Outcome::None(_) => Bound::NO_TARGET,
         };
@@ -2327,7 +2333,9 @@ fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> 
         | DeclKind::Instance
         | DeclKind::Property
         | DeclKind::Sequence
-        | DeclKind::Typedef => tree.key(scope, name, &[]),
+        | DeclKind::Typedef
+        // §6.10, §27: a block's implicit net is the block's.
+        | DeclKind::ImplicitNet => tree.key(scope, name, &[]),
         _ => return None,
     };
     (key != name).then_some(key)

@@ -18343,6 +18343,63 @@ fn collect_port_connection_net_candidates(items: &[ModuleItem], out: &mut Vec<St
     }
 }
 
+/// §6.10, §27: a port actual of an instance in a generate block that is an
+/// implicit net of the block (renamed `g[0].n`) is a scalar net of that key.
+/// Module-level port actuals are `create_implicit_nets`'.
+fn declare_block_port_implicit_nets(
+    e: &Expression,
+    elab: &mut ElaboratedModule,
+) -> Result<(), String> {
+    match &e.kind {
+        ExprKind::Ident(h)
+            if h.root.is_none() && h.path.len() == 1 && h.bound.is_block_implicit_net() =>
+        {
+            let name = &h.path[0].name.name;
+            if elab.signals.contains_key(name) || elab.nets.contains(name) {
+                return Ok(());
+            }
+            if sv_parser::default_nettype_none_seen() {
+                return Err(format!(
+                    "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
+                    name
+                ));
+            }
+            if crate::implicit_net_warn() {
+                crate::elab_diag(format!(
+                    "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                     (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+                    name
+                ));
+            }
+            signals_insert_traced(
+                &mut elab.signals,
+                line!(),
+                name.clone(),
+                Signal {
+                    is_const: false,
+                    name: name.clone().into(),
+                    width: 1,
+                    is_signed: false,
+                    direction: None,
+                    value: Value::new(1),
+                    is_real: false,
+                    type_name: None,
+                },
+            );
+            elab.implicit_nets.insert(name.clone());
+            elab.nets.insert(name.clone());
+            Ok(())
+        }
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                declare_block_port_implicit_nets(p, elab)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn create_implicit_nets(
     elab: &mut ElaboratedModule,
     port_conn_names: &[String],
@@ -19841,6 +19898,13 @@ fn elaborate_items(
                                 is_real: false,
                             },
                         );
+                    }
+                    for c in &hi.connections {
+                        if let PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) = c
+                        {
+                            declare_block_port_implicit_nets(e, elab)?;
+                        }
                     }
                 }
             }
@@ -33243,6 +33307,13 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
             ModuleItem::ModuleInstantiation(mi) => {
                 for hi in &mi.instances {
                     visit(&hi.name.name, hi.decl, RenamedKind::Other);
+                    for c in &hi.connections {
+                        if let PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) = c
+                        {
+                            visit_block_implicit_nets(e, visit);
+                        }
+                    }
                 }
             }
             // An out-of-block class method (`function C::m`) is the class's,
@@ -33264,6 +33335,19 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
             // name: it may name a class, and classes keep theirs.
             ModuleItem::TypedefDeclaration(t) if !matches!(t.data_type, DataType::Void(_)) => {
                 visit(&t.name.name, Bound::UNSET, RenamedKind::Type)
+            }
+            // §6.10: an implicit net a block's continuous assignment, port
+            // actual or gate terminal declares is the block's, as a declared
+            // net is (`g[0].n`).
+            ModuleItem::ContinuousAssign(ca) => {
+                for (lhs, _) in &ca.assignments {
+                    visit_block_implicit_nets(lhs, visit);
+                }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                for t in gi.instances.iter().flat_map(|i| &i.terminals) {
+                    visit_block_implicit_nets(t, visit);
+                }
             }
             // Nested generate constructs declare their own scope; we recurse
             // and rename names declared in the unconditional bodies, since a
@@ -33291,6 +33375,23 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
             ModuleItem::GenerateFor(gf) => visit_renamed_decls(&gf.items, visit),
             _ => {}
         }
+    }
+}
+
+/// The implicit nets of a generate block (`Bound::block_implicit_net`) that
+/// an implicit-net position names: a bare name, or each member of a
+/// concatenation (§6.10).
+fn visit_block_implicit_nets(e: &Expression, visit: &mut dyn FnMut(&str, Bound, RenamedKind)) {
+    match &e.kind {
+        ExprKind::Ident(h)
+            if h.root.is_none() && h.path.len() == 1 && h.bound.is_block_implicit_net() =>
+        {
+            visit(&h.path[0].name.name, h.bound, RenamedKind::Other)
+        }
+        ExprKind::Concatenation(parts) => parts
+            .iter()
+            .for_each(|p| visit_block_implicit_nets(p, visit)),
+        _ => {}
     }
 }
 
@@ -49532,6 +49633,14 @@ fn rewrite_expr_impl(
                     let mut m = mapped.clone();
                     if collides {
                         mark_actual_rooted(&mut m);
+                    }
+                    // §6.10: a block's implicit net keeps its binding under
+                    // its block key; the net itself is created later.
+                    if hier.bound.is_block_implicit_net()
+                        && let ExprKind::Ident(h) = &mut m.kind
+                        && h.bound.is_unset()
+                    {
+                        h.bound = hier.bound;
                     }
                     return m;
                 }
