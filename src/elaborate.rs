@@ -19359,6 +19359,26 @@ fn elaborate_items(
                         if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
+                        // §7.2, §27: an array of UNPACKED structs in a generate
+                        // block stores each element member-wise, as the
+                        // top-level path registers it; the element type drives
+                        // `%p` and `arr[i] = '{...}`. Without either,
+                        // `g.q[2].f` read x and `q[2] = '{5, 6}` stored a vector.
+                        elab.var_decl_types
+                            .entry(decl.name.name.clone())
+                            .or_insert_with(|| dd.data_type.clone());
+                        if let DataType::Struct(su) =
+                            resolve_typedef_chain(&dd.data_type, &elab.typedef_types)
+                            && !su.packed
+                            && !(matches!(su.kind, StructUnionKind::Union) && !su.tagged)
+                            && hi >= lo
+                            && (hi - lo) < 4096
+                        {
+                            for i in lo..=hi {
+                                let ebase = format!("{}[{}]", decl.name.name, i);
+                                register_unpacked_aggregate(elab, &ebase, &dd.data_type);
+                            }
+                        }
                         if let Some(UnpackedDimension::Range { left, right, .. }) =
                             decl.dimensions.first()
                         {
