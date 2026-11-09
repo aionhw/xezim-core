@@ -34826,6 +34826,16 @@ fn substitute_in_module_item(
             }
             ModuleItem::NetDeclaration(new_nd)
         }
+        // §6.18, §27.4: a typedef of a generate-for block reads the genvar in
+        // its type and dimensions (`typedef logic [4*i-1:0] t;`).
+        ModuleItem::TypedefDeclaration(td) => {
+            let mut new_td = td.clone();
+            new_td.data_type =
+                rewrite_data_type_genvar(&td.data_type, port_map, local_names, interface_map);
+            new_td.dimensions =
+                rewrite_unpacked_dims_genvar(&td.dimensions, port_map, local_names, interface_map);
+            ModuleItem::TypedefDeclaration(new_td)
+        }
         // Remaining module-level items don't carry genvar-dependent
         // expressions; pass through unchanged.
         other => other.clone(),
