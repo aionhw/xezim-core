@@ -1646,8 +1646,15 @@ fn an_implicit_net_is_declared_in_the_scope_of_its_first_reference() {
             check(at(&l, name, n), "Decl(top, ImplicitNet)", None, None);
         }
     }
-    check(at(&l, "b_net", 0), "Decl(top.g, ImplicitNet)", None, None);
-    check(at(&l, "b_net", 1), "Decl(top.g, ImplicitNet)", None, None);
+    // The block's net is renamed with the block (§27.4).
+    for n in [0, 1] {
+        check(
+            at(&l, "b_net", n),
+            "Decl(top.g, ImplicitNet)",
+            Some("g.b_net"),
+            None,
+        );
+    }
 }
 
 #[test]
@@ -1656,7 +1663,12 @@ fn an_implicit_net_of_a_block_is_not_a_name_of_the_module() {
     let src = "module w(output logic o); assign o = 1; endmodule
       module top; if (1) begin : g w v(.o(n)); end initial $display(n); endmodule";
     let l = audit(src);
-    check(at(&l, "n", 0), "Decl(top.g, ImplicitNet)", None, None);
+    check(
+        at(&l, "n", 0),
+        "Decl(top.g, ImplicitNet)",
+        Some("g.n"),
+        None,
+    );
     check(at(&l, "n", 1), "Upward", None, None);
 }
 
