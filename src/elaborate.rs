@@ -11967,12 +11967,12 @@ pub fn elaborate_module_with_defs(
                                 resolve_typedef_chain(elem_resolved, &elab.typedef_types)
                             {
                                 for m in &su.members {
-                                    let ew = packed_inner_elem_width(
+                                    let (ew, fd) = packed_member_meta(
                                         &m.data_type,
                                         &elab.parameters,
                                         &elab.typedefs,
+                                        &elab.typedef_types,
                                     );
-                                    let fd = packed_full_dims_of(&m.data_type, &elab.parameters);
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         if let Some(ew) = ew {
@@ -13035,19 +13035,19 @@ pub fn elaborate_module_with_defs(
                                         }
                                     }
                                 }
-                                if let Some(ew) = packed_inner_elem_width(
+                                let (ew, fd) = packed_member_meta(
                                     &m.data_type,
                                     &elab.parameters,
                                     &elab.typedefs,
-                                ) {
+                                    &elab.typedef_types,
+                                );
+                                if let Some(ew) = ew {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         elab.packed_signal_elem_widths.insert(key, ew);
                                     }
                                 }
-                                if let Some(fdims) =
-                                    packed_full_dims_of(&m.data_type, &elab.parameters)
-                                {
+                                if let Some(fdims) = fd {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         elab.packed_full_dims.insert(key, fdims.clone());
@@ -26826,6 +26826,33 @@ pub fn packed_inner_elem_width(
         }
     }
     None
+}
+
+/// §7.2, §7.4.1: the packed-array shape of a struct MEMBER declared with
+/// `dt`, as the runtime keys it under `<signal>.<member>`: the element width
+/// of its outermost dimension and every packed dimension (outermost first,
+/// the element's own bit range innermost). A member whose element type is a
+/// typedef (`t3_t [1:0][3:0][7:0] f0`) or whose dimensions live inside the
+/// typedef (`t3d_t f0`) has them only through the typedef chain;
+/// `packed_full_dims_of` sees the declaration alone, so with it only the
+/// first index of `s.f0[i][j]` selected an element and every later one was a
+/// one-bit select of the row.
+pub fn packed_member_meta(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> (Option<u32>, Option<Vec<(i64, i64)>>) {
+    let fd = packed_full_dims_of(dt, params)
+        .or_else(|| packed_full_dims_chained(dt, params, typedef_types));
+    let ew = packed_inner_elem_width(dt, params, typedefs).or_else(|| {
+        // An element of the outermost dimension spans all the others.
+        let dims = fd.as_ref().filter(|d| d.len() >= 2)?;
+        dims[1..].iter().try_fold(1u32, |w, (l, r)| {
+            w.checked_mul(u32::try_from((l - r).unsigned_abs() + 1).ok()?)
+        })
+    });
+    (ew, fd)
 }
 
 /// §5.9: a string literal is 8 bits per character, and an empty one still
@@ -40946,14 +40973,11 @@ fn inline_module_items(
                                         resolve_typedef_chain(dt, &elab.typedef_types).clone();
                                     if let DataType::Struct(su) = &member_dt {
                                         for m in &su.members {
-                                            let ew = packed_inner_elem_width(
+                                            let (ew, fd) = packed_member_meta(
                                                 &m.data_type,
                                                 &sub_merged_params,
                                                 &elab.typedefs,
-                                            );
-                                            let fd = packed_full_dims_of(
-                                                &m.data_type,
-                                                &sub_merged_params,
+                                                &elab.typedef_types,
                                             );
                                             for mdecl in &m.declarators {
                                                 let key =
@@ -41989,14 +42013,11 @@ fn inline_module_items(
                                                     .clone();
                                                     if let DataType::Struct(su) = &mdt {
                                                         for m in &su.members {
-                                                            let ew = packed_inner_elem_width(
+                                                            let (ew, fd) = packed_member_meta(
                                                                 &m.data_type,
                                                                 &sub_merged_params,
                                                                 &elab.typedefs,
-                                                            );
-                                                            let fd = packed_full_dims_of(
-                                                                &m.data_type,
-                                                                &sub_merged_params,
+                                                                &elab.typedef_types,
                                                             );
                                                             for mdecl in &m.declarators {
                                                                 for base in [&bare, &scoped] {
