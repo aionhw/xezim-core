@@ -25168,12 +25168,21 @@ fn tls_restore_typedef_shape(name: &str, saved: TypedefShapeSave) {
 struct DeclShapeLayers {
     type_params: std::rc::Rc<HashSet<String>>,
     blocks: Vec<std::rc::Rc<HashMap<String, DeclShape>>>,
+    /// The shapes of the blocks already elaborated in this scope, under
+    /// their block keys (`g[0].arr`), for a query from outside (§23.6).
+    left: HashMap<String, DeclShape>,
+    /// Every generate block's declared shapes as written, under the block
+    /// path without loop indices (`g.arr`), for a query from outside a block
+    /// not yet elaborated. A shape that reads a genvar does not evaluate.
+    by_path: std::rc::Rc<HashMap<String, DeclShape>>,
 }
 
-/// A definition's declared shapes and the names of its type parameters.
+/// A definition's declared shapes, the names of its type parameters, and
+/// its generate blocks' shapes by block path.
 type DeclShapeTable = (
     std::rc::Rc<HashMap<String, DeclShape>>,
     std::rc::Rc<HashSet<String>>,
+    std::rc::Rc<HashMap<String, DeclShape>>,
 );
 
 /// Restores the previously installed declared-shape table, and the block
@@ -25206,6 +25215,148 @@ fn decl_shape_of(name: &str) -> Option<DeclShape> {
         .or_else(|| {
             DECL_SHAPES_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))
         })
+        .or_else(|| {
+            DECL_SHAPE_LAYERS_TLS.with(|c| {
+                let c = c.borrow();
+                c.left.get(name).cloned().or_else(|| {
+                    let unindexed = strip_block_indices(name)?;
+                    c.by_path.get(&unindexed).cloned()
+                })
+            })
+        })
+}
+
+/// `g[0].n.arr` without its loop indices (`g.n.arr`); None for a simple name.
+fn strip_block_indices(name: &str) -> Option<String> {
+    if !name.contains('.') {
+        return None;
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut depth = 0u32;
+    for ch in name.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// §27.5, §27.6: the declared shapes of each generate block in `items`,
+/// every arm included, under `<prefix><block>.<name>`. A key two arms
+/// declare with different shapes is left out.
+fn collect_block_shapes(
+    items: &[ModuleItem],
+    prefix: &str,
+    type_params: &HashSet<String>,
+    out: &mut HashMap<String, DeclShape>,
+    clash: &mut HashSet<String>,
+) {
+    let block = |name: &str,
+                 block_items: &[ModuleItem],
+                 out: &mut HashMap<String, DeclShape>,
+                 clash: &mut HashSet<String>| {
+        let p = format!("{prefix}{name}.");
+        let (shapes, _) = collect_decl_shapes(&PortList::Empty, block_items, &[], type_params);
+        for (k, v) in shapes {
+            let key = format!("{p}{k}");
+            match out.get(&key) {
+                Some(old) if format!("{old:?}") != format!("{v:?}") => {
+                    clash.insert(key);
+                }
+                Some(_) => {}
+                None => {
+                    out.insert(key, v);
+                }
+            }
+        }
+        collect_block_shapes(block_items, &p, type_params, out, clash);
+    };
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(g) => {
+                collect_block_shapes(&g.items, prefix, type_params, out, clash)
+            }
+            ModuleItem::GenerateIf(g) => {
+                for (bi, (_, branch)) in g.branches.iter().enumerate() {
+                    if g.branch_direct.get(bi) == Some(&true) {
+                        collect_block_shapes(branch, prefix, type_params, out, clash);
+                        continue;
+                    }
+                    let label = g.branch_labels.get(bi).and_then(|l| l.as_ref());
+                    block(
+                        gen_scope_name(label, &g.implicit_name).as_str(),
+                        branch,
+                        out,
+                        clash,
+                    );
+                }
+            }
+            ModuleItem::GenerateCase(g) => {
+                for arm in &g.arms {
+                    if arm.direct {
+                        collect_block_shapes(&arm.items, prefix, type_params, out, clash);
+                        continue;
+                    }
+                    let name = gen_scope_name(arm.label.as_ref(), &g.implicit_name);
+                    block(name.as_str(), &arm.items, out, clash);
+                }
+            }
+            ModuleItem::GenerateFor(g) => {
+                let name = gen_scope_name(g.name.as_ref(), &g.implicit_name);
+                block(name.as_str(), &g.items, out, clash);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The name a declared-shape operand is keyed by: a simple name, or a path
+/// through generate blocks with constant indices (`g[0].arr`, parsed as
+/// `Ident` segments or as member selects), as the block's rename keys its
+/// declarations.
+fn decl_shape_operand_name(e: &Expression) -> Option<String> {
+    fn block_path(e: &Expression, out: &mut String) -> Option<()> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() => {
+                for (i, seg) in h.path.iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        let i = const_eval_i64_with_params(sel, None)?;
+                        out.push_str(&format!("[{i}]"));
+                    }
+                }
+                Some(())
+            }
+            ExprKind::Index { expr, index } => {
+                block_path(expr, out)?;
+                let i = const_eval_i64_with_params(index, None)?;
+                out.push_str(&format!("[{i}]"));
+                Some(())
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                block_path(expr, out)?;
+                out.push('.');
+                out.push_str(&member.name);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    let mut name = String::new();
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.last().is_some_and(|s| s.selects.is_empty()) => {
+            block_path(e, &mut name)?
+        }
+        ExprKind::MemberAccess { .. } => block_path(e, &mut name)?,
+        _ => return None,
+    }
+    Some(name)
 }
 
 /// §20.7, §20.6.2, §27: the array queries and `$bits` over a generate block's
@@ -25231,7 +25382,10 @@ fn elaborate_block_items(
     let r = elaborate_items(items, elab, all_defs);
     DECL_SHAPE_LAYERS_TLS.with(|c| {
         let mut c = c.borrow_mut();
-        c.blocks.pop();
+        if let Some(block) = c.blocks.pop() {
+            let block = std::rc::Rc::try_unwrap(block).unwrap_or_else(|b| (*b).clone());
+            c.left.extend(block);
+        }
         c.type_params = outer;
     });
     r
@@ -25284,12 +25438,21 @@ fn decl_shape_is_fixed(dt: &DataType, dims: &[UnpackedDimension]) -> bool {
 pub fn install_decl_shapes(def: Definition) -> DeclShapesGuard {
     let items = def.items();
     let key = (def.name().to_string(), items.as_ptr() as usize, items.len());
-    let (m, type_params) = match DECL_SHAPES_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+    let (m, type_params, by_path) = match DECL_SHAPES_CACHE.with(|c| c.borrow().get(&key).cloned())
+    {
         Some(e) => e,
         None => {
             let (m, tp) =
                 collect_decl_shapes(def.ports(), items, def.params(), &HashSet::default());
-            let e = (std::rc::Rc::new(m), std::rc::Rc::new(tp));
+            let mut by_path = HashMap::default();
+            let mut clash = HashSet::default();
+            collect_block_shapes(items, "", &tp, &mut by_path, &mut clash);
+            by_path.retain(|k, _| !clash.contains(k));
+            let e = (
+                std::rc::Rc::new(m),
+                std::rc::Rc::new(tp),
+                std::rc::Rc::new(by_path),
+            );
             DECL_SHAPES_CACHE.with(|c| c.borrow_mut().insert(key, e.clone()));
             e
         }
@@ -25302,6 +25465,8 @@ pub fn install_decl_shapes(def: Definition) -> DeclShapesGuard {
             DeclShapeLayers {
                 type_params,
                 blocks: Vec::new(),
+                left: HashMap::default(),
+                by_path,
             },
         )
     });
@@ -25573,10 +25738,7 @@ fn decl_var_query(
     if !is_decl_shape_operand(arg) {
         return None;
     }
-    let ExprKind::Ident(h) = &arg.kind else {
-        return None;
-    };
-    let (q, bits) = decl_shape_query(&h.path[0].name.name, params)?;
+    let (q, bits) = decl_shape_query(&decl_shape_operand_name(arg)?, params)?;
     if fname == "$bits" {
         return bits;
     }
@@ -25646,10 +25808,8 @@ fn decl_has_unpacked_dims(arg: &Expression) -> bool {
 /// array queries can answer at elaboration time?
 fn is_decl_shape_operand(arg: &Expression) -> bool {
     match &arg.kind {
-        ExprKind::Ident(h)
-            if h.path.len() == 1 && h.path[0].selects.is_empty() && h.root.is_none() =>
-        {
-            let Some(shape) = decl_shape_of(&h.path[0].name.name) else {
+        ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+            let Some(shape) = decl_shape_operand_name(arg).and_then(|n| decl_shape_of(&n)) else {
                 return false;
             };
             // `[K]` naming a TYPE is a real associative dimension.
@@ -29293,6 +29453,19 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 }
                 None => Value::new(32),
             }
+        }
+        // §20.7, §23.6: a query over a generate block's variable by path
+        // (`g[0].arr`) answers from the block's declared shape.
+        ExprKind::SystemCall { name, args }
+            if args
+                .first()
+                .is_some_and(|a| matches!(a.kind, ExprKind::MemberAccess { .. }))
+                && decl_var_query(name, args, Some(params)).is_some() =>
+        {
+            let v = decl_var_query(name, args, Some(params)).unwrap_or_default();
+            let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
+            out.is_signed = true;
+            out
         }
         // LRM §20.7 array-introspection on an array-name ident: consults
         // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
