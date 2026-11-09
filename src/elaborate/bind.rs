@@ -406,6 +406,55 @@ fn partly_renamed(pos: &str, target: Option<DeclKind>) -> bool {
 /// A hidden name, why, and the class its declared type may name.
 type Hidden = (String, Hide, Option<String>);
 
+/// The hidden names in scope, innermost last: a stack the walk truncates on
+/// leaving a scope, indexed by name so that a lookup does not scan it.
+#[derive(Default)]
+struct HiddenNames {
+    stack: Vec<Hidden>,
+    /// Per name, its positions in `stack`, innermost last.
+    at: HashMap<String, Vec<usize>>,
+}
+
+impl HiddenNames {
+    fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn push(&mut self, h: Hidden) {
+        self.at
+            .entry(h.0.clone())
+            .or_default()
+            .push(self.stack.len());
+        self.stack.push(h);
+    }
+
+    fn extend(&mut self, hs: impl IntoIterator<Item = Hidden>) {
+        for h in hs {
+            self.push(h);
+        }
+    }
+
+    fn truncate(&mut self, mark: usize) {
+        while self.stack.len() > mark {
+            let Some((name, ..)) = self.stack.pop() else {
+                break;
+            };
+            if let Some(v) = self.at.get_mut(&name) {
+                v.pop();
+                if v.is_empty() {
+                    self.at.remove(&name);
+                }
+            }
+        }
+    }
+
+    /// The innermost hidden name `name`.
+    fn find(&self, name: &str) -> Option<&Hidden> {
+        let i = *self.at.get(name)?.last()?;
+        self.stack.get(i)
+    }
+}
+
 /// The class `randomize() with` searches first (§18.7).
 enum Receiver {
     /// Scope randomization or a bare call (§18.12).
@@ -425,7 +474,7 @@ struct Binder<'a> {
     /// Per scope, the next child block: the walk visits generate blocks in
     /// the order the tree was built.
     next_child: Vec<u32>,
-    hidden: Vec<Hidden>,
+    hidden: HiddenNames,
     /// Depth of class bodies with an unknown base and inline constraints.
     unknown_members: u32,
     /// §23.4: the scopes a nested definition is declared in, innermost last.
@@ -477,7 +526,7 @@ impl<'a> Binder<'a> {
         {
             return Outcome::None(Hide::Qualified);
         }
-        if let Some((_, why, _)) = self.hidden.iter().rev().find(|(h, ..)| h == name) {
+        if let Some((_, why, _)) = self.hidden.find(name) {
             return Outcome::None(*why);
         }
         if self.unknown_members > 0 && self.names.any_member.contains(name) {
@@ -703,7 +752,7 @@ impl<'a> Binder<'a> {
         let Some(name) = receiver_name(call) else {
             return Receiver::Unknown;
         };
-        let class = match self.hidden.iter().rev().find(|(h, ..)| h == name) {
+        let class = match self.hidden.find(name) {
             Some((_, _, class)) => class.clone(),
             None => match self.resolve(name) {
                 Outcome::Decl(d) => self.tree.decl_types.get(&d).cloned(),
@@ -991,7 +1040,7 @@ impl<'a> Binder<'a> {
             others: self.others,
             scope: tree.root,
             next_child: vec![0; tree.scopes.len()],
-            hidden: Vec::new(),
+            hidden: HiddenNames::default(),
             unknown_members: 0,
             outer,
             formals: Vec::new(),
@@ -1996,7 +2045,7 @@ fn receiver_name(target: &Expression) -> Option<&str> {
     }
 }
 
-fn pattern_vars(p: &Pattern, out: &mut Vec<Hidden>) {
+fn pattern_vars(p: &Pattern, out: &mut HiddenNames) {
     match p {
         Pattern::Binding(n) => out.push((n.name.clone(), Hide::Pattern, None)),
         Pattern::Tagged { inner: Some(i), .. } => pattern_vars(i, out),
@@ -2017,7 +2066,7 @@ fn run<'a>(
         others,
         scope: tree.root,
         next_child: vec![0; tree.scopes.len()],
-        hidden: Vec::new(),
+        hidden: HiddenNames::default(),
         unknown_members: 0,
         outer: Vec::new(),
         formals: Vec::new(),
