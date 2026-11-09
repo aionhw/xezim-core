@@ -634,3 +634,83 @@ pub fn write_vcd_value<W: Write>(w: &mut W, val: &Value, id: &str) {
         let _ = writeln!(w, "b{} {}", vcd_vector_bits(val), id);
     }
 }
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingWriter(Arc<Mutex<(Vec<u8>, usize)>>);
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().1 += 1;
+            Ok(())
+        }
+    }
+
+    /// §21.7.1.6: flush acknowledges every preceding byte, including work
+    /// already dispatched by an asynchronous flush; clean calls do no IO.
+    #[test]
+    fn acknowledged_flush_tracks_new_work() {
+        let state = Arc::new(Mutex::new((Vec::new(), 0)));
+        let mut sink = VcdSink::threaded(Box::new(RecordingWriter(state.clone())));
+        sink.write_all(b"header\n").unwrap();
+        sink.flush_sync().unwrap();
+        assert_eq!(*state.lock().unwrap(), (b"header\n".to_vec(), 1));
+        for _ in 0..100 {
+            sink.flush_sync().unwrap();
+        }
+        assert_eq!(state.lock().unwrap().1, 1);
+        sink.post_vcd_changes(Some(1), vec![]);
+        sink.flush().unwrap();
+        sink.flush_sync().unwrap();
+        assert_eq!(*state.lock().unwrap(), (b"header\n#1\n".to_vec(), 3));
+    }
+
+    /// §21.7.1.6: hold the writer inside flush so completion cannot be
+    /// confused with enqueueing. Always release it before asserting failure.
+    #[test]
+    fn acknowledged_flush_waits_for_the_writer() {
+        struct GatedWriter {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            gated: bool,
+        }
+        impl Write for GatedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if !self.gated {
+                    self.gated = true;
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+        let (entered, waiting) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (done, returned) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut sink = VcdSink::threaded(Box::new(GatedWriter {
+                entered,
+                release: resume,
+                gated: false,
+            }));
+            sink.write_all(b"data").unwrap();
+            sink.flush_sync().unwrap();
+            done.send(()).unwrap();
+        });
+        waiting.recv().unwrap();
+        let early = returned.recv_timeout(std::time::Duration::from_millis(100));
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        returned.recv().unwrap();
+    }
+}
