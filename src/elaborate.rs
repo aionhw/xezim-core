@@ -33379,6 +33379,12 @@ impl Drop for GenRenameFrame {
     }
 }
 
+/// §3.12.1: whether a generate rename in progress renames a declaration
+/// `name` of its block, so the plain name there is the block's.
+fn gen_rename_declares(name: &str) -> bool {
+    GEN_RENAME_TLS.with(|g| g.borrow().iter().any(|gate| gate.names.contains(name)))
+}
+
 /// Whether the generate rename in progress leaves this reference alone.
 fn gen_rename_hides(name: &str, bound: Bound) -> bool {
     GEN_RENAME_TLS.with(|g| {
@@ -49363,7 +49369,15 @@ fn rewrite_expr_impl(
             // variable was injected under its plain name, so drop the
             // qualifier and let the normal port-map / local-name handling
             // below bind (and prefix) it like any other reference.
+            // A generate block that declares `x` hides the plain name there:
+            // the qualified name is rooted, so no later rewrite strips it and
+            // the run time reads the unit's `x`.
             if let Some(bare) = crate::sv_parser::strip_unit_scope_name(&hier.path[0].name.name) {
+                if gen_rename_declares(bare) {
+                    let mut rooted = hier.clone();
+                    rooted.root = Some("$root".to_string());
+                    return Expression::new(ExprKind::Ident(rooted), expr.span);
+                }
                 if !local_names.contains(hier.path[0].name.name.as_str()) {
                     let mut new_hier = hier.clone();
                     new_hier.path[0].name.name = bare.to_string();
