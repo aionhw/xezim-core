@@ -10867,6 +10867,16 @@ pub fn elaborate_module_with_defs(
                             elab.packed_struct_fields
                                 .entry(decl.name.name.clone())
                                 .or_insert(fields);
+                            // §7.2, §7.4.1: and its members' packed shapes,
+                            // as the ANSI and DataDeclaration arms record
+                            // them. Unrecorded, `arg.vec[1]` of a `logic
+                            // [3:0][7:0] vec` member was a one-bit select.
+                            register_member_packed_meta(
+                                &mut elab,
+                                &decl.name.name,
+                                &pd.data_type,
+                                None,
+                            );
                         }
                     }
                     // §6.18/§7.4: a PORT declared with an ARRAY typedef
@@ -26828,6 +26838,39 @@ pub fn packed_inner_elem_width(
     None
 }
 
+/// §7.2, §7.4.1: record `packed_member_meta` of every member of the packed
+/// struct `dt` under `<sig>.<member>`, keeping what is already there.
+/// `params` is the declaring scope's (the module's own when None).
+fn register_member_packed_meta(
+    elab: &mut ElaboratedModule,
+    sig: &str,
+    dt: &DataType,
+    params: Option<&HashMap<String, Value>>,
+) {
+    let DataType::Struct(su) = resolve_typedef_chain(dt, &elab.typedef_types) else {
+        return;
+    };
+    let params = params.unwrap_or(&elab.parameters);
+    let mut metas = Vec::new();
+    for m in &su.members {
+        let (ew, fd) =
+            packed_member_meta(&m.data_type, params, &elab.typedefs, &elab.typedef_types);
+        for mdecl in &m.declarators {
+            metas.push((format!("{sig}.{}", mdecl.name.name), ew, fd.clone()));
+        }
+    }
+    for (key, ew, fd) in metas {
+        if let Some(ew) = ew {
+            elab.packed_signal_elem_widths
+                .entry(key.clone())
+                .or_insert(ew);
+        }
+        if let Some(fd) = fd {
+            elab.packed_full_dims.entry(key).or_insert(fd);
+        }
+    }
+}
+
 /// §7.2, §7.4.1: the packed-array shape of a struct MEMBER declared with
 /// `dt`, as the runtime keys it under `<signal>.<member>`: the element width
 /// of its outermost dimension and every packed dimension (outermost first,
@@ -41586,6 +41629,14 @@ fn inline_module_items(
                                         elab.packed_struct_fields
                                             .entry(sig_name.clone())
                                             .or_insert(fields);
+                                        // §7.2, §7.4.1: its members' shapes,
+                                        // as the top-level port arm records.
+                                        register_member_packed_meta(
+                                            elab,
+                                            &sig_name,
+                                            &pd.data_type,
+                                            Some(&sub_local_params),
+                                        );
                                     }
                                 }
                                 // §6.6.7: resolve REALNESS through the
