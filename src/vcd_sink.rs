@@ -68,7 +68,7 @@ enum WorkerMsg {
     /// Force the worker's `BufWriter` (and any streaming zstd encoder) to
     /// flush accumulated bytes to the OS file, so a later crash/SIGKILL of
     /// the main process leaves a readable partial dump.
-    Flush,
+    Flush(Option<mpsc::SyncSender<io::Result<()>>>),
     Shutdown,
 }
 
@@ -85,12 +85,15 @@ enum Mode {
 
 pub struct VcdSink {
     mode: Mode,
+    /// Work accepted since the last successful acknowledged flush.
+    dirty: bool,
 }
 
 impl VcdSink {
     pub fn inline(w: DumpWriter) -> Self {
         VcdSink {
             mode: Mode::Inline(BufWriter::new(w)),
+            dirty: false,
         }
     }
 
@@ -120,8 +123,11 @@ impl VcdSink {
                                 write_xtrace_timestep(&mut bw, ts);
                             }
                         }
-                        WorkerMsg::Flush => {
-                            let _ = bw.flush();
+                        WorkerMsg::Flush(reply) => {
+                            let result = bw.flush();
+                            if let Some(reply) = reply {
+                                let _ = reply.send(result);
+                            }
                         }
                         WorkerMsg::Shutdown => break,
                     }
@@ -139,7 +145,41 @@ impl VcdSink {
                 tx: Some(tx),
                 handle: Some(handle),
             },
+            dirty: false,
         }
+    }
+
+    /// §21.7.1.6: return only after preceding output is visible to readers.
+    /// Ordinary asynchronous flushes retain their existing behavior.
+    pub fn flush_sync(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        match &mut self.mode {
+            Mode::Inline(w) => w.flush()?,
+            Mode::Threaded {
+                buf,
+                pending,
+                pending_xt,
+                tx: Some(tx),
+                ..
+            } => {
+                if !buf.is_empty() {
+                    let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
+                    tx.send(WorkerMsg::Chunk(chunk))
+                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                }
+                dispatch_batches(pending, pending_xt, tx);
+                let (reply, done) = mpsc::sync_channel(1);
+                tx.send(WorkerMsg::Flush(Some(reply)))
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                done.recv()
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))??;
+            }
+            Mode::Threaded { .. } => return Err(io::ErrorKind::BrokenPipe.into()),
+        }
+        self.dirty = false;
+        Ok(())
     }
 
     /// Open a dump sink writing to `file`.
@@ -163,6 +203,7 @@ impl VcdSink {
     /// batch (dispatched when the batch is full). In inline mode: format
     /// immediately on the caller thread.
     pub fn post_vcd_changes(&mut self, time: Option<u64>, changes: Vec<(Arc<str>, Value)>) {
+        self.dirty |= time.is_some() || !changes.is_empty();
         match &mut self.mode {
             Mode::Inline(w) => {
                 if let Some(t) = time {
@@ -201,6 +242,7 @@ impl VcdSink {
     /// simulator holds separate sinks for the two dumps), so only the byte
     /// buffer has to be ordered against this one.
     pub fn post_xtrace_changes(&mut self, ts: XtraceTimestep) {
+        self.dirty = true;
         match &mut self.mode {
             Mode::Inline(w) => write_xtrace_timestep(w, &ts),
             Mode::Threaded {
@@ -423,6 +465,7 @@ fn dispatch_batches(
 
 impl Write for VcdSink {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.dirty |= !data.is_empty();
         match &mut self.mode {
             Mode::Inline(w) => w.write(data),
             Mode::Threaded {
@@ -461,7 +504,7 @@ impl Write for VcdSink {
                     let _ = tx.send(WorkerMsg::Chunk(chunk));
                 }
                 dispatch_batches(pending, pending_xt, tx);
-                let _ = tx.send(WorkerMsg::Flush);
+                let _ = tx.send(WorkerMsg::Flush(None));
                 Ok(())
             }
             Mode::Threaded { .. } => Ok(()),
