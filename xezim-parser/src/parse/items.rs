@@ -3273,6 +3273,7 @@ impl Parser {
                     incr,
                     items,
                     name,
+                    name_decl: Default::default(),
                     implicit_name: String::new(),
                     span: self.span_from(s),
                 }))
@@ -3708,6 +3709,7 @@ impl Parser {
         ModuleItem::GenerateIf(GenerateIf {
             branches,
             branch_labels,
+            branch_label_decls: Vec::new(),
             branch_direct,
             implicit_name: String::new(),
             span: self.span_from(start),
@@ -3740,6 +3742,7 @@ impl Parser {
                 values,
                 items,
                 label,
+                label_decl: Default::default(),
                 direct,
             });
         }

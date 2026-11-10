@@ -720,6 +720,15 @@ impl<'a> Binder<'a> {
     }
 
     /// The current scope's declaration of `name`.
+    /// §27.6: a generate block's label, declared in the current scope.
+    fn own_label(&self, name: &str) -> Bound {
+        self.tree.scopes[self.scope.0 as usize]
+            .by_name
+            .get(name)
+            .filter(|d| self.tree.decls[d.0 as usize].kind == DeclKind::Label)
+            .map_or(Bound::UNSET, |d| Bound::decl(*d))
+    }
+
     fn own_decl(&self, name: &str) -> Bound {
         self.tree.scopes[self.scope.0 as usize]
             .by_name
@@ -879,6 +888,11 @@ impl<'a> Binder<'a> {
             }),
             ModuleItem::GenerateRegion(g) => self.items(&mut g.items),
             ModuleItem::GenerateIf(g) => {
+                g.branch_label_decls = g
+                    .branch_labels
+                    .iter()
+                    .map(|l| l.as_deref().map_or(Bound::UNSET, |l| self.own_label(l)))
+                    .collect();
                 for (bi, (cond, branch)) in g.branches.iter_mut().enumerate() {
                     if let Some(c) = cond {
                         self.expr(c);
@@ -893,6 +907,10 @@ impl<'a> Binder<'a> {
             ModuleItem::GenerateCase(g) => {
                 self.expr(&mut g.selector);
                 for arm in &mut g.arms {
+                    arm.label_decl = arm
+                        .label
+                        .as_deref()
+                        .map_or(Bound::UNSET, |l| self.own_label(l));
                     arm.values.iter_mut().for_each(|v| self.expr(v));
                     if arm.direct {
                         self.item(&mut arm.items[0]);
@@ -902,6 +920,10 @@ impl<'a> Binder<'a> {
                 }
             }
             ModuleItem::GenerateFor(g) => {
+                g.name_decl = g
+                    .name
+                    .as_deref()
+                    .map_or(Bound::UNSET, |l| self.own_label(l));
                 let mark = self.hidden.len();
                 self.hide(&g.var, Hide::Genvar);
                 if let Some(i) = &mut g.init {
