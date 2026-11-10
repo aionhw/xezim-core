@@ -202,7 +202,8 @@ pub use value::Value;
 /// \x3b = \x3a + the direct-nesting flags and implicit names of generate
 /// constructs.
 /// \x3c = \x3b + the full path of a `disable` target (§9.6.2).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3c";
+/// \x3d = \x3c + clocking skew edges (§14.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3d";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
