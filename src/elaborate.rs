@@ -33610,13 +33610,19 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
             // nested generate-if may declare a name that the parent's other
             // siblings reference.
             ModuleItem::GenerateRegion(gr) => visit_renamed_decls(&gr.items, visit),
+            // §27.6: a nested block's label is a name of the block, so a path
+            // through it (`h.V`) takes the block's path like a declaration.
             ModuleItem::GenerateIf(gi) => {
+                for (l, d) in gi.branch_labels.iter().zip(&gi.branch_label_decls) {
+                    visit_block_label(l.as_deref(), *d, visit);
+                }
                 for (_cond, branch) in &gi.branches {
                     visit_renamed_decls(branch, visit);
                 }
             }
             ModuleItem::GenerateCase(gc) => {
                 for arm in &gc.arms {
+                    visit_block_label(arm.label.as_deref(), arm.label_decl, visit);
                     visit_renamed_decls(&arm.items, visit);
                 }
             }
@@ -33628,9 +33634,23 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
             // `for(a) for(b) localparam Idx = f(a,b)` to `f(0,b)` — the
             // rr_arb_tree binary-tree index bug. The inner loop's own rename
             // then composes a second suffix, giving a distinct name per (a,b).
-            ModuleItem::GenerateFor(gf) => visit_renamed_decls(&gf.items, visit),
+            ModuleItem::GenerateFor(gf) => {
+                visit_block_label(gf.name.as_deref(), gf.name_decl, visit);
+                visit_renamed_decls(&gf.items, visit)
+            }
             _ => {}
         }
+    }
+}
+
+/// A generate block's explicit label, when the binder found its declaration.
+fn visit_block_label(
+    label: Option<&str>,
+    decl: Bound,
+    visit: &mut dyn FnMut(&str, Bound, DeclKind),
+) {
+    if let Some(l) = label.filter(|_| decl.as_decl().is_some()) {
+        visit(l, decl, DeclKind::Label);
     }
 }
 
@@ -33702,8 +33722,9 @@ fn gen_rename_declares(name: &str) -> bool {
 
 /// The key the generate rename in progress gives `name`, bound as `bound`,
 /// when it binds to a renamed declaration of a kind both `kinds` and the
-/// position take, spelled as that declaration is so far. An instance keeps
-/// its declarator's name, so only its references carry the enclosing renames.
+/// position take, spelled as that declaration is so far. An instance and a
+/// generate block's label keep their declarators' names, so only their
+/// references carry the enclosing renames.
 fn gen_renamed(bound: Bound, name: &str, kinds: fn(DeclKind) -> bool) -> Option<String> {
     let d = bound.as_decl()?;
     GEN_RENAME_TLS.with(|g| {
@@ -33711,8 +33732,21 @@ fn gen_renamed(bound: Bound, name: &str, kinds: fn(DeclKind) -> bool) -> Option<
         let f = g.last()?;
         let (kind, spelled) = f.renamed.get(&d)?;
         let takes = kinds(*kind) && f.part.get().is_none_or(|p| p(*kind));
-        (takes && (*kind == DeclKind::Instance || spelled == name))
+        (takes && (matches!(kind, DeclKind::Instance | DeclKind::Label) || spelled == name))
             .then(|| compose_scope(&f.scope, name))
+    })
+}
+
+/// Whether `bound` is a nested generate block's label that the rename in
+/// progress renames.
+fn gen_renamed_label(bound: Bound) -> bool {
+    bound.as_decl().is_some_and(|d| {
+        GEN_RENAME_TLS.with(|g| {
+            g.borrow()
+                .last()
+                .and_then(|f| f.renamed.get(&d))
+                .is_some_and(|(k, _)| *k == DeclKind::Label)
+        })
     })
 }
 
@@ -34026,6 +34060,7 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
                     values: arm.values.iter().map(gen_expr).collect(),
                     items: arm.items.iter().map(rename_item_decls).collect(),
                     label: arm.label.clone(),
+                    label_decl: arm.label_decl,
                     direct: arm.direct,
                 })
                 .collect();
@@ -37823,7 +37858,11 @@ fn inline_module_items(
                         };
                     let sub_mod_declares: std::collections::HashSet<String> = {
                         let mut v = Vec::new();
-                        visit_renamed_decls(sub_mod.items(), &mut |n, _, _| v.push(n.to_string()));
+                        visit_renamed_decls(sub_mod.items(), &mut |n, _, kind| {
+                            if kind != DeclKind::Label {
+                                v.push(n.to_string())
+                            }
+                        });
                         // §6.20: a HEADER parameter (`#(parameter ...)`) is a
                         // constant, not a net: `leaf u (.a(VREF));` binds its
                         // value. The body items above cover body parameters
@@ -49144,10 +49183,13 @@ fn rewrite_expr_impl(
             // is a new one, without a source span.
             if let Some(key) = gen_renamed(hier.bound, name, |_| true) {
                 let mut h = hier.clone();
-                h.path[0].name = Identifier {
-                    name: key,
-                    span: Span::dummy(),
+                // A path through a nested block's label keeps the head's
+                // place, where a diagnostic about the path points.
+                let span = match gen_renamed_label(hier.bound) {
+                    true => hier.path[0].name.span,
+                    false => Span::dummy(),
                 };
+                h.path[0].name = Identifier { name: key, span };
                 h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 h.cached_resolved_name = crate::ast::cache::NameCache::new();
                 if h.path.len() > 1 || !h.path[0].selects.is_empty() {

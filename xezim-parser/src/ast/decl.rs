@@ -1281,6 +1281,11 @@ pub struct GenerateIf {
     /// Empty (older cached ASTs) means all branches are unnamed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub branch_labels: Vec<Option<String>>,
+    /// Each branch label's declaration in its definition's tree (parallel to
+    /// `branch_labels`), from the binder (§23.9, §27.6); `UNSET` when unnamed
+    /// or not bound.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub branch_label_decls: Vec<super::binding::Bound>,
     /// §27.5 per branch (parallel to `branches`): no `begin`, and the one item
     /// is a conditional generate, so the branch is not a scope.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1303,6 +1308,10 @@ pub struct GenerateCaseArm {
     /// §27.6 `begin : label` block name for this arm.
     #[cfg_attr(feature = "serde", serde(default))]
     pub label: Option<String>,
+    /// The label's declaration in its definition's tree, from the binder
+    /// (§23.9, §27.6).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub label_decl: super::binding::Bound,
     /// §27.5: no `begin`, and the one item is a conditional generate, so the
     /// arm is not a scope.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1346,6 +1355,10 @@ pub struct GenerateFor {
     /// don't collide on `sig__gf_i_<n>_`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub name: Option<String>,
+    /// The label's declaration in its definition's tree, from the binder
+    /// (§23.9, §27.6).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub name_decl: super::binding::Bound,
     /// §27.6 name of the block when unnamed, from the scope tree.
     #[cfg_attr(feature = "serde", serde(default))]
     pub implicit_name: String,
