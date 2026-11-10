@@ -4456,13 +4456,14 @@ impl ElaboratedModule {
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.
-            match whole_array_assign_parts_dir(
+            match whole_array_assign_parts_dir_with_params(
                 &ca.lhs,
                 &ca.rhs,
                 ca.delay,
                 &self.arrays,
                 Some(&self.descending_arrays),
                 Some(&self.unpacked_decl_dims),
+                Some(&self.parameters),
             )
             .or_else(|| {
                 slice_array_assign_parts(
@@ -48137,9 +48138,25 @@ pub fn whole_array_assign_parts_dir(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
 ) -> Option<Vec<ContinuousAssignment>> {
+    whole_array_assign_parts_dir_with_params(lhs, rhs, delay, arrays, descending, decl_dims, None)
+}
+
+/// §10.9.1: pattern keys and replication counts use the design's parameter
+/// bindings even when expansion happens after loading a compiled artifact.
+pub fn whole_array_assign_parts_dir_with_params(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    params: Option<&HashMap<String, Value>>,
+) -> Option<Vec<ContinuousAssignment>> {
     let pattern = peel_unpacked_typed_pattern(rhs);
     if let ExprKind::AssignmentPattern(_) = &pattern.kind {
-        return pattern_array_assign_parts(lhs, pattern, delay, arrays, descending, decl_dims);
+        return pattern_array_assign_parts(
+            lhs, pattern, delay, arrays, descending, decl_dims, params,
+        );
     }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
         return None;
@@ -48455,6 +48472,7 @@ fn pattern_array_assign_parts(
     arrays: &HashMap<String, (i64, i64, u32)>,
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    params: Option<&HashMap<String, Value>>,
 ) -> Option<Vec<ContinuousAssignment>> {
     let ExprKind::Ident(lh) = &lhs.kind else {
         return None;
@@ -48482,7 +48500,7 @@ fn pattern_array_assign_parts(
         return None;
     }
     let mut out: Vec<(Vec<i64>, Expression)> = Vec::new();
-    pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out)?;
+    pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out, params)?;
     Some(
         out.into_iter()
             .map(|(idx, e)| ContinuousAssignment {
@@ -48505,6 +48523,7 @@ fn pattern_leaves(
     dims: &[(i64, i64)],
     idx: &mut Vec<i64>,
     out: &mut Vec<(Vec<i64>, Expression)>,
+    params: Option<&HashMap<String, Value>>,
 ) -> Option<()> {
     let Some(&(l, r)) = dims.first() else {
         if matches!(e.kind, ExprKind::AssignmentPattern(_)) {
@@ -48531,7 +48550,7 @@ fn pattern_leaves(
         if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
             && let ExprKind::Replication { count, exprs } = &only.kind
         {
-            let c = const_eval_i64_with_params(count, None)?;
+            let c = const_eval_i64_with_params(count, params)?;
             for _ in 0..c.max(0) {
                 flat.extend(exprs.iter());
             }
@@ -48549,7 +48568,7 @@ fn pattern_leaves(
             match it {
                 AssignmentPatternItem::Default(x) => default = Some(x),
                 AssignmentPatternItem::Keyed(key, x) => {
-                    let ix = const_eval_i64_with_params(key, None)?;
+                    let ix = const_eval_i64_with_params(key, params)?;
                     if ix < l.min(r) || ix > l.max(r) {
                         return None;
                     }
@@ -48562,7 +48581,7 @@ fn pattern_leaves(
     for (k, x) in elems.into_iter().enumerate() {
         idx.push(index_at(k));
         match (x, default) {
-            (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out)?,
+            (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out, params)?,
             // §10.9.1: `default:` reaches every leaf of a missing element.
             (None, Some(d))
                 if !matches!(
@@ -48572,7 +48591,7 @@ fn pattern_leaves(
             {
                 default_leaves(d, &dims[1..], idx, out)
             }
-            (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out)?,
+            (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out, params)?,
             (None, None) => return None,
         }
         idx.pop();
@@ -48624,13 +48643,14 @@ fn expand_whole_array_assign(
     delay: u64,
     elab: &mut ElaboratedModule,
 ) -> bool {
-    match whole_array_assign_parts_dir(
+    match whole_array_assign_parts_dir_with_params(
         lhs,
         rhs,
         delay,
         &elab.arrays,
         Some(&elab.descending_arrays),
         Some(&elab.unpacked_decl_dims),
+        Some(&elab.parameters),
     )
     .or_else(|| {
         slice_array_assign_parts(
