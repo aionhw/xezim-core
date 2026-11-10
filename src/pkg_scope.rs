@@ -74,6 +74,8 @@ struct PkgInfo {
     /// Variable names declared directly in the package (a subset of
     /// `values`).
     vars: HashSet<String>,
+    /// Package-owned value parameters retain lexical binding in subroutines.
+    params: HashSet<String>,
     /// `import Q::name;` as (Q, name).
     explicit: Vec<(String, String)>,
     /// `import Q::*;`
@@ -114,6 +116,7 @@ struct Info {
 #[derive(Default)]
 struct ClassInfo {
     types: HashSet<String>,
+    values: HashSet<String>,
     base: Option<String>,
     /// Every typedef the class declares (class-naming ones included).
     typedefs: HashSet<String>,
@@ -211,6 +214,7 @@ fn record_class(
         ..ClassInfo::default()
     };
     class_param_typedefs(c, class_names, &mut ci);
+    class_value_names(c, &mut ci.values);
     for it in &c.items {
         match it {
             ClassItem::Typedef(td) if class_typedef_renamable(td, class_names) => {
@@ -892,6 +896,9 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 let pi = pkgs.entry(p.name.name.clone()).or_default();
                 for it in &p.items {
                     package_item_values(it, &mut pi.values);
+                    if let PackageItem::Parameter(pd) = it {
+                        param_names(pd, &mut HashSet::default(), &mut pi.params);
+                    }
                     if let PackageItem::Data(dd) = it {
                         pi.vars
                             .extend(dd.declarators.iter().map(|v| v.name.name.clone()));
@@ -948,14 +955,23 @@ fn collect(descs: &[Description]) -> Option<Info> {
                 });
             }
             Description::Module(m) => {
+                for pd in &m.params {
+                    param_names(pd, &mut HashSet::default(), &mut other_values);
+                }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
             }
             Description::Interface(m) => {
+                for pd in &m.params {
+                    param_names(pd, &mut HashSet::default(), &mut other_values);
+                }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
             }
             Description::Program(m) => {
+                for pd in &m.params {
+                    param_names(pd, &mut HashSet::default(), &mut other_values);
+                }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
             }
@@ -1233,6 +1249,31 @@ fn param_names(
     }
 }
 
+fn class_value_names(c: &ClassDeclaration, out: &mut HashSet<String>) {
+    for pd in &c.params {
+        param_names(pd, &mut HashSet::default(), out);
+    }
+    for item in &c.items {
+        match item {
+            ClassItem::Property(p) => {
+                out.extend(p.declarators.iter().map(|d| d.name.name.clone()));
+                enum_members(&p.data_type, out);
+            }
+            ClassItem::Parameter(pd) => param_names(pd, &mut HashSet::default(), out),
+            ClassItem::Typedef(td) => enum_members(&td.data_type, out),
+            ClassItem::Method(m) => {
+                out.insert(match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => f.name.name.name.clone(),
+                    ClassMethodKind::Task(t) => t.name.name.name.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
     let mut sink = HashSet::default();
     match pi {
@@ -1458,14 +1499,21 @@ impl Rw<'_> {
                     .get(p)
                     .is_some_and(|pi| pi.values.contains(n))
                 {
-                    // The package's own declaration: its subroutines and
-                    // initializers already read their own package's entry
-                    // (including constant evaluation while it registers),
-                    // so the reference stays as written.
-                    return None;
+                    // §26.3: parameter references in package functions and
+                    // classes keep the package's value when a module owns
+                    // the same bare name in the flattened design.
+                    return self.info.pkgs[p].params.contains(n).then(|| p.clone());
                 }
             }
-            if f.values.contains(n) || f.inherits {
+            let inherited = f.inherits
+                && (f.bases.is_empty()
+                    || f.bases.iter().any(|base| {
+                        self.info
+                            .classes
+                            .get(base)
+                            .is_none_or(|ci| ci.values.contains(n))
+                    }));
+            if f.values.contains(n) || inherited {
                 return None;
             }
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
@@ -2998,6 +3046,16 @@ impl Rw<'_> {
             }
         }
         let mut body = Frame::default();
+        // §23.2/§26.3: the header and body form one module scope.
+        // Body imports cannot capture names already declared in the header.
+        for pd in params.iter() {
+            param_names(pd, &mut body.types, &mut body.values);
+        }
+        match ports {
+            PortList::Ansi(v) => body.values.extend(v.iter().map(|p| p.name.name.clone())),
+            PortList::NonAnsi(v) => body.values.extend(v.iter().map(|p| p.name.clone())),
+            PortList::Empty => {}
+        }
         self.module_class_bindings(items, &mut body);
         module_item_names(items, &mut body);
         self.frames.push(body);

@@ -9772,6 +9772,46 @@ pub fn elaborate_module_with_defs(
         elab.lets.insert(l.name.name.clone(), l.clone());
     }
 
+    // §26.3: names a wildcard import brings in that are ALSO declared locally
+    // — the local declaration shadows the imported one (no duplicate error).
+    if let Some(defs) = all_defs {
+        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), module.params(), defs)
+            .into_iter()
+            .collect();
+        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs)
+            .into_iter()
+            .collect();
+    }
+    // §26.3: an explicit import conflicts with a header declaration;
+    // unlike a wildcard import, it cannot be displaced by that declaration.
+    let header_names: HashSet<&str> = module
+        .params()
+        .iter()
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Data { assignments, .. } => assignments
+                .iter()
+                .map(|a| a.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ParameterKind::Type { assignments } => {
+                assignments.iter().map(|a| a.name.name.as_str()).collect()
+            }
+        })
+        .collect();
+    for item in module.items() {
+        if let ModuleItem::ImportDeclaration(imp) = item {
+            for ii in &imp.items {
+                if let Some(name) = &ii.item
+                    && header_names.contains(name.name.as_str())
+                {
+                    return Err(format!(
+                        "'{}' is already declared as a module parameter (IEEE 1800-2023 §26.3)",
+                        name.name
+                    ));
+                }
+            }
+        }
+    }
+
     // §13.4.3: register module-body function declarations before the
     // parameter pass so a header `parameter LOG_X = log2(X)` const-evaluates.
     for it in module.items() {
@@ -10595,16 +10635,6 @@ pub fn elaborate_module_with_defs(
         }
     }
 
-    // §26.3: names a wildcard import brings in that are ALSO declared locally
-    // — the local declaration shadows the imported one (no duplicate error).
-    if let Some(defs) = all_defs {
-        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs)
-            .into_iter()
-            .collect();
-        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs)
-            .into_iter()
-            .collect();
-    }
     // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
     // the items, so a declaration whose width depends on one of them is sized
     // correctly no matter what ORDER the parameters appear in.
@@ -32500,6 +32530,28 @@ fn inline_instantiations_inner(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    let header_values: Vec<_> = definitions
+        .get(&elab.name)
+        .into_iter()
+        .flat_map(|def| def.params())
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Data { assignments, .. } => assignments
+                .iter()
+                .map(|a| a.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ParameterKind::Type { .. } => Vec::new(),
+        })
+        .filter_map(|name| {
+            elab.parameters.get(name).map(|value| {
+                (
+                    name.to_string(),
+                    value.clone(),
+                    elab.signals.get(name).cloned(),
+                )
+            })
+        })
+        .collect();
+
     // §26.3: each design unit's package imports, for the runtime's
     // resolution of a contested package-variable name (see
     // `pkg_var_decls`).
@@ -33442,6 +33494,12 @@ fn inline_instantiations_inner(
     };
     // Recursively inline starting from the top module's items
     MODPORT_EXPR_TLS.with(|m| m.borrow_mut().clear());
+    for (name, value, signal) in header_values {
+        elab.set_param(line!(), name.clone(), value);
+        if let Some(signal) = signal {
+            signals_insert_traced(&mut elab.signals, line!(), name, signal);
+        }
+    }
     let top_params = elab.parameters.clone();
     // Snapshot the now-complete package/$unit parameters as the const-eval
     // fallback so sub-module header localparams (evaluated in the instance-merge
@@ -51740,6 +51798,7 @@ fn collect_local_scope_names(items: &[ModuleItem]) -> std::collections::HashSet<
 /// locally is a shadow (the local wins). Explicit imports are excluded.
 fn compute_wildcard_shadowed(
     items: &[ModuleItem],
+    params: &[ParameterDeclaration],
     defs: &HashMap<String, Definition>,
 ) -> std::collections::HashSet<String> {
     // §26.3 ordering rule: a local declaration only legally SHADOWS a
@@ -51763,7 +51822,18 @@ fn compute_wildcard_shadowed(
         Some(idx) => &items[..idx],
         None => items,
     };
-    let local = collect_local_scope_names(decl_items);
+    let mut local = collect_local_scope_names(decl_items);
+    // Header parameters precede every body item (§23.2, §26.3).
+    for pd in params {
+        match &pd.kind {
+            ParameterKind::Data { assignments, .. } => {
+                local.extend(assignments.iter().map(|a| a.name.name.clone()))
+            }
+            ParameterKind::Type { assignments } => {
+                local.extend(assignments.iter().map(|a| a.name.name.clone()))
+            }
+        }
+    }
     let mut out = std::collections::HashSet::default();
     for item in items {
         if let ModuleItem::ImportDeclaration(imp) = item {
@@ -52431,6 +52501,9 @@ fn process_import(
                                 let is_real = is_type_real(data_type);
                                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                 for assign in assignments {
+                                    if elab.local_decl_displaces(&assign.name.name) {
+                                        continue;
+                                    }
                                     if register_visible_array_param(
                                         elab, pkg_name, assign, data_type,
                                     ) {
