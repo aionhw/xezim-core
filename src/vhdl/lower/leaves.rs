@@ -197,6 +197,19 @@ impl<'a> Lw<'a> {
         Some((stride, out))
     }
 
+    /// A class that is one packed vector under record fields: the fields'
+    /// selection, the element bits and the length.
+    fn whole_class(c: &LeafClass) -> Option<(String, u32, i64)> {
+        let (last, fields) = c.steps.split_last()?;
+        let Step::PDim(n, w) = last else { return None };
+        let mut pre = String::new();
+        for s in fields {
+            let Step::Field(i) = s else { return None };
+            let _ = write!(pre, ".f{}", i);
+        }
+        (*n >= 1).then_some((pre, *w, *n))
+    }
+
     /// The runs of consecutive leaves of a coverage in `base..base + count`.
     fn cov_runs(cov: &Cov, base: i64, count: i64) -> Vec<(i64, i64)> {
         let mut runs: Vec<(i64, i64)> = Vec::new();
@@ -380,17 +393,33 @@ impl<'a> Lw<'a> {
             let et = r.sv();
             let tx = self.slot_tx(&r);
             let cap = c.count.max(1);
+            // A zero-delay assignment of the whole vector is one pending
+            // value (`emit_leaves`); a queued transaction first queues it.
+            let mut flush = String::new();
+            if let Some((_, w, n)) = Self::whole_class(c) {
+                let _ = writeln!(
+                    out,
+                    "  bit [{hi}:0] vh_pw{s}_{p}_c{ci};\n  bit vh_pwf{s}_{p}_c{ci};",
+                    hi = w as i64 * n - 1
+                );
+                let _ = write!(
+                    flush,
+                    "    if (vh_pwf{s}_{p}_c{ci}) begin\n      vh_pwf{s}_{p}_c{ci} = 0;\n      for (vh_pj = 0; vh_pj < {n}; vh_pj = vh_pj + 1) {tx}(vh_dt{s}_{p}_c{ci}, vh_dk{s}_{p}_c{ci}, vh_dq{s}_{p}_c{ci}, vh_pj, vh_pw{s}_{p}_c{ci}[{w} * ({n1} - vh_pj) +: {w}], 64'sd0, 64'sd0, 0);\n    end\n",
+                    n1 = n - 1
+                );
+            }
             // Pending zero-delay values by leaf, the leaves pending (each
             // once), and their number (the fast path of `emit_leaves`); a
             // queued transaction first moves the pending ones into the queue.
             let _ = write!(
                 out,
-                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  int vh_sqn{s}_{p}_c{c};\n  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n    for (vh_pj = 0; vh_pj < vh_pn{s}_{p}_c{c}; vh_pj = vh_pj + 1) begin\n      vh_lkk = vh_pl{s}_{p}_c{c}[vh_pj];\n      if (vh_pm{s}_{p}_c{c}[vh_lkk]) begin {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, vh_lkk, vh_pf{s}_{p}_c{c}[vh_lkk], 64'sd0, 64'sd0, 0); vh_pm{s}_{p}_c{c}[vh_lkk] = 0; end\n    end\n    vh_pn{s}_{p}_c{c} = 0;\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= vh_now) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;\n    end\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n",
+                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  int vh_sqn{s}_{p}_c{c};\n  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n{flush}    for (vh_pj = 0; vh_pj < vh_pn{s}_{p}_c{c}; vh_pj = vh_pj + 1) begin\n      vh_lkk = vh_pl{s}_{p}_c{c}[vh_pj];\n      if (vh_pm{s}_{p}_c{c}[vh_lkk]) begin {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, vh_lkk, vh_pf{s}_{p}_c{c}[vh_lkk], 64'sd0, 64'sd0, 0); vh_pm{s}_{p}_c{c}[vh_lkk] = 0; end\n    end\n    vh_pn{s}_{p}_c{c} = 0;\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= vh_now) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;\n    end\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n",
                 s = s,
                 p = p,
                 c = ci,
                 et = et,
                 tx = tx,
+                flush = flush,
                 cnt1 = c.count.max(1) - 1,
                 cap1 = cap - 1,
                 leaf = Self::leaf_sv(c, "k")
@@ -459,6 +488,34 @@ impl<'a> Lw<'a> {
                     Repr::Pk(w, n) => Some((w, slice_len.unwrap_or(n))),
                     _ => None,
                 };
+                // The whole of a packed vector, with no queued transaction:
+                // one pending value, which replaces those pending by leaf.
+                let mut whole = false;
+                if let Some((_, n)) = pk
+                    && ndim == 1
+                    && slice_start.is_none()
+                    && slice_len.is_none()
+                    && self.leaf_zero
+                    && self.sig_kind(s).is_none()
+                    && path.iter().all(|(f, _)| f.is_some())
+                    && self.ndims(e) == 0
+                    && let Some(classes) = self.leaf_classes(self.sigs[s].ty)
+                {
+                    let pre: String = path.iter().map(|(f, _)| format!(".f{}", f.unwrap_or(0))).collect();
+                    if let Some(ci) = classes
+                        .iter()
+                        .position(|c| Self::whole_class(c).is_some_and(|(q, _, m)| q == pre && m == n))
+                        && self.driver_classes(s, p).contains(&ci)
+                    {
+                        whole = true;
+                        let _ = writeln!(
+                            out,
+                            "{pad}if (vh_sqn{s}_{p}_c{c} == 0) begin\n{pad}  if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) vh_pm{s}_{p}_c{c}[vh_pl{s}_{p}_c{c}[vh_pi]] = 0; vh_pn{s}_{p}_c{c} = 0; end\n{pad}  vh_pw{s}_{p}_c{c} = {val}; vh_pwf{s}_{p}_c{c} = 1;\n{pad}end else begin",
+                            pad = pad,
+                            c = ci
+                        );
+                    }
+                }
                 for k in 0..ndim {
                     let iv = format!("vh_li{}_{}", depth, k);
                     let off = match (&slice_start, k) {
@@ -491,6 +548,9 @@ impl<'a> Lw<'a> {
                 }
                 for k in (0..opened).rev() {
                     let _ = writeln!(out, "{}{}end", pad, "  ".repeat(k));
+                }
+                if whole {
+                    let _ = writeln!(out, "{}end", pad);
                 }
             }
             _ => {
@@ -556,6 +616,12 @@ impl<'a> Lw<'a> {
         };
         for c in self.driver_classes(s, p) {
             let leaf = Self::leaf_sv(&classes[c], "vh_lk");
+            if let Some((pre, ..)) = Self::whole_class(&classes[c]) {
+                let _ = writeln!(
+                    out,
+                    "{ind}if (vh_pwf{s}_{p}_c{c}) begin vh_dv{s}_{p}{pre} = vh_pw{s}_{p}_c{c}; vh_pwf{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end"
+                );
+            }
             let _ = writeln!(
                 out,
                 "{ind}if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pl{s}_{p}_c{c}[vh_pi]; if (vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{leaf} = vh_pf{s}_{p}_c{c}[vh_lk]; vh_pm{s}_{p}_c{c}[vh_lk] = 0; end end vh_pn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end",
@@ -573,7 +639,11 @@ impl<'a> Lw<'a> {
     /// The next transaction time of driver (s, p) by parts.
     pub(super) fn slot_driver_next(&self, s: usize, p: usize) -> String {
         let mut out = String::new();
+        let classes = self.leaf_classes(self.sigs[s].ty).unwrap_or_default();
         for c in self.driver_classes(s, p) {
+            if classes.get(c).is_some_and(|c| Self::whole_class(c).is_some()) {
+                let _ = writeln!(out, "    if (vh_pwf{s}_{p}_c{c}) n = vh_now;");
+            }
             let _ = writeln!(
                 out,
                 "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now; else if (vh_sqn{s}_{p}_c{c} > 0 && (n < 0 || vh_dt{s}_{p}_c{c}[0] < n)) n = vh_dt{s}_{p}_c{c}[0];",
@@ -661,6 +731,25 @@ impl<'a> Lw<'a> {
                 for (p, d) in &cov {
                     for (a, b) in Self::cov_runs(&d.cov, c.base, c.count) {
                         let (a, b) = (a - c.base, b - c.base);
+                        // The whole class, a scalar or one packed vector
+                        // under record fields: one assignment.
+                        if a == 0
+                            && b == c.count - 1
+                            && c.steps.iter().filter(|s| !matches!(s, Step::Field(_))).count() <= 1
+                            && !c.steps.iter().any(|s| matches!(s, Step::Dim(_)))
+                            && matches!(c.steps.last(), None | Some(Step::Field(_) | Step::PDim(..)))
+                        {
+                            let pre: String = c
+                                .steps
+                                .iter()
+                                .filter_map(|s| match s {
+                                    Step::Field(i) => Some(format!(".f{}", i)),
+                                    _ => None,
+                                })
+                                .collect();
+                            let _ = writeln!(body, "    nv{pre} = vh_dv{s}_{p}{pre};", pre = pre, s = s, p = p);
+                            continue;
+                        }
                         match &elem {
                             Some((stride, e)) if a % stride == 0 && (b + 1) % stride == 0 => {
                                 let _ = writeln!(

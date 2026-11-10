@@ -2558,6 +2558,12 @@ impl<'a> Lw<'a> {
                     .iter()
                     .any(|c| matches!(c, HChoice::Range(_) | HChoice::Others));
             let x = if many { self.as_tmp(x, &er.sv()) } else { x };
+            // `(others => x)` alone: every element is `x`, one replication
+            // instead of a store per element.
+            if items.len() == 1 && matches!(choices.as_slice(), [HChoice::Others]) && w >= 1 && n >= 1 {
+                let _ = writeln!(body, "{a} = {{{n}{{{x}[{h}:0]}}}};", a = agg, n = n, x = x, h = w - 1);
+                continue;
+            }
             if choices.is_empty() {
                 let _ = writeln!(body, "{a} = {f}({a}, {p}, {x});", a = agg, f = setf, p = pos, x = x);
                 if named {
