@@ -206,7 +206,11 @@ pub use value::Value;
 /// constructs.
 /// \x3c = \x3b + the full path of a `disable` target (§9.6.2).
 /// \x3d = \x3c + clocking skew edges (§14.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3d";
+/// \x3e = \x3d + per-driver primitive fall delays (§28.16); old elaborations
+/// kept only the last primitive's delay on the shared net and lost its owner.
+/// ContinuousAssignment::gate_delay_fall keeps this metadata separate from
+/// the ordinary transition fields used by legacy primitive and net delays.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3e";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
