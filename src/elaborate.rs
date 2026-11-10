@@ -6251,7 +6251,7 @@ fn ordered_typedefs<'a>(defs: &HashMap<String, Definition<'a>>) -> Vec<&'a Typed
     out
 }
 
-/// §20.6.2: `$bits(<signal>)` inside a TYPE's packed dims (`typedef
+/// §20.6.2: `$bits` inside a TYPE's packed dims (`typedef
 /// logic[$bits(sig)-1:0] t;`) — rewrite the dims with the signal's known
 /// width so `resolve_type_width` sees a constant. Without this the dim
 /// silently evaluated to nothing and the typedef registered 1 bit wide.
@@ -6315,6 +6315,44 @@ fn prebind_type_dims(dt: &DataType, elab: &ElaboratedModule) -> Option<DataType>
             dimensions: rewrite(dimensions),
             span: *span,
         }),
+        DataType::TypeReference { dimensions, .. } if dims_mention_bits(dimensions) => {
+            let mut bound = dt.clone();
+            if let DataType::TypeReference {
+                dimensions: dims, ..
+            } = &mut bound
+            {
+                *dims = rewrite(dimensions);
+            }
+            Some(bound)
+        }
+        DataType::Struct(su) => {
+            // A member's type must retain its declaration-scope widths after
+            // serialization, just as the enclosing typedef does (§7.2, §27).
+            let mut bound = dims_mention_bits(&su.dimensions).then(|| {
+                let mut s = su.clone();
+                s.dimensions = rewrite(&s.dimensions);
+                s
+            });
+            for (i, member) in su.members.iter().enumerate() {
+                if let Some(dt) = prebind_type_dims(&member.data_type, elab) {
+                    bound.get_or_insert_with(|| su.clone()).members[i].data_type = dt;
+                }
+            }
+            bound.map(DataType::Struct)
+        }
+        DataType::Enum(et) => {
+            let mut bound = dims_mention_bits(&et.dimensions).then(|| {
+                let mut e = et.clone();
+                e.dimensions = rewrite(&e.dimensions);
+                e
+            });
+            if let Some(base) = &et.base_type
+                && let Some(dt) = prebind_type_dims(base, elab)
+            {
+                bound.get_or_insert_with(|| et.clone()).base_type = Some(Box::new(dt));
+            }
+            bound.map(DataType::Enum)
+        }
         _ => None,
     }
 }
@@ -24770,12 +24808,26 @@ fn prebind_bits_of_signals(
     let mut out = e.clone();
     if let ExprKind::SystemCall { name, args } = &e.kind {
         if name == "$bits" && args.len() == 1 {
+            // A typedef may be visible only in this generate scope. Freeze its
+            // width before the elaborator's type context is discarded (§20.6.2).
+            let from_type = flatten_member_chain(&args[0]).and_then(|(base, path)| {
+                let mut parts = vec![base];
+                parts.extend(path);
+                let dotted = parts.join(".");
+                if signals.contains_key(&dotted) || params.contains_key(&dotted) {
+                    return None;
+                }
+                typedefs
+                    .get(&dotted)
+                    .or_else(|| typedefs.get(&parts.join("::")))
+                    .copied()
+            });
             // §7.4.5: an element or slice of a declared variable (see
             // `decl_select_bits`) before the signal table's element width.
             let from_shape = decl_select_bits(&args[0], Some(params))
                 .and_then(|b| u32::try_from(b).ok())
                 .filter(|w| *w > 0);
-            if let Some(w) = from_shape.or_else(|| {
+            if let Some(w) = from_shape.or(from_type).or_else(|| {
                 bits_of_signal_expr(
                     &args[0],
                     signals,
