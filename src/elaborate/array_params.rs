@@ -361,7 +361,7 @@ pub(super) fn register(
             name.clone(),
             Signal {
                 is_const: true,
-                name,
+                name: name.into(),
                 width,
                 is_signed: value.is_signed,
                 is_real: value.is_real,

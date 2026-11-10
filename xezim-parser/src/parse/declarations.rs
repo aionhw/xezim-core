@@ -163,6 +163,7 @@ impl Parser {
                 None
             };
             assignments.push(ParamAssignment {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -266,6 +267,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: false, // forward CLASS — resolved via a class decl, not checked here
+                decl: Default::default(),
             };
         }
         // §6.18: KEYWORD-qualified forward form — `typedef struct T;`,
@@ -294,6 +296,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                decl: Default::default(),
             };
         }
         // IEEE 1800-2017 §6.18: bare forward type declaration `typedef name;`
@@ -309,6 +312,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                decl: Default::default(),
             };
         }
         let data_type = self.parse_data_type();
@@ -321,6 +325,7 @@ impl Parser {
             dimensions,
             span: self.span_from(start),
             forward: false,
+            decl: Default::default(),
         }
     }
 
@@ -474,6 +479,7 @@ impl Parser {
                 None
             };
             decls.push(VarDeclarator {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -510,23 +516,27 @@ impl Parser {
         for p in &ports {
             self.hide_let_name(&p.name.name);
         }
-        while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
-            if matches!(
-                self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
-            ) {
-                // §13.4.2 non-ANSI body ports fill `ports` for arg binding
-                // (ANSI functions already have a non-empty `ports` here).
-                let n0 = ports.len();
-                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
-                for i in n0..ports.len() {
-                    let n = ports[i].name.name.clone();
-                    self.hide_let_name(&n);
+        // §13.3/§13.4: declaration clones share this body, including package
+        // and generic-class uses that need no instance rewrite.
+        crate::ast::cache::without_scope_caches(|| {
+            while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+                ) {
+                    // §13.4.2 non-ANSI body ports fill `ports` for arg binding
+                    // (ANSI functions already have a non-empty `ports` here).
+                    let n0 = ports.len();
+                    self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                    for i in n0..ports.len() {
+                        let n = ports[i].name.name.clone();
+                        self.hide_let_name(&n);
+                    }
+                } else {
+                    self.parse_block_item(&mut items);
                 }
-            } else {
-                self.parse_block_item(&mut items);
             }
-        }
+        });
         self.pop_let_scope();
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
@@ -546,10 +556,11 @@ impl Parser {
             return_type,
             name,
             ports,
-            items,
+            items: items.into(),
             endlabel,
             strict_body_ports,
             default_args,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -660,21 +671,25 @@ impl Parser {
         for p in &ports {
             self.hide_let_name(&p.name.name);
         }
-        while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
-            if matches!(
-                self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
-            ) {
-                let n0 = ports.len();
-                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
-                for i in n0..ports.len() {
-                    let n = ports[i].name.name.clone();
-                    self.hide_let_name(&n);
+        // §13.3/§13.4: declaration clones share this body, including package
+        // and generic-class uses that need no instance rewrite.
+        crate::ast::cache::without_scope_caches(|| {
+            while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+                ) {
+                    let n0 = ports.len();
+                    self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                    for i in n0..ports.len() {
+                        let n = ports[i].name.name.clone();
+                        self.hide_let_name(&n);
+                    }
+                } else {
+                    self.parse_block_item(&mut items);
                 }
-            } else {
-                self.parse_block_item(&mut items);
             }
-        }
+        });
         self.pop_let_scope();
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
@@ -685,9 +700,10 @@ impl Parser {
             specifier,
             name,
             ports,
-            items,
+            items: items.into(),
             endlabel,
             strict_body_ports,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -918,6 +934,7 @@ impl Parser {
             scopes,
             name,
             span: self.span_from(start),
+            bound: Default::default(),
         }
     }
     /// The return type of a function declaration or prototype: an explicit
@@ -989,10 +1006,11 @@ impl Parser {
             return_type,
             name,
             ports,
-            items: Vec::new(),
+            items: Default::default(),
             endlabel: None,
             strict_body_ports: Vec::new(),
             default_args,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -1010,9 +1028,10 @@ impl Parser {
             specifier,
             name,
             ports,
-            items: Vec::new(),
+            items: Default::default(),
             endlabel: None,
             strict_body_ports: Vec::new(),
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -1196,6 +1215,7 @@ impl Parser {
                         scopes: Vec::new(),
                         name: iface_name,
                         span: self.span_from(start),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args: Vec::new(),
@@ -1540,6 +1560,7 @@ impl Parser {
                         .declarators
                         .into_iter()
                         .map(|d| VarDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             // §6.6: an undriven net holds z (a supply net its
                             // constant), where a package variable would start
                             // at its type's default.

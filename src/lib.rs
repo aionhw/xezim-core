@@ -68,11 +68,14 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
     }
 }
 
+mod ast_intern;
 pub mod bits2;
 mod body_type_params;
 pub mod elaborate;
 pub mod packed_value;
 mod param_override_lists;
+pub mod scope_tree;
+pub mod shared_names;
 mod unit_subroutine_usage;
 pub mod pkg_scope;
 pub mod sdf;
@@ -192,7 +195,16 @@ pub use value::Value;
 /// \x36 = string keys in element names escaped (`value::encode_name_key`).
 /// \x37 = \x36 + ExprKind::TypedPattern, the type of `T'{...}` (§10.9), and
 /// ElaboratedModule.param_decl_types.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x37";
+/// \x38 = \x37 + shared callable bodies and interned hierarchical signal names.
+/// \x39 = \x38 + whether the formal of an ElaboratedModule.input_port_actuals
+/// entry is 2-state (§23.3.3).
+/// \x3a = \x39 + the formal's path, not its instance's, in
+/// ElaboratedModule.input_port_actuals.
+/// \x3b = \x3a + the direct-nesting flags and implicit names of generate
+/// constructs.
+/// \x3c = \x3b + the full path of a `disable` target (§9.6.2).
+/// \x3d = \x3c + clocking skew edges (§14.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3d";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -375,6 +387,7 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the file size and decompression info.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
+    let _name_registry = shared_names::registry_scope();
     use std::io::Read;
 
     let stats_enabled = compression_stats_enabled();
@@ -429,6 +442,7 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
 /// Like `read_compiled` but reads from an in-memory slice (e.g. an embedded
 /// `include_bytes!()` payload in a binary produced by `--emit-native`).
 pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, String> {
+    let _name_registry = shared_names::registry_scope();
     if bytes.len() < 8 {
         return Err("xezim artifact: payload shorter than magic header".to_string());
     }
@@ -1328,11 +1342,73 @@ pub fn parse_and_elaborate_multi_preprocessed(
             pp.module_ts_own_file.clone(),
         ),
     };
+    // A `-v` library file supplies only modules, interfaces, programs and
+    // primitives, so its packages are not compiled (#937). With
+    // `--relax-library-packages` they are, as if the file were also a source
+    // file: they join the design here, before anything imports them. A
+    // package a source file declares wins.
+    let mut source_files = source_files.to_vec();
+    let mut extra_orig_lines: Vec<u32> = Vec::new();
+    if sv_parser::RELAX_LIBRARY_PACKAGES.get() {
+        let lib_files = library_cli_cell()
+            .lock()
+            .map(|c| c.lib_files.clone())
+            .unwrap_or_default();
+        let mut declared: std::collections::HashSet<String> = all_descriptions
+            .iter()
+            .filter_map(|d| match d {
+                ast::Description::Package(p) => Some(p.name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        for file in lib_files {
+            let path = std::path::PathBuf::from(&file);
+            // An unreadable file is reported when the library is indexed.
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lpp = preprocessor::Preprocessor::new();
+            for dir in include_dirs {
+                lpp.add_include_dir(std::path::PathBuf::from(dir));
+            }
+            for (name, def) in &lib_defines {
+                lpp.define(name.clone(), def.clone());
+            }
+            let preprocessed = lpp.preprocess_file(&text, Some(&path));
+            let line_map = lpp.take_line_map();
+            let result = sv_parser::parse(&preprocessed);
+            let line_map = line_map.filter(|_| result.source_text == preprocessed);
+            let packages: Vec<ast::Description> = result
+                .source
+                .descriptions
+                .into_iter()
+                .filter(|d| {
+                    matches!(d, ast::Description::Package(p) if declared.insert(p.name.name.clone()))
+                })
+                .collect();
+            if packages.is_empty() {
+                continue;
+            }
+            let index = preprocessed_texts.len() as u32;
+            for d in &packages {
+                if let ast::Description::Package(p) = d {
+                    src_file_of_module
+                        .entry(p.name.name.clone())
+                        .or_insert(index);
+                }
+            }
+            all_descriptions.extend(packages);
+            preprocessed_texts.push(result.source_text);
+            line_maps.push(line_map);
+            source_files.push(file);
+            extra_orig_lines.push(text.lines().count() as u32);
+        }
+    }
     // Publish the sources BEFORE elaborating so an error raised during
     // elaboration (e.g. a duplicate declaration) can report `file:line`;
     // `elab.source_texts` below is assigned too late for that. Moved, not
     // cloned, then moved back out.
-    elaborate::set_elab_sources(preprocessed_texts, source_files.to_vec());
+    elaborate::set_elab_sources(preprocessed_texts, source_files.clone());
     elaborate::set_elab_line_maps(line_maps);
     elaborate::set_elab_module_files(src_file_of_module.clone());
     if !compile_verbose() {
@@ -1362,6 +1438,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     // Captured from the RAW sources — the only place the pre-preprocessing
     // line counts are still known.
     elab.source_orig_lines = sources.iter().map(|s| s.lines().count() as u32).collect();
+    elab.source_orig_lines.extend(extra_orig_lines);
     Ok((defs, elab))
 }
 
@@ -1645,6 +1722,7 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    let _name_registry = shared_names::registry_scope();
     let _declaration_order_scope = elaborate::declaration_order_scope();
     // Every elaboration starts from the same state, whatever the thread
     // elaborated before (§23.11 binds elaborate a design twice).
@@ -1668,6 +1746,7 @@ fn parse_and_elaborate(
     body_type_params::normalize(&mut all_descriptions);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
+    scope_tree::build_design(&mut all_descriptions);
     let cli = module_timescale_cli();
     // Deterministic: `module_timescale_exp` is filled by walking this map,
     // and its serialized order follows the order entries are inserted in.
@@ -2270,7 +2349,10 @@ fn parse_and_elaborate(
     // Match the later top selection when a missing named top may fall back
     // to automatic detection with strict-top checking disabled.
     let named_top = top_module_name.filter(|name| definitions.contains_key(*name));
-    let unit_carrier = if top_level_functions.is_empty() && top_level_tasks.is_empty() {
+    let unit_carrier = if top_level_functions.is_empty()
+        && top_level_tasks.is_empty()
+        && top_level_params.is_empty()
+    {
         None
     } else if let Some(name) = named_top {
         definitions
@@ -2313,6 +2395,48 @@ fn parse_and_elaborate(
         &top_level_dpi_imports,
         &top_level_dpi_exports,
     ));
+
+    // §3.12.1 / §6.20: compilation-unit constants need not become owned
+    // declarations and parameter/signal/type entries in every unrelated
+    // definition and instance. Retain all constants on the root carrier for
+    // diagnostics and global lookup. Elsewhere discard only constants unused
+    // throughout the design: a reference from another scope (including a
+    // hierarchical reference) conservatively retains the constant everywhere.
+    // Do not seed from the parameter declarations themselves: their names
+    // would mark every candidate used. Follow their dependencies instead.
+    let unit_param_usage = unit_subroutine_usage::Usage::parameters(&top_level_params);
+    let mut needed_unit_params = unit_param_usage.references(&(
+        (&top_level_functions, &top_level_tasks, &top_level_nettypes),
+        (&top_level_vars, &top_level_nets, &top_level_covergroups),
+        (
+            &top_level_assertion_decls,
+            &top_level_dpi_imports,
+            &top_level_dpi_exports,
+        ),
+        (&top_level_lets, &top_level_binds, &top_level_ooc_constraints),
+        (&top_level_imports, &class_defs, &typedef_defs),
+    ));
+    for def in definitions.values() {
+        let refs = match def {
+            SourceDefinition::Module(d) => unit_param_usage.references(d),
+            SourceDefinition::Interface(d) => unit_param_usage.references(d),
+            SourceDefinition::Program(d) => unit_param_usage.references(d),
+            SourceDefinition::Class(d) => unit_param_usage.references(d),
+            SourceDefinition::Package(d) => unit_param_usage.references(d),
+            SourceDefinition::Typedef(d) => unit_param_usage.references(d),
+            SourceDefinition::Udp(d) => unit_param_usage.references(d),
+        };
+        needed_unit_params.extend(refs);
+    }
+    // Library modules are adopted below, after unit injection. Their bodies
+    // may contain hierarchical references into these definitions that this
+    // scan cannot see yet. Keep all candidates until those sources can be
+    // included in the dependency scan as well.
+    let lib_cli = library_cli_cell().lock().unwrap().clone();
+    if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
+        needed_unit_params.extend(unit_param_usage.references(&top_level_params));
+    }
+    let needed_unit_params = unit_param_usage.close(needed_unit_params);
 
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
@@ -2425,7 +2549,7 @@ fn parse_and_elaborate(
                     }
                     let mut f = f.clone();
                     if let Some(items) = subst_body(&f.items, &f.ports) {
-                        f.items = items;
+                        f.items = items.into();
                     }
                     items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
                 }
@@ -2437,7 +2561,7 @@ fn parse_and_elaborate(
                     }
                     let mut t = t.clone();
                     if let Some(items) = subst_body(&t.items, &t.ports) {
-                        t.items = items;
+                        t.items = items.into();
                     }
                     items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t));
                 }
@@ -2502,11 +2626,33 @@ fn parse_and_elaborate(
                 // declaring only `B`, dropping the whole declaration would have
                 // lost `A` and keeping it re-declared `B`.
                 for p in top_level_params.iter().rev() {
+                    let needed = |name: &str| retain_all || needed_unit_params.contains(name);
+                    let keep = match &p.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } => assignments
+                            .iter()
+                            .any(|a| !local_decl_names.contains(&a.name.name) && needed(&a.name.name)),
+                        ast::decl::ParameterKind::Type { assignments } => {
+                            assignments.iter().any(|a| needed(&a.name.name))
+                        }
+                    };
+                    if !keep {
+                        continue;
+                    }
                     let mut p = p.clone();
-                    if let ast::decl::ParameterKind::Data { assignments, .. } = &mut p.kind {
-                        assignments.retain(|a| !local_decl_names.contains(&a.name.name));
-                        if assignments.is_empty() {
-                            continue;
+                    match &mut p.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } => {
+                            assignments.retain(|a| {
+                                !local_decl_names.contains(&a.name.name) && needed(&a.name.name)
+                            });
+                            if assignments.is_empty() {
+                                continue;
+                            }
+                        }
+                        ast::decl::ParameterKind::Type { assignments } => {
+                            assignments.retain(|a| needed(&a.name.name));
+                            if assignments.is_empty() {
+                                continue;
+                            }
                         }
                     }
                     items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p));
@@ -2589,7 +2735,9 @@ fn parse_and_elaborate(
     // as the top and run. An include dir is a search path, not a compile list.
     let explicit_def_names: std::collections::HashSet<String> =
         definitions.keys().cloned().collect();
-    let lib_cli = library_cli_cell().lock().unwrap().clone();
+    // A previous elaboration's library files on this thread must not locate
+    // this design's spans.
+    elaborate::set_elab_library_sources(Default::default());
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(
             &mut definitions,
@@ -2690,7 +2838,7 @@ fn parse_and_elaborate(
                                 signed: true,
                                 base: ast::expr::NumberBase::Decimal,
                                 value: v.to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             e.span,
                         );
@@ -2733,7 +2881,7 @@ fn parse_and_elaborate(
                                                     signed: true,
                                                     base: ast::expr::NumberBase::Decimal,
                                                     value: n.to_string(),
-                                                    cached_val: std::cell::Cell::new(None),
+                                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                                 },
                                             ),
                                             *span,
@@ -2958,7 +3106,18 @@ fn parse_and_elaborate(
         if module_candidates.len() > 1 {
             // Multi-top design: synthesize `__xezim_multi_top` instantiating
             // every top-level module and elaborate that as the root.
-            let wrapper = make_multi_top_wrapper(&module_candidates);
+            let mut wrapper = make_multi_top_wrapper(&module_candidates);
+            // §6.6.7, §3.12.1: the root elaboration publishes the nettype
+            // registry from its own items, and the `$unit` declarations were
+            // copied into each source module's items only. Without them the
+            // wrapper root registered no `$unit` nettype, so in a design with
+            // two tops a net's resolution function never ran and the
+            // one-driver rule was never checked.
+            for n in top_level_nettypes.iter().rev() {
+                wrapper
+                    .items
+                    .insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+            }
             let wrapper_name = wrapper.name.name.clone();
             definitions.insert(
                 wrapper_name.clone(),
@@ -3600,14 +3759,17 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
                 },
                 params: None,
                 instances: vec![HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: ast::Identifier {
                         name: name.clone(),
                         span: ast::Span::dummy(),
                     },
                     dimensions: vec![],
                     connections: vec![],
+                    gen_indices: vec![],
                     span: ast::Span::dummy(),
                 }],
+                scope: None,
                 span: ast::Span::dummy(),
             })
         })
@@ -3712,6 +3874,10 @@ fn resolve_library_modules(
     let mut parse_issue_files: Vec<std::path::PathBuf> = Vec::new();
     let mut lib_origins: crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)> =
         Default::default();
+    // Every indexed file's preprocessed text and line map (by definition
+    // name), so a diagnostic inside an ADOPTED definition names its own file;
+    // and the packages library files declared, which are never compiled.
+    let mut lib_sources = elaborate::LibrarySources::default();
     #[allow(clippy::too_many_arguments)]
     fn index_library_file(
         path: std::path::PathBuf,
@@ -3724,6 +3890,7 @@ fn resolve_library_modules(
         scanned_paths: &mut Vec<std::path::PathBuf>,
         parse_issue_files: &mut Vec<std::path::PathBuf>,
         lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
+        lib_sources: &mut elaborate::LibrarySources,
     ) {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -3856,6 +4023,8 @@ fn resolve_library_modules(
                 _ => None,
             })
             .collect();
+        let file_index = lib_sources.files.len() as u32;
+        let mut defined: Vec<String> = Vec::new();
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(mut m) => {
@@ -3865,6 +4034,7 @@ fn resolve_library_modules(
                             m.items.insert(0, sub.clone());
                         }
                         lib.insert(name.clone(), SourceDefinition::Module(Rc::new(m)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "module"));
                     }
                 }
@@ -3872,6 +4042,7 @@ fn resolve_library_modules(
                     let name = i.name.name.clone();
                     if !lib.contains_key(&name) {
                         lib.insert(name.clone(), SourceDefinition::Interface(Rc::new(i)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "interface"));
                     }
                 }
@@ -3879,6 +4050,7 @@ fn resolve_library_modules(
                     let name = p.name.name.clone();
                     if !lib.contains_key(&name) {
                         lib.insert(name.clone(), SourceDefinition::Program(Rc::new(p)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "program"));
                     }
                 }
@@ -3889,17 +4061,42 @@ fn resolve_library_modules(
                 ast::Description::TypedefDecl(t) if !t.forward => {
                     lib_typedefs.push(Rc::new(t));
                 }
+                // A library file supplies definitions to unresolved
+                // instantiations only; its packages are not compiled. Keep
+                // where one was declared, for the "not found" error of an
+                // import that expected it.
+                ast::Description::Package(p)
+                    if !(explicit_v && sv_parser::RELAX_LIBRARY_PACKAGES.get()) =>
+                {
+                    let at = line_map
+                        .as_ref()
+                        .and_then(|m| m.location_string(&result.source_text, p.name.span))
+                        .unwrap_or_else(|| file_label.clone());
+                    lib_sources
+                        .ignored_packages
+                        .entry(p.name.name.clone())
+                        .or_insert((at, file_label.clone()));
+                }
                 // §29: a UDP defined in a `-v`/`-y` library file (vendor
                 // stdcell). Adopted on demand like a library module.
                 ast::Description::Udp(u) => {
                     let name = u.name.name.clone();
                     if !lib.contains_key(&name) {
                         lib.insert(name.clone(), SourceDefinition::Udp(Rc::new(u)));
+                        defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "UDP"));
                     }
                 }
                 _ => {}
             }
+        }
+        if !defined.is_empty() {
+            for name in defined {
+                lib_sources.def_file.insert(name, file_index);
+            }
+            lib_sources
+                .files
+                .push((file_label, result.source_text, line_map));
         }
     }
 
@@ -3915,6 +4112,7 @@ fn resolve_library_modules(
             &mut scanned_paths,
             &mut parse_issue_files,
             &mut lib_origins,
+            &mut lib_sources,
         );
     }
 
@@ -3960,6 +4158,7 @@ fn resolve_library_modules(
     let mut work: Vec<String> = seed.into_iter().collect();
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut adopted_from_v = 0usize;
+    let mut adopted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut full_scan_done = false;
     while let Some(name) = work.pop() {
         if definitions.contains_key(&name) {
@@ -3991,6 +4190,7 @@ fn resolve_library_modules(
                     &mut scanned_paths,
                     &mut parse_issue_files,
                     &mut lib_origins,
+                    &mut lib_sources,
                 );
             }
             if !lib.contains_key(&name) && !full_scan_done {
@@ -4007,6 +4207,7 @@ fn resolve_library_modules(
                         &mut scanned_paths,
                         &mut parse_issue_files,
                         &mut lib_origins,
+                        &mut lib_sources,
                     );
                 }
             }
@@ -4031,7 +4232,10 @@ fn resolve_library_modules(
             }
             let mut more = std::collections::HashSet::new();
             instantiations(def, &mut more);
-            definitions.insert(name.clone(), def.clone());
+            let mut def = def.clone();
+            scope_tree::adopt(&mut def);
+            definitions.insert(name.clone(), def);
+            adopted.insert(name.clone());
             for n in more {
                 referrers.entry(n.clone()).or_default().insert(name.clone());
                 if !definitions.contains_key(&n) {
@@ -4152,6 +4356,7 @@ fn resolve_library_modules(
                 &mut scanned_paths,
                 &mut parse_issue_files,
                 &mut lib_origins,
+                &mut lib_sources,
             );
         }
     }
@@ -4164,6 +4369,34 @@ fn resolve_library_modules(
             definitions.insert(name, SourceDefinition::Typedef(t));
         }
     }
+    // Publish only the files an adopted definition came from.
+    let mut slots: Vec<Option<(String, String, Option<sv_parser::source_map::LineMap>)>> =
+        std::mem::take(&mut lib_sources.files)
+            .into_iter()
+            .map(Some)
+            .collect();
+    let mut renumber: crate::hasher::HashMap<u32, u32> = Default::default();
+    let mut def_file: crate::hasher::HashMap<String, u32> = Default::default();
+    for (name, i) in std::mem::take(&mut lib_sources.def_file) {
+        if !adopted.contains(&name) {
+            continue;
+        }
+        let j = match renumber.get(&i) {
+            Some(&j) => j,
+            None => {
+                let Some(file) = slots.get_mut(i as usize).and_then(Option::take) else {
+                    continue;
+                };
+                let j = lib_sources.files.len() as u32;
+                lib_sources.files.push(file);
+                renumber.insert(i, j);
+                j
+            }
+        };
+        def_file.insert(name, j);
+    }
+    lib_sources.def_file = def_file;
+    elaborate::set_elab_library_sources(lib_sources);
     Ok(())
 }
 

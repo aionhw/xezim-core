@@ -1,7 +1,7 @@
 //! SystemVerilog expressions (IEEE 1800-2017 §A.8)
 
 use super::{Identifier, Span};
-use std::cell::Cell;
+use super::cache::{LiteralCache, NameCache, SignalCache, WidthCache};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -14,7 +14,7 @@ pub struct Expression {
     /// `infer_width`; never filled for shapes whose width depends on runtime
     /// state (a local's current value, an evaluated fallback).
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub cached_width: Cell<Option<u32>>,
+    pub cached_width: WidthCache,
 }
 
 impl Expression {
@@ -22,7 +22,7 @@ impl Expression {
         Self {
             kind,
             span,
-            cached_width: Cell::new(None),
+            cached_width: crate::ast::cache::WidthCache::new(None),
         }
     }
 
@@ -208,7 +208,7 @@ pub enum NumberLiteral {
         base: NumberBase,
         value: String,
         #[cfg_attr(feature = "serde", serde(skip))]
-        cached_val: Cell<Option<(u64, u64, u32)>>,
+        cached_val: LiteralCache,
     },
     Real(f64),
     UnbasedUnsized(char),
@@ -327,13 +327,17 @@ pub struct HierarchicalIdentifier {
     pub span: Span,
     /// Cached signal ID for fast lookup during simulation (set on first access).
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub cached_signal_id: Cell<Option<usize>>,
+    pub cached_signal_id: SignalCache,
     /// Cached resolved hierarchical name (set on first call to
     /// `resolve_hier_name`). Bypasses all path-joining, prefix-stripping and
     /// suffix-scanning on repeat calls — the dominant cost for tight
     /// memory-init loops and `arr[i]` accesses in hot paths.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub cached_resolved_name: std::cell::OnceCell<String>,
+    pub cached_resolved_name: NameCache,
+    /// §23.9: the binding of the head segment, decided per definition before
+    /// expansion.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
 }
 
 impl std::fmt::Debug for HierarchicalIdentifier {

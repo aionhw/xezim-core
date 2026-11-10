@@ -7,7 +7,6 @@ use crate::ast::Span;
 use crate::ast::expr::*;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::token::TokenKind;
-use std::cell::Cell;
 
 impl Parser {
     pub(super) fn parse_expression(&mut self) -> Expression {
@@ -371,7 +370,7 @@ impl Parser {
                                             size: None,
                                             base: NumberBase::Decimal,
                                             value: "100".into(),
-                                            cached_val: Cell::new(None),
+                                            cached_val: crate::ast::cache::LiteralCache::new(None),
                                         }),
                                         self.span_from(start),
                                     )
@@ -824,7 +823,7 @@ impl Parser {
                                 signed: false,
                                 base: crate::ast::expr::NumberBase::Decimal,
                                 value: v.to_string(),
-                                cached_val: std::cell::Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             this.span_from(start),
                         )
@@ -1113,6 +1112,7 @@ impl Parser {
                     .collect(),
                 name,
                 span: ty_expr.span,
+                bound: Default::default(),
             },
             dimensions: Vec::new(),
             type_args: Vec::new(),
@@ -1220,7 +1220,7 @@ impl Parser {
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: edge_code.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 );
@@ -1459,7 +1459,7 @@ impl Parser {
                         signed: false,
                         base: NumberBase::Binary,
                         value: "0".to_string(),
-                        cached_val: std::cell::Cell::new(Some((0u64, 0u64, 1u32))),
+                        cached_val: crate::ast::cache::LiteralCache::new(Some((0u64, 0u64, 1u32))),
                     }),
                     self.span_from(start),
                 )
@@ -1598,10 +1598,11 @@ impl Parser {
                 self.bump(); // $unit
                 self.bump(); // ::
                 let mut hier = self.parse_hierarchical_identifier();
-                if !self.at(TokenKind::LParen) {
-                    if let Some(seg) = hier.path.first_mut() {
-                        seg.name.name = crate::unit_scope_name(&seg.name.name);
-                    }
+                if self.at(TokenKind::LParen) && hier.path.len() == 1 {
+                    // §3.12.1: no lexical lookup applies to this name.
+                    hier.bound = crate::ast::binding::Bound::NO_TARGET;
+                } else if let Some(seg) = hier.path.first_mut() {
+                    seg.name.name = crate::unit_scope_name(&seg.name.name);
                 }
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -1671,8 +1672,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -1732,6 +1734,11 @@ impl Parser {
                         spec_text = Some(text);
                     }
                 }
+                // §18.17.7: a production's value variable has no lexical target.
+                let bound = match self.rs_values.contains(&id.name) {
+                    true => crate::ast::binding::Bound::NO_TARGET,
+                    false => crate::ast::binding::Bound::UNSET,
+                };
                 let hier = HierarchicalIdentifier {
                     root: None,
                     path: vec![HierPathSegment {
@@ -1739,8 +1746,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound,
                 };
                 let mut expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 if let Some(text) = spec_text {
@@ -1952,8 +1960,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let new_expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 // `new <expr>` shallow-copy constructor (SV 8.8, Syntax 8-2):
@@ -2030,7 +2039,7 @@ impl Parser {
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: "1".to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     self.span_from(start),
                 );
@@ -2076,7 +2085,7 @@ impl Parser {
                             signed: false,
                             base: crate::ast::expr::NumberBase::Decimal,
                             value: "1".to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         self.span_from(start),
                     );
@@ -2121,7 +2130,7 @@ impl Parser {
                             signed: false,
                             base: crate::ast::expr::NumberBase::Decimal,
                             value: "1".to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         self.span_from(start),
                     );
@@ -2392,7 +2401,7 @@ impl Parser {
                             signed: false,
                             base: NumberBase::Decimal,
                             value: w.to_string(),
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         self.span_from(start_s),
                     );
@@ -2541,8 +2550,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 args.push(Expression::new(
                     ExprKind::Ident(ident),
@@ -2832,8 +2842,9 @@ impl Parser {
             root: None,
             path,
             span: self.span_from(start),
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }
     }
     /// §A.2.2.3 `delay_value` after a bare `#`: a number, a time literal or an
@@ -2861,8 +2872,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: self.span_from(start),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
@@ -2881,8 +2893,9 @@ impl Parser {
                 selects: Vec::new(),
             }],
             span: self.span_from(start),
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         let mut res = Expression::new(ExprKind::Ident(hier), self.span_from(start));
 
@@ -2965,7 +2978,7 @@ impl Parser {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 this.span_from(start),
             )
@@ -3243,7 +3256,7 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
             signed,
             base,
             value,
-            cached_val: Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         };
     }
     // Plain decimal — signed per Verilog standard (LRM section 5.7.1)
@@ -3252,7 +3265,7 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
         signed: true,
         base: NumberBase::Decimal,
         value: text.replace('_', ""),
-        cached_val: Cell::new(None),
+        cached_val: crate::ast::cache::LiteralCache::new(None),
     }
 }
 

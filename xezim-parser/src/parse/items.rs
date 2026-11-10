@@ -29,6 +29,18 @@ pub(crate) enum ConstraintPos {
 }
 
 impl Parser {
+    /// The `edge_identifier` that may open a §14.3 `clocking_skew`.
+    fn parse_clocking_skew_edge(&mut self) -> Option<crate::ast::stmt::Edge> {
+        let edge = match self.current_kind() {
+            TokenKind::KwPosedge => crate::ast::stmt::Edge::Posedge,
+            TokenKind::KwNegedge => crate::ast::stmt::Edge::Negedge,
+            TokenKind::KwEdge => crate::ast::stmt::Edge::Edge,
+            _ => return None,
+        };
+        self.bump();
+        Some(edge)
+    }
+
     /// IEEE 1800-2023 §14.4 clocking skew value after the `#`: `1step`, a
     /// number or time literal, a parameter name, or a parenthesized
     /// expression. `1step` lexes as the integer `1` followed by the
@@ -58,8 +70,9 @@ impl Parser {
                         selects: Vec::new(),
                     }],
                     span: sp,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 return Some(Expression::new(ExprKind::Ident(hier), sp));
             }
@@ -86,8 +99,9 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span: sp,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             };
             return Some(Expression::new(ExprKind::Ident(hier), sp));
         }
@@ -208,7 +222,7 @@ impl Parser {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -748,8 +762,9 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         )
@@ -1493,7 +1508,7 @@ impl Parser {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -1689,6 +1704,7 @@ impl Parser {
                         delay_fall: None,
                         delay_off: None,
                         declarators: vec![NetDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             name: v.name,
                             dimensions: v.dimensions,
                             init: None,
@@ -1719,8 +1735,9 @@ impl Parser {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         );
@@ -1739,6 +1756,7 @@ impl Parser {
                     span,
                 },
                 declarators: vec![crate::ast::stmt::VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: port.clone(),
                     dimensions: Vec::new(),
                     init: None,
@@ -2626,6 +2644,7 @@ impl Parser {
                 let mut signals: Vec<ClockingSignal> = Vec::new();
                 let mut default_input_skew: Option<crate::ast::expr::Expression> = None;
                 let mut default_output_skew: Option<crate::ast::expr::Expression> = None;
+                let mut default_output_edge: Option<crate::ast::stmt::Edge> = None;
                 while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
                     // `default input #d output #d;` (§14.4) — capture the skew
                     // expressions; anything unrecognized is skipped to the `;`
@@ -2640,11 +2659,9 @@ impl Parser {
                             }
                             self.bump();
                             // `clocking_skew ::= edge_identifier [delay_control]`
-                            if matches!(
-                                self.current_kind(),
-                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
-                            ) {
-                                self.bump();
+                            let edge = self.parse_clocking_skew_edge();
+                            if dir_out {
+                                default_output_edge = edge;
                             }
                             if self.at(TokenKind::Hash) {
                                 self.bump();
@@ -2677,12 +2694,7 @@ impl Parser {
                             // captured per-signal; `#1step`/opaque forms → None.
                             let mut sig_skew: Option<crate::ast::expr::Expression> = None;
                             // `clocking_skew ::= edge_identifier [delay_control]`
-                            if matches!(
-                                self.current_kind(),
-                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
-                            ) {
-                                self.bump();
-                            }
+                            let sig_edge = self.parse_clocking_skew_edge();
                             if self.at(TokenKind::Hash) {
                                 self.bump();
                                 sig_skew = self.parse_clocking_skew_value();
@@ -2706,6 +2718,7 @@ impl Parser {
                                         direction,
                                         name: id,
                                         skew: sig_skew.clone(),
+                                        skew_edge: sig_edge,
                                         bound_to,
                                         span: self.span_from(sstart),
                                     });
@@ -2740,9 +2753,11 @@ impl Parser {
                 Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
                     name: id,
                     clock_signal: clock_signal_id,
+                    clock_bound: Default::default(),
                     clock_edge,
                     default_input_skew,
                     default_output_skew,
+                    default_output_edge,
                     is_default: false,
                     signals,
                     items,
@@ -2861,6 +2876,7 @@ impl Parser {
                     body: body_expr,
                     endlabel,
                     span: self.span_from(start),
+                    decl: Default::default(),
                 }))
             }
             TokenKind::KwSequence => {
@@ -2936,6 +2952,7 @@ impl Parser {
                     body: body_expr,
                     endlabel,
                     span: self.span_from(start),
+                    decl: Default::default(),
                 }))
             }
             TokenKind::KwCovergroup => Some(ModuleItem::CovergroupDeclaration(
@@ -2962,9 +2979,11 @@ impl Parser {
                         return Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
                             name,
                             clock_signal: None,
+                            clock_bound: Default::default(),
                             clock_edge: None,
                             default_input_skew: None,
                             default_output_skew: None,
+                            default_output_edge: None,
                             is_default: true,
                             signals: Vec::new(),
                             items: Vec::new(),
@@ -3245,7 +3264,7 @@ impl Parser {
                     }
                 };
                 self.expect(TokenKind::RParen);
-                let (items, name) = self.parse_generate_branch_items_named();
+                let (items, name, _) = self.parse_generate_branch_items_named();
                 Some(ModuleItem::GenerateFor(GenerateFor {
                     var: var_name,
                     init_val,
@@ -3254,6 +3273,7 @@ impl Parser {
                     incr,
                     items,
                     name,
+                    implicit_name: String::new(),
                     span: self.span_from(s),
                 }))
             }
@@ -3528,6 +3548,7 @@ impl Parser {
                 None
             };
             decls.push(NetDeclarator {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -3657,32 +3678,38 @@ impl Parser {
     fn parse_generate_if(&mut self, start: usize) -> ModuleItem {
         let mut branches = Vec::new();
         let mut branch_labels = Vec::new();
+        let mut branch_direct = Vec::new();
         self.bump();
         self.expect(TokenKind::LParen);
         let cond = self.parse_expression();
         self.expect(TokenKind::RParen);
-        let (items, label) = self.parse_generate_branch_items_named();
+        let (items, label, direct) = self.parse_generate_branch_items_named();
         branches.push((Some(cond), items));
         branch_labels.push(label);
+        branch_direct.push(direct);
         while self.eat(TokenKind::KwElse).is_some() {
             if self.at(TokenKind::KwIf) {
                 self.bump();
                 self.expect(TokenKind::LParen);
                 let c = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                let (items, label) = self.parse_generate_branch_items_named();
+                let (items, label, direct) = self.parse_generate_branch_items_named();
                 branches.push((Some(c), items));
                 branch_labels.push(label);
+                branch_direct.push(direct);
             } else {
-                let (items, label) = self.parse_generate_branch_items_named();
+                let (items, label, direct) = self.parse_generate_branch_items_named();
                 branches.push((None, items));
                 branch_labels.push(label);
+                branch_direct.push(direct);
                 break;
             }
         }
         ModuleItem::GenerateIf(GenerateIf {
             branches,
             branch_labels,
+            branch_direct,
+            implicit_name: String::new(),
             span: self.span_from(start),
         })
     }
@@ -3708,17 +3735,19 @@ impl Parser {
                 }
                 self.expect(TokenKind::Colon);
             }
-            let (items, label) = self.parse_generate_branch_items_named();
+            let (items, label, direct) = self.parse_generate_branch_items_named();
             arms.push(GenerateCaseArm {
                 values,
                 items,
                 label,
+                direct,
             });
         }
         self.expect(TokenKind::KwEndcase);
         ModuleItem::GenerateCase(GenerateCase {
             selector,
             arms,
+            implicit_name: String::new(),
             span: self.span_from(start),
         })
     }
@@ -4228,7 +4257,7 @@ impl Parser {
 
     /// Like `parse_generate_branch_items` but also returns the optional
     /// `begin : <label>` block name (needed to namespace generate-for renames).
-    fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>) {
+    fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>, bool) {
         self.generate_depth += 1;
         // §27.5: a generate block is a scope, for lets too (§11.13).
         self.push_let_scope();
@@ -4243,9 +4272,15 @@ impl Parser {
             {
                 self.unnamed_block_end_label(&l);
             }
-            (items, label)
+            (items, label, false)
         } else {
-            (self.parse_module_item().into_iter().collect(), None)
+            let items: Vec<ModuleItem> = self.parse_module_item().into_iter().collect();
+            // §27.5: without `begin`, a lone conditional generate is directly nested.
+            let direct = matches!(
+                items.as_slice(),
+                [ModuleItem::GenerateIf(_) | ModuleItem::GenerateCase(_)]
+            );
+            (items, None, direct)
         };
         self.pop_let_scope();
         self.generate_depth -= 1;
@@ -4388,8 +4423,9 @@ impl Parser {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         Some(Expression::new(ExprKind::Ident(hier), span))
     }
@@ -4511,6 +4547,7 @@ impl Parser {
                     scopes,
                     name: second_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args,
@@ -4627,6 +4664,7 @@ impl Parser {
                     scopes,
                     name: tn_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args: Vec::new(),
@@ -4663,6 +4701,7 @@ impl Parser {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions,
                 type_args,
@@ -4698,9 +4737,11 @@ impl Parser {
                 let dims = self.parse_unpacked_dimensions();
                 let conns = self.parse_port_connections();
                 instances.push(HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 });
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4712,6 +4753,7 @@ impl Parser {
                 module_name: first_name,
                 params,
                 instances,
+                scope: None,
                 span: self.span_from(start),
             });
         }
@@ -4736,9 +4778,11 @@ impl Parser {
                 let dims = self.parse_unpacked_dimensions();
                 let conns = self.parse_port_connections();
                 instances.push(HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: iname,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 });
                 if self.eat(TokenKind::Comma).is_none() {
@@ -4759,6 +4803,7 @@ impl Parser {
                         scopes: Vec::new(),
                         name: first_name,
                         span: self.span_from(start),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args,
@@ -4781,6 +4826,7 @@ impl Parser {
                     module_name: first_name,
                     params,
                     instances,
+                    scope: None,
                     span: self.span_from(start),
                 })
             }
@@ -4790,6 +4836,7 @@ impl Parser {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
@@ -5048,6 +5095,7 @@ impl Parser {
                 span: self.span_from(ext_start),
                 scopes: base_scopes,
                 default_args: ext_default_args,
+                bound: Default::default(),
             })
         } else {
             None
@@ -6173,8 +6221,9 @@ impl Parser {
                     root: None,
                     path,
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 span,
             )

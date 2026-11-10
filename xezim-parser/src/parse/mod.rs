@@ -69,6 +69,9 @@ pub struct Parser {
     /// last (see `lets.rs`), and how many lets they hold in all.
     pub(super) let_scopes: Vec<lets::LetScope>,
     pub(super) let_live: usize,
+    /// §18.17.7: the productions of the randsequence rule being parsed. A
+    /// code block of the rule reads each as an implicit variable.
+    pub(super) rs_values: Vec<String>,
 }
 
 impl Parser {
@@ -143,6 +146,7 @@ impl Parser {
             port_exprs: Vec::new(),
             let_scopes: Vec::new(),
             let_live: 0,
+            rs_values: Vec::new(),
         }
     }
 
@@ -276,15 +280,18 @@ impl Parser {
                 self.bump();
                 let span = self.span_from(start_byte);
                 let instance = crate::ast::decl::HierarchicalInstance {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: iname,
                     dimensions: dims,
                     connections: conns,
+                    gen_indices: Vec::new(),
                     span: self.span_from(inst_start),
                 };
                 let instantiation = crate::ast::decl::ModuleInstantiation {
                     module_name: bind_mod,
                     params: bind_params,
                     instances: vec![instance],
+                    scope: None,
                     span,
                 };
                 return Some(crate::ast::decl::BindDirective {

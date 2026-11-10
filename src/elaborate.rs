@@ -2,6 +2,7 @@
 //! Resolves net/variable declarations, continuous assigns, always blocks.
 
 use super::value::Value;
+use crate::ast::binding::{Bound, DeclId, DeclKind};
 use crate::ast::decl::*;
 use crate::ast::expr::*;
 use crate::ast::module::*;
@@ -10,17 +11,22 @@ use crate::ast::types::*;
 use crate::ast::{Identifier, Span};
 use crate::hasher::HashMap;
 use crate::hasher::HashSet;
+use crate::shared_names::{SharedName, SharedNameMap};
 use std::rc::Rc;
 
 pub(crate) mod array_params;
+pub mod bind;
+mod canonical;
 mod const_function_scope;
+#[cfg(test)]
+mod callable_sharing_tests;
+pub(crate) mod constructor_forwarding;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
-pub(crate) mod constructor_forwarding;
-pub(crate) mod relaxed_static;
 mod param_prefix_index;
 mod param_scope;
+pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);
 impl<F: FnMut()> Drop for ScopeGuardLite<F> {
@@ -240,7 +246,7 @@ impl Default for TableIdent {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct LoggedMap<V> {
-    map: HashMap<String, V>,
+    map: Rc<HashMap<String, V>>,
     #[serde(skip)]
     ident: TableIdent,
     #[serde(skip)]
@@ -252,7 +258,7 @@ pub type TypedefTable = LoggedMap<u32>;
 /// Subroutine name -> declaration.
 pub type FuncTable = LoggedMap<FunctionDeclaration>;
 
-impl<V> Default for LoggedMap<V> {
+impl<V: Clone> Default for LoggedMap<V> {
     fn default() -> Self {
         Self::from_map(HashMap::default())
     }
@@ -260,7 +266,7 @@ impl<V> Default for LoggedMap<V> {
 
 impl<V: Clone> Clone for LoggedMap<V> {
     fn clone(&self) -> Self {
-        Self::from_map(self.map.clone())
+        Self::from_shared(Rc::clone(&self.map))
     }
 }
 
@@ -271,8 +277,14 @@ impl<V> std::ops::Deref for LoggedMap<V> {
     }
 }
 
-impl<V> LoggedMap<V> {
+impl<V: Clone> LoggedMap<V> {
     pub fn from_map(map: HashMap<String, V>) -> Self {
+        Self::from_shared(Rc::new(map))
+    }
+
+    /// Read-only constant-evaluation shells share the existing function
+    /// snapshot. A later insertion detaches it before mutating (§13.4.3).
+    fn from_shared(map: Rc<HashMap<String, V>>) -> Self {
         Self {
             map,
             ident: TableIdent::default(),
@@ -286,16 +298,20 @@ impl<V> LoggedMap<V> {
 
     /// The plain map, for bulk in-place edits (rewrap with `from_map`).
     pub fn into_map(self) -> HashMap<String, V> {
-        self.map
+        Rc::try_unwrap(self.map).unwrap_or_else(|shared| (*shared).clone())
     }
 
     pub fn insert(&mut self, key: String, value: V) -> Option<V> {
         self.log.push(key.clone());
-        self.map.insert(key, value)
+        Rc::make_mut(&mut self.map).insert(key, value)
     }
 
     pub fn remove(&mut self, key: &str) -> Option<V> {
-        let prev = self.map.remove(key);
+        // Avoid detaching a read-only snapshot for an absent-key no-op.
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        let prev = Rc::make_mut(&mut self.map).remove(key);
         if prev.is_some() {
             self.log.push(key.to_string());
         }
@@ -385,7 +401,7 @@ fn type_trace_tls_refresh(at: &str, map: &HashMap<String, u32>) {
 /// A resolved signal in the simulation model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Signal {
-    pub name: String,
+    pub name: SharedName,
     pub width: u32,
     pub is_signed: bool,
     pub is_real: bool,
@@ -798,6 +814,9 @@ pub struct RewriteCtx {
     /// Name of the module/interface definition this body came from — the
     /// file a diagnostic's span belongs to.
     pub owner: String,
+    /// §23.8: the design's scope tree (`ElaboratedModule::upward_scopes`),
+    /// installed for `upward_scope_rewrite` while this body is rewritten.
+    pub upward: Rc<std::cell::RefCell<UpwardScopes>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1373,6 +1392,239 @@ thread_local! {
     /// Class constant declarations by class name (`register_class_consts`).
     static CLASS_CONST_DECLS_TLS: std::cell::RefCell<HashMap<String, Rc<ClassConstDecl>>>
         = std::cell::RefCell::new(HashMap::default());
+    /// §23.8: the design's scope tree for `upward_scope_rewrite`, shared
+    /// with `ElaboratedModule::upward_scopes` and every `RewriteCtx`
+    /// (installed by `inline_module_items` and `set_type_bind_tls`).
+    static UPWARD_SCOPES_TLS: std::cell::RefCell<Option<Rc<std::cell::RefCell<UpwardScopes>>>>
+        = const { std::cell::RefCell::new(None) };
+    /// §6.21 / §13.3: the names the statement lists and subroutine headers
+    /// being rewritten declare themselves (block locals, formals), innermost
+    /// last. Such a name is never a scope for `upward_scope_rewrite`: a
+    /// block-local handle named like an enclosing instance read null (the
+    /// `instance_block_locals_shadow_module_names` regression).
+    static STMT_LOCALS_TLS: std::cell::RefCell<Vec<HashSet<String>>>
+        = const { std::cell::RefCell::new(Vec::new()) };
+    /// The generate renames in progress, innermost last.
+    static GEN_RENAME_TLS: std::cell::RefCell<Vec<GenRename>>
+        = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pops the `STMT_LOCALS_TLS` frame `push_stmt_locals` pushed.
+struct StmtLocalsFrame;
+
+impl Drop for StmtLocalsFrame {
+    fn drop(&mut self) {
+        STMT_LOCALS_TLS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Registers `names` as statement-local for the lifetime of the returned
+/// guard; nothing is pushed for an empty set.
+fn push_stmt_locals(names: HashSet<String>) -> Option<StmtLocalsFrame> {
+    if names.is_empty() {
+        return None;
+    }
+    STMT_LOCALS_TLS.with(|s| s.borrow_mut().push(names));
+    Some(StmtLocalsFrame)
+}
+
+fn stmt_local_declared(name: &str) -> bool {
+    STMT_LOCALS_TLS.with(|s| s.borrow().iter().any(|frame| frame.contains(name)))
+}
+
+/// §23.8: what an upward hierarchical name is resolved against — the
+/// elaborated instance tree, grouped by parent scope, and per definition the
+/// scope names its source declares. Filled while the design is inlined
+/// (`inline_module_items`, the `ElabInstance` registration) and read by
+/// `upward_scope_rewrite`, both during elaboration and when a deferred body
+/// is materialized, by which time the tree is complete.
+#[derive(Debug, Default)]
+pub struct UpwardScopes {
+    /// Parent scope path (`""` = the top module) → its child instances as
+    /// `(instance name, definition name)`, bound instances included.
+    children: HashMap<String, Vec<(String, String)>>,
+    /// Instance path (`""` = the top module) → definition name.
+    defs: HashMap<String, String>,
+    /// Definition name → the scope names its source declares anywhere in
+    /// its body (instances of every generate branch, generate and block
+    /// labels, subroutines): a reference headed by one of them is a
+    /// DOWNWARD reference (§23.8 step a) even before that child is inlined.
+    declared: HashMap<String, HashSet<String>>,
+    /// §26.3: package names — `pkg.member` is the inliner's spelling of a
+    /// package constant, never a scope path.
+    packages: HashSet<String>,
+    /// §23.8.1: instance path → where its instantiation sits in its parent.
+    parents: HashMap<String, InstanceParent>,
+}
+
+/// The scope of the parent definition holding an instantiation.
+#[derive(Debug)]
+struct InstanceParent {
+    /// The instance's own definition.
+    def: String,
+    path: String,
+    tree: Rc<crate::scope_tree::ScopeTree>,
+    scope: crate::ast::binding::ScopeId,
+    indices: Vec<i64>,
+}
+
+impl UpwardScopes {
+    fn add_instance(&mut self, parent: &str, path: &str, def: &str) {
+        let leaf = match parent.is_empty() {
+            true => path,
+            false => path
+                .strip_prefix(parent)
+                .map_or(path, |p| p.trim_start_matches('.')),
+        };
+        self.children
+            .entry(parent.to_string())
+            .or_default()
+            .push((leaf.to_string(), def.to_string()));
+        self.defs.insert(path.to_string(), def.to_string());
+    }
+
+    /// Record where instance `path` is declared in its parent `parent`, an
+    /// instance of `def`. An instantiation the binder did not visit (a bind
+    /// target's, §23.11) sits at the definition scope.
+    fn add_parent(
+        &mut self,
+        parent: &str,
+        path: &str,
+        def: &str,
+        inst: &ModuleInstantiation,
+        hi: &HierarchicalInstance,
+    ) {
+        let Some(tree) = crate::scope_tree::tree_of(def) else {
+            return;
+        };
+        let scope = inst.scope.unwrap_or(tree.root);
+        if scope.0 as usize >= tree.scopes.len() {
+            return;
+        }
+        self.parents.insert(
+            path.to_string(),
+            InstanceParent {
+                def: inst.module_name.name.clone(),
+                path: parent.to_string(),
+                tree,
+                scope,
+                indices: hi.gen_indices.clone(),
+            },
+        );
+    }
+
+    /// §23.8.1 steps b) and c): the subroutine a bare `name` called in
+    /// instance `inst` names, from the scope of the instantiation up through
+    /// each enclosing instance. The search is for a scope named `name`, so a
+    /// variable of that name does not end it. `None` when a DPI import is
+    /// found first (keyed globally), or nothing is. §26.3: imports of an
+    /// enclosing scope are not visible to it.
+    fn subroutine_key(&self, inst: &str, name: &str) -> Option<String> {
+        let (up, s, dpi) = self.find_subroutine(inst, name)?;
+        if dpi {
+            return None;
+        }
+        let key = up.tree.key(s, name, &up.indices);
+        Some(match up.path.is_empty() {
+            true => key,
+            false => format!("{}.{key}", up.path),
+        })
+    }
+
+    /// The `subroutine_key` search: the parent and scope declaring `name`,
+    /// and whether it is a DPI import.
+    fn find_subroutine(
+        &self,
+        inst: &str,
+        name: &str,
+    ) -> Option<(&InstanceParent, crate::ast::binding::ScopeId, bool)> {
+        let mut at = inst;
+        while let Some(up) = self.parents.get(at) {
+            let mut scope = Some(up.scope);
+            while let Some(s) = scope {
+                let sc = &up.tree.scopes[s.0 as usize];
+                if let Some(d) = sc.by_name.get(name) {
+                    match up.tree.decls[d.0 as usize].kind {
+                        DeclKind::Function | DeclKind::Task => return Some((up, s, false)),
+                        DeclKind::DpiImport => return Some((up, s, true)),
+                        _ => {}
+                    }
+                }
+                scope = sc.parent;
+            }
+            at = &up.path;
+        }
+        None
+    }
+
+    /// §23.8.1: a bare call of `name` in a body of definition `def` finds a
+    /// subroutine upward from every instance of `def`. The top finds none.
+    fn every_instance_finds(&self, def: &str, name: &str) -> bool {
+        let mut insts = self.defs.iter().filter(|(_, d)| *d == def).peekable();
+        insts.peek().is_some() && insts.all(|(p, _)| self.find_subroutine(p, name).is_some())
+    }
+
+    fn declare(&mut self, def: &Definition) {
+        if self.declared.contains_key(def.name()) {
+            return;
+        }
+        let mut names = HashSet::default();
+        visit_renamed_decls(def.items(), &mut |n, _, kind| {
+            if kind == DeclKind::Instance {
+                names.insert(n.to_string());
+            }
+        });
+        collect_scope_labels_in_items(def.items(), &mut names);
+        self.declared.insert(def.name().to_string(), names);
+    }
+}
+
+/// Generate-block labels, named-block labels and subroutine names declared
+/// in `items`, nested generate blocks included (the non-instance scopes of
+/// §23.8 step a).
+fn collect_scope_labels_in_items(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(gr) => collect_scope_labels_in_items(&gr.items, out),
+            ModuleItem::GenerateIf(gi) => {
+                out.extend(gi.branch_labels.iter().flatten().cloned());
+                for (_, branch) in &gi.branches {
+                    collect_scope_labels_in_items(branch, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    out.extend(arm.label.iter().cloned());
+                    collect_scope_labels_in_items(&arm.items, out);
+                }
+            }
+            ModuleItem::GenerateFor(gf) => {
+                out.extend(gf.name.iter().cloned());
+                collect_scope_labels_in_items(&gf.items, out);
+            }
+            ModuleItem::AlwaysConstruct(a) => collect_block_labels(&a.stmt, out),
+            ModuleItem::InitialConstruct(i) => collect_block_labels(&i.stmt, out),
+            ModuleItem::FinalConstruct(f) => collect_block_labels(&f.stmt, out),
+            ModuleItem::FunctionDeclaration(f) => {
+                out.insert(f.name.name.name.clone());
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                out.insert(t.name.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn install_upward_scopes(scopes: &Rc<std::cell::RefCell<UpwardScopes>>) {
+    UPWARD_SCOPES_TLS.with(|c| {
+        let mut slot = c.borrow_mut();
+        if !slot.as_ref().is_some_and(|s| Rc::ptr_eq(s, scopes)) {
+            *slot = Some(Rc::clone(scopes));
+        }
+    });
 }
 
 fn class_const_decl(c: &ClassDeclaration) -> ClassConstDecl {
@@ -1916,11 +2168,29 @@ fn size_struct_member_dims(
 /// the property came out **1 bit** — truncating every store through
 /// `fit_class_prop` and reporting `$bits() == 1`. The same held for any
 /// module/package/`$unit` parameter used in a class property's packed range.
+/// Keep only directly mentioned outer bindings when all dimensions/defaults
+/// are self-contained. §6.20/§8.13: inheritance, calls and named types can
+/// read hidden declarations and deliberately retain the complete environment.
+fn class_enclosing_scope(
+    c: &ClassDeclaration,
+    scope_params: Option<&HashMap<String, Value>>,
+) -> HashMap<String, Value> {
+    let Some(scope) = scope_params else { return HashMap::default() };
+    let reads = c.extends.is_none()
+        .then(|| crate::unit_subroutine_usage::direct_parameter_reads(c))
+        .flatten();
+    let Some(reads) = reads else { return scope.clone() };
+    scope.iter().filter(|(name, _)| {
+        reads.contains(name.as_str())
+            || name.split(['.', ':', '[', ']']).any(|part| reads.contains(part))
+    }).map(|(name, value)| (name.clone(), value.clone())).collect()
+}
+
 fn class_const_scope(
     c: &ClassDeclaration,
     scope_params: Option<&HashMap<String, Value>>,
 ) -> HashMap<String, Value> {
-    let mut params: HashMap<String, Value> = scope_params.cloned().unwrap_or_default();
+    let mut params = class_enclosing_scope(c, scope_params);
     // §8.13: inherited constants, overridden below by the class's own.
     if c.extends.is_some() {
         for (n, v) in inherited_class_consts(c, &params) {
@@ -2106,11 +2376,14 @@ fn elaborate_class_in_scope(
     // specialization a wrong FIXED size. Such properties stay queue-backed
     // (indexing works; `size()`/`foreach` see the pushed elements only).
     let owned_unpacked_scope: HashMap<String, Value>;
-    let unpacked_scope: &HashMap<String, Value> = if !binds_values {
-        enclosing
+    let unpacked_scope: &HashMap<String, Value> = if !class_has_value_params(c) {
+        // §8.25/§6.20: only header value parameters distinguish these scopes.
+        // Localparam-only and inherited-constant classes can reuse the same
+        // evaluated bindings rather than copy every enclosing parameter twice.
+        const_scope
     } else {
         owned_unpacked_scope = {
-            let mut m = scope_params.cloned().unwrap_or_default();
+            let mut m = class_enclosing_scope(c, scope_params);
             m.extend(inherited.iter().cloned());
             for item in &c.items {
                 if let ClassItem::Parameter(pd) = item {
@@ -2828,7 +3101,7 @@ fn elaborate_class_in_scope(
                         decl.name.name.clone(),
                         Signal {
                             is_const: false,
-                            name: decl.name.name.clone(),
+                            name: decl.name.name.clone().into(),
                             width,
                             is_signed,
                             is_real,
@@ -2875,6 +3148,7 @@ fn elaborate_class_in_scope(
                                     span: cg.name.span,
                                 },
                                 span: cg.name.span,
+                                bound: Default::default(),
                             },
                             dimensions: Vec::new(),
                             type_args: Vec::new(),
@@ -2885,7 +3159,7 @@ fn elaborate_class_in_scope(
                         cg_name.clone(),
                         Signal {
                             is_const: false,
-                            name: cg_name.clone(),
+                            name: cg_name.clone().into(),
                             width: 32,
                             is_signed: false,
                             is_real: false,
@@ -3028,7 +3302,7 @@ fn elaborate_class_in_scope(
                                 a.name.name.clone(),
                                 Signal {
                                     is_const: true,
-                                    name: a.name.name.clone(),
+                                    name: a.name.name.clone().into(),
                                     width: ew,
                                     is_signed: is_type_signed(data_type),
                                     is_real: false,
@@ -3089,7 +3363,7 @@ fn elaborate_class_in_scope(
                         a.name.name.clone(),
                         Signal {
                             is_const: true,
-                            name: a.name.name.clone(),
+                            name: a.name.name.clone().into(),
                             width,
                             is_signed: implicit_no_dims || is_type_signed(data_type),
                             is_real: false,
@@ -3267,7 +3541,7 @@ pub struct ElaboratedModule {
     /// pre-scaled to this unit at elaboration; the simulator counts ticks of it.
     #[serde(default = "default_tick_s")]
     pub tick_s: f64,
-    pub signals: HashMap<String, Signal>,
+    pub signals: SharedNameMap<Signal>,
     /// Transient elaboration bookkeeping (not serialized): names that already
     /// received a type-bearing declaration, mapped to whether that type was
     /// *incompatible* (a named/atom/real/struct/enum type, which cannot be
@@ -3516,7 +3790,7 @@ pub struct ElaboratedModule {
     /// (`localparam e_t RST`), keyed as in `parameters`. The self-determined
     /// type of a parameter (§6.20.2), e.g. for a `default:` key (§10.9.1).
     #[serde(default)]
-    pub param_decl_types: HashMap<String, DataType>,
+    pub param_decl_types: SharedNameMap<DataType>,
     /// Struct variable -> its top-level member names in DECLARATION order, for
     /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
     /// offset (i.e. reversed) and unpacked members live in separate signals, so
@@ -3635,6 +3909,12 @@ pub struct ElaboratedModule {
     /// enough to enumerate a scope's children. Drives the VPI object model.
     #[serde(default)]
     pub instances: Vec<ElabInstance>,
+    /// §23.8: `instances` as a scope tree for `upward_scope_rewrite`, shared
+    /// with every `RewriteCtx` so a body materialized after elaboration
+    /// resolves its upward names against the complete design. Not cached:
+    /// the artifact stores materialized bodies only.
+    #[serde(skip)]
+    pub upward_scopes: Rc<std::cell::RefCell<UpwardScopes>>,
     /// §23.11: bind directives selected for each elaborated host path.
     pub resolved_binds: HashMap<String, Vec<crate::ast::decl::BindDirective>>,
     /// Active declarations collected in their elaborated lexical scopes.
@@ -3765,13 +4045,17 @@ pub struct ElaboratedModule {
     /// connected instance, including when reached from outside the module.
     #[serde(default)]
     pub interface_port_aliases: HashMap<String, String>,
-    /// IEEE 1800-2023 §23.3.3: `(instance path, actual)` of every input port
-    /// whose reads in the instance body were renamed to its actual. The port
-    /// is a continuous assignment from the actual, so its time-0 value is an
-    /// update event in the instance — the simulator replays it for the
-    /// level-sensitive blocks there.
+    /// IEEE 1800-2023 §23.3.3: `(formal's path, actual, formal is 2-state)`
+    /// of every input port whose reads in the instance body were renamed to
+    /// its actual; the instance is the path's parent. The port is a
+    /// continuous assignment from the actual, so its time-0 value is an
+    /// update event in the instance — the simulator replays it for the blocks
+    /// there, and for a parent's reference to the port by this path. The
+    /// update starts from the formal's own initial value, unknown for a
+    /// 4-state type and 0 for a 2-state one (§6.8), which an elided port no
+    /// longer records anywhere else.
     #[serde(default)]
-    pub input_port_actuals: Vec<(String, Expression)>,
+    pub input_port_actuals: Vec<(String, Expression, bool)>,
     /// Input ports whose net was never built (see [`set_port_elision`]): the
     /// [`elided_port_hash`] of each `<inst>.<port>` flat name, sorted. The
     /// simulator checks a failed name lookup against it, so a reference the
@@ -3993,7 +4277,7 @@ impl ElaboratedModule {
         Self {
             name,
             tick_s: default_tick_s(),
-            signals: HashMap::default(),
+            signals: SharedNameMap::default(),
             typed_decls: HashMap::default(),
             completed_ports: HashSet::default(),
             ranged_port_widths: HashMap::default(),
@@ -4056,7 +4340,7 @@ impl ElaboratedModule {
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             var_decl_types: HashMap::default(),
-            param_decl_types: HashMap::default(),
+            param_decl_types: SharedNameMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
@@ -4079,6 +4363,7 @@ impl ElaboratedModule {
             interconnect_nets: HashSet::default(),
             elab_diagnostics: Vec::new(),
             instances: Vec::new(),
+            upward_scopes: Rc::default(),
             resolved_binds: HashMap::default(),
             bind_sites: Vec::new(),
             param_index: Default::default(),
@@ -4171,13 +4456,14 @@ impl ElaboratedModule {
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.
-            match whole_array_assign_parts_dir(
+            match whole_array_assign_parts_dir_with_params(
                 &ca.lhs,
                 &ca.rhs,
                 ca.delay,
                 &self.arrays,
                 Some(&self.descending_arrays),
                 Some(&self.unpacked_decl_dims),
+                Some(&self.parameters),
             )
             .or_else(|| {
                 slice_array_assign_parts(
@@ -4494,7 +4780,7 @@ fn const_value_literal(v: &Value, span: Span) -> Option<Expression> {
             signed: v.is_signed,
             base: crate::ast::expr::NumberBase::Binary,
             value: v.to_bin(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     ))
@@ -4799,7 +5085,7 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
                     .or_insert_with(|| v.clone());
                 elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
                     is_const: false,
-                    name: nm.clone(),
+                    name: nm.clone().into(),
                     width: base_width,
                     is_signed: false,
                     is_real: false,
@@ -5188,7 +5474,7 @@ fn signal_trace_patterns() -> &'static Option<Vec<String>> {
 }
 
 pub(crate) fn signals_insert_traced(
-    map: &mut HashMap<String, Signal>,
+    map: &mut SharedNameMap<Signal>,
     line: u32,
     name: String,
     sig: Signal,
@@ -5965,7 +6251,7 @@ fn ordered_typedefs<'a>(defs: &HashMap<String, Definition<'a>>) -> Vec<&'a Typed
     out
 }
 
-/// §20.6.2: `$bits(<signal>)` inside a TYPE's packed dims (`typedef
+/// §20.6.2: `$bits` inside a TYPE's packed dims (`typedef
 /// logic[$bits(sig)-1:0] t;`) — rewrite the dims with the signal's known
 /// width so `resolve_type_width` sees a constant. Without this the dim
 /// silently evaluated to nothing and the typedef registered 1 bit wide.
@@ -6029,6 +6315,44 @@ fn prebind_type_dims(dt: &DataType, elab: &ElaboratedModule) -> Option<DataType>
             dimensions: rewrite(dimensions),
             span: *span,
         }),
+        DataType::TypeReference { dimensions, .. } if dims_mention_bits(dimensions) => {
+            let mut bound = dt.clone();
+            if let DataType::TypeReference {
+                dimensions: dims, ..
+            } = &mut bound
+            {
+                *dims = rewrite(dimensions);
+            }
+            Some(bound)
+        }
+        DataType::Struct(su) => {
+            // A member's type must retain its declaration-scope widths after
+            // serialization, just as the enclosing typedef does (§7.2, §27).
+            let mut bound = dims_mention_bits(&su.dimensions).then(|| {
+                let mut s = su.clone();
+                s.dimensions = rewrite(&s.dimensions);
+                s
+            });
+            for (i, member) in su.members.iter().enumerate() {
+                if let Some(dt) = prebind_type_dims(&member.data_type, elab) {
+                    bound.get_or_insert_with(|| su.clone()).members[i].data_type = dt;
+                }
+            }
+            bound.map(DataType::Struct)
+        }
+        DataType::Enum(et) => {
+            let mut bound = dims_mention_bits(&et.dimensions).then(|| {
+                let mut e = et.clone();
+                e.dimensions = rewrite(&e.dimensions);
+                e
+            });
+            if let Some(base) = &et.base_type
+                && let Some(dt) = prebind_type_dims(base, elab)
+            {
+                bound.get_or_insert_with(|| et.clone()).base_type = Some(Box::new(dt));
+            }
+            bound.map(DataType::Enum)
+        }
         _ => None,
     }
 }
@@ -6187,7 +6511,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                     nm.clone(),
                     Signal {
                         is_const: false,
-                        name: nm.clone(),
+                        name: nm.clone().into(),
                         width: base_width,
                         is_signed: enum_signed,
                         is_real: false,
@@ -6493,6 +6817,7 @@ fn validate_constraint_item_names(
 fn collect_class_member_names(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
+    body_classes: &[&ClassDeclaration],
     allowed: &mut HashSet<String>,
     seen: &mut HashSet<String>,
 ) {
@@ -6552,26 +6877,30 @@ fn collect_class_member_names(
             }
         }
     }
-    if let Some(ext) = &c.extends {
-        if let Some(defs) = all_defs {
-            // §8.16/§26.3: the base of a class declared in a MODULE body (or
-            // another package) may live INSIDE an imported package
-            // (`mypacket extends packet` where `packet` is `packet_pkg`'s
-            // class) rather than as a top-level Class definition. Packages
-            // are kept whole in `all_defs` (Definition::Package), so a bare
-            // `defs.get(base)` lookup misses package members and an inherited
-            // property reference in a derived constraint is wrongly rejected
-            // as undeclared. Fall back to searching every package's classes.
-            let parent: Option<&ClassDeclaration> = match defs.get(&ext.name.name) {
+    if let Some(ext) = &c.extends
+        && let Some(defs) = all_defs
+    {
+        // §8.16/§26.3: the base of a class declared in a MODULE body (or
+        // another package) may live INSIDE an imported package
+        // (`mypacket extends packet` where `packet` is `packet_pkg`'s
+        // class) rather than as a top-level Class definition. Packages
+        // are kept whole in `all_defs` (Definition::Package), so a bare
+        // `defs.get(base)` lookup misses package members and an inherited
+        // property reference in a derived constraint is wrongly rejected
+        // as undeclared. Fall back to searching every package's classes.
+        let parent = body_classes
+            .iter()
+            .copied()
+            .find(|p| p.name.name == ext.name.name)
+            .or_else(|| match defs.get(&ext.name.name) {
                 Some(Definition::Class(p)) => Some(p),
                 Some(Definition::Package(_)) | None => {
                     find_base_class_in_packages(defs, &ext.name.name)
                 }
                 _ => None,
-            };
-            if let Some(parent) = parent {
-                collect_class_member_names(parent, all_defs, allowed, seen);
-            }
+            });
+        if let Some(parent) = parent {
+            collect_class_member_names(parent, all_defs, body_classes, allowed, seen);
         }
     }
 }
@@ -6678,7 +7007,8 @@ fn defs_with_local_classes<'a>(
     }
     let mut merged: HashMap<String, Definition<'a>> = all_defs.cloned().unwrap_or_default();
     for (n, cd) in local {
-        merged.entry(n.to_string()).or_insert(Definition::Class(cd));
+        // §23.9: the nearest lexical class hides an enclosing declaration.
+        merged.insert(n.to_string(), Definition::Class(cd));
     }
     Some(merged)
 }
@@ -6686,6 +7016,20 @@ fn defs_with_local_classes<'a>(
 fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
+    module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
+    scope: Option<&ElaboratedModule>,
+    inst_prefix: Option<&str>,
+) -> Result<(), String> {
+    validate_class_constraints_in_body(c, all_defs, &[], module_enums, scope, inst_prefix)
+}
+
+/// §8.3/§18.5: an instantiated module's own classes participate in base
+/// lookup and scoped constraint names. Borrow its prepared body rather than
+/// copying the design-wide definition table for each instance.
+fn validate_class_constraints_in_body(
+    c: &ClassDeclaration,
+    all_defs: Option<&HashMap<String, Definition>>,
+    body_classes: &[&ClassDeclaration],
     module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
     scope: Option<&ElaboratedModule>,
     inst_prefix: Option<&str>,
@@ -6700,7 +7044,8 @@ fn validate_class_constraints(
     }
     let mut allowed = HashSet::default();
     let mut seen = HashSet::default();
-    collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
+    collect_class_member_names(c, all_defs, body_classes, &mut allowed, &mut seen);
+    allowed.extend(body_classes.iter().map(|c| c.name.name.clone()));
     if let Some(defs) = all_defs {
         collect_global_constraint_names(defs, &mut allowed);
     }
@@ -9427,6 +9772,46 @@ pub fn elaborate_module_with_defs(
         elab.lets.insert(l.name.name.clone(), l.clone());
     }
 
+    // §26.3: names a wildcard import brings in that are ALSO declared locally
+    // — the local declaration shadows the imported one (no duplicate error).
+    if let Some(defs) = all_defs {
+        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), module.params(), defs)
+            .into_iter()
+            .collect();
+        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs)
+            .into_iter()
+            .collect();
+    }
+    // §26.3: an explicit import conflicts with a header declaration;
+    // unlike a wildcard import, it cannot be displaced by that declaration.
+    let header_names: HashSet<&str> = module
+        .params()
+        .iter()
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Data { assignments, .. } => assignments
+                .iter()
+                .map(|a| a.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ParameterKind::Type { assignments } => {
+                assignments.iter().map(|a| a.name.name.as_str()).collect()
+            }
+        })
+        .collect();
+    for item in module.items() {
+        if let ModuleItem::ImportDeclaration(imp) = item {
+            for ii in &imp.items {
+                if let Some(name) = &ii.item
+                    && header_names.contains(name.name.as_str())
+                {
+                    return Err(format!(
+                        "'{}' is already declared as a module parameter (IEEE 1800-2023 §26.3)",
+                        name.name
+                    ));
+                }
+            }
+        }
+    }
+
     // §13.4.3: register module-body function declarations before the
     // parameter pass so a header `parameter LOG_X = log2(X)` const-evaluates.
     for it in module.items() {
@@ -9533,7 +9918,7 @@ pub fn elaborate_module_with_defs(
                                         signal_name.clone(),
                                         Signal {
                                             is_const: true,
-                                            name: signal_name,
+                                            name: signal_name.into(),
                                             width: elem_w,
                                             is_signed: is_type_signed(data_type),
                                             is_real: false,
@@ -9897,7 +10282,7 @@ pub fn elaborate_module_with_defs(
                 };
                 let sig = Signal {
                     is_const: false,
-                    name: port.name.name.clone(),
+                    name: port.name.name.clone().into(),
                     width,
                     is_signed,
                     is_real,
@@ -10250,16 +10635,6 @@ pub fn elaborate_module_with_defs(
         }
     }
 
-    // §26.3: names a wildcard import brings in that are ALSO declared locally
-    // — the local declaration shadows the imported one (no duplicate error).
-    if let Some(defs) = all_defs {
-        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs)
-            .into_iter()
-            .collect();
-        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs)
-            .into_iter()
-            .collect();
-    }
     // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
     // the items, so a declaration whose width depends on one of them is sized
     // correctly no matter what ORDER the parameters appear in.
@@ -10344,7 +10719,21 @@ pub fn elaborate_module_with_defs(
                 if !expr_idents_all_known(init_eval, &elab.parameters) {
                     continue;
                 }
-                let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
+                // §10.8 / §11.6.1: a parameter with a declared type is ASSIGNED
+                // its initializer, so the declared width is the operands'
+                // context — the same fold the walk below performs. This seed
+                // used the self-determined fold, so `localparam int A =
+                // (8'd128 + 8'd128) >> 8` was 0 here (the sum wrapped at
+                // 8 bits), so the declarations sized from it (`logic [A:0] v`)
+                // kept that width while the value itself was later corrected
+                // to 1 (#894).
+                let mut v = eval_param_init(
+                    data_type,
+                    init_eval,
+                    &elab.parameters,
+                    &elab.typedef_types,
+                    width,
+                );
                 // §6.20.2: the DECLARED signedness is authoritative. Setting it
                 // only when true let a signed INITIALIZER leak its signedness
                 // into an unsigned parameter: `parameter [7:0] UP = -3` kept
@@ -10451,8 +10840,6 @@ pub fn elaborate_module_with_defs(
     // `extends` when their constraints are validated.
     let local_defs = defs_with_local_classes(module.items(), all_defs);
     let cls_defs = local_defs.as_ref().or(all_defs);
-    // §27.6: generate constructs of this scope, numbered for `genblk<n>`.
-    let mut gen_ordinal = 0u32;
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -10500,14 +10887,33 @@ pub fn elaborate_module_with_defs(
                     // `output logic [3:0][9:0] o; assign o[1] = v;` degraded
                     // to a bit-window write (only the low bits landed) and
                     // struct-port member writes missed the layout.
+                    // §7.4.1: the packed dims may live on the TYPEDEF (`typedef
+                    // b_t [0:3] w_t; output w_t o;`): one step of a bare
+                    // reference, as the DataDeclaration arm takes.
                     if let Some(ew) =
                         packed_inner_elem_width(&pd.data_type, &elab.parameters, &elab.typedefs)
+                            .or_else(|| {
+                                let one = bare_typedef_step(&pd.data_type, &elab.typedef_types)?;
+                                packed_inner_elem_width(&one, &elab.parameters, &elab.typedefs)
+                            })
                     {
                         elab.packed_signal_elem_widths
                             .entry(decl.name.name.clone())
                             .or_insert(ew);
                     }
-                    if let Some(fd) = packed_full_dims_of(&pd.data_type, &elab.parameters) {
+                    // A TYPEDEF'd element with declared dims (`output u8_t
+                    // [0:7] o;`): chain them with the typedef's, as the
+                    // DataDeclaration arm does. Unrecorded, the ascending
+                    // `[0:7]` fell back to [7:0] element order (§7.4.1).
+                    if let Some(fd) =
+                        packed_full_dims_of(&pd.data_type, &elab.parameters).or_else(|| {
+                            packed_full_dims_chained(
+                                &pd.data_type,
+                                &elab.parameters,
+                                &elab.typedef_types,
+                            )
+                        })
+                    {
                         elab.packed_full_dims
                             .entry(decl.name.name.clone())
                             .or_insert(fd);
@@ -10519,10 +10925,31 @@ pub fn elaborate_module_with_defs(
                         &elab.typedef_types,
                     ) {
                         if !fields.is_empty() {
+                            // §7.4.1: a packed ARRAY of the struct (`output
+                            // s_t [0:3] o;`): its dims, the struct the
+                            // innermost, as the ANSI arm records them.
+                            let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                            if let Some(fd) =
+                                packed_typedef_array_dims(&pd.data_type, struct_w, &elab.parameters)
+                            {
+                                elab.packed_full_dims
+                                    .entry(decl.name.name.clone())
+                                    .or_insert(fd);
+                            }
                             tls_register_struct_layout(&decl.name.name, &fields);
                             elab.packed_struct_fields
                                 .entry(decl.name.name.clone())
                                 .or_insert(fields);
+                            // §7.2, §7.4.1: and its members' packed shapes,
+                            // as the ANSI and DataDeclaration arms record
+                            // them. Unrecorded, `arg.vec[1]` of a `logic
+                            // [3:0][7:0] vec` member was a one-bit select.
+                            register_member_packed_meta(
+                                &mut elab,
+                                &decl.name.name,
+                                &pd.data_type,
+                                None,
+                            );
                         }
                     }
                     // §6.18/§7.4: a PORT declared with an ARRAY typedef
@@ -10620,7 +11047,7 @@ pub fn elaborate_module_with_defs(
                     }
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width,
                         is_signed,
                         is_real,
@@ -10768,7 +11195,7 @@ pub fn elaborate_module_with_defs(
                     let init_value = default_net_value(nd.net_type, w, is_real);
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width: w,
                         is_signed,
                         is_real,
@@ -11623,12 +12050,12 @@ pub fn elaborate_module_with_defs(
                                 resolve_typedef_chain(elem_resolved, &elab.typedef_types)
                             {
                                 for m in &su.members {
-                                    let ew = packed_inner_elem_width(
+                                    let (ew, fd) = packed_member_meta(
                                         &m.data_type,
                                         &elab.parameters,
                                         &elab.typedefs,
+                                        &elab.typedef_types,
                                     );
-                                    let fd = packed_full_dims_of(&m.data_type, &elab.parameters);
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         if let Some(ew) = ew {
@@ -11902,7 +12329,7 @@ pub fn elaborate_module_with_defs(
                                         en.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: en,
+                                            name: en.into(),
                                             width: 1,
                                             is_signed: false,
                                             is_real: false,
@@ -12029,7 +12456,7 @@ pub fn elaborate_module_with_defs(
                                                         signed: false,
                                                         base: crate::ast::expr::NumberBase::Decimal,
                                                         value: idx_i.to_string(),
-                                                        cached_val: std::cell::Cell::new(None),
+                                                        cached_val: crate::ast::cache::LiteralCache::new(None),
                                                     },
                                                 ),
                                                 Span::dummy(),
@@ -12049,7 +12476,7 @@ pub fn elaborate_module_with_defs(
                                     let size_name = format!("{}.size", decl.name.name);
                                     let size_sig = Signal {
                                         is_const: false,
-                                        name: size_name.clone(),
+                                        name: size_name.clone().into(),
                                         width: 32,
                                         is_signed: false,
                                         is_real: false,
@@ -12162,7 +12589,7 @@ pub fn elaborate_module_with_defs(
 
                         let sig = Signal {
                             is_const: dd.const_kw,
-                            name: decl.name.name.clone(),
+                            name: decl.name.name.clone().into(),
                             width: w,
                             is_signed,
                             is_real,
@@ -12691,19 +13118,19 @@ pub fn elaborate_module_with_defs(
                                         }
                                     }
                                 }
-                                if let Some(ew) = packed_inner_elem_width(
+                                let (ew, fd) = packed_member_meta(
                                     &m.data_type,
                                     &elab.parameters,
                                     &elab.typedefs,
-                                ) {
+                                    &elab.typedef_types,
+                                );
+                                if let Some(ew) = ew {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         elab.packed_signal_elem_widths.insert(key, ew);
                                     }
                                 }
-                                if let Some(fdims) =
-                                    packed_full_dims_of(&m.data_type, &elab.parameters)
-                                {
+                                if let Some(fdims) = fd {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         elab.packed_full_dims.insert(key, fdims.clone());
@@ -12996,7 +13423,7 @@ pub fn elaborate_module_with_defs(
                                                     name: format!(
                                                         "{}[{}]",
                                                         assign.name.name, key_str
-                                                    ),
+                                                    ).into(),
                                                     width,
                                                     is_signed: signed,
                                                     is_real: false,
@@ -13011,39 +13438,7 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
-                        // Same element-width/full-dims registration the
-                        // variable path does: `PARAM[i]` on a multi-dim packed
-                        // parameter must element-select, not bit-select.
-                        if let Some(elem_w) =
-                            packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs)
-                        {
-                            // The CONST-eval index arm reads its own TLS table
-                            // (only `register_packed_array_elem_w` fed it, which
-                            // handles a typedef'd element type). Without this a
-                            // `localparam logic [1:0][7:0] MP` element select
-                            // `MP[0]` in another localparam bit-selected instead.
-                            // The runtime map is `register_packed_param_index`.
-                            tls_register_elem_w(&assign.name.name, elem_w);
-                        }
-                        if let Some((ew, msb0)) =
-                            packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types)
-                        {
-                            tls_register_elem_w(&assign.name.name, ew);
-                            if msb0 {
-                                tls_register_elem_msb0(&assign.name.name);
-                            }
-                        }
-                        // A typedef'd array (`exp_arr_t EXPS`, `enc_t [0:4] LOCAL`)
-                        // has its dims on the typedef or as a single ascending
-                        // range. `packed_inner_elem_width` / `packed_full_dims_of`
-                        // miss those, so a variable index bit-selects or reads
-                        // the last element.
-                        register_packed_param_index(
-                            &mut elab,
-                            &assign.name.name,
-                            data_type,
-                            None,
-                        );
+                        register_packed_param_shape(&mut elab, &assign.name.name, data_type);
                         let mut current_width = width;
                         let mut current_is_real = is_real;
                         let mut current_signed = signed;
@@ -13319,7 +13714,7 @@ pub fn elaborate_module_with_defs(
                             assign.name.name.clone(),
                             Signal {
                                 is_const: false,
-                                name: assign.name.name.clone(),
+                                name: assign.name.name.clone().into(),
                                 width: current_width,
                                 is_signed: current_signed,
                                 is_real: current_is_real,
@@ -13760,21 +14155,17 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::GenerateRegion(gr) => {
                 // Recursively process generate region items. A region is not
-                // a scope (§27.3): its constructs share this scope's genblk
-                // numbering.
-                elaborate_items_numbered(&gr.items, &mut elab, all_defs, &mut gen_ordinal)?;
+                // a scope (§27.3).
+                elaborate_items(&gr.items, &mut elab, cls_defs)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                gen_ordinal += 1;
-                elaborate_generate_if(gi, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_if(gi, &mut elab, cls_defs)?;
             }
             ModuleItem::GenerateCase(gc) => {
-                gen_ordinal += 1;
-                elaborate_generate_case(gc, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_case(gc, &mut elab, cls_defs)?;
             }
             ModuleItem::GenerateFor(gf) => {
-                gen_ordinal += 1;
-                elaborate_generate_for(gf, &mut elab, all_defs, gen_ordinal)?;
+                elaborate_generate_for(gf, &mut elab, cls_defs)?;
             }
             ModuleItem::CovergroupDeclaration(cg) => {
                 elab.covergroups.insert(cg.name.name.clone(), cg.clone());
@@ -13914,7 +14305,7 @@ pub fn elaborate_module_with_defs(
                             hi.name.name.clone(),
                             Signal {
                                 is_const: false,
-                                name: hi.name.name.clone(),
+                                name: hi.name.name.clone().into(),
                                 width: 1,
                                 is_signed: false,
                                 is_real: false,
@@ -17059,7 +17450,7 @@ fn register_generate_labels(items: &[ModuleItem], elab: &mut ElaboratedModule) {
                 l.clone(),
                 Signal {
                     is_const: false,
-                    name: l,
+                    name: l.into(),
                     width: 1,
                     is_signed: false,
                     is_real: false,
@@ -17354,6 +17745,16 @@ fn validate_expr_idents(
     elab: &ElaboratedModule,
     locals: &HashSet<String>,
 ) -> Result<(), String> {
+    validate_expr_idents_as(expr, elab, locals, HeadRole::Value)
+}
+
+/// `validate_expr_idents` for an expression whose head is written as `role`.
+fn validate_expr_idents_as(
+    expr: &Expression,
+    elab: &ElaboratedModule,
+    locals: &HashSet<String>,
+    role: HeadRole,
+) -> Result<(), String> {
     fn root_ident_name(expr: &Expression) -> Option<&str> {
         match &expr.kind {
             ExprKind::Ident(hier) if hier.path.len() == 1 => Some(hier.path[0].name.name.as_str()),
@@ -17398,16 +17799,6 @@ fn validate_expr_idents(
                 {
                     return Ok(());
                 }
-                // §27.6: `genblk<N>` — the implicit name of an unnamed
-                // generate block, legal as a hierarchical-reference root.
-                // (The simulator resolves through it by stripping the
-                // implicit segment; unnamed-block decls keep bare names.)
-                if name.starts_with("genblk")
-                    && name.len() > 6
-                    && name[6..].chars().all(|c| c.is_ascii_digit())
-                {
-                    return Ok(());
-                }
                 // A built-in type keyword captured as an Ident — only the
                 // parser's `$bits(<type>)` / `$size(<type>)` type-argument path
                 // produces these, so it's a type reference, not a signal.
@@ -17422,6 +17813,18 @@ fn validate_expr_idents(
                     .is_some_and(|(p, _)| elab.packages.contains(p))
                 {
                     return Ok(());
+                }
+                match head_verdict(hier, role) {
+                    HeadVerdict::Declared => return Ok(()),
+                    HeadVerdict::Unbound => {}
+                    // §23.8.1: the top has no upward scope to find a call in.
+                    HeadVerdict::Undeclared | HeadVerdict::UpwardCall => {
+                        return Err(span_error(
+                            elab,
+                            expr.span,
+                            &format!("Undeclared identifier '{}'", name),
+                        ));
+                    }
                 }
                 if !elab.signals.contains_key(name) && !elab.parameters.contains_key(name) &&
                    !elab.functions.contains_key(name) && !elab.tasks.contains_key(name) &&
@@ -17440,6 +17843,15 @@ fn validate_expr_idents(
                        &format!("Undeclared identifier '{}'", name),
                    ));
                 }            }
+        ExprKind::Ident(hier) => {
+            if let HeadVerdict::Undeclared = head_verdict(hier, role) {
+                return Err(span_error(
+                    elab,
+                    expr.span,
+                    &format!("Undeclared identifier '{}'", hier.path[0].name.name),
+                ));
+            }
+        }
         ExprKind::Unary { operand, .. } => validate_expr_idents(operand, elab, locals)?,
         ExprKind::Binary { left, right, .. } => { validate_expr_idents(left, elab, locals)?; validate_expr_idents(right, elab, locals)?; }
         ExprKind::Conditional { condition, then_expr, else_expr } => {
@@ -17485,7 +17897,11 @@ fn validate_expr_idents(
                     }
                 }
             }
-            validate_expr_idents(expr, elab, locals)?;
+            let base = match role {
+                HeadRole::Path => HeadRole::Path,
+                _ => HeadRole::Value,
+            };
+            validate_expr_idents_as(expr, elab, locals, base)?;
             validate_expr_idents(index, elab, locals)?;
         }
         ExprKind::RangeSelect { expr, left, right, .. } => {
@@ -17575,10 +17991,10 @@ fn validate_expr_idents(
                 if root == elab.name || elab.packages.contains(root) {
                     // scope / hierarchy reference, not a value lookup
                 } else {
-                    validate_expr_idents(expr, elab, locals)?;
+                    validate_expr_idents_as(expr, elab, locals, HeadRole::Path)?;
                 }
             } else {
-                validate_expr_idents(expr, elab, locals)?;
+                validate_expr_idents_as(expr, elab, locals, HeadRole::Path)?;
             }
         }
         ExprKind::WithClause { expr, filter } => {
@@ -17792,7 +18208,7 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             name.clone(),
             Signal {
                 is_const: false,
-                name: name.clone(),
+                name: name.clone().into(),
                 width: 1,
                 is_signed: false,
                 direction: None,
@@ -18010,6 +18426,63 @@ fn collect_port_connection_net_candidates(items: &[ModuleItem], out: &mut Vec<St
     }
 }
 
+/// §6.10, §27: a port actual of an instance in a generate block that is an
+/// implicit net of the block (renamed `g[0].n`) is a scalar net of that key.
+/// Module-level port actuals are `create_implicit_nets`'.
+fn declare_block_port_implicit_nets(
+    e: &Expression,
+    elab: &mut ElaboratedModule,
+) -> Result<(), String> {
+    match &e.kind {
+        ExprKind::Ident(h)
+            if h.root.is_none() && h.path.len() == 1 && h.bound.is_block_implicit_net() =>
+        {
+            let name = &h.path[0].name.name;
+            if elab.signals.contains_key(name) || elab.nets.contains(name) {
+                return Ok(());
+            }
+            if sv_parser::default_nettype_none_seen() {
+                return Err(format!(
+                    "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
+                    name
+                ));
+            }
+            if crate::implicit_net_warn() {
+                crate::elab_diag(format!(
+                    "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                     (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+                    name
+                ));
+            }
+            signals_insert_traced(
+                &mut elab.signals,
+                line!(),
+                name.clone(),
+                Signal {
+                    is_const: false,
+                    name: name.clone().into(),
+                    width: 1,
+                    is_signed: false,
+                    direction: None,
+                    value: Value::new(1),
+                    is_real: false,
+                    type_name: None,
+                },
+            );
+            elab.implicit_nets.insert(name.clone());
+            elab.nets.insert(name.clone());
+            Ok(())
+        }
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                declare_block_port_implicit_nets(p, elab)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn create_implicit_nets(
     elab: &mut ElaboratedModule,
     port_conn_names: &[String],
@@ -18077,7 +18550,7 @@ fn create_implicit_nets(
                 name.clone(),
                 Signal {
                     is_const: false,
-                    name: name.clone(),
+                    name: name.clone().into(),
                     width: 1,
                     is_signed: false,
                     direction: None,
@@ -18145,7 +18618,7 @@ fn create_implicit_nets(
                 name.clone(),
                 Signal {
                     is_const: false,
-                    name: name.clone(),
+                    name: name.clone().into(),
                     width: width.max(1),
                     is_signed: false,
                     direction: None,
@@ -18188,7 +18661,7 @@ fn create_implicit_nets(
             name.clone(),
             Signal {
                 is_const: false,
-                name: name.clone(),
+                name: name.clone().into(),
                 width: 1,
                 is_signed: false,
                 direction: None,
@@ -18311,8 +18784,8 @@ fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
 
 /// §6.10 implicit-net candidates of a continuous assignment: like
 /// `collect_ident_names`, but the root of a dotted reference (`blk.x`,
-/// `u.sig`, `s.field`) names a scope or a declared struct, never an implicit
-/// net. A select base (`arr[0].f`) is still collected.
+/// `u.sig`, `s.field`, `g[0].u.sig`) names a scope or a declared struct or
+/// array, never an implicit net.
 fn collect_assign_net_names(expr: &Expression, out: &mut Vec<String>) {
     collect_ident_names_in(expr, out, false);
 }
@@ -18371,9 +18844,40 @@ fn collect_ident_names_in(expr: &Expression, out: &mut Vec<String>, member_roots
             }
         }
         ExprKind::MemberAccess { expr, .. } => {
-            let bare_root = matches!(&expr.kind,
+            if member_roots {
+                rec(expr, out);
+                return;
+            }
+            // §6.10: the root of `blk.x`, and of `g[0].u.x` (a member reached
+            // through a select), names a scope or an array of instances,
+            // interfaces or structs, never a scalar net; only the select
+            // expressions can name nets. Collected, the generate block `g`
+            // of `assign g[0].u.a = s;` became a 1-bit implicit net.
+            let mut base = expr.as_ref();
+            let mut selects: Vec<&Expression> = Vec::new();
+            loop {
+                match &base.kind {
+                    ExprKind::Index { expr, index } => {
+                        selects.push(index);
+                        base = expr;
+                    }
+                    ExprKind::RangeSelect {
+                        expr, left, right, ..
+                    } => {
+                        selects.push(left);
+                        selects.push(right);
+                        base = expr;
+                    }
+                    _ => break,
+                }
+            }
+            let bare_root = matches!(&base.kind,
                 ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty());
-            if member_roots || !bare_root {
+            if bare_root {
+                for s in selects {
+                    rec(s, out);
+                }
+            } else {
                 rec(expr, out);
             }
         }
@@ -18387,18 +18891,6 @@ fn elaborate_items(
     items: &[ModuleItem],
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
-) -> Result<(), String> {
-    let mut gen_ordinal = 0u32;
-    elaborate_items_numbered(items, elab, all_defs, &mut gen_ordinal)
-}
-
-/// `elaborate_items` with the scope's generate-construct counter (§27.6
-/// `genblk<n>` names) threaded through generate regions.
-fn elaborate_items_numbered(
-    items: &[ModuleItem],
-    elab: &mut ElaboratedModule,
-    all_defs: Option<&HashMap<String, Definition>>,
-    gen_ordinal: &mut u32,
 ) -> Result<(), String> {
     // Classes declared in THIS body must be visible to each other's `extends`.
     let local_defs = defs_with_local_classes(items, all_defs);
@@ -18487,7 +18979,7 @@ fn elaborate_items_numbered(
                     }
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width,
                         is_signed,
                         direction: Some(pd.direction),
@@ -18533,7 +19025,7 @@ fn elaborate_items_numbered(
                     let init_value = default_net_value(nd.net_type, width, is_real);
                     let sig = Signal {
                         is_const: false,
-                        name: decl.name.name.clone(),
+                        name: decl.name.name.clone().into(),
                         width,
                         is_signed,
                         direction: None,
@@ -18709,9 +19201,16 @@ fn elaborate_items_numbered(
                         &elab.typedef_types,
                     );
                     record_coll_shape(elab, &decl.name.name, &shape_dims, None);
+                    // §7.4.2 / §7.8: `r [N]` parses as an associative dimension
+                    // keyed by "type N"; the normalized dims know whether `N` is
+                    // a parameter (fixed size) or a type (associative). Decided
+                    // from the raw dimension, a block's `[N]` sized by a
+                    // module or package parameter was registered associative
+                    // as well as fixed (the module-body path reads the
+                    // normalized dims).
                     if let Some(UnpackedDimension::Associative {
                         data_type: key_dt, ..
-                    }) = decl.dimensions.first()
+                    }) = shape_dims.first()
                     {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| {
                             matches!(
@@ -18929,6 +19428,26 @@ fn elaborate_items_numbered(
                         if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
+                        // §7.2, §27: an array of UNPACKED structs in a generate
+                        // block stores each element member-wise, as the
+                        // top-level path registers it; the element type drives
+                        // `%p` and `arr[i] = '{...}`. Without either,
+                        // `g.q[2].f` read x and `q[2] = '{5, 6}` stored a vector.
+                        elab.var_decl_types
+                            .entry(decl.name.name.clone())
+                            .or_insert_with(|| dd.data_type.clone());
+                        if let DataType::Struct(su) =
+                            resolve_typedef_chain(&dd.data_type, &elab.typedef_types)
+                            && !su.packed
+                            && !(matches!(su.kind, StructUnionKind::Union) && !su.tagged)
+                            && hi >= lo
+                            && (hi - lo) < 4096
+                        {
+                            for i in lo..=hi {
+                                let ebase = format!("{}[{}]", decl.name.name, i);
+                                register_unpacked_aggregate(elab, &ebase, &dd.data_type);
+                            }
+                        }
                         if let Some(UnpackedDimension::Range { left, right, .. }) =
                             decl.dimensions.first()
                         {
@@ -18998,7 +19517,7 @@ fn elaborate_items_numbered(
                                                         signed: false,
                                                         base: crate::ast::expr::NumberBase::Decimal,
                                                         value: idx_i.to_string(),
-                                                        cached_val: std::cell::Cell::new(None),
+                                                        cached_val: crate::ast::cache::LiteralCache::new(None),
                                                     },
                                                 ),
                                                 Span::dummy(),
@@ -19018,7 +19537,7 @@ fn elaborate_items_numbered(
                                     let size_name = format!("{}.size", decl.name.name);
                                     let size_sig = Signal {
                                         is_const: false,
-                                        name: size_name.clone(),
+                                        name: size_name.clone().into(),
                                         width: 32,
                                         is_signed: false,
                                         is_real: false,
@@ -19043,7 +19562,13 @@ fn elaborate_items_numbered(
                             }
                         }
                     } else {
-                        let init_val = if let Some(init_expr) = &decl.init {
+                        let procedural_init = decl
+                            .init
+                            .as_ref()
+                            .filter(|init| !is_const_expr(init, &elab.parameters));
+                        let init_val = if let Some(init_expr) =
+                            decl.init.as_ref().filter(|_| procedural_init.is_none())
+                        {
                             let mut rv = eval_init_for_width(init_expr, &elab.parameters, width);
                             if !is_real {
                                 rv.is_signed = is_signed;
@@ -19061,7 +19586,7 @@ fn elaborate_items_numbered(
                         };
                         let sig = Signal {
                             is_const: dd.const_kw,
-                            name: decl.name.name.clone(),
+                            name: decl.name.name.clone().into(),
                             width,
                             is_signed,
                             is_real,
@@ -19078,6 +19603,24 @@ fn elaborate_items_numbered(
                         if let Some(view) = &data_modport_view {
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());
+                        }
+                        // §6.8/§27: a generate-body initializer also executes
+                        // before initial processes. Constant folding cannot
+                        // construct an object or call a runtime function.
+                        if let Some(init) = procedural_init {
+                            if dd.const_kw {
+                                elab.const_decl_inits.insert(decl.name.name.clone());
+                            }
+                            elab.static_init_blocks.push(InitialBlock {
+                                stmt: Statement::new(
+                                    StatementKind::BlockingAssign {
+                                        lvalue: make_ident_expr(&decl.name.name),
+                                        rvalue: init.clone(),
+                                    },
+                                    decl.name.span,
+                                ),
+                                scope: String::new(),
+                            });
                         }
                         // Packed-struct metadata for a GENERATE-scope (or other
                         // elaborate_items-routed) declaration, mirroring the
@@ -19211,6 +19754,26 @@ fn elaborate_items_numbered(
                             "parameter/localparam",
                             true,
                         );
+                        // §27, §6.20.2: a generate scope holds the same shapes
+                        // as a module body. Without this an unpacked array got
+                        // no elements, so every `A[i]` read 0, and an index of
+                        // a packed array bit-selected.
+                        if !assign.dimensions.is_empty() {
+                            let params_snapshot = elab.parameters.clone();
+                            if register_array_param(
+                                elab,
+                                "",
+                                &assign.name.name,
+                                &assign.dimensions,
+                                assign.init.as_ref(),
+                                None,
+                                data_type,
+                                &params_snapshot,
+                            ) {
+                                continue;
+                            }
+                        }
+                        register_packed_param_shape(elab, &assign.name.name, data_type);
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
                                 // §6.20.2 + §5.7.1: an implicit-type parameter
@@ -19235,7 +19798,7 @@ fn elaborate_items_numbered(
                                             assign.name.name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: assign.name.name.clone(),
+                                                name: assign.name.name.clone().into(),
                                                 width: 1,
                                                 is_signed: false,
                                                 direction: None,
@@ -19300,7 +19863,7 @@ fn elaborate_items_numbered(
                                 assign.name.name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: assign.name.name.clone(),
+                                    name: assign.name.name.clone().into(),
                                     width,
                                     is_signed: signed,
                                     direction: None,
@@ -19429,7 +19992,7 @@ fn elaborate_items_numbered(
                             hi.name.name.clone(),
                             Signal {
                                 is_const: false,
-                                name: hi.name.name.clone(),
+                                name: hi.name.name.clone().into(),
                                 width: 1,
                                 is_signed: false,
                                 direction: None,
@@ -19439,25 +20002,29 @@ fn elaborate_items_numbered(
                             },
                         );
                     }
+                    for c in &hi.connections {
+                        if let PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) = c
+                        {
+                            declare_block_port_implicit_nets(e, elab)?;
+                        }
+                    }
                 }
             }
             ModuleItem::TypedefDeclaration(td) => {
                 process_typedef(td, elab);
             }
             ModuleItem::GenerateRegion(gr) => {
-                elaborate_items_numbered(&gr.items, elab, all_defs, gen_ordinal)?;
+                elaborate_items(&gr.items, elab, cls_defs)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                *gen_ordinal += 1;
-                elaborate_generate_if(gi, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_if(gi, elab, cls_defs)?;
             }
             ModuleItem::GenerateCase(gc) => {
-                *gen_ordinal += 1;
-                elaborate_generate_case(gc, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_case(gc, elab, cls_defs)?;
             }
             ModuleItem::GenerateFor(gf) => {
-                *gen_ordinal += 1;
-                elaborate_generate_for(gf, elab, all_defs, *gen_ordinal)?;
+                elaborate_generate_for(gf, elab, cls_defs)?;
             }
 
             ModuleItem::ClassDeclaration(cd) => {
@@ -19787,32 +20354,20 @@ fn elaborate_generate_if(
     gi: &GenerateIf,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
-    ordinal: u32,
 ) -> Result<(), String> {
-    // §27.6: a LABELED branch is a scope — rename its declarations to their
-    // hierarchical name (`g.x`), the same convention for-generate now uses.
-    // Bare storage made `g.x` resolvable only through ad-hoc fallbacks: a
-    // continuous assign READING `g.x` recorded a dependency on a name that
-    // matched no signal (so it evaluated once and stayed X forever), and a
-    // same-named declaration at module scope was a false "duplicate" error.
-    // Unlabeled branches keep bare names (their genblk ordinal is not known
-    // here, and in-suite code relies on the historical leakage).
-    let take_branch = |bi: usize, items: &Vec<ModuleItem>, elab: &mut ElaboratedModule| match gi
-        .branch_labels
-        .get(bi)
-        .and_then(|l| l.as_ref())
-    {
-        Some(label) => {
-            let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(label));
-            alias_labelled_subroutines(&mut renamed, label);
-            stamp_gen_scope(&mut renamed, label);
-            elaborate_items(&renamed, elab, all_defs)
+    // §27.5, §27.6: a branch is a scope, its declarations renamed to their
+    // hierarchical name (`g.x`, or `genblk1.x` unlabelled), the convention
+    // for-generate uses. §27.5: a directly nested branch is not a scope; its
+    // construct carries this construct's implicit name.
+    let take_branch = |bi: usize, items: &Vec<ModuleItem>, elab: &mut ElaboratedModule| {
+        if gi.branch_direct.get(bi) == Some(&true) {
+            return elaborate_items(items, elab, all_defs);
         }
-        None => {
-            let mut scoped = items.clone();
-            stamp_gen_scope(&mut scoped, &gen_scope_name(None, ordinal));
-            elaborate_items(&scoped, elab, all_defs)
-        }
+        let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
+        let scope = gen_scope_name(label, &gi.implicit_name);
+        let mut renamed = rename_decls_in_iter(items, &scope);
+        stamp_gen_scope(&mut renamed, &scope);
+        elaborate_block_items(&renamed, elab, all_defs)
     };
     for (bi, (cond, items)) in gi.branches.iter().enumerate() {
         match cond {
@@ -19840,7 +20395,6 @@ fn elaborate_generate_case(
     gc: &GenerateCase,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
-    ordinal: u32,
 ) -> Result<(), String> {
     let sel_folded = fold_const_fn_in_generate(&gc.selector, elab);
     let selector = sel_folded.as_ref().unwrap_or(&gc.selector);
@@ -19860,40 +20414,35 @@ fn elaborate_generate_case(
                 return Err("Generate case value must be a constant expression".to_string());
             }
             if eval_const_expr(v, &elab.parameters) == sel {
-                return elaborate_generate_case_arm(arm, elab, all_defs, ordinal);
+                return elaborate_generate_case_arm(gc, arm, elab, all_defs);
             }
         }
     }
     // No non-default match — fall through to default arm if present.
     for arm in &gc.arms {
         if arm.values.is_empty() {
-            return elaborate_generate_case_arm(arm, elab, all_defs, ordinal);
+            return elaborate_generate_case_arm(gc, arm, elab, all_defs);
         }
     }
     Ok(())
 }
 
-/// Labeled case arms scope their declarations like labeled if branches do —
-/// see elaborate_generate_if.
+/// Case arms scope their declarations like if branches do (see
+/// elaborate_generate_if).
 fn elaborate_generate_case_arm(
+    gc: &GenerateCase,
     arm: &GenerateCaseArm,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
-    ordinal: u32,
 ) -> Result<(), String> {
-    match &arm.label {
-        Some(label) => {
-            let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label));
-            alias_labelled_subroutines(&mut renamed, label);
-            stamp_gen_scope(&mut renamed, label);
-            elaborate_items(&renamed, elab, all_defs)
-        }
-        None => {
-            let mut scoped = arm.items.clone();
-            stamp_gen_scope(&mut scoped, &gen_scope_name(None, ordinal));
-            elaborate_items(&scoped, elab, all_defs)
-        }
+    // §27.5: a directly nested arm is not a scope.
+    if arm.direct {
+        return elaborate_items(&arm.items, elab, all_defs);
     }
+    let scope = gen_scope_name(arm.label.as_ref(), &gc.implicit_name);
+    let mut renamed = rename_decls_in_iter(&arm.items, &scope);
+    stamp_gen_scope(&mut renamed, &scope);
+    elaborate_block_items(&renamed, elab, all_defs)
 }
 
 /// §21.2.1.7: the processes of a generate block of the ROOT module run in
@@ -19930,76 +20479,10 @@ fn stamp_gen_scope(items: &mut [ModuleItem], scope: &str) {
     }
 }
 
-/// §27.6: a subroutine declared in the labelled generate-if/case branch `blk`
-/// is `blk.f` from outside the branch. The branch's items are elaborated into
-/// the enclosing module under their own names (so the branch's own bare calls
-/// keep resolving), so also register each subroutine under the labelled name:
-/// `blk.f(0)` — or `u.blk.f(0)` once the module is instantiated as `u` — then
-/// finds its body through the ordinary hierarchical-name lookup instead of
-/// silently returning 0. A function's result variable is its name, so the
-/// alias body assigns `blk.f`.
-fn alias_labelled_subroutines(items: &mut Vec<ModuleItem>, label: &str) {
-    let no_local = std::collections::HashSet::default();
-    let no_iface = HashMap::default();
-    let aliases: Vec<ModuleItem> = items
-        .iter()
-        .filter_map(|it| match it {
-            ModuleItem::FunctionDeclaration(fd) => {
-                let mut a = fd.clone();
-                let alias = format!("{}.{}", label, fd.name.name.name);
-                let mut result_var = HashMap::default();
-                result_var.insert(fd.name.name.name.clone(), make_ident_expr(&alias));
-                a.items = fd
-                    .items
-                    .iter()
-                    .map(|st| rewrite_stmt(st, "", &result_var, &no_local, &no_iface))
-                    .collect();
-                a.name.name.name = alias;
-                Some(ModuleItem::FunctionDeclaration(a))
-            }
-            ModuleItem::TaskDeclaration(td) => {
-                let mut a = td.clone();
-                a.name.name.name = format!("{}.{}", label, td.name.name.name);
-                Some(ModuleItem::TaskDeclaration(a))
-            }
-            _ => None,
-        })
-        .collect();
-    items.extend(aliases);
-}
-
-fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
-    for item in items {
-        match item {
-            ModuleItem::FunctionDeclaration(fd) => {
-                fd.name.name.name = format!("{}.{}", scope, fd.name.name.name);
-            }
-            ModuleItem::TaskDeclaration(td) => {
-                td.name.name.name = format!("{}.{}", scope, td.name.name.name);
-            }
-            ModuleItem::GenerateRegion(gr) => {
-                scope_generated_subroutines(&mut gr.items, scope);
-            }
-            ModuleItem::GenerateIf(gi) => {
-                for (_, branch) in &mut gi.branches {
-                    scope_generated_subroutines(branch, scope);
-                }
-            }
-            ModuleItem::GenerateCase(gc) => {
-                for arm in &mut gc.arms {
-                    scope_generated_subroutines(&mut arm.items, scope);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn elaborate_generate_for(
     gf: &GenerateFor,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
-    ordinal: u32,
 ) -> Result<(), String> {
     let var = &gf.var;
     let mut i = generate_for_start(gf, &elab.parameters);
@@ -20022,13 +20505,16 @@ fn elaborate_generate_for(
         // copy. Without this, two iterations both declare e.g. `valid_q` and
         // the elaborator's flat signal table flags a duplicate.
         let subst = substitute_genvar_in_items(&gf.items, var, i);
-        // §27.6: unnamed blocks use the enclosing construct's genblk ordinal,
-        // exactly as named blocks use their label. Data and process scopes agree.
-        let scope = format!("{}[{}]", gen_scope_name(gf.name.as_ref(), ordinal), i);
-        let mut renamed = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
-        scope_generated_subroutines(&mut renamed, &scope);
+        // §27.6: unnamed blocks use the construct's implicit name, exactly as
+        // named blocks use their label. Data and process scopes agree.
+        let scope = format!(
+            "{}[{}]",
+            gen_scope_name(gf.name.as_ref(), &gf.implicit_name),
+            i
+        );
+        let mut renamed = rename_decls_in_iter(&subst, &scope);
         stamp_gen_scope(&mut renamed, &scope);
-        elaborate_items(&renamed, elab, all_defs)?;
+        elaborate_block_items(&renamed, elab, all_defs)?;
         if trace && (iter_count % 8) == 0 {
             let rss = std::fs::read_to_string("/proc/self/statm")
                 .ok()
@@ -20927,10 +21413,10 @@ fn literalize_stmt_decl_dims(items: &mut [ModuleItem], params: &HashMap<String, 
     let mut tds: HashMap<String, DataType> = HashMap::default();
     for item in items.iter() {
         if let ModuleItem::TypedefDeclaration(td) = item {
-            // §6.18/§7.4: an unpacked-array typedef (`typedef logic [31:0]
-            // arr_t [2:4];`) keeps its name: its dimensions live on the
-            // declaration, not in `data_type`, so substituting the element
-            // type turned `arr_t v;` into a scalar.
+            // §6.18: an UNPACKED-array typedef (`typedef u8_t u8a_t [0:7]`)
+            // keeps its name like every unpacked aggregate: its dimensions
+            // are on the declaration, not in `data_type`, so substituting
+            // the element type made `u8a_t r;` a single element.
             if !td.dimensions.is_empty() {
                 continue;
             }
@@ -21280,7 +21766,7 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
         signed: true,
         base: crate::ast::expr::NumberBase::Decimal,
         value: v.to_string(),
-        cached_val: std::cell::Cell::new(None),
+        cached_val: crate::ast::cache::LiteralCache::new(None),
     });
 }
 
@@ -22583,7 +23069,7 @@ fn const_eval_user_call(
     if let Some(p) = params {
         shell.parameters = p.clone();
     }
-    shell.functions = FuncTable::from_map((*funcs).clone());
+    shell.functions = FuncTable::from_shared(Rc::clone(&funcs));
     // Generate-if conditions reach this shell with no typedef table. A formal
     // `fmt_unit_types_t` then has no element width, so `types[i] == MERGED`
     // reads a bit and the merged opgroup is not generated. The localparam
@@ -22693,8 +23179,8 @@ pub(super) fn const_index_base_keys(
     }
 }
 
-/// Full spelling of a hierarchical constant, including constant instance
-/// indices. Interface-array parameters must retain every selected instance.
+/// Full spelling of a hierarchical path with constant selects, for parameter
+/// lookup and member-wise storage. Retain every selected instance or element.
 fn const_parameter_path(
     expr: &Expression,
     params: Option<&HashMap<String, Value>>,
@@ -23596,7 +24082,7 @@ fn set_funcs_tls(funcs: &FuncTable) {
                     funcs.replay_into(std::rc::Rc::make_mut(rc), seen);
                 }
             }
-            _ => *slot = Some(std::rc::Rc::new(funcs.map.clone())),
+            _ => *slot = Some(std::rc::Rc::new((*funcs.map).clone())),
         }
     });
     FUNCS_TLS_MIRROR.with(|m| m.set(Some((funcs.ident.0, funcs.log.len()))));
@@ -23654,7 +24140,7 @@ fn sync_typedefs_tls(table: &TypedefTable) {
             (Some(snap), Some((id, seen))) if id == table.ident.0 && seen <= table.log.len() => {
                 table.replay_into(snap, seen)
             }
-            _ => *slot = Some(table.map.clone()),
+            _ => *slot = Some((*table.map).clone()),
         }
     });
     TYPEDEFS_TLS_MIRROR.with(|m| m.set(Some((table.ident.0, table.log.len()))));
@@ -24209,7 +24695,7 @@ fn prebind_bits_from_declared_types(
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: w.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 });
             }
             return out;
@@ -24341,7 +24827,7 @@ fn flatten_member_chain(e: &Expression) -> Option<(String, Vec<String>)> {
 /// select, so only a base that really names a signal is rewritten here.
 fn prebind_bits_of_signals(
     e: &Expression,
-    signals: &HashMap<String, Signal>,
+    signals: &SharedNameMap<Signal>,
     params: &HashMap<String, Value>,
     prefix: &str,
     typedefs: &HashMap<String, u32>,
@@ -24352,12 +24838,33 @@ fn prebind_bits_of_signals(
     let mut out = e.clone();
     if let ExprKind::SystemCall { name, args } = &e.kind {
         if name == "$bits" && args.len() == 1 {
+            // A typedef may be visible only in this generate scope. Freeze its
+            // width before the elaborator's type context is discarded (§20.6.2).
+            let from_type = flatten_member_chain(&args[0]).and_then(|(base, path)| {
+                let mut parts = vec![base];
+                parts.extend(path);
+                let dotted = parts.join(".");
+                if signals.contains_key(&dotted) || params.contains_key(&dotted) {
+                    return None;
+                }
+                // §20.6.2: the width table holds an unpacked typedef's
+                // element width; $bits includes all of its dimensions.
+                typedef_unpacked_bits(&dotted, Some(params))
+                    .or_else(|| typedef_unpacked_bits(&parts.join("::"), Some(params)))
+                    .and_then(|w| u32::try_from(w).ok())
+                    .or_else(|| {
+                        typedefs
+                            .get(&dotted)
+                            .or_else(|| typedefs.get(&parts.join("::")))
+                            .copied()
+                    })
+            });
             // §7.4.5: an element or slice of a declared variable (see
             // `decl_select_bits`) before the signal table's element width.
             let from_shape = decl_select_bits(&args[0], Some(params))
                 .and_then(|b| u32::try_from(b).ok())
                 .filter(|w| *w > 0);
-            if let Some(w) = from_shape.or_else(|| {
+            if let Some(w) = from_shape.or(from_type).or_else(|| {
                 bits_of_signal_expr(
                     &args[0],
                     signals,
@@ -24374,7 +24881,7 @@ fn prebind_bits_of_signals(
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: w.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 });
             }
             return out;
@@ -24421,7 +24928,7 @@ fn prebind_bits_of_signals(
 #[allow(clippy::too_many_arguments)]
 fn bits_of_signal_expr(
     arg: &Expression,
-    signals: &HashMap<String, Signal>,
+    signals: &SharedNameMap<Signal>,
     params: &HashMap<String, Value>,
     prefix: &str,
     typedefs: &HashMap<String, u32>,
@@ -24635,8 +25142,12 @@ thread_local! {
         = const { std::cell::RefCell::new(None) };
     /// Built declared-shape tables, keyed by definition (name and source
     /// identity) — see `install_decl_shapes`.
-    static DECL_SHAPES_CACHE: std::cell::RefCell<HashMap<(String, usize, usize), std::rc::Rc<HashMap<String, DeclShape>>>>
+    static DECL_SHAPES_CACHE: std::cell::RefCell<HashMap<(String, usize, usize), DeclShapeTable>>
         = std::cell::RefCell::new(HashMap::default());
+    /// The generate blocks being elaborated in that scope (see
+    /// `elaborate_block_items`) and the type parameters visible there.
+    static DECL_SHAPE_LAYERS_TLS: std::cell::RefCell<DeclShapeLayers>
+        = std::cell::RefCell::new(DeclShapeLayers::default());
     /// Full definitions of the typedefs seen so far (data type and unpacked
     /// dimensions), mirroring `typedef_types` / `typedef_unpacked_dims` for
     /// const-eval, which otherwise only knows a typedef's width.
@@ -24774,14 +25285,234 @@ fn tls_restore_typedef_shape(name: &str, saved: TypedefShapeSave) {
     });
 }
 
-/// Restores the previously installed declared-shape table on drop.
-pub struct DeclShapesGuard(Option<std::rc::Rc<HashMap<String, DeclShape>>>);
+/// Declared shapes layered over a scope's own table: one per generate block
+/// being elaborated, innermost last (§27: a block's declarations hide the
+/// enclosing ones), and the type parameters a declaration there may name.
+#[derive(Default)]
+struct DeclShapeLayers {
+    type_params: std::rc::Rc<HashSet<String>>,
+    blocks: Vec<std::rc::Rc<HashMap<String, DeclShape>>>,
+    /// The shapes of the blocks already elaborated in this scope, under
+    /// their block keys (`g[0].arr`), for a query from outside (§23.6).
+    left: HashMap<String, DeclShape>,
+    /// Every generate block's declared shapes as written, under the block
+    /// path without loop indices (`g.arr`), for a query from outside a block
+    /// not yet elaborated. A shape that reads a genvar does not evaluate.
+    by_path: std::rc::Rc<HashMap<String, DeclShape>>,
+}
+
+/// A definition's declared shapes, the names of its type parameters, and
+/// its generate blocks' shapes by block path.
+type DeclShapeTable = (
+    std::rc::Rc<HashMap<String, DeclShape>>,
+    std::rc::Rc<HashSet<String>>,
+    std::rc::Rc<HashMap<String, DeclShape>>,
+);
+
+/// Restores the previously installed declared-shape table, and the block
+/// layers over it, on drop.
+pub struct DeclShapesGuard(
+    Option<std::rc::Rc<HashMap<String, DeclShape>>>,
+    DeclShapeLayers,
+);
 
 impl Drop for DeclShapesGuard {
     fn drop(&mut self) {
         let prev = self.0.take();
         DECL_SHAPES_TLS.with(|c| *c.borrow_mut() = prev);
+        let layers = std::mem::take(&mut self.1);
+        DECL_SHAPE_LAYERS_TLS.with(|c| *c.borrow_mut() = layers);
     }
+}
+
+/// The declared shape of `name` in the scope being elaborated: the innermost
+/// generate block that declares it, else the module or instance.
+fn decl_shape_of(name: &str) -> Option<DeclShape> {
+    DECL_SHAPE_LAYERS_TLS
+        .with(|c| {
+            c.borrow()
+                .blocks
+                .iter()
+                .rev()
+                .find_map(|m| m.get(name).cloned())
+        })
+        .or_else(|| {
+            DECL_SHAPES_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))
+        })
+        .or_else(|| {
+            DECL_SHAPE_LAYERS_TLS.with(|c| {
+                let c = c.borrow();
+                c.left.get(name).cloned().or_else(|| {
+                    let unindexed = strip_block_indices(name)?;
+                    c.by_path.get(&unindexed).cloned()
+                })
+            })
+        })
+}
+
+/// `g[0].n.arr` without its loop indices (`g.n.arr`); None for a simple name.
+fn strip_block_indices(name: &str) -> Option<String> {
+    if !name.contains('.') {
+        return None;
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut depth = 0u32;
+    for ch in name.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// §27.5, §27.6: the declared shapes of each generate block in `items`,
+/// every arm included, under `<prefix><block>.<name>`. A key two arms
+/// declare with different shapes is left out.
+fn collect_block_shapes(
+    items: &[ModuleItem],
+    prefix: &str,
+    type_params: &HashSet<String>,
+    out: &mut HashMap<String, DeclShape>,
+    clash: &mut HashSet<String>,
+) {
+    let block = |name: &str,
+                 block_items: &[ModuleItem],
+                 out: &mut HashMap<String, DeclShape>,
+                 clash: &mut HashSet<String>| {
+        let p = format!("{prefix}{name}.");
+        let (shapes, _) = collect_decl_shapes(&PortList::Empty, block_items, &[], type_params);
+        for (k, v) in shapes {
+            let key = format!("{p}{k}");
+            match out.get(&key) {
+                Some(old) if format!("{old:?}") != format!("{v:?}") => {
+                    clash.insert(key);
+                }
+                Some(_) => {}
+                None => {
+                    out.insert(key, v);
+                }
+            }
+        }
+        collect_block_shapes(block_items, &p, type_params, out, clash);
+    };
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(g) => {
+                collect_block_shapes(&g.items, prefix, type_params, out, clash)
+            }
+            ModuleItem::GenerateIf(g) => {
+                for (bi, (_, branch)) in g.branches.iter().enumerate() {
+                    if g.branch_direct.get(bi) == Some(&true) {
+                        collect_block_shapes(branch, prefix, type_params, out, clash);
+                        continue;
+                    }
+                    let label = g.branch_labels.get(bi).and_then(|l| l.as_ref());
+                    block(
+                        gen_scope_name(label, &g.implicit_name).as_str(),
+                        branch,
+                        out,
+                        clash,
+                    );
+                }
+            }
+            ModuleItem::GenerateCase(g) => {
+                for arm in &g.arms {
+                    if arm.direct {
+                        collect_block_shapes(&arm.items, prefix, type_params, out, clash);
+                        continue;
+                    }
+                    let name = gen_scope_name(arm.label.as_ref(), &g.implicit_name);
+                    block(name.as_str(), &arm.items, out, clash);
+                }
+            }
+            ModuleItem::GenerateFor(g) => {
+                let name = gen_scope_name(g.name.as_ref(), &g.implicit_name);
+                block(name.as_str(), &g.items, out, clash);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The name a declared-shape operand is keyed by: a simple name, or a path
+/// through generate blocks with constant indices (`g[0].arr`, parsed as
+/// `Ident` segments or as member selects), as the block's rename keys its
+/// declarations.
+fn decl_shape_operand_name(e: &Expression) -> Option<String> {
+    fn block_path(e: &Expression, out: &mut String) -> Option<()> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() => {
+                for (i, seg) in h.path.iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        let i = const_eval_i64_with_params(sel, None)?;
+                        out.push_str(&format!("[{i}]"));
+                    }
+                }
+                Some(())
+            }
+            ExprKind::Index { expr, index } => {
+                block_path(expr, out)?;
+                let i = const_eval_i64_with_params(index, None)?;
+                out.push_str(&format!("[{i}]"));
+                Some(())
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                block_path(expr, out)?;
+                out.push('.');
+                out.push_str(&member.name);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    let mut name = String::new();
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.last().is_some_and(|s| s.selects.is_empty()) => {
+            block_path(e, &mut name)?
+        }
+        ExprKind::MemberAccess { .. } => block_path(e, &mut name)?,
+        _ => return None,
+    }
+    Some(name)
+}
+
+/// §20.7, §20.6.2, §27: the array queries and `$bits` over a generate block's
+/// own declarations are constant, as over the module's. Elaborate the block's
+/// (already renamed) items with their declared shapes layered over the
+/// enclosing ones; a nested block adds its own when it is reached.
+fn elaborate_block_items(
+    items: &[ModuleItem],
+    elab: &mut ElaboratedModule,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Result<(), String> {
+    let outer = DECL_SHAPE_LAYERS_TLS.with(|c| c.borrow().type_params.clone());
+    let (shapes, type_params) = collect_decl_shapes(&PortList::Empty, items, &[], &outer);
+    if shapes.is_empty() && type_params.len() == outer.len() {
+        return elaborate_items(items, elab, all_defs);
+    }
+    let type_params = std::rc::Rc::new(type_params);
+    DECL_SHAPE_LAYERS_TLS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.type_params = type_params;
+        c.blocks.push(std::rc::Rc::new(shapes));
+    });
+    let r = elaborate_items(items, elab, all_defs);
+    DECL_SHAPE_LAYERS_TLS.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(block) = c.blocks.pop() {
+            let block = std::rc::Rc::try_unwrap(block).unwrap_or_else(|b| (*b).clone());
+            c.left.extend(block);
+        }
+        c.type_params = outer;
+    });
+    r
 }
 
 /// `arr[N]` with `N` a parameter parses as an associative dimension keyed by a
@@ -24831,34 +25562,75 @@ fn decl_shape_is_fixed(dt: &DataType, dims: &[UnpackedDimension]) -> bool {
 pub fn install_decl_shapes(def: Definition) -> DeclShapesGuard {
     let items = def.items();
     let key = (def.name().to_string(), items.as_ptr() as usize, items.len());
-    let m = match DECL_SHAPES_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        Some(m) => m,
+    let (m, type_params, by_path) = match DECL_SHAPES_CACHE.with(|c| c.borrow().get(&key).cloned())
+    {
+        Some(e) => e,
         None => {
-            let m = std::rc::Rc::new(collect_decl_shapes(def.ports(), items, def.params()));
-            DECL_SHAPES_CACHE.with(|c| c.borrow_mut().insert(key, m.clone()));
-            m
+            let (m, tp) =
+                collect_decl_shapes(def.ports(), items, def.params(), &HashSet::default());
+            let mut by_path = HashMap::default();
+            let mut clash = HashSet::default();
+            collect_block_shapes(items, "", &tp, &mut by_path, &mut clash);
+            by_path.retain(|k, _| !clash.contains(k));
+            let e = (
+                std::rc::Rc::new(m),
+                std::rc::Rc::new(tp),
+                std::rc::Rc::new(by_path),
+            );
+            DECL_SHAPES_CACHE.with(|c| c.borrow_mut().insert(key, e.clone()));
+            e
         }
     };
     let prev = DECL_SHAPES_TLS.with(|c| c.borrow_mut().replace(m));
-    DeclShapesGuard(prev)
+    // A generate block of the enclosing scope does not reach into this one.
+    let layers = DECL_SHAPE_LAYERS_TLS.with(|c| {
+        std::mem::replace(
+            &mut *c.borrow_mut(),
+            DeclShapeLayers {
+                type_params,
+                blocks: Vec::new(),
+                left: HashMap::default(),
+                by_path,
+            },
+        )
+    });
+    DeclShapesGuard(prev, layers)
 }
 
+/// The items of a scope, with those of its `generate` regions in place: a
+/// region is not a scope (§27.3).
+fn scope_items(items: &[ModuleItem]) -> Vec<&ModuleItem> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            ModuleItem::GenerateRegion(gr) => out.extend(scope_items(&gr.items)),
+            _ => out.push(it),
+        }
+    }
+    out
+}
+
+/// The declared shapes of a scope's ports and declarations, and the type
+/// parameters visible in it: `outer_type_params` (an enclosing scope's) and
+/// its own.
 fn collect_decl_shapes(
     ports: &PortList,
     items: &[ModuleItem],
     header_params: &[ParameterDeclaration],
-) -> HashMap<String, DeclShape> {
+    outer_type_params: &HashSet<String>,
+) -> (HashMap<String, DeclShape>, HashSet<String>) {
+    let items = scope_items(items);
     // A variable typed by one of the module's own TYPE parameters takes the
     // instance's binding; it is sized from that width alone, never from a
     // same-named typedef elsewhere.
-    let mut type_params: HashSet<&str> = HashSet::default();
+    let mut type_params: HashSet<String> = outer_type_params.clone();
     let body_params = items.iter().filter_map(|it| match it {
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
         _ => None,
     });
     for pd in header_params.iter().chain(body_params) {
         if let ParameterKind::Type { assignments } = &pd.kind {
-            type_params.extend(assignments.iter().map(|a| a.name.name.as_str()));
+            type_params.extend(assignments.iter().map(|a| a.name.name.clone()));
         }
     }
     let by_type_param = |dt: &DataType| {
@@ -24917,7 +25689,7 @@ fn collect_decl_shapes(
             });
         }
     }
-    m
+    (m, type_params)
 }
 
 /// `[l:r]` / `[n]` bounds of fixed unpacked dimensions, declared order. None
@@ -24968,7 +25740,7 @@ fn decl_shape_query(
     if params.is_some_and(|p| p.contains_key(name)) {
         return None;
     }
-    let shape = DECL_SHAPES_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))?;
+    let shape = decl_shape_of(name)?;
     let mut q = TypeQueryDims {
         dims: fixed_unpacked_bounds(&shape.unpacked, params)?,
         unpacked: shape.unpacked.len(),
@@ -25090,10 +25862,7 @@ fn decl_var_query(
     if !is_decl_shape_operand(arg) {
         return None;
     }
-    let ExprKind::Ident(h) = &arg.kind else {
-        return None;
-    };
-    let (q, bits) = decl_shape_query(&h.path[0].name.name, params)?;
+    let (q, bits) = decl_shape_query(&decl_shape_operand_name(arg)?, params)?;
     if fname == "$bits" {
         return bits;
     }
@@ -25150,11 +25919,7 @@ fn decl_has_unpacked_dims(arg: &Expression) -> bool {
     let ExprKind::Ident(h) = &arg.kind else {
         return false;
     };
-    let Some(shape) = DECL_SHAPES_TLS.with(|c| {
-        c.borrow()
-            .as_ref()
-            .and_then(|m| m.get(&h.path.last()?.name.name).cloned())
-    }) else {
+    let Some(shape) = h.path.last().and_then(|s| decl_shape_of(&s.name.name)) else {
         return false;
     };
     !shape.unpacked.is_empty()
@@ -25167,14 +25932,8 @@ fn decl_has_unpacked_dims(arg: &Expression) -> bool {
 /// array queries can answer at elaboration time?
 fn is_decl_shape_operand(arg: &Expression) -> bool {
     match &arg.kind {
-        ExprKind::Ident(h)
-            if h.path.len() == 1 && h.path[0].selects.is_empty() && h.root.is_none() =>
-        {
-            let Some(shape) = DECL_SHAPES_TLS.with(|c| {
-                c.borrow()
-                    .as_ref()
-                    .and_then(|m| m.get(&h.path[0].name.name).cloned())
-            }) else {
+        ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+            let Some(shape) = decl_shape_operand_name(arg).and_then(|n| decl_shape_of(&n)) else {
                 return false;
             };
             // `[K]` naming a TYPE is a real associative dimension.
@@ -26193,6 +26952,66 @@ pub fn packed_inner_elem_width(
     None
 }
 
+/// §7.2, §7.4.1: record `packed_member_meta` of every member of the packed
+/// struct `dt` under `<sig>.<member>`, keeping what is already there.
+/// `params` is the declaring scope's (the module's own when None).
+fn register_member_packed_meta(
+    elab: &mut ElaboratedModule,
+    sig: &str,
+    dt: &DataType,
+    params: Option<&HashMap<String, Value>>,
+) {
+    let DataType::Struct(su) = resolve_typedef_chain(dt, &elab.typedef_types) else {
+        return;
+    };
+    let params = params.unwrap_or(&elab.parameters);
+    let mut metas = Vec::new();
+    for m in &su.members {
+        let (ew, fd) =
+            packed_member_meta(&m.data_type, params, &elab.typedefs, &elab.typedef_types);
+        for mdecl in &m.declarators {
+            metas.push((format!("{sig}.{}", mdecl.name.name), ew, fd.clone()));
+        }
+    }
+    for (key, ew, fd) in metas {
+        if let Some(ew) = ew {
+            elab.packed_signal_elem_widths
+                .entry(key.clone())
+                .or_insert(ew);
+        }
+        if let Some(fd) = fd {
+            elab.packed_full_dims.entry(key).or_insert(fd);
+        }
+    }
+}
+
+/// §7.2, §7.4.1: the packed-array shape of a struct MEMBER declared with
+/// `dt`, as the runtime keys it under `<signal>.<member>`: the element width
+/// of its outermost dimension and every packed dimension (outermost first,
+/// the element's own bit range innermost). A member whose element type is a
+/// typedef (`t3_t [1:0][3:0][7:0] f0`) or whose dimensions live inside the
+/// typedef (`t3d_t f0`) has them only through the typedef chain;
+/// `packed_full_dims_of` sees the declaration alone, so with it only the
+/// first index of `s.f0[i][j]` selected an element and every later one was a
+/// one-bit select of the row.
+pub fn packed_member_meta(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> (Option<u32>, Option<Vec<(i64, i64)>>) {
+    let fd = packed_full_dims_of(dt, params)
+        .or_else(|| packed_full_dims_chained(dt, params, typedef_types));
+    let ew = packed_inner_elem_width(dt, params, typedefs).or_else(|| {
+        // An element of the outermost dimension spans all the others.
+        let dims = fd.as_ref().filter(|d| d.len() >= 2)?;
+        dims[1..].iter().try_fold(1u32, |w, (l, r)| {
+            w.checked_mul(u32::try_from((l - r).unsigned_abs() + 1).ok()?)
+        })
+    });
+    (ew, fd)
+}
+
 /// §5.9: a string literal is 8 bits per character, and an empty one still
 /// occupies a byte, so `parameter P = "untyped"` keeps all its text.
 fn string_literal_width(init: &Expression) -> Option<u32> {
@@ -27094,7 +27913,7 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
         DataType::Struct(su) if su.packed => {
             elab.signals.entry(name.to_string()).or_insert(Signal {
                 is_const: false,
-                name: name.to_string(),
+                name: name.to_string().into(),
                 width: w,
                 is_signed: signed,
                 is_real: false,
@@ -27110,12 +27929,19 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
                 }
             }
         }
-        // A nested UNPACKED struct member: recurse into its own members.
-        DataType::Struct(_) => register_unpacked_aggregate(elab, name, dt),
+        // §7.2 / §23.3.3: a nested unpacked struct is itself a valid port
+        // actual. It has no container signal, so retain its type for the
+        // whole-struct expansion of `parent.member = inst.port` as well as
+        // registering its leaves. Resolve the alias while its scope is live.
+        DataType::Struct(_) => {
+            elab.var_decl_types
+                .insert(name.to_string(), resolved.clone());
+            register_unpacked_aggregate(elab, name, dt);
+        }
         _ => {
             elab.signals.entry(name.to_string()).or_insert(Signal {
                 is_const: false,
-                name: name.to_string(),
+                name: name.to_string().into(),
                 width: w,
                 is_signed: signed,
                 is_real: real,
@@ -27169,6 +27995,30 @@ fn register_array_param(
     )
 }
 
+/// An index of a multi-dimensional packed parameter is an element select, not
+/// a bit select, the same registration the variable path does.
+fn register_packed_param_shape(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
+    if let Some(elem_w) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
+        // The CONST-eval index arm reads its own TLS table (only
+        // `register_packed_array_elem_w` fed it, which handles a typedef'd
+        // element type). Without this a `localparam logic [1:0][7:0] MP`
+        // element select `MP[0]` in another localparam bit-selected instead.
+        // The runtime map is `register_packed_param_index`.
+        tls_register_elem_w(name, elem_w);
+    }
+    if let Some((ew, msb0)) = packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types) {
+        tls_register_elem_w(name, ew);
+        if msb0 {
+            tls_register_elem_msb0(name);
+        }
+    }
+    // A typedef'd array (`exp_arr_t EXPS`, `enc_t [0:4] LOCAL`) has its dims on
+    // the typedef or as a single ascending range. `packed_inner_elem_width` /
+    // `packed_full_dims_of` miss those, so a variable index bit-selects or
+    // reads the last element.
+    register_packed_param_index(elab, name, data_type, None);
+}
+
 /// `base.member` as a hierarchical IDENTIFIER when `base` is a whole-net
 /// identifier, falling back to a `MemberAccess` node otherwise.
 ///
@@ -27190,8 +28040,9 @@ fn member_ref_expr(base: &Expression, member: &Identifier) -> Expression {
                     root: None,
                     path: segs,
                     span: base.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 base.span,
             );
@@ -27474,7 +28325,7 @@ fn index_expr_of(base: Expression, idx: i64) -> Expression {
                     signed: true,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: idx.to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )),
@@ -27614,7 +28465,7 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
         let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
         elab.signals.entry(base.to_string()).or_insert(Signal {
             is_const: false,
-            name: base.to_string(),
+            name: base.to_string().into(),
             width: w,
             is_signed: false,
             is_real: false,
@@ -28786,6 +29637,19 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 }
                 None => Value::new(32),
             }
+        }
+        // §20.7, §23.6: a query over a generate block's variable by path
+        // (`g[0].arr`) answers from the block's declared shape.
+        ExprKind::SystemCall { name, args }
+            if args
+                .first()
+                .is_some_and(|a| matches!(a.kind, ExprKind::MemberAccess { .. }))
+                && decl_var_query(name, args, Some(params)).is_some() =>
+        {
+            let v = decl_var_query(name, args, Some(params)).unwrap_or_default();
+            let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
+            out.is_signed = true;
+            out
         }
         // LRM §20.7 array-introspection on an array-name ident: consults
         // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
@@ -30923,6 +31787,95 @@ fn resolve_name_class(
     }
 }
 
+/// §23.9, §23.8.1, §27.6: what the binding of a name's head says to the
+/// undeclared-name checks.
+enum HeadVerdict {
+    /// Not bound (a synthesized or unanalysed position), or the head of an
+    /// upward path: the name tables decide.
+    Unbound,
+    Declared,
+    /// A bare call nothing declares lexically: legal if found upward.
+    UpwardCall,
+    Undeclared,
+}
+
+/// Where a single-segment head is written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadRole {
+    Value,
+    Callee,
+    /// The base of a member select, `a.b` or `a[i].b`.
+    Path,
+}
+
+fn head_verdict(h: &HierarchicalIdentifier, role: HeadRole) -> HeadVerdict {
+    if h.root.is_some() || h.path.is_empty() {
+        return HeadVerdict::Declared;
+    }
+    if h.bound.is_unset() {
+        return HeadVerdict::Unbound;
+    }
+    if !h.bound.is_upward() {
+        return HeadVerdict::Declared;
+    }
+    let path = h.path.len() > 1 || role == HeadRole::Path;
+    match role {
+        // §27.6: an implicit block name is a name of its own scope only.
+        _ if path && is_implicit_block_name(&h.path[0].name.name) => HeadVerdict::Undeclared,
+        // §23.8: a hierarchical path, for the hierarchical-reference lint.
+        _ if h.path.len() > 1 => HeadVerdict::Declared,
+        HeadRole::Path => HeadVerdict::Unbound,
+        HeadRole::Callee => HeadVerdict::UpwardCall,
+        HeadRole::Value => HeadVerdict::Undeclared,
+    }
+}
+
+/// The role of each head `for_each_sub_expr` visits, which sees a call or
+/// a member select before its callee or base.
+struct HeadRoles {
+    callee: *const Expression,
+    base: *const Expression,
+}
+
+impl HeadRoles {
+    fn new() -> Self {
+        HeadRoles {
+            callee: std::ptr::null(),
+            base: std::ptr::null(),
+        }
+    }
+
+    fn note(&mut self, x: &Expression) {
+        match &x.kind {
+            ExprKind::Call { func, .. } => self.callee = &**func,
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut b = &**expr;
+                while let ExprKind::Index { expr, .. } = &b.kind {
+                    b = expr;
+                }
+                self.base = b;
+            }
+            _ => {}
+        }
+    }
+
+    fn role(&self, x: &Expression) -> HeadRole {
+        if std::ptr::eq(x, self.callee) {
+            HeadRole::Callee
+        } else if std::ptr::eq(x, self.base) {
+            HeadRole::Path
+        } else {
+            HeadRole::Value
+        }
+    }
+}
+
+/// §27.6 `genblk<n>`.
+fn is_implicit_block_name(name: &str) -> bool {
+    name.strip_prefix("genblk")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
 /// An identifier or call in an inlined sub-instance body that NOTHING in the
 /// design declares is an error — the reference tooling rejects it at
 /// elaboration. The per-module validator only ever saw the TOP module's
@@ -30931,11 +31884,11 @@ fn resolve_name_class(
 /// it simply never ran (assertions silently vanished), and a typo'd signal in
 /// a child read x for the whole run.
 ///
-/// The bar is deliberately "declared nowhere": a bare name is accepted if the
-/// instance's own module declares it (`local_names`, ports, interfaces), the
-/// body declares it, any elaborated table knows it under any scope, or any
-/// definition in the design declares it. Scope resolution is the runtime's
-/// job; this only catches names that cannot resolve anywhere.
+/// §23.9, §23.8.1: the binding of a head decides (`head_verdict`). A head the
+/// binder did not walk, or an upward path head, keeps the "declared nowhere"
+/// bar: a bare name is accepted if the instance's own module declares it
+/// (`local_names`, ports, interfaces), the body declares it, any elaborated
+/// table knows it under any scope, or any definition in the design declares it.
 fn validate_inlined_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
@@ -31032,56 +31985,79 @@ fn validate_inlined_bodies(
     };
     // One check per distinct source body: sibling instances share the Rc.
     let mut seen: HashSet<usize> = HashSet::default();
+    // Per body, its calls the binding leaves upward, checked per instance.
+    let mut upward_calls: HashMap<usize, Vec<(String, Span)>> = HashMap::default();
     let mut first: Option<(String, Span, String)> = None;
     let mut check_body =
         |source_ptr: usize,
          ctx: &RewriteCtx,
          locals: &HashSet<String>,
          visit: &mut dyn FnMut(&mut dyn FnMut(&Expression))| {
-            if first.is_some() || !seen.insert(source_ptr) {
+            if first.is_some() {
                 return;
             }
-            let mut check_expr = |e: &Expression| {
-                for_each_sub_expr(e, &mut |x| {
-                    if first.is_some() {
-                        return;
-                    }
-                    let h = match &x.kind {
-                        ExprKind::Ident(h) => h,
-                        ExprKind::Call { func, .. } => match &func.kind {
-                            ExprKind::Ident(h) => h,
-                            _ => return,
-                        },
-                        _ => return,
-                    };
-                    if h.root.is_some() || h.path.len() != 1 {
-                        return;
-                    }
-                    let raw = h.path[0].name.name.as_str();
-                    let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
-                    if name.starts_with('$')
-                        || name.contains('.')
-                        || matches!(
-                            name,
-                            "new" | "super" | "this" | "randomize" | "std" | "process" | "null"
-                        )
-                        || is_builtin_type_keyword(name)
-                        || (name.starts_with("genblk")
-                            && name.len() > 6
-                            && name[6..].chars().all(|c| c.is_ascii_digit()))
-                        || ctx.local_names.contains(name)
-                        || ctx.port_map.contains_key(name)
-                        || ctx.interface_map.contains_key(name)
-                        || ctx.type_binds.contains_key(name)
-                        || locals.contains(name)
-                        || known.contains(name)
-                    {
-                        return;
-                    }
-                    first = Some((name.to_string(), x.span, ctx.owner.clone()));
-                });
-            };
-            visit(&mut check_expr);
+            if seen.insert(source_ptr) {
+                let calls = upward_calls.entry(source_ptr).or_default();
+                let mut roles = HeadRoles::new();
+                let mut check_expr = |e: &Expression| {
+                    for_each_sub_expr(e, &mut |x| {
+                        if first.is_some() {
+                            return;
+                        }
+                        roles.note(x);
+                        let ExprKind::Ident(h) = &x.kind else { return };
+                        let Some(head) = h.path.first() else { return };
+                        let raw = head.name.name.as_str();
+                        let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+                        if name.starts_with('$')
+                            || name.contains('.')
+                            || matches!(
+                                name,
+                                "new" | "super" | "this" | "randomize" | "std" | "process" | "null"
+                            )
+                            || is_builtin_type_keyword(name)
+                        {
+                            return;
+                        }
+                        match head_verdict(h, roles.role(x)) {
+                            HeadVerdict::Declared => return,
+                            HeadVerdict::UpwardCall => {
+                                calls.push((name.to_string(), x.span));
+                                return;
+                            }
+                            HeadVerdict::Undeclared => {
+                                first = Some((name.to_string(), x.span, ctx.owner.clone()));
+                                return;
+                            }
+                            HeadVerdict::Unbound => {}
+                        }
+                        if h.root.is_some()
+                            || h.path.len() != 1
+                            || ctx.local_names.contains(name)
+                            || ctx.port_map.contains_key(name)
+                            || ctx.interface_map.contains_key(name)
+                            || ctx.type_binds.contains_key(name)
+                            || locals.contains(name)
+                            || known.contains(name)
+                        {
+                            return;
+                        }
+                        first = Some((name.to_string(), x.span, ctx.owner.clone()));
+                    });
+                };
+                visit(&mut check_expr);
+            }
+            // §23.8.1: each instance searches upward from where it sits.
+            let inst = ctx.prefix.trim_end_matches('.');
+            let upward = ctx.upward.borrow();
+            if let Some((name, span)) = upward_calls
+                .get(&source_ptr)
+                .into_iter()
+                .flatten()
+                .find(|(n, _)| upward.find_subroutine(inst, n).is_none())
+            {
+                first.get_or_insert((name.clone(), *span, ctx.owner.clone()));
+            }
         };
     for p in &elab.pending_always {
         let mut locals = HashSet::default();
@@ -31417,11 +32393,16 @@ fn validate_subroutine_bodies(
         if !class.is_empty() && !bases_declared(class) {
             continue;
         }
+        let upward = |n: &str| {
+            elab.upward_scopes
+                .borrow()
+                .every_instance_finds(body.owner, n)
+        };
         let found = if class.is_empty() {
-            first_undeclared_in_subroutine(body, known, None)
+            first_undeclared_in_subroutine(body, known, None, &upward)
         } else {
             let scope = scopes.entry(class).or_insert_with(|| class_scope(class));
-            first_undeclared_in_subroutine(body, outside_classes, Some(scope))
+            first_undeclared_in_subroutine(body, outside_classes, Some(scope), &upward)
         };
         if let Some((name, span)) = found {
             return Err(span_error_of(
@@ -31435,13 +32416,16 @@ fn validate_subroutine_bodies(
     Ok(())
 }
 
-/// The first bare identifier (or called name) in a subroutine body that is
+/// The first bare identifier (or called name) in a subroutine body that the
+/// binding leaves undeclared, or, where the binder did not walk, that is
 /// neither local to it — a formal, the function's own name, a body-local
 /// declaration, a `with` iterator — nor declared anywhere in the design.
+/// `upward` says whether a bare call the binding leaves upward is found.
 fn first_undeclared_in_subroutine(
     body: &SubroutineBody,
     known: &HashSet<String>,
     class_scope: Option<&HashSet<String>>,
+    upward: &dyn Fn(&str) -> bool,
 ) -> Option<(String, Span)> {
     let mut locals: HashSet<String> = HashSet::default();
     locals.insert(body.name.to_string());
@@ -31455,31 +32439,35 @@ fn first_undeclared_in_subroutine(
         add_construct_bound_names(s, &mut locals);
     }
     let mut first: Option<(String, Span)> = None;
+    let mut roles = HeadRoles::new();
     for s in body.items {
         for_each_stmt_expr(s, &mut |e| {
             for_each_sub_expr(e, &mut |x| {
                 if first.is_some() {
                     return;
                 }
-                let h = match &x.kind {
-                    ExprKind::Ident(h) => h,
-                    ExprKind::Call { func, .. } => match &func.kind {
-                        ExprKind::Ident(h) => h,
-                        _ => return,
-                    },
-                    _ => return,
-                };
-                if h.root.is_some() || h.path.len() != 1 {
+                roles.note(x);
+                let ExprKind::Ident(h) = &x.kind else { return };
+                let Some(head) = h.path.first() else { return };
+                let raw = head.name.name.as_str();
+                let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+                if name.starts_with('$') || name.contains('.') || is_builtin_bare_name(name) {
                     return;
                 }
-                let raw = h.path[0].name.name.as_str();
-                let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
-                if name.starts_with('$')
-                    || name.contains('.')
+                match head_verdict(h, roles.role(x)) {
+                    HeadVerdict::Declared => return,
+                    HeadVerdict::UpwardCall if upward(name) => return,
+                    HeadVerdict::UpwardCall | HeadVerdict::Undeclared => {
+                        first = Some((name.to_string(), x.span));
+                        return;
+                    }
+                    HeadVerdict::Unbound => {}
+                }
+                if h.root.is_some()
+                    || h.path.len() != 1
                     || locals.contains(name)
                     || known.contains(name)
                     || class_scope.is_some_and(|c| c.contains(name))
-                    || is_builtin_bare_name(name)
                 {
                     return;
                 }
@@ -31495,8 +32483,8 @@ fn first_undeclared_in_subroutine(
 
 /// Names legal as a bare identifier without any declaration: `this`/`super`,
 /// the built-in `std` package and `process` class, the §18 built-in class
-/// methods callable unqualified inside a method, the implicit `genblk<N>`
-/// generate-scope names, and built-in type keywords (`$bits(int)`).
+/// methods callable unqualified inside a method, and built-in type keywords
+/// (`$bits(int)`).
 fn is_builtin_bare_name(name: &str) -> bool {
     matches!(
         name,
@@ -31529,9 +32517,7 @@ fn is_builtin_bare_name(name: &str) -> bool {
             | "string"
             | "chandle"
             | "void"
-    ) || (name.starts_with("genblk")
-        && name.len() > 6
-        && name[6..].chars().all(|c| c.is_ascii_digit()))
+    )
 }
 
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
@@ -31551,6 +32537,28 @@ fn inline_instantiations_inner(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    let header_values: Vec<_> = definitions
+        .get(&elab.name)
+        .into_iter()
+        .flat_map(|def| def.params())
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Data { assignments, .. } => assignments
+                .iter()
+                .map(|a| a.name.name.as_str())
+                .collect::<Vec<_>>(),
+            ParameterKind::Type { .. } => Vec::new(),
+        })
+        .filter_map(|name| {
+            elab.parameters.get(name).map(|value| {
+                (
+                    name.to_string(),
+                    value.clone(),
+                    elab.signals.get(name).cloned(),
+                )
+            })
+        })
+        .collect();
+
     // §26.3: each design unit's package imports, for the runtime's
     // resolution of a contested package-variable name (see
     // `pkg_var_decls`).
@@ -31990,7 +32998,10 @@ fn inline_instantiations_inner(
                                     &elab.typedef_types,
                                 );
                                 record_coll_shape(elab, &decl.name.name, &shape_dims, None);
-                                let first_dim = decl.dimensions.first();
+                                // `[N]` sized by a parameter is fixed, not
+                                // associative: read the normalized dims (see
+                                // the generate-scope path).
+                                let first_dim = shape_dims.first();
                                 let is_dynamic_dim = first_dim.is_some_and(|d| {
                                     matches!(
                                         d,
@@ -32067,8 +33078,12 @@ fn inline_instantiations_inner(
                                 // module-scope path does. Only the first
                                 // dimension was registered, so `v[i][j]` was a
                                 // bit-select and `foreach (v[i, j])` walked bits.
-                                if decl.dimensions.len() >= 2
-                                    && decl.dimensions.iter().all(|d| {
+                                // Read the normalized dimensions: the parser
+                                // gives `[N]` as an associative dimension keyed
+                                // by "type" `N`, so `d [N][2]` failed this check
+                                // and was registered one-dimensional.
+                                if shape_dims.len() >= 2
+                                    && shape_dims.iter().all(|d| {
                                         matches!(
                                             d,
                                             UnpackedDimension::Range { .. }
@@ -32076,8 +33091,7 @@ fn inline_instantiations_inner(
                                         )
                                     })
                                 {
-                                    let shape: Option<Vec<(i64, i64)>> = decl
-                                        .dimensions
+                                    let shape: Option<Vec<(i64, i64)>> = shape_dims
                                         .iter()
                                         .map(|d| {
                                             extract_array_range(
@@ -32341,7 +33355,7 @@ fn inline_instantiations_inner(
                                         qualified.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: qualified,
+                                            name: qualified.into(),
                                             width: w,
                                             is_signed,
                                             is_real,
@@ -32354,7 +33368,7 @@ fn inline_instantiations_inner(
                                         .entry(decl.name.name.clone())
                                         .or_insert(Signal {
                                             is_const: false,
-                                            name: decl.name.name.clone(),
+                                            name: decl.name.name.clone().into(),
                                             width: w,
                                             is_signed,
                                             is_real,
@@ -32414,7 +33428,7 @@ fn inline_instantiations_inner(
                                     for (i, item_expr) in init_items.iter().enumerate() {
                                         let lval = Expression::new(ExprKind::Index {
                                             expr: Box::new(make_ident_expr(&decl.name.name)),
-                                            index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: i.to_string(), cached_val: std::cell::Cell::new(None) }), Span::dummy())),
+                                            index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: i.to_string(), cached_val: crate::ast::cache::LiteralCache::new(None) }), Span::dummy())),
                                         }, Span::dummy());
                                         stmts.push(Statement::new(
                                             StatementKind::BlockingAssign {
@@ -32432,7 +33446,7 @@ fn inline_instantiations_inner(
                                             size_name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: size_name,
+                                                name: size_name.into(),
                                                 width: 32,
                                                 is_signed: false,
                                                 is_real: false,
@@ -32487,6 +33501,12 @@ fn inline_instantiations_inner(
     };
     // Recursively inline starting from the top module's items
     MODPORT_EXPR_TLS.with(|m| m.borrow_mut().clear());
+    for (name, value, signal) in header_values {
+        elab.set_param(line!(), name.clone(), value);
+        if let Some(signal) = signal {
+            signals_insert_traced(&mut elab.signals, line!(), name, signal);
+        }
+    }
     let top_params = elab.parameters.clone();
     // Snapshot the now-complete package/$unit parameters as the const-eval
     // fallback so sub-module header localparams (evaluated in the instance-merge
@@ -32495,7 +33515,7 @@ fn inline_instantiations_inner(
     set_param_fallback(&top_params);
     set_typedef_types_tls(&elab.typedef_types);
     set_typedef_widths_tls(elab.typedefs.as_map());
-    let mut cache = HashMap::default();
+    let mut cache = InlineCache::default();
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
     // §23.10/§26.3: the snapshot is held once; each scope takes from it only
@@ -32611,73 +33631,111 @@ fn genvar_const_expr(value: i64) -> Expression {
             signed: true,
             base: NumberBase::Decimal,
             value: value.to_string(),
-            cached_val: std::cell::Cell::new(Some((value as u64, 0u64, 32u32))),
+            cached_val: crate::ast::cache::LiteralCache::new(Some((value as u64, 0u64, 32u32))),
         }),
         Span::dummy(),
     )
 }
 
-/// Replace bare references to `var` (a genvar) with the given constant
-/// `value` throughout the module items. Walks into nested generate-for /
-/// generate-if / generate-region so the substitution covers the whole
-/// generate subtree before unrolling kicks in.
+/// §27.4: an iteration's genvar is a localparam of its block; replace bare
+/// references to `var` with `value` throughout the items, nested generate
+/// constructs included, before unrolling.
 fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Vec<ModuleItem> {
-    let mut port_map: HashMap<String, Expression> = HashMap::default();
-    port_map.insert(var.to_string(), genvar_const_expr(value));
-    let local_names: std::collections::HashSet<String> = std::collections::HashSet::default();
-    let interface_map: HashMap<String, String> = HashMap::default();
-    items
-        .iter()
-        .map(|item| substitute_in_module_item(item, &port_map, &local_names, &interface_map))
-        .collect()
+    let mut genvar = HashMap::default();
+    genvar.insert(var.to_string(), genvar_const_expr(value));
+    gen_walk(
+        items,
+        GenRename {
+            genvar,
+            ..Default::default()
+        },
+    )
 }
 
-/// Collect the names of signals/parameters/instances declared at the top level
-/// of a generate-for body. These need per-iteration renaming so that 20 copies
-/// of `logic valid_q;` don't collapse into a single flat signal.
-fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
+/// The declarations a generate rename applies to: data, nets, parameters,
+/// instances, subroutines, properties, sequences and typedefs (§23.9, §27.5:
+/// a generate block's declarations belong to its scope, so `g_a.look` and
+/// `g_b.look` are two tasks). `visit` gets the name, the declaration's own
+/// id, and its kind.
+fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, DeclKind)) {
     for item in items {
         match item {
             ModuleItem::DataDeclaration(dd) => {
                 for d in &dd.declarators {
-                    names.push(d.name.name.clone());
+                    visit(&d.name.name, d.decl, DeclKind::Data);
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
                 for d in &nd.declarators {
-                    names.push(d.name.name.clone());
+                    visit(&d.name.name, d.decl, DeclKind::Net);
                 }
             }
             ModuleItem::PortDeclaration(pd) => {
                 for d in &pd.declarators {
-                    names.push(d.name.name.clone());
+                    visit(&d.name.name, d.decl, DeclKind::Data);
                 }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                 if let ParameterKind::Data { assignments, .. } = &pd.kind {
                     for a in assignments {
-                        names.push(a.name.name.clone());
+                        visit(&a.name.name, a.decl, DeclKind::Param);
                     }
                 }
             }
             ModuleItem::ModuleInstantiation(mi) => {
                 for hi in &mi.instances {
-                    names.push(hi.name.name.clone());
+                    visit(&hi.name.name, hi.decl, DeclKind::Instance);
+                    for c in &hi.connections {
+                        if let PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) = c
+                        {
+                            visit_block_implicit_nets(e, visit);
+                        }
+                    }
+                }
+            }
+            // An out-of-block class method (`function C::m`) is the class's,
+            // not the block's.
+            ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
+                visit(&fd.name.name.name, fd.decl, DeclKind::Function);
+            }
+            ModuleItem::TaskDeclaration(td) if td.name.scopes.is_empty() => {
+                visit(&td.name.name.name, td.decl, DeclKind::Task);
+            }
+            // §16.12, §16.8.
+            ModuleItem::PropertyDeclaration(p) => visit(&p.name.name, p.decl, DeclKind::Property),
+            ModuleItem::SequenceDeclaration(p) => visit(&p.name.name, p.decl, DeclKind::Sequence),
+            // §6.18. A forward declaration keeps its name: it may name a
+            // class, and classes keep theirs.
+            ModuleItem::TypedefDeclaration(t) if !matches!(t.data_type, DataType::Void(_)) => {
+                visit(&t.name.name, t.decl, DeclKind::Typedef)
+            }
+            // §6.10: an implicit net a block's continuous assignment, port
+            // actual or gate terminal declares is the block's, as a declared
+            // net is (`g[0].n`).
+            ModuleItem::ContinuousAssign(ca) => {
+                for (lhs, _) in &ca.assignments {
+                    visit_block_implicit_nets(lhs, visit);
+                }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                for t in gi.instances.iter().flat_map(|i| &i.terminals) {
+                    visit_block_implicit_nets(t, visit);
                 }
             }
             // Nested generate constructs declare their own scope; we recurse
             // and rename names declared in the unconditional bodies, since a
             // nested generate-if may declare a name that the parent's other
             // siblings reference.
-            ModuleItem::GenerateRegion(gr) => collect_decl_names_in_items(&gr.items, names),
+            ModuleItem::GenerateRegion(gr) => visit_renamed_decls(&gr.items, visit),
             ModuleItem::GenerateIf(gi) => {
                 for (_cond, branch) in &gi.branches {
-                    collect_decl_names_in_items(branch, names);
+                    visit_renamed_decls(branch, visit);
                 }
             }
             ModuleItem::GenerateCase(gc) => {
                 for arm in &gc.arms {
-                    collect_decl_names_in_items(&arm.items, names);
+                    visit_renamed_decls(&arm.items, visit);
                 }
             }
             // A NESTED generate-for's body decls must also be uniquified by the
@@ -32688,239 +33746,213 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
             // `for(a) for(b) localparam Idx = f(a,b)` to `f(0,b)` — the
             // rr_arb_tree binary-tree index bug. The inner loop's own rename
             // then composes a second suffix, giving a distinct name per (a,b).
-            ModuleItem::GenerateFor(gf) => collect_decl_names_in_items(&gf.items, names),
+            ModuleItem::GenerateFor(gf) => visit_renamed_decls(&gf.items, visit),
             _ => {}
         }
     }
 }
 
-/// Rename declarations inside a generate-for iteration so that each iteration
-/// owns a distinct copy of every locally declared name. References in
-/// always/initial/contassign/instance ports get rewritten via a port_map.
-/// How a generate-for iteration's declarations are renamed.
-///
-/// `Scope("gl[1]")` produces the LRM-visible hierarchical name
-/// (`gl[1].plain`, §27.6) — the same dotted-flat-key convention named
-/// IF-generate blocks already use (`g.sig`), so hierarchical reads AND writes
-/// (`gl[1].plain = ...`) resolve with no aliasing layer, and the packed
-/// metadata registered under the declarator's name is found by the same key.
-/// Nested loops insert the inner scope BEFORE the base name
-/// (`outer[0].x` + `inner[1]` → `outer[0].inner[1].x`), matching the LRM path.
-///
-enum GenRename<'a> {
-    Scope(&'a str),
-}
-
-impl GenRename<'_> {
-    fn apply(&self, n: &str) -> String {
-        match self {
-            GenRename::Scope(sc) => match n.rsplit_once('.') {
-                Some((outer, base)) => format!("{}.{}.{}", outer, sc, base),
-                None => format!("{}.{}", sc, n),
-            },
+/// The implicit nets of a generate block (`Bound::block_implicit_net`) that
+/// an implicit-net position names: a bare name, or each member of a
+/// concatenation (§6.10).
+fn visit_block_implicit_nets(e: &Expression, visit: &mut dyn FnMut(&str, Bound, DeclKind)) {
+    match &e.kind {
+        ExprKind::Ident(h)
+            if h.root.is_none() && h.path.len() == 1 && h.bound.is_block_implicit_net() =>
+        {
+            visit(&h.path[0].name.name, h.bound, DeclKind::ImplicitNet)
         }
+        ExprKind::Concatenation(parts) => parts
+            .iter()
+            .for_each(|p| visit_block_implicit_nets(p, visit)),
+        _ => {}
     }
 }
 
-fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleItem> {
-    let mut names = Vec::new();
-    collect_decl_names_in_items(items, &mut names);
-    if names.is_empty() {
+/// §23.9, §27.6: the generate rename in progress: the block's scope and, per
+/// renamed declaration, its kind and its spelling so far; or an iteration's
+/// genvar substitution.
+#[derive(Default)]
+struct GenRename {
+    scope: String,
+    renamed: HashMap<DeclId, (DeclKind, String)>,
+    /// §27.4: the iteration's genvar and its value, replaced by name.
+    genvar: HashMap<String, Expression>,
+    /// Whether a process local's type can take a renamed declaration.
+    local_kinds: bool,
+    /// The kinds the position being rewritten takes, when not all.
+    part: std::cell::Cell<Option<fn(DeclKind) -> bool>>,
+    /// Whether the position is in a class body.
+    class: std::cell::Cell<bool>,
+}
+
+/// §18.5: a constraint takes a block's subroutines and types; the solver
+/// reads data by its bare name.
+pub(crate) fn constraint_takes(k: DeclKind) -> bool {
+    matches!(k, DeclKind::Function | DeclKind::Task | DeclKind::Typedef)
+}
+
+/// §6.21: a process local's type and dimensions take a block's parameters
+/// and types.
+pub(crate) fn local_type_takes(k: DeclKind) -> bool {
+    matches!(k, DeclKind::Param | DeclKind::Typedef)
+}
+
+/// §27.6: `n` of block `scope` is `scope.n`; a name an enclosing block
+/// renamed takes the scope before its last segment (`outer[0].x` in
+/// `inner[1]` is `outer[0].inner[1].x`), the LRM path.
+fn compose_scope(scope: &str, n: &str) -> String {
+    match n.rsplit_once('.') {
+        Some((outer, base)) => format!("{outer}.{scope}.{base}"),
+        None => format!("{scope}.{n}"),
+    }
+}
+
+/// §3.12.1: whether the generate rename in progress renames a declaration
+/// `name` of its block, so the plain name there is the block's.
+fn gen_rename_declares(name: &str) -> bool {
+    GEN_RENAME_TLS.with(|g| {
+        g.borrow()
+            .iter()
+            .any(|f| f.renamed.values().any(|(_, spelled)| spelled == name))
+    })
+}
+
+/// The key the generate rename in progress gives `name`, bound as `bound`,
+/// when it binds to a renamed declaration of a kind both `kinds` and the
+/// position take, spelled as that declaration is so far. An instance keeps
+/// its declarator's name, so only its references carry the enclosing renames.
+fn gen_renamed(bound: Bound, name: &str, kinds: fn(DeclKind) -> bool) -> Option<String> {
+    let d = bound.as_decl()?;
+    GEN_RENAME_TLS.with(|g| {
+        let g = g.borrow();
+        let f = g.last()?;
+        let (kind, spelled) = f.renamed.get(&d)?;
+        let takes = kinds(*kind) && f.part.get().is_none_or(|p| p(*kind));
+        (takes && (*kind == DeclKind::Instance || spelled == name))
+            .then(|| compose_scope(&f.scope, name))
+    })
+}
+
+/// §13.5, §8.3: in a genvar substitution, a name the binding gives another
+/// target (a formal, a class member) keeps it.
+fn genvar_hidden(bound: Bound) -> bool {
+    !bound.is_unset()
+        && bound != Bound::GENVAR
+        && GEN_RENAME_TLS.with(|g| g.borrow().last().is_some_and(|f| !f.genvar.is_empty()))
+}
+
+/// Whether a process local's type is being renamed (`local_type_takes`).
+fn gen_renames_local_types(prefix: &str) -> bool {
+    prefix.is_empty() && GEN_RENAME_TLS.with(|g| g.borrow().last().is_some_and(|f| f.local_kinds))
+}
+
+/// `f` with the rename taking only the kinds `part` takes.
+fn with_gen_part<R>(part: fn(DeclKind) -> bool, f: impl FnOnce() -> R) -> R {
+    let old = GEN_RENAME_TLS.with(|g| g.borrow().last().map(|t| t.part.replace(Some(part))));
+    let out = f();
+    if let Some(old) = old {
+        GEN_RENAME_TLS.with(|g| g.borrow().last().map(|t| t.part.set(old)));
+    }
+    out
+}
+
+/// A class body under the genvar substitution keeps its member selects
+/// as written (§8); the rename pass still folds them.
+fn gen_in_class() -> bool {
+    GEN_RENAME_TLS.with(|g| {
+        g.borrow()
+            .last()
+            .is_some_and(|f| f.class.get() && !f.genvar.is_empty())
+    })
+}
+
+/// `f` with the genvar map of the substitution in progress.
+fn with_genvar<R>(f: impl FnOnce(&HashMap<String, Expression>) -> R) -> R {
+    let none = HashMap::default();
+    GEN_RENAME_TLS.with(|g| f(g.borrow().last().map_or(&none, |t| &t.genvar)))
+}
+
+fn gen_expr(e: &Expression) -> Expression {
+    with_genvar(|m| rewrite_expr(e, "", m, &Default::default(), &HashMap::default()))
+}
+
+fn gen_stmt(s: &Statement) -> Statement {
+    with_genvar(|m| rewrite_stmt(s, "", m, &Default::default(), &HashMap::default()))
+}
+
+fn gen_type(t: &DataType) -> DataType {
+    with_genvar(|m| rewrite_data_type_genvar(t, m, &Default::default(), &HashMap::default()))
+}
+
+fn gen_dims(d: &[UnpackedDimension]) -> Vec<UnpackedDimension> {
+    with_genvar(|m| rewrite_unpacked_dims_genvar(d, m, &Default::default(), &HashMap::default()))
+}
+
+fn gen_constraint(c: &ConstraintItem) -> ConstraintItem {
+    with_genvar(|m| rewrite_constraint_item(c, "", m, &Default::default(), &HashMap::default()))
+}
+
+/// A declarator the rename in progress renames gets its key.
+fn gen_rename(decl: Bound, name: &mut String) {
+    if let Some(k) = gen_renamed(decl, name, |_| true) {
+        *name = k;
+    }
+}
+
+/// Rename the declarations of one generate block (or generate-for
+/// iteration) of scope `scope`, and every reference to them from inside the
+/// block, to `<scope>.<name>`. A function or task is a declaration of the
+/// block like its data (§23.9, §27.6): the declaration becomes `<scope>.f`,
+/// and a bare call to `f` from the block — a process, a continuous assign,
+/// another of the block's subroutines, a nested block, a `disable` — binds to
+/// the innermost enclosing block that declares `f`, else to the module's `f`
+/// (§23.8.1 Example 2). The elaborated module keeps one flat subroutine
+/// table, so without the rename the last block's `look` answered every
+/// block's calls, and a block's `t` was a false duplicate of the module's.
+/// Which references are the block's is the binding's decision.
+fn rename_decls_in_iter(items: &[ModuleItem], scope: &str) -> Vec<ModuleItem> {
+    let mut renamed = HashMap::default();
+    visit_renamed_decls(items, &mut |n, stamp, kind| {
+        debug_assert!(stamp.as_decl().is_some(), "an unbound declaration {n}");
+        if let Some(d) = stamp.as_decl() {
+            renamed.insert(d, (kind, n.to_string()));
+        }
+    });
+    if renamed.is_empty() {
         return items.to_vec();
     }
-    // Build rewrite map: original_name -> Ident(renamed)
-    let mut port_map: HashMap<String, Expression> = HashMap::default();
-    let rename_set: std::collections::HashSet<String> = names.iter().cloned().collect();
-    for n in &names {
-        let renamed = rename.apply(n);
-        let id = Identifier {
-            name: renamed.clone(),
-            span: Span { start: 0, end: 0 },
-        };
-        let hier = HierarchicalIdentifier {
-            root: None,
-            path: vec![HierPathSegment {
-                name: id,
-                selects: Vec::new(),
-            }],
-            span: Span { start: 0, end: 0 },
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
-        };
-        port_map.insert(
-            n.clone(),
-            Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }),
-        );
-    }
-    // §23.6/§27.6: an INSTANCE declared in a nested generate block keeps its
-    // bare name here (the instance path gets each scope later, innermost
-    // first), but an enclosing iteration already rewrote references to it to
-    // `<outer>[i].u`. Map those to `<outer>[i].<this>[j].u` as well, the way
-    // a renamed declaration composes; without it a relative `u.report()` or
-    // `u.n` two generate levels deep named a nonexistent `<outer>[i].u`.
-    {
-        let mut inst_names: HashSet<String> = HashSet::default();
-        collect_instance_names_in_items(items, &mut inst_names);
-        if !inst_names.is_empty() {
-            let mut heads: HashSet<String> = HashSet::default();
-            collect_scoped_instance_heads(items, &inst_names, &mut heads);
-            for h in heads {
-                if port_map.contains_key(&h) {
-                    continue;
-                }
-                let renamed = rename.apply(&h);
-                let hier = HierarchicalIdentifier {
-                    root: None,
-                    path: vec![HierPathSegment {
-                        name: Identifier {
-                            name: renamed,
-                            span: Span { start: 0, end: 0 },
-                        },
-                        selects: Vec::new(),
-                    }],
-                    span: Span { start: 0, end: 0 },
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                };
-                port_map.insert(
-                    h,
-                    Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }),
-                );
-            }
-        }
-    }
-    let local_names: std::collections::HashSet<String> = std::collections::HashSet::default();
-    let interface_map: HashMap<String, String> = HashMap::default();
-    items
-        .iter()
-        .map(|item| {
-            rename_item_decls(
-                item,
-                rename,
-                &rename_set,
-                &port_map,
-                &local_names,
-                &interface_map,
-            )
-        })
-        .collect()
+    let local_kinds = renamed.values().any(|(k, _)| local_type_takes(*k));
+    gen_walk(
+        items,
+        GenRename {
+            scope: scope.to_string(),
+            renamed,
+            local_kinds,
+            ..Default::default()
+        },
+    )
 }
 
-/// Every module-instance name declared in `items`, nested generate blocks
-/// included.
-fn collect_instance_names_in_items(items: &[ModuleItem], out: &mut HashSet<String>) {
-    for item in items {
-        match item {
-            ModuleItem::ModuleInstantiation(mi) => {
-                for hi in &mi.instances {
-                    out.insert(hi.name.name.clone());
-                }
-            }
-            ModuleItem::GenerateRegion(gr) => collect_instance_names_in_items(&gr.items, out),
-            ModuleItem::GenerateIf(gi) => {
-                for (_, branch) in &gi.branches {
-                    collect_instance_names_in_items(branch, out);
-                }
-            }
-            ModuleItem::GenerateCase(gc) => {
-                for arm in &gc.arms {
-                    collect_instance_names_in_items(&arm.items, out);
-                }
-            }
-            ModuleItem::GenerateFor(gf) => collect_instance_names_in_items(&gf.items, out),
-            _ => {}
-        }
-    }
+/// `items` through the one generate walker under `frame`.
+fn gen_walk(items: &[ModuleItem], frame: GenRename) -> Vec<ModuleItem> {
+    GEN_RENAME_TLS.with(|g| g.borrow_mut().push(frame));
+    let out = items.iter().map(rename_item_decls).collect();
+    GEN_RENAME_TLS.with(|g| g.borrow_mut().pop());
+    out
 }
 
-/// The scoped reference heads `<scope>.<inst>` (`<inst>` in `insts`) that
-/// the expressions of `items` use, nested generate blocks included.
-fn collect_scoped_instance_heads(
-    items: &[ModuleItem],
-    insts: &HashSet<String>,
-    out: &mut HashSet<String>,
-) {
-    fn heads_in(e: &Expression, insts: &HashSet<String>, out: &mut HashSet<String>) {
-        for_each_sub_expr(e, &mut |x: &Expression| {
-            if let ExprKind::Ident(h) = &x.kind {
-                if let Some(head) = h.path.first().map(|s| s.name.name.as_str()) {
-                    if let Some((scope, leaf)) = head.rsplit_once('.') {
-                        if !scope.is_empty() && insts.contains(leaf) {
-                            out.insert(head.to_string());
-                        }
-                    }
-                }
-            }
-        })
-    }
-    for item in items {
-        let mut visit = |e: &Expression| heads_in(e, insts, out);
-        match item {
-            ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut visit),
-            ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut visit),
-            ModuleItem::AssertionItem(a) => {
-                visit(&a.expr);
-                if let Some(s) = &a.action {
-                    for_each_stmt_expr(s, &mut visit);
-                }
-                if let Some(s) = &a.else_action {
-                    for_each_stmt_expr(s, &mut visit);
-                }
-            }
-            ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut visit),
-            ModuleItem::ContinuousAssign(ca) => {
-                for (l, r) in &ca.assignments {
-                    visit(l);
-                    visit(r);
-                }
-            }
-            ModuleItem::ModuleInstantiation(mi) => {
-                for hi in &mi.instances {
-                    for conn in &hi.connections {
-                        if let PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) = conn
-                        {
-                            visit(e);
-                        }
-                    }
-                }
-            }
-            ModuleItem::FunctionDeclaration(fd) => {
-                for st in &fd.items {
-                    for_each_stmt_expr(st, &mut visit);
-                }
-            }
-            ModuleItem::TaskDeclaration(td) => {
-                for st in &td.items {
-                    for_each_stmt_expr(st, &mut visit);
-                }
-            }
-            ModuleItem::GenerateRegion(gr) => collect_scoped_instance_heads(&gr.items, insts, out),
-            ModuleItem::GenerateIf(gi) => {
-                for (_, branch) in &gi.branches {
-                    collect_scoped_instance_heads(branch, insts, out);
-                }
-            }
-            ModuleItem::GenerateCase(gc) => {
-                for arm in &gc.arms {
-                    collect_scoped_instance_heads(&arm.items, insts, out);
-                }
-            }
-            ModuleItem::GenerateFor(gf) => collect_scoped_instance_heads(&gf.items, insts, out),
-            _ => {}
-        }
-    }
-}
-
-fn rename_item_decls(
-    item: &ModuleItem,
-    rename: &GenRename,
-    rename_set: &std::collections::HashSet<String>,
-    port_map: &HashMap<String, Expression>,
-    local_names: &std::collections::HashSet<String>,
-    interface_map: &HashMap<String, String>,
-) -> ModuleItem {
+fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
     match item {
+        ModuleItem::Bind(b) => {
+            let mut b = b.clone();
+            for path in std::iter::once(&mut b.target_path).chain(b.extra_paths.iter_mut()) {
+                for index in path.iter_mut().flat_map(|s| s.selects.iter_mut()) {
+                    *index = gen_expr(index);
+                }
+            }
+            ModuleItem::Bind(b)
+        }
         ModuleItem::DataDeclaration(dd) => {
             let mut new_dd = dd.clone();
             // The RANGE may reference a renamed sibling localparam
@@ -32929,28 +33961,17 @@ fn rename_item_decls(
             // data type's dimensions kept the bare name, which then
             // resolved to nothing and the width clamped to 1 bit — every
             // write past bit 0 silently dropped.
-            new_dd.data_type =
-                rewrite_data_type_genvar(&dd.data_type, port_map, local_names, interface_map);
+            new_dd.data_type = gen_type(&dd.data_type);
             for d in &mut new_dd.declarators {
-                if rename_set.contains(&d.name.name) {
-                    d.name.name = rename.apply(&d.name.name);
-                }
-                d.dimensions = rewrite_unpacked_dims_genvar(
-                    &d.dimensions,
-                    port_map,
-                    local_names,
-                    interface_map,
-                );
-                if let Some(init) = &d.init {
-                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                }
+                gen_rename(d.decl, &mut d.name.name);
+                d.dimensions = gen_dims(&d.dimensions);
+                d.init = d.init.as_ref().map(gen_expr);
             }
             ModuleItem::DataDeclaration(new_dd)
         }
         ModuleItem::NetDeclaration(nd) => {
             let mut new_nd = nd.clone();
-            new_nd.data_type =
-                rewrite_data_type_genvar(&nd.data_type, port_map, local_names, interface_map);
+            new_nd.data_type = gen_type(&nd.data_type);
             for d in [
                 &mut new_nd.delay,
                 &mut new_nd.delay_fall,
@@ -32959,45 +33980,37 @@ fn rename_item_decls(
             .into_iter()
             .flatten()
             {
-                *d = rewrite_expr(d, "", port_map, local_names, interface_map);
+                *d = gen_expr(d);
             }
             for d in &mut new_nd.declarators {
-                if rename_set.contains(&d.name.name) {
-                    d.name.name = rename.apply(&d.name.name);
-                }
-                d.dimensions = rewrite_unpacked_dims_genvar(
-                    &d.dimensions,
-                    port_map,
-                    local_names,
-                    interface_map,
-                );
-                if let Some(init) = &d.init {
-                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                }
+                gen_rename(d.decl, &mut d.name.name);
+                d.dimensions = gen_dims(&d.dimensions);
+                d.init = d.init.as_ref().map(gen_expr);
             }
             ModuleItem::NetDeclaration(new_nd)
         }
         ModuleItem::PortDeclaration(pd) => {
             let mut new_pd = pd.clone();
-            new_pd.data_type =
-                rewrite_data_type_genvar(&pd.data_type, port_map, local_names, interface_map);
+            new_pd.data_type = gen_type(&pd.data_type);
             for d in &mut new_pd.declarators {
-                if rename_set.contains(&d.name.name) {
-                    d.name.name = rename.apply(&d.name.name);
-                }
+                gen_rename(d.decl, &mut d.name.name);
             }
             ModuleItem::PortDeclaration(new_pd)
         }
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
             let mut new_pd = pd.clone();
-            if let ParameterKind::Data { assignments, .. } = &mut new_pd.kind {
+            if let ParameterKind::Data {
+                data_type,
+                assignments,
+            } = &mut new_pd.kind
+            {
+                // The type and dimensions may name a renamed sibling
+                // localparam, as a data declaration's may.
+                *data_type = gen_type(data_type);
                 for a in assignments {
-                    if rename_set.contains(&a.name.name) {
-                        a.name.name = rename.apply(&a.name.name);
-                    }
-                    if let Some(init) = &a.init {
-                        a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                    }
+                    gen_rename(a.decl, &mut a.name.name);
+                    a.dimensions = gen_dims(&a.dimensions);
+                    a.init = a.init.as_ref().map(gen_expr);
                 }
             }
             // Preserve original variant
@@ -33021,14 +34034,9 @@ fn rename_item_decls(
                         ParamConnection::Named { value, .. } => value,
                     };
                     match value {
-                        Some(ParamValue::Expr(e)) => {
-                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
-                        }
+                        Some(ParamValue::Expr(e)) => *e = gen_expr(e),
                         // A TYPE override's dimensions too (`.T(logic [W-1:0])`).
-                        Some(ParamValue::Type(dt)) => {
-                            *dt =
-                                rewrite_data_type_genvar(dt, port_map, local_names, interface_map);
-                        }
+                        Some(ParamValue::Type(dt)) => *dt = gen_type(dt),
                         None => {}
                     }
                 }
@@ -33041,9 +34049,7 @@ fn rename_item_decls(
                 for conn in &mut hi.connections {
                     match conn {
                         PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) => {
-                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
-                        }
+                        | PortConnection::Ordered(Some(e)) => *e = gen_expr(e),
                         _ => {}
                     }
                 }
@@ -33052,12 +34058,12 @@ fn rename_item_decls(
         }
         ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(AlwaysConstruct {
             kind: ac.kind,
-            stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
+            stmt: gen_stmt(&ac.stmt),
             span: ac.span,
             gen_scope: ac.gen_scope.clone(),
         }),
         ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
-            stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
+            stmt: gen_stmt(&ic.stmt),
             span: ic.span,
             gen_scope: ic.gen_scope.clone(),
         }),
@@ -33066,53 +34072,53 @@ fn rename_item_decls(
         // the item unchanged bound a shadowed counter to the parent module.
         ModuleItem::AssertionItem(a) => {
             let st = Statement::new(StatementKind::Assertion(a.clone()), a.span);
-            let rewritten = rewrite_stmt(&st, "", port_map, local_names, interface_map);
-            let StatementKind::Assertion(a) = rewritten.kind else {
+            let StatementKind::Assertion(a) = gen_stmt(&st).kind else {
                 unreachable!()
             };
             ModuleItem::AssertionItem(a)
         }
+        // §23.9 / §27.6: a block's function or task is renamed with its data
+        // (`g.f`); its return type and formals may read the block's
+        // parameters. Inside the body a formal or a local hides a same-named
+        // block declaration (§13.3, §13.4), by its binding. The function's
+        // own name in the body is its result variable (`f = ...`) or a
+        // recursive call, and both name the renamed function.
         ModuleItem::FunctionDeclaration(fd) => {
             let mut new_fd = fd.clone();
-            new_fd.items = fd
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
+            gen_rename(fd.decl, &mut new_fd.name.name.name);
+            new_fd.return_type = gen_type(&fd.return_type);
+            rename_subroutine_ports(&mut new_fd.ports);
+            new_fd.items = rename_subroutine_body(&fd.items, &fd.ports);
             ModuleItem::FunctionDeclaration(new_fd)
         }
         ModuleItem::TaskDeclaration(td) => {
             let mut new_td = td.clone();
-            new_td.items = td
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
+            gen_rename(td.decl, &mut new_td.name.name.name);
+            rename_subroutine_ports(&mut new_td.ports);
+            new_td.items = rename_subroutine_body(&td.items, &td.ports);
             ModuleItem::TaskDeclaration(new_td)
+        }
+        // §6.18: a block's typedef is the block's (`a.t`); its type reads the
+        // block's parameters and types.
+        ModuleItem::TypedefDeclaration(td) => {
+            let mut new_td = td.clone();
+            gen_rename(td.decl, &mut new_td.name.name);
+            new_td.data_type = gen_type(&td.data_type);
+            new_td.dimensions = gen_dims(&td.dimensions);
+            ModuleItem::TypedefDeclaration(new_td)
         }
         ModuleItem::ContinuousAssign(ca) => {
             let mut new_ca = ca.clone();
             new_ca.assignments = ca
                 .assignments
                 .iter()
-                .map(|(l, r)| {
-                    (
-                        rewrite_expr(l, "", port_map, local_names, interface_map),
-                        rewrite_expr(r, "", port_map, local_names, interface_map),
-                    )
-                })
+                .map(|(l, r)| (gen_expr(l), gen_expr(r)))
                 .collect();
             ModuleItem::ContinuousAssign(new_ca)
         }
         ModuleItem::GenerateRegion(gr) => {
             let mut new_gr = gr.clone();
-            new_gr.items = gr
-                .items
-                .iter()
-                .map(|i| {
-                    rename_item_decls(i, rename, rename_set, port_map, local_names, interface_map)
-                })
-                .collect();
+            new_gr.items = gr.items.iter().map(rename_item_decls).collect();
             ModuleItem::GenerateRegion(new_gr)
         }
         ModuleItem::GenerateIf(gi) => {
@@ -33121,23 +34127,11 @@ fn rename_item_decls(
                 .branches
                 .iter()
                 .map(|(cond, branch_items)| {
-                    let new_cond = cond
-                        .as_ref()
-                        .map(|c| rewrite_expr(c, "", port_map, local_names, interface_map));
-                    let new_items: Vec<ModuleItem> = branch_items
-                        .iter()
-                        .map(|i| {
-                            rename_item_decls(
-                                i,
-                                rename,
-                                rename_set,
-                                port_map,
-                                local_names,
-                                interface_map,
-                            )
-                        })
-                        .collect();
-                    (new_cond, new_items)
+                    let new_cond = cond.as_ref().map(gen_expr);
+                    (
+                        new_cond,
+                        branch_items.iter().map(rename_item_decls).collect(),
+                    )
                 })
                 .collect();
             ModuleItem::GenerateIf(new_gi)
@@ -33147,55 +34141,234 @@ fn rename_item_decls(
                 .arms
                 .iter()
                 .map(|arm| GenerateCaseArm {
-                    values: arm
-                        .values
-                        .iter()
-                        .map(|v| rewrite_expr(v, "", port_map, local_names, interface_map))
-                        .collect(),
-                    items: arm
-                        .items
-                        .iter()
-                        .map(|i| {
-                            rename_item_decls(
-                                i,
-                                rename,
-                                rename_set,
-                                port_map,
-                                local_names,
-                                interface_map,
-                            )
-                        })
-                        .collect(),
+                    values: arm.values.iter().map(gen_expr).collect(),
+                    items: arm.items.iter().map(rename_item_decls).collect(),
                     label: arm.label.clone(),
+                    direct: arm.direct,
                 })
                 .collect();
             ModuleItem::GenerateCase(GenerateCase {
-                selector: rewrite_expr(&gc.selector, "", port_map, local_names, interface_map),
+                selector: gen_expr(&gc.selector),
                 arms: new_arms,
+                implicit_name: gc.implicit_name.clone(),
                 span: gc.span,
             })
         }
         ModuleItem::GenerateFor(gf) => {
-            // Inner generate-for: rewrite expression refs but leave its body
-            // alone (its own iteration loop will handle further renaming).
+            // Inner generate-for: its own iteration loop renames further.
             let mut new_gf = gf.clone();
-            new_gf.init = gf
-                .init
-                .as_ref()
-                .map(|e| rewrite_expr(e, "", port_map, local_names, interface_map));
-            new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
-            new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
-            new_gf.items = gf
-                .items
-                .iter()
-                .map(|i| {
-                    rename_item_decls(i, rename, rename_set, port_map, local_names, interface_map)
-                })
-                .collect();
+            new_gf.init = gf.init.as_ref().map(gen_expr);
+            new_gf.cond = gen_expr(&gf.cond);
+            new_gf.incr = gen_expr(&gf.incr);
+            new_gf.items = gf.items.iter().map(rename_item_decls).collect();
             ModuleItem::GenerateFor(new_gf)
+        }
+        ModuleItem::FinalConstruct(_)
+        | ModuleItem::GateInstantiation(_)
+        | ModuleItem::PropertyDeclaration(_)
+        | ModuleItem::SequenceDeclaration(_)
+        | ModuleItem::LetDeclaration(_)
+        | ModuleItem::CovergroupDeclaration(_)
+        | ModuleItem::ClockingDeclaration(_)
+        | ModuleItem::ClassDeclaration(_)
+        | ModuleItem::OutOfClassConstraint { .. } => {
+            let mut out = rename_item_refs(item);
+            match &mut out {
+                ModuleItem::PropertyDeclaration(p) => gen_rename(p.decl, &mut p.name.name),
+                ModuleItem::SequenceDeclaration(p) => gen_rename(p.decl, &mut p.name.name),
+                _ => {}
+            }
+            out
         }
         other => other.clone(),
     }
+}
+
+/// §23.9: a final block (§9.2.3), gate (§28), property or sequence (§16),
+/// let (§11.13), covergroup (§19), clocking block (§14.3) or class (§8) in a
+/// generate block names the block's declarations by their renamed keys and
+/// the iteration's genvar by its value (§27.4).
+/// Formals keep their names by their bindings (§16.8). A class body gets the
+/// definition-relative key; the inliner adds the instance.
+fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
+    let mut out = item.clone();
+    match &mut out {
+        ModuleItem::FinalConstruct(fc) => fc.stmt = gen_stmt(&fc.stmt),
+        ModuleItem::GateInstantiation(g) => {
+            for d in [&mut g.delay, &mut g.delay_fall].into_iter().flatten() {
+                *d = gen_expr(d);
+            }
+            for t in g.instances.iter_mut().flat_map(|i| i.terminals.iter_mut()) {
+                *t = gen_expr(t);
+            }
+        }
+        ModuleItem::PropertyDeclaration(p) => {
+            p.items = p.items.iter().map(gen_stmt).collect();
+            p.body = p.body.as_ref().map(gen_expr);
+        }
+        ModuleItem::SequenceDeclaration(p) => {
+            p.items = p.items.iter().map(gen_stmt).collect();
+            p.body = p.body.as_ref().map(gen_expr);
+        }
+        ModuleItem::LetDeclaration(l) => {
+            if let PortList::Ansi(ps) = &mut l.ports {
+                for p in ps.iter_mut() {
+                    p.default = p.default.as_ref().map(gen_expr);
+                }
+            }
+            l.expr = gen_expr(&l.expr);
+        }
+        ModuleItem::CovergroupDeclaration(c) => rename_covergroup_refs(c),
+        ModuleItem::ClockingDeclaration(c) => {
+            // §14.3: the clocking event is an expression of the block.
+            if let Some(clk) = &mut c.clock_signal {
+                gen_rename(c.clock_bound, &mut clk.name);
+            }
+            for d in [&mut c.default_input_skew, &mut c.default_output_skew]
+                .into_iter()
+                .flatten()
+            {
+                *d = gen_expr(d);
+            }
+            for s in &mut c.signals {
+                for e in [&mut s.skew, &mut s.bound_to].into_iter().flatten() {
+                    *e = gen_expr(e);
+                }
+            }
+            c.items = c.items.iter().map(gen_stmt).collect();
+        }
+        ModuleItem::ClassDeclaration(c) => {
+            let in_class = |v| GEN_RENAME_TLS.with(|g| g.borrow().last().map(|t| t.class.set(v)));
+            in_class(true);
+            rename_class_refs(c);
+            in_class(false);
+        }
+        ModuleItem::OutOfClassConstraint { items, .. } => {
+            *items = with_gen_part(constraint_takes, || {
+                items.iter().map(gen_constraint).collect()
+            });
+        }
+        _ => {}
+    }
+    out
+}
+
+/// §19.3, §19.8.1: the formals and `item` (§19.5.1.1) hide outer names in
+/// the body, by their bindings.
+fn rename_covergroup_refs(c: &mut CovergroupDeclaration) {
+    rename_subroutine_ports(&mut c.ports);
+    rename_subroutine_ports(&mut c.sample_ports);
+    c.for_each_expr_mut(&mut |e| *e = gen_expr(e));
+    for it in &mut c.items {
+        if let CovergroupItem::Coverpoint(p) = it {
+            for b in &mut p.bins {
+                for e in [&mut b.with_filter, &mut b.iff_guard].into_iter().flatten() {
+                    *e = gen_expr(e);
+                }
+            }
+        }
+    }
+}
+
+/// §8.3: a class body sees the names around its declaration, after its own
+/// members and those of its bases, which the binding reports.
+fn rename_class_refs(c: &mut ClassDeclaration) {
+    let param = |p: &mut ParameterDeclaration| match &mut p.kind {
+        ParameterKind::Data {
+            data_type,
+            assignments,
+        } => {
+            *data_type = gen_type(data_type);
+            for a in assignments {
+                a.dimensions = gen_dims(&a.dimensions);
+                a.init = a.init.as_ref().map(gen_expr);
+            }
+        }
+        ParameterKind::Type { assignments } => {
+            for a in assignments {
+                a.init = a.init.as_ref().map(gen_type);
+            }
+        }
+    };
+    c.params.iter_mut().for_each(param);
+    if let Some(e) = &mut c.extends {
+        if e.scopes.is_empty() {
+            if let Some(key) = gen_renamed(e.bound, &e.name.name, |k| k == DeclKind::Typedef) {
+                e.name.name = key;
+            }
+        }
+        for a in &mut e.args {
+            match a {
+                ParamValue::Expr(x) => *x = gen_expr(x),
+                ParamValue::Type(t) => *t = gen_type(t),
+            }
+        }
+    }
+    for item in &mut c.items {
+        match item {
+            ClassItem::Property(p) => {
+                p.data_type = gen_type(&p.data_type);
+                for d in &mut p.declarators {
+                    d.dimensions = gen_dims(&d.dimensions);
+                    d.init = d.init.as_ref().map(gen_expr);
+                }
+            }
+            ClassItem::Method(m) => match &mut m.kind {
+                ClassMethodKind::Function(f)
+                | ClassMethodKind::PureVirtual(f)
+                | ClassMethodKind::Extern(f) => {
+                    f.return_type = gen_type(&f.return_type);
+                    rename_subroutine_ports(&mut f.ports);
+                    f.items = rename_subroutine_body(&f.items, &f.ports);
+                }
+                ClassMethodKind::Task(t) => {
+                    rename_subroutine_ports(&mut t.ports);
+                    t.items = rename_subroutine_body(&t.items, &t.ports);
+                }
+            },
+            ClassItem::Constraint(k) => {
+                k.items = with_gen_part(constraint_takes, || {
+                    k.items.iter().map(gen_constraint).collect()
+                });
+            }
+            ClassItem::Typedef(t) => {
+                t.data_type = gen_type(&t.data_type);
+                t.dimensions = gen_dims(&t.dimensions);
+            }
+            ClassItem::Parameter(p) => param(p),
+            ClassItem::Class(i) => rename_class_refs(i),
+            ClassItem::Covergroup(g) => rename_covergroup_refs(g),
+            ClassItem::Import(_) | ClassItem::Empty => {}
+        }
+    }
+}
+
+/// The formals of a generate block's subroutine, with their types,
+/// dimensions and defaults rewritten through the block's rename (§27.6).
+fn rename_subroutine_ports(ports: &mut [FunctionPort]) {
+    for p in ports {
+        p.data_type = gen_type(&p.data_type);
+        p.dimensions = gen_dims(&p.dimensions);
+        p.default = p.default.as_ref().map(gen_expr);
+    }
+}
+
+/// The body of a generate block's subroutine rewritten through the block's
+/// rename. The formals and the body's locals are no scopes
+/// (`upward_scope_rewrite`, §13.3, §13.4).
+fn rename_subroutine_body(
+    items: &[Statement],
+    ports: &[FunctionPort],
+) -> crate::ast::shared_vec::SharedVec<Statement> {
+    let mut own: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
+    own.extend(
+        stmt_list_declared_names(items)
+            .into_iter()
+            .map(str::to_string),
+    );
+    own.extend(stmt_list_typedef_names(items).map(str::to_string));
+    let _locals = push_stmt_locals(own);
+    items.iter().map(gen_stmt).collect::<Vec<_>>().into()
 }
 
 /// Genvar-substitute the expressions inside unpacked dimensions.
@@ -33303,6 +34476,38 @@ fn rewrite_unpacked_dims_scoped(
                 }),
                 span: *span,
             },
+            // `[N]` parses as an associative index until `N` is known not to be
+            // a type (`normalize_unpacked_dims`). A generate rename maps a
+            // sibling localparam or genvar, which cannot be a type, so bind the
+            // name now: later the bare `N` resolves to nothing.
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                span,
+            } if prefix.is_empty() => match dt.as_ref() {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty()
+                    && name.scopes.is_empty()
+                    && (port_map.contains_key(&name.name.name)
+                        || gen_renamed(name.bound, &name.name.name, |_| true).is_some()) =>
+                {
+                    let mut n = make_ident_expr(&name.name.name);
+                    if let ExprKind::Ident(h) = &mut n.kind {
+                        h.bound = name.bound;
+                    }
+                    UnpackedDimension::Expression {
+                        expr: Box::new(rewrite_expr(
+                            &n,
+                            prefix,
+                            port_map,
+                            local_names,
+                            interface_map,
+                        )),
+                        span: *span,
+                    }
+                }
+                _ => d.clone(),
+            },
             other => other.clone(),
         })
         .collect()
@@ -33338,21 +34543,43 @@ fn rewrite_data_type_scoped(
             dimensions,
             type_args,
             span,
-        } => DataType::TypeReference {
-            name: name.clone(),
-            dimensions: rewrite_packed_dims_scoped(
-                dimensions,
-                prefix,
-                port_map,
-                local_names,
-                interface_map,
-            ),
-            type_args: type_args
-                .iter()
-                .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map))
-                .collect(),
-            span: *span,
-        },
+        } => {
+            let mut name = name.clone();
+            if name.scopes.is_empty() {
+                let typedef = |k| k == crate::ast::binding::DeclKind::Typedef;
+                if let Some(key) = gen_renamed(name.bound, &name.name.name, typedef) {
+                    name.name.name = key;
+                }
+            }
+            DataType::TypeReference {
+                name,
+                dimensions: rewrite_packed_dims_scoped(
+                    dimensions,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                ),
+                type_args: type_args
+                    .iter()
+                    .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map))
+                    .collect(),
+                span: *span,
+            }
+        }
+        DataType::Enum(e) => {
+            let mut e = e.clone();
+            if let Some(b) = &e.base_type {
+                e.base_type = Some(Box::new(rewrite_data_type_scoped(
+                    b,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                )));
+            }
+            DataType::Enum(e)
+        }
         DataType::Implicit {
             signing,
             dimensions,
@@ -33416,292 +34643,32 @@ fn rewrite_data_type_scoped(
     }
 }
 
-fn substitute_in_module_item(
-    item: &ModuleItem,
-    port_map: &HashMap<String, Expression>,
-    local_names: &std::collections::HashSet<String>,
-    interface_map: &HashMap<String, String>,
-) -> ModuleItem {
-    match item {
-        ModuleItem::Bind(b) => {
-            let mut b = b.clone();
-            for path in std::iter::once(&mut b.target_path).chain(b.extra_paths.iter_mut()) {
-                for segment in path {
-                    for index in &mut segment.selects {
-                        *index = rewrite_expr(index, "", port_map, local_names, interface_map);
-                    }
-                }
-            }
-            ModuleItem::Bind(b)
-        }
-        // §27.4: each generated assertion and its actions see the
-        // iteration's implicit genvar localparam, like other processes.
-        ModuleItem::AssertionItem(a) => {
-            let stmt = crate::ast::stmt::Statement::new(
-                crate::ast::stmt::StatementKind::Assertion(a.clone()),
-                a.span,
-            );
-            let stmt = rewrite_stmt(&stmt, "", port_map, local_names, interface_map);
-            let crate::ast::stmt::StatementKind::Assertion(a) = stmt.kind else {
-                unreachable!()
-            };
-            ModuleItem::AssertionItem(a)
-        }
-        ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(AlwaysConstruct {
-            kind: ac.kind,
-            stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
-            span: ac.span,
-            gen_scope: ac.gen_scope.clone(),
-        }),
-        ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
-            stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
-            span: ic.span,
-            gen_scope: ic.gen_scope.clone(),
-        }),
-        ModuleItem::FunctionDeclaration(fd) => {
-            let mut new_fd = fd.clone();
-            new_fd.items = fd
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::FunctionDeclaration(new_fd)
-        }
-        ModuleItem::TaskDeclaration(td) => {
-            let mut new_td = td.clone();
-            new_td.items = td
-                .items
-                .iter()
-                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::TaskDeclaration(new_td)
-        }
-        // §9.2.3: a `final` inside a generate-for must see the genvar's
-        // per-iteration constant, like initial/always do.
-        ModuleItem::FinalConstruct(fc) => ModuleItem::FinalConstruct(FinalConstruct {
-            stmt: rewrite_stmt(&fc.stmt, "", port_map, local_names, interface_map),
-            span: fc.span,
-        }),
-        ModuleItem::ContinuousAssign(ca) => {
-            let mut new_ca = ca.clone();
-            new_ca.assignments = ca
-                .assignments
-                .iter()
-                .map(|(l, r)| {
-                    (
-                        rewrite_expr(l, "", port_map, local_names, interface_map),
-                        rewrite_expr(r, "", port_map, local_names, interface_map),
-                    )
-                })
-                .collect();
-            ModuleItem::ContinuousAssign(new_ca)
-        }
-        ModuleItem::ModuleInstantiation(inst) => {
-            let mut new_inst = inst.clone();
-            for hi in &mut new_inst.instances {
-                for conn in &mut hi.connections {
-                    match conn {
-                        PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) => {
-                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(params) = &mut new_inst.params {
-                for pc in params.iter_mut() {
-                    match pc {
-                        ParamConnection::Named {
-                            value: Some(ParamValue::Expr(e)),
-                            ..
-                        }
-                        | ParamConnection::Ordered(Some(ParamValue::Expr(e))) => {
-                            *e = rewrite_expr(e, "", port_map, local_names, interface_map);
-                        }
-                        // §27.4: a genvar in a TYPE override's dimensions
-                        // (`.T(logic [g*2-1:0])`) kept the bare ident, so
-                        // every iteration bound the same wrong width.
-                        ParamConnection::Named {
-                            value: Some(ParamValue::Type(dt)),
-                            ..
-                        }
-                        | ParamConnection::Ordered(Some(ParamValue::Type(dt))) => {
-                            *dt =
-                                rewrite_data_type_genvar(dt, port_map, local_names, interface_map);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            ModuleItem::ModuleInstantiation(new_inst)
-        }
-        ModuleItem::GenerateRegion(gr) => {
-            let mut new_gr = gr.clone();
-            new_gr.items = gr
-                .items
-                .iter()
-                .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::GenerateRegion(new_gr)
-        }
-        ModuleItem::GenerateIf(gi) => {
-            let mut new_gi = gi.clone();
-            new_gi.branches = gi
-                .branches
-                .iter()
-                .map(|(cond, branch_items)| {
-                    let new_cond = cond
-                        .as_ref()
-                        .map(|c| rewrite_expr(c, "", port_map, local_names, interface_map));
-                    let new_items: Vec<ModuleItem> = branch_items
-                        .iter()
-                        .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                        .collect();
-                    (new_cond, new_items)
-                })
-                .collect();
-            ModuleItem::GenerateIf(new_gi)
-        }
-        ModuleItem::GenerateCase(gc) => {
-            let new_arms: Vec<GenerateCaseArm> = gc
-                .arms
-                .iter()
-                .map(|arm| GenerateCaseArm {
-                    values: arm
-                        .values
-                        .iter()
-                        .map(|v| rewrite_expr(v, "", port_map, local_names, interface_map))
-                        .collect(),
-                    items: arm
-                        .items
-                        .iter()
-                        .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                        .collect(),
-                    label: arm.label.clone(),
-                })
-                .collect();
-            ModuleItem::GenerateCase(GenerateCase {
-                selector: rewrite_expr(&gc.selector, "", port_map, local_names, interface_map),
-                arms: new_arms,
-                span: gc.span,
-            })
-        }
-        ModuleItem::GenerateFor(gf) => {
-            let mut new_gf = gf.clone();
-            new_gf.init = gf
-                .init
-                .as_ref()
-                .map(|e| rewrite_expr(e, "", port_map, local_names, interface_map));
-            new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
-            new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
-            new_gf.items = gf
-                .items
-                .iter()
-                .map(|i| substitute_in_module_item(i, port_map, local_names, interface_map))
-                .collect();
-            ModuleItem::GenerateFor(new_gf)
-        }
-        // A localparam/parameter declared inside a generate-for can size or
-        // value itself from the genvar — e.g. rr_arb_tree's
-        // `localparam int Idx0 = 2**level-1+l;` per tree node. Without genvar
-        // substitution here the init keeps the bare `level`/`l` idents and
-        // every iteration's Idx0 collapses to X/0, so `assign vec[Idx0]` all
-        // target bit 0 and the arbiter never routes (floo_router forwarding
-        // loss). Substitute the init and dimension expressions.
-        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
-            let mut new_pd = pd.clone();
-            if let ParameterKind::Data {
-                data_type,
-                assignments,
-            } = &mut new_pd.kind
-            {
-                *data_type =
-                    rewrite_data_type_genvar(data_type, port_map, local_names, interface_map);
-                for a in assignments.iter_mut() {
-                    a.dimensions = rewrite_unpacked_dims_genvar(
-                        &a.dimensions,
-                        port_map,
-                        local_names,
-                        interface_map,
-                    );
-                    if let Some(init) = &a.init {
-                        a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                    }
-                }
-            }
-            match item {
-                ModuleItem::ParameterDeclaration(_) => ModuleItem::ParameterDeclaration(new_pd),
-                _ => ModuleItem::LocalparamDeclaration(new_pd),
-            }
-        }
-        // A variable/net declared inside a generate-for can size itself from
-        // the genvar (`logic [i*W-1:0] slice_i;`) or initialise from it. Same
-        // fall-through hazard as the parameter case above.
-        ModuleItem::DataDeclaration(dd) => {
-            let mut new_dd = dd.clone();
-            new_dd.data_type =
-                rewrite_data_type_genvar(&dd.data_type, port_map, local_names, interface_map);
-            for d in new_dd.declarators.iter_mut() {
-                d.dimensions = rewrite_unpacked_dims_genvar(
-                    &d.dimensions,
-                    port_map,
-                    local_names,
-                    interface_map,
-                );
-                if let Some(init) = &d.init {
-                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                }
-            }
-            ModuleItem::DataDeclaration(new_dd)
-        }
-        ModuleItem::NetDeclaration(nd) => {
-            let mut new_nd = nd.clone();
-            new_nd.data_type =
-                rewrite_data_type_genvar(&nd.data_type, port_map, local_names, interface_map);
-            for d in [
-                &mut new_nd.delay,
-                &mut new_nd.delay_fall,
-                &mut new_nd.delay_off,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                *d = rewrite_expr(d, "", port_map, local_names, interface_map);
-            }
-            for d in new_nd.declarators.iter_mut() {
-                d.dimensions = rewrite_unpacked_dims_genvar(
-                    &d.dimensions,
-                    port_map,
-                    local_names,
-                    interface_map,
-                );
-                if let Some(init) = &d.init {
-                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
-                }
-            }
-            ModuleItem::NetDeclaration(new_nd)
-        }
-        // Remaining module-level items don't carry genvar-dependent
-        // expressions; pass through unchanged.
-        other => other.clone(),
-    }
+/// §23.2.2.1: the parser names a non-ANSI null port (`(a, , b)`) and an
+/// unnamed port expression (`(a[1:0])`, `({a, b})`) with a placeholder that
+/// no source identifier can spell. Such a port has no name to connect by
+/// (`.*`, §23.3.2.4).
+pub fn is_unnamed_port_placeholder(name: &str) -> bool {
+    name.starts_with("__xz_null_port_") || name.starts_with("__xz_port_expr_")
 }
 
 /// Recursively inline all instantiations found in `source_mod`, using `prefix` for signal naming.
 /// Flatten module items by resolving generate-if/else and generate regions.
 /// Returns all effective items after evaluating generate conditions.
-/// §27.6: the implicit name of an unnamed generate block is `genblk<N>` where
-/// N is the construct's ordinal position among ALL generate constructs in its
-/// enclosing scope (named ones consume a number too). Prefix every instance
-/// name in a flattened generate block with its scope name so hierarchical
-/// paths match the LRM (`u_mod.genblk1.u_ff` — what other simulators report),
-/// composing naturally for nested blocks (inner blocks flatten first, so the
-/// outer prefix lands leftmost).
-fn gen_scope_name(label: Option<&String>, ordinal: u32) -> String {
+/// §27.6: a generate block's scope name, its label or the construct's implicit
+/// name from the scope tree. Prefix every instance name in a flattened generate
+/// block with it so hierarchical paths match the LRM (`u_mod.genblk1.u_ff` —
+/// what other simulators report), composing naturally for nested blocks (inner
+/// blocks flatten first, so the outer prefix lands leftmost).
+fn gen_scope_name(label: Option<&String>, implicit: &str) -> String {
     match label {
         Some(l) => l.clone(),
-        None => format!("genblk{}", ordinal),
+        None => {
+            debug_assert!(
+                !implicit.is_empty(),
+                "generate construct without a scope tree"
+            );
+            implicit.to_string()
+        }
     }
 }
 
@@ -33711,7 +34678,8 @@ fn gen_scope_name(label: Option<&String>, ordinal: u32) -> String {
 ///
 /// Also sets the `gen_scope` field on AlwaysConstruct and InitialConstruct
 /// so that %m reports the full hierarchical path including generate block names.
-fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
+/// `index` is a generate-for block's loop index, recorded on its instances.
+fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str, index: Option<i64>) {
     for item in items.iter_mut() {
         match item {
             ModuleItem::Bind(b) => {
@@ -33724,6 +34692,10 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &mut inst.instances {
                     hi.name.name = format!("{}.{}", scope, hi.name.name);
+                    // Inner blocks were expanded first.
+                    if let Some(i) = index {
+                        hi.gen_indices.insert(0, i);
+                    }
                 }
             }
             ModuleItem::GateInstantiation(g) => {
@@ -33816,7 +34788,7 @@ fn fold_class_param_arg(arg: &Expression, params: &HashMap<String, Value>) -> Ex
                     signed: false,
                     base: NumberBase::Decimal,
                     value: n.unsigned_abs().to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 arg.span,
             );
@@ -33841,14 +34813,6 @@ fn cat2(a: &str, b: &str) -> String {
     s.push_str(a);
     s.push_str(b);
     s
-}
-
-fn collect_effective_items(
-    items: &[ModuleItem],
-    params: &HashMap<String, Value>,
-) -> Vec<ModuleItem> {
-    let mut gen_ordinal = 0u32;
-    collect_effective_items_scoped(items, params, &mut gen_ordinal)
 }
 
 /// `collect_effective_items` for callers that only read the result: items
@@ -33885,16 +34849,15 @@ fn collect_effective_items_ref<'a>(
     fn walk<'a>(
         items: &'a [ModuleItem],
         params: &HashMap<String, Value>,
-        gen_ordinal: &mut u32,
         out: &mut Vec<std::borrow::Cow<'a, ModuleItem>>,
     ) {
         for item in items {
             match item {
-                ModuleItem::GenerateRegion(gr) => walk(&gr.items, params, gen_ordinal, out),
+                ModuleItem::GenerateRegion(gr) => walk(&gr.items, params, out),
                 ModuleItem::GenerateIf(_)
                 | ModuleItem::GenerateCase(_)
                 | ModuleItem::GenerateFor(_) => out.extend(
-                    collect_effective_items_scoped(std::slice::from_ref(item), params, gen_ordinal)
+                    collect_effective_items(std::slice::from_ref(item), params)
                         .into_iter()
                         .map(std::borrow::Cow::Owned),
                 ),
@@ -33902,9 +34865,8 @@ fn collect_effective_items_ref<'a>(
             }
         }
     }
-    let mut gen_ordinal = 0u32;
     let mut out = Vec::new();
-    walk(items, params, &mut gen_ordinal, &mut out);
+    walk(items, params, &mut out);
     out
 }
 
@@ -33923,25 +34885,18 @@ fn eval_generate_const(expr: &Expression, params: &HashMap<String, Value>) -> u6
     eval_const_expr(expr, params)
 }
 
-fn collect_effective_items_scoped(
+fn collect_effective_items(
     items: &[ModuleItem],
     params: &HashMap<String, Value>,
-    gen_ordinal: &mut u32,
 ) -> Vec<ModuleItem> {
     let mut result = Vec::new();
     for item in items {
         match item {
             ModuleItem::GenerateRegion(gr) => {
-                // A generate region is NOT a scope (§27.3) — its constructs
-                // number in the enclosing scope, so the counter is shared.
-                result.extend(collect_effective_items_scoped(
-                    &gr.items,
-                    params,
-                    gen_ordinal,
-                ));
+                // A generate region is NOT a scope (§27.3).
+                result.extend(collect_effective_items(&gr.items, params));
             }
             ModuleItem::GenerateIf(gi) => {
-                *gen_ordinal += 1;
                 let mut matched = false;
                 for (bi, (cond, branch_items)) in gi.branches.iter().enumerate() {
                     let take = match cond {
@@ -33949,27 +34904,20 @@ fn collect_effective_items_scoped(
                         None => true, // unconditional else branch
                     };
                     if take {
+                        // §27.5: a directly nested branch is not a scope.
+                        if gi.branch_direct.get(bi) == Some(&true) {
+                            result.extend(collect_effective_items(branch_items, params));
+                            break;
+                        }
                         // All branches of one if-chain share the construct's
                         // scope name unless the taken branch is labeled.
                         let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
-                        let scope = gen_scope_name(label, *gen_ordinal);
-                        // Labeled branch: scope the declarations themselves
-                        // (see elaborate_generate_if) so this expansion path
-                        // registers the same `g.x` keys as the direct path.
-                        let scoped_items;
-                        let branch_items = match label {
-                            Some(l) => {
-                                scoped_items =
-                                    rename_decls_in_iter(branch_items, &GenRename::Scope(l));
-                                &scoped_items
-                            }
-                            None => branch_items,
-                        };
-                        let mut inner = collect_effective_items(branch_items, params);
-                        if let Some(l) = label {
-                            alias_labelled_subroutines(&mut inner, l);
-                        }
-                        prefix_gen_scope(&mut inner, &scope);
+                        let scope = gen_scope_name(label, &gi.implicit_name);
+                        // The same `g.x` keys as the direct path
+                        // (see elaborate_generate_if).
+                        let scoped_items = rename_decls_in_iter(branch_items, &scope);
+                        let mut inner = collect_effective_items(&scoped_items, params);
+                        prefix_gen_scope(&mut inner, &scope, None);
                         result.extend(inner);
                         matched = true;
                         break;
@@ -33978,7 +34926,6 @@ fn collect_effective_items_scoped(
                 let _ = matched;
             }
             ModuleItem::GenerateCase(gc) => {
-                *gen_ordinal += 1;
                 let sel = eval_generate_const(&gc.selector, params);
                 let mut chosen: Option<&GenerateCaseArm> = None;
                 // First pass: try non-default arms.
@@ -33999,26 +34946,18 @@ fn collect_effective_items_scoped(
                 if chosen.is_none() {
                     chosen = gc.arms.iter().find(|arm| arm.values.is_empty());
                 }
-                if let Some(arm) = chosen {
-                    let scope = gen_scope_name(arm.label.as_ref(), *gen_ordinal);
-                    let scoped_items;
-                    let arm_items = match &arm.label {
-                        Some(l) => {
-                            scoped_items = rename_decls_in_iter(&arm.items, &GenRename::Scope(l));
-                            &scoped_items
-                        }
-                        None => &arm.items,
-                    };
-                    let mut inner = collect_effective_items(arm_items, params);
-                    if let Some(l) = &arm.label {
-                        alias_labelled_subroutines(&mut inner, l);
-                    }
-                    prefix_gen_scope(&mut inner, &scope);
+                // §27.5: a directly nested arm is not a scope.
+                if let Some(arm) = chosen.filter(|arm| arm.direct) {
+                    result.extend(collect_effective_items(&arm.items, params));
+                } else if let Some(arm) = chosen {
+                    let scope = gen_scope_name(arm.label.as_ref(), &gc.implicit_name);
+                    let arm_items = rename_decls_in_iter(&arm.items, &scope);
+                    let mut inner = collect_effective_items(&arm_items, params);
+                    prefix_gen_scope(&mut inner, &scope, None);
                     result.extend(inner);
                 }
             }
             ModuleItem::GenerateFor(gf) => {
-                *gen_ordinal += 1;
                 // Without this expansion, items inside `for genvar` (always
                 // blocks, instances, cont assigns) are dropped when the
                 // host module is inlined into its parent. ct_fifo's
@@ -34044,11 +34983,14 @@ fn collect_effective_items_scoped(
                     // iteration gets its own unique copy. Without this, two
                     // iterations both declare `valid_q` and the elaborator
                     // sees a flat duplicate.
-                    let scope =
-                        format!("{}[{}]", gen_scope_name(gf.name.as_ref(), *gen_ordinal), i);
-                    let subst = rename_decls_in_iter(&subst, &GenRename::Scope(&scope));
+                    let scope = format!(
+                        "{}[{}]",
+                        gen_scope_name(gf.name.as_ref(), &gf.implicit_name),
+                        i
+                    );
+                    let subst = rename_decls_in_iter(&subst, &scope);
                     let mut inner = collect_effective_items(&subst, &local_params);
-                    prefix_gen_scope(&mut inner, &scope);
+                    prefix_gen_scope(&mut inner, &scope, Some(i));
                     result.extend(inner);
                     match &gf.incr.kind {
                         ExprKind::Unary {
@@ -34482,7 +35424,7 @@ fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
                 signed: true,
                 base: crate::ast::expr::NumberBase::Hex,
                 value: format!("{:x}", n as u64),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         );
@@ -34493,7 +35435,7 @@ fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
             signed: false,
             base: crate::ast::expr::NumberBase::Decimal,
             value: n.to_string(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     )
@@ -34731,9 +35673,11 @@ fn ai_expand_instances(
                 let _ = write!(ident.name, "[{index}]");
             }
             out.push(HInst {
+                decl: hi.decl,
                 name: ident,
                 dimensions: vec![],
                 connections: new_conns,
+                gen_indices: hi.gen_indices.clone(),
                 span: hi.span,
             });
         }
@@ -34968,6 +35912,7 @@ enum BodySource {
 struct PreparedModuleItems {
     effective_items: Vec<ModuleItem>,
     body_sources: Vec<BodySource>,
+    has_subroutines: bool,
     local_typedefs: std::collections::HashSet<String>,
     interface_ports: std::collections::HashSet<String>,
     port_directions: HashMap<String, PortDirection>,
@@ -35162,7 +36107,77 @@ fn collect_body_driven_names(
     }
 }
 
-type InlinePrepCache = HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>;
+/// What the inlining of one design computes once and reuses for each
+/// instance.
+#[derive(Default)]
+struct InlineCache {
+    /// Prepared bodies (`prepare_module_items`).
+    prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
+    process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
+    callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
+    /// Per definition, the typedefs its imports bind, one list per import.
+    imports: HashMap<(String, usize), Rc<[ImportedTypedefs]>>,
+    /// Per package, the typedefs `import P::*` binds.
+    wildcards: HashMap<String, ImportedTypedefs>,
+}
+
+/// The typedefs an import binds, as (bare name, qualified key) in binding
+/// order.
+type ImportedTypedefs = Rc<[(String, String)]>;
+
+impl InlineCache {
+    #[cfg(test)]
+    fn len(&self) -> usize { self.prepared.len() }
+
+    /// §26.3: the typedefs the imports of `def` bind, in binding order. An
+    /// import of a package the design does not declare is an error, at that
+    /// import (the built-in `std` binds no typedefs).
+    fn imported_typedefs(
+        &mut self,
+        elab: &ElaboratedModule,
+        def: Definition,
+        definitions: &HashMap<String, Definition>,
+    ) -> Result<Rc<[ImportedTypedefs]>, String> {
+        let key = param_scope::def_key(&def);
+        if let Some(lists) = self.imports.get(&key) {
+            return Ok(Rc::clone(lists));
+        }
+        let mut lists = Vec::new();
+        for item in def.items() {
+            let ModuleItem::ImportDeclaration(imp) = item else {
+                continue;
+            };
+            for ii in &imp.items {
+                let pkg = &ii.package.name;
+                if !matches!(definitions.get(pkg), Some(Definition::Package(_))) {
+                    if pkg == "std" {
+                        continue;
+                    }
+                    let msg = format!("Package '{}' not found", pkg);
+                    return Err(format!(
+                        "{}{}",
+                        span_error_of(elab, ii.package.span, def.name(), &msg),
+                        ignored_library_package_note(pkg)
+                    ));
+                }
+                lists.push(match &ii.item {
+                    Some(sym) => Rc::from([(sym.name.clone(), format!("{pkg}::{}", sym.name))]),
+                    None => match self.wildcards.get(pkg) {
+                        Some(list) => Rc::clone(list),
+                        None => {
+                            let list = wildcard_typedefs(pkg, definitions);
+                            self.wildcards.insert(pkg.clone(), Rc::clone(&list));
+                            list
+                        }
+                    },
+                });
+            }
+        }
+        let lists: Rc<[ImportedTypedefs]> = lists.into();
+        self.imports.insert(key, Rc::clone(&lists));
+        Ok(lists)
+    }
+}
 
 /// `XEZIM_COMPILE_PHASES`: how the prepared-body cache is doing, printed as
 /// it goes (an `[elab-stats]` line at each power-of-two miss count and every
@@ -35196,27 +36211,46 @@ fn note_prep_lookup(hit: bool, key_len: usize) {
     });
 }
 
+/// The definition's type parameters as bound, for its prepared-body key;
+/// `None` when one has no recorded shape to tell its bindings apart.
+fn type_bindings(
+    def: Definition,
+    typedef_widths: &HashMap<String, u32>,
+) -> Option<Vec<param_scope::TypeBinding>> {
+    def.params_and_body_types()
+        .flat_map(|pd| match &pd.kind {
+            ParameterKind::Type { assignments } => assignments.as_slice(),
+            _ => &[],
+        })
+        .map(|a| {
+            let name = &a.name.name;
+            let shape = TYPEDEF_SHAPES_TLS.with(|c| {
+                let c = c.borrow();
+                match (c.0.get(name), c.1.get(name)) {
+                    (None, None) => None,
+                    shape => canonical::span_free(&shape),
+                }
+            })?;
+            Some((name.clone(), typedef_widths.get(name).copied(), shape))
+        })
+        .collect()
+}
+
 fn prepare_module_items(
     source_def: Definition,
     definitions: &HashMap<String, Definition>,
     local_params: &HashMap<String, Value>,
     typedef_widths: &HashMap<String, u32>,
-    cache: &mut InlinePrepCache,
+    cache: &mut InlineCache,
     param_scope: &param_scope::ParamScope,
 ) -> Rc<PreparedModuleItems> {
-    let (cache_key, key_bytes) = param_scope.prepared_key(source_def, definitions, local_params);
-    if let Some(prepared) = cache.get(&cache_key) {
+    let cache_key = type_bindings(source_def, typedef_widths)
+        .map(|types| param_scope.prepared_key(source_def, definitions, local_params, types));
+    if let Some(prepared) = cache_key.as_ref().and_then(|(k, _)| cache.prepared.get(k)) {
         note_prep_lookup(true, 0);
         return Rc::clone(prepared);
     }
-    note_prep_lookup(false, key_bytes);
-
-    let mut local_typedefs = std::collections::HashSet::default();
-    for item in source_def.items() {
-        if let ModuleItem::TypedefDeclaration(td) = item {
-            local_typedefs.insert(td.name.name.clone());
-        }
-    }
+    note_prep_lookup(false, cache_key.as_ref().map_or(0, |(_, bytes)| *bytes));
 
     let mut interface_ports = std::collections::HashSet::default();
     if let PortList::Ansi(ports) = source_def.ports() {
@@ -35230,6 +36264,14 @@ fn prepare_module_items(
     }
 
     let mut effective_items = collect_effective_items(source_def.items(), local_params);
+    // §6.18: a generate block's typedef is the module's under its block key.
+    let local_typedefs: std::collections::HashSet<String> = effective_items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::TypedefDeclaration(td) => Some(td.name.name.clone()),
+            _ => None,
+        })
+        .collect();
 
     // Bind this instance's parameters into statement-local declarations while
     // they are still resolvable by their bare names — after elaboration only
@@ -35495,8 +36537,29 @@ fn prepare_module_items(
         }
     }
 
+    let body_driven_ports = {
+        let mut driven = std::collections::HashSet::default();
+        collect_body_driven_names(&effective_items, definitions, &mut driven);
+        // Keep only PORT names — everything else is a local and irrelevant to
+        // the substitution decision.
+        driven.retain(|n| port_directions.contains_key(n));
+        driven
+    };
+
+    // Fill literals before extracting shared sources so pending processes
+    // reuse the cached values instead of parsing them in every instance.
+    prefill_literal_caches(&effective_items);
+
+    // §9.2.1/§9.2.2 (#721): pending processes own the shared source body.
+    // Run name/driver analysis and literal prefill before moving it out of
+    // the prepared item. Remaining consumers need only the wrapper's kind,
+    // span and generate scope; retaining its AST would duplicate every
+    // process once per prepared specialization for the whole inline pass.
+    let has_subroutines = effective_items.iter().any(|item| matches!(
+        item, ModuleItem::FunctionDeclaration(_) | ModuleItem::TaskDeclaration(_)
+    ));
     let body_sources: Vec<BodySource> = effective_items
-        .iter()
+        .iter_mut()
         .map(|item| {
             match item {
                 ModuleItem::ContinuousAssign(ca) => BodySource::ContAssign(
@@ -35521,13 +36584,20 @@ fn prepare_module_items(
                         })
                         .collect(),
                 ),
-                ModuleItem::AlwaysConstruct(ac) => BodySource::Always(
-                    ac.kind,
-                    std::rc::Rc::new(ac.stmt.clone()),
-                    ac.gen_scope.clone(),
-                ),
+                ModuleItem::AlwaysConstruct(ac) => {
+                    let placeholder = Statement::new(StatementKind::Null, ac.stmt.span);
+                    BodySource::Always(
+                        ac.kind,
+                        cache.process_bodies.intern(Rc::new(std::mem::replace(&mut ac.stmt, placeholder))),
+                        ac.gen_scope.clone(),
+                    )
+                }
                 ModuleItem::InitialConstruct(ic) => {
-                    BodySource::Initial(std::rc::Rc::new(ic.stmt.clone()), ic.gen_scope.clone())
+                    let placeholder = Statement::new(StatementKind::Null, ic.stmt.span);
+                    BodySource::Initial(
+                        cache.process_bodies.intern(Rc::new(std::mem::replace(&mut ic.stmt, placeholder))),
+                        ic.gen_scope.clone(),
+                    )
                 }
                 // §16.5: a concurrent assertion in an INLINED instance (sub-module
                 // or interface) travels like the top-level hoist — one synthetic
@@ -35545,29 +36615,19 @@ fn prepare_module_items(
         })
         .collect();
 
-    let body_driven_ports = {
-        let mut driven = std::collections::HashSet::default();
-        collect_body_driven_names(&effective_items, definitions, &mut driven);
-        // Keep only PORT names — everything else is a local and irrelevant to
-        // the substitution decision.
-        driven.retain(|n| port_directions.contains_key(n));
-        driven
-    };
-
-    // Every instance of this module gets a copy of these items, so parse
-    // their integer literals once, here, instead of once per instance.
-    prefill_literal_caches(&effective_items);
-
     let prepared = Rc::new(PreparedModuleItems {
         effective_items,
         body_sources,
+        has_subroutines,
         local_typedefs,
         interface_ports,
         port_directions,
         local_names: std::rc::Rc::new(local_names),
         body_driven_ports,
     });
-    cache.insert(cache_key, Rc::clone(&prepared));
+    if let Some((key, _)) = cache_key {
+        cache.prepared.insert(key, Rc::clone(&prepared));
+    }
     prepared
 }
 
@@ -36278,6 +37338,64 @@ fn scope_local_type_name(
     })
 }
 
+/// Retype every local declaration in a subroutine body (`T v;` in any
+/// nested block) for which `rename` returns a type.
+fn scope_local_decl_types(stmts: &mut [Statement], rename: &dyn Fn(&DataType) -> Option<DataType>) {
+    for s in stmts {
+        scope_local_decl_types_in(s, rename);
+    }
+}
+
+fn scope_local_decl_types_in(s: &mut Statement, rename: &dyn Fn(&DataType) -> Option<DataType>) {
+    match &mut s.kind {
+        StatementKind::VarDecl { data_type, .. } => {
+            if let Some(dt) = rename(data_type) {
+                *data_type = dt;
+            }
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            scope_local_decl_types(stmts, rename)
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            scope_local_decl_types_in(then_stmt, rename);
+            if let Some(e) = else_stmt {
+                scope_local_decl_types_in(e, rename);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                scope_local_decl_types_in(&mut it.stmt, rename);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => scope_local_decl_types_in(body, rename),
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            scope_local_decl_types_in(stmt, rename)
+        }
+        _ => {}
+    }
+}
+
+/// One typedef step of a BARE reference with no dimensions of its own:
+/// `w_t` gives `b_t [0:3]` for `typedef b_t [0:3] w_t;`. A reference that
+/// carries dims keeps them for the chained walk instead.
+fn bare_typedef_step(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> Option<DataType> {
+    match dt {
+        DataType::TypeReference {
+            name, dimensions, ..
+        } if dimensions.is_empty() => lookup_scoped_type(name, typedef_types).cloned(),
+        _ => None,
+    }
+}
+
 /// §6.18/§23.10: rename every bare `TypeReference` in `dt` that names one of
 /// `local_names` to its instance-scoped form `"<prefix><name>"`. A typedef
 /// stored under a scoped key still carried BARE member-type references, so a
@@ -36447,6 +37565,7 @@ fn register_modport_expressions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -36454,7 +37573,7 @@ fn inline_module_items(
     definitions: &HashMap<String, Definition>,
     interface_map: &mut HashMap<String, String>,
     local_params: &HashMap<String, Value>,
-    cache: &mut InlinePrepCache,
+    cache: &mut InlineCache,
     // §23.3.3: THIS instance's formal->actual substitution. The module's own
     // statements are rewritten through it (via `RewriteCtx`), so a nested
     // instantiation's connection ACTUALS must be too: without it
@@ -36477,7 +37596,8 @@ fn inline_module_items(
     // (`elaborate_module_with_defs`); the inlined-instance path never processed
     // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
     // took whichever package last hoisted that bare name.
-    rebind_imported_typedefs(elab, source_def.items(), definitions);
+    let imports = cache.imported_typedefs(elab, source_def, definitions)?;
+    rebind_imported_typedefs(elab, &imports);
     INLINE_CHAIN_TLS.with(|c| {
         c.borrow_mut()
             .push((prefix.to_string(), source_def.name().to_string()))
@@ -36491,6 +37611,19 @@ fn inline_module_items(
         }
     }
     let _chain_pop = ChainPop;
+    // §23.8: this definition's declared scopes, and the tree every upward
+    // name in its body is resolved against (`upward_scope_rewrite`).
+    install_upward_scopes(&elab.upward_scopes);
+    {
+        let mut scopes = elab.upward_scopes.borrow_mut();
+        scopes.declare(&source_def);
+        if prefix.is_empty() {
+            scopes
+                .defs
+                .insert(String::new(), source_def.name().to_string());
+            scopes.packages.extend(elab.packages.iter().cloned());
+        }
+    }
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
@@ -36641,7 +37774,7 @@ fn inline_module_items(
                                 sig_name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: sig_name,
+                                    name: sig_name.into(),
                                     width,
                                     is_signed: is_real,
                                     direction: None,
@@ -36674,7 +37807,7 @@ fn inline_module_items(
                                 sig_name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: sig_name,
+                                    name: sig_name.into(),
                                     width: 1,
                                     is_signed: false,
                                     direction: None,
@@ -36734,6 +37867,13 @@ fn inline_module_items(
                 let __th = iprof_now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                elab.upward_scopes.borrow_mut().add_parent(
+                    prefix.trim_end_matches('.'),
+                    inst_prefix.trim_end_matches('.'),
+                    source_def.name(),
+                    inst,
+                    hi,
+                );
                 // Bare-name keys this instance adds to the design-wide
                 // geometry tables while its body is processed (see the
                 // DataDeclaration arm below); removed again when the
@@ -36777,7 +37917,8 @@ fn inline_module_items(
                 // parent's walk, so rebinding at the recursive call would be too
                 // late — an unqualified `T [1:0] s;` in a module that imports
                 // `P::*` took whichever package last hoisted that bare name.
-                rebind_imported_typedefs(elab, sub_mod.items(), definitions);
+                let imports = cache.imported_typedefs(elab, sub_mod, definitions)?;
+                rebind_imported_typedefs(elab, &imports);
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -36800,7 +37941,7 @@ fn inline_module_items(
                         };
                     let sub_mod_declares: std::collections::HashSet<String> = {
                         let mut v = Vec::new();
-                        collect_decl_names_in_items(sub_mod.items(), &mut v);
+                        visit_renamed_decls(sub_mod.items(), &mut |n, _, _| v.push(n.to_string()));
                         // §6.20: a HEADER parameter (`#(parameter ...)`) is a
                         // constant, not a net: `leaf u (.a(VREF));` binds its
                         // value. The body items above cover body parameters
@@ -36878,7 +38019,7 @@ fn inline_module_items(
                             scoped.clone(),
                             Signal {
                                 is_const: false,
-                                name: scoped.clone(),
+                                name: scoped.clone().into(),
                                 width: 1,
                                 is_signed: false,
                                 direction: None,
@@ -37023,47 +38164,72 @@ fn inline_module_items(
                             }
                         }
                         if has_wildcard {
-                            if let PortList::Ansi(ports) = sub_mod.ports() {
-                                for port in ports {
-                                    let name = &port.name.name;
-                                    if explicit.contains(name)
-                                        || port_map.contains_key(name)
-                                        || sub_interface_map.contains_key(name)
-                                    {
-                                        continue;
-                                    }
-                                    // §23.3.2: the implicitly-connected actual is the
-                                    // same-named net IN THE PARENT SCOPE — which may
-                                    // itself be a PORT of the enclosing instance. Resolve
-                                    // it through that instance's formal->actual map, as an
-                                    // EXPLICIT connection already is. Binding straight to
-                                    // `prefix + name` ties the connection to the formal's
-                                    // own signal, so a driver reaching it from inside (a
-                                    // bound interface output driving an input port) never
-                                    // propagated to the real parent net and every reader
-                                    // of it read z. `rewrite_expr`'s fallback IS
-                                    // `prefix + name`, so the unmapped case is unchanged.
-                                    let parent_name = cat2(&prefix, &name);
-                                    let actual = rewrite_expr(
-                                        &make_ident_expr(name),
-                                        prefix,
-                                        parent_port_map,
-                                        parent_local_names,
-                                        interface_map,
+                            // §23.3.2.4 `.*` fills every port the connection list
+                            // does not name, ANSI or non-ANSI. A non-ANSI header
+                            // is only a name list (`module m(clk, rst); input clk;`);
+                            // the type lives in a later port declaration, so those
+                            // ports are connected as nets. Leaving the arm ANSI-only
+                            // dropped clk/rst/wr_en on `sfifo_fill`-style instances
+                            // and the unconnected inputs read Z.
+                            let wildcard_ports: Vec<(String, bool)> = match sub_mod.ports() {
+                                PortList::Ansi(ports) => ports
+                                    .iter()
+                                    .map(|port| {
+                                        let is_if_port = port
+                                            .data_type
+                                            .as_ref()
+                                            .map(|dt| is_interface_type(dt, definitions))
+                                            .unwrap_or(false);
+                                        (port.name.name.clone(), is_if_port)
+                                    })
+                                    .collect(),
+                                // §23.3.2.4: `.*` connects ports that have a
+                                // name. A null port (`(a, , b)`) and an unnamed
+                                // port expression (`(a[1:0])`, `({a, b})`) carry
+                                // the parser's placeholder names; they stay
+                                // unconnected, instead of binding to the
+                                // placeholder of a non-ANSI parent's own port
+                                // expression or to a name that exists nowhere.
+                                PortList::NonAnsi(names) => names
+                                    .iter()
+                                    .filter(|n| !is_unnamed_port_placeholder(&n.name))
+                                    .map(|n| (n.name.clone(), false))
+                                    .collect(),
+                                PortList::Empty => Vec::new(),
+                            };
+                            for (name, is_if_port) in wildcard_ports {
+                                if explicit.contains(&name)
+                                    || port_map.contains_key(&name)
+                                    || sub_interface_map.contains_key(&name)
+                                {
+                                    continue;
+                                }
+                                // §23.3.2: the implicitly-connected actual is the
+                                // same-named net IN THE PARENT SCOPE — which may
+                                // itself be a PORT of the enclosing instance. Resolve
+                                // it through that instance's formal->actual map, as an
+                                // EXPLICIT connection already is. Binding straight to
+                                // `prefix + name` ties the connection to the formal's
+                                // own signal, so a driver reaching it from inside (a
+                                // bound interface output driving an input port) never
+                                // propagated to the real parent net and every reader
+                                // of it read z. `rewrite_expr`'s fallback IS
+                                // `prefix + name`, so the unmapped case is unchanged.
+                                let parent_name = cat2(prefix, &name);
+                                let actual = rewrite_expr(
+                                    &make_ident_expr(&name),
+                                    prefix,
+                                    parent_port_map,
+                                    parent_local_names,
+                                    interface_map,
+                                );
+                                if is_if_port {
+                                    sub_interface_map.insert(
+                                        name,
+                                        whole_net_ident_name(&actual).unwrap_or(parent_name),
                                     );
-                                    let is_if_port = port
-                                        .data_type
-                                        .as_ref()
-                                        .map(|dt| is_interface_type(dt, definitions))
-                                        .unwrap_or(false);
-                                    if is_if_port {
-                                        sub_interface_map.insert(
-                                            name.clone(),
-                                            whole_net_ident_name(&actual).unwrap_or(parent_name),
-                                        );
-                                    } else {
-                                        port_map.insert(name.clone(), actual);
-                                    }
+                                } else {
+                                    port_map.insert(name, actual);
                                 }
                             }
                         }
@@ -37264,6 +38430,7 @@ fn inline_module_items(
                                     scopes,
                                     name: hier.path[hier.path.len() - 1].name.clone(),
                                     span: v.span,
+                                    bound: Default::default(),
                                 },
                                 dimensions: Vec::new(),
                                 type_args: Vec::new(),
@@ -37282,6 +38449,7 @@ fn inline_module_items(
                                 scopes,
                                 name: leaf,
                                 span: v.span,
+                                bound: Default::default(),
                             },
                             dimensions: Vec::new(),
                             type_args: Vec::new(),
@@ -37630,9 +38798,10 @@ fn inline_module_items(
                 // recursion into ITS sub-instances, so `.T(type_t)` chains
                 // resolve). Prior same-named entries saved for restore.
                 let mut saved_type_binds: Vec<(String, Option<u32>, Option<DataType>)> = Vec::new();
-                // Bare-key unpacked dimensions of this instance's local
-                // typedefs, restored with the type binds.
-                let mut saved_type_dims: Vec<(String, Option<Vec<UnpackedDimension>>)> = Vec::new();
+                // Bare `typedef_unpacked_dims` entries this instance's own
+                // typedefs shadow while it is inlined, restored after it.
+                let mut saved_unpacked_dims: Vec<(String, Option<Vec<UnpackedDimension>>)> =
+                    Vec::new();
                 // §20.7: the constant array queries (`localparam L = $left(T)`)
                 // read a type's full definition from TYPEDEF_SHAPES_TLS, where
                 // an instance's type parameters never went: they answered
@@ -38437,7 +39606,7 @@ fn inline_module_items(
                                                         sname.clone(),
                                                         Signal {
                                                             is_const: true,
-                                                            name: sname,
+                                                            name: sname.into(),
                                                             width: elem_w,
                                                             is_signed: is_type_signed(data_type),
                                                             is_real: false,
@@ -38987,7 +40156,7 @@ fn inline_module_items(
                         full_name.clone(),
                         Signal {
                             is_const: false,
-                            name: full_name,
+                            name: full_name.into(),
                             width: val.width,
                             is_signed: val.is_signed,
                             is_real: val.is_real,
@@ -39003,7 +40172,7 @@ fn inline_module_items(
                 // parent clone when local_params is empty (top-level case).
                 // §6.18/§23.10: this sub-module's own typedef names — used to
                 // rename type references to their instance-scoped keys.
-                let sub_typedef_names_all: std::collections::HashSet<String> = prepared_sub
+                let mut sub_typedef_names_all: std::collections::HashSet<String> = prepared_sub
                     .effective_items
                     .iter()
                     .filter_map(|it| match it {
@@ -39012,6 +40181,12 @@ fn inline_module_items(
                         _ => None,
                     })
                     .collect();
+                for parameter in sub_mod.params_and_body_types() {
+                    if let ParameterKind::Type { assignments } = &parameter.kind {
+                        sub_typedef_names_all
+                            .extend(assignments.iter().map(|a| a.name.name.clone()));
+                    }
+                }
                 record_param_decl_types(
                     elab,
                     sub_mod
@@ -39293,14 +40468,11 @@ fn inline_module_items(
                                         resolve_typedef_chain(dt, &elab.typedef_types).clone();
                                     if let DataType::Struct(su) = &member_dt {
                                         for m in &su.members {
-                                            let ew = packed_inner_elem_width(
+                                            let (ew, fd) = packed_member_meta(
                                                 &m.data_type,
                                                 &sub_merged_params,
                                                 &elab.typedefs,
-                                            );
-                                            let fd = packed_full_dims_of(
-                                                &m.data_type,
-                                                &sub_merged_params,
+                                                &elab.typedef_types,
                                             );
                                             for mdecl in &m.declarators {
                                                 let key =
@@ -39435,7 +40607,7 @@ fn inline_module_items(
                                     sig_name.clone(),
                                     Signal {
                                         is_const: false,
-                                        name: sig_name.clone(),
+                                        name: sig_name.clone().into(),
                                         width,
                                         is_signed: port
                                             .data_type
@@ -39479,145 +40651,8 @@ fn inline_module_items(
                             }
                         }
                     }
-                    PortList::NonAnsi(_names) => {
-                        for sub_item in &prepared_sub.effective_items {
-                            if let ModuleItem::PortDeclaration(pd) = sub_item {
-                                if is_interface_type(&pd.data_type, definitions) {
-                                    continue;
-                                }
-                                let width = resolve_type_width(
-                                    &pd.data_type,
-                                    Some(&sub_local_params),
-                                    Some(&elab.typedefs),
-                                );
-                                let is_signed = is_type_signed(&pd.data_type);
-                                for decl in &pd.declarators {
-                                    let sig_name = cat2(&inst_prefix, &decl.name.name);
-                                    let dims = if decl.dimensions.is_empty() {
-                                        match &pd.data_type {
-                                            DataType::TypeReference { name, .. } => {
-                                                lookup_scoped_type(
-                                                    name,
-                                                    &elab.typedef_unpacked_dims,
-                                                )
-                                                .cloned()
-                                                .unwrap_or_default()
-                                            }
-                                            _ => Vec::new(),
-                                        }
-                                    } else {
-                                        decl.dimensions.clone()
-                                    };
-                                    let dims = normalize_unpacked_dims(
-                                        &dims,
-                                        &sub_local_params,
-                                        &elab.typedef_types,
-                                    );
-                                    if let Some(shape) =
-                                        fixed_unpacked_shape(&dims, &sub_local_params)
-                                            .filter(|d| !d.is_empty())
-                                    {
-                                        register_fixed_unpacked_array(
-                                            elab,
-                                            &sig_name,
-                                            &shape,
-                                            width,
-                                            is_type_two_state_resolved(
-                                                &pd.data_type,
-                                                &elab.typedef_types,
-                                            ),
-                                        );
-                                        if let Some(declared) =
-                                            declared_unpacked_dims(&dims, &sub_local_params)
-                                        {
-                                            if declared.first().is_some_and(|(l, r)| l > r) {
-                                                elab.descending_arrays.insert(sig_name.clone());
-                                            }
-                                            elab.unpacked_decl_dims
-                                                .insert(sig_name.clone(), declared);
-                                        }
-                                        elab.var_decl_types
-                                            .insert(sig_name.clone(), scope_local_typerefs(&pd.data_type, &sub_typedef_names_all, &inst_prefix));
-                                    }
-                                    // §7.4.1: a non-ANSI PORT of a packed
-                                    // multi-D / packed-struct type needs the
-                                    // same shape registrations a variable
-                                    // declaration gets. Without them
-                                    // `assign o[1] = v;` on a
-                                    // `output logic [3:0][9:0] o;` inlined
-                                    // port degraded to a bit-window write, and
-                                    // struct-port member assigns lost the
-                                    // layout.
-                                    if let Some(ew) = packed_inner_elem_width(
-                                        &pd.data_type,
-                                        &sub_local_params,
-                                        &elab.typedefs,
-                                    ) {
-                                        elab.packed_signal_elem_widths
-                                            .entry(sig_name.clone())
-                                            .or_insert(ew);
-                                    }
-                                    if let Some(fd) =
-                                        packed_full_dims_of(&pd.data_type, &sub_local_params)
-                                    {
-                                        elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
-                                    }
-                                    if let Some(fields) = packed_struct_field_layout(
-                                        &pd.data_type,
-                                        &sub_local_params,
-                                        &elab.typedefs,
-                                        &elab.typedef_types,
-                                    ) {
-                                        if !fields.is_empty() {
-                                            tls_register_struct_layout(&sig_name, &fields);
-                                            elab.packed_struct_fields
-                                                .entry(sig_name.clone())
-                                                .or_insert(fields);
-                                        }
-                                    }
-                                    // §6.6.7: resolve REALNESS through the
-                                    // typedef table — a nettype port formal
-                                    // (`inout rnet p`, rnet = `nettype real`)
-                                    // is a real signal. The bare is_type_real
-                                    // left it integral, so `%f` on the formal
-                                    // printed raw bits and any true real
-                                    // consumer read 0.0 (reads only worked
-                                    // when both sides were bit-identical).
-                                    let port_is_real =
-                                        is_type_real_resolved(&pd.data_type, &elab.typedef_types);
-                                    signals_insert_traced(
-                                        &mut elab.signals,
-                                        line!(),
-                                        sig_name.clone(),
-                                        Signal {
-                                            is_const: false,
-                                            name: sig_name.clone(),
-                                            width,
-                                            is_signed,
-                                            direction: Some(pd.direction),
-                                            value: default_port_value(
-                                                Some(pd.direction),
-                                                Some(&pd.data_type),
-                                                width,
-                                                port_is_real,
-                                                port_decl_net_type(pd),
-                                            ),
-                                            is_real: port_is_real,
-                                            type_name: scope_local_type_name(
-                                                get_type_name(&pd.data_type),
-                                                &sub_typedef_names_all,
-                                                &inst_prefix,
-                                            ),
-                                        },
-                                    );
-                                    if let Some(net_type) = port_decl_net_type(pd) {
-                                        register_net_type(elab, &sig_name, net_type);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    PortList::Empty => {}
+                    // Non-ANSI: registered after the local typedefs, below.
+                    PortList::NonAnsi(_) | PortList::Empty => {}
                 }
 
                 iprof_since("ck3_after_hdrparams", __th);
@@ -39688,7 +40723,7 @@ fn inline_module_items(
                                         member.name.name.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: member.name.name.clone(),
+                                            name: member.name.name.clone().into(),
                                             width: base_width,
                                             is_signed: false,
                                             direction: None,
@@ -39722,7 +40757,7 @@ fn inline_module_items(
                                     sc.clone(),
                                     Signal {
                                         is_const: false,
-                                        name: sc,
+                                        name: sc.into(),
                                         width: base_width,
                                         is_signed: false,
                                         direction: None,
@@ -39867,45 +40902,233 @@ fn inline_module_items(
                                         &inst_prefix,
                                     )
                                 });
-                        }
-                        // §6.18/§7.4: the typedef's UNPACKED dimensions
-                        // (`typedef int arr_t [0:2];`), as `process_typedef`
-                        // records them for a top-level or $unit typedef — an
-                        // alias of a dimensioned typedef carries the base's
-                        // dimensions after its own. Only the width and type
-                        // were recorded here, so `arr_t v;` in a child module
-                        // (a variable, a block local, a function return)
-                        // became a 32-bit scalar. Bare key for this
-                        // instance's inlining (restored below), scoped key
-                        // for the prefixed names in the inlined body.
-                        let base_dims = match &td.data_type {
-                            DataType::TypeReference {
+                            // §6.18/§7.4: its UNPACKED dimensions under the
+                            // instance-scoped key as well, which is what this
+                            // instance's subroutine signatures name. Missing,
+                            // a function returning `typedef u8_t u8a_t [0:7]`
+                            // returned one element and `f = mk(v)` read x.
+                            let scoped = cat2(&inst_prefix, &td.name.name);
+                            let mut udims = td.dimensions.clone();
+                            if let DataType::TypeReference {
                                 name, dimensions, ..
-                            } if dimensions.is_empty() && name.qualified() != td.name.name => {
-                                lookup_scoped_type(name, &elab.typedef_unpacked_dims).cloned()
+                            } = &td.data_type
+                                && dimensions.is_empty()
+                            {
+                                let base = name
+                                    .scopes
+                                    .is_empty()
+                                    .then(|| {
+                                        elab.typedef_unpacked_dims
+                                            .get(&cat2(&inst_prefix, &name.name.name))
+                                    })
+                                    .flatten()
+                                    .or_else(|| {
+                                        lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                    });
+                                if let Some(bd) = base {
+                                    udims.extend(bd.iter().cloned());
+                                }
                             }
-                            _ => None,
-                        };
-                        let dims = match base_dims {
-                            Some(bd) => {
-                                let mut d = td.dimensions.clone();
-                                d.extend(bd);
-                                Some(d)
-                            }
-                            None => (!td.dimensions.is_empty()).then(|| td.dimensions.clone()),
-                        };
-                        saved_type_dims.push((
-                            td.name.name.clone(),
-                            elab.typedef_unpacked_dims.get(&td.name.name).cloned(),
-                        ));
-                        match dims {
-                            Some(d) => {
-                                elab.typedef_unpacked_dims
-                                    .insert(cat2(&inst_prefix, &td.name.name), d.clone());
-                                elab.typedef_unpacked_dims.insert(td.name.name.clone(), d);
-                            }
-                            None => {
+                            // The BARE key holds them for the duration of the
+                            // inlining too, like the width and type slots
+                            // above: the body's declarations (`u8a_t g;`) look
+                            // the bare name up, and another module's same-named
+                            // typedef must not shape them.
+                            saved_unpacked_dims.push((
+                                td.name.name.clone(),
+                                elab.typedef_unpacked_dims.get(&td.name.name).cloned(),
+                            ));
+                            if udims.is_empty() {
                                 elab.typedef_unpacked_dims.remove(&td.name.name);
+                            } else {
+                                elab.typedef_unpacked_dims
+                                    .insert(td.name.name.clone(), udims.clone());
+                                elab.typedef_unpacked_dims.insert(scoped, udims);
+                            }
+                        }
+                    }
+                }
+                // §23.2.2.1/§6.18: a non-ANSI port declaration lives in the
+                // BODY, so it may name a typedef declared there (`typedef
+                // logic [7:0] u8_t; output u8_t [0:7] o;`). Register the
+                // ports after this instance's typedefs (loop B above): sized
+                // before them, the local type fell back to 32 bits per element.
+                if let PortList::NonAnsi(_) = sub_mod.ports() {
+                    for sub_item in &prepared_sub.effective_items {
+                        if let ModuleItem::PortDeclaration(pd) = sub_item {
+                            if is_interface_type(&pd.data_type, definitions) {
+                                continue;
+                            }
+                            let width = resolve_type_width(
+                                &pd.data_type,
+                                Some(&sub_local_params),
+                                Some(&elab.typedefs),
+                            );
+                            let is_signed = is_type_signed(&pd.data_type);
+                            for decl in &pd.declarators {
+                                let sig_name = cat2(&inst_prefix, &decl.name.name);
+                                let dims = if decl.dimensions.is_empty() {
+                                    match &pd.data_type {
+                                        DataType::TypeReference { name, .. } => {
+                                            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                                .cloned()
+                                                .unwrap_or_default()
+                                        }
+                                        _ => Vec::new(),
+                                    }
+                                } else {
+                                    decl.dimensions.clone()
+                                };
+                                let dims = normalize_unpacked_dims(
+                                    &dims,
+                                    &sub_local_params,
+                                    &elab.typedef_types,
+                                );
+                                if let Some(shape) = fixed_unpacked_shape(&dims, &sub_local_params)
+                                    .filter(|d| !d.is_empty())
+                                {
+                                    register_fixed_unpacked_array(
+                                        elab,
+                                        &sig_name,
+                                        &shape,
+                                        width,
+                                        is_type_two_state_resolved(
+                                            &pd.data_type,
+                                            &elab.typedef_types,
+                                        ),
+                                    );
+                                    if let Some(declared) =
+                                        declared_unpacked_dims(&dims, &sub_local_params)
+                                    {
+                                        if declared.first().is_some_and(|(l, r)| l > r) {
+                                            elab.descending_arrays.insert(sig_name.clone());
+                                        }
+                                        elab.unpacked_decl_dims.insert(sig_name.clone(), declared);
+                                    }
+                                    elab.var_decl_types.insert(
+                                        sig_name.clone(),
+                                        scope_local_typerefs(
+                                            &pd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        ),
+                                    );
+                                }
+                                // §7.4.1: a non-ANSI PORT of a packed
+                                // multi-D / packed-struct type needs the
+                                // same shape registrations a variable
+                                // declaration gets. Without them
+                                // `assign o[1] = v;` on a
+                                // `output logic [3:0][9:0] o;` inlined
+                                // port degraded to a bit-window write, and
+                                // struct-port member assigns lost the
+                                // layout.
+                                if let Some(ew) = packed_inner_elem_width(
+                                    &pd.data_type,
+                                    &sub_local_params,
+                                    &elab.typedefs,
+                                )
+                                .or_else(|| {
+                                    // Dims on the TYPEDEF (`output w_t o;`).
+                                    let one =
+                                        bare_typedef_step(&pd.data_type, &elab.typedef_types)?;
+                                    packed_inner_elem_width(&one, &sub_local_params, &elab.typedefs)
+                                }) {
+                                    elab.packed_signal_elem_widths
+                                        .entry(sig_name.clone())
+                                        .or_insert(ew);
+                                }
+                                // §7.4.1: a TYPEDEF'd element with
+                                // declared dims (`output u8_t [0:7] o;`)
+                                // chains them with the typedef's, as the
+                                // ANSI arm does; unrecorded, ascending
+                                // `[0:7]` fell back to [7:0] order.
+                                if let Some(fd) =
+                                    packed_full_dims_of(&pd.data_type, &sub_local_params).or_else(
+                                        || {
+                                            packed_full_dims_chained(
+                                                &pd.data_type,
+                                                &sub_local_params,
+                                                &elab.typedef_types,
+                                            )
+                                        },
+                                    )
+                                {
+                                    elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
+                                }
+                                if let Some(fields) = packed_struct_field_layout(
+                                    &pd.data_type,
+                                    &sub_local_params,
+                                    &elab.typedefs,
+                                    &elab.typedef_types,
+                                ) {
+                                    if !fields.is_empty() {
+                                        // §7.4.1: a packed ARRAY of the struct
+                                        // (`output s_t [0:3] o;`), as the ANSI
+                                        // arm records it.
+                                        let struct_w =
+                                            fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                        if let Some(fd) = packed_typedef_array_dims(
+                                            &pd.data_type,
+                                            struct_w,
+                                            &sub_local_params,
+                                        ) {
+                                            elab.packed_full_dims
+                                                .entry(sig_name.clone())
+                                                .or_insert(fd);
+                                        }
+                                        tls_register_struct_layout(&sig_name, &fields);
+                                        elab.packed_struct_fields
+                                            .entry(sig_name.clone())
+                                            .or_insert(fields);
+                                        // §7.2, §7.4.1: its members' shapes,
+                                        // as the top-level port arm records.
+                                        register_member_packed_meta(
+                                            elab,
+                                            &sig_name,
+                                            &pd.data_type,
+                                            Some(&sub_local_params),
+                                        );
+                                    }
+                                }
+                                // §6.6.7: resolve REALNESS through the
+                                // typedef table — a nettype port formal
+                                // (`inout rnet p`, rnet = `nettype real`)
+                                // is a real signal. The bare is_type_real
+                                // left it integral, so `%f` on the formal
+                                // printed raw bits and any true real
+                                // consumer read 0.0 (reads only worked
+                                // when both sides were bit-identical).
+                                let port_is_real =
+                                    is_type_real_resolved(&pd.data_type, &elab.typedef_types);
+                                signals_insert_traced(
+                                    &mut elab.signals,
+                                    line!(),
+                                    sig_name.clone(),
+                                    Signal {
+                                        is_const: false,
+                                        name: sig_name.clone().into(),
+                                        width,
+                                        is_signed,
+                                        direction: Some(pd.direction),
+                                        value: default_port_value(
+                                            Some(pd.direction),
+                                            Some(&pd.data_type),
+                                            width,
+                                            port_is_real,
+                                            port_decl_net_type(pd),
+                                        ),
+                                        is_real: port_is_real,
+                                        type_name: scope_local_type_name(
+                                            get_type_name(&pd.data_type),
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        ),
+                                    },
+                                );
+                                if let Some(net_type) = port_decl_net_type(pd) {
+                                    register_net_type(elab, &sig_name, net_type);
+                                }
                             }
                         }
                     }
@@ -40045,7 +41268,7 @@ fn inline_module_items(
                                     sig_name.clone(),
                                     Signal {
                                         is_const: false,
-                                        name: sig_name,
+                                        name: sig_name.into(),
                                         width,
                                         is_signed: is_type_signed(&nd.data_type),
                                         // Resolved through the typedef table so a
@@ -40134,7 +41357,7 @@ fn inline_module_items(
                                         scoped.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: scoped,
+                                            name: scoped.into(),
                                             width: base_width,
                                             is_signed: false,
                                             is_real: false,
@@ -40293,14 +41516,11 @@ fn inline_module_items(
                                                     .clone();
                                                     if let DataType::Struct(su) = &mdt {
                                                         for m in &su.members {
-                                                            let ew = packed_inner_elem_width(
+                                                            let (ew, fd) = packed_member_meta(
                                                                 &m.data_type,
                                                                 &sub_merged_params,
                                                                 &elab.typedefs,
-                                                            );
-                                                            let fd = packed_full_dims_of(
-                                                                &m.data_type,
-                                                                &sub_merged_params,
+                                                                &elab.typedef_types,
                                                             );
                                                             for mdecl in &m.declarators {
                                                                 for base in [&bare, &scoped] {
@@ -41045,7 +42265,7 @@ fn inline_module_items(
                                         sig_name.clone(),
                                         Signal {
                                             is_const: dd.const_kw,
-                                            name: sig_name,
+                                            name: sig_name.into(),
                                             width,
                                             is_signed,
                                             direction: None,
@@ -41287,7 +42507,7 @@ fn inline_module_items(
                                                     signed: false,
                                                     base: crate::ast::expr::NumberBase::Binary,
                                                     value: "z".to_string(),
-                                                    cached_val: std::cell::Cell::new(None),
+                                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                                 },
                                             ),
                                             span,
@@ -41559,10 +42779,18 @@ fn inline_module_items(
                         prepared_sub.port_directions.get(pname.as_str()),
                         Some(PortDirection::Input)
                     ) {
-                        elab.input_port_actuals.push((
-                            inst_prefix.trim_end_matches('.').to_string(),
-                            actual.clone(),
-                        ));
+                        // §6.8: the formal starts at its own initial value,
+                        // 0 for a 2-state type and z for a 4-state one
+                        // (`default_port_value`); a scalar ANSI port is not
+                        // in `two_state_signals`.
+                        let formal = cat2(&inst_prefix, pname);
+                        let two_state = elab.two_state_signals.contains(&formal)
+                            || elab
+                                .signals
+                                .get(&formal)
+                                .is_some_and(|s| !s.is_real && !s.value.has_xz());
+                        elab.input_port_actuals
+                            .push((formal, actual.clone(), two_state));
                     }
                 }
 
@@ -41687,6 +42915,21 @@ fn inline_module_items(
                 // survive inlining. Bake class-valued type parameters into
                 // expression receivers as well as declaration data types.
                 for (name, dt) in &pend_type_binds {
+                    // §6.20.3: variables declared with a module type parameter
+                    // need its binding after the temporary bare typedef is
+                    // restored. Keep an instance-qualified alias for `new`,
+                    // reflection and member access through those variables.
+                    let key = cat2(&inst_prefix, name);
+                    let scoped = scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix);
+                    let width =
+                        resolve_type_width(&scoped, Some(&sub_merged_params), Some(&elab.typedefs));
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:instance_type_parameter",
+                        key.clone(),
+                        width,
+                    );
+                    elab.typedef_types.insert(key, scoped);
                     if let Some(receiver) = module_class_scope::receiver(dt) {
                         rewrite_port_map.insert(name.clone(), receiver);
                     }
@@ -41728,6 +42971,7 @@ fn inline_module_items(
                     type_bind_widths: pend_type_bind_widths,
                     type_bind_queries: pend_type_bind_queries,
                     owner: sub_mod.name().to_string(),
+                    upward: Rc::clone(&elab.upward_scopes),
                 });
 
                 // §6.8: the deferred (non-constant) declaration initializers of
@@ -41789,10 +43033,17 @@ fn inline_module_items(
                 // call time, and the formal would collapse to 1 bit. Substitute
                 // the sub-instance's resolved params into the formals' data
                 // types + unpacked dims.
-                let param_expr_map: HashMap<String, Expression> = sub_merged_params
-                    .iter()
-                    .filter_map(|(k, v)| v.to_i64().map(|iv| (k.clone(), genvar_const_expr(iv))))
-                    .collect();
+                // §13.3/#721: only callable signatures need these literal
+                // expressions. Empty instances must not copy every ancestor's
+                // parameters into another retained map at each hierarchy level.
+                let param_expr_map: HashMap<String, Expression> = if prepared_sub.has_subroutines {
+                    sub_merged_params
+                        .iter()
+                        .filter_map(|(k, v)| v.to_i64().map(|iv| (k.clone(), genvar_const_expr(iv))))
+                        .collect()
+                } else {
+                    HashMap::default()
+                };
                 let no_local: std::collections::HashSet<String> =
                     std::collections::HashSet::default();
                 let no_iface: HashMap<String, String> = HashMap::default();
@@ -41825,6 +43076,30 @@ fn inline_module_items(
                     }
                     dt.clone()
                 };
+                // §6.18/§23.9: a subroutine-local declaration typed by this
+                // instance's own unpacked-array typedef (`u8a_t r;` with
+                // `typedef u8_t u8a_t [0:7]`) names the instance-scoped key,
+                // as the signature does; the bare key is not this instance's.
+                let local_array_typedefs: std::collections::HashSet<&String> = sub_typedef_names
+                    .iter()
+                    .filter(|n| {
+                        elab.typedef_unpacked_dims
+                            .contains_key(&cat2(&inst_prefix, n))
+                    })
+                    .collect();
+                let scope_array_typedef = |dt: &DataType| -> Option<DataType> {
+                    match dt {
+                        DataType::TypeReference {
+                            name, dimensions, ..
+                        } if name.scopes.is_empty()
+                            && dimensions.is_empty()
+                            && local_array_typedefs.contains(&name.name.name) =>
+                        {
+                            Some(scope_local_typeref(dt))
+                        }
+                        _ => None,
+                    }
+                };
                 let bake_formal_type = |p: &mut FunctionPort| {
                     p.data_type = scope_local_typeref(&rewrite_data_type_genvar(
                         &p.data_type,
@@ -41848,6 +43123,14 @@ fn inline_module_items(
                 // `rewrite_stmt`, so this instance's type-parameter widths
                 // must be live for `$bits(T)` to fold inside them too.
                 set_type_bind_tls(&pend_ctx);
+                let body_classes: Vec<&ClassDeclaration> = prepared_sub
+                    .effective_items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ModuleItem::ClassDeclaration(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
                 for (sub_item, body_src) in prepared_sub
                     .effective_items
                     .iter()
@@ -41897,20 +43180,24 @@ fn inline_module_items(
                         }
                         let formal_names: Vec<&str> =
                             fd.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        new_fd.items = with_shadowed(
-                            &formal_names,
-                            &rewrite_port_map,
-                            &fn_locals,
-                            |ports, locals| {
-                                rewrite_stmt_list_scoped(
-                                    &fd.items,
-                                    &inst_prefix,
-                                    ports,
-                                    locals,
-                                    &sub_interface_map,
-                                )
-                            },
-                        );
+                        let mut items = crate::ast::cache::without_scope_caches(|| {
+                            with_shadowed(
+                                &formal_names,
+                                &rewrite_port_map,
+                                &fn_locals,
+                                |ports, locals| {
+                                    rewrite_stmt_list_scoped(
+                                        &fd.items,
+                                        &inst_prefix,
+                                        ports,
+                                        locals,
+                                        &sub_interface_map,
+                                    )
+                                },
+                            )
+                        });
+                        scope_local_decl_types(&mut items, &scope_array_typedef);
+                        new_fd.items = cache.callable_bodies.intern(items.into());
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
                     // §16.6/§16.8: a named property or sequence of an INLINED
@@ -41998,31 +43285,58 @@ fn inline_module_items(
                         }
                         let formal_names: Vec<&str> =
                             td.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        new_td.items = with_shadowed(
-                            &formal_names,
-                            &rewrite_port_map,
-                            &task_locals,
-                            |ports, locals| {
-                                rewrite_stmt_list_scoped(
-                                    &td.items,
-                                    &inst_prefix,
-                                    ports,
-                                    locals,
-                                    &sub_interface_map,
-                                )
-                            },
-                        );
+                        let mut items = crate::ast::cache::without_scope_caches(|| {
+                            with_shadowed(
+                                &formal_names,
+                                &rewrite_port_map,
+                                &task_locals,
+                                |ports, locals| {
+                                    rewrite_stmt_list_scoped(
+                                        &td.items,
+                                        &inst_prefix,
+                                        ports,
+                                        locals,
+                                        &sub_interface_map,
+                                    )
+                                },
+                            )
+                        });
+                        scope_local_decl_types(&mut items, &scope_array_typedef);
+                        new_td.items = cache.callable_bodies.intern(items.into());
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
-                        validate_class_constraints(
+                        validate_class_constraints_in_body(
                             cd,
                             Some(definitions),
+                            &body_classes,
                             Some(&elab.enum_members),
                             Some(&elab),
                             Some(&inst_prefix),
                         )?;
-                        let scoped = module_class_scope::class(cd, &inst_prefix, &class_bindings);
+                        // §8.3, §23.9: a class of a generate block reads the
+                        // block's data by its key, this instance's (`u.a.k`).
+                        let mut bindings = class_bindings.clone();
+                        visit_renamed_decls(&prepared_sub.effective_items, &mut |n, _, kind| {
+                            if n.contains('.')
+                                && !matches!(kind, DeclKind::Function | DeclKind::Task)
+                            {
+                                let key = make_ident_expr(&cat2(&inst_prefix, n));
+                                bindings.entry(n.to_string()).or_insert(key);
+                            }
+                        });
+                        let mut scoped = module_class_scope::class(cd, &inst_prefix, &bindings);
+                        for item in &mut scoped.items {
+                            if let ClassItem::Method(method) = item {
+                                let body = match &mut method.kind {
+                                    ClassMethodKind::Function(f)
+                                    | ClassMethodKind::Extern(f)
+                                    | ClassMethodKind::PureVirtual(f) => &mut f.items,
+                                    ClassMethodKind::Task(t) => &mut t.items,
+                                };
+                                *body = cache.callable_bodies.intern(std::mem::take(body));
+                            }
+                        }
                         register_class_enum_members(&scoped, elab);
                         register_class_covergroups(&scoped, elab);
                         register_class_scoped_typedef_aliases(&scoped, None, elab);
@@ -42357,6 +43671,9 @@ fn inline_module_items(
                     }
                 }
                 clear_type_bind_tls();
+                // Signature rewriting is complete; do not retain this map
+                // through recursive child elaboration (§13.3, #721).
+                drop(param_expr_map);
 
                 // Record the instance before descending. Inlining is about to
                 // dissolve this module into the parent, so this is the only
@@ -42367,6 +43684,11 @@ fn inline_module_items(
                     parent: prefix.trim_end_matches('.').to_string(),
                     src_pos: hi.span.start.max(item_floor),
                 });
+                elab.upward_scopes.borrow_mut().add_instance(
+                    prefix.trim_end_matches('.'),
+                    inst_prefix.trim_end_matches('.'),
+                    &sub_mod_name,
+                );
                 // Keep later items strictly after this one: bound
                 // instantiations carry spans from elsewhere.
                 items_end = items_end.max(hi.span.start.max(item_floor) + 1);
@@ -42429,20 +43751,18 @@ fn inline_module_items(
                 )?;
                 iprof_since("recursion", __te);
 
-                // Restore the bare-key unpacked dimensions this instance's
-                // local typedefs shadowed.
-                for (td_name, prev) in saved_type_dims.into_iter().rev() {
-                    match prev {
-                        Some(d) => {
-                            elab.typedef_unpacked_dims.insert(td_name, d);
-                        }
-                        None => {
-                            elab.typedef_unpacked_dims.remove(&td_name);
-                        }
-                    }
-                }
                 for (tp_name, saved) in saved_type_shapes.into_iter().rev() {
                     tls_restore_typedef_shape(&tp_name, saved);
+                }
+                for (name, prev) in saved_unpacked_dims.into_iter().rev() {
+                    match prev {
+                        Some(d) => {
+                            elab.typedef_unpacked_dims.insert(name, d);
+                        }
+                        None => {
+                            elab.typedef_unpacked_dims.remove(&name);
+                        }
+                    }
                 }
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.
@@ -44370,7 +45690,7 @@ fn make_i64_literal(v: i64, span: crate::ast::Span) -> Expression {
             signed: true,
             base: crate::ast::expr::NumberBase::Decimal,
             value: txt,
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     );
@@ -44444,6 +45764,64 @@ thread_local! {
     /// Line maps of the published sources (parallel to them).
     static ELAB_LINE_MAPS_TLS: std::cell::RefCell<Vec<Option<sv_parser::source_map::LineMap>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The `-v`/`-y` library files a definition was adopted from. They are
+    /// not among the published sources, so a span inside an adopted module
+    /// fitted some PRIMARY file instead and was reported there.
+    static ELAB_LIB_SOURCES_TLS: std::cell::RefCell<LibrarySources> =
+        std::cell::RefCell::new(LibrarySources::default());
+}
+
+/// The library files adopted definitions came from, and the packages those
+/// files declared (a library file supplies no packages).
+#[derive(Default)]
+pub struct LibrarySources {
+    /// (file label, preprocessed text, line map) per adopted library file.
+    pub files: Vec<(String, String, Option<sv_parser::source_map::LineMap>)>,
+    /// Adopted definition name -> index into `files`.
+    pub def_file: HashMap<String, u32>,
+    /// Package name -> where a library file declared it, as
+    /// (`file:line:col` of the declaration, library file label).
+    pub ignored_packages: HashMap<String, (String, String)>,
+}
+
+/// Publish the library files of this run's adopted definitions.
+pub fn set_elab_library_sources(lib: LibrarySources) {
+    ELAB_LIB_SOURCES_TLS.with(|c| *c.borrow_mut() = lib);
+}
+
+/// The note for a package that is missing because only a library file
+/// declared it, or an empty string.
+fn ignored_library_package_note(pkg: &str) -> String {
+    ELAB_LIB_SOURCES_TLS.with(|c| match c.borrow().ignored_packages.get(pkg) {
+        Some((at, lib)) => format!(
+            "\nnote: package '{pkg}' is declared at {at}, in library file '{lib}'; a -v/-y \
+             library file supplies only modules, interfaces, programs and primitives, so the \
+             package was not compiled. Pass that file as a source file, or, for a -v file, \
+             compile its packages with --relax-library-packages"
+        ),
+        None => String::new(),
+    })
+}
+
+/// The location of `span` inside the library file definition `owner` was
+/// adopted from, when it was adopted from one.
+fn library_span_locate(owner: &str, span: Span) -> Option<Option<SpanLoc>> {
+    ELAB_LIB_SOURCES_TLS.with(|c| {
+        let lib = c.borrow();
+        let i = *lib.def_file.get(owner)? as usize;
+        let (file, text, map) = lib.files.get(i)?;
+        if span.start >= text.len() {
+            return Some(None);
+        }
+        if let Some(loc) = map.as_ref().and_then(|m| m.locate(text, span)) {
+            return Some(Some(SpanLoc::Mapped(loc)));
+        }
+        let line = 1 + text.as_bytes()[..span.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        Some(Some(SpanLoc::Plain(format!("{}:{}", file, line))))
+    })
 }
 
 /// Publish the line maps of the sources passed to `set_elab_sources`.
@@ -44474,6 +45852,25 @@ pub fn set_elab_module_files(map: HashMap<String, u32>) {
 pub fn take_elab_sources() -> (Vec<String>, Vec<String>) {
     ELAB_MODULE_FILES_TLS.with(|c| c.borrow_mut().clear());
     ELAB_SOURCES_TLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// `file:line` of a span of a definition in the primary sources; `def@offset`
+/// for one adopted from a library, whose text is not published yet.
+pub(crate) fn audit_location(def: &str, span: Span) -> String {
+    let at = ELAB_MODULE_FILES_TLS
+        .with(|c| c.borrow().get(def).copied())
+        .and_then(|i| {
+            let i = i as usize;
+            ELAB_SOURCES_TLS.with(|s| {
+                ELAB_LINE_MAPS_TLS.with(|m| {
+                    let s = s.borrow();
+                    let text = s.0.get(i)?;
+                    let loc = m.borrow().get(i)?.as_ref()?.location_string(text, span)?;
+                    loc.rsplit_once(':').map(|(l, _)| l.to_string())
+                })
+            })
+        });
+    at.unwrap_or_else(|| format!("{def}@{}", span.start))
 }
 
 /// Resolve a `Span` (a byte offset into its own file's PREPROCESSED text) to
@@ -44542,6 +45939,12 @@ fn span_locate_owned(
     // which is every real one. Prefer the file that actually defines this
     // module and fall back to the scan only when it is unknown.
     let hint_name: &str = owner.unwrap_or(elab.name.as_str());
+    // A definition adopted from a library file: its spans index THAT file.
+    if hint && !hint_name.is_empty() {
+        if let Some(loc) = library_span_locate(hint_name, span) {
+            return loc;
+        }
+    }
     let preferred: Option<usize> = if !hint || hint_name.is_empty() {
         None
     } else {
@@ -44775,15 +46178,36 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     if !has_unpacked_struct_type(elab) {
         return;
     }
-    let struct_type = |elab: &ElaboratedModule, name: &str| {
-        declared_type_name(elab, name)
-            .and_then(|tn| elab.typedef_types.get(&tn))
-            .and_then(|dt| match resolve_typedef_chain(dt, &elab.typedef_types) {
-                // A PACKED struct keeps a contiguous bit layout that a
-                // whole-value write already fills correctly.
-                DataType::Struct(su) if !su.packed && !su.members.is_empty() => Some(su.clone()),
-                _ => None,
-            })
+    // §23.3.3.5: instance-array splitting produces `w[k]` actuals. They
+    // still denote whole structs, but `ident_flat_name` deliberately rejects
+    // selects. Recover only constant storage paths here, not arbitrary
+    // expressions: evaluating an index per member could repeat side effects.
+    let struct_target = |elab: &ElaboratedModule, expr: &Expression| {
+        let name = const_parameter_path(expr, Some(&elab.parameters))?;
+        let mut base = name.as_str();
+        let mut rank = 0;
+        while base.ends_with(']') {
+            let bracket = base.rfind('[')?;
+            base[bracket + 1..base.len() - 1].parse::<i64>().ok()?;
+            base = &base[..bracket];
+            rank += 1;
+        }
+        // Only consume unpacked dimensions, never packed bit selects or a
+        // partial array. The element's declared type lives on the array.
+        if elab.unpacked_decl_dims.get(base).map_or(0, Vec::len) != rank {
+            return None;
+        }
+        let dt = elab.var_decl_types.get(base).or_else(|| {
+            declared_type_name(elab, base).and_then(|tn| elab.typedef_types.get(&tn))
+        })?;
+        match resolve_typedef_chain(dt, &elab.typedef_types) {
+            // A PACKED struct keeps a contiguous bit layout that a
+            // whole-value write already fills correctly.
+            DataType::Struct(su) if !su.packed && !su.members.is_empty() => {
+                Some((name, su.clone()))
+            }
+            _ => None,
+        }
     };
 
     // A sub-module body may still sit in the LAZY pending list, which the loop
@@ -44801,7 +46225,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                 &pca.ctx.local_names,
                 &pca.ctx.interface_map,
             );
-            if ident_flat_name(&lhs).is_some_and(|n| struct_type(elab, &n).is_some()) {
+            if struct_target(elab, &lhs).is_some() {
                 let ca = pca.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {
@@ -44817,7 +46241,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     // here wrote `4.5` as `5`).
     let mut out: Vec<ContinuousAssignment> = Vec::new();
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        let target = ident_flat_name(&ca.lhs).and_then(|n| struct_type(elab, &n).map(|su| (n, su)));
+        let target = struct_target(elab, &ca.lhs);
         match target {
             Some((base, su)) => emit_struct_member_assigns(
                 &make_ident_expr(&base),
@@ -44895,7 +46319,12 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 &pca.ctx.local_names,
                 &pca.ctx.interface_map,
             );
-            if ident_flat_name(&lhs).is_some_and(|n| net_resolver.contains_key(&n)) {
+            // A member of one too (`u.p.V`): a port connection taken apart.
+            if ident_flat_name(&lhs).is_some_and(|n| {
+                net_resolver.contains_key(&n)
+                    || n.match_indices('.')
+                        .any(|(i, _)| net_resolver.contains_key(&n[..i]))
+            }) {
                 let ca = pca.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {
@@ -44938,12 +46367,55 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     let mut delays: HashMap<String, u64> = HashMap::default();
     let mut kept: Vec<ContinuousAssignment> = Vec::new();
 
+    // Member-wise drivers of resolver-less nets: net -> member -> count.
+    let mut member_drivers: HashMap<String, HashMap<String, usize>> = HashMap::default();
+    // The nettype net a member path (`u.p.V`) belongs to, and the member.
+    let net_member = |name: &str| -> Option<(String, String)> {
+        name.match_indices('.')
+            .map(|(i, _)| (&name[..i], &name[i + 1..]))
+            .find(|(net, _)| net_resolver.contains_key(*net))
+            .map(|(net, m)| (net.to_string(), m.to_string()))
+    };
     for ca in std::mem::take(&mut elab.continuous_assigns) {
         let Some(lhs_name) = ident_flat_name(&ca.lhs).filter(|n| net_resolver.contains_key(n))
         else {
+            // §6.6.7, §23.3.3: a port connection of a resolver-less
+            // unpacked-struct net arrives member by member (`n.V = u.p.V`).
+            // It joins the two nets for the one-driver count, as the
+            // whole-net link below does, and stays an ordinary assignment.
+            let joined = ident_flat_name(&ca.lhs)
+                .and_then(|l| net_member(&l))
+                .zip(ident_flat_name(&ca.rhs).and_then(|r| net_member(&r)))
+                .filter(|((ln, lm), (rn, rm))| {
+                    lm == rm
+                        && ln != rn
+                        && net_resolver[ln].is_empty()
+                        && net_resolver[rn].is_empty()
+                });
+            if let Some(((ln, _), (rn, _))) = joined {
+                let a = find(&mut parent, &ln);
+                let b = find(&mut parent, &rn);
+                if a != b {
+                    parent.insert(a, b);
+                }
+            } else if let Some((net, m)) = ident_flat_name(&ca.lhs)
+                .and_then(|l| net_member(&l))
+                .filter(|(net, _)| net_resolver[net].is_empty())
+            {
+                // A whole-net driver an earlier pass already took apart.
+                *member_drivers.entry(net).or_default().entry(m).or_insert(0) += 1;
+            }
             kept.push(ca);
             continue;
         };
+        // §6.6.7: without a resolver the driver is an ordinary assignment.
+        // Keep it (and its port links) for `expand_unpacked_struct_assigns`:
+        // the resolver emitter selects members of an evaluated struct, but
+        // an assignment pattern needs type-directed expansion instead.
+        // Still gather the drivers below for the existing count check.
+        if net_resolver[&lhs_name].is_empty() {
+            kept.push(ca.clone());
+        }
         // Identity link to another nettype net => port connection, not a driver.
         if let Some(rhs_name) = ident_flat_name(&ca.rhs) {
             if net_resolver.contains_key(&rhs_name) && rhs_name != lhs_name {
@@ -44987,6 +46459,31 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     for n in &all_nets {
         let root = find(&mut parent, n);
         comp_members.entry(root).or_default().push(n.clone());
+    }
+
+    // §6.6.7: count the drivers of each resolver-less net over its whole
+    // component, member-wise ones included (a driver taken apart counts once,
+    // as its most-driven member).
+    for n in &all_nets {
+        let root = find(&mut parent, n);
+        if root != *n || !net_resolver[&root].is_empty() {
+            continue;
+        }
+        let members = &comp_members[&root];
+        let mut per_member: HashMap<&str, usize> = HashMap::default();
+        for net in members {
+            for (m, c) in member_drivers.get(net).into_iter().flatten() {
+                *per_member.entry(m.as_str()).or_insert(0) += c;
+            }
+        }
+        let total = comp_drivers.get(&root).map_or(0, |d| d.len())
+            + per_member.values().copied().max().unwrap_or(0);
+        if total > 1 {
+            return Err(format!(
+                "net '{}' of an unresolved nettype has {} continuous drivers; a nettype declared without a resolution function permits only one (IEEE 1800-2017 6.6.7)",
+                root, total
+            ));
+        }
     }
 
     // Struct members of a nettype net, or None for a scalar one.
@@ -45075,7 +46572,9 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     drivers.len()
                 ));
             }
-            drivers.into_iter().next().unwrap()
+            // The original assignments and links were retained above. This
+            // also preserves their delay and scope metadata.
+            continue;
         } else {
             // §6.6.7: the resolution function must exist, be `automatic`, and
             // take a single unpacked-array input. Checked here because this is
@@ -45254,8 +46753,8 @@ fn retarget_lvalue_net(e: &mut Expression, from: &str, to: &str) {
                     },
                     selects,
                 }];
-                h.cached_signal_id = std::cell::Cell::new(None);
-                h.cached_resolved_name = std::cell::OnceCell::new();
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
             }
         }
         ExprKind::MemberAccess { expr, .. }
@@ -45484,7 +46983,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         // The driver side: a copy of the net, same kind and shape.
         let drv = format!("{net}$netdrv");
         let mut sig = elab.signals[&net].clone();
-        sig.name = drv.clone();
+        sig.name = drv.clone().into();
         sig.direction = None;
         elab.signals.insert(drv.clone(), sig);
         elab.nets.insert(drv.clone());
@@ -45539,7 +47038,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             elab.signals.insert(
                 b.clone(),
                 Signal {
-                    name: b.clone(),
+                    name: b.clone().into(),
                     width: 1,
                     is_signed: false,
                     is_real: false,
@@ -45614,7 +47113,7 @@ fn make_z_fill(k: u32, span: Span) -> Expression {
             signed: false,
             base: NumberBase::Binary,
             value: "z".repeat(k as usize),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     )
@@ -46076,7 +47575,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             *k += 1;
             if let Some(sig) = elab.signals.get(&name) {
                 let mut sig = sig.clone();
-                sig.name = drv.clone();
+                sig.name = drv.clone().into();
                 sig.direction = None;
                 elab.signals.insert(drv.clone(), sig);
             }
@@ -46584,7 +48083,7 @@ fn lower_udp_instances(
                                 name.clone(),
                                 Signal {
                                     is_const: false,
-                                    name: name.clone(),
+                                    name: name.clone().into(),
                                     width: 1,
                                     is_signed: false,
                                     direction: None,
@@ -46690,7 +48189,7 @@ fn make_udp_int_expr(v: i64) -> Expression {
             signed: true,
             base: NumberBase::Decimal,
             value: v.unsigned_abs().to_string(),
-            cached_val: std::cell::Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         Span::dummy(),
     );
@@ -46756,9 +48255,25 @@ pub fn whole_array_assign_parts_dir(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
 ) -> Option<Vec<ContinuousAssignment>> {
+    whole_array_assign_parts_dir_with_params(lhs, rhs, delay, arrays, descending, decl_dims, None)
+}
+
+/// §10.9.1: pattern keys and replication counts use the design's parameter
+/// bindings even when expansion happens after loading a compiled artifact.
+pub fn whole_array_assign_parts_dir_with_params(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+    descending: Option<&HashSet<String>>,
+    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    params: Option<&HashMap<String, Value>>,
+) -> Option<Vec<ContinuousAssignment>> {
     let pattern = peel_unpacked_typed_pattern(rhs);
     if let ExprKind::AssignmentPattern(_) = &pattern.kind {
-        return pattern_array_assign_parts(lhs, pattern, delay, arrays, descending, decl_dims);
+        return pattern_array_assign_parts(
+            lhs, pattern, delay, arrays, descending, decl_dims, params,
+        );
     }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
         return None;
@@ -47074,6 +48589,7 @@ fn pattern_array_assign_parts(
     arrays: &HashMap<String, (i64, i64, u32)>,
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    params: Option<&HashMap<String, Value>>,
 ) -> Option<Vec<ContinuousAssignment>> {
     let ExprKind::Ident(lh) = &lhs.kind else {
         return None;
@@ -47101,7 +48617,7 @@ fn pattern_array_assign_parts(
         return None;
     }
     let mut out: Vec<(Vec<i64>, Expression)> = Vec::new();
-    pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out)?;
+    pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out, params)?;
     Some(
         out.into_iter()
             .map(|(idx, e)| ContinuousAssignment {
@@ -47124,6 +48640,7 @@ fn pattern_leaves(
     dims: &[(i64, i64)],
     idx: &mut Vec<i64>,
     out: &mut Vec<(Vec<i64>, Expression)>,
+    params: Option<&HashMap<String, Value>>,
 ) -> Option<()> {
     let Some(&(l, r)) = dims.first() else {
         if matches!(e.kind, ExprKind::AssignmentPattern(_)) {
@@ -47150,7 +48667,7 @@ fn pattern_leaves(
         if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
             && let ExprKind::Replication { count, exprs } = &only.kind
         {
-            let c = const_eval_i64_with_params(count, None)?;
+            let c = const_eval_i64_with_params(count, params)?;
             for _ in 0..c.max(0) {
                 flat.extend(exprs.iter());
             }
@@ -47168,7 +48685,7 @@ fn pattern_leaves(
             match it {
                 AssignmentPatternItem::Default(x) => default = Some(x),
                 AssignmentPatternItem::Keyed(key, x) => {
-                    let ix = const_eval_i64_with_params(key, None)?;
+                    let ix = const_eval_i64_with_params(key, params)?;
                     if ix < l.min(r) || ix > l.max(r) {
                         return None;
                     }
@@ -47181,7 +48698,7 @@ fn pattern_leaves(
     for (k, x) in elems.into_iter().enumerate() {
         idx.push(index_at(k));
         match (x, default) {
-            (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out)?,
+            (Some(x), _) => pattern_leaves(x, &dims[1..], idx, out, params)?,
             // §10.9.1: `default:` reaches every leaf of a missing element.
             (None, Some(d))
                 if !matches!(
@@ -47191,7 +48708,7 @@ fn pattern_leaves(
             {
                 default_leaves(d, &dims[1..], idx, out)
             }
-            (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out)?,
+            (None, Some(d)) => pattern_leaves(d, &dims[1..], idx, out, params)?,
             (None, None) => return None,
         }
         idx.pop();
@@ -47243,13 +48760,14 @@ fn expand_whole_array_assign(
     delay: u64,
     elab: &mut ElaboratedModule,
 ) -> bool {
-    match whole_array_assign_parts_dir(
+    match whole_array_assign_parts_dir_with_params(
         lhs,
         rhs,
         delay,
         &elab.arrays,
         Some(&elab.descending_arrays),
         Some(&elab.unpacked_decl_dims),
+        Some(&elab.parameters),
     )
     .or_else(|| {
         slice_array_assign_parts(
@@ -47282,8 +48800,9 @@ fn make_ident_expr(name: &str) -> Expression {
                 selects: Vec::new(),
             }],
             span: Span::dummy(),
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         Span::dummy(),
     )
@@ -47389,6 +48908,126 @@ pub fn rewrite_expr(
     interface_map: &HashMap<String, String>,
 ) -> Expression {
     rewrite_expr_impl(expr, prefix, port_map, local_names, interface_map)
+}
+
+/// §23.8 (upward name referencing) for a hierarchical name in an inlined body
+/// whose first segment names none of the body's own declarations (not a
+/// local, a port, an interface port or a package). The first segment is
+/// looked for as a SCOPE NAME, starting at the instance the body belongs to
+/// and walking up one enclosing scope at a time, until the top module:
+///   a) a scope the current design element declares anywhere (a child
+///      instance of any generate branch, a generate or block label, a
+///      subroutine) makes it a downward reference, which the ordinary
+///      scope-relative resolution already handles — left alone;
+///   b) in each enclosing scope `p`: the DEFINITION name of `p`'s own
+///      instance (`node1.req1` from a module bound into `u_node1`, an
+///      instance of `node1`, is the nearest enclosing instance of that
+///      module — it wins over a same-named instance further up), then a
+///      child instance of `p` by its INSTANCE name, then a generate or block
+///      label `p` declares. A module name that is not an ancestor's (a
+///      sibling's) matches nothing, as in the reference simulator.
+/// The hit is rewritten to the matched scope's absolute path and rooted, so
+/// the simulator resolves it exactly there instead of guessing from a
+/// scope hint: the earlier runtime-only search bound `node1.req1` to a
+/// same-named signal of the top module (#890). A head that names nothing
+/// (the top module's own name, `$root`, a `$unit` variable) is left as it
+/// was.
+fn upward_scope_rewrite(hier: &HierarchicalIdentifier, prefix: &str) -> Option<ExprKind> {
+    if hier.root.is_some() || hier.path.len() < 2 || !hier.path[0].selects.is_empty() {
+        return None;
+    }
+    let head = hier.path[0].name.name.as_str();
+    if head.contains(['.', ':', '$']) || stmt_local_declared(head) {
+        return None;
+    }
+    let scopes = UPWARD_SCOPES_TLS.with(|c| c.borrow().clone())?;
+    let scopes = scopes.borrow();
+    if scopes.packages.contains(head) {
+        return None;
+    }
+    let declares = |p: &str| -> bool {
+        scopes
+            .defs
+            .get(p)
+            .and_then(|d| scopes.declared.get(d))
+            .is_some_and(|names| names.contains(head))
+    };
+    let kids_of = |p: &str| scopes.children.get(p).map(Vec::as_slice).unwrap_or(&[]);
+    let child_named = |p: &str| {
+        kids_of(p)
+            .iter()
+            .find(|(l, _)| l == head)
+            .map(|(l, _)| l.as_str())
+    };
+    let cur = prefix.trim_end_matches('.');
+    // Step a: the current design element's own scopes are downward.
+    if declares(cur) || child_named(cur).is_some() {
+        return None;
+    }
+    let mut p = cur;
+    // The matched scope and what replaces the head below it: nothing when
+    // the head named `p`'s module, the child's name, or the label itself.
+    let hit: Option<(&str, Option<&str>)> = loop {
+        if !p.is_empty() && scopes.defs.get(p).is_some_and(|d| d == head) {
+            break Some((p, None));
+        }
+        if p != cur {
+            if let Some(leaf) = child_named(p) {
+                break Some((p, Some(leaf)));
+            }
+            if declares(p) {
+                break Some((p, Some(head)));
+            }
+        }
+        if p.is_empty() {
+            break None;
+        }
+        p = p.rsplit_once('.').map_or("", |(parent, _)| parent);
+    };
+    let (scope, below) = hit?;
+    let mut new_hier = hier.clone();
+    let template = HierPathSegment {
+        name: new_hier.path[0].name.clone(),
+        selects: Vec::new(),
+    };
+    let segment = |name: &str| {
+        let mut s = template.clone();
+        s.name.name = name.to_string();
+        s
+    };
+    let mut path: Vec<HierPathSegment> = Vec::with_capacity(hier.path.len() + 4);
+    if !scope.is_empty() {
+        path.extend(scope.split('.').map(segment));
+    }
+    path.extend(below.map(segment));
+    path.extend(new_hier.path.drain(1..));
+    new_hier.path = path;
+    new_hier.root = Some("$root".to_string());
+    new_hier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+    new_hier.cached_resolved_name = crate::ast::cache::NameCache::new();
+    Some(ExprKind::Ident(new_hier))
+}
+
+/// §23.8.1: the key of the subroutine a bare name the binder left to the
+/// hierarchy (`Bound::UPWARD`) calls from the instance at `prefix`, when it
+/// differs from the name.
+fn upward_subroutine_key(hier: &HierarchicalIdentifier, prefix: &str) -> Option<String> {
+    if !hier.bound.is_upward() || hier.path.len() != 1 || !hier.path[0].selects.is_empty() {
+        return None;
+    }
+    let scopes = UPWARD_SCOPES_TLS.with(|c| c.borrow().clone())?;
+    let scopes = scopes.borrow();
+    let name = hier.path[0].name.name.as_str();
+    let inst = prefix.trim_end_matches('.');
+    let key = scopes.subroutine_key(inst, name)?;
+    if bind::audit_enabled() {
+        let def = scopes.parents.get(inst).map_or("", |up| up.def.as_str());
+        eprintln!(
+            "[bind-audit] upward {} {name} in {inst} -> {key}",
+            audit_location(def, hier.span)
+        );
+    }
+    (key != name).then_some(key)
 }
 
 /// §23.8 / §23.10.1: a port actual `dut.gclk_a` whose first segment names
@@ -47549,12 +49188,20 @@ fn rewrite_expr_impl(
             // variable was injected under its plain name, so drop the
             // qualifier and let the normal port-map / local-name handling
             // below bind (and prefix) it like any other reference.
+            // A generate block that declares `x` hides the plain name there:
+            // the qualified name is rooted, so no later rewrite strips it and
+            // the run time reads the unit's `x`.
             if let Some(bare) = crate::sv_parser::strip_unit_scope_name(&hier.path[0].name.name) {
+                if gen_rename_declares(bare) {
+                    let mut rooted = hier.clone();
+                    rooted.root = Some("$root".to_string());
+                    return Expression::new(ExprKind::Ident(rooted), expr.span);
+                }
                 if !local_names.contains(hier.path[0].name.name.as_str()) {
                     let mut new_hier = hier.clone();
                     new_hier.path[0].name.name = bare.to_string();
-                    new_hier.cached_signal_id = std::cell::Cell::new(None);
-                    new_hier.cached_resolved_name = std::cell::OnceCell::new();
+                    new_hier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    new_hier.cached_resolved_name = crate::ast::cache::NameCache::new();
                     let bare_expr = Expression::new(ExprKind::Ident(new_hier), expr.span);
                     return rewrite_expr_impl(
                         &bare_expr,
@@ -47629,7 +49276,24 @@ fn rewrite_expr_impl(
                     return mapped.clone();
                 }
             }
-            if let Some(mapped) = port_map.get(name) {
+            // §23.9, §27.6: a name bound to a declaration of the generate
+            // block being renamed takes the declaration's key. A whole name
+            // is a new one, without a source span.
+            if let Some(key) = gen_renamed(hier.bound, name, |_| true) {
+                let mut h = hier.clone();
+                h.path[0].name = Identifier {
+                    name: key,
+                    span: Span::dummy(),
+                };
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
+                if h.path.len() > 1 || !h.path[0].selects.is_empty() {
+                    return Expression::new(ExprKind::Ident(h), expr.span);
+                }
+                h.span = Span::dummy();
+                return Expression::new(ExprKind::Ident(h), Span::dummy());
+            }
+            if let Some(mapped) = port_map.get(name).filter(|_| !genvar_hidden(hier.bound)) {
                 // §25.5.4: `p.b` through a modport-typed port whose actual is
                 // an interface instance — a modport EXPRESSION member
                 // substitutes its registered expression (see
@@ -47824,6 +49488,17 @@ fn rewrite_expr_impl(
                 let mut new_hier = hier.clone();
                 new_hier.path[0].name.name = cat2(&prefix, &name);
                 ExprKind::Ident(new_hier)
+            } else if let Some(key) = upward_subroutine_key(hier, prefix) {
+                let mut new_hier = hier.clone();
+                new_hier.path[0].name.name = key;
+                new_hier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                new_hier.cached_resolved_name = crate::ast::cache::NameCache::new();
+                ExprKind::Ident(new_hier)
+            } else if let Some(upward) = upward_scope_rewrite(hier, prefix) {
+                // §23.8: a name headed by an enclosing scope (the bind
+                // target's module name, a sibling instance, ...) resolves
+                // there, not to whatever the runtime's scope hint suggests.
+                upward
             } else {
                 expr.kind.clone()
             }
@@ -48067,15 +49742,16 @@ fn rewrite_expr_impl(
             let rewritten_base =
                 rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
             // `flatten_pkg_member_refs`: only a package-headed `P::m` folds.
-            let keep = PKG_FLATTEN_ONLY.with(|s| {
-                s.borrow().as_ref().is_some_and(|pkgs| {
-                    !matches!(&rewritten_base.kind, ExprKind::Ident(h)
-                        if h.root.is_none()
-                            && h.path.len() == 1
-                            && h.path[0].selects.is_empty()
-                            && pkgs.contains(&h.path[0].name.name))
-                })
-            });
+            let keep = gen_in_class()
+                || PKG_FLATTEN_ONLY.with(|s| {
+                    s.borrow().as_ref().is_some_and(|pkgs| {
+                        !matches!(&rewritten_base.kind, ExprKind::Ident(h)
+                            if h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty()
+                                && pkgs.contains(&h.path[0].name.name))
+                    })
+                });
             if keep {
                 return Expression::new(
                     ExprKind::MemberAccess {
@@ -48101,7 +49777,14 @@ fn rewrite_expr_impl(
                     name: member.clone(),
                     selects: Vec::new(),
                 });
-                ExprKind::Ident(hier)
+                // §23.8: `node1.req1` parses as a member access on the bare
+                // `node1`; folded into one path, its head may name an
+                // enclosing scope (see `upward_scope_rewrite`). A head the
+                // body declares was prefixed above and is skipped there.
+                match upward_scope_rewrite(&hier, prefix) {
+                    Some(upward) => upward,
+                    None => ExprKind::Ident(hier),
+                }
             } else {
                 ExprKind::MemberAccess {
                     expr: Box::new(rewritten_base),
@@ -48520,6 +50203,8 @@ fn with_shadowed<R>(
     local_names: &std::collections::HashSet<String>,
     f: impl FnOnce(&HashMap<String, Expression>, &std::collections::HashSet<String>) -> R,
 ) -> R {
+    // §13.3: the formals are not scopes either (`upward_scope_rewrite`).
+    let _stmt_locals = push_stmt_locals(bound.iter().map(|b| (*b).to_string()).collect());
     let ln = without_declared(local_names, bound.iter().copied());
     let pm = if bound.iter().any(|b| port_map.contains_key(*b)) {
         let mut m = port_map.clone();
@@ -48709,6 +50394,9 @@ fn rewrite_pattern(
 }
 
 fn set_type_bind_tls(ctx: &RewriteCtx) {
+    // §23.8: a body materialized after elaboration (possibly on another
+    // thread) resolves its upward names against the design's scope tree.
+    install_upward_scopes(&ctx.upward);
     // Always assign — an instance WITHOUT type parameters must clear
     // whatever an enclosing instance left, or its `$bits(T)` on a typedef
     // named `T` would fold to the parent's parameter width.
@@ -49002,8 +50690,9 @@ pub fn substitute_bare_idents_stmt(
                 selects: Vec::new(),
             }],
             span: stmt.span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         };
         port_map.insert(
             from.clone(),
@@ -49078,8 +50767,9 @@ pub fn rename_process_shadowed_locals(
                             selects: Vec::new(),
                         }],
                         span: d.name.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     };
                     map.insert(
                         d.name.name.clone(),
@@ -49255,6 +50945,28 @@ fn stmt_list_declared_names(stmts: &[Statement]) -> Vec<&str> {
     out
 }
 
+/// A process local's type: class and type keys of the instance, then in a
+/// generate rename the block's parameters and types (§6.21, §23.9).
+fn rewrite_local_type(
+    dt: &DataType,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+) -> DataType {
+    let dt = module_class_scope::data_type(dt, prefix, port_map);
+    match gen_renames_local_types(prefix) {
+        true => with_gen_part(local_type_takes, || gen_type(&dt)),
+        false => dt,
+    }
+}
+
+/// §6.18, §23.9: the types a statement list declares.
+fn stmt_list_typedef_names(stmts: &[Statement]) -> impl Iterator<Item = &str> {
+    stmts.iter().filter_map(|st| match &st.kind {
+        StatementKind::Typedef(td) => Some(td.name.name.as_str()),
+        _ => None,
+    })
+}
+
 /// Rewrite a statement list where each `VarDecl` shadows the module names
 /// for the statements AFTER it (its own initialiser still sees the outer
 /// set).
@@ -49267,6 +50979,18 @@ fn rewrite_stmt_list_scoped(
 ) -> Vec<Statement> {
     let mut cur: Option<std::collections::HashSet<String>> = None;
     let mut cur_ports: Option<HashMap<String, Expression>> = None;
+    // §6.21: the list's own declarations are not scopes (`upward_scope_rewrite`).
+    let _stmt_locals = push_stmt_locals(
+        stmts
+            .iter()
+            .filter_map(|st| match &st.kind {
+                StatementKind::VarDecl { declarators, .. } => Some(declarators),
+                _ => None,
+            })
+            .flatten()
+            .map(|d| d.name.name.clone())
+            .collect(),
+    );
     let mut out = Vec::with_capacity(stmts.len());
     for st in stmts {
         let names = cur.as_ref().unwrap_or(local_names);
@@ -49425,7 +51149,7 @@ fn rewrite_stmt(
                                 name,
                                 init,
                             } => ForInit::VarDecl {
-                                data_type: data_type.clone(),
+                                data_type: rewrite_local_type(data_type, prefix, port_map),
                                 name: name.clone(),
                                 init: rewrite_expr(
                                     init,
@@ -49559,28 +51283,50 @@ fn rewrite_stmt(
                 )),
             })
         }
-        // Declared names and dimensions stay untouched (they are introduced
-        // by the declaration itself); only the initializer reads outer names.
+        // Declared names stay untouched (the declaration introduces them).
+        // §6.21, §23.9: in a generate rename the type and dimensions read the
+        // block's parameters and types; elsewhere only the initializer reads
+        // outer names.
+        // Block data there keeps its bare name, which the instance resolves.
         StatementKind::VarDecl {
             data_type,
             lifetime,
             declarators,
-        } => StatementKind::VarDecl {
-            data_type: module_class_scope::data_type(data_type, prefix, port_map),
-            lifetime: *lifetime,
-            declarators: declarators
-                .iter()
-                .map(|d| crate::ast::stmt::VarDeclarator {
-                    name: d.name.clone(),
-                    dimensions: d.dimensions.clone(),
-                    init: d
-                        .init
-                        .as_ref()
-                        .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
-                    span: d.span,
-                })
-                .collect(),
-        },
+        } => {
+            let renaming = gen_renames_local_types(prefix);
+            let data_type = rewrite_local_type(data_type, prefix, port_map);
+            StatementKind::VarDecl {
+                data_type,
+                lifetime: *lifetime,
+                declarators: declarators
+                    .iter()
+                    .map(|d| crate::ast::stmt::VarDeclarator {
+                        decl: d.decl,
+                        name: d.name.clone(),
+                        dimensions: match renaming {
+                            true => with_gen_part(local_type_takes, || gen_dims(&d.dimensions)),
+                            false => d.dimensions.clone(),
+                        },
+                        init: d
+                            .init
+                            .as_ref()
+                            .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+                        span: d.span,
+                    })
+                    .collect(),
+            }
+        }
+        // A process-local typedef's type reads as a local's does.
+        StatementKind::Typedef(td) if prefix.is_empty() => {
+            let mut td = td.clone();
+            if gen_renames_local_types(prefix) {
+                with_gen_part(local_type_takes, || {
+                    td.data_type = gen_type(&td.data_type);
+                    td.dimensions = gen_dims(&td.dimensions);
+                });
+            }
+            StatementKind::Typedef(td)
+        }
         StatementKind::RandCase { items } => StatementKind::RandCase {
             items: items
                 .iter()
@@ -49746,6 +51492,14 @@ fn rewrite_stmt(
                     whole_net_ident_name(mapped).unwrap_or_else(|| name.name.clone())
                 } else if local_names.contains(&name.name) {
                     cat2(prefix, &name.name)
+                } else if let Some(k) = target.as_deref().and_then(|t| match &t.kind {
+                    // The parser's name of a one-name target (§15.5.1).
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == name.name => {
+                        gen_renamed(h.bound, &name.name, |_| true)
+                    }
+                    _ => None,
+                }) {
+                    k
                 } else {
                     name.name.clone()
                 },
@@ -49783,9 +51537,40 @@ fn rewrite_stmt(
             local_names,
             interface_map,
         ))),
+        StatementKind::Disable(h) => {
+            StatementKind::Disable(rewrite_disable(h, prefix, local_names))
+        }
         other => other.clone(),
     };
     Statement::new(new_kind, stmt.span)
+}
+
+/// §9.6.2: a `disable` of a task names the task's key, as a call does: the
+/// generate rename unless the name binds elsewhere (§23.9), then the instance
+/// prefix, or the key found upward (§23.8.1). A block keeps its label, by
+/// which it is matched.
+fn rewrite_disable(
+    h: &HierarchicalIdentifier,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+) -> HierarchicalIdentifier {
+    let [seg] = &h.path[..] else {
+        return h.clone();
+    };
+    if h.root.is_some() || !seg.selects.is_empty() {
+        return h.clone();
+    }
+    let name = seg.name.name.as_str();
+    let key = gen_renamed(h.bound, name, |_| true)
+        .or_else(|| {
+            (h.bound.as_decl().is_some() && local_names.contains(name)).then(|| cat2(prefix, name))
+        })
+        .or_else(|| upward_subroutine_key(h, prefix));
+    let mut out = h.clone();
+    if let Some(k) = key {
+        out.path[0].name.name = k;
+    }
+    out
 }
 
 fn rewrite_event_control(
@@ -50020,6 +51805,7 @@ fn collect_local_scope_names(items: &[ModuleItem]) -> std::collections::HashSet<
 /// locally is a shadow (the local wins). Explicit imports are excluded.
 fn compute_wildcard_shadowed(
     items: &[ModuleItem],
+    params: &[ParameterDeclaration],
     defs: &HashMap<String, Definition>,
 ) -> std::collections::HashSet<String> {
     // §26.3 ordering rule: a local declaration only legally SHADOWS a
@@ -50043,7 +51829,18 @@ fn compute_wildcard_shadowed(
         Some(idx) => &items[..idx],
         None => items,
     };
-    let local = collect_local_scope_names(decl_items);
+    let mut local = collect_local_scope_names(decl_items);
+    // Header parameters precede every body item (§23.2, §26.3).
+    for pd in params {
+        match &pd.kind {
+            ParameterKind::Data { assignments, .. } => {
+                local.extend(assignments.iter().map(|a| a.name.name.clone()))
+            }
+            ParameterKind::Type { assignments } => {
+                local.extend(assignments.iter().map(|a| a.name.name.clone()))
+            }
+        }
+    }
     let mut out = std::collections::HashSet::default();
     for item in items {
         if let ModuleItem::ImportDeclaration(imp) = item {
@@ -50066,110 +51863,93 @@ fn compute_wildcard_shadowed(
     out
 }
 
-/// §26.2/§26.3: bind a scope's IMPORTED type names into the bare namespace.
+/// §26.2/§26.3: bind a scope's imported type names into the bare namespace.
 ///
-/// Package typedefs are hoisted into ONE global bare-name table, so a
-/// same-named typedef in an unrelated package can end up owning the bare key
-/// (and which one does depends on `definitions` iteration order). An
-/// unqualified reference inside a module must resolve to the package THAT
-/// module imports, so re-point the bare keys at the qualified entries before
-/// anything in the body is resolved.
-///
-/// Only the TYPE tables are rebound. The rest of `process_import` has
-/// design-wide side effects (package parameters become signals, classes are
-/// elaborated) that must not re-run per instance.
-fn rebind_imported_typedefs(
-    elab: &mut ElaboratedModule,
-    items: &[ModuleItem],
-    definitions: &HashMap<String, Definition>,
-) {
+/// Package typedefs are hoisted into one global bare-name table, so a
+/// same-named typedef of an unrelated package can own the bare key. An
+/// unqualified reference inside a module resolves to the package that module
+/// imports, so the bare keys are re-pointed at the qualified entries before
+/// the body is resolved. Only the type tables are rebound: the rest of
+/// `process_import` has design-wide effects that must not re-run per instance.
+fn rebind_imported_typedefs(elab: &mut ElaboratedModule, imports: &[ImportedTypedefs]) {
     let mut changed = false;
-    for item in items {
-        let ModuleItem::ImportDeclaration(imp) = item else {
-            continue;
-        };
-        for ii in &imp.items {
-            let pkg = &ii.package.name;
-            let Some(Definition::Package(p)) = definitions.get(pkg) else {
-                continue;
-            };
-            // `import P::sym` binds one name; `import P::*` binds all of P's
-            // AND, transitively, its own wildcard imports' — `import P::*`
-            // where P does `import CHIP::*` is how large testbenches reach
-            // core types without ever naming CHIP. Rebinding only P's own
-            // typedefs left every chained name exposed to transient
-            // re-binding of the global bare slot.
-            fn wildcard_names(
-                pkg: &crate::ast::module::PackageDeclaration,
-                defs: &HashMap<String, Definition>,
-                depth: u32,
-                out: &mut Vec<(String, String)>, // (owning pkg, typedef name)
-            ) {
-                if depth > 8 {
-                    return;
-                }
-                for pi in &pkg.items {
-                    match pi {
-                        PackageItem::Typedef(td) => {
-                            out.push((pkg.name.name.clone(), td.name.name.clone()))
-                        }
-                        PackageItem::Import(inner) => {
-                            for jj in &inner.items {
-                                if jj.item.is_none() {
-                                    if let Some(Definition::Package(q)) = defs.get(&jj.package.name)
-                                    {
-                                        wildcard_names(q, defs, depth + 1, out);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+    for (name, key) in imports.iter().flat_map(|list| list.iter()) {
+        if let Some(w) = elab.typedefs.get(key).copied()
+            && typedefs_insert_traced(&mut elab.typedefs, "rebind:import", name.clone(), w)
+                != Some(w)
+        {
+            changed = true;
+        }
+        if let Some(t) = elab.typedef_types.get(key).cloned() {
+            elab.typedef_types.insert(name.clone(), t);
+            // §6.18, §26.3: an import binds the whole type, its shape included;
+            // a scalar import clears a displaced shape.
+            if let Some(dims) = elab.typedef_unpacked_dims.get(key).cloned() {
+                elab.typedef_unpacked_dims.insert(name.clone(), dims);
+            } else {
+                elab.typedef_unpacked_dims.remove(name);
             }
-            let names: Vec<(String, String)> = match &ii.item {
-                Some(sym) => vec![(pkg.clone(), sym.name.clone())],
-                None => {
-                    let mut v = Vec::new();
-                    wildcard_names(p, definitions, 0, &mut v);
-                    v
-                }
-            };
-            for (owner, n) in names {
-                let key = format!("{}::{}", owner, n);
-                if let Some(w) = elab.typedefs.get(&key).copied() {
-                    // trace tag "rebind:import" — logs the old width alongside
-                    // the qualified-key width being rebound onto the bare name.
-                    if typedefs_insert_traced(&mut elab.typedefs, "rebind:import", n.clone(), w)
-                        != Some(w)
-                    {
-                        changed = true;
-                    }
-                }
-                if let Some(t) = elab.typedef_types.get(&key).cloned() {
-                    elab.typedef_types.insert(n.clone(), t);
-                    // §6.18 / §26.3: an import binds the whole type, including
-                    // its shape; a scalar import clears any displaced shape.
-                    if let Some(dims) = elab.typedef_unpacked_dims.get(&key).cloned() {
-                        elab.typedef_unpacked_dims.insert(n.clone(), dims);
-                    } else {
-                        elab.typedef_unpacked_dims.remove(&n);
-                    }
-                    if let Some(width) = elab.typedef_elem_widths.get(&key).copied() {
-                        elab.typedef_elem_widths.insert(n.clone(), width);
-                    } else {
-                        elab.typedef_elem_widths.remove(&n);
-                    }
-                }
+            if let Some(width) = elab.typedef_elem_widths.get(key).copied() {
+                elab.typedef_elem_widths.insert(name.clone(), width);
+            } else {
+                elab.typedef_elem_widths.remove(name);
             }
         }
     }
-    // Keep the const-eval snapshot in step, but only when a width actually
-    // moved — this runs per inlined instance and the map is large.
+    // Keep the const-eval snapshot in step when a width moved.
     if changed {
         type_trace_tls_refresh("rebind_import", &elab.typedefs);
         sync_typedefs_tls(&elab.typedefs);
     }
+}
+
+/// Depth of the import chain `wildcard_typedefs` follows.
+const MAX_IMPORT_DEPTH: u32 = 8;
+
+/// The typedefs `import pkg::*` binds: those of `pkg` and, transitively, of
+/// the packages it wildcard-imports. §26.6 passes those on only through
+/// `export`; following them regardless is an extension. A typedef reached by
+/// two paths keeps its last place.
+fn wildcard_typedefs(pkg: &str, definitions: &HashMap<String, Definition>) -> ImportedTypedefs {
+    fn walk(
+        pkg: &str,
+        definitions: &HashMap<String, Definition>,
+        depth: u32,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let Some(Definition::Package(p)) = definitions.get(pkg) else {
+            return;
+        };
+        if depth > MAX_IMPORT_DEPTH {
+            return;
+        }
+        for item in &p.items {
+            match item {
+                PackageItem::Typedef(td) => {
+                    out.push((td.name.name.clone(), format!("{pkg}::{}", td.name.name)))
+                }
+                PackageItem::Import(inner) => {
+                    for ii in inner.items.iter().filter(|ii| ii.item.is_none()) {
+                        walk(&ii.package.name, definitions, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    walk(pkg, definitions, 0, &mut all);
+    // The key names the pair: keep each one's last place.
+    let mut seen = HashSet::default();
+    let keep: Vec<bool> = all
+        .iter()
+        .rev()
+        .map(|(_, key)| seen.insert(key.as_str()))
+        .collect();
+    all.into_iter()
+        .zip(keep.into_iter().rev())
+        .filter_map(|(pair, keep)| keep.then_some(pair))
+        .collect()
 }
 
 /// §26.6: does `pkg` EXPORT symbols coming from `src` (by name or `*::*`)?
@@ -50414,7 +52194,7 @@ fn process_import(
                                             assign.name.name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: assign.name.name.clone(),
+                                                name: assign.name.name.clone().into(),
                                                 width,
                                                 is_signed: signed,
                                                 is_real,
@@ -50484,7 +52264,7 @@ fn process_import(
                                                 nm.clone(),
                                                 Signal {
                                                     is_const: false,
-                                                    name: nm.clone(),
+                                                    name: nm.clone().into(),
                                                     width: base_width,
                                                     is_signed: false,
                                                     is_real: false,
@@ -50621,7 +52401,7 @@ fn process_import(
                                         decl.name.name.clone(),
                                         Signal {
                                             is_const: dd.const_kw,
-                                            name: decl.name.name.clone(),
+                                            name: decl.name.name.clone().into(),
                                             width,
                                             is_signed,
                                             is_real,
@@ -50728,6 +52508,9 @@ fn process_import(
                                 let is_real = is_type_real(data_type);
                                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                 for assign in assignments {
+                                    if elab.local_decl_displaces(&assign.name.name) {
+                                        continue;
+                                    }
                                     if register_visible_array_param(
                                         elab, pkg_name, assign, data_type,
                                     ) {
@@ -50832,7 +52615,7 @@ fn process_import(
                                             assign.name.name.clone(),
                                             Signal {
                                                 is_const: false,
-                                                name: assign.name.name.clone(),
+                                                name: assign.name.name.clone().into(),
                                                 width,
                                                 is_signed: signed,
                                                 is_real,
@@ -51025,7 +52808,7 @@ fn process_import(
                                     decl.name.name.clone(),
                                     Signal {
                                         is_const: dd.const_kw,
-                                        name: decl.name.name.clone(),
+                                        name: decl.name.name.clone().into(),
                                         width,
                                         is_signed,
                                         is_real,
@@ -51107,8 +52890,12 @@ fn process_import(
                     r
                 })?;
             }
-        } else {
-            return Err(format!("Package '{}' not found", pkg_name));
+        } else if pkg_name != "std" {
+            return Err(format!(
+                "Package '{}' not found{}",
+                pkg_name,
+                ignored_library_package_note(pkg_name)
+            ));
         }
     }
     Ok(())
@@ -51132,6 +52919,7 @@ mod logged_map_tests {
                         span,
                     },
                     span,
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
@@ -51230,7 +53018,7 @@ mod logged_map_tests {
         let id = table.ident.0;
         sync_typedefs_tls(&table);
         let seen = table.log.len();
-        let mut older_snapshot = table.map.clone();
+        let mut older_snapshot = (*table.map).clone();
 
         for _ in 0..1000 {
             assert_eq!(table.insert_if_changed("word_t".into(), 8), Some(8));
@@ -51432,6 +53220,36 @@ mod logged_map_tests {
 }
 
 #[cfg(test)]
+mod imported_typedef_tests {
+    /// §26.3, §26.6 (aionhw/xezim#721): each instance binds the typedefs
+    /// its own imports reach, whichever instance came before.
+    #[test]
+    fn each_instance_binds_its_own_imported_typedefs() {
+        let source = "package a; typedef logic [3:0] t; endpackage
+package b; typedef logic [7:0] t; endpackage
+package c; import a::*; export a::*; endpackage
+module via_c; import c::*; t q; endmodule
+module via_b; import b::*; t q; endmodule
+module via_a; import a::t; t q; endmodule
+module top; via_c u0(); via_b u1(); via_c u2(); via_a u3(); via_b u4(); endmodule
+";
+        let (_, design) = crate::parse_and_elaborate_multi(
+            &[source.into()],
+            Some("top"),
+            &[],
+            &["top.sv".into()],
+            &[],
+        )
+        .expect("elaborate imports");
+        let widths: Vec<_> = ["u0.q", "u1.q", "u2.q", "u3.q", "u4.q"]
+            .iter()
+            .map(|n| design.signals[*n].width)
+            .collect();
+        assert_eq!(widths, [4, 8, 4, 4, 8]);
+    }
+}
+
+#[cfg(test)]
 mod generated_instance_tests {
     use super::*;
 
@@ -51453,7 +53271,9 @@ mod generated_instance_tests {
                 "module top; for(genvar {loop_header}) begin: bank mem m(); end endmodule"
             ));
             assert!(result.errors.is_empty(), "{:?}", result.errors);
-            let crate::ast::Description::Module(module) = &result.source.descriptions[0] else {
+            let mut descs = result.source.descriptions;
+            crate::scope_tree::build_design(&mut descs);
+            let crate::ast::Description::Module(module) = &descs[0] else {
                 panic!("missing top");
             };
             let items = collect_effective_items(&module.items, &HashMap::default());
@@ -51583,5 +53403,179 @@ mod package_net_tests {
             );
             assert_eq!(elab.supply_nets.contains("s"), bare_is_net, "{source}");
         }
+    }
+}
+
+#[cfg(test)]
+mod prepared_process_ownership_tests {
+    use super::*;
+
+    /// §23.10/§27.5: prepared environments stay distinct, while identical
+    /// source syntax shares ownership; selecting another branch must differ.
+    #[test]
+    fn different_prepared_keys_share_only_identical_process_sources() {
+        let parsed = crate::parse(
+            "module leaf #(parameter ID=0, SEL=0)(input logic a, output logic y);
+               initial y=ID;
+               if (SEL) begin: chosen initial y=1; end
+               else begin: other initial y=0; end
+             endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        let definitions = HashMap::from_iter([("leaf".to_string(), Definition::Module(module))]);
+        let base = HashMap::default();
+        let scope = param_scope::ParamScope::new(
+            &base, &definitions, &HashMap::default(), &HashMap::default(),
+        );
+        let mut cache = InlineCache::default();
+        let mut prepare = |id, sel| {
+            let params = HashMap::from_iter([
+                ("ID".into(), Value::from_u64(id, 32)),
+                ("SEL".into(), Value::from_u64(sel, 32)),
+            ]);
+            prepare_module_items(definitions["leaf"], &definitions, &params,
+                &HashMap::default(), &mut cache, &scope)
+        };
+        let a = prepare(1, 0);
+        let b = prepare(2, 0);
+        let c = prepare(2, 1);
+        assert_eq!(cache.len(), 3);
+        assert!(!Rc::ptr_eq(&a, &b));
+        let sources = |prepared: &PreparedModuleItems| {
+            prepared.body_sources.iter().filter_map(|body| match body {
+                BodySource::Initial(body, _) => Some(Rc::clone(body)),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        let a = sources(&a);
+        let b = sources(&b);
+        let c = sources(&c);
+        assert_eq!((a.len(), b.len(), c.len()), (2, 2, 2));
+        assert!(Rc::ptr_eq(&a[0], &b[0]));
+        assert!(Rc::ptr_eq(&a[1], &b[1]));
+        assert!(Rc::ptr_eq(&b[0], &c[0]));
+        assert!(!Rc::ptr_eq(&b[1], &c[1]));
+    }
+
+    /// #721, IEEE 1800-2023 §9.2.1/§9.2.2 and §23.6: a prepared process
+    /// retains one complete source tree, while its ordering/scope wrapper and
+    /// name/driver analysis survive. Cache hits and bound-instance copies share
+    /// that source rather than retaining another owned statement tree.
+    #[test]
+    fn prepared_processes_keep_one_body_and_share_it_across_cache_and_bind_copies() {
+        let parsed = crate::parse(
+            "module leaf(input logic a, output logic [31:0] y, output logic q);
+               initial begin : boot y = 8'h2a; y = 3000000000; end
+               always_comb begin : drive q = a; end
+             endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        let original = format!("{:?}", module.items);
+        let definitions = HashMap::from_iter([("leaf".to_string(), Definition::Module(module))]);
+        let params = HashMap::default();
+        let scope = param_scope::ParamScope::new(
+            &params,
+            &definitions,
+            &HashMap::default(),
+            &HashMap::default(),
+        );
+        let mut cache = InlineCache::default();
+        let prepared = prepare_module_items(
+            definitions["leaf"],
+            &definitions,
+            &params,
+            &HashMap::default(),
+            &mut cache,
+            &scope,
+        );
+        assert!(prepared.local_names.contains("boot"));
+        assert!(prepared.local_names.contains("drive"));
+        assert!(prepared.body_driven_ports.contains("y"));
+        assert!(prepared.body_driven_ports.contains("q"));
+        assert!(!prepared.body_driven_ports.contains("a"));
+        let mut sources = Vec::new();
+        for (item, body) in prepared.effective_items.iter().zip(&prepared.body_sources) {
+            let (placeholder, source, expected_len) = match (item, body) {
+                (ModuleItem::InitialConstruct(ic), BodySource::Initial(source, scope)) => {
+                    assert_eq!(&ic.gen_scope, scope);
+                    (&ic.stmt, source, 2)
+                }
+                (ModuleItem::AlwaysConstruct(ac), BodySource::Always(kind, source, scope)) => {
+                    assert_eq!(&ac.kind, kind);
+                    assert_eq!(&ac.gen_scope, scope);
+                    (&ac.stmt, source, 1)
+                }
+                _ => continue,
+            };
+            assert!(
+                matches!(placeholder.kind, StatementKind::Null),
+                "prepared item must not retain a second process tree"
+            );
+            assert_eq!(placeholder.span, source.span);
+            let StatementKind::SeqBlock { stmts, .. } = &source.kind else {
+                panic!("complete named block expected");
+            };
+            assert_eq!(stmts.len(), expected_len);
+            sources.push(Rc::clone(source));
+        }
+        assert_eq!(sources.len(), 2);
+        // §5.7.1: cache ordinary literals in the retained source, but leave
+        // warning-producing unsized decimal literals for their evaluator.
+        let StatementKind::SeqBlock { stmts, .. } = &sources[0].kind else {
+            unreachable!();
+        };
+        for (stmt, expected) in stmts.iter().zip([Some((42, 0, 8)), None]) {
+            let StatementKind::BlockingAssign { rvalue, .. } = &stmt.kind else {
+                panic!("assignment expected");
+            };
+            let ExprKind::Number(NumberLiteral::Integer { cached_val, .. }) = &rvalue.kind else {
+                panic!("integer literal expected");
+            };
+            assert_eq!(cached_val.get(), expected);
+        }
+        let hit = prepare_module_items(
+            definitions["leaf"],
+            &definitions,
+            &params,
+            &HashMap::default(),
+            &mut cache,
+            &scope,
+        );
+        assert!(Rc::ptr_eq(&prepared, &hit));
+        assert_eq!(cache.len(), 1);
+        // §23.11: resolved binds mutate a private prepared wrapper using
+        // make_mut; complete process sources must still be shared.
+        let mut bound = Rc::clone(&prepared);
+        Rc::make_mut(&mut bound);
+        for (old, new) in prepared.body_sources.iter().zip(&bound.body_sources) {
+            match (old, new) {
+                (BodySource::Initial(a, _), BodySource::Initial(b, _))
+                | (BodySource::Always(_, a, _), BodySource::Always(_, b, _)) => {
+                    assert!(Rc::ptr_eq(a, b));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            format!("{:?}", module.items),
+            original,
+            "preparing an instance must not consume or mutate its source definition"
+        );
+        drop(bound);
+        drop(hit);
+        drop(prepared);
+        drop(cache);
+        // Pending processes own Rc handles after the preparation cache dies.
+        assert!(
+            sources
+                .iter()
+                .all(|s| matches!(s.kind, StatementKind::SeqBlock { .. }))
+        );
     }
 }

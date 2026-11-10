@@ -7,6 +7,8 @@
 //! span the parser produces indexes the preprocessed text; this map is what
 //! turns one back into `file:line:col` for a diagnostic.
 
+use std::sync::OnceLock;
+
 use crate::ast::Span;
 use crate::diagnostics::Location;
 
@@ -95,6 +97,53 @@ pub struct LineMap {
     macros: Vec<String>,
     segs: Vec<Seg>,
     columns: Vec<Vec<MacroColumn>>,
+    /// Where each line of the text starts, taken from the first text
+    /// `locate` is given, so that finding a span's line is a binary search
+    /// rather than a count of the newlines before it: a design can locate
+    /// the spans of a cell library once per cell instance (#898).
+    line_starts: OnceLock<LineStarts>,
+}
+
+/// Byte offsets at which the lines of one text start.
+#[derive(Clone)]
+struct LineStarts {
+    /// Length of the text the offsets were taken from.
+    len: usize,
+    starts: Vec<usize>,
+}
+
+impl LineStarts {
+    fn new(text: &str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter(|&(_, b)| b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        LineStarts {
+            len: text.len(),
+            starts,
+        }
+    }
+}
+
+impl std::fmt::Debug for LineStarts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LineStarts({} lines)", self.starts.len())
+    }
+}
+
+/// 0-based line of `text` holding byte `start`, and the byte range of that
+/// line without its newline, found by scanning the text.
+fn line_at_by_scan(text: &str, start: usize) -> (usize, usize, usize) {
+    let line = text.as_bytes()[..start]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    let line_start = text[..start].rfind('\n').map_or(0, |p| p + 1);
+    let line_end = text[start..].find('\n').map_or(text.len(), |p| start + p);
+    (line, line_start, line_end)
 }
 
 impl LineMap {
@@ -139,7 +188,20 @@ impl LineMap {
             macros,
             segs,
             columns,
+            line_starts: OnceLock::new(),
         }
+    }
+
+    /// `line_at_by_scan` by binary search over the line starts. A text of
+    /// another length than the first one located in is scanned instead.
+    fn line_at(&self, text: &str, start: usize) -> (usize, usize, usize) {
+        let index = self.line_starts.get_or_init(|| LineStarts::new(text));
+        if index.len != text.len() {
+            return line_at_by_scan(text, start);
+        }
+        let line = index.starts.partition_point(|&s| s <= start) - 1;
+        let line_end = index.starts.get(line + 1).map_or(text.len(), |&s| s - 1);
+        (line, index.starts[line], line_end)
     }
 
     /// Origin of output line `out` (0-based).
@@ -180,14 +242,9 @@ impl LineMap {
     /// built for) to the original source position.
     pub fn locate(&self, text: &str, span: Span) -> Option<Location> {
         let start = span.start.min(text.len());
-        let out_line = text.as_bytes()[..start]
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count();
+        let (out_line, line_start, line_end) = self.line_at(text, start);
         let o = self.origin(out_line)?;
         let file = self.files.get(o.file as usize)?;
-        let line_start = text[..start].rfind('\n').map_or(0, |p| p + 1);
-        let line_end = text[start..].find('\n').map_or(text.len(), |p| start + p);
         let out_col = text[line_start..start].chars().count() as u32;
         let end = span.end.clamp(start, line_end);
         let len = text[start..end].chars().count().max(1) as u32;
@@ -272,5 +329,81 @@ impl LineMap {
     /// `file:line:col` of `span`, or `None` when the map does not cover it.
     pub fn location_string(&self, text: &str, span: Span) -> Option<String> {
         self.locate(text, span).map(|l| l.short())
+    }
+}
+
+#[cfg(test)]
+mod line_start_tests {
+    use super::{line_at_by_scan, LineMap};
+    use crate::ast::Span;
+    use crate::preprocessor::Preprocessor;
+
+    /// Byte offsets of `text` that start a character, and its end.
+    fn char_offsets(text: &str) -> impl Iterator<Item = usize> + '_ {
+        text.char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+    }
+
+    /// The line found by binary search is the one a scan finds, at every
+    /// offset: line starts, newlines, the end, an empty last line.
+    #[test]
+    fn binary_search_finds_the_scanned_line() {
+        for text in [
+            "",
+            "a",
+            "\n",
+            "\n\n",
+            "ab\ncd",
+            "ab\ncd\n",
+            "a\n\nb\r\n\u{e9}\u{fc}\n  x\n",
+        ] {
+            let map = LineMap::default();
+            for start in char_offsets(text) {
+                assert_eq!(
+                    map.line_at(text, start),
+                    line_at_by_scan(text, start),
+                    "offset {start} of {text:?}"
+                );
+            }
+        }
+    }
+
+    /// `locate` answers as before the index at every offset of a text with
+    /// an include, macros (one spanning lines) and a `line directive: one
+    /// map's index is built from the text, the other's from a text of
+    /// another length, so that it scans.
+    #[test]
+    fn locate_matches_the_scan_at_every_offset() {
+        let dir =
+            std::env::temp_dir().join(format!("sv-parser-line-starts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inc = dir.join("inc.svh");
+        std::fs::write(&inc, "wire from_inc;\n`define TWO(a) a + \\\n  a\n").unwrap();
+        let top = dir.join("top.sv");
+        let src = format!(
+            "`include \"{}\"\n`define W 8\nmodule top;\n  logic [`W-1:0] d;\n  \
+             initial d = `TWO(3);\n`line 40 \"other.sv\" 0\n  wire \u{e9}t\u{e9};\nendmodule\n",
+            inc.display()
+        );
+        let mut pp = Preprocessor::new();
+        let text = pp.preprocess_file(&src, Some(&top));
+        let indexed = pp.take_line_map().expect("line map");
+        let scanned = indexed.clone();
+        let longer = format!("{text} ");
+        let _ = scanned.locate(&longer, Span::new(0, 0));
+        let _ = indexed.locate(&text, Span::new(0, 0));
+        for start in char_offsets(&text) {
+            let end = (start + 3..=text.len())
+                .find(|&e| text.is_char_boundary(e))
+                .unwrap_or(text.len());
+            let span = Span::new(start, end);
+            assert_eq!(
+                indexed.locate(&text, span),
+                scanned.locate(&text, span),
+                "offset {start} of:\n{text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

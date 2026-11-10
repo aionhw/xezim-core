@@ -5,7 +5,6 @@ use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral
 use crate::ast::stmt::*;
 use crate::ast::types::{DataType, Lifetime, SimpleType};
 use crate::lexer::token::TokenKind;
-use std::cell::Cell;
 use std::collections::HashMap;
 
 impl Parser {
@@ -143,6 +142,7 @@ impl Parser {
                     let declarators: Vec<VarDeclarator> = assignments
                         .into_iter()
                         .map(|a| VarDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             name: a.name,
                             dimensions: a.dimensions,
                             init: a.init,
@@ -327,6 +327,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -356,16 +357,8 @@ impl Parser {
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::DisableFork, self.span_from(start))
                 } else {
-                    // §9.6.2: the disable target may be a HIERARCHICAL block or
-                    // task name (`disable top.be_name`). Runtime resolution is by
-                    // the block LABEL (the leaf), so consume the dotted path and
-                    // keep its last segment. Previously a `.` after the first
-                    // identifier errored ("expected Semicolon, found Dot").
-                    let mut name = self.parse_identifier();
-                    while self.at(TokenKind::Dot) {
-                        self.bump();
-                        name = self.parse_identifier();
-                    }
+                    // §9.6.2: a task or block name, possibly hierarchical.
+                    let name = self.parse_hierarchical_identifier();
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::Disable(name), self.span_from(start))
                 }
@@ -801,6 +794,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -843,6 +837,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -887,6 +882,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -940,6 +936,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -1020,6 +1017,7 @@ impl Parser {
                         None
                     };
                     declarators.push(VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
                         init,
@@ -2262,7 +2260,7 @@ impl Parser {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: delay.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 );
@@ -2494,7 +2492,7 @@ impl Parser {
                 signed: true,
                 base: NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         );
@@ -2531,6 +2529,7 @@ impl Parser {
 
     fn parse_rs_seq(&mut self) -> RsSeq {
         let mut items = Vec::new();
+        let mark = self.rs_values.len();
         loop {
             match self.current_kind() {
                 TokenKind::BitOr
@@ -2545,8 +2544,12 @@ impl Parser {
                 _ => {}
             }
             let item = self.parse_rs_prod();
+            if let RsProd::Ref(name, _) = &item {
+                self.rs_values.push(name.clone());
+            }
             items.push(item);
         }
+        self.rs_values.truncate(mark);
         RsSeq { items }
     }
 
@@ -2774,7 +2777,7 @@ fn expand_alt(prods: &ProdMap, alt: &RsAlt, depth: &mut u32, span: crate::ast::S
                 signed: true,
                 base: NumberBase::Decimal,
                 value: "1".into(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             sp,
         )
@@ -2819,6 +2822,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
             let mut stmts: Vec<Statement> = Vec::new();
             for ((dt, pname), arg) in params.iter().zip(args.iter()) {
                 let declarator = VarDeclarator {
+                    decl: crate::ast::binding::Bound::UNSET,
                     name: crate::ast::Identifier {
                         name: pname.clone(),
                         span,
