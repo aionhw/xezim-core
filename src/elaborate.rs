@@ -24847,10 +24847,17 @@ fn prebind_bits_of_signals(
                 if signals.contains_key(&dotted) || params.contains_key(&dotted) {
                     return None;
                 }
-                typedefs
-                    .get(&dotted)
-                    .or_else(|| typedefs.get(&parts.join("::")))
-                    .copied()
+                // §20.6.2: the width table holds an unpacked typedef's
+                // element width; $bits includes all of its dimensions.
+                typedef_unpacked_bits(&dotted, Some(params))
+                    .or_else(|| typedef_unpacked_bits(&parts.join("::"), Some(params)))
+                    .and_then(|w| u32::try_from(w).ok())
+                    .or_else(|| {
+                        typedefs
+                            .get(&dotted)
+                            .or_else(|| typedefs.get(&parts.join("::")))
+                            .copied()
+                    })
             });
             // §7.4.5: an element or slice of a declared variable (see
             // `decl_select_bits`) before the signal table's element width.
