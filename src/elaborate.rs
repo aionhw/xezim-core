@@ -47554,13 +47554,23 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
             by_net.entry(n.as_str()).or_default().push((*lo, *hi, true));
         }
     }
+    // §6.6.5: every bit of a tri0 or tri1 net resolves against the net's
+    // implicit pull, which the whole-net fold supplies; a select driver left
+    // per-select kept its z bits, and the bits no select drives, at z.
+    let pulled = |n: &str| {
+        matches!(
+            elab.resolved_net_kinds.get(n),
+            Some(ResolvedNetKind::Tri0 | ResolvedNetKind::Tri1)
+        )
+    };
     let widen: HashSet<String> = by_net
         .into_iter()
-        .filter(|(_, v)| {
+        .filter(|(n, v)| {
             v.iter().any(|s| s.2)
-                && v.iter()
-                    .enumerate()
-                    .any(|(i, a)| v[i + 1..].iter().any(|b| a.0 <= b.1 && b.0 <= a.1))
+                && (pulled(n)
+                    || v.iter()
+                        .enumerate()
+                        .any(|(i, a)| v[i + 1..].iter().any(|b| a.0 <= b.1 && b.0 <= a.1)))
         })
         .map(|(n, _)| n.to_string())
         .collect();
