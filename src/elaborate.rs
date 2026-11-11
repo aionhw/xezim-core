@@ -42554,6 +42554,10 @@ fn inline_module_items(
                                 .map(|f| (f.width, f.is_real, f.type_name.clone()));
                             if let Some((fw, freal, ftn)) = formal {
                                 if fw > 1 || freal {
+                                    // §4.1: nettype name the shaped actual
+                                    // adopts, captured before `ftn` moves into
+                                    // the base signal below.
+                                    let ftn_leaves = ftn.clone();
                                     if let Some(asig) = elab.signals.get_mut(&an) {
                                         if asig.width <= 1 && !asig.is_real {
                                             asig.width = fw;
@@ -42591,6 +42595,32 @@ fn inline_module_items(
                                                 span: Span::new(0, 0),
                                             },
                                         );
+                                    }
+                                    // §6.6.7/§7.2: a nettype over an UNPACKED
+                                    // STRUCT is stored per member — the sub-
+                                    // module declaration path creates real
+                                    // member leaves (`d.o.V`, `d.o.I`) for the
+                                    // formal, so a read of `d.o.V` is a real
+                                    // leaf. A typeless interconnect bound to it
+                                    // adopted the packed 128-bit whole signal
+                                    // but got NO member leaves, so the member-
+                                    // wise connect assigns (`w.V = d.o.V`)
+                                    // wrote into bit-selects of the packed
+                                    // storage and read back nan (#1040). Give
+                                    // the interconnect the same member leaves.
+                                    if let Some(tn) = ftn_leaves.as_deref() {
+                                        let resolved = elab.typedef_types.get(tn).map(|sdt| {
+                                            resolve_typedef_chain(sdt, &elab.typedef_types).clone()
+                                        });
+                                        if let Some(r) = &resolved
+                                            && matches!(
+                                                &r,
+                                                DataType::Struct(su)
+                                                    if !su.packed && !su.members.is_empty()
+                                            )
+                                        {
+                                            register_unpacked_aggregate(elab, &an, r);
+                                        }
                                     }
                                 }
                             }
