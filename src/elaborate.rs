@@ -53679,3 +53679,197 @@ mod prepared_process_ownership_tests {
     }
 }
 
+#[cfg(test)]
+mod prepared_callable_ownership_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn module_items(source: &str) -> Vec<ModuleItem> {
+        let parsed = crate::parse(source);
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        module.items.clone()
+    }
+
+    fn callable_bodies(items: &[ModuleItem]) -> Vec<Arc<Vec<Statement>>> {
+        let mut bodies = Vec::new();
+        for item in items {
+            match item {
+                ModuleItem::FunctionDeclaration(f) => bodies.push(Arc::clone(f.items.as_arc())),
+                ModuleItem::TaskDeclaration(t) => bodies.push(Arc::clone(t.items.as_arc())),
+                ModuleItem::ClassDeclaration(c) => {
+                    for item in &c.items {
+                        if let crate::ast::decl::ClassItem::Method(m) = item {
+                            match &m.kind {
+                                crate::ast::decl::ClassMethodKind::Function(f)
+                                | crate::ast::decl::ClassMethodKind::PureVirtual(f)
+                                | crate::ast::decl::ClassMethodKind::Extern(f) => {
+                                    bodies.push(Arc::clone(f.items.as_arc()));
+                                }
+                                crate::ast::decl::ClassMethodKind::Task(t) => {
+                                    bodies.push(Arc::clone(t.items.as_arc()));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        bodies
+    }
+
+    /// §13.3/§13.4 and §23.10: unrelated parameter bindings must not copy
+    /// subroutine syntax without foldable declarations into every prepared instance.
+    #[test]
+    fn dimension_fold_keeps_unchanged_callable_bodies_shared() {
+        let original = module_items(
+            "module leaf #(parameter ID=0);
+               function int f(input int a); if (a) return a+1; else return 0; endfunction
+               task t(input int a); begin repeat (2) $display(a); end endtask
+               function int scalar(input int a);
+                 int acc; localparam ID=3; acc=a+ID; return acc;
+               endfunction
+               class C;
+                 function int f(input int a); return a+2; endfunction
+                 task t(input int a); $display(a); endtask
+               endclass
+             endmodule",
+        );
+        let source_bodies = callable_bodies(&original);
+        assert_eq!(source_bodies.len(), 5);
+        for id in [1, 7, 123] {
+            let mut prepared = original.clone();
+            literalize_stmt_decl_dims(
+                &mut prepared,
+                &HashMap::from_iter([("ID".into(), Value::from_u64(id, 32))]),
+            );
+            for (source, body) in source_bodies.iter().zip(callable_bodies(&prepared)) {
+                assert!(Arc::ptr_eq(source, &body), "unchanged body was copied");
+            }
+        }
+    }
+
+    /// §6.20.2/§6.20.4: a shared body containing declarations still folds
+    /// instance widths independently and respects a block's shadowing binding.
+    #[test]
+    fn dimension_fold_copies_declarations_and_preserves_lexical_bindings() {
+        let original = module_items(
+            "module leaf #(parameter DW=1);
+               function int f();
+                 logic [DW-1:0] outer_value;
+                 begin : nested
+                   localparam DW=5;
+                   logic [DW-1:0] inner_value;
+                 end
+                 return 0;
+               endfunction
+             endmodule",
+        );
+        let source_bodies = callable_bodies(&original);
+        let original_debug = format!("{:?}", original);
+        for width in [12, 65] {
+            let mut prepared = original.clone();
+            literalize_stmt_decl_dims(
+                &mut prepared,
+                &HashMap::from_iter([("DW".into(), Value::from_u64(width, 32))]),
+            );
+            let bodies = callable_bodies(&prepared);
+            assert!(!Arc::ptr_eq(&source_bodies[0], &bodies[0]));
+            let body = &bodies[0];
+            let StatementKind::VarDecl { data_type, .. } = &body[0].kind else {
+                panic!("outer declaration expected");
+            };
+            assert_eq!(resolve_type_width(data_type, None, None), width as u32);
+            let StatementKind::SeqBlock { stmts, .. } = &body[1].kind else {
+                panic!("nested block expected");
+            };
+            let StatementKind::VarDecl { data_type, .. } = &stmts[1].kind else {
+                panic!("inner declaration expected");
+            };
+            assert_eq!(resolve_type_width(data_type, None, None), 5);
+        }
+        assert_eq!(format!("{:?}", original), original_debug);
+    }
+
+    /// §6.18/§6.20.2 and §9/§12: declaration discovery must reach nested
+    /// control-flow bodies, including typedefs that need instance widths.
+    #[test]
+    fn dimension_fold_finds_nested_task_declarations_and_typedefs() {
+        for wrapper in [
+            "begin BODY end",
+            "fork BODY join",
+            "#1 BODY",
+            "wait (1) BODY",
+            "if (1) BODY",
+            "if (0) ; else BODY",
+            "for (int i=0;i<1;i++) BODY",
+            "foreach (a[i]) BODY",
+            "while (0) BODY",
+            "do BODY while (0);",
+            "repeat (1) BODY",
+            "forever BODY",
+            "case (1) 1: BODY endcase",
+        ] {
+            for declaration in ["word_t value;", "typedef logic [DW-1:0] local_t;"] {
+                let nested = wrapper.replace("BODY", &format!("begin {declaration} end"));
+                let original = module_items(&format!(
+                    "module leaf #(parameter DW=1);
+                       typedef logic [DW-1:0] word_t;
+                       int a[2];
+                       task t(); {nested} endtask
+                     endmodule"
+                ));
+                let source_body = callable_bodies(&original).remove(0);
+                for width in [12, 65] {
+                    let mut prepared = original.clone();
+                    literalize_stmt_decl_dims(
+                        &mut prepared,
+                        &HashMap::from_iter([("DW".into(), Value::from_u64(width, 32))]),
+                    );
+                    let body = callable_bodies(&prepared).remove(0);
+                    assert!(!Arc::ptr_eq(&source_body, &body), "{wrapper}");
+                    fn declared_width(s: &Statement) -> Option<u32> {
+                        match &s.kind {
+                            StatementKind::VarDecl { data_type, .. } => {
+                                Some(resolve_type_width(data_type, None, None))
+                            }
+                            StatementKind::Typedef(td) => {
+                                Some(resolve_type_width(&td.data_type, None, None))
+                            }
+                            StatementKind::SeqBlock { stmts, .. }
+                            | StatementKind::ParBlock { stmts, .. } => {
+                                stmts.iter().find_map(declared_width)
+                            }
+                            StatementKind::TimingControl { stmt, .. }
+                            | StatementKind::Wait { stmt, .. } => declared_width(stmt),
+                            StatementKind::If {
+                                then_stmt,
+                                else_stmt,
+                                ..
+                            } => declared_width(then_stmt)
+                                .or_else(|| else_stmt.as_ref().and_then(|s| declared_width(s))),
+                            StatementKind::For { body, .. }
+                            | StatementKind::Foreach { body, .. }
+                            | StatementKind::While { body, .. }
+                            | StatementKind::DoWhile { body, .. }
+                            | StatementKind::Repeat { body, .. }
+                            | StatementKind::Forever { body, .. } => declared_width(body),
+                            StatementKind::Case { items, .. } => {
+                                items.iter().find_map(|it| declared_width(&it.stmt))
+                            }
+                            _ => None,
+                        }
+                    }
+                    assert_eq!(
+                        body.iter().find_map(declared_width),
+                        Some(width as u32),
+                        "{wrapper}"
+                    );
+                }
+            }
+        }
+    }
+}
