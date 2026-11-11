@@ -47805,12 +47805,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 &p.ctx.local_names,
                 &p.ctx.interface_map,
             );
-            // §6.6.1: a bit/part-select driver drives its base net, so it
-            // counts toward that net's multi-driver total just like a
-            // whole-net driver. `ident_flat_name` returns None for a select
-            // (`n[3]`), which hid every sub-module select from the fold below
-            // and left only the first select of each bit applied (#1062).
-            ident_flat_name(&lhs).or_else(|| cont_assign_net_span(&lhs, elab).map(|(n, _, _)| n))
+            ident_flat_name(&lhs)
         })
         .collect();
     for n in pending_lhs.iter().flatten() {
