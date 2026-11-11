@@ -42539,7 +42539,14 @@ fn inline_module_items(
                     // the nettype name the §6.6.7 resolver machinery keys on).
                     // A dimensioned interconnect (width > 1) keeps its
                     // declared width, per the declaration's own constraint.
-                    if let Some(an) = whole_net_ident_name(parent_expr) {
+                    // An ARRAY element actual (`iBus[1]`) is a select, not a
+                    // whole-net ident, so `whole_net_ident_name` returns None;
+                    // fall back to its base so the typeless interconnect
+                    // array adopts the width/realness of the element it is
+                    // bound to (§6.6.8).
+                    if let Some(an) = whole_net_ident_name(parent_expr)
+                        .or_else(|| interconnect_array_base_name(parent_expr))
+                    {
                         if elab.interconnect_nets.contains(&an) {
                             let formal = elab
                                 .signals
@@ -42560,6 +42567,30 @@ fn inline_module_items(
                                                 Value::all_z(fw)
                                             };
                                         }
+                                    }
+                                    // §6.6.8: the interconnect ARRAY's
+                                    // per-element storage must match the
+                                    // shaped element width/realness too —
+                                    // `arrays[an]` still says elem_w=1 for a
+                                    // typeless interconnect array, so a real
+                                    // element (`iBus[1] = r1.out`) truncated to
+                                    // one bit even after the base was shaped
+                                    // (#1039). Bump the element width/realness
+                                    // to the formal's, mirroring a
+                                    // nettype-typed array (`realNet a[0:1]`
+                                    // registers elem_w=64).
+                                    if let Some((_, _, ew)) = elab.arrays.get_mut(&an) {
+                                        if *ew < fw {
+                                            *ew = fw;
+                                        }
+                                    }
+                                    if freal {
+                                        elab.var_decl_types.entry(an.clone()).or_insert_with(
+                                            || DataType::Real {
+                                                kind: RealType::Real,
+                                                span: Span::new(0, 0),
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -49197,6 +49228,20 @@ fn whole_net_ident_name(expr: &Expression) -> Option<String> {
                     .collect::<Vec<_>>()
                     .join("."),
             )
+        }
+        _ => None,
+    }
+}
+
+/// The base interconnect name of an ELEMENT select (`iBus[1]`, `m.ic[2]`) —
+/// used to shape a typeless `interconnect` ARRAY from a typed ELEMENT that
+/// drives (or reads) a single member. `whole_net_ident_name` deliberately
+/// returns None for an index/select because a select is a separate object;
+/// here the SIZE/realness has to live on the base array net itself.
+fn interconnect_array_base_name(expr: &Expression) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+            whole_net_ident_name(base)
         }
         _ => None,
     }
