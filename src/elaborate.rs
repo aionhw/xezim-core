@@ -845,6 +845,12 @@ pub struct PendingContAssign {
     pub lhs_source: std::rc::Rc<Expression>,
     pub rhs_source: std::rc::Rc<Expression>,
     pub ctx: std::rc::Rc<RewriteCtx>,
+    /// §10.3.1 / §21.2.1.5 drive strength (`(weak0, weak1)`, …) of the
+    /// source `assign`; wrapped into the `$__weak`/`$__pull`/… marker at
+    /// materialize time, exactly as the top-module path does. Dropping it
+    /// left an inlined sub-module driver with no strength marker, so it was
+    /// folded as STRONG against the net's other drivers (#1063).
+    pub strength: Option<String>,
     /// `assign #N ...` delay expression, unevaluated: parameters it names
     /// resolve per-instance, so it is rewritten with `ctx` and evaluated at
     /// materialize time against the flattened parameter table. Dropping it
@@ -978,6 +984,20 @@ impl PendingContAssign {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        // §10.3.1 / §21.2.1.5: apply the drive-strength marker, exactly as
+        // the top-module copy at the `ModuleItem::ContinuousAssign` sites
+        // does. Without this an inlined sub-module driver arrived WITHOUT a
+        // marker and `resolve_multi_driver_nets` folded it as STRONG, so a
+        // `(weak0, weak1)` pull lost to—and fought—the net's real driver
+        // (#1063).
+        let rhs = match self.strength.as_deref().and_then(strength_marker) {
+            Some((marker, code)) => make_syscall(
+                marker,
+                vec![rhs.clone(), strength_code_literal(code, rhs.span)],
+                rhs.span,
+            ),
+            None => rhs,
+        };
         let eval_delay = |src: &Option<std::rc::Rc<Expression>>| -> Option<u64> {
             src.as_ref().map(|d| {
                 let d = rewrite_expr(
@@ -43660,6 +43680,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    strength: ca_item.strength.clone(),
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: delay_off_rc.clone(),
@@ -43707,6 +43728,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    strength: None,
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: None,
@@ -43734,6 +43756,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::new(new_lhs),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    strength: None,
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: delay_off_rc.clone(),
