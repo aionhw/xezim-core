@@ -1086,3 +1086,24 @@ fn net_declaration_strength_pairs_survive_parsing() {
         assert_eq!(net.strength.as_deref(), Some(pair));
     }
 }
+
+/// aionhw/xezim-core#191: the reference census lives as long as the
+/// compilation sessions that fed it. An inner session ending leaves the names
+/// of the one still running; the last one releases them.
+#[test]
+fn reference_census_ends_with_its_last_session() {
+    let has = || {
+        crate::reference_census()
+            .dotted
+            .contains("zq_census_probe_191")
+    };
+    let outer = crate::census_session();
+    {
+        let _inner = crate::census_session();
+        let result = parse("module m; initial top.zq_census_probe_191 = 1; endmodule");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+    assert!(has(), "the outer session still needs the census");
+    drop(outer);
+    assert!(!has(), "the last session releases the census");
+}
