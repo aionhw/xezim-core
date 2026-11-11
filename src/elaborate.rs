@@ -53848,6 +53848,80 @@ mod prepared_callable_ownership_tests {
         }
     }
 
+    /// §7.4/§13.4: fixed local dimensions must not copy a shared body.
+    #[test]
+    fn dimension_fold_keeps_name_free_local_dimensions_shared() {
+        let original = module_items(
+            "module leaf #(parameter ID=0);
+               function int f(input int value);
+                 logic [31:0] a;
+                 logic [8*4-1:0] b;
+                 int c[4]; int d[0:2+1]; int dyn[]; int q[$];
+                 a=value; b=a; return b;
+               endfunction
+               task t(); typedef logic [15:0] local_t; endtask
+               class C;
+                 function int f(input int value);
+                   logic [31:0] a[4]; return value;
+                 endfunction
+               endclass
+             endmodule",
+        );
+        let source_bodies = callable_bodies(&original);
+        assert_eq!(source_bodies.len(), 3);
+        for id in [1, 7, 123] {
+            let mut prepared = original.clone();
+            literalize_stmt_decl_dims(
+                &mut prepared,
+                &HashMap::from_iter([("ID".into(), Value::from_u64(id, 32))]),
+            );
+            for (source, body) in source_bodies.iter().zip(callable_bodies(&prepared)) {
+                assert!(
+                    Arc::ptr_eq(source, &body),
+                    "fixed local dimensions were copied"
+                );
+            }
+        }
+    }
+
+    /// §7.4/§6.20.2: named unpacked dimensions still fold per instance.
+    #[test]
+    fn dimension_fold_preserves_named_unpacked_dimensions() {
+        let original = module_items(
+            "module leaf #(parameter N=1);
+               task t(); int a[N+0]; int b[N-1:0]; endtask
+             endmodule",
+        );
+        let source_body = callable_bodies(&original).remove(0);
+        for size in [3, 7] {
+            let mut prepared = original.clone();
+            literalize_stmt_decl_dims(
+                &mut prepared,
+                &HashMap::from_iter([("N".into(), Value::from_u64(size, 32))]),
+            );
+            let body = callable_bodies(&prepared).remove(0);
+            assert!(!Arc::ptr_eq(&source_body, &body));
+            for (index, stmt) in body.iter().enumerate() {
+                let StatementKind::VarDecl { declarators, .. } = &stmt.kind else {
+                    panic!("local declaration expected");
+                };
+                match &declarators[0].dimensions[0] {
+                    UnpackedDimension::Expression { expr, .. } if index == 0 => {
+                        assert_eq!(const_eval_i64_with_params(expr, None), Some(size as i64));
+                    }
+                    UnpackedDimension::Range { left, right, .. } if index == 1 => {
+                        assert_eq!(
+                            const_eval_i64_with_params(left, None),
+                            Some(size as i64 - 1)
+                        );
+                        assert_eq!(const_eval_i64_with_params(right, None), Some(0));
+                    }
+                    _ => panic!("unpacked dimension expected"),
+                }
+            }
+        }
+    }
+
     /// §6.20.2/§6.20.4: a shared body containing declarations still folds
     /// instance widths independently and respects a block's shadowing binding.
     #[test]
