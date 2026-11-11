@@ -1157,6 +1157,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     ),
     String,
 > {
+    let _census_session = sv_parser::census_session();
     let mut pre = pre.filter(|p| p.matches(sources, source_files, include_dirs, defines));
     if let Some(p) = pre.as_ref() {
         if p.default_nettype_none {
