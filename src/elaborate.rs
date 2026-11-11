@@ -47404,7 +47404,13 @@ fn cont_assign_net_span(lhs: &Expression, elab: &ElaboratedModule) -> Option<(St
 /// whole-net fold below resolves the shared bits and passes the rest through.
 /// Nets whose select drivers are disjoint keep their per-select assigns.
 fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
-    let spans: Vec<Option<(String, u32, u32)>> = elab
+    // Compute each materialized driver's net span, and the same for LAZY
+    // sub-module drivers without materializing them: a future instance whose
+    // body sits in `pending_cont_assign` (bit/part selects on `n` inside a
+    // child module) is invisible to a scan of `elab.continuous_assigns`, so
+    // an overlapping-select net driven only from a sub-module was never
+    // widened and its overlapping selects stayed per-bit (#1062).
+    let materialized_spans: Vec<Option<(String, u32, u32)>> = elab
         .continuous_assigns
         .iter()
         .map(|ca| {
@@ -47419,8 +47425,29 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
             }
         })
         .collect();
+    let mut pending_spans: Vec<Option<(String, u32, u32)>> =
+        Vec::with_capacity(elab.pending_cont_assign.len());
+    for p in &elab.pending_cont_assign {
+        let lhs = rewrite_expr(
+            &p.lhs_source,
+            &p.ctx.prefix,
+            &p.ctx.port_map,
+            &p.ctx.local_names,
+            &p.ctx.interface_map,
+        );
+        let span = if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) || ident_flat_name(&lhs).is_some_and(|n| elab.nets.contains(&n))
+        {
+            cont_assign_net_span(&lhs, elab)
+        } else {
+            None
+        };
+        pending_spans.push(span);
+    }
     let mut by_net: HashMap<&str, Vec<(u32, u32, bool)>> = HashMap::default();
-    for (s, ca) in spans.iter().zip(&elab.continuous_assigns) {
+    for (s, ca) in materialized_spans.iter().zip(&elab.continuous_assigns) {
         if let Some((n, lo, hi)) = s {
             let is_select = !matches!(
                 ca.lhs.kind,
@@ -47430,6 +47457,13 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
                 .entry(n.as_str())
                 .or_default()
                 .push((*lo, *hi, is_select));
+        }
+    }
+    // Pending assigns count toward a net's driver roster (a select is
+    // always a select) even though we do not widen them here yet.
+    for s in &pending_spans {
+        if let Some((n, lo, hi)) = s {
+            by_net.entry(n.as_str()).or_default().push((*lo, *hi, true));
         }
     }
     let widen: HashSet<String> = by_net
@@ -47445,6 +47479,35 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     if widen.is_empty() {
         return;
     }
+    // A pending driver on a widen net must join the materialized roster so
+    // the widening below (and the whole-net fold that follows) sees every
+    // driver of the net, not only the first select.
+    if !elab.pending_cont_assign.is_empty() {
+        let mut pending = std::mem::take(&mut elab.pending_cont_assign);
+        for (p, s) in pending.drain(..).zip(pending_spans) {
+            if s.is_some_and(|(n, _, _)| widen.contains(&n)) {
+                elab.continuous_assigns
+                    .push(p.materialize(&elab.parameters));
+            } else {
+                elab.pending_cont_assign.push(p);
+            }
+        }
+    }
+    let spans: Vec<Option<(String, u32, u32)>> = elab
+        .continuous_assigns
+        .iter()
+        .map(|ca| {
+            if matches!(
+                ca.lhs.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            ) || ident_flat_name(&ca.lhs).is_some_and(|n| elab.nets.contains(&n))
+            {
+                cont_assign_net_span(&ca.lhs, elab)
+            } else {
+                None
+            }
+        })
+        .collect();
     let z_fill = make_z_fill;
     for (ca, s) in elab.continuous_assigns.iter_mut().zip(spans) {
         let Some((n, lo, hi)) = s else { continue };
@@ -47637,7 +47700,12 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 &p.ctx.local_names,
                 &p.ctx.interface_map,
             );
-            ident_flat_name(&lhs)
+            // §6.6.1: a bit/part-select driver drives its base net, so it
+            // counts toward that net's multi-driver total just like a
+            // whole-net driver. `ident_flat_name` returns None for a select
+            // (`n[3]`), which hid every sub-module select from the fold below
+            // and left only the first select of each bit applied (#1062).
+            ident_flat_name(&lhs).or_else(|| cont_assign_net_span(&lhs, elab).map(|(n, _, _)| n))
         })
         .collect();
     for n in pending_lhs.iter().flatten() {
