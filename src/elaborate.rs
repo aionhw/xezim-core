@@ -43842,7 +43842,9 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::new(new_lhs),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
-                                    strength: None,
+                                    // §6.7: `wire (weak0, weak1) w = v;`
+                                    // drives with the declaration's strength.
+                                    strength: nd.strength.clone(),
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: delay_off_rc.clone(),
@@ -47689,6 +47691,23 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 {
                     ca.lhs = make_ident_expr(&bare);
                 }
+            }
+        }
+    }
+    // §28.12: a driver with a strength inside an instance joins the roster
+    // now, so its net records the strength for `%v` like a top-level one.
+    if elab
+        .pending_cont_assign
+        .iter()
+        .any(|p| p.strength.is_some())
+    {
+        let pending = std::mem::take(&mut elab.pending_cont_assign);
+        for p in pending {
+            if p.strength.is_some() {
+                let ca = p.materialize(&elab.parameters);
+                elab.continuous_assigns.push(ca);
+            } else {
+                elab.pending_cont_assign.push(p);
             }
         }
     }
