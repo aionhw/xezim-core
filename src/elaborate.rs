@@ -439,9 +439,10 @@ pub struct ContinuousAssignment {
     pub delay_fall: Option<u64>,
     /// §10.3.3 turn-off delay (transition to z).
     pub delay_off: Option<u64>,
-    /// §28.16 fall value retained for splitting an eager primitive driver.
-    /// Separate from `delay_fall`: unsplit, tristate and zero-rise primitives
-    /// must keep their existing runtime path, including net-delay lowering.
+    /// §28.16 fall value of the primitive this assignment was lowered from,
+    /// kept for the split of a net's drivers into a stage each. Separate from
+    /// `delay_fall`: a primitive that stays the only driver of its net keeps
+    /// its fall delay in `gate_fall_delays`, including net-delay lowering.
     pub gate_delay_fall: Option<u64>,
     /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
     /// inline time — its RHS names live in the PARENT scope by
@@ -3720,10 +3721,9 @@ pub struct ElaboratedModule {
     #[serde(default)]
     pub resolved_net_kinds: HashMap<String, ResolvedNetKind>,
     /// §28.16 primitive fall delays, keyed by the driven signal (the private
-    /// driver stage for an eligible split net). Tristate and zero-rise
-    /// primitive nets retain the legacy public entry. This map also lets the
-    /// runtime apply primitive delay-mode overrides. Only differing rise/fall
-    /// values are recorded.
+    /// driver stage where a net's drivers were split). This map also lets
+    /// the runtime apply primitive delay-mode overrides. Only differing
+    /// rise/fall values are recorded.
     #[serde(default)]
     pub gate_fall_delays: HashMap<String, u64>,
     /// Nets driven by a lowered GATE PRIMITIVE (`buf`, `and`, …), by name.
@@ -47493,6 +47493,15 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
 /// switches): elaboration lowers each to `ctl ? data : 'z` and marks it as
 /// synthesized (no `origin`). Returns `(ctl, data)`. A user-written `assign
 /// w = en ? d : 'z` has an origin and keeps the ordinary `?:` semantics.
+/// §10.3.3, §28.16: does this driver delay its own transitions? A primitive
+/// with a zero rise delay and a fall delay (`buf #(0, 5)`) does.
+fn cont_assign_has_own_delay(ca: &ContinuousAssignment) -> bool {
+    ca.delay != 0
+        || ca.delay_fall.is_some()
+        || ca.delay_off.is_some()
+        || ca.gate_delay_fall.is_some_and(|f| f != 0)
+}
+
 fn gate_tristate_parts(ca: &ContinuousAssignment) -> Option<(&Expression, &Expression)> {
     if ca.origin.is_some() {
         return None;
@@ -48010,6 +48019,15 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         set_undriven_z(elab);
         return;
     }
+    // §28.12: the single-driver entries recorded above are per NET, so with
+    // several tristate primitives the last one stood for the whole net. The
+    // fold below records the drivers of a resolved net afresh where their
+    // strengths matter; without this a net whose tristate drivers all moved
+    // to delayed stages kept that one entry, and read as that one primitive,
+    // undelayed, with every other driver ignored.
+    for n in &multi {
+        elab.strength_drivers.remove(n);
+    }
     if pending_lhs
         .iter()
         .any(|n| n.as_ref().is_some_and(|n| multi.contains(n)))
@@ -48038,7 +48056,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         if let Some(n) = ident_flat_name(&ca.lhs).filter(|n| !hier && multi.contains(n)) {
             let e = fold_drivers.entry(n).or_insert((0, false));
             e.0 += 1;
-            e.1 |= ca.delay != 0 || ca.delay_fall.is_some() || ca.delay_off.is_some();
+            e.1 |= cont_assign_has_own_delay(ca);
         }
     }
     let split_delays: HashSet<String> = fold_drivers
@@ -48046,21 +48064,13 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         .filter(|(_, (count, delayed))| *count > 1 && *delayed)
         .map(|(n, _)| n)
         .collect();
-    // §28.6/§28.7/§28.9 / §28.12: tristate strength descriptors still
-    // read raw data/control rather than the private stage. Keep the entire
-    // net on its existing path, including its public fall entry. Zero-rise
-    // primitive scheduling is also outside this change.
-    let legacy_gate_nets: HashSet<String> = all
-        .iter()
-        .filter(|ca| gate_tristate_parts(ca).is_some() || (ca.origin.is_none() && ca.delay == 0))
-        .filter_map(|ca| ident_flat_name(&ca.lhs))
-        .collect();
-    // §28.16: move only existing public entries. Pending child primitives
-    // already carry ordinary fall fields on main; preserve their delay-mode
-    // behavior instead of adding an override only to their split stages.
+    // §28.16: a primitive's fall delay is recorded under the net it drives.
+    // Where the net's drivers get a stage each, that entry moves to the
+    // primitive's own stage — a tristate, MOS or zero-rise primitive
+    // included — so the net itself is no longer delayed by one of them.
     let split_gate_delays: HashSet<String> = split_delays
         .iter()
-        .filter(|n| !legacy_gate_nets.contains(*n) && elab.gate_fall_delays.contains_key(*n))
+        .filter(|n| elab.gate_fall_delays.contains_key(*n))
         .cloned()
         .collect();
     for name in &split_gate_delays {
@@ -48119,9 +48129,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             continue;
         };
         let mut ca = ca;
-        if split_delays.contains(&name)
-            && (ca.delay != 0 || ca.delay_fall.is_some() || ca.delay_off.is_some())
-        {
+        if split_delays.contains(&name) && cont_assign_has_own_delay(&ca) {
             let k = split_count.entry(name.clone()).or_insert(0);
             let drv = format!("{name}$drv{k}");
             *k += 1;
@@ -48548,8 +48556,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
             }
         }
         elab.continuous_assigns.push(ContinuousAssignment {
-            // Leave zero-rise gates on main's existing fused path.
-            gate_delay_fall: if delay > 0 { fall } else { None },
+            gate_delay_fall: fall,
             origin: None,
             lhs: lhs.clone(),
             rhs,
