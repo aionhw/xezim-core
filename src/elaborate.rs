@@ -42661,7 +42661,32 @@ fn inline_module_items(
                     // bit/part-select, a concat, an expression, a literal — is a
                     // separate object and gets no alias.
                     if let Some(actual) = whole_net_ident_name(parent_expr) {
-                        elab.port_aliases.insert(sub_sig_name.clone(), actual);
+                        elab.port_aliases
+                            .insert(sub_sig_name.clone(), actual.clone());
+                        // §23.3.3.7.1: the formal and actual become ONE net,
+                        // whose net type follows the non-plain-wire side: a
+                        // tri0/tri1/supply port connected to a `wire` actual
+                        // makes the MERGED net tri0/tri1/supply. After port
+                        // substitution the sub-module's writes land on the
+                        // ACTUAL (`w`/`p`), so the implicit pull has to be
+                        // there, not only on the leftover port signal
+                        // (`u_diff.p`) — otherwise the outside wire reads z
+                        // while the port reads 1 (#1060). If the actual
+                        // already has its own non-wire kind it keeps it.
+                        if elab.nets.contains(&actual) {
+                            let formal_kind = elab.resolved_net_kinds.get(&sub_sig_name).cloned();
+                            let formal_supply = elab.supply_nets.contains(&sub_sig_name);
+                            let have_own = elab.resolved_net_kinds.contains_key(&actual)
+                                || elab.supply_nets.contains(&actual);
+                            if !have_own {
+                                if let Some(k) = formal_kind {
+                                    elab.resolved_net_kinds.insert(actual.clone(), k);
+                                }
+                                if formal_supply {
+                                    elab.supply_nets.insert(actual.clone());
+                                }
+                            }
+                        }
                     }
                     // §23.3.3.7 port collapsing: a port bound to a NET (whole,
                     // a select, or a concatenation of them) merges with that
@@ -47733,6 +47758,28 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                     | Some(ResolvedNetKind::ChargeStorage)
             )
         {
+            // A WHOLE-NET port connection (`.p(w)`) is one physical net, and
+            // after substitution the sub-module's drivers land on the ACTUAL
+            // (`w`), leaving the leftover formal `u_diff.p` as a pure reader
+            // driven only by its connection assign. If it is itself tri0/tri1
+            // it joined `multi` here and folded a SECOND time — for a
+            // same-named actual (`u_same.p` vs `p`) that second fold read the
+            // actual it was also writing, a cycle that settled to x and made
+            // `@(p)` inside hang (#1060). The actual carries the merged kind
+            // (see the `port_aliases` insertion), so the leftover must NOT
+            // pull-fold independently. An OUTPUT formal is the real SOURCE
+            // (its driver is not substituted), so it keeps folding. A
+            // leftover with >1 driver still folds via the `count > 1` rule
+            // above.
+            if *c == 1
+                && elab.port_aliases.contains_key(n.as_ref())
+                && matches!(
+                    elab.signals.get(n.as_ref()).map(|s| s.direction),
+                    Some(Some(PortDirection::Inout | PortDirection::Input))
+                )
+            {
+                continue;
+            }
             multi.insert(n.to_string());
         }
     }
