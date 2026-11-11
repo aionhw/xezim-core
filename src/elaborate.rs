@@ -21447,8 +21447,8 @@ fn lsdd_items(
             ModuleItem::FinalConstruct(fc) => {
                 lsdd_body(std::slice::from_mut(&mut fc.stmt), params, tds)
             }
-            ModuleItem::TaskDeclaration(td) => lsdd_body(&mut td.items, params, tds),
-            ModuleItem::FunctionDeclaration(fd) => lsdd_body(&mut fd.items, params, tds),
+            ModuleItem::TaskDeclaration(td) => lsdd_shared_body(&mut td.items, params, tds),
+            ModuleItem::FunctionDeclaration(fd) => lsdd_shared_body(&mut fd.items, params, tds),
             ModuleItem::ClassDeclaration(cd) => lsdd_class(cd, params, tds),
             // A module-level typedef is resolved for its own WIDTH while the
             // parameters are still bare-bound, but its member LAYOUT is built
@@ -21483,8 +21483,8 @@ fn lsdd_class(
             ClassItem::Method(m) => match &mut m.kind {
                 ClassMethodKind::Function(fd)
                 | ClassMethodKind::PureVirtual(fd)
-                | ClassMethodKind::Extern(fd) => lsdd_body(&mut fd.items, params, tds),
-                ClassMethodKind::Task(td) => lsdd_body(&mut td.items, params, tds),
+                | ClassMethodKind::Extern(fd) => lsdd_shared_body(&mut fd.items, params, tds),
+                ClassMethodKind::Task(td) => lsdd_shared_body(&mut td.items, params, tds),
             },
             ClassItem::Class(nc) => lsdd_class(nc, params, tds),
             _ => {}
@@ -21566,6 +21566,63 @@ fn lsdd_resolve_local_typedef(dt: &DataType, tds: &HashMap<String, DataType>) ->
         _ => return None,
     }
     Some(cur)
+}
+
+/// §13.3/§13.4, §6.20.2: inspect shared bodies before mutable access.
+/// Skip copy-on-write when local declarations need no folding.
+fn lsdd_shared_body(
+    stmts: &mut crate::ast::shared_vec::SharedVec<Statement>,
+    params: &HashMap<String, Value>,
+    tds: &HashMap<String, DataType>,
+) {
+    if stmts.iter().any(lsdd_may_fold_decl) {
+        lsdd_body(stmts, params, tds);
+    }
+}
+
+/// Mirror `lsdd_stmt`; preserve scoped folding for dimensions and named types.
+/// Scalar bindings matter only when another declaration needs folding.
+fn lsdd_may_fold_decl(s: &Statement) -> bool {
+    match &s.kind {
+        StatementKind::VarDecl {
+            data_type,
+            declarators,
+            ..
+        } => lsdd_may_fold_type(data_type) || declarators.iter().any(|d| !d.dimensions.is_empty()),
+        StatementKind::Typedef(td) => lsdd_may_fold_type(&td.data_type),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().any(lsdd_may_fold_decl)
+        }
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            lsdd_may_fold_decl(stmt)
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            lsdd_may_fold_decl(then_stmt)
+                || else_stmt.as_ref().is_some_and(|s| lsdd_may_fold_decl(s))
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body, .. } => lsdd_may_fold_decl(body),
+        StatementKind::Case { items, .. } => items.iter().any(|it| lsdd_may_fold_decl(&it.stmt)),
+        _ => false,
+    }
+}
+
+fn lsdd_may_fold_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+            !dimensions.is_empty()
+        }
+        DataType::TypeReference { .. } | DataType::Struct(_) | DataType::Enum(_) => true,
+        _ => false,
+    }
 }
 
 /// One subroutine/process body. The fold runs against a lexically scoped
@@ -53621,3 +53678,4 @@ mod prepared_process_ownership_tests {
         );
     }
 }
+
