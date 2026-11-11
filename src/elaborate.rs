@@ -9431,6 +9431,35 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    static UNIT_BIND_INSTANCES: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::default());
+}
+
+/// §23.11: the instance names of the compilation-unit `bind` directives. A
+/// bound instance is instantiated in its target, so the target can start a
+/// hierarchical name with it (`a.y`), but the undeclared-name checks run on
+/// each definition before those binds are applied. A module-scope bind is in
+/// the definitions already (`collect_design_declared_names`). The scope
+/// restores the previous set for nested or later library calls.
+pub(crate) struct UnitBindInstancesGuard(HashSet<String>);
+impl Drop for UnitBindInstancesGuard {
+    fn drop(&mut self) {
+        UNIT_BIND_INSTANCES.with(|s| *s.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+pub(crate) fn unit_bind_instances_scope(binds: &[BindDirective]) -> UnitBindInstancesGuard {
+    let names = binds
+        .iter()
+        .flat_map(|b| b.instantiation.instances.iter())
+        .map(|hi| hi.name.name.clone())
+        .collect();
+    UnitBindInstancesGuard(UNIT_BIND_INSTANCES.with(|s| s.replace(names)))
+}
+fn is_unit_bind_instance(name: &str) -> bool {
+    UNIT_BIND_INSTANCES.with(|s| s.borrow().contains(name))
+}
+
 /// §3.12.1/§6.5: validate source definitions before copying compilation-unit
 /// items into module storage. The scope keeps bind retries from checking the
 /// synthetic copies, and restores state for nested or later library calls.
@@ -17877,6 +17906,8 @@ fn validate_expr_idents_as(
                    !elab.sequences.contains(name) &&
                    // §19.7.1 `cg::type_option.f` scopes on the covergroup name.
                    !elab.covergroups.contains_key(name) &&
+                   // §23.11: an instance a compilation-unit bind adds.
+                   !(role == HeadRole::Path && is_unit_bind_instance(name)) &&
                    !locals.contains(name) {
                    return Err(span_error(
                        elab,
@@ -32093,6 +32124,8 @@ fn validate_inlined_bodies(
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
     let mut known = collect_design_declared_names(definitions, true);
+    // §23.11: instances that compilation-unit binds add.
+    UNIT_BIND_INSTANCES.with(|s| known.extend(s.borrow().iter().cloned()));
     let mut outside_classes = collect_design_declared_names(definitions, false);
     // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
     let mut leaves: HashSet<String> = HashSet::default();
