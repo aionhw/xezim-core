@@ -683,6 +683,51 @@ fn bind_root_hierarchy_paths() {
     }
 }
 
+/// §23.11: a bind instantiation is a module, interface, program or checker
+/// instantiation, so it can list several instances; each is bound.
+#[test]
+fn bind_instance_list() {
+    for (directive, names) in [
+        ("bind t c #(3) a(), b();", &["a", "b"][..]),
+        ("bind t c a(), b[1:0](), d();", &["a", "b", "d"][..]),
+        ("bind m : t.u1, t.u2 c #(.A(1)) x(), y();", &["x", "y"][..]),
+    ] {
+        let result = parse(directive);
+        assert!(result.errors.is_empty(), "{directive}: {:?}", result.errors);
+        let Some(Description::Bind(bind)) = result.source.descriptions.first() else {
+            panic!("missing bind in {directive}");
+        };
+        let got: Vec<&str> = bind
+            .instantiation
+            .instances
+            .iter()
+            .map(|h| h.name.name.as_str())
+            .collect();
+        assert_eq!(got, names, "{directive}");
+    }
+    let result = parse("bind t c a(), b[1:0]();");
+    let Some(Description::Bind(bind)) = result.source.descriptions.first() else {
+        panic!("missing bind");
+    };
+    assert_eq!(bind.instantiation.instances[1].dimensions.len(), 1);
+}
+
+/// §23.11: a bind directive that cannot be read is reported, not dropped.
+#[test]
+fn unreadable_bind_directive_is_reported() {
+    for directive in [
+        "bind t c #(3) a() b();",
+        "module m; bind t c a(),; endmodule",
+    ] {
+        let result = parse(directive);
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("bind")),
+            "{directive}: {:?}",
+            result.errors
+        );
+    }
+}
+
 /// §25.9: a module-scope `virtual interface` declaration must report a
 /// diagnostic instead of hanging. Previously `virtual interface vif;` shipped
 /// the still-keyword `virtual` into `parse_identifier_starting_item`, whose
