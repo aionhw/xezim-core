@@ -3197,6 +3197,7 @@ fn parse_and_elaborate(
     // §3.12.1/§6.20/§23.11: evaluate the compilation unit's bind
     // constants with ordinary typed parameter elaboration, before a top's
     // declarations can shadow them.
+    let _unit_bind_instances = elaborate::unit_bind_instances_scope(&top_level_binds);
     let unit_bind_params = if top_level_binds.is_empty() {
         crate::hasher::HashMap::default()
     } else {
