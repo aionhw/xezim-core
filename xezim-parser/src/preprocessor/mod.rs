@@ -4,6 +4,8 @@
 //! This is a simplified preprocessor suitable for parsing purposes.
 
 use std::collections::{HashMap, HashSet};
+// §20.10: diagnostic write failures must not abort the run.
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::diagnostics::{self, Location};
@@ -387,7 +389,8 @@ impl Preprocessor {
             }
             let tick = format!("`{}", name);
             let loc = self.here_at(&tick);
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "{}",
                 diagnostics::render(
                     "warning",
@@ -498,7 +501,7 @@ impl Preprocessor {
             .map(|mut g| g.get_or_insert_with(HashSet::new).insert(text.clone()))
             .unwrap_or(true);
         if fresh {
-            eprintln!("{}", text);
+            let _ = writeln!(std::io::stderr().lock(), "{}", text);
         }
     }
 
@@ -896,7 +899,8 @@ impl Preprocessor {
     /// backtick and a name removed (XEZIM_RELAX_MACRO_SPACE, #627).
     fn strip_file_comments(&self, source: &str, path: &str) -> String {
         let warn = |n: usize, what: &str, clause: &str, var: &str| {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "{path}: warning: {n} {what} (IEEE 1800-2017 {clause}, {var})",
                 path = if path.is_empty() { "<input>" } else { path }
             );
@@ -2282,7 +2286,8 @@ impl Preprocessor {
                 .unwrap()
                 .get_or_insert_with(Default::default)
                 .insert(filename.to_string());
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "[PP] warning: `include \"{}\" resolved to '{}'; a different copy in '{}' is shadowed by the search order",
                 filename,
                 chosen.display(),
