@@ -21588,7 +21588,18 @@ fn lsdd_may_fold_decl(s: &Statement) -> bool {
             data_type,
             declarators,
             ..
-        } => lsdd_may_fold_type(data_type) || declarators.iter().any(|d| !d.dimensions.is_empty()),
+        } => {
+            lsdd_may_fold_type(data_type)
+                || declarators.iter().any(|d| {
+                    d.dimensions.iter().any(|dim| match dim {
+                        UnpackedDimension::Range { left, right, .. } => {
+                            lsdd_may_fold_expr(left) || lsdd_may_fold_expr(right)
+                        }
+                        UnpackedDimension::Expression { expr, .. } => lsdd_may_fold_expr(expr),
+                        _ => false,
+                    })
+                })
+        }
         StatementKind::Typedef(td) => lsdd_may_fold_type(&td.data_type),
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             stmts.iter().any(lsdd_may_fold_decl)
@@ -21618,11 +21629,26 @@ fn lsdd_may_fold_decl(s: &Statement) -> bool {
 fn lsdd_may_fold_type(dt: &DataType) -> bool {
     match dt {
         DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
-            !dimensions.is_empty()
+            dimensions.iter().any(|dim| match dim {
+                PackedDimension::Range { left, right, .. } => {
+                    lsdd_may_fold_expr(left) || lsdd_may_fold_expr(right)
+                }
+                _ => false,
+            })
         }
         DataType::TypeReference { .. } | DataType::Struct(_) | DataType::Enum(_) => true,
         _ => false,
     }
+}
+
+/// Match `lsdd_expr`: literal and name-free endpoints are already immutable.
+fn lsdd_may_fold_expr(expr: &Expression) -> bool {
+    if matches!(expr.kind, ExprKind::Number(_)) {
+        return false;
+    }
+    let mut names = Vec::new();
+    collect_ident_names(expr, &mut names);
+    !names.is_empty()
 }
 
 /// One subroutine/process body. The fold runs against a lexically scoped
@@ -30393,7 +30419,7 @@ fn with_enclosing_params(
 
 /// Visit every expression reachable from a statement, in evaluation-agnostic
 /// order. Statement kinds with no expression payload are skipped.
-fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
+pub fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
     use crate::ast::stmt::StatementKind as K;
     match &stmt.kind {
         K::Expr(e) => f(e),
@@ -30480,12 +30506,58 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
                 for_each_stmt_expr(st, f);
             }
         }
-        K::TimingControl { stmt, .. } => for_each_stmt_expr(stmt, f),
+        K::TimingControl { control, stmt } => {
+            use crate::ast::stmt::{EventControl, TimingControl};
+            match control {
+                TimingControl::Delay(e) | TimingControl::Event(EventControl::HierIdentifier(e)) => {
+                    f(e)
+                }
+                TimingControl::Event(EventControl::EventExpr(events)) => {
+                    for event in events {
+                        f(&event.expr);
+                        if let Some(iff) = &event.iff {
+                            f(iff);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for_each_stmt_expr(stmt, f);
+        }
         K::Wait { condition, stmt } => {
             f(condition);
             for_each_stmt_expr(stmt, f);
         }
-        K::Assertion(a) => f(&a.expr),
+        K::Assertion(a) => {
+            f(&a.expr);
+            for action in [&a.action, &a.else_action].into_iter().flatten() {
+                for_each_stmt_expr(action, f);
+            }
+        }
+        K::ProceduralContinuous(p) => {
+            use crate::ast::stmt::ProceduralContinuous as P;
+            match p {
+                P::Assign { lvalue, rvalue } | P::Force { lvalue, rvalue } => {
+                    f(lvalue);
+                    f(rvalue);
+                }
+                P::Deassign(e) | P::Release(e) => f(e),
+            }
+        }
+        K::EventTrigger {
+            target: Some(e), ..
+        } => f(e),
+        K::Coverpoint { expr: e, .. } => f(e),
+        K::Cross { items, .. } => {
+            for e in items {
+                f(e);
+            }
+        }
+        K::WaitOrder { pass, fail, .. } => {
+            for action in [pass, fail].into_iter().flatten() {
+                for_each_stmt_expr(action, f);
+            }
+        }
         K::Return(Some(e)) => f(e),
         K::VarDecl { declarators, .. } => {
             for d in declarators {
@@ -30729,9 +30801,16 @@ fn collect_write_targets(
 }
 
 /// Visit every sub-expression (pre-order, `e` included).
-fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
+pub fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
     f(e);
     match &e.kind {
+        ExprKind::Ident(h) => {
+            for segment in &h.path {
+                for select in &segment.selects {
+                    for_each_sub_expr(select, f);
+                }
+            }
+        }
         ExprKind::Unary { operand, .. } => for_each_sub_expr(operand, f),
         ExprKind::Binary { left, right, .. } => {
             for_each_sub_expr(left, f);
@@ -30746,11 +30825,25 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
             for_each_sub_expr(then_expr, f);
             for_each_sub_expr(else_expr, f);
         }
-        ExprKind::Concatenation(xs) | ExprKind::StreamOp { exprs: xs, .. } => {
+        ExprKind::Concatenation(xs) => {
             for x in xs {
                 for_each_sub_expr(x, f);
             }
         }
+        ExprKind::StreamOp {
+            slice_size, exprs, ..
+        } => {
+            if let Some(size) = slice_size {
+                for_each_sub_expr(size, f);
+            }
+            for expr in exprs {
+                for_each_sub_expr(expr, f);
+            }
+        }
+        ExprKind::Matches { expr, .. } => for_each_sub_expr(expr, f),
+        ExprKind::Tagged {
+            inner: Some(expr), ..
+        } => for_each_sub_expr(expr, f),
         ExprKind::Replication { count, exprs } => {
             for_each_sub_expr(count, f);
             for x in exprs {
@@ -30759,6 +30852,9 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
         }
         ExprKind::AssignmentPattern(items) => {
             for it in items {
+                if let AssignmentPatternItem::Keyed(key, _) = it {
+                    for_each_sub_expr(key, f);
+                }
                 for_each_sub_expr(it.expr(), f);
             }
         }
