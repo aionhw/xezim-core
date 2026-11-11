@@ -37243,7 +37243,7 @@ fn absolute_defparams(
     root: &str,
     definitions: &HashMap<String, Definition>,
     root_params: &HashMap<String, Value>,
-) -> Vec<(Vec<String>, Value)> {
+) -> Vec<PendingDefparam> {
     fn instances<'i>(items: &'i [ModuleItem], out: &mut Vec<&'i ModuleInstantiation>) {
         for it in items {
             match it {
@@ -37316,7 +37316,12 @@ fn absolute_defparams(
                     continue;
                 }
                 let path = if wrapper { path } else { path[1..].to_vec() };
-                out.push((path, eval_const_expr_val(rhs, params)));
+                out.push(PendingDefparam {
+                    path,
+                    value: eval_const_expr_val(rhs, params),
+                    span: lhs.span,
+                    owner: name.clone(),
+                });
             }
         }
     }
@@ -37336,7 +37341,7 @@ fn absolute_defparams(
 fn upward_defparams(
     root: &str,
     definitions: &HashMap<String, Definition>,
-) -> Vec<(Vec<String>, Value)> {
+) -> Vec<PendingDefparam> {
     /// Plain (non-generate, non-array) child instances: (name, definition).
     fn children(items: &[ModuleItem]) -> Vec<(String, String)> {
         let mut out = Vec::new();
@@ -37484,7 +37489,12 @@ fn upward_defparams(
                         }
                     }
                     if let Some(t) = target.filter(|t| t.len() >= 2) {
-                        out.push((t, eval_const_expr_val(rhs, &no_params)));
+                        out.push(PendingDefparam {
+                            path: t,
+                            value: eval_const_expr_val(rhs, &no_params),
+                            span: lhs.span,
+                            owner: chain[depth].clone(),
+                        });
                     }
                 }
             }
@@ -37500,6 +37510,18 @@ fn upward_defparams(
         }
     }
     out
+}
+
+/// §23.10.1: a `defparam` on its way to its target: the remaining path, the
+/// value already evaluated in the declaring scope, and where it is written
+/// (the target's span and the definition holding it), so an illegal target
+/// is reported at the `defparam` even when the child is in another file.
+#[derive(Clone)]
+struct PendingDefparam {
+    path: Vec<String>,
+    value: Value,
+    span: Span,
+    owner: String,
 }
 
 /// Extract the dotted instance/parameter path of a `defparam` LHS
@@ -37818,9 +37840,9 @@ fn inline_module_items(
     // propagated up to the actual (the parent read `z`).
     parent_port_map: &HashMap<String, Expression>,
     // §23.10.1 pending `defparam` overrides targeting instances in THIS scope:
-    // `(path_segments, value)` where the value was already evaluated in the
-    // scope that declared the defparam. Path[0] is a child instance name.
-    pending_defparams: &[(Vec<String>, Value)],
+    // The value was already evaluated in the scope that declared the
+    // defparam. Path[0] is a child instance name.
+    pending_defparams: &[PendingDefparam],
     // §23.10/§26.3: the package, `$unit` and top parameters, from which a
     // child's scope takes the entries its definition can name.
     param_scope: &param_scope::ParamScope,
@@ -37925,13 +37947,17 @@ fn inline_module_items(
         .collect();
     // Collect defparams: those propagated in from a parent scope, plus this
     // module's own `defparam` items (RHS evaluated in THIS scope, §23.10.1).
-    let mut defparams: Vec<(Vec<String>, Value)> = pending_defparams.to_vec();
+    let mut defparams: Vec<PendingDefparam> = pending_defparams.to_vec();
     for it in &prepared_source.effective_items {
         if let ModuleItem::Defparam(assigns) = it {
             for (lhs, rhs) in assigns {
                 if let Some(path) = defparam_path_segments(lhs) {
-                    let val = eval_const_expr_val(rhs, local_params);
-                    defparams.push((path, val));
+                    defparams.push(PendingDefparam {
+                        path,
+                        value: eval_const_expr_val(rhs, local_params),
+                        span: lhs.span,
+                        owner: source_def.name().to_string(),
+                    });
                 }
             }
         }
@@ -38996,8 +39022,9 @@ fn inline_module_items(
                     .collect();
                 let inst_segs: Vec<&str> = hi.name.name.split('.').collect();
                 let n_inst = inst_segs.len();
-                let mut sub_defparams: Vec<(Vec<String>, Value)> = Vec::new();
-                for (path, val) in &defparams {
+                let mut sub_defparams: Vec<PendingDefparam> = Vec::new();
+                for dp in &defparams {
+                    let path = &dp.path;
                     if path.len() <= n_inst
                         || !path[..n_inst].iter().zip(&inst_segs).all(|(a, b)| a == b)
                     {
@@ -39005,17 +39032,26 @@ fn inline_module_items(
                     }
                     let rest = &path[n_inst..];
                     if rest.len() == 1 {
-                        // Targets a parameter of this instance directly — apply
-                        // only if it is overridable (skip localparams, §6.20.4).
+                        // Targets a parameter of this instance directly. The
+                        // per-file strict pass misses a child in another file,
+                        // so judge the target here (§23.10.1, §6.20.1).
+                        crate::param_override_lists::check_defparam(
+                            elab, sub_mod, &rest[0], dp.span, &dp.owner,
+                        )?;
+                        // Apply only if it is overridable (skip localparams,
+                        // §6.20.4).
                         if overridable.contains(rest[0].as_str()) {
-                            sub_params.insert(rest[0].clone(), val.clone());
+                            sub_params.insert(rest[0].clone(), dp.value.clone());
                             // Its value was evaluated in the defparam's own
                             // scope; only the conversion below applies.
                             ovr_exprs.remove(rest[0].as_str());
                         }
                     } else {
                         // Targets a deeper instance — propagate into recursion.
-                        sub_defparams.push((rest.to_vec(), val.clone()));
+                        sub_defparams.push(PendingDefparam {
+                            path: rest.to_vec(),
+                            ..dp.clone()
+                        });
                     }
                 }
 

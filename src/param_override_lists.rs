@@ -7,7 +7,9 @@
 //! leaves alone what is not built. `--no-strict` turns it off.
 
 use crate::ast::Span;
-use crate::ast::decl::{ModuleInstantiation, ModuleItem, ParamConnection};
+use crate::ast::decl::{
+    ModuleInstantiation, ModuleItem, ParamConnection, ParameterDeclaration, ParameterKind,
+};
 use crate::elaborate::{Definition, ElaboratedModule, span_error_of};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -158,4 +160,64 @@ pub(crate) fn check_bound_instance(
         Some((message, _)) => Err(message),
         None => Ok(()),
     }
+}
+
+/// §6.20.3: whether `name` is a type parameter of `def`.
+fn is_type_parameter(def: Definition, name: &str) -> bool {
+    fn declares(pd: &ParameterDeclaration, name: &str) -> bool {
+        matches!(&pd.kind, ParameterKind::Type { assignments }
+            if assignments.iter().any(|a| a.name.name == name))
+    }
+    fn in_items(items: &[ModuleItem], name: &str) -> bool {
+        items.iter().any(|it| match it {
+            ModuleItem::ParameterDeclaration(pd) => declares(pd, name),
+            ModuleItem::GenerateRegion(gr) => in_items(&gr.items, name),
+            _ => false,
+        })
+    }
+    def.params().iter().any(|pd| declares(pd, name)) || in_items(def.items(), name)
+}
+
+/// §23.10.1: a `defparam` written in `owner` sets `param` of an instance of
+/// `def`. It can set only an overridable data parameter: not a localparam, not
+/// a body `parameter` that a parameter port list made local (§6.20.1), and not
+/// a type parameter. The per-file strict pass judges this only when the child
+/// is defined in the same file; this runs as each instance is built.
+pub(crate) fn check_defparam(
+    elab: &ElaboratedModule,
+    def: Definition,
+    param: &str,
+    span: Span,
+    owner: &str,
+) -> Result<(), String> {
+    if !sv_parser::strict_checks() {
+        return Ok(());
+    }
+    let Some(kind) = instantiable_kind(def) else {
+        return Ok(());
+    };
+    let child = def.name();
+    if REDEFINED_MODULES.with(|r| r.borrow().contains(child)) {
+        return Ok(());
+    }
+    let message = if !overridable_param_slots(def.params(), def.items()).contains(&param) {
+        let local = if is_local_body_parameter(def, param) {
+            ": a parameter declared in the body of a module with a parameter port list \
+             is local (§6.20.1)"
+        } else {
+            ""
+        };
+        format!(
+            "defparam cannot override '{param}' of {kind} '{child}' — not an overridable \
+             parameter (IEEE 1800-2017 §23.10.1){local}; --no-strict accepts it"
+        )
+    } else if is_type_parameter(def, param) {
+        format!(
+            "defparam cannot override type parameter '{param}' of {kind} '{child}' \
+             (IEEE 1800-2017 §23.10.1); --no-strict accepts it"
+        )
+    } else {
+        return Ok(());
+    };
+    Err(span_error_of(elab, span, owner, &message))
 }
