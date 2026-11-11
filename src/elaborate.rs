@@ -42645,8 +42645,14 @@ fn inline_module_items(
                                         }
                                     }
                                     if freal {
-                                        elab.var_decl_types.entry(an.clone()).or_insert_with(
-                                            || DataType::Real {
+                                        // The declaration recorded the
+                                        // interconnect's implicit type;
+                                        // readers that go by the declared
+                                        // type took the element's bits for
+                                        // an integer.
+                                        elab.var_decl_types.insert(
+                                            an.clone(),
+                                            DataType::Real {
                                                 kind: RealType::Real,
                                                 span: Span::new(0, 0),
                                             },
