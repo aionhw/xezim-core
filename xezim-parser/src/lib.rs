@@ -109,6 +109,10 @@ static CENSUS_ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize =
 
 /// RAII guard for scoping the lifetime of [`ReferenceCensus`].
 /// When all session guards are dropped, the process-wide census is cleared.
+/// Sessions that overlap (compilations on several threads) share one census
+/// until the last of them ends: a name another compilation spelled only makes
+/// the elaborator keep a port net it could have dropped, while a census
+/// cleared under a running compilation would let it drop one still in use.
 pub struct CensusSession;
 
 impl Drop for CensusSession {
