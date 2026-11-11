@@ -47504,6 +47504,13 @@ fn cont_assign_net_span(lhs: &Expression, elab: &ElaboratedModule) -> Option<(St
         let w = net_width(&n)?;
         return Some((n, 0, w - 1));
     }
+    // §7.4.2: the first select of an unpacked array of nets names an
+    // ELEMENT, a net of its own, not a bit of one vector.
+    let unpacked = |n: &str| {
+        elab.arrays.contains_key(n)
+            || elab.arrays_2d.contains_key(n)
+            || elab.arrays_nd.contains_key(n)
+    };
     let (base, l, r) = match &lhs.kind {
         ExprKind::Index { expr, index } => {
             let i = const_eval_i64_with_params(index, Some(&elab.parameters))?;
@@ -47526,7 +47533,7 @@ fn cont_assign_net_span(lhs: &Expression, elab: &ElaboratedModule) -> Option<(St
         }
         _ => return None,
     };
-    let n = ident_flat_name(base)?;
+    let n = ident_flat_name(base).filter(|n| !unpacked(n))?;
     let w = net_width(&n)? as i64;
     // Label → physical bit (§7.4.1). A single non-normalized dimension is
     // recorded in `packed_full_dims`/`ascending_packed`; absence means [w-1:0].
