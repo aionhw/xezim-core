@@ -210,7 +210,8 @@ pub use value::Value;
 /// kept only the last primitive's delay on the shared net and lost its owner.
 /// ContinuousAssignment::gate_delay_fall keeps this metadata separate from
 /// the ordinary transition fields used by legacy primitive and net delays.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3e";
+/// \x3f = \x3e + assignment target bits/vector shape and declared vector nets (§10.3.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3f";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

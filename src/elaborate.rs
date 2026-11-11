@@ -498,6 +498,9 @@ pub struct ContinuousAssignment {
     /// `delay_fall`: a primitive that stays the only driver of its net keeps
     /// its fall delay in `gate_fall_delays`, including net-delay lowering.
     pub gate_delay_fall: Option<u64>,
+    /// §10.3.3 / §28.16: physical (low bit, width, vector shape) before
+    /// driver widening. A bit-select is scalar; a width-one part is vector.
+    pub delay_select: Option<(u32, u32, bool)>,
     /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
     /// inline time — its RHS names live in the PARENT scope by
     /// construction. The simulator must not apply the child scope hint to
@@ -1082,6 +1085,7 @@ impl PendingContAssign {
             .map(|sp| (sp, self.ctx.prefix.trim_end_matches('.').to_string()));
         ContinuousAssignment {
             gate_delay_fall: None,
+            delay_select: None,
             origin,
             lhs,
             rhs,
@@ -3895,6 +3899,9 @@ pub struct ElaboratedModule {
     /// non-zero-based ranges (LRM §7.4.1).
     #[serde(default)]
     pub packed_full_dims: HashMap<String, Vec<(i64, i64)>>,
+    /// §6.9.1 / §10.3.3: declared vector net shape, including equal bounds.
+    /// Keyed by final flat net name; independent of array query/select tables.
+    pub vector_nets: HashSet<String>,
     /// Signals declared as `string` (LRM §6.16). The bytecode compiler
     /// consults this so that `{a, b}` concatenations involving any
     /// string-typed operand bail to the AST interpreter — the bit-concat
@@ -4435,6 +4442,7 @@ impl ElaboratedModule {
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
             packed_full_dims: HashMap::default(),
+            vector_nets: HashSet::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
             class_type_args: HashMap::default(),
@@ -10391,7 +10399,12 @@ pub fn elaborate_module_with_defs(
                 };
                 elab.port_order.push(port.name.name.clone());
                 if let Some(net_type) = ansi_port_net_type(port) {
-                    register_net_type(&mut elab, &port.name.name, net_type);
+                    register_net_type(
+                        &mut elab,
+                        &port.name.name,
+                        net_type,
+                        port.data_type.as_ref(),
+                    );
                 }
                 if port_shape.is_empty() {
                     signals_insert_traced(&mut elab.signals, line!(), port.name.name.clone(), sig);
@@ -11158,7 +11171,12 @@ pub fn elaborate_module_with_defs(
                                     .insert(decl.name.name.clone(), view.clone());
                             }
                             if let Some(net_type) = pd.net_type {
-                                register_net_type(&mut elab, &decl.name.name, net_type);
+                                register_net_type(
+                                    &mut elab,
+                                    &decl.name.name,
+                                    net_type,
+                                    Some(&pd.data_type),
+                                );
                             }
                             continue;
                         }
@@ -11190,7 +11208,12 @@ pub fn elaborate_module_with_defs(
                     }
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(net_type) = port_decl_net_type(pd) {
-                        register_net_type(&mut elab, &decl.name.name, net_type);
+                        register_net_type(
+                            &mut elab,
+                            &decl.name.name,
+                            net_type,
+                            Some(&pd.data_type),
+                        );
                     }
                     if let Some(view) = &port_modport_view {
                         elab.modport_views
@@ -11259,7 +11282,12 @@ pub fn elaborate_module_with_defs(
                             if is_signed {
                                 existing.is_signed = true;
                             }
-                            register_net_type(&mut elab, &decl.name.name, nd.net_type);
+                            register_net_type(
+                                &mut elab,
+                                &decl.name.name,
+                                nd.net_type,
+                                Some(&nd.data_type),
+                            );
                             // §10.3.1: the net declaration's initializer is a
                             // continuous assignment — it was dropped when the
                             // name was already declared as a port, leaving
@@ -11274,6 +11302,7 @@ pub fn elaborate_module_with_defs(
                                 );
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     gate_delay_fall: None,
+                                    delay_select: None,
                                     origin: Some((init_expr.span, String::new())),
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: decl_rhs,
@@ -11316,7 +11345,7 @@ pub fn elaborate_module_with_defs(
                     // §6.6.1: an undriven wire reads high-impedance — nets
                     // default to Z, not X (bits with drivers are overwritten
                     // at the first settle; bits nothing drives stay z).
-                    register_net_type(&mut elab, &decl.name.name, nd.net_type);
+                    register_net_type(&mut elab, &decl.name.name, nd.net_type, Some(&nd.data_type));
                     let init_value = default_net_value(nd.net_type, w, is_real);
                     let sig = Signal {
                         is_const: false,
@@ -11497,6 +11526,7 @@ pub fn elaborate_module_with_defs(
                             net_declaration_driver(nd, &decl.name.name, init_expr, &mut elab);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_select: None,
                             origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: decl_rhs,
@@ -14205,6 +14235,7 @@ pub fn elaborate_module_with_defs(
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_select: None,
                             origin: Some((ca.span, String::new())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
@@ -14400,6 +14431,7 @@ pub fn elaborate_module_with_defs(
                 for (delayed, source) in &sb.delayed_nets {
                     elab.continuous_assigns.push(ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
@@ -19094,7 +19126,12 @@ fn elaborate_items(
                                     .insert(decl.name.name.clone(), view.clone());
                             }
                             if let Some(net_type) = pd.net_type {
-                                register_net_type(elab, &decl.name.name, net_type);
+                                register_net_type(
+                                    elab,
+                                    &decl.name.name,
+                                    net_type,
+                                    Some(&pd.data_type),
+                                );
                             }
                             continue;
                         }
@@ -19123,7 +19160,7 @@ fn elaborate_items(
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(net_type) = port_decl_net_type(pd) {
-                        register_net_type(elab, &decl.name.name, net_type);
+                        register_net_type(elab, &decl.name.name, net_type, Some(&pd.data_type));
                     }
                     elab.port_order.push(decl.name.name.clone());
                     if let Some(view) = &port_modport_view {
@@ -19149,7 +19186,7 @@ fn elaborate_items(
                     if let Some(d) = net_delay_of(decl, nd, &elab.parameters) {
                         elab.net_delays.insert(decl.name.name.clone(), d);
                     }
-                    register_net_type(elab, &decl.name.name, nd.net_type);
+                    register_net_type(elab, &decl.name.name, nd.net_type, Some(&nd.data_type));
                     let init_value = default_net_value(nd.net_type, width, is_real);
                     let sig = Signal {
                         is_const: false,
@@ -19167,6 +19204,7 @@ fn elaborate_items(
                         let decl_rhs = net_declaration_driver(nd, &decl.name.name, init_expr, elab);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_select: None,
                             origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: decl_rhs,
@@ -20053,6 +20091,7 @@ fn elaborate_items(
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_select: None,
                             origin: Some((ca.span, String::new())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
@@ -20256,6 +20295,7 @@ fn elaborate_items(
                 for (delayed, source) in &sb.delayed_nets {
                     elab.continuous_assigns.push(ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
@@ -23029,7 +23069,41 @@ fn port_decl_net_type(pd: &PortDeclaration) -> Option<NetType> {
 /// Record every semantic property carried by a built-in net type.  Keeping
 /// this in one helper prevents elaboration paths from setting an initial value
 /// while forgetting the metadata needed after a driver changes or releases.
-fn register_net_type(elab: &mut ElaboratedModule, name: &str, net_type: NetType) {
+fn register_net_type(
+    elab: &mut ElaboratedModule,
+    name: &str,
+    net_type: NetType,
+    data_type: Option<&DataType>,
+) {
+    // §6.9.1 permits equal vector bounds. Follow typedefs without changing
+    // the dimension tables used for §7.4 selects and §20.7 array queries.
+    let mut dt = data_type;
+    for _ in 0..64 {
+        match dt {
+            Some(DataType::TypeReference {
+                name: ty,
+                dimensions,
+                ..
+            }) if dimensions.is_empty() => {
+                dt = lookup_scoped_type(ty, &elab.typedef_types);
+            }
+            Some(
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. }
+                | DataType::TypeReference { dimensions, .. },
+            ) => {
+                if !dimensions.is_empty() {
+                    elab.vector_nets.insert(name.to_string());
+                }
+                break;
+            }
+            Some(DataType::Struct(st)) if st.packed => {
+                elab.vector_nets.insert(name.to_string());
+                break;
+            }
+            _ => break,
+        }
+    }
     elab.nets.insert(name.to_string());
     if matches!(net_type, NetType::Supply0 | NetType::Supply1) {
         elab.supply_nets.insert(name.to_string());
@@ -23044,6 +23118,7 @@ fn register_net_type(elab: &mut ElaboratedModule, name: &str, net_type: NetType)
 
 fn unregister_net_type(elab: &mut ElaboratedModule, name: &str) {
     elab.nets.remove(name);
+    elab.vector_nets.remove(name);
     elab.supply_nets.remove(name);
     elab.resolved_net_kinds.remove(name);
     elab.interconnect_nets.remove(name);
@@ -28296,6 +28371,7 @@ fn emit_struct_member_assigns(
     if depth > 16 {
         out.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_select: ca.delay_select,
             origin: ca.origin.clone(),
             lhs: lhs_base.clone(),
             rhs: rhs.clone(),
@@ -28436,6 +28512,7 @@ fn emit_member_elem_assigns(
             }
             _ => out.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: ca.delay_select,
                 origin: ca.origin.clone(),
                 lhs,
                 rhs,
@@ -33198,12 +33275,18 @@ fn inline_instantiations_inner(
                             if let Some(nt) = dd.net_type {
                                 for decl in &dd.declarators {
                                     if !elab.local_decl_displaces(&decl.name.name) {
-                                        register_net_type(elab, &decl.name.name, nt);
+                                        register_net_type(
+                                            elab,
+                                            &decl.name.name,
+                                            nt,
+                                            Some(&dd.data_type),
+                                        );
                                     }
                                     register_net_type(
                                         elab,
                                         &format!("{}::{}", name, decl.name.name),
                                         nt,
+                                        Some(&dd.data_type),
                                     );
                                 }
                             }
@@ -38669,6 +38752,7 @@ fn inline_module_items(
                     ) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_select: None,
                             origin: None,
                             lhs: clk_out_expr,
                             rhs: clk_in_expr,
@@ -40888,7 +40972,12 @@ fn inline_module_items(
                                 }
                             }
                             if let Some(net_type) = ansi_port_net_type(port) {
-                                register_net_type(elab, &sig_name, net_type);
+                                register_net_type(
+                                    elab,
+                                    &sig_name,
+                                    net_type,
+                                    port.data_type.as_ref(),
+                                );
                             }
                             if port_shape.is_empty() {
                                 // §7.2: unpacked-struct port of an INLINED
@@ -41455,7 +41544,12 @@ fn inline_module_items(
                                     },
                                 );
                                 if let Some(net_type) = port_decl_net_type(pd) {
-                                    register_net_type(elab, &sig_name, net_type);
+                                    register_net_type(
+                                        elab,
+                                        &sig_name,
+                                        net_type,
+                                        Some(&pd.data_type),
+                                    );
                                 }
                             }
                         }
@@ -41588,7 +41682,12 @@ fn inline_module_items(
                                 }
                                 let net_is_real =
                                     is_type_real_resolved(&nd.data_type, &elab.typedef_types);
-                                register_net_type(elab, &sig_name, nd.net_type);
+                                register_net_type(
+                                    elab,
+                                    &sig_name,
+                                    nd.net_type,
+                                    Some(&nd.data_type),
+                                );
                                 let init_value = default_net_value(nd.net_type, width, net_is_real);
                                 signals_insert_traced(
                                     &mut elab.signals,
@@ -42850,6 +42949,7 @@ fn inline_module_items(
                                 Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
                                         gate_delay_fall: None,
+                                        delay_select: None,
                                         origin: None,
                                         lhs: sub_expr,
                                         rhs: parent_elem,
@@ -42862,6 +42962,7 @@ fn inline_module_items(
                                 Some(PortDirection::Output) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
                                         gate_delay_fall: None,
+                                        delay_select: None,
                                         origin: None,
                                         lhs: parent_elem,
                                         rhs: sub_expr,
@@ -43007,6 +43108,7 @@ fn inline_module_items(
                             }
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_select: None,
                                 origin: None,
                                 lhs: sub_expr,
                                 rhs,
@@ -43019,6 +43121,7 @@ fn inline_module_items(
                         Some(PortDirection::Output) => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_select: None,
                                 origin: None,
                                 lhs: parent_expr.clone(),
                                 rhs: sub_expr,
@@ -43031,6 +43134,7 @@ fn inline_module_items(
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_select: None,
                                 origin: None,
                                 lhs: sub_expr,
                                 rhs: parent_expr.clone(),
@@ -44075,6 +44179,7 @@ fn inline_module_items(
                             );
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_select: None,
                                 origin: None,
                                 lhs,
                                 rhs,
@@ -47020,6 +47125,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     mrhs.span = span;
                     kept.push(ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: mlhs,
                         rhs: mrhs,
@@ -47032,6 +47138,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             }
             None => kept.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: make_ident_expr(lhs),
                 rhs,
@@ -47411,6 +47518,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         for (port, root) in members {
             cas.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: make_ident_expr(port),
                 rhs: make_ident_expr(root),
@@ -47469,6 +47577,8 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             // A lone undelayed driver of the whole net IS the net's value:
             // the net delay is simply its delay.
             let ca = &mut elab.continuous_assigns[drivers[&net][0]];
+            // §28.16: this is a net delay, even on a [0:0] vector.
+            ca.delay_select = Some((0, width, false));
             ca.delay = rise;
             ca.delay_fall = fall;
             ca.delay_off = off;
@@ -47515,6 +47625,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         if !per_bit {
             elab.continuous_assigns.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: make_ident_expr(&net),
                 rhs: make_ident_expr(&drv),
@@ -47554,6 +47665,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             );
             elab.continuous_assigns.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: make_ident_expr(&b),
                 rhs: bit_of_drv,
@@ -47567,6 +47679,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         bits.reverse();
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_select: None,
             origin: None,
             lhs: make_ident_expr(&net),
             rhs: Expression::new(ExprKind::Concatenation(bits), Span::dummy()),
@@ -47629,12 +47742,16 @@ fn make_z_fill(k: u32, span: Span) -> Expression {
 /// net for a bare name, or the physical bits of a constant bit/part select
 /// (`w[3]`, `w[7:2]`, `w[2 +: 4]`). `None` for anything else (a variable
 /// index, a multi-dimensional packed net, a concatenation lvalue).
-fn cont_assign_net_span(lhs: &Expression, elab: &ElaboratedModule) -> Option<(String, u32, u32)> {
+fn cont_assign_net_span(
+    lhs: &Expression,
+    elab: &ElaboratedModule,
+    signal_width: Option<u32>,
+) -> Option<(String, u32, u32)> {
     let net_width = |n: &str| -> Option<u32> {
         if !elab.nets.contains(n) {
             return None;
         }
-        elab.signals.get(n).map(|s| s.width).filter(|&w| w > 0)
+        elab.signals.get(n).map(|s| s.width).or(signal_width).filter(|&w| w > 0)
     };
     if let Some(n) = ident_flat_name(lhs) {
         let w = net_width(&n)?;
@@ -47692,6 +47809,23 @@ fn cont_assign_net_span(lhs: &Expression, elab: &ElaboratedModule) -> Option<(St
     Some((n, lo as u32, hi as u32))
 }
 
+/// §6.9 / §6.9.1 / §10.3.3: delay selection follows target shape, not width.
+/// Also used for assignments materialized lazily after driver resolution;
+/// the simulator supplies the width after releasing the elaborated signals.
+pub fn continuous_assign_delay_select(
+    lhs: &Expression,
+    elab: &ElaboratedModule,
+    signal_width: Option<u32>,
+) -> Option<(u32, u32, bool)> {
+    let (n, lo, hi) = cont_assign_net_span(lhs, elab, signal_width)?;
+    let vector = match &lhs.kind {
+        ExprKind::Index { .. } => false,
+        ExprKind::RangeSelect { .. } => true,
+        _ => hi > lo || elab.vector_nets.contains(&n),
+    };
+    Some((lo, hi - lo + 1, vector))
+}
+
 /// IEEE 1800-2017 §6.6.1/§11.5.1: a bit or part select driver of a net is a
 /// driver of those bits only, and every bit resolves ALL of its drivers.
 /// Select drivers that overlap another driver of the same net (`assign w =
@@ -47717,7 +47851,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
                 ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
             ) || ident_flat_name(&ca.lhs).is_some_and(|n| elab.nets.contains(&n))
             {
-                cont_assign_net_span(&ca.lhs, elab)
+                cont_assign_net_span(&ca.lhs, elab, None)
             } else {
                 None
             }
@@ -47738,7 +47872,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
         ) || ident_flat_name(&lhs).is_some_and(|n| elab.nets.contains(&n))
         {
-            cont_assign_net_span(&lhs, elab)
+            cont_assign_net_span(&lhs, elab, None)
         } else {
             None
         };
@@ -47810,14 +47944,29 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
                 ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
             ) || ident_flat_name(&ca.lhs).is_some_and(|n| elab.nets.contains(&n))
             {
-                cont_assign_net_span(&ca.lhs, elab)
+                cont_assign_net_span(&ca.lhs, elab, None)
             } else {
                 None
             }
         })
         .collect();
     let z_fill = make_z_fill;
-    for (ca, s) in elab.continuous_assigns.iter_mut().zip(spans) {
+    let delay_selects: Vec<_> = elab
+        .continuous_assigns
+        .iter()
+        .zip(&spans)
+        .map(|(ca, s)| {
+            s.as_ref()
+                .filter(|(n, _, _)| widen.contains(n))
+                .and_then(|_| continuous_assign_delay_select(&ca.lhs, elab, None))
+        })
+        .collect();
+    for ((ca, s), delay_select) in elab
+        .continuous_assigns
+        .iter_mut()
+        .zip(spans)
+        .zip(delay_selects)
+    {
         let Some((n, lo, hi)) = s else { continue };
         if !widen.contains(&n) || ident_flat_name(&ca.lhs).is_some() {
             continue;
@@ -47883,6 +48032,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
             ca.rhs = make_syscall(&name, args, span);
         }
         ca.lhs = make_ident_expr(&n);
+        ca.delay_select = delay_select;
     }
 }
 
@@ -47934,6 +48084,7 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
         elab.udp_instances[i].output = Expression::new(make_ident_expr(&stage).kind, span);
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_select: None,
             origin: None,
             lhs: make_ident_expr(&net),
             rhs: make_ident_expr(&stage),
@@ -48290,6 +48441,9 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
             let rhs = make_ident_expr(&drv);
             let mut delayed = ca.clone();
+            if delayed.origin.is_some() && delayed.delay_select.is_none() {
+                delayed.delay_select = continuous_assign_delay_select(&ca.lhs, elab, None);
+            }
             delayed.lhs = make_ident_expr(&drv);
             if split_gate_delays.contains(&name)
                 && let Some(fall) = ca.gate_delay_fall
@@ -48517,6 +48671,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             };
             elab.continuous_assigns.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: acc.lhs,
                 rhs,
@@ -48598,6 +48753,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
 
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_select: None,
             origin: None,
             lhs: term_a,
             rhs: make_syscall(
@@ -48612,6 +48768,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
         });
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_select: None,
             origin: None,
             lhs: term_b,
             rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
@@ -48706,6 +48863,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
         }
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: fall,
+            delay_select: None,
             origin: None,
             lhs: lhs.clone(),
             rhs,
@@ -49030,6 +49188,7 @@ pub fn whole_array_assign_parts_dir_with_params(
         (0..=n)
             .map(|k| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: index_expr(lhs.clone(), if ld { lhi - k } else { llo + k }),
                 rhs: index_expr(rhs.clone(), if rd { rhi - k } else { rlo + k }),
@@ -49075,6 +49234,7 @@ pub fn slice_array_assign_parts(
             .zip(rhs_elems)
             .map(|(l, r)| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: l,
                 rhs: r,
@@ -49289,6 +49449,7 @@ pub fn whole_array_row_assign_parts(
         (0..=n)
             .map(|k| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: make_index_expr(ln, if ld { lhi - k } else { llo + k }),
                 rhs: make_multi_index_expr(rn, &[row, if rd { ihi - k } else { ilo + k }]),
@@ -49347,6 +49508,7 @@ fn pattern_array_assign_parts(
         out.into_iter()
             .map(|(idx, e)| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_select: None,
                 origin: None,
                 lhs: make_multi_index_expr(ln, &idx),
                 rhs: e,
@@ -49634,7 +49796,7 @@ fn tri_port_select_pull(
     ) {
         return None;
     }
-    let (net, lo, hi) = cont_assign_net_span(actual, elab)?;
+    let (net, lo, hi) = cont_assign_net_span(actual, elab, None)?;
     if elab.arrays.contains_key(&net)
         || elab.resolved_net_kinds.contains_key(&net)
         || elab.supply_nets.contains(&net)
@@ -49648,6 +49810,7 @@ fn tri_port_select_pull(
     }
     let span = actual.span;
     Some(ContinuousAssignment {
+        delay_select: None,
         origin: None,
         lhs: actual.clone(),
         rhs: make_syscall(
@@ -53504,12 +53667,18 @@ fn process_import(
                             if let Some(nt) = dd.net_type {
                                 for decl in &dd.declarators {
                                     if !elab.local_decl_displaces(&decl.name.name) {
-                                        register_net_type(elab, &decl.name.name, nt);
+                                        register_net_type(
+                                            elab,
+                                            &decl.name.name,
+                                            nt,
+                                            Some(&dd.data_type),
+                                        );
                                     }
                                     register_net_type(
                                         elab,
                                         &format!("{}::{}", pkg_name, decl.name.name),
                                         nt,
+                                        Some(&dd.data_type),
                                     );
                                 }
                             }
