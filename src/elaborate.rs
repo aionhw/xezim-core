@@ -42560,11 +42560,60 @@ fn inline_module_items(
                                 .get(&sub_sig_name)
                                 .map(|f| (f.width, f.is_real, f.type_name.clone()));
                             if let Some((fw, freal, ftn)) = formal {
-                                if fw > 1 || freal {
-                                    // §4.1: nettype name the shaped actual
-                                    // adopts, captured before `ftn` moves into
-                                    // the base signal below.
-                                    let ftn_leaves = ftn.clone();
+                                // §6.6.7, §7.2: a nettype over an unpacked
+                                // struct is stored per member.
+                                let struct_dt = ftn
+                                    .as_deref()
+                                    .and_then(|tn| elab.typedef_types.get(tn))
+                                    .map(|sdt| {
+                                        resolve_typedef_chain(sdt, &elab.typedef_types).clone()
+                                    })
+                                    .filter(|r| {
+                                        matches!(
+                                            r,
+                                            DataType::Struct(su)
+                                                if !su.packed && !su.members.is_empty()
+                                        )
+                                    });
+                                // §6.6.8: an ELEMENT bound to a struct nettype
+                                // makes a still typeless array an array of
+                                // that struct, each element with its member
+                                // leaves (`sa[0].V`) as a declared
+                                // `vinet sa[0:1]` has. Giving the BASE net
+                                // the members and every element the
+                                // container's width truncated the `real`
+                                // elements of an array shaped before, which
+                                // keeps its shape here.
+                                let element = whole_net_ident_name(parent_expr).is_none();
+                                if element && let Some(dt) = &struct_dt {
+                                    let typeless = elab
+                                        .signals
+                                        .get(&an)
+                                        .is_some_and(|a| a.width <= 1 && !a.is_real);
+                                    let range = elab
+                                        .arrays
+                                        .get(&an)
+                                        .map(|&(l, r, _)| (l.min(r), l.max(r)))
+                                        .filter(|&(lo, hi)| typeless && hi - lo < 4096);
+                                    if let Some((lo, hi)) = range {
+                                        if let Some((_, _, ew)) = elab.arrays.get_mut(&an) {
+                                            *ew = fw;
+                                        }
+                                        if let Some(asig) = elab.signals.get_mut(&an) {
+                                            asig.width = fw;
+                                            asig.type_name = ftn;
+                                            asig.value = Value::all_z(fw);
+                                        }
+                                        elab.var_decl_types.insert(an.clone(), dt.clone());
+                                        for i in lo..=hi {
+                                            register_unpacked_aggregate(
+                                                elab,
+                                                &format!("{an}[{i}]"),
+                                                dt,
+                                            );
+                                        }
+                                    }
+                                } else if fw > 1 || freal {
                                     if let Some(asig) = elab.signals.get_mut(&an) {
                                         if asig.width <= 1 && !asig.is_real {
                                             asig.width = fw;
@@ -42603,31 +42652,18 @@ fn inline_module_items(
                                             },
                                         );
                                     }
-                                    // §6.6.7/§7.2: a nettype over an UNPACKED
-                                    // STRUCT is stored per member — the sub-
-                                    // module declaration path creates real
-                                    // member leaves (`d.o.V`, `d.o.I`) for the
-                                    // formal, so a read of `d.o.V` is a real
-                                    // leaf. A typeless interconnect bound to it
-                                    // adopted the packed 128-bit whole signal
-                                    // but got NO member leaves, so the member-
-                                    // wise connect assigns (`w.V = d.o.V`)
-                                    // wrote into bit-selects of the packed
-                                    // storage and read back nan (#1040). Give
-                                    // the interconnect the same member leaves.
-                                    if let Some(tn) = ftn_leaves.as_deref() {
-                                        let resolved = elab.typedef_types.get(tn).map(|sdt| {
-                                            resolve_typedef_chain(sdt, &elab.typedef_types).clone()
-                                        });
-                                        if let Some(r) = &resolved
-                                            && matches!(
-                                                &r,
-                                                DataType::Struct(su)
-                                                    if !su.packed && !su.members.is_empty()
-                                            )
-                                        {
-                                            register_unpacked_aggregate(elab, &an, r);
-                                        }
+                                    // §6.6.7, §7.2: the sub-module
+                                    // declaration path creates member leaves
+                                    // (`d.o.V`, `d.o.I`) for the formal. A
+                                    // typeless interconnect bound to it
+                                    // adopted the packed whole signal but got
+                                    // no member leaves, so the member-wise
+                                    // connect assigns (`w.V = d.o.V`) wrote
+                                    // into bit-selects of the packed storage
+                                    // and read back nan (#1040). Give the
+                                    // interconnect the same member leaves.
+                                    if let Some(dt) = &struct_dt {
+                                        register_unpacked_aggregate(elab, &an, dt);
                                     }
                                 }
                             }
