@@ -929,6 +929,21 @@ impl PendingAlways {
 }
 
 impl PendingInitial {
+    /// The instance scope `materialize` records: `ctx.prefix` is the
+    /// instance path with a trailing dot ("TB.p1."), recorded dot-trimmed.
+    /// §21.2.1.7: inside a generate block, the generate block scope is appended
+    /// to the instance path.
+    pub fn scope(&self) -> String {
+        let mut scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        if !self.gen_scope.is_empty() {
+            if !scope.is_empty() {
+                scope.push('.');
+            }
+            scope.push_str(&self.gen_scope);
+        }
+        scope
+    }
+
     pub fn materialize(self) -> InitialBlock {
         set_type_bind_tls(&self.ctx);
         let stmt = rewrite_stmt(
@@ -940,17 +955,7 @@ impl PendingInitial {
         );
         clear_type_bind_tls();
         let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
-        // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
-        // record it (dot-trimmed) as the block's scope for name resolution.
-        // §21.2.1.7: if this block was inside a generate block, append the
-        // generate block scope to the instance path.
-        let mut scope = self.ctx.prefix.trim_end_matches('.').to_string();
-        if !self.gen_scope.is_empty() {
-            if !scope.is_empty() {
-                scope.push('.');
-            }
-            scope.push_str(&self.gen_scope);
-        }
+        let scope = self.scope();
         InitialBlock { stmt, scope }
     }
 }
