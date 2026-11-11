@@ -2,6 +2,9 @@
 //! artifact format used by both the `xezim` bytecode interpreter and the
 //! `xezim-b` native compiler.
 
+#[macro_use]
+mod stdio;
+
 // Rust permits exactly ONE `#[global_allocator]` per binary, so this lives here
 // rather than in the `xezim` bin: declaring it in the shared library means the
 // xezim binary, xezim-b, AND every test binary get it, whereas a declaration in
