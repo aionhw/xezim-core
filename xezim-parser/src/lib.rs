@@ -104,6 +104,26 @@ impl std::hash::Hasher for CensusHasher {
 pub type CensusSet = std::collections::HashSet<String, std::hash::BuildHasherDefault<CensusHasher>>;
 
 static REFERENCE_CENSUS: std::sync::Mutex<Option<ReferenceCensus>> = std::sync::Mutex::new(None);
+static CENSUS_ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard for scoping the lifetime of [`ReferenceCensus`].
+/// When all session guards are dropped, the process-wide census is cleared.
+pub struct CensusSession;
+
+impl Drop for CensusSession {
+    fn drop(&mut self) {
+        if CENSUS_ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            clear_reference_census();
+        }
+    }
+}
+
+/// Begin a compilation or parse session with an explicit lifetime.
+pub fn census_session() -> CensusSession {
+    CENSUS_ACTIVE_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CensusSession
+}
 
 /// Add one token stream to the process-wide [`ReferenceCensus`]. Called for
 /// every stream the parser is built over, so nothing parsed escapes it.
@@ -240,6 +260,12 @@ pub fn reference_census() -> ReferenceCensus {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default()
+}
+
+/// Reset the process-wide [`ReferenceCensus`], releasing any retained identifiers.
+pub fn clear_reference_census() {
+    let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
 }
 
 /// Reserved storage name for a compilation-unit (`$unit`) declaration that a

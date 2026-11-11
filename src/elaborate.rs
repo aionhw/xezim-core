@@ -7318,6 +7318,7 @@ fn port_elision_setup() {
     } else {
         None
     };
+    crate::sv_parser::clear_reference_census();
     PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = state);
 }
 
