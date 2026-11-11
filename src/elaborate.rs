@@ -4061,6 +4061,12 @@ pub struct ElaboratedModule {
     /// root.
     #[serde(default)]
     pub port_aliases: HashMap<String, String>,
+    /// §23.3.3.7: `(net, bit)` of every bit a tri0 or tri1 port bound to a
+    /// select has given its pull, so a second such port on the same bit adds
+    /// none (the first connection decides, as on a whole net). Elaboration
+    /// state only.
+    #[serde(skip)]
+    pub tri_select_pulls: HashSet<(String, u32)>,
     /// §25.3 / §23.8: an interface port is a hierarchical alias of its
     /// connected instance, including when reached from outside the module.
     #[serde(default)]
@@ -4402,6 +4408,7 @@ impl ElaboratedModule {
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
+            tri_select_pulls: HashSet::default(),
             net_delays: HashMap::default(),
             const_decl_inits: HashSet::default(),
             forward_typedef_names: HashSet::default(),
@@ -42724,30 +42731,54 @@ fn inline_module_items(
                     if let Some(actual) = whole_net_ident_name(parent_expr) {
                         elab.port_aliases
                             .insert(sub_sig_name.clone(), actual.clone());
-                        // §23.3.3.7.1: the formal and actual become ONE net,
-                        // whose net type follows the non-plain-wire side: a
-                        // tri0/tri1/supply port connected to a `wire` actual
-                        // makes the MERGED net tri0/tri1/supply. After port
+                        // §23.3.3.7, Table 23-1: the formal and the actual
+                        // become ONE net, and an internal tri0, tri1 or
+                        // supply net dominates an external `wire`: the
+                        // merged net is tri0/tri1/supply. After port
                         // substitution the sub-module's writes land on the
                         // ACTUAL (`w`/`p`), so the implicit pull has to be
                         // there, not only on the leftover port signal
                         // (`u_diff.p`) — otherwise the outside wire reads z
-                        // while the port reads 1 (#1060). If the actual
-                        // already has its own non-wire kind it keeps it.
+                        // while the port reads 1 (#1060). An actual with a
+                        // net type of its own other than `wire` keeps it
+                        // (the table's "external" cells).
                         if elab.nets.contains(&actual) {
                             let formal_kind = elab.resolved_net_kinds.get(&sub_sig_name).cloned();
                             let formal_supply = elab.supply_nets.contains(&sub_sig_name);
                             let have_own = elab.resolved_net_kinds.contains_key(&actual)
                                 || elab.supply_nets.contains(&actual);
                             if !have_own {
+                                // §6.6.5, §6.6.6: with no driver at all the
+                                // merged net rests at the dominating net's
+                                // value (1 for tri1), which no fold computes.
+                                let rest = matches!(
+                                    formal_kind,
+                                    Some(ResolvedNetKind::Tri0 | ResolvedNetKind::Tri1)
+                                ) || formal_supply;
                                 if let Some(k) = formal_kind {
                                     elab.resolved_net_kinds.insert(actual.clone(), k);
                                 }
                                 if formal_supply {
                                     elab.supply_nets.insert(actual.clone());
                                 }
+                                if rest
+                                    && let Some(v) = elab
+                                        .signals
+                                        .get(&sub_sig_name)
+                                        .filter(|f| !f.is_real)
+                                        .map(|f| (f.width, f.value.clone()))
+                                    && let Some(asig) = elab.signals.get_mut(&actual)
+                                    && !asig.is_real
+                                    && asig.width == v.0
+                                {
+                                    asig.value = v.1;
+                                }
                             }
                         }
+                    } else if let Some(pull) =
+                        tri_port_select_pull(parent_expr, &sub_sig_name, elab)
+                    {
+                        elab.continuous_assigns.push(pull);
                     }
                     // §23.3.3.7 port collapsing: a port bound to a NET (whole,
                     // a select, or a concatenation of them) merges with that
@@ -47852,12 +47883,17 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             // actual it was also writing, a cycle that settled to x and made
             // `@(p)` inside hang (#1060). The actual carries the merged kind
             // (see the `port_aliases` insertion), so the leftover must NOT
-            // pull-fold independently. An OUTPUT formal is the real SOURCE
+            // pull-fold independently. A VARIABLE actual (`.p(r)`) is not
+            // part of the net: the port keeps its own pull, and reads 1
+            // while the variable holds z. An OUTPUT formal is the real SOURCE
             // (its driver is not substituted), so it keeps folding. A
             // leftover with >1 driver still folds via the `count > 1` rule
             // above.
             if *c == 1
-                && elab.port_aliases.contains_key(n.as_ref())
+                && elab
+                    .port_aliases
+                    .get(n.as_ref())
+                    .is_some_and(|actual| elab.nets.contains(actual))
                 && matches!(
                     elab.signals.get(n.as_ref()).map(|s| s.direction),
                     Some(Some(PortDirection::Inout | PortDirection::Input))
@@ -49299,6 +49335,59 @@ fn interconnect_array_base_name(expr: &Expression) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// §23.3.3.7, Table 23-1: a tri0 or tri1 port bound to a bit or part select
+/// of a `wire` makes those bits of the merged net tri0/tri1, while the
+/// vector's other bits stay a `wire`. The implicit pull (§6.6.5) of the
+/// selected bits is a pull-strength driver of that select, which the
+/// multi-driver fold resolves against the bits' other drivers. `None` for any
+/// other formal or actual, and for an external net with a type of its own.
+fn tri_port_select_pull(
+    actual: &Expression,
+    formal: &str,
+    elab: &mut ElaboratedModule,
+) -> Option<ContinuousAssignment> {
+    let one = match elab.resolved_net_kinds.get(formal)? {
+        ResolvedNetKind::Tri0 => false,
+        ResolvedNetKind::Tri1 => true,
+        _ => return None,
+    };
+    if !matches!(
+        actual.kind,
+        ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+    ) {
+        return None;
+    }
+    let (net, lo, hi) = cont_assign_net_span(actual, elab)?;
+    if elab.arrays.contains_key(&net)
+        || elab.resolved_net_kinds.contains_key(&net)
+        || elab.supply_nets.contains(&net)
+        || elab.signals.get(&net).is_none_or(|s| s.is_real)
+        || (lo..=hi).any(|b| elab.tri_select_pulls.contains(&(net.clone(), b)))
+    {
+        return None;
+    }
+    for b in lo..=hi {
+        elab.tri_select_pulls.insert((net.clone(), b));
+    }
+    let span = actual.span;
+    Some(ContinuousAssignment {
+        origin: None,
+        lhs: actual.clone(),
+        rhs: make_syscall(
+            "$__pull",
+            vec![
+                make_fill_expr(one, span),
+                strength_code_literal(5 * 8 + 5, span),
+            ],
+            span,
+        ),
+        delay: 0,
+        rhs_parent_scoped: false,
+        delay_fall: None,
+        delay_off: None,
+    })
 }
 
 /// A continuous assign whose LHS names a HIERARCHICAL target writes into a
