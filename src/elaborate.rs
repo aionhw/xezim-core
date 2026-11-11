@@ -845,6 +845,12 @@ pub struct PendingContAssign {
     pub lhs_source: std::rc::Rc<Expression>,
     pub rhs_source: std::rc::Rc<Expression>,
     pub ctx: std::rc::Rc<RewriteCtx>,
+    /// §10.3.1 / §21.2.1.5 drive strength (`(weak0, weak1)`, …) of the
+    /// source `assign`; wrapped into the `$__weak`/`$__pull`/… marker at
+    /// materialize time, exactly as the top-module path does. Dropping it
+    /// left an inlined sub-module driver with no strength marker, so it was
+    /// folded as STRONG against the net's other drivers (#1063).
+    pub strength: Option<String>,
     /// `assign #N ...` delay expression, unevaluated: parameters it names
     /// resolve per-instance, so it is rewritten with `ctx` and evaluated at
     /// materialize time against the flattened parameter table. Dropping it
@@ -978,6 +984,24 @@ impl PendingContAssign {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        // §10.3.1 / §21.2.1.5: apply the drive-strength marker, exactly as
+        // the top-module copy at the `ModuleItem::ContinuousAssign` sites
+        // does. Without this an inlined sub-module driver arrived WITHOUT a
+        // marker and `resolve_multi_driver_nets` folded it as STRONG, so a
+        // `(weak0, weak1)` pull lost to—and fought—the net's real driver
+        // (#1063).
+        let rhs = match self
+            .strength
+            .as_deref()
+            .and_then(strength_marker)
+        {
+            Some((marker, code)) => make_syscall(
+                marker,
+                vec![rhs.clone(), strength_code_literal(code, rhs.span)],
+                rhs.span,
+            ),
+            None => rhs,
+        };
         let eval_delay = |src: &Option<std::rc::Rc<Expression>>| -> Option<u64> {
             src.as_ref().map(|d| {
                 let d = rewrite_expr(
@@ -42641,7 +42665,33 @@ fn inline_module_items(
                     // bit/part-select, a concat, an expression, a literal — is a
                     // separate object and gets no alias.
                     if let Some(actual) = whole_net_ident_name(parent_expr) {
-                        elab.port_aliases.insert(sub_sig_name.clone(), actual);
+                        elab
+                            .port_aliases
+                            .insert(sub_sig_name.clone(), actual.clone());
+                        // §23.3.3.7.1: the formal and actual become ONE net,
+                        // whose net type follows the non-plain-wire side: a
+                        // tri0/tri1/supply port connected to a `wire` actual
+                        // makes the MERGED net tri0/tri1/supply. After port
+                        // substitution the sub-module's writes land on the
+                        // ACTUAL (`w`/`p`), so the implicit pull has to be
+                        // there, not only on the leftover port signal
+                        // (`u_diff.p`) — otherwise the outside wire reads z
+                        // while the port reads 1 (#1060). If the actual
+                        // already has its own non-wire kind it keeps it.
+                        if elab.nets.contains(&actual) {
+                            let formal_kind = elab.resolved_net_kinds.get(&sub_sig_name).cloned();
+                            let formal_supply = elab.supply_nets.contains(&sub_sig_name);
+                            let have_own = elab.resolved_net_kinds.contains_key(&actual)
+                                || elab.supply_nets.contains(&actual);
+                            if !have_own {
+                                if let Some(k) = formal_kind {
+                                    elab.resolved_net_kinds.insert(actual.clone(), k);
+                                }
+                                if formal_supply {
+                                    elab.supply_nets.insert(actual.clone());
+                                }
+                            }
+                        }
                     }
                     // §23.3.3.7 port collapsing: a port bound to a NET (whole,
                     // a select, or a concatenation of them) merges with that
@@ -43660,6 +43710,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    strength: ca_item.strength.clone(),
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: delay_off_rc.clone(),
@@ -43707,6 +43758,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    strength: None,
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: None,
@@ -43734,6 +43786,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::new(new_lhs),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    strength: None,
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: delay_off_rc.clone(),
@@ -47381,7 +47434,13 @@ fn cont_assign_net_span(lhs: &Expression, elab: &ElaboratedModule) -> Option<(St
 /// whole-net fold below resolves the shared bits and passes the rest through.
 /// Nets whose select drivers are disjoint keep their per-select assigns.
 fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
-    let spans: Vec<Option<(String, u32, u32)>> = elab
+    // Compute each materialized driver's net span, and the same for LAZY
+    // sub-module drivers without materializing them: a future instance whose
+    // body sits in `pending_cont_assign` (bit/part selects on `n` inside a
+    // child module) is invisible to a scan of `elab.continuous_assigns`, so
+    // an overlapping-select net driven only from a sub-module was never
+    // widened and its overlapping selects stayed per-bit (#1062).
+    let materialized_spans: Vec<Option<(String, u32, u32)>> = elab
         .continuous_assigns
         .iter()
         .map(|ca| {
@@ -47396,17 +47455,41 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
             }
         })
         .collect();
+    let mut pending_spans: Vec<Option<(String, u32, u32)>> = Vec::with_capacity(
+        elab.pending_cont_assign.len(),
+    );
+    for p in &elab.pending_cont_assign {
+        let lhs = rewrite_expr(
+            &p.lhs_source,
+            &p.ctx.prefix,
+            &p.ctx.port_map,
+            &p.ctx.local_names,
+            &p.ctx.interface_map,
+        );
+        let span = if matches!(lhs.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })
+            || ident_flat_name(&lhs).is_some_and(|n| elab.nets.contains(&n))
+        {
+            cont_assign_net_span(&lhs, elab)
+        } else {
+            None
+        };
+        pending_spans.push(span);
+    }
     let mut by_net: HashMap<&str, Vec<(u32, u32, bool)>> = HashMap::default();
-    for (s, ca) in spans.iter().zip(&elab.continuous_assigns) {
+    for (s, ca) in materialized_spans.iter().zip(&elab.continuous_assigns) {
         if let Some((n, lo, hi)) = s {
             let is_select = !matches!(
                 ca.lhs.kind,
                 ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
             );
-            by_net
-                .entry(n.as_str())
-                .or_default()
-                .push((*lo, *hi, is_select));
+            by_net.entry(n.as_str()).or_default().push((*lo, *hi, is_select));
+        }
+    }
+    // Pending assigns count toward a net's driver roster (a select is
+    // always a select) even though we do not widen them here yet.
+    for s in &pending_spans {
+        if let Some((n, lo, hi)) = s {
+            by_net.entry(n.as_str()).or_default().push((*lo, *hi, true));
         }
     }
     let widen: HashSet<String> = by_net
@@ -47422,6 +47505,35 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     if widen.is_empty() {
         return;
     }
+    // A pending driver on a widen net must join the materialized roster so
+    // the widening below (and the whole-net fold that follows) sees every
+    // driver of the net, not only the first select.
+    if !elab.pending_cont_assign.is_empty() {
+        let mut pending = std::mem::take(&mut elab.pending_cont_assign);
+        for (p, s) in pending.drain(..).zip(pending_spans) {
+            if s.is_some_and(|(n, _, _)| widen.contains(&n)) {
+                elab.continuous_assigns
+                    .push(p.materialize(&elab.parameters));
+            } else {
+                elab.pending_cont_assign.push(p);
+            }
+        }
+    }
+    let spans: Vec<Option<(String, u32, u32)>> = elab
+        .continuous_assigns
+        .iter()
+        .map(|ca| {
+            if matches!(
+                ca.lhs.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            ) || ident_flat_name(&ca.lhs).is_some_and(|n| elab.nets.contains(&n))
+            {
+                cont_assign_net_span(&ca.lhs, elab)
+            } else {
+                None
+            }
+        })
+        .collect();
     let z_fill = make_z_fill;
     for (ca, s) in elab.continuous_assigns.iter_mut().zip(spans) {
         let Some((n, lo, hi)) = s else { continue };
@@ -47614,7 +47726,14 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 &p.ctx.local_names,
                 &p.ctx.interface_map,
             );
-            ident_flat_name(&lhs)
+            // §6.6.1: a bit/part-select driver drives its base net, so it
+            // counts toward that net's multi-driver total just like a
+            // whole-net driver. `ident_flat_name` returns None for a select
+            // (`n[3]`), which hid every sub-module select from the fold below
+            // and left only the first select of each bit applied (#1062).
+            ident_flat_name(&lhs).or_else(|| {
+                cont_assign_net_span(&lhs, elab).map(|(n, _, _)| n)
+            })
         })
         .collect();
     for n in pending_lhs.iter().flatten() {
@@ -47642,6 +47761,28 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                     | Some(ResolvedNetKind::ChargeStorage)
             )
         {
+            // A WHOLE-NET port connection (`.p(w)`) is one physical net, and
+            // after substitution the sub-module's drivers land on the ACTUAL
+            // (`w`), leaving the leftover formal `u_diff.p` as a pure reader
+            // driven only by its connection assign. If it is itself tri0/tri1
+            // it joined `multi` here and folded a SECOND time — for a
+            // same-named actual (`u_same.p` vs `p`) that second fold read the
+            // actual it was also writing, a cycle that settled to x and made
+            // `@(p)` inside hang (#1060). The actual carries the merged kind
+            // (see the `port_aliases` insertion), so the leftover must NOT
+            // pull-fold independently. An OUTPUT formal is the real SOURCE
+            // (its driver is not substituted), so it keeps folding. A
+            // leftover with >1 driver still folds via the `count > 1` rule
+            // above.
+            if *c == 1
+                && elab.port_aliases.contains_key(n.as_ref())
+                && matches!(
+                    elab.signals.get(n.as_ref()).map(|s| s.direction),
+                    Some(Some(PortDirection::Inout | PortDirection::Input))
+                )
+            {
+                continue;
+            }
             multi.insert(n.to_string());
         }
     }
