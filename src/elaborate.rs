@@ -47797,6 +47797,65 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     }
 }
 
+/// §29.3, §28.12: a UDP instance's output terminal is a driver of its net
+/// like a gate's. The instance writes the net it names directly, so beside a
+/// continuous assignment or another UDP on the same net the last writer won
+/// and nothing was resolved (`udp u(w, a); assign w = b;` read `b`, or `a`,
+/// where the two disagreed). Such an instance drives a stage of its own,
+/// `<net>$udp<k>`, with its instance delay, and an undelayed assignment of
+/// the stage joins the net's other drivers in the fold. A UDP that is the
+/// only driver of its net keeps writing it.
+fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
+    if elab.udp_instances.is_empty() {
+        return;
+    }
+    let mut drivers: HashMap<String, usize> = HashMap::default();
+    for u in &elab.udp_instances {
+        if let Some(n) = ident_flat_name(&u.output).filter(|n| elab.nets.contains(n)) {
+            *drivers.entry(n).or_insert(0) += 1;
+        }
+    }
+    if drivers.is_empty() {
+        return;
+    }
+    for ca in &elab.continuous_assigns {
+        if let Some(n) = ident_flat_name(&ca.lhs)
+            && let Some(c) = drivers.get_mut(&n)
+        {
+            *c += 1;
+        }
+    }
+    let mut staged: HashMap<String, usize> = HashMap::default();
+    for i in 0..elab.udp_instances.len() {
+        let Some(net) = ident_flat_name(&elab.udp_instances[i].output)
+            .filter(|n| drivers.get(n).is_some_and(|&c| c > 1))
+        else {
+            continue;
+        };
+        let k = staged.entry(net.clone()).or_insert(0);
+        let stage = format!("{net}$udp{k}");
+        *k += 1;
+        let Some(mut sig) = elab.signals.get(&net).cloned() else {
+            continue;
+        };
+        sig.name = stage.clone().into();
+        sig.direction = None;
+        elab.signals.insert(stage.clone(), sig);
+        let span = elab.udp_instances[i].output.span;
+        elab.udp_instances[i].output = Expression::new(make_ident_expr(&stage).kind, span);
+        elab.continuous_assigns.push(ContinuousAssignment {
+            gate_delay_fall: None,
+            origin: None,
+            lhs: make_ident_expr(&net),
+            rhs: make_ident_expr(&stage),
+            delay: 0,
+            rhs_parent_scoped: false,
+            delay_fall: None,
+            delay_off: None,
+        });
+    }
+}
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     widen_overlapping_select_drivers(elab);
     // §26.2: a package net driven by its qualified name (`assign
@@ -47842,6 +47901,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     }
+    stage_shared_udp_outputs(elab);
     // §28.12 / §21.2.1.5: a net with ONE driver that carries a strength or
     // is a tristate primitive keeps that driver for `%v`; a net several
     // drivers resolve replaces it below.
