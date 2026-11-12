@@ -1152,3 +1152,71 @@ fn reference_census_ends_with_its_last_session() {
     drop(outer);
     assert!(!has(), "the last session releases the census");
 }
+
+/// §23.2.2.3: a later ANSI port that omits its direction, port kind and data
+/// type takes all three from the previous port, as that port ended up. One
+/// that gives any of them takes only an omitted direction; an omitted kind
+/// follows the first-port rules and an omitted data type is `logic`
+/// (aionhw/xezim#1078). The LRM's examples `mh16`-`mh21` are among the cases.
+#[test]
+fn ansi_port_inherits_only_when_it_omits_direction_kind_and_type() {
+    use crate::ast::module::{AnsiPort, PortList};
+    use crate::ast::types::{DataType, NetType, PortDirection};
+    fn ports(header: &str) -> Vec<AnsiPort> {
+        let result = parse(&format!("module m{header}; endmodule"));
+        assert!(result.errors.is_empty(), "{header}: {:?}", result.errors);
+        let Some(Description::Module(m)) = result.source.descriptions.first() else {
+            panic!("{header}: no module");
+        };
+        let PortList::Ansi(ports) = &m.ports else {
+            panic!("{header}: not an ANSI list");
+        };
+        ports.clone()
+    }
+    let packed = |p: &AnsiPort| match &p.data_type {
+        Some(DataType::Implicit { dimensions, .. })
+        | Some(DataType::IntegerVector { dimensions, .. }) => dimensions.len(),
+        _ => 0,
+    };
+    // `clk` gives a direction, so it is a scalar `logic`; `rst_n` gives
+    // nothing and inherits that from `clk`, not the type of `d`.
+    let p = ports("(input logic [7:0] d, input clk, rst_n)");
+    assert_eq!(p[1].direction, Some(PortDirection::Input));
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    assert_eq!(p[2].direction, Some(PortDirection::Input));
+    assert!(p[2].data_type.is_none(), "{:?}", p[2].data_type);
+    // mh0: a port kind alone opens an ANSI list; `y` takes `inout wire logic`.
+    let p = ports("(wire x, y)");
+    assert_eq!(p[1].net_type, Some(NetType::Wire));
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    // mh16: an implicit type opens one too, and `wire y` gives a kind, so it
+    // is `inout wire logic y`.
+    let p = ports("([5:0] x, wire y)");
+    assert_eq!(packed(&p[0]), 1);
+    assert_eq!(p[1].net_type, Some(NetType::Wire));
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    // mh17: `input var integer x, wire y` -> `input wire logic y`.
+    let p = ports("(input var integer x, wire y)");
+    assert_eq!(p[1].direction, Some(PortDirection::Input));
+    assert!(!p[1].var_kw);
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    // mh19: `integer y` keeps the direction only.
+    let p = ports("(output signed [5:0] x, integer y)");
+    assert_eq!(p[1].direction, Some(PortDirection::Output));
+    assert!(matches!(p[1].data_type, Some(DataType::IntegerAtom { .. })));
+    assert!(p[1].net_type.is_none());
+    // mh20: `y` gives nothing and takes `ref var logic [5:0]`.
+    let p = ports("(ref [5:0] x, y)");
+    assert_eq!(p[1].direction, Some(PortDirection::Ref));
+    assert_eq!(packed(&p[1]), 1);
+    // `var` and the net kind carry over with everything else.
+    let p = ports("(output var logic [3:0] a, b, input wand [1:0] c, e)");
+    assert!(p[1].var_kw);
+    assert_eq!(packed(&p[1]), 1);
+    assert_eq!(p[3].net_type, Some(NetType::Wand));
+    assert_eq!(packed(&p[3]), 1);
+    // A port that gives only a data type does not take the earlier kind.
+    let p = ports("(input wand [1:0] c, logic [2:0] f)");
+    assert_eq!(p[1].direction, Some(PortDirection::Input));
+    assert!(p[1].net_type.is_none());
+}
