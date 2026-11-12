@@ -54612,3 +54612,47 @@ mod prepared_callable_ownership_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod shared_map_tests {
+    use super::*;
+
+    #[test]
+    fn copies_share_one_map_until_one_is_written() {
+        let mut a = SharedMap::<u32>::default();
+        a.insert("t".into(), 4);
+        let b = a.clone();
+        assert!(Rc::ptr_eq(&a.0, &b.0));
+        a.insert("u".into(), 8);
+        assert!(!Rc::ptr_eq(&a.0, &b.0));
+        assert_eq!(a.get("u"), Some(&8));
+        assert_eq!(b.get("u"), None);
+        assert_eq!(b.get("t"), Some(&4));
+    }
+
+    #[test]
+    fn serializes_as_the_plain_map() {
+        let mut plain: HashMap<String, u32> = HashMap::default();
+        plain.insert("t".into(), 4);
+        plain.insert("u".into(), 8);
+        let shared = SharedMap::from(plain.clone());
+        let cfg = crate::xez_bincode_config();
+        let bytes = bincode::serde::encode_to_vec(&shared, cfg).unwrap();
+        assert_eq!(bytes, bincode::serde::encode_to_vec(&plain, cfg).unwrap());
+        let (back, _): (SharedMap<u32>, usize) =
+            bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!(*back, plain);
+    }
+
+    #[test]
+    fn constant_function_snapshots_share_the_elaboration_tables() {
+        let elab = ElaboratedModule::new("m".into());
+        set_typedef_types_tls(&elab.typedef_types);
+        set_typedef_widths_tls(&elab.typedefs);
+        let types = TYPEDEF_TYPES_TLS.with(|c| c.borrow().clone()).unwrap();
+        assert!(Rc::ptr_eq(&types.0, &elab.typedef_types.0));
+        let widths = TYPEDEF_WIDTHS_TLS.with(|c| c.borrow().clone()).unwrap();
+        assert!(Rc::ptr_eq(&widths, &elab.typedefs.shared_map()));
+        reset_const_eval_snapshots();
+    }
+}
