@@ -37096,6 +37096,77 @@ fn type_bindings(
         .collect()
 }
 
+/// Whether any instantiation among `items` declares an array of instances.
+fn has_instance_arrays(items: &[ModuleItem]) -> bool {
+    items.iter().any(|it| {
+        matches!(it, ModuleItem::ModuleInstantiation(inst)
+            if inst.instances.iter().any(|h| !h.dimensions.is_empty()))
+    })
+}
+
+/// The widths and unpacked shapes of the signals and ports of the scope
+/// holding `items` (a definition's body), which an instance array's
+/// connections are sliced by.
+type ScopeShapes = (HashMap<String, u32>, HashMap<String, Vec<(i64, i64)>>);
+
+fn ai_scope_shapes(
+    items: &[ModuleItem],
+    source_def: Definition,
+    local_params: &HashMap<String, Value>,
+    typedef_widths: &HashMap<String, u32>,
+) -> ScopeShapes {
+    let mut widths = ai_scan_signal_widths(items, local_params, typedef_widths);
+    let mut unpacked_shapes = ai_scan_unpacked_shapes(items, local_params);
+    if let PortList::Ansi(ports) = source_def.ports() {
+        for port in ports {
+            let width = port
+                .data_type
+                .as_ref()
+                .map(|dt| resolve_type_width(dt, Some(local_params), Some(typedef_widths)))
+                .unwrap_or(1)
+                .max(1);
+            widths.insert(port.name.name.clone(), width);
+            if let Some(shape) = declared_unpacked_dims(&port.dimensions, local_params) {
+                unpacked_shapes.insert(port.name.name.clone(), shape);
+            }
+        }
+    }
+    (widths, unpacked_shapes)
+}
+
+/// §23.3.2: replace each array of instances among `items` by its elements.
+fn ai_expand_instance_arrays(
+    items: &mut [ModuleItem],
+    (widths, unpacked_shapes): &ScopeShapes,
+    definitions: &HashMap<String, Definition>,
+    local_params: &HashMap<String, Value>,
+    typedef_widths: &HashMap<String, u32>,
+) {
+    for item in items.iter_mut() {
+        if let ModuleItem::ModuleInstantiation(inst) = item {
+            if inst.instances.iter().any(|h| !h.dimensions.is_empty()) {
+                let def = definitions.get(&inst.module_name.name);
+                let port_widths = def
+                    .map(|d| ai_module_port_widths(d, local_params, typedef_widths))
+                    .unwrap_or_default();
+                let port_shapes = def
+                    .map(|d| ai_module_port_shapes(d, local_params))
+                    .unwrap_or_default();
+                let port_names = def.map(ai_module_port_names).unwrap_or_default();
+                inst.instances = ai_expand_instances(
+                    &inst.instances,
+                    &port_widths,
+                    &port_shapes,
+                    &port_names,
+                    widths,
+                    unpacked_shapes,
+                    local_params,
+                );
+            }
+        }
+    }
+}
+
 fn prepare_module_items(
     source_def: Definition,
     definitions: &HashMap<String, Definition>,
@@ -37141,53 +37212,15 @@ fn prepare_module_items(
 
     // §23.3.2: expand arrays of module instances into individual instances with
     // bit-sliced vector connections, before body_sources/driver derivation.
-    if effective_items.iter().any(|it| {
-        matches!(it, ModuleItem::ModuleInstantiation(inst)
-            if inst.instances.iter().any(|h| !h.dimensions.is_empty()))
-    }) {
-        let mut widths = ai_scan_signal_widths(&effective_items, local_params, typedef_widths);
-        let mut unpacked_shapes = ai_scan_unpacked_shapes(&effective_items, local_params);
-        if let PortList::Ansi(ports) = source_def.ports() {
-            for port in ports {
-                let width = port
-                    .data_type
-                    .as_ref()
-                    .map(|dt| resolve_type_width(dt, Some(local_params), Some(typedef_widths)))
-                    .unwrap_or(1)
-                    .max(1);
-                widths.insert(port.name.name.clone(), width);
-                if let Some(shape) = declared_unpacked_dims(&port.dimensions, local_params) {
-                    unpacked_shapes.insert(port.name.name.clone(), shape);
-                }
-            }
-        }
-        for item in effective_items.iter_mut() {
-            if let ModuleItem::ModuleInstantiation(inst) = item {
-                if inst.instances.iter().any(|h| !h.dimensions.is_empty()) {
-                    let port_widths = definitions
-                        .get(&inst.module_name.name)
-                        .map(|d| ai_module_port_widths(d, local_params, typedef_widths))
-                        .unwrap_or_default();
-                    let port_shapes = definitions
-                        .get(&inst.module_name.name)
-                        .map(|d| ai_module_port_shapes(d, local_params))
-                        .unwrap_or_default();
-                    let port_names = definitions
-                        .get(&inst.module_name.name)
-                        .map(ai_module_port_names)
-                        .unwrap_or_default();
-                    inst.instances = ai_expand_instances(
-                        &inst.instances,
-                        &port_widths,
-                        &port_shapes,
-                        &port_names,
-                        &widths,
-                        &unpacked_shapes,
-                        local_params,
-                    );
-                }
-            }
-        }
+    if has_instance_arrays(&effective_items) {
+        let shapes = ai_scope_shapes(&effective_items, source_def, local_params, typedef_widths);
+        ai_expand_instance_arrays(
+            &mut effective_items,
+            &shapes,
+            definitions,
+            local_params,
+            typedef_widths,
+        );
     }
 
     let mut port_directions = HashMap::default();
@@ -38540,11 +38573,29 @@ fn inline_module_items(
             }
         }
         let prepared = Rc::make_mut(&mut prepared_source);
-        let bound: Vec<ModuleItem> = binds
+        let mut bound: Vec<ModuleItem> = binds
             .iter()
             .rev()
             .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
             .collect();
+        // §23.11, §23.3.2: a bound array of instances is expanded like one
+        // written here; the body's items were expanded before the binds were
+        // known, so the array's elements were never built.
+        if has_instance_arrays(&bound) {
+            let shapes = ai_scope_shapes(
+                &prepared.effective_items,
+                source_def,
+                local_params,
+                &elab.typedefs,
+            );
+            ai_expand_instance_arrays(
+                &mut bound,
+                &shapes,
+                definitions,
+                local_params,
+                &elab.typedefs,
+            );
+        }
         // §23.11/§6.10: an undeclared name in a bound instance's connection
         // is an implicit net of this (the target) scope, as it is for an
         // instance written here, never an object of the bind's scope.
