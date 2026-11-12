@@ -32327,6 +32327,18 @@ fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
         K::TimingControl { stmt, .. } | K::Wait { stmt, .. } => {
             collect_stmt_declared_names(stmt, out);
         }
+        // §16 immediate/concurrent assertions: the `pass` / `else` statements
+        // may declare block-locals (e.g. `assert (c) else begin int e; ... end`
+        // after macro expansion), which later statements in the same body may
+        // reference. Mirror the `K::If` recursion so those names are collected.
+        K::Assertion(a) => {
+            if let Some(s) = &a.action {
+                collect_stmt_declared_names(s, out);
+            }
+            if let Some(s) = &a.else_action {
+                collect_stmt_declared_names(s, out);
+            }
+        }
         K::RandCase { items } => {
             for (_, st) in items {
                 collect_stmt_declared_names(st, out);
