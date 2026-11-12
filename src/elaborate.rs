@@ -23066,6 +23066,36 @@ fn port_decl_net_type(pd: &PortDeclaration) -> Option<NetType> {
         .or_else(|| implicit_port_net_type(Some(pd.direction), false, Some(&pd.data_type), false))
 }
 
+/// §6.9 / §6.9.1: whether a declared type is a vector (has a packed
+/// dimension, equal bounds included, or is a packed structure) rather than a
+/// scalar. Follows typedefs without changing the dimension tables used for
+/// §7.4 selects and §20.7 array queries.
+fn declared_vector_shape(
+    data_type: Option<&DataType>,
+    typedef_types: &HashMap<String, DataType>,
+) -> bool {
+    let mut dt = data_type;
+    for _ in 0..64 {
+        match dt {
+            Some(DataType::TypeReference {
+                name: ty,
+                dimensions,
+                ..
+            }) if dimensions.is_empty() => {
+                dt = lookup_scoped_type(ty, typedef_types);
+            }
+            Some(
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. }
+                | DataType::TypeReference { dimensions, .. },
+            ) => return !dimensions.is_empty(),
+            Some(DataType::Struct(st)) => return st.packed,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Record every semantic property carried by a built-in net type.  Keeping
 /// this in one helper prevents elaboration paths from setting an initial value
 /// while forgetting the metadata needed after a driver changes or releases.
@@ -23075,34 +23105,8 @@ fn register_net_type(
     net_type: NetType,
     data_type: Option<&DataType>,
 ) {
-    // §6.9.1 permits equal vector bounds. Follow typedefs without changing
-    // the dimension tables used for §7.4 selects and §20.7 array queries.
-    let mut dt = data_type;
-    for _ in 0..64 {
-        match dt {
-            Some(DataType::TypeReference {
-                name: ty,
-                dimensions,
-                ..
-            }) if dimensions.is_empty() => {
-                dt = lookup_scoped_type(ty, &elab.typedef_types);
-            }
-            Some(
-                DataType::IntegerVector { dimensions, .. }
-                | DataType::Implicit { dimensions, .. }
-                | DataType::TypeReference { dimensions, .. },
-            ) => {
-                if !dimensions.is_empty() {
-                    elab.vector_nets.insert(name.to_string());
-                }
-                break;
-            }
-            Some(DataType::Struct(st)) if st.packed => {
-                elab.vector_nets.insert(name.to_string());
-                break;
-            }
-            _ => break,
-        }
+    if declared_vector_shape(data_type, &elab.typedef_types) {
+        elab.vector_nets.insert(name.to_string());
     }
     elab.nets.insert(name.to_string());
     if matches!(net_type, NetType::Supply0 | NetType::Supply1) {
@@ -47817,7 +47821,23 @@ pub fn continuous_assign_delay_select(
     elab: &ElaboratedModule,
     signal_width: Option<u32>,
 ) -> Option<(u32, u32, bool)> {
-    let (n, lo, hi) = cont_assign_net_span(lhs, elab, signal_width)?;
+    let Some((n, lo, hi)) = cont_assign_net_span(lhs, elab, signal_width) else {
+        // §10.3.2: a whole variable may be the target too; §10.3.3 then
+        // chooses its delay by the same rules, from its declared shape.
+        let n = ident_flat_name(lhs).filter(|n| !elab.arrays.contains_key(n))?;
+        let dt = elab.var_decl_types.get(&n)?;
+        let w = elab
+            .signals
+            .get(&n)
+            .map(|s| s.width)
+            .or(signal_width)
+            .filter(|&w| w > 0)?;
+        return Some((
+            0,
+            w,
+            w > 1 || declared_vector_shape(Some(dt), &elab.typedef_types),
+        ));
+    };
     let vector = match &lhs.kind {
         ExprKind::Index { .. } => false,
         ExprKind::RangeSelect { .. } => true,
