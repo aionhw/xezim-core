@@ -1316,6 +1316,11 @@ impl Parser {
         if self.is_port_direction() || self.is_data_type_keyword() || self.at(TokenKind::KwVar)
             // §6.6.8 — `interconnect p` opens an ANSI port list too.
             || self.at(TokenKind::KwInterconnect)
+            // §23.2.2.3 — a port kind or an implicit data type, `(wire x)`,
+            // `([5:0] x, wire y)`: the first port gives one, so the list is
+            // ANSI. No non-ANSI port starts with either.
+            || self.is_net_type_keyword()
+            || self.at(TokenKind::LBracket)
             || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Dot)
             || (self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash))
             // LRM §25.9 — `virtual <iface_t> <name>` port form.
@@ -1325,43 +1330,35 @@ impl Parser {
             // LRM §25.3.2 — generic interface port `interface [.mp] <name>`.
             || self.at(TokenKind::KwInterface)
         {
-            let mut ports = Vec::new();
-            let mut last_direction: Option<PortDirection> = None;
-            let mut last_data_type: Option<DataType> = None;
-            let mut last_net_type: Option<NetType> = None;
-            let mut last_var_kw = false;
+            let mut ports: Vec<AnsiPort> = Vec::new();
             loop {
                 if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                     break;
                 }
                 let mut port = self.parse_ansi_port();
-                let direction_was_explicit = port.direction.is_some();
-                if port.direction.is_none() && last_direction.is_some() {
-                    port.direction = last_direction;
+                // §23.2.2.3: a later port that omits its direction, port kind
+                // and data type all three takes all three from the previous
+                // port, as that port ended up (`output var a, b`: b is a
+                // variable too). One that gives any of them takes only an
+                // omitted direction; an omitted kind follows the first-port
+                // rules and an omitted data type is `logic`. So in
+                // `input logic [7:0] d, input clk, rst_n` the port `rst_n` is
+                // a scalar like `clk`, and `wire y` after `inout [5:0] x` is
+                // one bit.
+                if let Some(prev) = ports.last() {
+                    if port.direction.is_none()
+                        && port.net_type.is_none()
+                        && !port.var_kw
+                        && port.data_type.is_none()
+                    {
+                        port.direction = prev.direction;
+                        port.net_type = prev.net_type;
+                        port.var_kw = prev.var_kw;
+                        port.data_type = prev.data_type.clone();
+                    } else if port.direction.is_none() {
+                        port.direction = prev.direction;
+                    }
                 }
-                if port.data_type.is_none() && last_data_type.is_some() && !direction_was_explicit {
-                    port.data_type = last_data_type.clone();
-                }
-                if port.net_type.is_none() && last_net_type.is_some() && !direction_was_explicit {
-                    port.net_type = last_net_type;
-                }
-                // §23.2.2.3: `output var a, b` — b continues the SAME port
-                // declaration and is a variable too. `var` carried across the
-                // comma like the data type; without this b registered as an
-                // untyped default net.
-                if !port.var_kw && last_var_kw && !direction_was_explicit {
-                    port.var_kw = true;
-                }
-                if port.direction.is_some() {
-                    last_direction = port.direction;
-                }
-                if port.data_type.is_some() {
-                    last_data_type = port.data_type.clone();
-                }
-                if port.net_type.is_some() {
-                    last_net_type = port.net_type;
-                }
-                last_var_kw = port.var_kw;
                 // §23.2.2.4: only an input port takes a default value; an
                 // inout is a net.
                 if crate::strict_checks()
