@@ -42616,6 +42616,76 @@ fn inline_module_items(
                                     }
                                 }
                             }
+                            // §7.2, §7.4.1: the packed geometry of each member
+                            // of a submodule struct variable, packed or
+                            // unpacked, as the top-level declaration path
+                            // registers it: a packed array of packed structs
+                            // (`pair_t [0:1] pairs`) needs its element layout
+                            // and dimensions, and a packed-array member of an
+                            // unpacked struct (`lane_t [0:3] lanes`) its
+                            // dimensions. Without them `s.pairs[0].pair[0]`
+                            // and `us.lanes[0]` in an instance — every top of
+                            // a multi-top design — took the wrong element or
+                            // a single bit.
+                            if let DataType::Struct(su) =
+                                &resolve_typedef_chain(&dd.data_type, &elab.typedef_types)
+                            {
+                                for decl in &dd.declarators {
+                                    let scoped = cat2(&inst_prefix, &decl.name.name);
+                                    for m in &su.members {
+                                        let (ew, fd) = packed_member_meta(
+                                            &m.data_type,
+                                            &sub_merged_params,
+                                            &elab.typedefs,
+                                            &elab.typedef_types,
+                                        );
+                                        let elem = packed_struct_array_info(
+                                            &m.data_type,
+                                            &sub_merged_params,
+                                            &elab.typedef_types,
+                                        )
+                                        .and_then(|(dims, elem_dt)| {
+                                            let fields = flatten_struct_fields(
+                                                &elem_dt,
+                                                &sub_merged_params,
+                                                &elab.typedefs,
+                                                &elab.typedef_types,
+                                            )?;
+                                            let w = fields
+                                                .iter()
+                                                .map(|(_, o, w)| o + w)
+                                                .max()
+                                                .filter(|&w| w > 0)?;
+                                            let mut fdims = dims;
+                                            fdims.push((w as i64 - 1, 0));
+                                            Some((w, fdims, fields))
+                                        });
+                                        for mdecl in &m.declarators {
+                                            let key = format!("{}.{}", scoped, mdecl.name.name);
+                                            if let Some((w, fdims, fields)) = &elem {
+                                                elab.packed_signal_elem_widths
+                                                    .insert(key.clone(), *w);
+                                                elab.packed_full_dims
+                                                    .insert(key.clone(), fdims.clone());
+                                                elab.packed_struct_fields
+                                                    .entry(key)
+                                                    .or_insert_with(|| fields.clone());
+                                                continue;
+                                            }
+                                            if let Some(ew) = ew {
+                                                elab.packed_signal_elem_widths
+                                                    .entry(key.clone())
+                                                    .or_insert(ew);
+                                            }
+                                            if let Some(fd) = &fd {
+                                                elab.packed_full_dims
+                                                    .entry(key)
+                                                    .or_insert_with(|| fd.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let width = match &dd.data_type {
                                 // Packed dims on the reference (`some_t [1:0] g`)
                                 // multiply the typedef's width — the bare-typedef
