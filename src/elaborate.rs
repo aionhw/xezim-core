@@ -28400,56 +28400,12 @@ fn emit_struct_member_assigns(
     }
     // An assignment pattern on the RHS is taken APART here, item by item.
     // Member-selecting the literal instead (`'{1.5, 1'b1}.f1`) has no
-    // evaluation path and yields 0 -- silently, which is why both forms below
-    // are handled explicitly rather than left to a fallback.
-    //
-    //   ORDERED  `'{1.5, 1'b1}`          maps position-wise onto the members.
-    //   NAMED    `'{f1: 1.5, f2: 1'b1}`  maps by member name, in any order.
-    //
-    // Named patterns used to fall through: the map returned None for a Named
-    // item, `collect::<Option<Vec<_>>>` short-circuits the whole pattern to
-    // None on the first one, and the literal was then member-selected -- the
-    // exact case the comment above warns about. `'{i: 3e-3, v: 1.8}` therefore
-    // wrote a struct of zeros, with no diagnostic. §10.9.2 gives both forms
-    // equal standing, and named is the form anyone writes for a struct whose
-    // members are not obviously ordered.
+    // evaluation path and yields 0 -- silently, which is why every form of
+    // §10.9.2 is bound to its members explicitly (`bind_struct_pattern`):
+    // by position, by member name, by type key and by `default:`.
     let pat_items: Option<Vec<Expression>> = match &peel_unpacked_typed_pattern(rhs).kind {
-        ExprKind::AssignmentPattern(items) if items.len() == flat.len() => {
-            use crate::ast::expr::AssignmentPatternItem as Item;
-            if items.iter().all(|it| matches!(it, Item::Ordered(_))) {
-                items
-                    .iter()
-                    .map(|it| match it {
-                        Item::Ordered(e) => Some(e.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                // By name. Every member must be named exactly once; anything
-                // else (a repeat, a miss, a `default:`) is left to the general
-                // path rather than half-applied.
-                let mut by_name: HashMap<String, Expression> = HashMap::default();
-                let mut usable = true;
-                for it in items {
-                    match it {
-                        Item::Named(key, val) => {
-                            if by_name.insert(key.name.clone(), val.clone()).is_some() {
-                                usable = false;
-                            }
-                        }
-                        _ => usable = false,
-                    }
-                }
-                if usable && flat.iter().all(|(m, _, _)| by_name.contains_key(m)) {
-                    Some(
-                        flat.iter()
-                            .map(|(m, _, _)| by_name.remove(m).expect("checked above"))
-                            .collect(),
-                    )
-                } else {
-                    None
-                }
-            }
+        ExprKind::AssignmentPattern(items) => {
+            bind_struct_pattern(items, &flat, typedef_types, params, rhs.span)
         }
         _ => None,
     };
@@ -28536,34 +28492,453 @@ fn emit_member_elem_assigns(
         push_leaf(out, lhs, rhs);
         return;
     };
-    for tup in cartesian_index_tuples(&lists) {
-        // A pattern item supplies the element through one nested ordered
-        // pattern level per dimension (§10.10), by position in declared order.
-        let rhs_e = if rhs_is_item {
-            let mut cur = Some(&rhs);
-            for (d, idx) in tup.iter().enumerate() {
-                let pos = lists[d].iter().position(|i| i == idx);
-                cur = match (cur.map(|e| &peel_unpacked_typed_pattern(e).kind), pos) {
-                    (Some(ExprKind::AssignmentPattern(items)), Some(p)) => match items.get(p) {
-                        Some(crate::ast::expr::AssignmentPatternItem::Ordered(e)) => Some(e),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-            }
-            match cur {
-                Some(e) => e.clone(),
-                // Not an ordered nested pattern: keep the whole-member form.
-                None => {
-                    push_leaf(out, lhs, rhs);
-                    return;
-                }
-            }
-        } else {
-            tup.iter().fold(rhs.clone(), |e, &i| index_expr_of(e, i))
+    if rhs_is_item {
+        // A pattern item supplies the elements through one nested pattern
+        // level per dimension (§10.9.1): by position, by replication, by index
+        // key, by type key or by `default:`. An item that is not a pattern
+        // is an array value, read element by element.
+        let mut leaves: Vec<(Vec<i64>, Expression)> = Vec::new();
+        let elem = ArraySlot {
+            elem_dt: mdt,
+            typedef_types,
+            params,
+            scope: ca.origin.as_ref().map_or("", |(_, scope)| scope.as_str()),
         };
+        if elem
+            .bind(&rhs, &lists, &mut Vec::new(), &mut leaves)
+            .is_none()
+        {
+            // Not bindable here: keep the whole-member form.
+            push_leaf(out, lhs, rhs);
+            return;
+        }
+        for (idx, rhs_e) in leaves {
+            let lhs_e = idx.iter().fold(lhs.clone(), |e, &i| index_expr_of(e, i));
+            push_leaf(out, lhs_e, rhs_e);
+        }
+        return;
+    }
+    for tup in cartesian_index_tuples(&lists) {
+        let rhs_e = tup.iter().fold(rhs.clone(), |e, &i| index_expr_of(e, i));
         let lhs_e = tup.iter().fold(lhs.clone(), |e, &i| index_expr_of(e, i));
         push_leaf(out, lhs_e, rhs_e);
+    }
+}
+
+/// §10.9.1 / §10.9.2: the type keys and `default:` key of a structure or
+/// array pattern, which reach every member or element that no position,
+/// name or index key sets, and recursively the members and elements of an
+/// aggregate one they reach.
+#[derive(Default)]
+struct PatternKeys {
+    types: Vec<(DataType, Expression)>,
+    default: Option<Expression>,
+}
+
+impl PatternKeys {
+    /// Record one key item of a pattern; false for any other item, or for a
+    /// second `default:`.
+    fn add(
+        &mut self,
+        item: &AssignmentPatternItem,
+        typedef_types: &HashMap<String, DataType>,
+    ) -> bool {
+        match item {
+            AssignmentPatternItem::Typed(t, v) => self.types.push((t.clone(), v.clone())),
+            // §10.9.2: a `name:` key that names a type is a type key.
+            AssignmentPatternItem::Named(k, v) if typedef_types.contains_key(&k.name) => {
+                let span = k.span;
+                self.types.push((
+                    DataType::TypeReference {
+                        name: TypeName {
+                            scopes: Vec::new(),
+                            name: k.clone(),
+                            span,
+                            bound: Default::default(),
+                        },
+                        dimensions: Vec::new(),
+                        type_args: Vec::new(),
+                        span,
+                    },
+                    v.clone(),
+                ));
+            }
+            AssignmentPatternItem::Default(v) => {
+                if self.default.replace(v.clone()).is_some() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The value these keys give one member or element of type `dt`, which
+    /// is an unpacked (sub)array when `is_array`. The last type key the type
+    /// matches wins (§10.9.2); otherwise `default:` applies. An aggregate
+    /// (unpacked array or structure, packed structure, multidimensional
+    /// packed array; §6.11.1) gets the keys as a pattern of its own, so they
+    /// reach its members and elements; a pattern given as the default is the
+    /// aggregate's own value. None when nothing covers it, or when a type
+    /// key cannot be matched here.
+    fn value_for(
+        &self,
+        dt: &DataType,
+        is_array: bool,
+        typedef_types: &HashMap<String, DataType>,
+        params: &HashMap<String, Value>,
+        span: Span,
+    ) -> Option<Expression> {
+        let aggregate = is_array || pattern_slot_is_aggregate(dt, typedef_types)?;
+        if !is_array {
+            let mut typed = None;
+            for (key, v) in &self.types {
+                if pattern_type_signature(key, typedef_types, params)?
+                    == pattern_type_signature(dt, typedef_types, params)?
+                {
+                    typed = Some(v);
+                }
+            }
+            if let Some(v) = typed {
+                return Some(v.clone());
+            }
+        }
+        if !aggregate {
+            return self.default.clone();
+        }
+        if let Some(d) = &self.default
+            && matches!(
+                peel_unpacked_typed_pattern(d).kind,
+                ExprKind::AssignmentPattern(_)
+            )
+        {
+            return Some(d.clone());
+        }
+        if self.types.is_empty() && self.default.is_none() {
+            return None;
+        }
+        let mut items: Vec<AssignmentPatternItem> = self
+            .types
+            .iter()
+            .map(|(t, v)| AssignmentPatternItem::Typed(t.clone(), v.clone()))
+            .collect();
+        if let Some(d) = &self.default {
+            items.push(AssignmentPatternItem::Default(d.clone()));
+        }
+        Some(Expression::new(ExprKind::AssignmentPattern(items), span))
+    }
+}
+
+/// Whether type and `default:` keys reach into a value of type `dt` rather
+/// than set it whole (§10.9.1, §10.9.2): a structure, or a packed array of
+/// more than one dimension, which is not a simple bit vector type (§6.11.1).
+/// None for a union, whose members the keys do not place here.
+fn pattern_slot_is_aggregate(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<bool> {
+    let mut packed_dims = 0usize;
+    let mut cur = dt;
+    for _ in 0..64 {
+        match cur {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
+                packed_dims += dimensions.len();
+                match lookup_scoped_type(name, typedef_types) {
+                    Some(next) => cur = next,
+                    None => return Some(packed_dims > 1),
+                }
+            }
+            DataType::Struct(su) => {
+                return (su.kind == StructUnionKind::Struct).then_some(true);
+            }
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                return Some(packed_dims + dimensions.len() > 1);
+            }
+            DataType::Enum(e) => return Some(packed_dims + e.dimensions.len() > 1),
+            _ => return Some(packed_dims > 0),
+        }
+    }
+    None
+}
+
+/// §6.22.1: a key that two types share when they match, for the types a
+/// pattern's type key names (integral, real and string types, and named
+/// structures and enumerations, which match only their own declaration).
+/// None when it cannot be decided here.
+fn pattern_type_signature(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+    params: &HashMap<String, Value>,
+) -> Option<String> {
+    let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
+        match d {
+            PackedDimension::Range { left, right, .. } => Some((
+                const_eval_i64_with_params(left, Some(params))?,
+                const_eval_i64_with_params(right, Some(params))?,
+            )),
+            PackedDimension::Unsized(_) => None,
+        }
+    };
+    let mut out = String::new();
+    let mut cur = dt;
+    for _ in 0..64 {
+        match cur {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
+                for d in dimensions {
+                    let (l, r) = bounds(d)?;
+                    out.push_str(&format!("[{l}:{r}]"));
+                }
+                cur = lookup_scoped_type(name, typedef_types)?;
+            }
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                ..
+            } => {
+                let state = if *kind == IntegerVectorType::Bit {
+                    2
+                } else {
+                    4
+                };
+                return Some(vector_type_signature(
+                    out,
+                    state,
+                    *signing == Some(Signing::Signed),
+                    dimensions,
+                    bounds,
+                )?);
+            }
+            DataType::Implicit {
+                signing,
+                dimensions,
+                ..
+            } => {
+                return Some(vector_type_signature(
+                    out,
+                    4,
+                    *signing == Some(Signing::Signed),
+                    dimensions,
+                    bounds,
+                )?);
+            }
+            DataType::IntegerAtom { kind, signing, .. } => {
+                let (w, state) = match kind {
+                    IntegerAtomType::Byte => (8, 2),
+                    IntegerAtomType::ShortInt => (16, 2),
+                    IntegerAtomType::Int => (32, 2),
+                    IntegerAtomType::LongInt => (64, 2),
+                    IntegerAtomType::Integer => (32, 4),
+                    IntegerAtomType::Time => (64, 4),
+                };
+                let signed = match signing {
+                    Some(s) => *s == Signing::Signed,
+                    None => *kind != IntegerAtomType::Time,
+                };
+                out.push_str(&format!("v{state}{signed}[{}:0]", w - 1));
+                return Some(out);
+            }
+            DataType::Real { kind, .. } => {
+                out.push_str(&format!("r{kind:?}"));
+                return Some(out);
+            }
+            DataType::Simple { kind, .. } => {
+                out.push_str(&format!("s{kind:?}"));
+                return Some(out);
+            }
+            DataType::Struct(su) if su.dimensions.is_empty() && su.span != Span::dummy() => {
+                out.push_str(&format!("u{}:{}", su.span.start, su.span.end));
+                return Some(out);
+            }
+            DataType::Enum(e) if e.dimensions.is_empty() && e.span != Span::dummy() => {
+                out.push_str(&format!("e{}:{}", e.span.start, e.span.end));
+                return Some(out);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The signature of a bit vector type: each outer packed dimension, then the
+/// innermost range (or none for a scalar).
+fn vector_type_signature(
+    mut out: String,
+    state: u8,
+    signed: bool,
+    dimensions: &[PackedDimension],
+    bounds: impl Fn(&PackedDimension) -> Option<(i64, i64)>,
+) -> Option<String> {
+    let Some((last, outer)) = dimensions.split_last() else {
+        out.push_str(&format!("b{state}{signed}"));
+        return Some(out);
+    };
+    for d in outer {
+        let (l, r) = bounds(d)?;
+        out.push_str(&format!("[{l}:{r}]"));
+    }
+    let (l, r) = bounds(last)?;
+    out.push_str(&format!("v{state}{signed}[{l}:{r}]"));
+    Some(out)
+}
+
+/// §10.9.2: the item of each member of `flat` (name, type, unpacked
+/// dimensions, in declaration order) in the structure pattern `items`: by
+/// position, where a replication sets exactly the members; by member name;
+/// by the last type key the member's type matches; else by `default:`
+/// (`PatternKeys::value_for`). None when an item cannot be placed here, a
+/// member is named twice, or a member is left uncovered.
+fn bind_struct_pattern(
+    items: &[AssignmentPatternItem],
+    flat: &[(String, DataType, Vec<UnpackedDimension>)],
+    typedef_types: &HashMap<String, DataType>,
+    params: &HashMap<String, Value>,
+    span: Span,
+) -> Option<Vec<Expression>> {
+    if let Some(ordered) = ordered_pattern_items(items, params) {
+        return (ordered.len() == flat.len()).then_some(ordered);
+    }
+    let mut by_name: HashMap<&str, &Expression> = HashMap::default();
+    let mut keys = PatternKeys::default();
+    for item in items {
+        match item {
+            AssignmentPatternItem::Named(k, v) if flat.iter().any(|(m, _, _)| *m == k.name) => {
+                if by_name.insert(k.name.as_str(), v).is_some() {
+                    return None;
+                }
+            }
+            _ if keys.add(item, typedef_types) => {}
+            _ => return None,
+        }
+    }
+    flat.iter()
+        .map(|(m, mdt, mdims)| match by_name.get(m.as_str()) {
+            Some(v) => Some((*v).clone()),
+            None => keys.value_for(mdt, !mdims.is_empty(), typedef_types, params, span),
+        })
+        .collect()
+}
+
+/// The items of an ordered pattern, with a replication (`'{2{a, b}}`)
+/// spelled out; None when any item is keyed.
+fn ordered_pattern_items(
+    items: &[AssignmentPatternItem],
+    params: &HashMap<String, Value>,
+) -> Option<Vec<Expression>> {
+    if !items
+        .iter()
+        .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
+    {
+        return None;
+    }
+    if let [AssignmentPatternItem::Ordered(only)] = items
+        && let ExprKind::Replication { count, exprs } = &only.kind
+    {
+        let c = const_eval_i64_with_params(count, Some(params))?;
+        return Some((0..c.max(0)).flat_map(|_| exprs.iter().cloned()).collect());
+    }
+    Some(items.iter().map(|it| it.expr().clone()).collect())
+}
+
+/// The elements of one fixed unpacked array member of a structure pattern.
+struct ArraySlot<'a> {
+    elem_dt: &'a DataType,
+    typedef_types: &'a HashMap<String, DataType>,
+    params: &'a HashMap<String, Value>,
+    /// The instance scope of the assignment (`""` for the top), whose
+    /// parameters a `name:` index key names.
+    scope: &'a str,
+}
+
+impl ArraySlot<'_> {
+    /// The value of the parameter `name` of the assignment's scope.
+    fn param(&self, name: &str) -> Option<&Value> {
+        if self.scope.is_empty() {
+            self.params.get(name)
+        } else {
+            self.params.get(&format!("{}.{}", self.scope, name))
+        }
+    }
+
+    /// Append to `out` the item of every element below index prefix `idx`
+    /// that the item `e` gives over the dimensions `lists` (each in declared
+    /// order, outermost first). §10.9.1: each pattern level is one dimension,
+    /// whose elements are set by position (a replication is the whole
+    /// dimension), by index key, by the last matching type key, else by
+    /// `default:`; an element no key covers, a repeated index or an index
+    /// outside the range leaves the member to the caller.
+    fn bind(
+        &self,
+        e: &Expression,
+        lists: &[Vec<i64>],
+        idx: &mut Vec<i64>,
+        out: &mut Vec<(Vec<i64>, Expression)>,
+    ) -> Option<()> {
+        let Some((list, rest)) = lists.split_first() else {
+            out.push((idx.clone(), e.clone()));
+            return Some(());
+        };
+        let elems: Vec<Expression> = match &peel_unpacked_typed_pattern(e).kind {
+            ExprKind::AssignmentPattern(items) => {
+                self.level(items, list, !rest.is_empty(), e.span)?
+            }
+            _ => list.iter().map(|&i| index_expr_of(e.clone(), i)).collect(),
+        };
+        for (&i, x) in list.iter().zip(&elems) {
+            idx.push(i);
+            self.bind(x, rest, idx, out)?;
+            idx.pop();
+        }
+        Some(())
+    }
+
+    /// The items of the elements `list` of one pattern level.
+    fn level(
+        &self,
+        items: &[AssignmentPatternItem],
+        list: &[i64],
+        subarray: bool,
+        span: Span,
+    ) -> Option<Vec<Expression>> {
+        if let Some(ordered) = ordered_pattern_items(items, self.params) {
+            return (ordered.len() == list.len()).then_some(ordered);
+        }
+        let mut keyed: Vec<Option<&Expression>> = vec![None; list.len()];
+        let mut keys = PatternKeys::default();
+        for item in items {
+            let (index, v) = match item {
+                AssignmentPatternItem::Keyed(k, v) => {
+                    (const_eval_i64_with_params(k, Some(self.params))?, v)
+                }
+                // A parameter name is an index key, not a member name.
+                AssignmentPatternItem::Named(k, v) if self.param(&k.name).is_some() => {
+                    (self.param(&k.name)?.to_i64()?, v)
+                }
+                _ if keys.add(item, self.typedef_types) => continue,
+                _ => return None,
+            };
+            let pos = list.iter().position(|&i| i == index)?;
+            if keyed[pos].replace(v).is_some() {
+                return None;
+            }
+        }
+        keyed
+            .into_iter()
+            .map(|v| match v {
+                Some(v) => Some(v.clone()),
+                None => keys.value_for(
+                    self.elem_dt,
+                    subarray,
+                    self.typedef_types,
+                    self.params,
+                    span,
+                ),
+            })
+            .collect()
     }
 }
 
@@ -28610,6 +28985,21 @@ fn cartesian_index_tuples(lists: &[Vec<i64>]) -> Vec<Vec<i64>> {
         tuples = next;
     }
     tuples
+}
+
+/// The ordered pattern `'{base[i0], base[i1], ...}` of the elements of
+/// `base` over the dimensions `lists`, one nested level per dimension.
+fn element_pattern(base: &Expression, lists: &[Vec<i64>]) -> Expression {
+    let Some((list, rest)) = lists.split_first() else {
+        return base.clone();
+    };
+    let items = list
+        .iter()
+        .map(|&i| {
+            AssignmentPatternItem::Ordered(element_pattern(&index_expr_of(base.clone(), i), rest))
+        })
+        .collect();
+    Expression::new(ExprKind::AssignmentPattern(items), base.span)
 }
 
 /// `base[idx]` as an expression.
@@ -47086,16 +47476,26 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         }
     }
 
-    // Struct members of a nettype net, or None for a scalar one.
-    let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<String>> {
+    // Struct members of a nettype net (name, type, unpacked dimensions), or
+    // None for a scalar one.
+    type NetMembers = Option<Vec<(String, DataType, Vec<UnpackedDimension>)>>;
+    let struct_members = |elab: &ElaboratedModule, name: &str| -> NetMembers {
         declared_type_name(elab, name)
             .and_then(|tn| elab.typedef_types.get(&tn).cloned())
             .and_then(|dt| match resolve_typedef_chain(&dt, &elab.typedef_types) {
                 DataType::Struct(su) if !su.packed => {
-                    let ms: Vec<String> = su
+                    let ms: Vec<_> = su
                         .members
                         .iter()
-                        .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                        .flat_map(|m| {
+                            m.declarators.iter().map(|d| {
+                                (
+                                    d.name.name.clone(),
+                                    m.data_type.clone(),
+                                    d.dimensions.clone(),
+                                )
+                            })
+                        })
                         .collect();
                     if ms.is_empty() { None } else { Some(ms) }
                 }
@@ -47108,12 +47508,14 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     let emit = |kept: &mut Vec<ContinuousAssignment>,
                 lhs: &str,
                 rhs: Expression,
-                members: &Option<Vec<String>>,
+                members: &NetMembers,
                 delay: u64,
-                span: Span| {
+                span: Span,
+                typedef_types: &HashMap<String, DataType>,
+                params: &HashMap<String, Value>| {
         match members {
             Some(ms) => {
-                for m in ms {
+                for (m, mdt, mdims) in ms {
                     let mident = Identifier {
                         name: m.clone(),
                         span: Span::dummy(),
@@ -47127,6 +47529,35 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     mlhs.span = span;
                     let mut mrhs = member_ref_expr(&rhs, &mident);
                     mrhs.span = span;
+                    if !mdims.is_empty() {
+                        // §7.2, §7.4: an unpacked array member has no storage
+                        // of its own; each element is its own leaf, and gets
+                        // that element of the resolved value (§6.6.7).
+                        let template = ContinuousAssignment {
+                            gate_delay_fall: None,
+                            delay_select: None,
+                            origin: None,
+                            lhs: mlhs.clone(),
+                            rhs: mrhs.clone(),
+                            delay,
+                            rhs_parent_scoped: false,
+                            delay_fall: None,
+                            delay_off: None,
+                        };
+                        emit_member_elem_assigns(
+                            mlhs,
+                            mrhs,
+                            false,
+                            mdt,
+                            mdims,
+                            &template,
+                            typedef_types,
+                            params,
+                            kept,
+                            0,
+                        );
+                        continue;
+                    }
                     kept.push(ContinuousAssignment {
                         gate_delay_fall: None,
                         delay_select: None,
@@ -47215,13 +47646,27 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             let span = d.span;
                             let fields: Vec<crate::ast::expr::AssignmentPatternItem> = ms
                                 .iter()
-                                .map(|m| {
+                                .map(|(m, _, mdims)| {
                                     let mident = Identifier {
                                         name: m.clone(),
                                         span: Span::dummy(),
                                     };
                                     let mut e = member_ref_expr(&d, &mident);
                                     e.span = span;
+                                    // An unpacked array member is read
+                                    // element by element (§7.4).
+                                    if let Some(lists) = (!mdims.is_empty())
+                                        .then(|| {
+                                            fixed_unpacked_index_lists(
+                                                mdims,
+                                                &elab.parameters,
+                                                &elab.typedef_types,
+                                            )
+                                        })
+                                        .flatten()
+                                    {
+                                        e = element_pattern(&e, &lists);
+                                    }
                                     crate::ast::expr::AssignmentPatternItem::Ordered(e)
                                 })
                                 .collect();
@@ -47240,7 +47685,16 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 span,
             )
         };
-        emit(&mut kept, &root, rhs, &members, delay, span);
+        emit(
+            &mut kept,
+            &root,
+            rhs,
+            &members,
+            delay,
+            span,
+            &elab.typedef_types,
+            &elab.parameters,
+        );
 
         // Every other net in the component names the same physical node.
         if let Some(ms) = comp_members.get(&root) {
@@ -47249,7 +47703,16 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     continue;
                 }
                 let mm = struct_members(elab, m);
-                emit(&mut kept, m, make_ident_expr(&root), &mm, 0, span);
+                emit(
+                    &mut kept,
+                    m,
+                    make_ident_expr(&root),
+                    &mm,
+                    0,
+                    span,
+                    &elab.typedef_types,
+                    &elab.parameters,
+                );
             }
         }
     }
