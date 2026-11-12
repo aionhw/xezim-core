@@ -9493,33 +9493,59 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-thread_local! {
-    static UNIT_BIND_INSTANCES: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::default());
-}
-
-/// §23.11: the instance names of the compilation-unit `bind` directives. A
-/// bound instance is instantiated in its target, so the target can start a
+/// §23.11: the instances the compilation-unit `bind` directives add. A bound
+/// instance is instantiated in its target, so the target can start a
 /// hierarchical name with it (`a.y`), but the undeclared-name checks run on
 /// each definition before those binds are applied. A module-scope bind is in
-/// the definitions already (`collect_design_declared_names`). The scope
+/// the definitions already (`collect_design_declared_names`).
+#[derive(Default)]
+pub(crate) struct UnitBindInstances {
+    /// Every instance name, for the instance bodies, whose check accepts any
+    /// name the design declares.
+    names: HashSet<String>,
+    /// The names a bind adds to every instance of a module (`bind t c a();`),
+    /// by that module: what a top's own processes can name. A bind into an
+    /// instance path never targets the top itself.
+    by_module: HashMap<String, HashSet<String>>,
+}
+
+thread_local! {
+    static UNIT_BIND_INSTANCES: std::cell::RefCell<UnitBindInstances> =
+        std::cell::RefCell::new(UnitBindInstances::default());
+}
+
+/// Holds the compilation-unit binds' instances for one elaboration and
 /// restores the previous set for nested or later library calls.
-pub(crate) struct UnitBindInstancesGuard(HashSet<String>);
+pub(crate) struct UnitBindInstancesGuard(UnitBindInstances);
 impl Drop for UnitBindInstancesGuard {
     fn drop(&mut self) {
         UNIT_BIND_INSTANCES.with(|s| *s.borrow_mut() = std::mem::take(&mut self.0));
     }
 }
 pub(crate) fn unit_bind_instances_scope(binds: &[BindDirective]) -> UnitBindInstancesGuard {
-    let names = binds
-        .iter()
-        .flat_map(|b| b.instantiation.instances.iter())
-        .map(|hi| hi.name.name.clone())
-        .collect();
-    UnitBindInstancesGuard(UNIT_BIND_INSTANCES.with(|s| s.replace(names)))
+    let mut set = UnitBindInstances::default();
+    for b in binds {
+        for hi in &b.instantiation.instances {
+            set.names.insert(hi.name.name.clone());
+            if b.target_path.is_empty() {
+                set.by_module
+                    .entry(b.target_module.name.clone())
+                    .or_default()
+                    .insert(hi.name.name.clone());
+            }
+        }
+    }
+    UnitBindInstancesGuard(UNIT_BIND_INSTANCES.with(|s| s.replace(set)))
 }
-fn is_unit_bind_instance(name: &str) -> bool {
-    UNIT_BIND_INSTANCES.with(|s| s.borrow().contains(name))
+/// Whether a compilation-unit bind adds an instance `name` to every instance
+/// of `module`.
+fn is_unit_bind_instance_of(module: &str, name: &str) -> bool {
+    UNIT_BIND_INSTANCES.with(|s| {
+        s.borrow()
+            .by_module
+            .get(module)
+            .is_some_and(|names| names.contains(name))
+    })
 }
 
 /// §3.12.1/§6.5: validate source definitions before copying compilation-unit
@@ -18025,8 +18051,9 @@ fn validate_expr_idents_as(
                    !elab.sequences.contains(name) &&
                    // §19.7.1 `cg::type_option.f` scopes on the covergroup name.
                    !elab.covergroups.contains_key(name) &&
-                   // §23.11: an instance a compilation-unit bind adds.
-                   !(role == HeadRole::Path && is_unit_bind_instance(name)) &&
+                   // §23.11: an instance a compilation-unit bind adds to
+                   // this top. Another top cannot name it (§23.8).
+                   !(role == HeadRole::Path && is_unit_bind_instance_of(&elab.name, name)) &&
                    !locals.contains(name) {
                    return Err(span_error(
                        elab,
@@ -32685,7 +32712,7 @@ fn validate_inlined_bodies(
 ) -> Result<(), String> {
     let mut known = collect_design_declared_names(definitions, true);
     // §23.11: instances that compilation-unit binds add.
-    UNIT_BIND_INSTANCES.with(|s| known.extend(s.borrow().iter().cloned()));
+    UNIT_BIND_INSTANCES.with(|s| known.extend(s.borrow().names.iter().cloned()));
     let mut outside_classes = collect_design_declared_names(definitions, false);
     // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
     let mut leaves: HashSet<String> = HashSet::default();
