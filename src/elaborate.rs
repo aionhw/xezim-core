@@ -10577,7 +10577,8 @@ pub fn elaborate_module_with_defs(
                             info: &mut HashMap<String, (DataType, Option<String>)>,
                             seen: &mut HashSet<String>,
                             nd: &crate::ast::decl::NettypeDeclaration,
-                            key: String| {
+                            key: String,
+                            package: Option<&str>| {
         seen.insert(key.clone());
         let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
         typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", key.clone(), w);
@@ -10586,7 +10587,21 @@ pub fn elaborate_module_with_defs(
             key,
             (
                 nd.data_type.clone(),
-                nd.resolver.as_ref().map(|r| r.name.clone()),
+                // §26.3: an import exposes the original declaration; its
+                // resolver stays in the declaring package, even if the
+                // importing module has a function with the same name.
+                nd.resolver.as_ref().map(|r| match package {
+                    Some(pkg) => {
+                        let qualified = format!("{}::{}", pkg, r.name);
+                        if elab.functions.contains_key(&qualified) {
+                            qualified
+                        } else {
+                            // Keep imported resolvers on the existing lookup path.
+                            r.name.clone()
+                        }
+                    }
+                    None => r.name.clone(),
+                }),
             ),
         );
     };
@@ -10617,15 +10632,26 @@ pub fn elaborate_module_with_defs(
             for item in &pkg.items {
                 if let crate::ast::decl::PackageItem::Nettype(nd) = item {
                     let bare = nd.name.name.clone();
-                    let qualified = format!("{}::{}", pkg.name.name, bare);
+                    // A package nettype whose name collides with another
+                    // package's type already carries its package key.
+                    if !bare.contains("::") {
+                        register_nettype(
+                            &mut elab,
+                            &mut nettype_info,
+                            &mut user_nettypes,
+                            nd,
+                            format!("{}::{}", pkg.name.name, bare),
+                            Some(&pkg.name.name),
+                        );
+                    }
                     register_nettype(
                         &mut elab,
                         &mut nettype_info,
                         &mut user_nettypes,
                         nd,
-                        qualified,
+                        bare,
+                        Some(&pkg.name.name),
                     );
-                    register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, bare);
                 }
             }
         }
@@ -10635,7 +10661,14 @@ pub fn elaborate_module_with_defs(
     for item in module.items() {
         if let ModuleItem::NettypeDeclaration(nd) = item {
             let key = nd.name.name.clone();
-            register_nettype(&mut elab, &mut nettype_info, &mut user_nettypes, nd, key);
+            register_nettype(
+                &mut elab,
+                &mut nettype_info,
+                &mut user_nettypes,
+                nd,
+                key,
+                None,
+            );
         }
     }
     // §6.6.7 nettype ALIAS: `nettype T wT; nettype wT wT2;` — a nettype may be
@@ -52916,6 +52949,13 @@ fn process_import(
                                     }
                                 }
                             }
+                        }
+                        PackageItem::Nettype(nd) if &nd.name.name == sym_name => {
+                            // §26.3 / §6.6.7: accept the explicitly imported
+                            // nettype. The shared nettype pre-pass registers
+                            // its data type and package-bound resolver for
+                            // explicit, wildcard and qualified references.
+                            found = true;
                         }
                         PackageItem::Typedef(td) if &td.name.name == sym_name => {
                             process_typedef(td, elab);
