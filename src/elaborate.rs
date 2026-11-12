@@ -253,6 +253,54 @@ pub struct LoggedMap<V> {
     log: Vec<String>,
 }
 
+/// A name-keyed table whose copies share one map until one of them is
+/// written (copy on write). Reads and writes go through `Deref` and
+/// `DerefMut` to the map; serialized exactly as the plain map. Typedef
+/// bodies are kept this way so the constant evaluator's snapshot and its
+/// per-call shells share the table instead of copying it (#721).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct SharedMap<V>(Rc<HashMap<String, V>>);
+
+impl<V> Default for SharedMap<V> {
+    fn default() -> Self {
+        Self(Rc::new(HashMap::default()))
+    }
+}
+
+impl<V> Clone for SharedMap<V> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<V> std::ops::Deref for SharedMap<V> {
+    type Target = HashMap<String, V>;
+    fn deref(&self) -> &HashMap<String, V> {
+        &self.0
+    }
+}
+
+impl<V: Clone> std::ops::DerefMut for SharedMap<V> {
+    fn deref_mut(&mut self) -> &mut HashMap<String, V> {
+        Rc::make_mut(&mut self.0)
+    }
+}
+
+impl<V> From<HashMap<String, V>> for SharedMap<V> {
+    fn from(map: HashMap<String, V>) -> Self {
+        Self(Rc::new(map))
+    }
+}
+
+impl<'a, V> IntoIterator for &'a SharedMap<V> {
+    type Item = (&'a String, &'a V);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// Typedef name -> width.
 pub type TypedefTable = LoggedMap<u32>;
 /// Subroutine name -> declaration.
@@ -294,6 +342,12 @@ impl<V: Clone> LoggedMap<V> {
 
     pub fn as_map(&self) -> &HashMap<String, V> {
         &self.map
+    }
+
+    /// The map itself, shared: a snapshot that costs nothing until this
+    /// table is next written (§13.4.3 constant-function shells, #721).
+    fn shared_map(&self) -> Rc<HashMap<String, V>> {
+        Rc::clone(&self.map)
     }
 
     /// The plain map, for bulk in-place edits (rewrap with `from_map`).
@@ -3627,7 +3681,7 @@ pub struct ElaboratedModule {
     /// elements (`typedef u8_t [15:0] vec_t`), the ELEMENT width (8 here).
     /// Lets downstream compilers slice `local[i]` on typedef-typed locals.
     pub typedef_elem_widths: HashMap<String, u32>,
-    pub typedef_types: HashMap<String, DataType>,
+    pub typedef_types: SharedMap<DataType>,
     /// §6.6.7 nettype name -> resolution function, for every user-defined
     /// nettype visible at the top module (which is where a nettype shared
     /// across a port boundary must be declared — both sides have to name the
@@ -4329,7 +4383,7 @@ impl ElaboratedModule {
             program_initial_blocks: Vec::new(),
             parameters: HashMap::default(),
             typedefs: TypedefTable::default(),
-            typedef_types: HashMap::default(),
+            typedef_types: SharedMap::default(),
             nettype_resolvers: HashMap::default(),
             arrays: HashMap::default(),
             associative_arrays: HashMap::default(),
@@ -23208,7 +23262,7 @@ fn const_eval_user_call(
     // the actual is zero-extended. An ascending `[0:N]` index then reads the
     // top of that 32-bit word (zeros) instead of element 0.
     if let Some(widths) = TYPEDEF_WIDTHS_TLS.with(|c| c.borrow().clone()) {
-        shell.typedefs = TypedefTable::from_map(widths);
+        shell.typedefs = TypedefTable::from_shared(widths);
     }
     let mut argv = Vec::with_capacity(args.len());
     for a in args {
@@ -24337,13 +24391,15 @@ thread_local! {
     /// Typedef bodies for `const_eval_user_call`. That path builds an empty
     /// module shell, so a generate-if that calls a package function could not
     /// see `typedef unit_type_t [0:4] fmt_unit_types_t` and indexed the formal
-    /// as bits. Snapshot taken once the package typedefs are complete.
-    static TYPEDEF_TYPES_TLS: std::cell::RefCell<Option<HashMap<String, DataType>>>
+    /// as bits. Snapshot taken once the package typedefs are complete; it
+    /// shares the elaboration's table until either is written, and every
+    /// shell shares it, so a call no longer copies every typedef (#721).
+    static TYPEDEF_TYPES_TLS: std::cell::RefCell<Option<SharedMap<DataType>>>
         = const { std::cell::RefCell::new(None) };
     /// Matching widths. A miss in `resolve_type_width` is 32 bits, which
     /// zero-extends a 10-bit packed array and moves ascending element 0 off
-    /// the bits that hold the value.
-    static TYPEDEF_WIDTHS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
+    /// the bits that hold the value. Shared the same way.
+    static TYPEDEF_WIDTHS_TLS: std::cell::RefCell<Option<Rc<HashMap<String, u32>>>>
         = const { std::cell::RefCell::new(None) };
 }
 
@@ -24363,12 +24419,12 @@ fn set_param_fallback(params: &HashMap<String, Value>) {
     PARAM_FALLBACK_TLS.with(|c| *c.borrow_mut() = params.clone());
 }
 
-fn set_typedef_types_tls(types: &HashMap<String, DataType>) {
+fn set_typedef_types_tls(types: &SharedMap<DataType>) {
     TYPEDEF_TYPES_TLS.with(|c| *c.borrow_mut() = Some(types.clone()));
 }
 
-fn set_typedef_widths_tls(widths: &HashMap<String, u32>) {
-    TYPEDEF_WIDTHS_TLS.with(|c| *c.borrow_mut() = Some(widths.clone()));
+fn set_typedef_widths_tls(widths: &TypedefTable) {
+    TYPEDEF_WIDTHS_TLS.with(|c| *c.borrow_mut() = Some(widths.shared_map()));
 }
 
 /// Look up `name` in the global parameter fallback (package/$unit params).
@@ -33713,7 +33769,7 @@ fn inline_instantiations_inner(
     // resolve imported package parameters like black-parrot's `all_cfgs_gp`.
     set_param_fallback(&top_params);
     set_typedef_types_tls(&elab.typedef_types);
-    set_typedef_widths_tls(elab.typedefs.as_map());
+    set_typedef_widths_tls(&elab.typedefs);
     let mut cache = InlineCache::default();
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
