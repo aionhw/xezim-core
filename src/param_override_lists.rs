@@ -221,3 +221,104 @@ pub(crate) fn check_defparam(
     };
     Err(span_error_of(elab, span, owner, &message))
 }
+
+/// §6.20.1: whether `path`, written from an instance of a definition whose
+/// body is `items`, names a parameter declared in one of its generate blocks
+/// (`g.P`, `g[1].h.P`). Every such parameter is a local parameter.
+fn generate_block_parameter(items: &[ModuleItem], path: &[String]) -> bool {
+    fn declares(items: &[ModuleItem], name: &str) -> bool {
+        items.iter().any(|it| match it {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                match &pd.kind {
+                    ParameterKind::Data { assignments, .. } => {
+                        assignments.iter().any(|a| a.name.name == name)
+                    }
+                    ParameterKind::Type { assignments } => {
+                        assignments.iter().any(|a| a.name.name == name)
+                    }
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => declares(&gr.items, name),
+            _ => false,
+        })
+    }
+    let [head, rest @ ..] = path else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // A block named `label` (indexed for a loop) holding `items`.
+    let block = |label: &str, items: &[ModuleItem], indexed: bool| {
+        let named = if indexed {
+            head.strip_prefix(label)
+                .is_some_and(|r| r.starts_with('[') && r.ends_with(']'))
+        } else {
+            head == label
+        };
+        named
+            && match rest {
+                [name] => declares(items, name),
+                _ => generate_block_parameter(items, rest),
+            }
+    };
+    items.iter().any(|it| match it {
+        // §27.3: a generate region is not a scope.
+        ModuleItem::GenerateRegion(gr) => generate_block_parameter(&gr.items, path),
+        ModuleItem::GenerateIf(gi) => gi.branches.iter().enumerate().any(|(i, (_, items))| {
+            if gi.branch_direct.get(i) == Some(&true) {
+                return generate_block_parameter(items, path);
+            }
+            let label = gi.branch_labels.get(i).and_then(|l| l.as_deref());
+            block(label.unwrap_or(&gi.implicit_name), items, false)
+        }),
+        ModuleItem::GenerateCase(gc) => gc.arms.iter().any(|arm| {
+            if arm.direct {
+                return generate_block_parameter(&arm.items, path);
+            }
+            block(
+                arm.label.as_deref().unwrap_or(&gc.implicit_name),
+                &arm.items,
+                false,
+            )
+        }),
+        ModuleItem::GenerateFor(gf) => block(
+            gf.name.as_deref().unwrap_or(&gf.implicit_name),
+            &gf.items,
+            true,
+        ),
+        _ => false,
+    })
+}
+
+/// §23.10.1, §6.20.1: a `defparam` written in `owner` whose path continues
+/// below an instance of `def` (`u.g.P`). One that ends at a parameter of a
+/// generate block of `def` cannot set it: that parameter is local. A path into
+/// a deeper instance is judged when that instance is built.
+pub(crate) fn check_defparam_path(
+    elab: &ElaboratedModule,
+    def: Definition,
+    path: &[String],
+    span: Span,
+    owner: &str,
+) -> Result<(), String> {
+    if !sv_parser::strict_checks() {
+        return Ok(());
+    }
+    let Some(kind) = instantiable_kind(def) else {
+        return Ok(());
+    };
+    let child = def.name();
+    if REDEFINED_MODULES.with(|r| r.borrow().contains(child))
+        || !generate_block_parameter(def.items(), path)
+    {
+        return Ok(());
+    }
+    let message = format!(
+        "defparam cannot override '{}' of {kind} '{child}': a parameter declared in a \
+         generate block is a local parameter (IEEE 1800-2017 §23.10.1, §6.20.1); \
+         --no-strict accepts it",
+        path.join(".")
+    );
+    Err(span_error_of(elab, span, owner, &message))
+}

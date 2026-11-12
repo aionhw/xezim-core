@@ -35023,6 +35023,14 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             new_gf.items = gf.items.iter().map(rename_item_decls).collect();
             ModuleItem::GenerateFor(new_gf)
         }
+        // §27.4: a defparam value may read the iteration's genvar or a
+        // parameter of the block.
+        ModuleItem::Defparam(pairs) => ModuleItem::Defparam(
+            pairs
+                .iter()
+                .map(|(target, value)| (target.clone(), gen_expr(value)))
+                .collect(),
+        ),
         ModuleItem::FinalConstruct(_)
         | ModuleItem::GateInstantiation(_)
         | ModuleItem::PropertyDeclaration(_)
@@ -35540,8 +35548,30 @@ fn gen_scope_name(label: Option<&String>, implicit: &str) -> String {
 /// so that %m reports the full hierarchical path including generate block names.
 /// `index` is a generate-for block's loop index, recorded on its instances.
 fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str, index: Option<i64>) {
+    // §23.10.1: a `defparam` of the block names its targets from the block,
+    // so a path starting at one of the block's instances gets the scope the
+    // instance gets below (`u.P` in `gb` is `gb.u.P`). It matched no instance
+    // and was dropped.
+    let local_instances: Vec<String> =
+        if items.iter().any(|it| matches!(it, ModuleItem::Defparam(_))) {
+            items
+                .iter()
+                .filter_map(|it| match it {
+                    ModuleItem::ModuleInstantiation(mi) => Some(mi),
+                    _ => None,
+                })
+                .flat_map(|mi| mi.instances.iter().map(|hi| hi.name.name.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
     for item in items.iter_mut() {
         match item {
+            ModuleItem::Defparam(pairs) => {
+                for (target, _) in pairs.iter_mut() {
+                    prefix_defparam_target(target, scope, &local_instances);
+                }
+            }
             ModuleItem::Bind(b) => {
                 b.gen_scope = if b.gen_scope.is_empty() {
                     scope.to_string()
@@ -35585,6 +35615,40 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str, index: Option<i64>) {
             ModuleItem::AssertionItem(_) => assertion_item_in_gen_scope(item, scope),
             _ => {}
         }
+    }
+}
+
+/// See `prefix_gen_scope`: put `scope` in front of a `defparam` target whose
+/// first component is one of the block's `instances` (by name, or as the
+/// scope of an inner block's instance, `inner.u`).
+fn prefix_defparam_target(target: &mut Expression, scope: &str, instances: &[String]) {
+    match &mut target.kind {
+        ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+            prefix_defparam_target(expr, scope, instances)
+        }
+        ExprKind::Ident(h) if h.root.is_none() => {
+            let Some(head) = h.path.first() else {
+                return;
+            };
+            let n = head.name.name.as_str();
+            let local = instances
+                .iter()
+                .any(|i| i == n || i.strip_prefix(n).is_some_and(|r| r.starts_with('.')));
+            if local {
+                let span = head.name.span;
+                h.path.insert(
+                    0,
+                    crate::ast::expr::HierPathSegment {
+                        name: Identifier {
+                            name: scope.to_string(),
+                            span,
+                        },
+                        selects: Vec::new(),
+                    },
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -39725,6 +39789,12 @@ fn inline_module_items(
                             ovr_exprs.remove(rest[0].as_str());
                         }
                     } else {
+                        // §6.20.1: a parameter of one of the child's generate
+                        // blocks (`u.g.P`) is local; it matched no instance
+                        // below and was dropped without a message.
+                        crate::param_override_lists::check_defparam_path(
+                            elab, sub_mod, rest, dp.span, &dp.owner,
+                        )?;
                         // Targets a deeper instance — propagate into recursion.
                         sub_defparams.push(PendingDefparam {
                             path: rest.to_vec(),
