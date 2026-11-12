@@ -44249,6 +44249,11 @@ fn inline_module_items(
                             )
                         });
                         scope_local_decl_types(&mut items, &scope_array_typedef);
+                        // §6.20.3: a local declared with one of this instance's
+                        // type parameters (`T loc;`) has the type bound here, as
+                        // in its initial and always blocks; the bare name has
+                        // no binding once the instance is inlined.
+                        let items = substitute_type_params_stmts(items, &pend_ctx.type_binds);
                         new_fd.items = cache.callable_bodies.intern(items.into());
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
@@ -44354,6 +44359,8 @@ fn inline_module_items(
                             )
                         });
                         scope_local_decl_types(&mut items, &scope_array_typedef);
+                        // §6.20.3: as for a function above.
+                        let items = substitute_type_params_stmts(items, &pend_ctx.type_binds);
                         new_td.items = cache.callable_bodies.intern(items.into());
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
@@ -52009,6 +52016,20 @@ fn query_of_bound_type_param(name: &str, args: &[Expression]) -> Option<i64> {
         let c = c.borrow();
         type_query_bound(name, c.as_ref()?.get(t)?, dim)
     })
+}
+
+/// `substitute_type_params_stmt` over a subroutine body.
+fn substitute_type_params_stmts(
+    stmts: Vec<Statement>,
+    binds: &HashMap<String, DataType>,
+) -> Vec<Statement> {
+    if binds.is_empty() {
+        return stmts;
+    }
+    stmts
+        .into_iter()
+        .map(|st| substitute_type_params_stmt(st, binds))
+        .collect()
 }
 
 /// Substitute an instance's TYPE-PARAMETER bindings into the declarations of
