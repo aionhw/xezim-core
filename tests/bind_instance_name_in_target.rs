@@ -47,3 +47,17 @@ fn a_name_no_bind_declares_is_still_undeclared() {
     let e = elaborate(&src, "t").err().expect("zz must be rejected");
     assert!(e.contains("Undeclared identifier 'zz'"), "{e}");
 }
+
+/// §23.8: a top that is not the bind's target cannot name the bound instance;
+/// the target's own processes can.
+#[test]
+fn another_top_cannot_name_the_bound_instance() {
+    let src = format!(
+        "{CHILD}module t; endmodule\nmodule other; int r; initial #1 r = a.y; endmodule\n\
+         bind t c #(3) a();\n"
+    );
+    let e = elaborate(&src, "other")
+        .err()
+        .expect("other must not see a");
+    assert!(e.contains("Undeclared identifier 'a'"), "{e}");
+}
