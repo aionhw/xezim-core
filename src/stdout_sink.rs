@@ -357,6 +357,16 @@ impl StdoutSink {
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn writer_thread_reservation_failure_keeps_an_inline_sink() {
+        // A PiB stack exceeds the Linux user address range without consuming
+        // resident memory. Exercise the real spawn error, not a mock writer.
+        let sink = StdoutSink::threaded_with_builder(
+            std::thread::Builder::new().stack_size(1usize << 50));
+        assert!(matches!(sink.mode, Mode::Inline(_)));
+    }
+
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
