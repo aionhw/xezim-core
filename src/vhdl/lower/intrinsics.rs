@@ -2,13 +2,18 @@
 //! values. The IEEE bodies compute bit by bit through tables (which the
 //! simulator's compiled tier declines); on operands made only of '0' and
 //! '1' the result is plain binary arithmetic, so a wrapper computes it
-//! natively and calls the specialised body for anything else (metavalues,
-//! truncations: their warnings and results stay those of the IEEE source).
-//! numeric_bit values have no metavalues, so their arithmetic is native.
+//! natively and calls the specialised body for anything else (a truncation,
+//! whose warning and result stay those of the IEEE source). numeric_bit
+//! values have no metavalues, so their arithmetic is native.
 //!
 //! A std_ulogic element is its position (`U X 0 1 Z W L H -` = 0..8) in 4
-//! bits: a vector is "clean" when every nibble is 2 or 3, and the binary
-//! value is then bit 0 of each nibble (`compress`), put back by `spread`.
+//! bits. 'L' and 'H' are '0' and '1' with bit 2 set; clearing it is TO_01.
+//! A vector is "clean" when every nibble is then 2 or 3, and the binary
+//! value is bit 0 of each nibble (`compress`), put back by `spread`. A
+//! relational operator whose operand still has a metavalue returns the
+//! IEEE result here (false, or true for `/=`) and reports the same warning.
+//! The specialised body does that with an interpreted TO_01 loop, which is
+//! about a millisecond for an 8-bit compare.
 
 use std::fmt::Write as _;
 
@@ -35,7 +40,71 @@ enum Cls {
 
 /// A W-bit hex literal with nibble `nib` repeated n times.
 fn nib_pat(n: i64, nib: char) -> String {
-    format!("{}'h{}", 4 * n, std::iter::repeat_n(nib, n as usize).collect::<String>())
+    format!(
+        "{}'h{}",
+        4 * n,
+        std::iter::repeat_n(nib, n as usize).collect::<String>()
+    )
+}
+
+/// The packed operand with the strength bit of every nibble cleared, so
+/// 'L'/'H' compare as '0'/'1' the way `TO_01` does.
+fn strength_stripped(name: &str, n: i64) -> String {
+    format!("({} & ~{})", name, nib_pat(n, '4'))
+}
+
+/// `assert` line of the "metavalue detected" report in `numeric_std-body`,
+/// for the six overloads of one relational operator: unsigned/unsigned,
+/// signed/signed, natural/unsigned, integer/signed, unsigned/natural,
+/// signed/integer. The report text is the line after.
+fn rel_meta_line(name: &str, c0: Cls, c1: Cls) -> i32 {
+    let is_vec = |c: Cls| matches!(c, Cls::U | Cls::S);
+    let signed = matches!(c0, Cls::S) || matches!(c1, Cls::S);
+    let idx = match (is_vec(c0), is_vec(c1), signed) {
+        (true, true, false) => 0,
+        (true, true, true) => 1,
+        (false, true, false) => 2,
+        (false, true, true) => 3,
+        (true, false, false) => 4,
+        _ => 5,
+    };
+    const LINES: &[(&str, [i32; 6])] = &[
+        (">", [1168, 1195, 1217, 1241, 1265, 1289]),
+        ("<", [1320, 1347, 1369, 1393, 1417, 1441]),
+        ("<=", [1472, 1499, 1521, 1545, 1569, 1593]),
+        (">=", [1624, 1651, 1673, 1697, 1721, 1745]),
+        ("=", [1776, 1803, 1825, 1849, 1873, 1897]),
+        ("/=", [1928, 1955, 1977, 2001, 2025, 2049]),
+    ];
+    LINES
+        .iter()
+        .find(|(op, _)| *op == name)
+        .map(|(_, lines)| lines[idx])
+        .unwrap_or(1873)
+}
+
+/// Relational result when `TO_01` of an operand is all 'X': false, except
+/// `/=`, which is true. The warning goes through `vh_meta_rel`, the same
+/// kind of call as the IEEE-body fallback, so this wrapper does not itself
+/// call `vh_report`.
+fn meta_relation(name: &str, cls: &[Cls], weak: &[(&str, i64)]) -> String {
+    if weak.is_empty() || cls.len() < 2 {
+        return String::new();
+    }
+    let guard = weak
+        .iter()
+        .map(|(nm, n)| format!("!{}", Lw::clean(*n, &strength_stripped(nm, *n))))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    let (ret, word) = if name == "/=" {
+        ("1", "TRUE")
+    } else {
+        ("0", "FALSE")
+    };
+    let line = rel_meta_line(name, cls[0], cls[1]);
+    format!(
+        "    if ({guard}) return vh_meta_rel({line}, \"NUMERIC_STD.\\\"{name}\\\": metavalue detected, returning {word}\", {ret});\n"
+    )
 }
 
 /// A W-bit literal: within each period of `period` bits the low `keep` bits.
@@ -99,7 +168,12 @@ impl<'a> Lw<'a> {
                 let s = 3 * k;
                 p *= 2;
                 k *= 2;
-                let _ = writeln!(body, "    x = (x | (x >> {})) & {};", s, period_mask(w, p, k));
+                let _ = writeln!(
+                    body,
+                    "    x = (x | (x >> {})) & {};",
+                    s,
+                    period_mask(w, p, k)
+                );
             }
             let _ = write!(
                 self.type_defs,
@@ -130,7 +204,12 @@ impl<'a> Lw<'a> {
             for j in (1..levels.len()).rev() {
                 let (pp, kk, _) = levels[j - 1];
                 let s = levels[j].2;
-                let _ = writeln!(body, "    x = (x | (x << {})) & {};", s, period_mask(w, pp, kk));
+                let _ = writeln!(
+                    body,
+                    "    x = (x | (x << {})) & {};",
+                    s,
+                    period_mask(w, pp, kk)
+                );
             }
             let _ = write!(
                 self.type_defs,
@@ -165,7 +244,13 @@ impl<'a> Lw<'a> {
         }
     }
 
-    fn intrinsic_1164(&mut self, s: SubId, name: &str, cls: &[Cls], args: &[HExpr]) -> Option<String> {
+    fn intrinsic_1164(
+        &mut self,
+        s: SubId,
+        name: &str,
+        cls: &[Cls],
+        args: &[HExpr],
+    ) -> Option<String> {
         let logical = matches!(name, "and" | "or" | "xor" | "nand" | "nor" | "xnor");
         match cls {
             [Cls::Ul, Cls::Ul] if logical => {
@@ -188,7 +273,8 @@ impl<'a> Lw<'a> {
                 Some(format!("vh_ul_x01({})", x))
             }
             [Cls::UlVec, Cls::UlVec] if logical => {
-                let (Repr::Pk(4, n), Repr::Pk(4, n2)) = (self.erepr(&args[0]), self.erepr(&args[1]))
+                let (Repr::Pk(4, n), Repr::Pk(4, n2)) =
+                    (self.erepr(&args[0]), self.erepr(&args[1]))
                 else {
                     return None;
                 };
@@ -305,6 +391,8 @@ impl<'a> Lw<'a> {
         let mut val = Vec::new();
         let mut conds = Vec::new();
         let mut formals = Vec::new();
+        // std_logic vector formals, so a metavalue can return before the body.
+        let mut weak: Vec<(&str, i64)> = Vec::new();
         let names = ["a", "b"];
         for (i, (c, a)) in cls.iter().zip(args).enumerate() {
             let nm = names[i];
@@ -314,11 +402,13 @@ impl<'a> Lw<'a> {
                     if bit_elem {
                         val.push(nm.to_string());
                     } else {
-                        conds.push(Self::clean(n, nm));
+                        let src = strength_stripped(nm, n);
+                        weak.push((nm, n));
+                        conds.push(Self::clean(n, &src));
                         let cf = self.cmp_fn(n);
                         let _ = writeln!(decls, "    bit [{}:0] x{};", n - 1, nm);
                         val.push(format!("x{}", nm));
-                        decl.push_str(&format!("    x{} = {}({});\n", nm, cf, nm));
+                        decl.push_str(&format!("    x{} = {}({});\n", nm, cf, src));
                     }
                     if signed(*c) {
                         // As a 64-bit two's complement number.
@@ -365,7 +455,9 @@ impl<'a> Lw<'a> {
         };
         let ret_pk = |lw: &mut Self| -> Option<(i64, String)> {
             match lw.pspecs[k].ret.clone() {
-                Some(Repr::Pk(ww, n)) if ww == w => Some((n, format!("bit [{}:0]", w as i64 * n - 1))),
+                Some(Repr::Pk(ww, n)) if ww == w => {
+                    Some((n, format!("bit [{}:0]", w as i64 * n - 1)))
+                }
                 _ => None,
             }
         };
@@ -388,7 +480,10 @@ impl<'a> Lw<'a> {
                         format!("x = {} {} {};\n    return x;", val[0], sv_op, val[1])
                     } else {
                         let sf = self.spr_fn(n);
-                        format!("x = {} {} {};\n    return {}(x);", val[0], sv_op, val[1], sf)
+                        format!(
+                            "x = {} {} {};\n    return {}(x);",
+                            val[0], sv_op, val[1], sf
+                        )
                     };
                     let _ = writeln!(decls, "    bit [{}:0] x;", n - 1);
                     body = format!("{}    {}", decl, res);
@@ -419,7 +514,10 @@ impl<'a> Lw<'a> {
                         format!("x = {} {} {};\n    return x;", val[0], sv_op, val[1])
                     } else {
                         let sf = self.spr_fn(n);
-                        format!("x = {} {} {};\n    return {}(x);", val[0], sv_op, val[1], sf)
+                        format!(
+                            "x = {} {} {};\n    return {}(x);",
+                            val[0], sv_op, val[1], sf
+                        )
                     };
                     let _ = writeln!(decls, "    bit [{}:0] x;", n - 1);
                     body = format!("{}    {}", decl, res);
@@ -491,6 +589,17 @@ impl<'a> Lw<'a> {
             _ => return None,
         }
         let _ = h;
+        let meta = if rel && !bit_elem {
+            meta_relation(name, cls, &weak)
+        } else {
+            String::new()
+        };
+        if !meta.is_empty() && self.pk_fns.insert("vh_meta_rel".to_string()) {
+            let _ = write!(
+                self.type_defs,
+                "  function automatic byte unsigned vh_meta_rel(int line, string msg, byte unsigned ret);\n    vh_report(\"../../src/ieee2008/numeric_std-body.vhdl\", line, 7, 1, msg, 1);\n    return ret;\n  endfunction\n"
+            );
+        }
         if self.pk_fns.insert(f.clone()) {
             let cond = if conds.is_empty() {
                 "1".to_string()
@@ -500,13 +609,14 @@ impl<'a> Lw<'a> {
             let fargs: Vec<&str> = names[..args.len()].to_vec();
             let _ = write!(
                 self.type_defs,
-                "  function automatic {ret} {f}({formals});\n{decls}    if ({cond}) begin\n  {body}\n    end\n    return {fb}({fargs});\n  endfunction\n",
+                "  function automatic {ret} {f}({formals});\n{decls}    if ({cond}) begin\n  {body}\n    end\n{meta}    return {fb}({fargs});\n  endfunction\n",
                 ret = ret_sv,
                 f = f,
                 formals = formals.join(", "),
                 decls = decls,
                 cond = cond,
                 body = body.replace('\n', "\n  "),
+                meta = meta,
                 fb = fb,
                 fargs = fargs.join(", ")
             );
