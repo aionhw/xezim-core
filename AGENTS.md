@@ -162,10 +162,10 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
   this is the shared lib — declaring it here covers xezim, xezim-b, and every
   test binary. **Never add another `#[global_allocator]`.** A consumer opting
   out uses `xezim-core = { path = "../xezim-core", default-features = false }`.
-- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x3f"`
+- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x41"`
   (`src/lib.rs`). The last byte is the serialized-format version. When you add
   or change a serialized field in `ElaboratedModule` (or any bincode-serialized
-  type), **bump the version byte** (for example, `\x3e` to `\x3f`) and add one line to the
+  type), **bump the version byte** (for example, `\x40` to `\x41`) and add one line to the
   version-ladder comment above it, so stale `.xez` artifacts fail with a clear "recompile with
   current xezim" error instead of deserializing garbage.
 - **Artifacts are zstd-compressed bincode 2** (serde, standard configuration).
