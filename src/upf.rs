@@ -1598,3 +1598,134 @@ pub fn inject(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Glue for `design` (top `top`) under the UPF text `upf`, with the
+    /// scope override `top_override` (`--upf-top`).
+    fn glue_for(design_src: &str, top: &str, upf: &str, top_override: Option<&str>) -> Glue {
+        let parsed = crate::sv_parser::parse(design_src);
+        assert!(parsed.errors.is_empty(), "design failed to parse");
+        let mut modules: HashMap<String, &ModuleDeclaration> = HashMap::new();
+        for d in &parsed.source.descriptions {
+            if let Description::Module(m) = d {
+                modules.entry(m.name.name.clone()).or_insert(m);
+            }
+        }
+        // A file per call: the tests run in parallel and may share a top.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "xezim_core_upf_{}_{}_{}.upf",
+            std::process::id(),
+            top,
+            seq
+        ));
+        std::fs::write(&path, upf).unwrap();
+        let mut model = Model::default();
+        parse_upf_file(path.to_str().unwrap(), &mut model, &mut HashMap::new(), 0).unwrap();
+        std::fs::remove_file(&path).ok();
+        let design = Design { modules };
+        let top_m = *design.modules.get(top).unwrap();
+        generate(&model, &design, top, top_m, top_override).unwrap()
+    }
+
+    const DESIGN: &str = "
+module blk(input logic clk, input logic [3:0] d, output logic [3:0] q);
+  always @(posedge clk) q <= d;
+endmodule
+module top;
+  logic clk = 0; logic [3:0] d = 4'h5; logic [3:0] q;
+  blk u_b(.clk(clk), .d(d), .q(q));
+endmodule
+";
+
+    const ROOT_UPF: &str = "
+set_design_top top
+create_power_domain PD_TOP -elements {.}
+create_supply_net VDD -domain PD_TOP
+create_supply_net VSS -domain PD_TOP
+set_domain_supply_net PD_TOP -primary_power_net VDD -primary_ground_net VSS
+";
+
+    /// IEEE 1801 §6.11: `-elements {.}` names the scope instance. When the
+    /// scope is the root module the glue sits in that module, so its signals
+    /// are plain names and a child's are `u_b.q`; the empty scope prefix used
+    /// to give `.clk`, which the glue parse rejected.
+    #[test]
+    fn root_scope_elements_dot_names_the_root_signals() {
+        let glue = glue_for(DESIGN, "top", ROOT_UPF, None);
+        for want in [
+            "force clk = 'x;",
+            "force d = 'x;",
+            "force q = 'x;",
+            "force u_b.q = 'x;",
+            "release u_b.q;",
+        ] {
+            assert!(
+                glue.items.contains(want),
+                "missing `{want}`:\n{}",
+                glue.items
+            );
+        }
+        assert!(
+            !glue.items.contains(" ."),
+            "a path starts with '.':\n{}",
+            glue.items
+        );
+        let text = format!(
+            "{}\nmodule __upf_glue;\n{}endmodule\n",
+            glue.package, glue.items
+        );
+        assert!(
+            crate::sv_parser::parse(&text).errors.is_empty(),
+            "glue does not parse:\n{text}"
+        );
+    }
+
+    /// The root module given as the scope explicitly (`--upf-top /top`).
+    #[test]
+    fn root_scope_from_upf_top_override() {
+        let glue = glue_for(DESIGN, "top", ROOT_UPF, Some("/top"));
+        assert!(glue.items.contains("force u_b.q = 'x;"), "{}", glue.items);
+        assert!(
+            !glue.items.contains(" ."),
+            "a path starts with '.':\n{}",
+            glue.items
+        );
+    }
+
+    /// Guard: a scope below the root keeps its instance prefix.
+    #[test]
+    fn instance_scope_elements_keep_the_prefix() {
+        let design = "
+module blk(input logic clk, output logic [3:0] q);
+  always @(posedge clk) q <= 4'h5;
+endmodule
+module mid(input logic clk);
+  logic [3:0] q;
+  blk u_b(.clk(clk), .q(q));
+endmodule
+module top;
+  logic clk = 0;
+  mid u_m(.clk(clk));
+endmodule
+";
+        let upf = "
+set_design_top mid
+create_power_domain PD -elements {.}
+create_supply_net VDD -domain PD
+create_supply_net VSS -domain PD
+set_domain_supply_net PD -primary_power_net VDD -primary_ground_net VSS
+";
+        let glue = glue_for(design, "top", upf, None);
+        assert!(glue.items.contains("force u_m.q = 'x;"), "{}", glue.items);
+        assert!(
+            glue.items.contains("force u_m.u_b.q = 'x;"),
+            "{}",
+            glue.items
+        );
+    }
+}
