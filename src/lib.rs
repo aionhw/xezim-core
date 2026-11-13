@@ -2612,6 +2612,21 @@ fn parse_and_elaborate(
                             )
                         }),
                 );
+                shadowed_unit_vars.extend(top_level_params.iter().flat_map(|p| {
+                    match &p.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } => assignments
+                            .iter()
+                            .filter(|a| local_decl_names.contains(&a.name.name))
+                            .map(|a| {
+                                (
+                                    a.name.name.clone(),
+                                    sv_parser::unit_scope_name(&a.name.name),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    }
+                }));
                 let subst_body = |items: &[ast::stmt::Statement],
                                   ports: &[ast::decl::FunctionPort]|
                  -> Option<Vec<ast::stmt::Statement>> {
@@ -2722,21 +2737,14 @@ fn parse_and_elaborate(
                         items.insert(0, ast::decl::ModuleItem::CovergroupDeclaration(cg.clone()));
                     }
                 }
-                // $unit-scope parameters become body localparams (constants):
-                // visible inside the module, not part of its override interface.
-                // A module-local declaration of the same name SHADOWS the $unit
-                // one (LRM §3.12.1 name resolution) — skip injecting any $unit
-                // param the module already declares, else the two collide as a
-                // "Duplicate declaration". The skip is per DECLARATOR: with
-                // `localparam int A = 1, B = 2;` at $unit scope and a module
-                // declaring only `B`, dropping the whole declaration would have
-                // lost `A` and keeping it re-declared `B`.
+                // §3.12.1: keep shadowed constants under their qualified
+                // names, and bind dependent initializers/ranges to that copy.
                 for p in top_level_params.iter().rev() {
                     let needed = |name: &str| retain_all || needed_unit_params.contains(name);
                     let keep = match &p.kind {
-                        ast::decl::ParameterKind::Data { assignments, .. } => assignments
-                            .iter()
-                            .any(|a| !local_decl_names.contains(&a.name.name) && needed(&a.name.name)),
+                        ast::decl::ParameterKind::Data { assignments, .. } => {
+                            assignments.iter().any(|a| needed(&a.name.name))
+                        }
                         ast::decl::ParameterKind::Type { assignments } => {
                             assignments.iter().any(|a| needed(&a.name.name))
                         }
@@ -2744,12 +2752,20 @@ fn parse_and_elaborate(
                     if !keep {
                         continue;
                     }
-                    let mut p = p.clone();
+                    let mut p = if shadowed_unit_vars.is_empty() {
+                        p.clone()
+                    } else {
+                        elaborate::substitute_bare_idents_param(p, &shadowed_unit_vars)
+                    };
                     match &mut p.kind {
                         ast::decl::ParameterKind::Data { assignments, .. } => {
-                            assignments.retain(|a| {
-                                !local_decl_names.contains(&a.name.name) && needed(&a.name.name)
-                            });
+                            assignments.retain(|a| needed(&a.name.name));
+                            for assignment in assignments.iter_mut() {
+                                if local_decl_names.contains(&assignment.name.name) {
+                                    assignment.name.name =
+                                        sv_parser::unit_scope_name(&assignment.name.name);
+                                }
+                            }
                             if assignments.is_empty() {
                                 continue;
                             }

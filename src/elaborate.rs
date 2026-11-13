@@ -22994,7 +22994,9 @@ fn untyped_param_is_signed(init: &Expression, params: &HashMap<String, Value>) -
                 return true;
             }
             let raw = h.path[0].name.name.as_str();
-            lookup(crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw)).unwrap_or(true)
+            lookup(raw)
+                .or_else(|| lookup(crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw)))
+                .unwrap_or(true)
         }
         ExprKind::MemberAccess { expr, member } => match &expr.kind {
             ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
@@ -27435,7 +27437,11 @@ fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Optio
             }
             let raw = h.path[0].name.name.as_str();
             let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
-            params.get(name).filter(|v| !v.is_real).map(|v| v.width)
+            params
+                .get(raw)
+                .or_else(|| params.get(name))
+                .filter(|v| !v.is_real)
+                .map(|v| v.width)
         }
         // `pkg::P`
         ExprKind::MemberAccess { expr, member } => match &expr.kind {
@@ -52797,6 +52803,16 @@ pub fn substitute_bare_idents_stmt(
     stmt: &Statement,
     map: &std::collections::HashMap<String, String>,
 ) -> Statement {
+    let port_map = bare_ident_map(map, stmt.span);
+    let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_iface: HashMap<String, String> = HashMap::default();
+    rewrite_stmt(stmt, "", &port_map, &empty_locals, &empty_iface)
+}
+
+fn bare_ident_map(
+    map: &std::collections::HashMap<String, String>,
+    span: Span,
+) -> HashMap<String, Expression> {
     let mut port_map: HashMap<String, Expression> = HashMap::default();
     for (from, to) in map {
         let hier = crate::ast::expr::HierarchicalIdentifier {
@@ -52804,23 +52820,44 @@ pub fn substitute_bare_idents_stmt(
             path: vec![crate::ast::expr::HierPathSegment {
                 name: crate::ast::Identifier {
                     name: to.clone(),
-                    span: stmt.span,
+                    span: span,
                 },
                 selects: Vec::new(),
             }],
-            span: stmt.span,
+            span: span,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
             bound: crate::ast::binding::Bound::UNSET,
         };
-        port_map.insert(
-            from.clone(),
-            Expression::new(ExprKind::Ident(hier), stmt.span),
-        );
+        port_map.insert(from.clone(), Expression::new(ExprKind::Ident(hier), span));
     }
-    let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let empty_iface: HashMap<String, String> = HashMap::default();
-    rewrite_stmt(stmt, "", &port_map, &empty_locals, &empty_iface)
+    port_map
+}
+
+/// §3.12.1: an injected compilation-unit constant keeps the scope of its
+/// initializer and declared ranges, even when the receiving module shadows
+/// another compilation-unit declaration they reference.
+pub fn substitute_bare_idents_param(
+    param: &ParameterDeclaration,
+    map: &std::collections::HashMap<String, String>,
+) -> ParameterDeclaration {
+    let mut out = param.clone();
+    let ports = bare_ident_map(map, param.span);
+    let locals = Default::default();
+    let interfaces = HashMap::default();
+    if let ParameterKind::Data {
+        data_type,
+        assignments,
+    } = &mut out.kind
+    {
+        *data_type = rewrite_data_type_scoped(data_type, "", &ports, &locals, &interfaces);
+        for assignment in assignments {
+            if let Some(value) = &mut assignment.init {
+                *value = rewrite_expr(value, "", &ports, &locals, &interfaces);
+            }
+        }
+    }
+    out
 }
 
 thread_local! {
