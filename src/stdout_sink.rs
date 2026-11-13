@@ -157,11 +157,13 @@ impl StdoutSink {
     }
 
     pub fn threaded() -> Self {
+        Self::threaded_with_builder(std::thread::Builder::new().name("xezim-stdout".to_string()))
+    }
+
+    fn threaded_with_builder(builder: std::thread::Builder) -> Self {
         let (tx, rx) = mpsc::channel::<Msg>();
         let (recycle_tx, recycle) = mpsc::channel::<Vec<u8>>();
-        let handle = std::thread::Builder::new()
-            .name("xezim-stdout".to_string())
-            .spawn(move || {
+        let handle = builder.spawn(move || {
                 // Do NOT hold an exclusive `stdout.lock()` on the worker —
                 // it would deadlock anything on the main thread that
                 // touches stdout (e.g. `println!` after sim.run() returns).
@@ -169,8 +171,12 @@ impl StdoutSink {
                 // and releases it between calls.
                 let w = BufWriter::with_capacity(BUF_CAPACITY, io::stdout());
                 run_threaded_writer(rx, w, Some(recycle_tx));
-            })
-            .expect("spawn xezim-stdout writer thread");
+            });
+        // A worker may fit under RLIMIT_AS while a second stack does not.
+        // The synchronous sink preserves output when that reservation fails.
+        let Ok(handle) = handle else {
+            return Self::inline();
+        };
         StdoutSink {
             mode: Mode::Threaded {
                 buf: Vec::with_capacity(BUF_CAPACITY),
@@ -350,6 +356,7 @@ impl StdoutSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
