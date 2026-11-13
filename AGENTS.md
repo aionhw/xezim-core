@@ -103,7 +103,7 @@ xezim-parser/src/strict_check.rs  Additive negative-case lint (gated by --strict
 
 ## Build & test
 
-Toolchain: Rust **1.92** MSRV (`rust-version` in `Cargo.toml`), edition 2024.
+Toolchain: Rust **1.100** MSRV (`rust-version` in `Cargo.toml`), edition 2024.
 CI (`test.yml`) runs core and parser tests separately; `msrv.yml` verifies
 both crates. The parser is a path dependency, not a workspace member.
 
@@ -181,7 +181,7 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
 
 ## Coding conventions
 
-snake_case; Rust 2024 edition; MSRV 1.92 (`rust-version` in `Cargo.toml`);
+snake_case; Rust 2024 edition; MSRV 1.100 (`rust-version` in `Cargo.toml`);
 clippy-clean. Modules carry `//!` doc comments. Hard fixes get explanatory
 comments with **LRM § citations** (e.g. `§6.6.7`) and regression tests
 referencing the same section. User-facing errors are `Result<_, String>` /
