@@ -52827,11 +52827,11 @@ fn bare_ident_map(
             path: vec![crate::ast::expr::HierPathSegment {
                 name: crate::ast::Identifier {
                     name: to.clone(),
-                    span: span,
+                    span,
                 },
                 selects: Vec::new(),
             }],
-            span: span,
+            span,
             cached_signal_id: crate::ast::cache::SignalCache::new(None),
             cached_resolved_name: crate::ast::cache::NameCache::new(),
             bound: crate::ast::binding::Bound::UNSET,
@@ -52859,6 +52859,13 @@ pub fn substitute_bare_idents_param(
     {
         *data_type = rewrite_data_type_scoped(data_type, "", &ports, &locals, &interfaces);
         for assignment in assignments {
+            assignment.dimensions = rewrite_unpacked_dims_scoped(
+                &assignment.dimensions,
+                "",
+                &ports,
+                &locals,
+                &interfaces,
+            );
             if let Some(value) = &mut assignment.init {
                 *value = rewrite_expr(value, "", &ports, &locals, &interfaces);
             }
