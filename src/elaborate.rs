@@ -29949,7 +29949,9 @@ fn eval_const_expr_val_inner(
         ExprKind::Binary { op, left, right } => {
             // §11.8.2: comparison operands share width/sign before any
             // nested arithmetic, while the comparison result stays one bit.
-            let common = if const_context::is_comparison(*op) {
+            let common = if const_context::is_comparison(*op)
+                && (is_context_operator(left) || is_context_operator(right))
+            {
                 let l = const_context::infer(left, params, types);
                 let r = const_context::infer(right, params, types);
                 (l.integral && r.integral).then_some((l.width.max(r.width), l.signed && r.signed))
@@ -29968,6 +29970,18 @@ fn eval_const_expr_val_inner(
                     eval_const_expr_val_inner(right, params, types),
                 ),
             };
+            if const_context::is_comparison(*op) && common.is_none() && !l.is_real && !r.is_real {
+                let w = l.width.max(r.width);
+                let signed = l.is_signed && r.is_signed;
+                l.is_signed = signed;
+                r.is_signed = signed;
+                if l.width != w || l.is_fill {
+                    l = l.resize_for_assign(w);
+                }
+                if r.width != w || r.is_fill {
+                    r = r.resize_for_assign(w);
+                }
+            }
             // §11.8.2: a relational or equality operator's operands take REAL
             // type from each other, and the real type propagates one operator
             // into the integral side: `(UP - 2) > 1.0` compares -1.0. (An
@@ -31161,7 +31175,11 @@ fn const_ctx_fold(
             if !signed {
                 v.is_signed = false;
             }
-            v.resize_for_assign(w)
+            if v.width == w && w != 0 && !v.is_fill {
+                v
+            } else {
+                v.resize_for_assign(w)
+            }
         }
     };
     // Arithmetic with X/Z may produce an unsigned Value; its expression
@@ -46281,6 +46299,8 @@ fn eval_const_user_function(
         }
         let mut value = if rhs.is_real {
             real_to_integral(rhs.to_f64(), storage.width)
+        } else if rhs.width == storage.width && storage.width != 0 && !rhs.is_fill {
+            rhs
         } else {
             rhs.resize_for_assign(storage.width)
         };
@@ -46699,8 +46719,21 @@ fn eval_const_user_function(
         depth: u32,
         context: Option<(u32, Option<bool>)>,
     ) -> Option<Value> {
-        let resolved = resolve_const_fn_cast_targets(e, locals, elab);
-        let e = &resolved;
+        // Most loop expressions contain neither casts nor calls. Borrow
+        // their AST instead of cloning it in both rewriting passes.
+        let mut has_cast = false;
+        let mut has_call = false;
+        for_each_sub_expr(e, &mut |part| match &part.kind {
+            ExprKind::Call { .. } => has_call = true,
+            ExprKind::SystemCall { name, .. }
+                if name == "$__xz_named_cast" || name == "$__xz_type_cast" =>
+            {
+                has_cast = true
+            }
+            _ => {}
+        });
+        let resolved = has_cast.then(|| resolve_const_fn_cast_targets(e, locals, elab));
+        let e = resolved.as_ref().unwrap_or(e);
         if !const_fn_expr_supported(e) {
             return None;
         }
@@ -46732,16 +46765,21 @@ fn eval_const_user_function(
                 value
             });
         }
-        let subbed = substitute_const_fn_calls(e, locals, elab, depth + 1)?;
-        if expr_has_call(&subbed) {
+        let subbed = if has_call {
+            Some(substitute_const_fn_calls(e, locals, elab, depth + 1)?)
+        } else {
+            None
+        };
+        let e = subbed.as_ref().unwrap_or(e);
+        if expr_has_call(e) {
             return None;
         }
         let mut types = const_context::Types::default();
         if let Some((width, signed)) = context {
-            let ty = const_context::infer(&subbed, locals, &mut types);
+            let ty = const_context::infer(e, locals, &mut types);
             if ty.integral {
                 return const_ctx_fold(
-                    &subbed,
+                    e,
                     locals,
                     width.max(ty.width),
                     signed.unwrap_or(ty.signed),
@@ -46749,7 +46787,7 @@ fn eval_const_user_function(
                 );
             }
         }
-        Some(eval_const_expr_val_inner(&subbed, locals, &mut types))
+        Some(eval_const_expr_val_inner(e, locals, &mut types))
     }
 
     let mut fuel: u32 = 100_000;
