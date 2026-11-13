@@ -23842,8 +23842,13 @@ pub fn const_eval_i64_with_params(
         ExprKind::Paren(e) => const_eval_i64_with_params(e, params),
         // LRM §20.8 / §20.9 — constant integer system functions commonly used
         // in array bounds: $clog2, $unsigned, $signed are size-preserving;
-        // $min/$max take two args; $ln/$log10/etc. are not constant-eval here.
+        // $min/$max take two args. Real math reaches integer dimensions
+        // through $rtoi, retaining each operand's packed width (§20.5).
         ExprKind::SystemCall { name, args } => match name.as_str() {
+            "$rtoi" if args.len() == 1 && const_fn_expr_supported(&args[0]) => {
+                let empty = HashMap::default();
+                eval_const_expr_val(expr, params.unwrap_or(&empty)).to_i64()
+            }
             "$clog2" => {
                 let val = const_eval_i64_with_params(args.first()?, params)?;
                 if val <= 1 {
@@ -29702,6 +29707,18 @@ fn const_eval_in_real_context(e: &Expression, params: &HashMap<String, Value>) -
     }
 }
 
+/// §20.8.2, Table 20-4: real math functions are also constant system
+/// functions (§11.2.1). Keep arity shared with the constant-function guard.
+fn const_real_math_arity(name: &str) -> Option<usize> {
+    match name {
+        "$ln" | "$log10" | "$log2" | "$exp" | "$sqrt" | "$floor" | "$ceil" | "$sin" | "$cos"
+        | "$tan" | "$asin" | "$acos" | "$atan" | "$sinh" | "$cosh" | "$tanh" | "$asinh"
+        | "$acosh" | "$atanh" => Some(1),
+        "$pow" | "$atan2" | "$hypot" => Some(2),
+        _ => None,
+    }
+}
+
 fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
     let res = match &expr.kind {
         // §3.14.3: an elaborated `1step` delay is one tick.
@@ -30141,7 +30158,12 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         ExprKind::SystemCall { name, args }
             if matches!(
                 name.as_str(),
-                "$rtoi" | "$itor" | "$ceil" | "$floor" | "$sqrt"
+                "$rtoi"
+                    | "$itor"
+                    | "$realtobits"
+                    | "$bitstoreal"
+                    | "$shortrealtobits"
+                    | "$bitstoshortreal"
             ) && args.len() == 1 =>
         {
             let v = eval_const_expr_val(&args[0], params);
@@ -30151,10 +30173,40 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 // which rounds).
                 "$rtoi" => Value::rtoi(f),
                 "$itor" => Value::from_f64(f),
-                "$ceil" => Value::from_f64(f.ceil()),
-                "$floor" => Value::from_f64(f.floor()),
-                _ => Value::from_f64(f.sqrt()),
+                "$realtobits" => Value::from_u64(f.to_bits(), 64),
+                "$bitstoreal" => Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0))),
+                "$shortrealtobits" => Value::from_u64((f as f32).to_bits() as u64, 32),
+                _ => Value::from_f64(f32::from_bits(v.to_u64().unwrap_or(0) as u32) as f64),
             }
+        }
+        ExprKind::SystemCall { name, args } if const_real_math_arity(name) == Some(args.len()) => {
+            let a = eval_const_expr_val(&args[0], params).to_f64();
+            let b = || eval_const_expr_val(&args[1], params).to_f64();
+            let result = match name.as_str() {
+                "$ln" => a.ln(),
+                "$log10" => a.log10(),
+                "$log2" => a.log2(),
+                "$exp" => a.exp(),
+                "$sqrt" => a.sqrt(),
+                "$floor" => a.floor(),
+                "$ceil" => a.ceil(),
+                "$pow" => a.powf(b()),
+                "$sin" => a.sin(),
+                "$cos" => a.cos(),
+                "$tan" => a.tan(),
+                "$asin" => a.asin(),
+                "$acos" => a.acos(),
+                "$atan" => a.atan(),
+                "$atan2" => a.atan2(b()),
+                "$hypot" => a.hypot(b()),
+                "$sinh" => a.sinh(),
+                "$cosh" => a.cosh(),
+                "$tanh" => a.tanh(),
+                "$asinh" => a.asinh(),
+                "$acosh" => a.acosh(),
+                _ => a.atanh(),
+            };
+            Value::from_f64(result)
         }
         ExprKind::SystemCall { name, args } if name == "$__xz_size_cast" && args.len() == 2 => {
             let n = eval_const_expr_val(&args[0], params)
@@ -44309,7 +44361,29 @@ fn inline_module_items(
                 let param_expr_map: HashMap<String, Expression> = if prepared_sub.has_subroutines {
                     sub_merged_params
                         .iter()
-                        .filter_map(|(k, v)| v.to_i64().map(|iv| (k.clone(), genvar_const_expr(iv))))
+                        .filter_map(|(k, v)| {
+                            v.to_i64()?;
+                            // §6.20.2: a substituted parameter keeps its type.
+                            // A signed 32-bit genvar literal widened narrow
+                            // arithmetic in a signature's $rtoi argument.
+                            let literal = if v.is_real {
+                                NumberLiteral::Real(v.to_f64())
+                            } else if v.is_fill {
+                                NumberLiteral::UnbasedUnsized(v.to_bin_string().chars().last()?)
+                            } else {
+                                NumberLiteral::Integer {
+                                    size: Some(v.width),
+                                    signed: v.is_signed,
+                                    base: NumberBase::Binary,
+                                    value: v.to_bin_string(),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                                }
+                            };
+                            Some((
+                                k.clone(),
+                                Expression::new(ExprKind::Number(literal), Span::dummy()),
+                            ))
+                        })
                         .collect()
                 } else {
                     HashMap::default()
@@ -46508,7 +46582,17 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
                 && const_fn_expr_supported(&args[1])
         }
         ExprKind::SystemCall { name, args } => {
-            matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned")
+            (matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned")
+                || (matches!(
+                    name.as_str(),
+                    "$rtoi"
+                        | "$itor"
+                        | "$realtobits"
+                        | "$bitstoreal"
+                        | "$shortrealtobits"
+                        | "$bitstoshortreal"
+                ) && args.len() == 1)
+                || const_real_math_arity(name) == Some(args.len()))
                 && args.iter().all(const_fn_expr_supported)
         }
         _ => false,
