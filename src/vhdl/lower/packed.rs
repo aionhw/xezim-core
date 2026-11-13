@@ -2,7 +2,10 @@
 //! enumeration element (`std_ulogic_vector(7 downto 0)`, `bit_vector(0 to
 //! 3)`) is an SV packed vector of `w` bits per element (`Repr::Pk`), which
 //! the simulator's compiled tier handles as a scalar, rather than the
-//! struct of a dynamic array (`Repr::Arr`) that it interprets. Arrays whose
+//! struct of a dynamic array (`Repr::Arr`) that it interprets. A static
+//! array of records is the same vector when every field packs: the element
+//! width is the sum of the field widths, field 0 at the high bits of the
+//! element, the left element at the high bits of the vector. Arrays whose
 //! bounds are only known at run time keep the struct, so a value changes
 //! representation where it flows between the two (`coerce`): the
 //! representation of an expression is `erepr` and its static bounds
@@ -68,7 +71,8 @@ impl<'a> Lw<'a> {
     }
 
     /// The packed representation of array subtype `t`: static bounds of
-    /// one dimension, at least one element, a packable element.
+    /// one dimension, at least one element, a packable element. A record
+    /// element packs when every field does (`record_array_pack`).
     pub(super) fn pk_of(&self, t: TypeId) -> Option<Repr> {
         let b = self.base(t);
         let TypeKind::Array { index, elem } = &self.d.types[b].kind else {
@@ -77,9 +81,216 @@ impl<'a> Lw<'a> {
         if index.len() != 1 {
             return None;
         }
+        if let Some(w) = self.pack_elem(*elem) {
+            let n = bounds_len(self.static_bounds(t)?);
+            return Self::pk_fits(w, n).then_some(Repr::Pk(w, n));
+        }
+        let (w, n) = self.record_array_pack(t)?;
+        Some(Repr::Pk(w, n))
+    }
+
+    /// A static one-dimensional array of records whose fields all pack:
+    /// `(element bits, element count)`. Field 0 is the high end of an
+    /// element and the left element is the high end of the vector. An
+    /// enumeration element is `pk_of`'s other arm, not this.
+    pub(super) fn record_array_pack(&self, t: TypeId) -> Option<(u32, i64)> {
+        let b = self.base(t);
+        let TypeKind::Array { index, elem } = &self.d.types[b].kind else {
+            return None;
+        };
+        if index.len() != 1 || self.pack_elem(*elem).is_some() {
+            return None;
+        }
+        let ew = self.record_pack_width(*elem)?;
+        let n = bounds_len(self.static_bounds(t)?);
+        Self::pk_fits(ew, n).then_some((ew, n))
+    }
+
+    /// Bits of a record whose every field packs.
+    pub(super) fn record_pack_width(&self, t: TypeId) -> Option<u32> {
+        if !matches!(self.d.types[self.base(t)].kind, TypeKind::Record(_)) {
+            return None;
+        }
+        let fields = self.field_storage(t);
+        if fields.is_empty() {
+            return None;
+        }
+        let mut w = 0u32;
+        for ft in fields {
+            w = w.checked_add(self.field_pack_width(ft)?)?;
+        }
+        Some(w)
+    }
+
+    /// Bits of one packable field: an enumeration, or a static
+    /// one-dimensional array of one.
+    fn field_pack_width(&self, t: TypeId) -> Option<u32> {
+        if let Some(w) = self.pack_elem(t) {
+            return Some(w);
+        }
+        let TypeKind::Array { index, elem } = &self.d.types[self.base(t)].kind else {
+            return None;
+        };
+        if index.len() != 1 {
+            return None;
+        }
         let w = self.pack_elem(*elem)?;
         let n = bounds_len(self.static_bounds(t)?);
-        (n >= 1 && n * w as i64 <= MAX_PK_BITS).then_some(Repr::Pk(w, n))
+        if !Self::pk_fits(w, n) {
+            return None;
+        }
+        w.checked_mul(u32::try_from(n).ok()?)
+    }
+
+    /// `(bits from the low end of the record to the field, field width)`.
+    /// Field 0 sits at the high end.
+    pub(super) fn record_field_lo(&self, t: TypeId, field: usize) -> Option<(u32, u32)> {
+        let fields = self.field_storage(t);
+        let mut widths = Vec::with_capacity(fields.len());
+        for ft in &fields {
+            widths.push(self.field_pack_width(*ft)?);
+        }
+        let fw = *widths.get(field)?;
+        let after: u32 = widths[field + 1..].iter().copied().sum();
+        Some((after, fw))
+    }
+
+    /// One packed record's default, field 0 at the left.
+    pub(super) fn record_default_bits(&self, t: TypeId) -> Option<String> {
+        if !matches!(self.d.types[self.base(t)].kind, TypeKind::Record(_)) {
+            return None;
+        }
+        let mut s = String::new();
+        for ft in self.field_storage(t) {
+            s.push_str(&self.field_default_bits(ft)?);
+        }
+        Some(s)
+    }
+
+    fn field_default_bits(&self, t: TypeId) -> Option<String> {
+        if let Some(w) = self.pack_elem(t) {
+            return Some(self.enum_left_bits(t, w));
+        }
+        let TypeKind::Array { index, elem } = &self.d.types[self.base(t)].kind else {
+            return None;
+        };
+        if index.len() != 1 {
+            return None;
+        }
+        let w = self.pack_elem(*elem)?;
+        let n = bounds_len(self.static_bounds(t)?);
+        if !Self::pk_fits(w, n) {
+            return None;
+        }
+        let one = self.enum_left_bits(*elem, w);
+        Some(one.repeat(n as usize))
+    }
+
+    fn enum_left_bits(&self, t: TypeId, w: u32) -> String {
+        let c = self
+            .d
+            .scalar_range(t)
+            .and_then(|sr| sr.left.as_i64())
+            .unwrap_or(0) as u32;
+        let mut s = String::with_capacity(w as usize);
+        for k in (0..w).rev() {
+            s.push(if ((c >> k) & 1) == 1 { '1' } else { '0' });
+        }
+        s
+    }
+
+    /// Offset of index `i` from the left bound. No out-of-range check:
+    /// the check is a call, and a call in the part-select keeps the
+    /// process on the interpreter. An index outside the bounds selects
+    /// the wrong bits.
+    pub(super) fn index_off(i: &str, b: Bounds) -> String {
+        let (l, dir, _) = b;
+        if let Some(iv) = lit_i64(i) {
+            return match dir {
+                Dir::To => iv - l,
+                Dir::Downto => l - iv,
+            }
+            .to_string();
+        }
+        match dir {
+            Dir::To if l == 0 => i.to_string(),
+            Dir::To => format!("(({}) - {})", i, l),
+            Dir::Downto if l == 0 => format!("(-({}))", i),
+            Dir::Downto => format!("({} - ({}))", l, i),
+        }
+    }
+
+    /// `factor * (span - off)`, folded when `off` is a literal.
+    pub(super) fn bit_mul(factor: u32, span: i64, off: &str) -> String {
+        if let Ok(k) = off.parse::<i64>() {
+            return (factor as i64 * (span - k)).to_string();
+        }
+        format!("{} * ({} - ({}))", factor, span, off)
+    }
+
+    pub(super) fn bit_sum(a: String, b: String) -> String {
+        match (a.parse::<i64>(), b.parse::<i64>()) {
+            (Ok(x), Ok(y)) => (x + y).to_string(),
+            (Ok(0), _) => b,
+            (_, Ok(0)) => a,
+            _ => format!("({}) + ({})", a, b),
+        }
+    }
+
+    /// The vector holding `rec` (`a(i)` of a packed record array) and the
+    /// low bit of that element.
+    fn packed_record_elem_loc(&mut self, rec: &HExpr) -> Option<(String, String)> {
+        let HExprKind::Index(arr, idx) = &rec.kind else {
+            return None;
+        };
+        if idx.len() != 1 {
+            return None;
+        }
+        let (ew, n) = self.record_array_pack(arr.ty)?;
+        let root = self.ex(arr);
+        let i = self.ex(&idx[0]);
+        let bnd = self.shape(arr).unwrap_or((n - 1, Dir::Downto, 0));
+        let off = Self::index_off(&i, bnd);
+        Some((root, Self::bit_mul(ew, n - 1, &off)))
+    }
+
+    /// `a(i).f` as one part-select of the packed record array.
+    pub(super) fn packed_field_expr(&mut self, rec: &HExpr, field: usize) -> Option<String> {
+        let (shift, fw) = self.record_field_lo(rec.ty, field)?;
+        let (root, elem_lo) = self.packed_record_elem_loc(rec)?;
+        let lo = Self::bit_sum(elem_lo, shift.to_string());
+        Some(format!("{}[{} +: {}]", root, lo, fw))
+    }
+
+    /// `a(i).f(j)` as one part-select, when `f` is a packed array.
+    pub(super) fn packed_field_elem_expr(&mut self, field_expr: &HExpr, ix: &HExpr) -> Option<String> {
+        let HExprKind::Field(rec, fi) = &field_expr.kind else {
+            return None;
+        };
+        let ft = self.field_storage(rec.ty).get(*fi).copied()?;
+        let Repr::Pk(w, n) = self.pk_of(ft)? else {
+            return None;
+        };
+        let (shift, _) = self.record_field_lo(rec.ty, *fi)?;
+        let (root, elem_lo) = self.packed_record_elem_loc(rec)?;
+        let field_lo = Self::bit_sum(elem_lo, shift.to_string());
+        let i = self.ex(ix);
+        let bnd = self.shape(field_expr).unwrap_or((n - 1, Dir::Downto, 0));
+        let off = Self::index_off(&i, bnd);
+        let lo = Self::bit_sum(field_lo, Self::bit_mul(w, n - 1, &off));
+        Some(format!("{}[{} +: {}]", root, lo, w))
+    }
+
+    /// A variable or signal part that is one part-select of a packed
+    /// record array.
+    pub(super) fn packed_record_lvalue(&mut self, target: &HExpr) -> Option<String> {
+        match &target.kind {
+            HExprKind::Field(b, i) => self.packed_field_expr(b, *i),
+            HExprKind::Index(b, idx) if idx.len() == 1 => {
+                self.packed_field_elem_expr(b, &idx[0])
+            }
+            _ => None,
+        }
     }
 
     /// Packed when `n` elements of `w` bits fit.
