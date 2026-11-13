@@ -219,3 +219,65 @@ pub(super) fn is_comparison(op: BinaryOp) -> bool {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expression(text: &str) -> Expression {
+        let source = format!("module top; localparam P={text}; endmodule");
+        let parsed = crate::parse_str(&source).expect("parse constant expression");
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module");
+        };
+        let ModuleItem::LocalparamDeclaration(param) = &module.items[0] else {
+            panic!("localparam");
+        };
+        let ParameterKind::Data { assignments, .. } = &param.kind else {
+            panic!("value parameter");
+        };
+        assignments[0].init.clone().unwrap()
+    }
+
+    /// §11.8.2: arithmetic sees the enclosing width before truncation.
+    #[test]
+    fn common_width_precedes_arithmetic_and_preserves_boundaries() {
+        let params = HashMap::default();
+        for (text, width, value) in [
+            ("(3'd7*3'd7)+8'd0", 8, 49),
+            ("(3'd7*3'd7)==8'd49", 1, 1),
+            ("{3'd7*3'd7}+8'd0", 8, 1),
+            ("8'h80 >> (2'b11+2'b01)", 8, 128),
+            ("1'b1 ? 4'shf : 8'd0", 8, 15),
+        ] {
+            let value_expr = expression(text);
+            let got = eval_const_expr_val(&value_expr, &params);
+            assert_eq!((got.width, got.to_u64()), (width, Some(value)), "{text}");
+        }
+        let got = eval_const_expr_val(&expression("(4'sb1000 + 4'sbx000) >>> 1"), &params);
+        assert_eq!(got.to_bin(), "xxxx");
+        assert!(got.is_signed);
+    }
+
+    /// Alternating self-determined boundaries must not multiply evaluation
+    /// work: evaluating an inner cast to infer its type consumes that value.
+    #[test]
+    fn nested_boundaries_consume_inferred_leaf_values() {
+        // Match the parser/elaborator worker's stack instead of the test
+        // harness's small default stack for this deliberately deep syntax.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut text = "8'd1".to_string();
+                for _ in 0..32 {
+                    text = format!("8'({{{text}}}+8'd1)");
+                }
+                let expr = expression(&text);
+                let mut types = Types::default();
+                let got = eval_const_expr_val_inner(&expr, &HashMap::default(), &mut types);
+                assert_eq!(got.to_u64(), Some(33));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
