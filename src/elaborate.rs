@@ -21,6 +21,7 @@ mod const_function_scope;
 #[cfg(test)]
 mod callable_sharing_tests;
 pub(crate) mod constructor_forwarding;
+mod context_maps;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
@@ -866,13 +867,13 @@ pub struct RewriteCtx {
     /// restored after each instance — so a `CLASS_T obj;` in an initial block
     /// had no binding left at run time and `obj = new()` never constructed.
     /// `materialize` substitutes these into cloned statements' declarations.
-    pub type_binds: HashMap<String, DataType>,
+    pub type_binds: Rc<HashMap<String, DataType>>,
     /// Packed width of each bound type parameter — folded into `$bits(T)`
     /// while this instance's items are rewritten (see `TYPE_BIND_WIDTHS_TLS`).
-    pub type_bind_widths: HashMap<String, u32>,
+    pub type_bind_widths: Rc<HashMap<String, u32>>,
     /// What each bound type parameter answers to the §20.7 array queries
     /// (`$left(T)`, `$size(T)`, …), folded alongside `$bits(T)`.
-    pub type_bind_queries: HashMap<String, TypeQueryDims>,
+    pub type_bind_queries: Rc<HashMap<String, TypeQueryDims>>,
     /// Name of the module/interface definition this body came from — the
     /// file a diagnostic's span belongs to.
     pub owner: String,
@@ -24513,16 +24514,16 @@ thread_local! {
     /// and read 1 — wrong in every expression position (cont-assign,
     /// procedural, loop bound) while a `localparam NB = $bits(T)` folded
     /// correctly during elaboration. Same pattern as TYPEDEFS_TLS.
-    static TYPE_BIND_WIDTHS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
+    static TYPE_BIND_WIDTHS_TLS: std::cell::RefCell<Option<Rc<HashMap<String, u32>>>>
         = const { std::cell::RefCell::new(None) };
     /// §20.7 — the same instance's type parameters as array-query operands:
     /// `$left(T)` / `$size(T)` / … fold from these. At run time `T` is not a
     /// signal and the queries read 0.
-    static TYPE_BIND_QUERIES_TLS: std::cell::RefCell<Option<HashMap<String, TypeQueryDims>>>
+    static TYPE_BIND_QUERIES_TLS: std::cell::RefCell<Option<Rc<HashMap<String, TypeQueryDims>>>>
         = const { std::cell::RefCell::new(None) };
     /// §10.9: the same instance's type parameters as types, for a typed
     /// pattern `T'{...}`; `T` resolves only while the instance is inlined.
-    static TYPE_BIND_TYPES_TLS: std::cell::RefCell<Option<HashMap<String, DataType>>>
+    static TYPE_BIND_TYPES_TLS: std::cell::RefCell<Option<Rc<HashMap<String, DataType>>>>
         = const { std::cell::RefCell::new(None) };
     /// LRM §20.7 — thread-local array-range table for const-eval of
     /// `$size`/`$left`/`$right`/`$high`/`$low`/`$dimensions` on an
@@ -26627,7 +26628,7 @@ pub fn packed_full_dims_chained(
 
 /// IEEE 1800-2017 §20.7 — what a TYPE operand exposes to the array query
 /// functions (`$left(int)`, `$size(my_vec_t)`, `$dimensions(bit [3:0][7:0])`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TypeQueryDims {
     /// The queryable dimensions, unpacked first then packed (§7.4.5 numbers
     /// them in that order), each as the DECLARED `(left, right)` bounds:
@@ -37091,6 +37092,11 @@ struct InlineCache {
     prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
+    /// §6.20.3 / §20.7: equal type bindings and their independent width/query
+    /// snapshots are immutable. Keep one copy through deferred rewriting.
+    type_binds: context_maps::MapInterner<DataType>,
+    type_widths: context_maps::MapInterner<u32>,
+    type_queries: context_maps::MapInterner<TypeQueryDims>,
     /// Per definition, the typedefs its imports bind, one list per import.
     imports: HashMap<(String, usize), Rc<[ImportedTypedefs]>>,
     /// Per package, the typedefs `import P::*` binds.
@@ -44289,9 +44295,9 @@ fn inline_module_items(
                     port_map: rewrite_port_map.clone(),
                     local_names: std::rc::Rc::clone(&prepared_sub.local_names),
                     interface_map: sub_interface_map.clone(),
-                    type_binds: pend_type_binds,
-                    type_bind_widths: pend_type_bind_widths,
-                    type_bind_queries: pend_type_bind_queries,
+                    type_binds: cache.type_binds.intern(pend_type_binds),
+                    type_bind_widths: cache.type_widths.intern(pend_type_bind_widths),
+                    type_bind_queries: cache.type_queries.intern(pend_type_bind_queries),
                     owner: sub_mod.name().to_string(),
                     upward: Rc::clone(&elab.upward_scopes),
                 });
