@@ -80,6 +80,8 @@ mod param_override_lists;
 pub mod scope_tree;
 pub mod shared_names;
 mod unit_subroutine_usage;
+#[cfg(test)]
+mod unit_assertion_retention_tests;
 pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;

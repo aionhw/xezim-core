@@ -22,6 +22,8 @@ mod const_function_scope;
 mod callable_sharing_tests;
 pub(crate) mod constructor_forwarding;
 mod context_maps;
+#[cfg(test)]
+mod context_maps_tests;
 mod interface_arrays;
 pub mod interface_ports;
 mod module_class_scope;
