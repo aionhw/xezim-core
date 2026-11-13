@@ -148,8 +148,11 @@ fn arr_len(l: i64, r: i64) -> Option<i64> {
 }
 
 /// The largest root signal mirrored for SV, in converted scalars: a
-/// mirror is converted again on every event of its signal.
-const MAX_MIRROR_CELLS: i64 = super::MAX_PK_BITS;
+/// mirror is converted again on every event of its signal. Not
+/// `MAX_PK_BITS`: a wide packed vector is still one signal, and a memory
+/// larger than this stays unmirrored (its copy would refresh on every
+/// change). 2048 cells is what the VHDL guide describes.
+const MAX_MIRROR_CELLS: i64 = 2048;
 
 /// An SV value driving a VHDL signal.
 #[derive(Clone, Debug)]

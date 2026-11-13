@@ -210,6 +210,58 @@ impl<'a> Lw<'a> {
         (*n >= 1).then_some((pre, *w, *n))
     }
 
+    /// The packed word a class's trailing `PDim` selects, indexed by word
+    /// number `k` rather than by scalar leaf. `None` when the class is not
+    /// a packed vector of more than one element under record and array steps.
+    ///
+    /// The leaf walk would otherwise copy that word a nibble at a time
+    /// (`[4*(31-(k%32)) +: 4]`), which keeps `vh_upd` on the interpreter.
+    /// One assignment of the word is the same value when the driver covers
+    /// every element of it.
+    fn packed_word_sv(c: &LeafClass, k: &str) -> Option<String> {
+        let last = c.steps.len().checked_sub(1)?;
+        let Step::PDim(n, _) = c.steps[last] else {
+            return None;
+        };
+        if n <= 1 {
+            return None;
+        }
+        let dims: Vec<i64> = c.steps[..last]
+            .iter()
+            .filter_map(|s| match s {
+                Step::Dim(d) | Step::PDim(d, _) => Some(*d),
+                Step::Field(_) => None,
+            })
+            .collect();
+        let mut out = String::new();
+        let mut di = 0;
+        for s in &c.steps[..last] {
+            match s {
+                Step::Field(i) => {
+                    let _ = write!(out, ".f{}", i);
+                }
+                Step::Dim(d) | Step::PDim(d, _) => {
+                    let stride: i64 = dims[di + 1..].iter().copied().product();
+                    di += 1;
+                    let idx = match (stride, dims.len() == 1) {
+                        (1, true) => k.to_string(),
+                        (1, false) => format!("(({}) % {})", k, d),
+                        _ => format!("((({}) / {}) % {})", k, stride, d),
+                    };
+                    match s {
+                        Step::PDim(nn, w) => {
+                            let _ = write!(out, "[{} * ({} - ({})) +: {}]", w, nn - 1, idx, w);
+                        }
+                        _ => {
+                            let _ = write!(out, ".d[{}]", idx);
+                        }
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// The runs of consecutive leaves of a coverage in `base..base + count`.
     fn cov_runs(cov: &Cov, base: i64, count: i64) -> Vec<(i64, i64)> {
         let mut runs: Vec<(i64, i64)> = Vec::new();
@@ -731,6 +783,30 @@ impl<'a> Lw<'a> {
                 for (p, d) in &cov {
                     for (a, b) in Self::cov_runs(&d.cov, c.base, c.count) {
                         let (a, b) = (a - c.base, b - c.base);
+                        // A run of whole packed words (every element of each
+                        // word, no partial word at either end): one assignment
+                        // per word. A nibble loop over the same leaves does
+                        // not compile. A bare packed vector (no array
+                        // dimension above the word) already has the
+                        // one-assignment path below.
+                        if c.steps.iter().any(|s| matches!(s, Step::Dim(_)))
+                            && let Some(Step::PDim(n, _)) = c.steps.last()
+                            && *n > 1
+                            && a % *n == 0
+                            && (b + 1) % *n == 0
+                            && let Some(pre) = Self::packed_word_sv(c, "k")
+                        {
+                            let _ = writeln!(
+                                body,
+                                "    for (k = {}; k <= {}; k++) nv{pre} = vh_dv{s}_{p}{pre};",
+                                a / *n,
+                                b / *n,
+                                pre = pre,
+                                s = s,
+                                p = p
+                            );
+                            continue;
+                        }
                         // The whole class, a scalar or one packed vector
                         // under record fields: one assignment.
                         if a == 0
