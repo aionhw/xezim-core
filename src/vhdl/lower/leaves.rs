@@ -262,6 +262,68 @@ impl<'a> Lw<'a> {
         Some(out)
     }
 
+    /// A packed word under an array: the number of words, the element
+    /// bits and the elements per word. A bare packed vector is handled by
+    /// `whole_class` and is not this.
+    fn word_pending(c: &LeafClass) -> Option<(i64, u32, i64)> {
+        let (n, w) = match c.steps.last() {
+            Some(Step::PDim(n, w)) if *n > 1 => (*n, *w),
+            _ => return None,
+        };
+        if !c.steps.iter().any(|s| matches!(s, Step::Dim(_))) {
+            return None;
+        }
+        let nwords = c.count / n;
+        (nwords >= 1).then_some((nwords, w, n))
+    }
+
+    /// The word number of a packed element reached by `path` (the indices
+    /// above the trailing `PDim`).
+    fn word_key(c: &LeafClass, path: &[(Option<usize>, String)]) -> Option<String> {
+        let last = c.steps.len().checked_sub(1)?;
+        let dims: Vec<i64> = c.steps[..last]
+            .iter()
+            .filter_map(|s| match s {
+                Step::Dim(d) | Step::PDim(d, _) => Some(*d),
+                Step::Field(_) => None,
+            })
+            .collect();
+        let offs: Vec<&String> = path.iter().filter(|(f, _)| f.is_none()).map(|(_, o)| o).collect();
+        if dims.is_empty() || dims.len() != offs.len() {
+            return None;
+        }
+        let mut key = String::from("0");
+        for (k, n) in dims.iter().enumerate() {
+            key = if key == "0" {
+                offs[k].clone()
+            } else {
+                format!("({}) * {} + {}", key, n, offs[k])
+            };
+        }
+        Some(key)
+    }
+
+    /// The class of the packed vector at `path` (the path steps, then its
+    /// `PDim` of `n` elements).
+    fn packed_class<'b>(
+        classes: &'b [LeafClass],
+        path: &[(Option<usize>, String)],
+        n: i64,
+    ) -> Option<(usize, &'b LeafClass)> {
+        classes.iter().enumerate().find(|(_, c)| {
+            let Some(Step::PDim(pn, _)) = c.steps.last() else {
+                return false;
+            };
+            *pn == n
+                && c.steps.len() == path.len() + 1
+                && c.steps[..path.len()].iter().zip(path).all(|(a, (f, _))| match (a, f) {
+                    (Step::Field(x), Some(y)) => x == y,
+                    (Step::Dim(_), None) => true,
+                    _ => false,
+                })
+        })
+    }
+
     /// The runs of consecutive leaves of a coverage in `base..base + count`.
     fn cov_runs(cov: &Cov, base: i64, count: i64) -> Vec<(i64, i64)> {
         let mut runs: Vec<(i64, i64)> = Vec::new();
@@ -448,6 +510,30 @@ impl<'a> Lw<'a> {
             // A zero-delay assignment of the whole vector is one pending
             // value (`emit_leaves`); a queued transaction first queues it.
             let mut flush = String::new();
+            let mut wflush = String::new();
+            if let Some((nwords, w, n)) = Self::word_pending(c) {
+                let bits = w as i64 * n - 1;
+                let _ = writeln!(
+                    out,
+                    "  bit [{bits}:0] vh_pww{s}_{p}_c{ci} [0:{nw}];\n  bit vh_pwwm{s}_{p}_c{ci} [0:{nw}];\n  longint vh_pwwi{s}_{p}_c{ci} [0:{nw}];\n  int vh_pwwn{s}_{p}_c{ci};",
+                    bits = bits,
+                    nw = nwords - 1,
+                    s = s,
+                    p = p,
+                    ci = ci
+                );
+                let _ = write!(
+                    wflush,
+                    "    if (vh_pwwn{s}_{p}_c{ci} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{ci}; vh_pi = vh_pi + 1) begin vh_lkk = vh_pwwi{s}_{p}_c{ci}[vh_pi]; if (vh_pwwm{s}_{p}_c{ci}[vh_lkk]) begin for (vh_pj = 0; vh_pj < {n}; vh_pj = vh_pj + 1) {tx}(vh_dt{s}_{p}_c{ci}, vh_dk{s}_{p}_c{ci}, vh_dq{s}_{p}_c{ci}, vh_lkk * {n} + vh_pj, vh_pww{s}_{p}_c{ci}[vh_lkk][{w} * ({n1} - vh_pj) +: {w}], 64'sd0, 64'sd0, 0); vh_pwwm{s}_{p}_c{ci}[vh_lkk] = 0; end end vh_pwwn{s}_{p}_c{ci} = 0; end\n",
+                    n1 = n - 1,
+                    s = s,
+                    p = p,
+                    ci = ci,
+                    tx = tx,
+                    n = n,
+                    w = w
+                );
+            }
             if let Some((_, w, n)) = Self::whole_class(c) {
                 let _ = writeln!(
                     out,
@@ -465,12 +551,13 @@ impl<'a> Lw<'a> {
             // queued transaction first moves the pending ones into the queue.
             let _ = write!(
                 out,
-                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  int vh_sqn{s}_{p}_c{c};\n  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n{flush}    for (vh_pj = 0; vh_pj < vh_pn{s}_{p}_c{c}; vh_pj = vh_pj + 1) begin\n      vh_lkk = vh_pl{s}_{p}_c{c}[vh_pj];\n      if (vh_pm{s}_{p}_c{c}[vh_lkk]) begin {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, vh_lkk, vh_pf{s}_{p}_c{c}[vh_lkk], 64'sd0, 64'sd0, 0); vh_pm{s}_{p}_c{c}[vh_lkk] = 0; end\n    end\n    vh_pn{s}_{p}_c{c} = 0;\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= vh_now) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;\n    end\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n",
+                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  int vh_sqn{s}_{p}_c{c};\n  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n{wflush}{flush}    for (vh_pj = 0; vh_pj < vh_pn{s}_{p}_c{c}; vh_pj = vh_pj + 1) begin\n      vh_lkk = vh_pl{s}_{p}_c{c}[vh_pj];\n      if (vh_pm{s}_{p}_c{c}[vh_lkk]) begin {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, vh_lkk, vh_pf{s}_{p}_c{c}[vh_lkk], 64'sd0, 64'sd0, 0); vh_pm{s}_{p}_c{c}[vh_lkk] = 0; end\n    end\n    vh_pn{s}_{p}_c{c} = 0;\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= vh_now) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;\n    end\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n",
                 s = s,
                 p = p,
                 c = ci,
                 et = et,
                 tx = tx,
+                wflush = wflush,
                 flush = flush,
                 cnt1 = c.count.max(1) - 1,
                 cap1 = cap - 1,
@@ -568,6 +655,37 @@ impl<'a> Lw<'a> {
                         );
                     }
                 }
+                // The same, for one element of an array: one pending word
+                // instead of a nibble per element. A nibble already pending
+                // (a bit assigned earlier in this process) keeps the loop,
+                // and the due phase applies nibbles after words so the bit
+                // wins.
+                let mut word = false;
+                if !whole
+                    && let Some((_, n)) = pk
+                    && ndim == 1
+                    && slice_start.is_none()
+                    && slice_len.is_none()
+                    && self.leaf_zero
+                    && self.sig_kind(s).is_none()
+                    && path.iter().any(|(f, _)| f.is_none())
+                    && self.ndims(e) == 0
+                    && let Some(classes) = self.leaf_classes(self.sigs[s].ty)
+                    && let Some((ci, c)) = Self::packed_class(&classes, path, n)
+                    && Self::word_pending(c).is_some()
+                    && self.driver_classes(s, p).contains(&ci)
+                    && let Some(key) = Self::word_key(c, path)
+                {
+                    word = true;
+                    let _ = writeln!(
+                        out,
+                        "{pad}if (vh_sqn{s}_{p}_c{c} == 0 && vh_pn{s}_{p}_c{c} == 0) begin\n{pad}  vh_lk = {key};\n{pad}  vh_pww{s}_{p}_c{c}[vh_lk] = {val}; if (!vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_pwwm{s}_{p}_c{c}[vh_lk] = 1; vh_pwwi{s}_{p}_c{c}[vh_pwwn{s}_{p}_c{c}] = vh_lk; vh_pwwn{s}_{p}_c{c} = vh_pwwn{s}_{p}_c{c} + 1; end\n{pad}end else begin",
+                        pad = pad,
+                        key = key,
+                        c = ci,
+                        val = val
+                    );
+                }
                 for k in 0..ndim {
                     let iv = format!("vh_li{}_{}", depth, k);
                     let off = match (&slice_start, k) {
@@ -601,7 +719,7 @@ impl<'a> Lw<'a> {
                 for k in (0..opened).rev() {
                     let _ = writeln!(out, "{}{}end", pad, "  ".repeat(k));
                 }
-                if whole {
+                if whole || word {
                     let _ = writeln!(out, "{}end", pad);
                 }
             }
@@ -674,6 +792,14 @@ impl<'a> Lw<'a> {
                     "{ind}if (vh_pwf{s}_{p}_c{c}) begin vh_dv{s}_{p}{pre} = vh_pw{s}_{p}_c{c}; vh_pwf{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end"
                 );
             }
+            if Self::word_pending(&classes[c]).is_some()
+                && let Some(pre) = Self::packed_word_sv(&classes[c], "vh_lk")
+            {
+                let _ = writeln!(
+                    out,
+                    "{ind}if (vh_pwwn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pwwi{s}_{p}_c{c}[vh_pi]; if (vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{pre} = vh_pww{s}_{p}_c{c}[vh_lk]; vh_pwwm{s}_{p}_c{c}[vh_lk] = 0; end end vh_pwwn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end"
+                );
+            }
             let _ = writeln!(
                 out,
                 "{ind}if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pl{s}_{p}_c{c}[vh_pi]; if (vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{leaf} = vh_pf{s}_{p}_c{c}[vh_lk]; vh_pm{s}_{p}_c{c}[vh_lk] = 0; end end vh_pn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end",
@@ -695,6 +821,9 @@ impl<'a> Lw<'a> {
         for c in self.driver_classes(s, p) {
             if classes.get(c).is_some_and(|c| Self::whole_class(c).is_some()) {
                 let _ = writeln!(out, "    if (vh_pwf{s}_{p}_c{c}) n = vh_now;");
+            }
+            if classes.get(c).is_some_and(|c| Self::word_pending(c).is_some()) {
+                let _ = writeln!(out, "    if (vh_pwwn{s}_{p}_c{c} > 0) n = vh_now;");
             }
             let _ = writeln!(
                 out,

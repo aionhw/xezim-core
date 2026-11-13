@@ -115,4 +115,8 @@ end architecture;
         sv.contains(".d[k]") && sv.contains("= vh_dv"),
         "no whole-word copy of the array element"
     );
+    assert!(
+        sv.contains("vh_pww"),
+        "a whole packed element is still stored a nibble at a time"
+    );
 }
