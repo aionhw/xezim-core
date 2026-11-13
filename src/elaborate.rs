@@ -2448,6 +2448,34 @@ fn range_refs_class_header_param(c: &ClassDeclaration, l: &Expression, r: &Expre
     expr_names_any(l, &params) || expr_names_any(r, &params)
 }
 
+/// The unpacked dimensions a class property's element typedef adds after
+/// the declarator's own (§7.4.5): the class's typedef of that name, else an
+/// enclosing module or `$unit` typedef. Empty for any other type.
+fn typedef_row_dims(
+    data_type: &DataType,
+    local_typedef_dims: &HashMap<String, Vec<UnpackedDimension>>,
+) -> Vec<UnpackedDimension> {
+    let DataType::TypeReference {
+        name, dimensions, ..
+    } = data_type
+    else {
+        return Vec::new();
+    };
+    if !dimensions.is_empty() {
+        return Vec::new();
+    }
+    let n = &name.name.name;
+    local_typedef_dims
+        .get(n)
+        .cloned()
+        .or_else(|| {
+            name.scopes
+                .is_empty()
+                .then(|| TYPEDEF_SHAPES_TLS.with(|c| c.borrow().1.get(n).cloned()))?
+        })
+        .unwrap_or_default()
+}
+
 fn elaborate_class_in_scope(
     c: &ClassDeclaration,
     scope_params: Option<&HashMap<String, Value>>,
@@ -2603,8 +2631,7 @@ fn elaborate_class_in_scope(
                 for decl in &p.declarators {
                     // A property typed by an unpacked-dimension typedef
                     // (`edges_t m;`) inherits the typedef's dims when it
-                    // declares none of its own. Otherwise this is exactly
-                    // `decl.dimensions`, so behavior is unchanged.
+                    // declares none of its own.
                     let effective_dims: Vec<UnpackedDimension> = if decl.dimensions.is_empty() {
                         match &p.data_type {
                             DataType::TypeReference { name, .. } => local_typedef_dims
@@ -2614,7 +2641,14 @@ fn elaborate_class_in_scope(
                             _ => Vec::new(),
                         }
                     } else {
-                        decl.dimensions.clone()
+                        // §7.4.5: with dimensions of its own (`q_t qq[$];`)
+                        // they come first, then the typedef's — from the
+                        // class's typedefs, else the enclosing scope's — as
+                        // at module scope. The typedef's were dropped, so the
+                        // rows of `qq` held one scalar each.
+                        let mut d = decl.dimensions.clone();
+                        d.extend(typedef_row_dims(&p.data_type, &local_typedef_dims));
+                        d
                     };
                     if matches!(
                         effective_dims.first(),
