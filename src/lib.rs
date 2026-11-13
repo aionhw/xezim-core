@@ -2358,6 +2358,7 @@ fn parse_and_elaborate(
     let unit_carrier = if top_level_functions.is_empty()
         && top_level_tasks.is_empty()
         && top_level_params.is_empty()
+        && top_level_assertion_decls.is_empty()
     {
         None
     } else if let Some(name) = named_top {
@@ -2402,6 +2403,38 @@ fn parse_and_elaborate(
         &top_level_dpi_exports,
     ));
 
+    // §3.12.1 / §16.8 / §16.12: retain unused unit properties/sequences on
+    // the carrier for validation, rather than cloning their expression trees
+    // into every unrelated definition. A use anywhere conservatively keeps
+    // its declaration and dependencies everywhere, including hierarchical
+    // references from another module.
+    let unit_assertion_usage = unit_subroutine_usage::Usage::assertions(&top_level_assertion_decls);
+    let mut needed_unit_assertions = unit_assertion_usage.references(&(
+        (&top_level_functions, &top_level_tasks, &top_level_nettypes),
+        (&top_level_vars, &top_level_nets, &top_level_covergroups),
+        (&top_level_dpi_imports, &top_level_dpi_exports),
+        (
+            &top_level_lets,
+            &top_level_binds,
+            &top_level_ooc_constraints,
+        ),
+        (&top_level_imports, &class_defs, &typedef_defs),
+    ));
+    if !top_level_assertion_decls.is_empty() {
+        for def in definitions.values() {
+            let references = match def {
+                SourceDefinition::Module(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Interface(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Program(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Class(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Package(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Typedef(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Udp(d) => unit_assertion_usage.references(d),
+            };
+            needed_unit_assertions.extend(references);
+        }
+    }
+
     // §3.12.1 / §6.20: compilation-unit constants need not become owned
     // declarations and parameter/signal/type entries in every unrelated
     // definition and instance. Retain all constants on the root carrier for
@@ -2441,8 +2474,10 @@ fn parse_and_elaborate(
     let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         needed_unit_params.extend(unit_param_usage.references(&top_level_params));
+        needed_unit_assertions.extend(unit_assertion_usage.references(&top_level_assertion_decls));
     }
     let needed_unit_params = unit_param_usage.close(needed_unit_params);
+    let needed_unit_assertions = unit_assertion_usage.close(needed_unit_assertions);
 
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
@@ -2604,6 +2639,12 @@ fn parse_and_elaborate(
                 };
                 for d in top_level_assertion_decls.iter().rev() {
                     let n = decl_name(d);
+                    if !retain_all
+                        && n.as_ref()
+                            .is_some_and(|name| !needed_unit_assertions.contains(name))
+                    {
+                        continue;
+                    }
                     if !items
                         .iter()
                         .any(|it| decl_name(it).is_some() && decl_name(it) == n)

@@ -105,6 +105,30 @@ impl Usage {
         usage
     }
 
+    /// §3.12.1 / §16.8 / §16.12: unit assertion declarations are shared
+    /// lexical declarations. Follow sequence/property dependencies without
+    /// treating their own names as uses in unrelated module definitions.
+    pub(crate) fn assertions(declarations: &[crate::ast::decl::ModuleItem]) -> Self {
+        use crate::ast::decl::ModuleItem;
+        let name = |item: &ModuleItem| match item {
+            ModuleItem::PropertyDeclaration(p) => Some(p.name.name.clone()),
+            ModuleItem::SequenceDeclaration(s) => Some(s.name.name.clone()),
+            _ => None,
+        };
+        let mut usage = Self {
+            names: declarations.iter().filter_map(name).collect(),
+            deps: HashMap::default(),
+            qualified_components: true,
+        };
+        for declaration in declarations {
+            if let Some(name) = name(declaration) {
+                let references = usage.references(declaration);
+                usage.deps.entry(name).or_default().extend(references);
+            }
+        }
+        usage
+    }
+
     pub(crate) fn references<T: Serialize + ?Sized>(&self, value: &T) -> HashSet<String> {
         let mut found = HashSet::default();
         if self.names.is_empty() {
