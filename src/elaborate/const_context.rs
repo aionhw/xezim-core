@@ -52,6 +52,18 @@ impl Types {
 }
 
 pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &mut Types) -> Type {
+    // A bound name already carries its type. Reading it for type inference
+    // must not clone its value or allocate a cache entry on each loop step.
+    if let ExprKind::Ident(h) = &expr.kind {
+        if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
+            let name = &h.path[0].name.name;
+            if let Some(value) = params.get(name) {
+                let mut ty = Type::of(value);
+                ty.integral &= !tls_is_string_param(name);
+                return ty;
+            }
+        }
+    }
     let key = expr as *const _ as usize;
     if let Some(entry) = types.0.get(&key) {
         return entry.ty;
@@ -166,7 +178,13 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
             ty
         }
     };
-    types.0.insert(key, Entry { ty, value: cached });
+    // Integral operator types are cheap to derive and folding traverses
+    // those operands directly. Cache only evaluated leaves and real trees:
+    // leaves prevent repeated evaluation across casts/selects; real trees
+    // prevent repeated type walks when ordinary evaluation visits children.
+    if cached.is_some() || ty.real {
+        types.0.insert(key, Entry { ty, value: cached });
+    }
     ty
 }
 

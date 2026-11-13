@@ -46312,6 +46312,13 @@ fn eval_const_user_function(
         elab: &ElaboratedModule,
         depth: u32,
     ) -> Option<Value> {
+        if let ExprKind::Ident(h) = &target.kind {
+            if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
+                if let Some(storage) = locals.get(&h.path[0].name.name) {
+                    return eval_for_storage(rhs, storage, locals, elab, depth);
+                }
+            }
+        }
         let storage = eval_fn_expr(target, locals, elab, depth)?;
         eval_for_storage(rhs, &storage, locals, elab, depth)
     }
