@@ -824,6 +824,18 @@ impl<'a> Design<'a> {
         out
     }
 
+    /// `prefix.name`, or `name` when `prefix` is empty. The glue sits in the
+    /// root module, so with the root as the UPF scope (`-elements {.}`) a
+    /// signal is named by itself; joining the empty prefix gave `.clk`, which
+    /// the glue parse rejected (IEEE 1801 §6.11).
+    fn child_path(prefix: &str, name: &str) -> String {
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", prefix, name)
+        }
+    }
+
     /// Hierarchical names (relative to `prefix`) of everything in `m` that a
     /// power-down corrupts: scalar/vector variables, nets and outputs, and
     /// the same inside sub-instances. Inputs are the parent's nets and are
@@ -860,7 +872,7 @@ impl<'a> Design<'a> {
         };
         let push = |name: &str, out: &mut Vec<String>| {
             if !inputs.iter().any(|i| i == name) {
-                let full = format!("{}.{}", prefix, name);
+                let full = Self::child_path(prefix, name);
                 if !out.contains(&full) {
                     out.push(full);
                 }
@@ -904,7 +916,7 @@ impl<'a> Design<'a> {
                 continue;
             }
             if let Some(sub) = self.modules.get(&mname) {
-                self.corruptible(sub, &format!("{}.{}", prefix, iname), skip, out, depth + 1);
+                self.corruptible(sub, &Self::child_path(prefix, &iname), skip, out, depth + 1);
             }
         }
     }
