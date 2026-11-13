@@ -29113,6 +29113,12 @@ fn element_pattern(base: &Expression, lists: &[Vec<i64>]) -> Expression {
 
 /// `base[idx]` as an expression.
 fn index_expr_of(base: Expression, idx: i64) -> Expression {
+    // §7.4.2 / §10.9.1: negative declared indices select array elements too.
+    // As for whole-array assignments, synthesize unary minus (§5.7.1), not
+    // a numeric token containing a sign, which loses the negative leaf.
+    if idx < 0 {
+        return index_expr(base, idx);
+    }
     let span = base.span;
     Expression::new(
         ExprKind::Index {
