@@ -60,6 +60,7 @@ pub fn release_free_memory() {
 /// `XEZIM_COMPILE_PHASES`: print the wall time of one elaboration pass,
 /// measured from `since`, and restart the clock.
 pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
+    oom_trace::checkpoint(label, &[]);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("XEZIM_COMPILE_PHASES").is_some()) {
         eprintln!(
@@ -72,6 +73,7 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
 }
 
 mod ast_intern;
+pub mod oom_trace;
 pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
@@ -397,6 +399,8 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the file size and decompression info.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
+    let _oom_trace = oom_trace::session();
+    let _oom_read = oom_trace::scope("read compiled artifact", path, "", "");
     let _name_registry = shared_names::registry_scope();
     use std::io::Read;
 
@@ -1080,11 +1084,18 @@ pub fn preprocess_design(
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
 ) -> PreprocessedSources {
+    let _oom_trace = oom_trace::session();
     let mut pp = new_design_preprocessor(include_dirs, defines);
     let mut texts = Vec::with_capacity(sources.len());
     let mut line_maps = Vec::with_capacity(sources.len());
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
+        let _oom_source = oom_trace::scope(
+            "preprocess",
+            source_files.get(i).map(String::as_str).unwrap_or("<unnamed>"),
+            "",
+            "",
+        );
         pp.begin_top_level_file();
         texts.push(pp.preprocess_file(source, source_path.as_deref()));
         line_maps.push(pp.take_line_map());
@@ -1165,6 +1176,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     ),
     String,
 > {
+    let _oom_trace = oom_trace::session();
     let _census_session = sv_parser::census_session();
     let mut pre = pre.filter(|p| p.matches(sources, source_files, include_dirs, defines));
     if let Some(p) = pre.as_ref() {
@@ -1206,6 +1218,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("<unnamed>");
+        let _oom_source = oom_trace::scope("preprocess", label, "", "");
         if compile_verbose() {
             eprintln!("[compile] ({}/{}) parsing {}", i + 1, sources.len(), label);
         } else {
@@ -1246,7 +1259,21 @@ pub fn parse_and_elaborate_multi_preprocessed(
             ));
         }
 
+        oom_trace::checkpoint(
+            "lex",
+            &[
+                ("source_bytes", source.len()),
+                ("preprocessed_bytes", preprocessed.len()),
+            ],
+        );
         let tokens = lexer::Lexer::new(&preprocessed).tokenize();
+        oom_trace::checkpoint(
+            "parse",
+            &[
+                ("tokens", tokens.len()),
+                ("preprocessed_bytes", preprocessed.len()),
+            ],
+        );
         let mut parser = sv_parser::parse::Parser::new(tokens);
         let source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
@@ -1334,6 +1361,13 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 src_file_of_module.entry(name.clone()).or_insert(i as u32);
             }
         }
+        oom_trace::checkpoint(
+            "parsed file",
+            &[
+                ("descriptions", source_ast.descriptions.len()),
+                ("preprocessed_bytes", preprocessed.len()),
+            ],
+        );
         all_descriptions.extend(source_ast.descriptions);
         preprocessed_texts.push(preprocessed);
         line_maps.push(line_map);
@@ -1730,6 +1764,7 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    let _oom_prepare = oom_trace::scope("prepare definitions", "", "", "");
     let _name_registry = shared_names::registry_scope();
     let _declaration_order_scope = elaborate::declaration_order_scope();
     // Every elaboration starts from the same state, whatever the thread
@@ -2494,7 +2529,28 @@ fn parse_and_elaborate(
         || !top_level_dpi_imports.is_empty()
         || !top_level_dpi_exports.is_empty()
     {
+        let _oom_unit = oom_trace::scope("compilation-unit declarations", "", "", "");
         for (def_name, def) in definitions.iter_mut() {
+            let _oom_definition = if oom_trace::enabled() {
+                let definition = match &*def {
+                    SourceDefinition::Module(d) => Some(elaborate::Definition::Module(d)),
+                    SourceDefinition::Interface(d) => Some(elaborate::Definition::Interface(d)),
+                    SourceDefinition::Program(d) => Some(elaborate::Definition::Program(d)),
+                    _ => None,
+                };
+                definition.map(|d| oom_trace::definition(d, "inject unit declarations", ""))
+            } else {
+                None
+            };
+            oom_trace::checkpoint(
+                "inject unit declarations",
+                &[
+                    ("unit_variables", top_level_vars.len()),
+                    ("unit_nets", top_level_nets.len()),
+                    ("unit_parameters", top_level_params.len()),
+                    ("unit_assertions", top_level_assertion_decls.len()),
+                ],
+            );
             let retain_all = unit_carrier.as_ref().is_none_or(|name| name == def_name);
             // §3.12.1 / §13.4.3: programs and interfaces share compilation-
             // unit declarations with modules, including constant functions.
@@ -2771,6 +2827,12 @@ fn parse_and_elaborate(
                     }
                     items.insert(0, ast::decl::ModuleItem::NetDeclaration(net));
                 }
+                oom_trace::checkpoint(
+                    "unit declarations injected",
+                    &[
+                        ("module_items", items.len()),
+                    ],
+                );
             }
         }
     }
@@ -3474,6 +3536,7 @@ fn parse_and_elaborate(
         try_size("specify_delays   ", bincode::serde::encode_to_vec(&elab.specify_delays, cfg));
     }
     elab_phase("post-inline passes", &mut phase_t);
+    oom_trace::model("elaboration complete", &elab, None);
     Ok((definitions, elab))
 }
 

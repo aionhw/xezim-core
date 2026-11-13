@@ -9671,6 +9671,8 @@ pub fn elaborate_module_with_defs(
     top_level_lets: &[LetDeclaration],
     seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
+    let _oom_trace = crate::oom_trace::session();
+    let _oom_definition = crate::oom_trace::definition(module, "elaborate module", module.name());
     let mut elab = ElaboratedModule::new(module.name().to_string());
     // §6.5/§10: within a scope a net/variable must be DECLARED before it is
     // referenced (implicit nets §6.10 are the only exception, and they do not
@@ -33399,6 +33401,8 @@ pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    let _oom_trace = crate::oom_trace::session();
+    let _oom_inline = crate::oom_trace::scope("inline hierarchy", "", &elab.name, &elab.name);
     port_elision_setup();
     let result = inline_instantiations_inner(elab, definitions);
     PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
@@ -38635,6 +38639,11 @@ fn inline_module_items(
     // (`elaborate_module_with_defs`); the inlined-instance path never processed
     // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
     // took whichever package last hoisted that bare name.
+    let _oom_body = crate::oom_trace::definition(
+        source_def,
+        "prepare module body",
+        prefix.trim_end_matches('.'),
+    );
     let imports = cache.imported_typedefs(elab, source_def, definitions)?;
     rebind_imported_typedefs(elab, &imports);
     INLINE_CHAIN_TLS.with(|c| {
@@ -38928,6 +38937,17 @@ fn inline_module_items(
                 let __th = iprof_now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                let _oom_instance = if crate::oom_trace::enabled() {
+                    Some(crate::oom_trace::scope(
+                        "inline instance",
+                        &audit_location(source_def.name(), hi.name.span),
+                        sub_mod_name,
+                        inst_prefix.trim_end_matches('.'),
+                    ))
+                } else {
+                    None
+                };
+                crate::oom_trace::model("prepare instance", elab, Some(cache.prepared.len()));
                 elab.upward_scopes.borrow_mut().add_parent(
                     prefix.trim_end_matches('.'),
                     inst_prefix.trim_end_matches('.'),
@@ -44304,6 +44324,20 @@ fn inline_module_items(
                     upward: Rc::clone(&elab.upward_scopes),
                 });
 
+                crate::oom_trace::checkpoint(
+                    "retain instance context",
+                    &[
+                        ("signals", elab.signals.len()),
+                        ("type_bindings", pend_ctx.type_binds.len()),
+                        ("type_widths", pend_ctx.type_bind_widths.len()),
+                        ("type_queries", pend_ctx.type_bind_queries.len()),
+                        ("port_bindings", pend_ctx.port_map.len()),
+                        ("interface_bindings", pend_ctx.interface_map.len()),
+                        ("local_names", pend_ctx.local_names.len()),
+                        ("prepared_bodies", cache.prepared.len()),
+                    ],
+                );
+
                 // §6.8: the deferred (non-constant) declaration initializers of
                 // this instance, in DECLARATION ORDER and ahead of the
                 // instance's own initial blocks (pushed further below). One
@@ -45115,6 +45149,7 @@ fn inline_module_items(
                     &sub_defparams,
                     param_scope,
                 )?;
+                crate::oom_trace::model("instance complete", elab, Some(cache.prepared.len()));
                 iprof_since("recursion", __te);
 
                 for (tp_name, saved) in saved_type_shapes.into_iter().rev() {
