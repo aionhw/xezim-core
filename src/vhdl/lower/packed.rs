@@ -89,11 +89,22 @@ impl<'a> Lw<'a> {
         Some(Repr::Pk(w, n))
     }
 
+    /// A record array this design may store as one vector. The shape is
+    /// necessary but not sufficient: `select_record_packs` admits a type
+    /// only when the packed form cannot be told from per-element drivers.
+    pub(super) fn record_array_pack(&self, t: TypeId) -> Option<(u32, i64)> {
+        let b = self.base(t);
+        if !self.record_pack_ok.contains(&b) {
+            return None;
+        }
+        self.record_array_shape(t)
+    }
+
     /// A static one-dimensional array of records whose fields all pack:
     /// `(element bits, element count)`. Field 0 is the high end of an
     /// element and the left element is the high end of the vector. An
     /// enumeration element is `pk_of`'s other arm, not this.
-    pub(super) fn record_array_pack(&self, t: TypeId) -> Option<(u32, i64)> {
+    pub(super) fn record_array_shape(&self, t: TypeId) -> Option<(u32, i64)> {
         let b = self.base(t);
         let TypeKind::Array { index, elem } = &self.d.types[b].kind else {
             return None;
@@ -199,27 +210,6 @@ impl<'a> Lw<'a> {
         s
     }
 
-    /// Offset of index `i` from the left bound. No out-of-range check:
-    /// the check is a call, and a call in the part-select keeps the
-    /// process on the interpreter. An index outside the bounds selects
-    /// the wrong bits.
-    pub(super) fn index_off(i: &str, b: Bounds) -> String {
-        let (l, dir, _) = b;
-        if let Some(iv) = lit_i64(i) {
-            return match dir {
-                Dir::To => iv - l,
-                Dir::Downto => l - iv,
-            }
-            .to_string();
-        }
-        match dir {
-            Dir::To if l == 0 => i.to_string(),
-            Dir::To => format!("(({}) - {})", i, l),
-            Dir::Downto if l == 0 => format!("(-({}))", i),
-            Dir::Downto => format!("({} - ({}))", l, i),
-        }
-    }
-
     /// `factor * (span - off)`, folded when `off` is a literal.
     pub(super) fn bit_mul(factor: u32, span: i64, off: &str) -> String {
         if let Ok(k) = off.parse::<i64>() {
@@ -250,7 +240,7 @@ impl<'a> Lw<'a> {
         let root = self.ex(arr);
         let i = self.ex(&idx[0]);
         let bnd = self.shape(arr).unwrap_or((n - 1, Dir::Downto, 0));
-        let off = Self::index_off(&i, bnd);
+        let off = self.pk_off(&i, bnd, &idx[0].loc);
         Some((root, Self::bit_mul(ew, n - 1, &off)))
     }
 
@@ -276,7 +266,7 @@ impl<'a> Lw<'a> {
         let field_lo = Self::bit_sum(elem_lo, shift.to_string());
         let i = self.ex(ix);
         let bnd = self.shape(field_expr).unwrap_or((n - 1, Dir::Downto, 0));
-        let off = Self::index_off(&i, bnd);
+        let off = self.pk_off(&i, bnd, &ix.loc);
         let lo = Self::bit_sum(field_lo, Self::bit_mul(w, n - 1, &off));
         Some(format!("{}[{} +: {}]", root, lo, w))
     }

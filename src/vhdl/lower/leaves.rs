@@ -89,13 +89,7 @@ impl<'a> Lw<'a> {
 
     /// `packed`: the storage of `t` may be a packed vector (not for a
     /// record field whose declared type is unconstrained).
-    fn collect_classes(
-        &self,
-        t: TypeId,
-        steps: &mut Vec<Step>,
-        out: &mut Vec<LeafClass>,
-        packed: bool,
-    ) -> Option<()> {
+    fn collect_classes(&self, t: TypeId, steps: &mut Vec<Step>, out: &mut Vec<LeafClass>, packed: bool) -> Option<()> {
         let b = self.base(t);
         match &self.d.types[b].kind {
             TypeKind::Record(_) => {
@@ -522,18 +516,7 @@ impl<'a> Lw<'a> {
                 // Fields as stored (an unconstrained element is a struct).
                 for (i, ft) in self.field_storage(t).into_iter().enumerate() {
                     path.push((Some(i), String::new()));
-                    self.emit_leaves(
-                        s,
-                        p,
-                        ft,
-                        &format!("{}.f{}", val, i),
-                        path,
-                        None,
-                        None,
-                        out,
-                        ind,
-                        depth,
-                    );
+                    self.emit_leaves(s, p, ft, &format!("{}.f{}", val, i), path, None, None, out, ind, depth);
                     path.pop();
                 }
             }
@@ -541,9 +524,7 @@ impl<'a> Lw<'a> {
                 let ndim = index.len();
                 // The elements as stored (an element constraint of an array
                 // of unconstrained arrays leaves them structs).
-                let Some(e) = self.elem_storage(t) else {
-                    return;
-                };
+                let Some(e) = self.elem_storage(t) else { return };
                 let mut v = val.to_string();
                 let mut opened = 0;
                 // A packed value: `pk_n` elements (a slice target's value has
@@ -565,13 +546,11 @@ impl<'a> Lw<'a> {
                     && self.ndims(e) == 0
                     && let Some(classes) = self.leaf_classes(self.sigs[s].ty)
                 {
-                    let pre: String = path
+                    let pre: String = path.iter().map(|(f, _)| format!(".f{}", f.unwrap_or(0))).collect();
+                    if let Some(ci) = classes
                         .iter()
-                        .map(|(f, _)| format!(".f{}", f.unwrap_or(0)))
-                        .collect();
-                    if let Some(ci) = classes.iter().position(|c| {
-                        Self::whole_class(c).is_some_and(|(q, _, m)| q == pre && m == n)
-                    }) && self.driver_classes(s, p).contains(&ci)
+                        .position(|c| Self::whole_class(c).is_some_and(|(q, _, m)| q == pre && m == n))
+                        && self.driver_classes(s, p).contains(&ci)
                     {
                         whole = true;
                         let _ = writeln!(
@@ -608,18 +587,7 @@ impl<'a> Lw<'a> {
                         None => format!("{}.d[{}]", v, iv),
                     };
                 }
-                self.emit_leaves(
-                    s,
-                    p,
-                    e,
-                    &v,
-                    path,
-                    None,
-                    None,
-                    out,
-                    ind + 2 * opened,
-                    depth + 1,
-                );
+                self.emit_leaves(s, p, e, &v, path, None, None, out, ind + 2 * opened, depth + 1);
                 for _ in 0..ndim {
                     path.pop();
                 }
@@ -632,9 +600,7 @@ impl<'a> Lw<'a> {
             }
             _ => {
                 // The class of this leaf: the same fields and dimensions.
-                let Some(classes) = self.leaf_classes(self.sigs[s].ty) else {
-                    return;
-                };
+                let Some(classes) = self.leaf_classes(self.sigs[s].ty) else { return };
                 let shape: Vec<Step> = path
                     .iter()
                     .map(|(f, _)| match f {
@@ -653,11 +619,7 @@ impl<'a> Lw<'a> {
                     return;
                 };
                 let dims = c.dims();
-                let offs: Vec<&String> = path
-                    .iter()
-                    .filter(|(f, _)| f.is_none())
-                    .map(|(_, o)| o)
-                    .collect();
+                let offs: Vec<&String> = path.iter().filter(|(f, _)| f.is_none()).map(|(_, o)| o).collect();
                 let mut key = String::from("0");
                 for (k, n) in dims.iter().enumerate() {
                     key = if key == "0" {
@@ -714,14 +676,7 @@ impl<'a> Lw<'a> {
                 c = c,
                 leaf = leaf
             );
-            let _ = writeln!(
-                out,
-                "{ind}if (vh_sqn{s}_{p}_c{c} > 0) vh_drd_{s}_{p}_c{c}();",
-                ind = ind,
-                s = s,
-                p = p,
-                c = c
-            );
+            let _ = writeln!(out, "{ind}if (vh_sqn{s}_{p}_c{c} > 0) vh_drd_{s}_{p}_c{c}();", ind = ind, s = s, p = p, c = c);
         }
         out
     }
@@ -731,10 +686,7 @@ impl<'a> Lw<'a> {
         let mut out = String::new();
         let classes = self.leaf_classes(self.sigs[s].ty).unwrap_or_default();
         for c in self.driver_classes(s, p) {
-            if classes
-                .get(c)
-                .is_some_and(|c| Self::whole_class(c).is_some())
-            {
+            if classes.get(c).is_some_and(|c| Self::whole_class(c).is_some()) {
                 let _ = writeln!(out, "    if (vh_pwf{s}_{p}_c{c}) n = vh_now;");
             }
             let _ = writeln!(
@@ -765,10 +717,7 @@ impl<'a> Lw<'a> {
         let Some(classes) = self.leaf_classes(ty) else {
             self.err(
                 &info.loc,
-                format!(
-                    "signal '{}' has drivers of parts but bounds that are not static",
-                    info.name
-                ),
+                format!("signal '{}' has drivers of parts but bounds that are not static", info.name),
             );
             return None;
         };
@@ -831,16 +780,9 @@ impl<'a> Lw<'a> {
                         // under record fields: one assignment.
                         if a == 0
                             && b == c.count - 1
-                            && c.steps
-                                .iter()
-                                .filter(|s| !matches!(s, Step::Field(_)))
-                                .count()
-                                <= 1
+                            && c.steps.iter().filter(|s| !matches!(s, Step::Field(_))).count() <= 1
                             && !c.steps.iter().any(|s| matches!(s, Step::Dim(_)))
-                            && matches!(
-                                c.steps.last(),
-                                None | Some(Step::Field(_) | Step::PDim(..))
-                            )
+                            && matches!(c.steps.last(), None | Some(Step::Field(_) | Step::PDim(..)))
                         {
                             let pre: String = c
                                 .steps
@@ -850,13 +792,7 @@ impl<'a> Lw<'a> {
                                     _ => None,
                                 })
                                 .collect();
-                            let _ = writeln!(
-                                body,
-                                "    nv{pre} = vh_dv{s}_{p}{pre};",
-                                pre = pre,
-                                s = s,
-                                p = p
-                            );
+                            let _ = writeln!(body, "    nv{pre} = vh_dv{s}_{p}{pre};", pre = pre, s = s, p = p);
                             continue;
                         }
                         match &elem {
@@ -978,9 +914,7 @@ impl<'a> Lw<'a> {
                         .map(|s| match s {
                             Sel::Field(i) => DSel::Field(i),
                             Sel::Elem(k) => DSel::Elem(k.to_string(), Some(k)),
-                            Sel::Slice(k, n) => {
-                                DSel::Slice(k.to_string(), n.to_string(), Some((k, n)))
-                            }
+                            Sel::Slice(k, n) => DSel::Slice(k.to_string(), n.to_string(), Some((k, n))),
                         })
                         .collect(),
                 };
@@ -1016,17 +950,12 @@ impl<'a> Lw<'a> {
                     let static_b = if k == 0 {
                         bounds
                     } else {
-                        self.static_dim(bty, k)
-                            .and_then(|sr| Some((sr.left.as_i64()?, sr.dir, sr.right.as_i64()?)))
+                        self.static_dim(bty, k).and_then(|sr| {
+                            Some((sr.left.as_i64()?, sr.dir, sr.right.as_i64()?))
+                        })
                     };
                     let mut off = if let Some(bnd) = static_b {
-                        // A packed record array's part-select has to
-                        // compile. `vh_ix` does not.
-                        if self.record_array_pack(self.sigs[s].ty).is_some() {
-                            Self::index_off(&i, bnd)
-                        } else {
-                            self.pk_off(&i, bnd, &t.loc)
-                        }
+                        self.pk_off(&i, bnd, &t.loc)
                     } else {
                         if value.is_empty() {
                             value = self.ex(b);
@@ -1256,22 +1185,8 @@ impl<'a> Lw<'a> {
         }
         let mut body = String::new();
         let (after, rej, mode) = timing;
-        let saved = std::mem::replace(
-            &mut self.leaf_zero,
-            after == "64'sd0" && rej == "64'sd0" && mode == 1,
-        );
-        self.emit_leaves(
-            s,
-            p,
-            t,
-            val,
-            &mut prefix,
-            slice_start,
-            slice_len,
-            &mut body,
-            ind + 2,
-            0,
-        );
+        let saved = std::mem::replace(&mut self.leaf_zero, after == "64'sd0" && rej == "64'sd0" && mode == 1);
+        self.emit_leaves(s, p, t, val, &mut prefix, slice_start, slice_len, &mut body, ind + 2, 0);
         self.leaf_zero = saved;
         format!(
             "{pad}begin\n{pad}  longint after, rej;\n{pad}  int mode;\n{pad}  after = {after}; rej = {rej}; mode = {mode};\n{body}{pad}end\n",
@@ -1285,14 +1200,7 @@ impl<'a> Lw<'a> {
 
     /// The SV reading part `path` of value `base` of signal `s` (a formal
     /// associated with that part: `ty`, the formal's subtype).
-    pub(super) fn path_read(
-        &mut self,
-        base: &str,
-        path: &[Sel],
-        s: usize,
-        ty: TypeId,
-        loc: &Loc,
-    ) -> String {
+    pub(super) fn path_read(&mut self, base: &str, path: &[Sel], s: usize, ty: TypeId, loc: &Loc) -> String {
         let (sel, slice, at) = self.path_sv(self.sigs[s].ty, path, loc);
         let Some((off, len)) = slice else {
             return format!("{}{}", base, sel);
@@ -1306,9 +1214,9 @@ impl<'a> Lw<'a> {
             Some(b) => b,
             None => {
                 let st = self.path_type(self.sigs[s].ty, &path[..path.len() - 1]);
-                let (al, adir, _) =
-                    st.and_then(|t| self.static_bounds(t))
-                        .unwrap_or((0, Dir::To, 0));
+                let (al, adir, _) = st
+                    .and_then(|t| self.static_bounds(t))
+                    .unwrap_or((0, Dir::To, 0));
                 let (l, rr) = match adir {
                     Dir::To => (al + off, al + off + len - 1),
                     Dir::Downto => (al - off, al - off - len + 1),
@@ -1320,10 +1228,7 @@ impl<'a> Lw<'a> {
                 )
             }
         };
-        format!(
-            "{}_sub({}{}, {}, {}, {}, {}, {})",
-            name, base, sel, off, len, l, r, dn
-        )
+        format!("{}_sub({}{}, {}, {}, {}, {}, {})", name, base, sel, off, len, l, r, dn)
     }
 
     /// The subtype at a static path from type `t`.

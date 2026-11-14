@@ -169,6 +169,11 @@ struct Lw<'a> {
     read_drv: Option<(usize, usize)>,
     /// Signals forced or released (`elab::force`).
     forced: BTreeSet<usize>,
+    /// Base types of static record arrays stored as one packed vector.
+    /// Empty until `select_record_packs`: a type is here only when every
+    /// signal of it has one driver and only zero-delay field assigns, so
+    /// the packed form cannot be told from the per-element form.
+    record_pack_ok: BTreeSet<TypeId>,
     /// Procedures lowered per calling process and signal actuals.
     specs: Vec<elab::Spec>,
     spec_keys: HashMap<String, usize>,
@@ -326,6 +331,7 @@ impl<'a> Lw<'a> {
             drv_checks: Vec::new(),
             read_drv: None,
             forced: BTreeSet::new(),
+            record_pack_ok: BTreeSet::new(),
             specs: Vec::new(),
             spec_keys: HashMap::new(),
             spec_todo: Vec::new(),

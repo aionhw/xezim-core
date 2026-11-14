@@ -83,7 +83,10 @@ end architecture;
     );
     let p = process0(&sv);
     assert!(p.contains("132 * (7 - ("), "the element offset is not arithmetic");
-    assert!(!p.contains("vh_ix"), "the part-select still calls vh_ix");
+    assert!(
+        p.contains("vh_ix"),
+        "a variable index dropped the bounds check"
+    );
 }
 
 #[test]
@@ -116,5 +119,102 @@ end architecture;
     assert!(
         p.contains(".d["),
         "an array past the pack cap was packed"
+    );
+}
+
+/// Two processes driving different elements stay per-element drivers.
+#[test]
+fn two_processes_keep_the_per_element_form() {
+    let sv = lowered(
+        r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity t is end;
+architecture a of t is
+  type rec is record
+    v : std_logic_vector(7 downto 0);
+    b : std_logic;
+  end record;
+  type rarr is array (0 to 3) of rec;
+  signal clk : std_logic := '0';
+  signal m : rarr;
+begin
+  p0 : process (clk) begin
+    if rising_edge(clk) then m(0).v <= x"01"; end if;
+  end process;
+  p1 : process (clk) begin
+    if falling_edge(clk) then m(2).v <= x"02"; end if;
+  end process;
+end architecture;
+"#,
+    );
+    assert!(
+        !sv.contains("bit [143:0]"),
+        "two drivers were packed into one vector"
+    );
+    // The field stays a per-element driver: eight nibbles into `vh_pf`,
+    // not one write of the whole vector.
+    assert!(
+        process0(&sv).contains("vh_pf"),
+        "the per-element field driver was dropped"
+    );
+}
+
+/// A delayed part assignment keeps its own waveform.
+#[test]
+fn delayed_part_assignment_is_not_packed() {
+    let sv = lowered(
+        r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity t is end;
+architecture a of t is
+  type rec is record
+    v : std_logic_vector(7 downto 0);
+    b : std_logic;
+  end record;
+  type rarr is array (0 to 3) of rec;
+  signal dl : rarr;
+begin
+  process begin
+    dl(0).v <= x"A0" after 10 ns;
+    dl(1).v <= x"B1" after 5 ns;
+    wait;
+  end process;
+end architecture;
+"#,
+    );
+    assert!(
+        !sv.contains("bit [143:0]"),
+        "a delayed part assignment was packed into one vector"
+    );
+}
+
+/// An aggregate initial value keeps the record array.
+#[test]
+fn aggregate_initial_value_is_not_packed() {
+    let sv = lowered(
+        r#"
+library ieee;
+use ieee.std_logic_1164.all;
+entity t is end;
+architecture a of t is
+  type rec is record
+    v : std_logic_vector(7 downto 0);
+    b : std_logic;
+  end record;
+  type rarr is array (2 downto -1) of rec;
+  constant rinit : rec := (v => x"3C", b => '1');
+  signal ri : rarr := (others => rinit);
+begin
+  process begin
+    wait;
+  end process;
+end architecture;
+"#,
+    );
+    assert!(
+        !sv.contains("bit [143:0]"),
+        "an aggregate initial value was packed"
     );
 }
