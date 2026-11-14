@@ -25770,6 +25770,9 @@ pub struct DeclShape {
     /// Typed by one of the module's own TYPE parameters: only the instance's
     /// width binding (TYPEDEFS_TLS) describes it, never a same-named typedef.
     pub by_type_param: bool,
+    /// A value parameter's declared type (§20.7 queries a parameter's shape
+    /// as it does a variable's).
+    pub param: bool,
 }
 
 thread_local! {
@@ -26286,11 +26289,12 @@ fn collect_decl_shapes(
                     data_type: dt.clone(),
                     unpacked: p.dimensions.clone(),
                     by_type_param: by_type_param(dt),
+                    param: false,
                 });
             }
         }
     }
-    for item in items {
+    for &item in &items {
         let (dt, decls): (&DataType, Vec<(&Identifier, &Vec<UnpackedDimension>)>) = match item {
             ModuleItem::DataDeclaration(dd) => (
                 &dd.data_type,
@@ -26325,7 +26329,37 @@ fn collect_decl_shapes(
                 data_type: dt.clone(),
                 unpacked: dims.clone(),
                 by_type_param: by_type_param(dt),
+                param: false,
             });
+        }
+    }
+    // §20.7, §6.20.2: a value parameter with a declared type or range has
+    // that shape (`$size(V)` of `localparam logic [7:0] V` is 8); an untyped
+    // one takes its value's, which the parameter table answers.
+    let body_params = items.iter().filter_map(|it| match it {
+        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+        _ => None,
+    });
+    for pd in header_params.iter().chain(body_params) {
+        let ParameterKind::Data {
+            data_type,
+            assignments,
+        } = &pd.kind
+        else {
+            continue;
+        };
+        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+            continue;
+        }
+        for a in assignments {
+            if decl_shape_is_fixed(data_type, &a.dimensions) {
+                m.entry(a.name.name.clone()).or_insert_with(|| DeclShape {
+                    data_type: data_type.clone(),
+                    unpacked: a.dimensions.clone(),
+                    by_type_param: by_type_param(data_type),
+                    param: true,
+                });
+            }
         }
     }
     (m, type_params)
@@ -26376,10 +26410,10 @@ fn decl_shape_query(
     name: &str,
     params: Option<&HashMap<String, Value>>,
 ) -> Option<(TypeQueryDims, Option<i64>)> {
-    if params.is_some_and(|p| p.contains_key(name)) {
+    let shape = decl_shape_of(name)?;
+    if !shape.param && params.is_some_and(|p| p.contains_key(name)) {
         return None;
     }
-    let shape = decl_shape_of(name)?;
     let mut q = TypeQueryDims {
         dims: fixed_unpacked_bounds(&shape.unpacked, params)?,
         unpacked: shape.unpacked.len(),
