@@ -75,12 +75,17 @@ pub fn root_requests(
             _ => None,
         })
         .collect();
+    let pkgs = packages(descs);
     let mut reqs: Vec<RootReq> = Vec::new();
     let mut err = None;
     for d in descs {
         let Description::Module(m) = d else { continue };
         let from = m.name.name.clone();
-        let scope = param_scope(m);
+        let own = param_names(m);
+        let scope = Scope {
+            own: &own,
+            pkgs: &pkgs,
+        };
         visit(&m.items, &mut |mi| {
             if let Some(r) = request(mi, &defined, entities, &from, &scope, &mut err)
                 && !reqs.iter().any(|x| same(x, &r))
@@ -149,10 +154,15 @@ fn request(
 pub fn rewrite(descs: &mut [Description], reqs: &[RootReq], names: &[String]) {
     let defined: BTreeSet<String> = sv_modules(descs).into_values().map(|m| m.name).collect();
     let entities: BTreeSet<String> = reqs.iter().map(|r| r.entity.clone()).collect();
+    let pkgs = packages(descs);
     for d in descs.iter_mut() {
         let Description::Module(m) = d else { continue };
         let from = m.name.name.clone();
-        let scope = param_scope(m);
+        let own = param_names(m);
+        let scope = Scope {
+            own: &own,
+            pkgs: &pkgs,
+        };
         visit_mut(&mut m.items, &mut |mi| {
             let mut err = None;
             let Some(r) = request(mi, &defined, &entities, &from, &scope, &mut err) else {
@@ -216,23 +226,123 @@ fn visit_mut(items: &mut [ModuleItem], f: &mut dyn FnMut(&mut ModuleInstantiatio
     }
 }
 
-/// The parameters (and local parameters) of a module with their default
-/// values: the scope parameter values are evaluated in.
-type Scope = BTreeMap<String, Expression>;
+/// The names parameter values are evaluated with: the parameters (and
+/// local parameters) of a module or package with their default values, and
+/// the packages it imports (IEEE 1800 §26.3): by wildcard, in order, and by
+/// name (the name, then its package).
+#[derive(Default)]
+struct Names {
+    params: BTreeMap<String, Expression>,
+    wild: Vec<String>,
+    named: BTreeMap<String, String>,
+}
 
-fn param_scope(m: &crate::ast::module::ModuleDeclaration) -> Scope {
-    let mut out = Scope::new();
-    let body = m.items.iter().filter_map(|i| match i {
-        ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => Some(p),
-        _ => None,
-    });
-    for p in m.params.iter().chain(body) {
+impl Names {
+    fn param(&mut self, p: &crate::ast::decl::ParameterDeclaration) {
         if let ParameterKind::Data { assignments, .. } = &p.kind {
             for a in assignments {
                 if let Some(e) = &a.init {
-                    out.insert(a.name.name.clone(), e.clone());
+                    self.params.insert(a.name.name.clone(), e.clone());
                 }
             }
+        }
+    }
+
+    fn import(&mut self, i: &crate::ast::decl::ImportDeclaration) {
+        for it in &i.items {
+            match &it.item {
+                Some(n) => {
+                    self.named
+                        .insert(n.name.clone(), it.package.name.clone());
+                }
+                None => self.wild.push(it.package.name.clone()),
+            }
+        }
+    }
+}
+
+/// The packages of the design by name, and the imports of the compilation
+/// unit (every module sees them, §26.3).
+#[derive(Default)]
+struct Packages {
+    by_name: BTreeMap<String, Names>,
+    unit: Names,
+}
+
+fn packages(descs: &[Description]) -> Packages {
+    let mut out = Packages::default();
+    for d in descs {
+        match d {
+            Description::Package(p) => {
+                let mut n = Names::default();
+                for it in &p.items {
+                    match it {
+                        crate::ast::decl::PackageItem::Parameter(pd) => n.param(pd),
+                        crate::ast::decl::PackageItem::Import(i) => n.import(i),
+                        _ => {}
+                    }
+                }
+                out.by_name.insert(p.name.name.clone(), n);
+            }
+            Description::ImportDecl(i) => out.unit.import(i),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The scope a parameter value is evaluated in.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    own: &'a Names,
+    pkgs: &'a Packages,
+}
+
+impl<'a> Scope<'a> {
+    /// The value of parameter `name` of package `pkg`, and its scope.
+    fn in_package(&self, pkg: &str, name: &str) -> Option<(&'a Expression, Scope<'a>)> {
+        let own = self.pkgs.by_name.get(pkg)?;
+        Some((
+            own.params.get(name)?,
+            Scope {
+                own,
+                pkgs: self.pkgs,
+            },
+        ))
+    }
+
+    /// The value of the simple name `name`, and the scope it is in: a
+    /// parameter of this scope, then a name imported by name, then the
+    /// first wildcard-imported package that declares it; the same for the
+    /// imports of the compilation unit.
+    fn find(&self, name: &str) -> Option<(&'a Expression, Scope<'a>)> {
+        if let Some(e) = self.own.params.get(name) {
+            return Some((e, *self));
+        }
+        for n in [self.own, &self.pkgs.unit] {
+            if let Some(p) = n.named.get(name) {
+                return self.in_package(p, name);
+            }
+            if let Some(r) = n.wild.iter().find_map(|p| self.in_package(p, name)) {
+                return Some(r);
+            }
+        }
+        None
+    }
+}
+
+fn param_names(m: &crate::ast::module::ModuleDeclaration) -> Names {
+    let mut out = Names::default();
+    for p in &m.params {
+        out.param(p);
+    }
+    for i in &m.items {
+        match i {
+            ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                out.param(p)
+            }
+            ModuleItem::ImportDeclaration(d) => out.import(d),
+            _ => {}
         }
     }
     out
@@ -247,10 +357,29 @@ fn sv_const(e: &Expression, scope: &Scope, depth: u32) -> Option<SvConst> {
     let int = |v: i64| Some(SvConst::Bits(format!("{:032b}", v as u32), true));
     match &e.kind {
         ExprKind::Paren(x) => sv_const(x, scope, depth + 1),
+        // A parameter, or a package's as `pkg::name` (§26.3).
         ExprKind::Ident(h)
-            if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            if h.root.is_none()
+                && matches!(h.path.len(), 1 | 2)
+                && h.path.iter().all(|p| p.selects.is_empty()) =>
         {
-            sv_const(scope.get(&h.path[0].name.name)?, scope, depth + 1)
+            let (e, sc) = match h.path.as_slice() {
+                [n] => scope.find(&n.name.name)?,
+                [p, n] => scope.in_package(&p.name.name, &n.name.name)?,
+                _ => return None,
+            };
+            sv_const(e, &sc, depth + 1)
+        }
+        ExprKind::MemberAccess { expr, member } => {
+            let ExprKind::Ident(h) = &expr.kind else {
+                return None;
+            };
+            let [p] = h.path.as_slice() else { return None };
+            if h.root.is_some() || !p.selects.is_empty() {
+                return None;
+            }
+            let (e, sc) = scope.in_package(&p.name.name, &member.name)?;
+            sv_const(e, &sc, depth + 1)
         }
         ExprKind::Binary { op, left, right } => {
             let l = sv_const(left, scope, depth + 1)?;
