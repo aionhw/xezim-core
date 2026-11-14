@@ -30879,48 +30879,30 @@ fn eval_const_expr_val_inner(
             let Some(arg) = args.first() else {
                 return Value::zero(32);
             };
+            // §20.9: count over every bit of the operand, x and z included;
+            // a 64-bit integer view loses the high bits and reads x/z as 0.
+            use crate::value::LogicBit;
             let v = eval_const_expr_val_inner(arg, params, types);
-            let raw = v.to_u64().unwrap_or(0);
+            let count = |want: &[LogicBit]| {
+                (0..v.width as usize)
+                    .filter(|&i| want.contains(&v.get_bit(i)))
+                    .count() as u64
+            };
             let result: u64 = match name.as_str() {
-                "$countones" => raw.count_ones() as u64,
-                "$onehot" => {
-                    if raw != 0 && raw & (raw - 1) == 0 {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                "$onehot0" => {
-                    if raw == 0 || raw & (raw - 1) == 0 {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                "$isunknown" => 0, // const path strips X/Z
+                "$countones" => count(&[LogicBit::One]),
+                "$onehot" => (count(&[LogicBit::One]) == 1) as u64,
+                "$onehot0" => (count(&[LogicBit::One]) <= 1) as u64,
+                "$isunknown" => (count(&[LogicBit::X, LogicBit::Z]) != 0) as u64,
                 "$countbits" => {
-                    let mut want_zero = false;
-                    let mut want_one = false;
+                    // A control bit is 1-bit logic; only its LSB counts.
+                    let mut want = Vec::new();
                     for ctl in &args[1..] {
-                        let c = eval_const_expr_val_inner(ctl, params, types)
-                            .to_u64()
-                            .unwrap_or(0);
-                        match c {
-                            0 => want_zero = true,
-                            1 => want_one = true,
-                            _ => {}
+                        let bit = eval_const_expr_val_inner(ctl, params, types).get_bit(0);
+                        if !want.contains(&bit) {
+                            want.push(bit);
                         }
                     }
-                    let w = 64u32.saturating_sub(raw.leading_zeros());
-                    let mut count: u32 = 0;
-                    if want_one {
-                        count += raw.count_ones();
-                    }
-                    if want_zero {
-                        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                        count += (!raw & mask).count_ones();
-                    }
-                    count as u64
+                    count(&want)
                 }
                 _ => 0,
             };
