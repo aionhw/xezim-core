@@ -38058,7 +38058,7 @@ fn prefill_literal_caches(items: &[ModuleItem]) {
         if w > 64 {
             return;
         }
-        if let Some((vb, xz)) = Value::from_str_radix(value, radix, w).inline_bits() {
+        if let Some((vb, xz)) = Value::from_literal_text(value, radix, w).inline_bits() {
             cached_val.set(Some((vb, xz, w)));
         }
     }

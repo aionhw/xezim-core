@@ -5842,6 +5842,24 @@ impl Value {
         self.to_bin()
     }
 
+    /// The value of the digits of an integer literal (`NumberLiteral::Integer`
+    /// text) at `width`. §5.7.1: a source literal never carries a sign (`-1`
+    /// is unary minus applied to `1`), but the elaborator writes a negative
+    /// value it substitutes or folds, such as a genvar (§27.4), as one
+    /// decimal token `-2`, which constant evaluation reads as negative. The
+    /// literal's cached value is not serialized, so a design loaded from the
+    /// design cache or an artifact evaluates that text again: read it as the
+    /// two's complement of the magnitude (`from_str_radix` leaves a sign to
+    /// the caller and reads it as x).
+    pub fn from_literal_text(s: &str, radix: u32, width: u32) -> Self {
+        match s.strip_prefix('-') {
+            Some(magnitude) if magnitude.bytes().next().is_some_and(|b| b.is_ascii_digit()) => {
+                Self::from_str_radix(magnitude, radix, width).negate()
+            }
+            _ => Self::from_str_radix(s, radix, width),
+        }
+    }
+
     /// Parse from a string with given radix (2, 8, 10, 16)
     pub fn from_str_radix(s: &str, radix: u32, width: u32) -> Self {
         let s = s.trim();
