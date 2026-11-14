@@ -55,7 +55,13 @@ enum Repr {
 }
 
 /// The widest packed vector (bits); larger arrays keep the struct.
-const MAX_PK_BITS: i64 = 2048;
+///
+/// `std_logic` is 4 bits, so 2048 packed only a 512-element vector. A
+/// 2048-element `std_logic_vector` (8192 bits) then stayed a dynamic
+/// array, and every assignment went through an interpreted driver queue.
+/// 16384 bits covers a 4096-element vector. The SV mirror budget stays
+/// 2048 cells (`MAX_MIRROR_CELLS`); this cap is only the packed form.
+const MAX_PK_BITS: i64 = 16384;
 
 impl Repr {
     fn sv(&self) -> String {

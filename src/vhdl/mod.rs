@@ -411,6 +411,21 @@ fn parse_generated(text: &str) -> Result<Vec<Description>, String> {
     Ok(source.descriptions)
 }
 
+/// Lower VHDL-2008 sources (a test hook): the generated SystemVerilog.
+pub fn lower_design(sources: &[(&str, &str, &[u8])]) -> Result<String, Vec<String>> {
+    let std = VhdlStd::V2008;
+    let mut files = Vec::new();
+    for (lib, path, text) in sources {
+        let p = cst::parse_std(cst::SourceFile::new((*path).to_string(), text.to_vec()), std);
+        if !p.errors.is_empty() {
+            return Err(p.errors.iter().map(|d| p.file.render(d)).collect());
+        }
+        files.push(((*lib).to_string(), p));
+    }
+    let analysed = sema::analyze(files, None, &sema::Mixed::default(), std)?;
+    Ok(lower::lower(&analysed, &[], VhdlOptions::default())?.sv)
+}
+
 /// Analyse VHDL-2008 sources (a test hook): the rendered errors.
 pub fn check_design(sources: &[(&str, &str, &[u8])]) -> Vec<String> {
     check_design_std(sources, VhdlStd::V2008)
