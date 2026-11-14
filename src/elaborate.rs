@@ -49087,10 +49087,88 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     elab.continuous_assigns = out;
 }
 
+/// §6.6.8: the nettype net an element select names. `a[0]` where `a` is a
+/// nettype ARRAY names the ELEMENT's own resolvable net `a[0]`; the driver
+/// count of that element stays independent of a sibling (`a[1]`). A plain
+/// identifier returns its own name (an Index/RangeSelect names the base for
+/// non-array selects). None when the expression is not a nettype-net LHS.
+fn net_base_of(elab: &ElaboratedModule, e: &Expression) -> Option<String> {
+    if let Some(n) = ident_flat_name(e) {
+        return Some(n);
+    }
+    match &e.kind {
+        ExprKind::Index {
+            expr: base,
+            index,
+            ..
+        } => {
+            let bn = whole_net_ident_name(base)?;
+            if !elab.arrays.contains_key(&bn) {
+                return None;
+            }
+            let idx = eval_const_expr_val(index, &elab.parameters).to_i64()?;
+            let (lo, hi, _) = elab.arrays[&bn];
+            if idx < lo.min(hi) || idx > lo.max(hi) {
+                return None;
+            }
+            let elem = format!("{bn}[{idx}]");
+            // §5.6.1: an escaped identifier (`\a[0] `) is ONE declared scalar
+            // whose flat name is `a[0]`; array elements live under the base
+            // (§7.4.2) and are NEVER separate `signals` entries. If a signal of
+            // that spelling exists, it is the escaped scalar, a DIFFERENT
+            // object from element `a[idx]` — leave the element to the ordinary
+            // (runtime) path so two different objects stay separate.
+            if elab.signals.contains_key(&elem) {
+                return None;
+            }
+            Some(elem)
+        }
+        _ => None,
+    }
+}
+
+/// §6.6.8: an emit LHS naming an ARRAY ELEMENT (`a[0]`) must be a real Index
+/// expression — a flat ident literally named `a[0]` does not resolve to the
+/// element's storage.
+fn make_net_lhs_expr(name: &str) -> Expression {
+    if let Some(open) = name.rfind('[')
+        && name.ends_with(']')
+        && let Ok(idx) = name[open + 1..name.len() - 1].parse::<i64>()
+    {
+        let base = &name[..open];
+        return Expression::new(
+            ExprKind::Index {
+                expr: Box::new(make_ident_expr(base)),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: idx.to_string(),
+                        cached_val: Default::default(),
+                    }),
+                    Span::dummy(),
+                )),
+            },
+            Span::dummy(),
+        );
+    }
+    make_ident_expr(name)
+}
+
 pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), String> {
     if elab.nettype_resolvers.is_empty() {
         return Ok(());
     }
+
+    // A nettype net that is an UNPACKED ARRAY resolves per element (§6.6.7,
+    // §6.6.8): `interconnect realN a[1]; source s(a[0]); load l(a[0]);` — a
+    // port connection drives the ELEMENT `a[0]`, an Index expression whose
+    // base is the array. `ident_flat_name` returns None for a select, so such
+    // a driver would be invisible to the fold below. Resolve the LHS to its
+    // NETTYPE ARRAY first, then treat an ELEMENT select as a driver of that
+    // element (`a[0]`), which the seeding above put in the resolver. A
+    // bare array name (`a`) keeps the whole-array key a driver may have.
 
     // net name -> resolver, for every signal whose declared type is a nettype.
     let mut net_resolver: HashMap<String, String> = HashMap::default();
@@ -49129,6 +49207,33 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     for (name, resolver) in from_decls {
         net_resolver.insert(name, resolver);
     }
+    // §6.6.8: a nettype net that is an UNPACKED ARRAY resolves PER ELEMENT
+    // (`interconnect realN a[1]; source s(a0); load l(a1);` — element a[1]
+    // must resolve its own drivers, independent of a[0]). Seed each declared
+    // element `a[lo]`..`a[hi]` with the base array's resolver, so an
+    // element-select driver (`assign a[0] = ...`) is folded onto its OWN
+    // element instead of the whole array.
+    // §5.6.1: an escaped identifier (`\a[0] `) is ONE identifier whose name
+    // contains the brackets — it lands in `signals` as the flat name `a[0]`,
+    // a DIFFERENT object from element 0 of the array `a` (§7.4.2). Do not
+    // seed an element key over a declared signal of that spelling: the
+    // declared object keeps its own (resolver-less) treatment.
+    let mut elem_resolvers: Vec<(String, String)> = Vec::new();
+    for (base, resolver) in &net_resolver {
+        if let Some(&(lo, hi, _)) = elab.arrays.get(base) && resolver.len() != 0 {
+            for i in lo..=hi {
+                let elem = format!("{base}[{i}]");
+                if elab.signals.contains_key(&elem) {
+                    continue;
+                }
+                elem_resolvers.push((elem, resolver.clone()));
+            }
+        }
+    }
+    elem_resolvers.sort();
+    for (elem, resolver) in elem_resolvers {
+        net_resolver.insert(elem, resolver);
+    }
     if net_resolver.is_empty() {
         return Ok(());
     }
@@ -49142,7 +49247,9 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         for pca in pending {
             let lhs = pca.materialize_lhs();
             // A member of one too (`u.p.V`): a port connection taken apart.
-            if ident_flat_name(&lhs).is_some_and(|n| {
+            // §6.6.8: an element select of a nettype ARRAY (`a[0]`) names that
+            // element's resolvable net too.
+            if net_base_of(elab, &lhs).is_some_and(|n| {
                 net_resolver.contains_key(&n)
                     || n.match_indices('.')
                         .any(|(i, _)| net_resolver.contains_key(&n[..i]))
@@ -49199,7 +49306,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             .map(|(net, m)| (net.to_string(), m.to_string()))
     };
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        let Some(lhs_name) = ident_flat_name(&ca.lhs).filter(|n| net_resolver.contains_key(n))
+        let Some(lhs_name) = net_base_of(elab, &ca.lhs).filter(|n| net_resolver.contains_key(n))
         else {
             // §6.6.7, §23.3.3: a port connection of a resolver-less
             // unpacked-struct net arrives member by member (`n.V = u.p.V`).
@@ -49238,8 +49345,15 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         if net_resolver[&lhs_name].is_empty() {
             kept.push(ca.clone());
         }
-        // Identity link to another nettype net => port connection, not a driver.
-        if let Some(rhs_name) = ident_flat_name(&ca.rhs) {
+        // A port CONNECTION to another nettype net merges the two nets
+        // (§23.3.3.7.1: "any port connection with an interconnect net shall
+        // merge"). An `origin` marks a user BODY continuous assign
+        // (`assign o = i;`), which stays a DIRECTIONAL driver of `o` reading
+        // `i` — a buffer must not backward-resolve its input, so its internal
+        // assignment is not a merge even though both ends are nettype nets.
+        // An element select on the RHS (`u.i = a[0]`) is likewise a directional
+        // read of the element, whose own fold writes the element's storage.
+        if let Some(rhs_name) = ca.origin.is_none().then(|| net_base_of(elab, &ca.rhs)).flatten() {
             if net_resolver.contains_key(&rhs_name) && rhs_name != lhs_name {
                 let a = find(&mut parent, &lhs_name);
                 let b = find(&mut parent, &rhs_name);
@@ -49405,17 +49519,21 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     });
                 }
             }
-            None => kept.push(ContinuousAssignment {
-                gate_delay_fall: None,
-                delay_select: None,
-                origin: None,
-                lhs: make_ident_expr(lhs),
-                rhs,
-                delay,
-                rhs_parent_scoped: false,
-                delay_fall: None,
-                delay_off: None,
-            }),
+            None => {
+                kept.push(ContinuousAssignment {
+                    gate_delay_fall: None,
+                    delay_select: None,
+                    origin: None,
+                    // §6.6.8: an element name (`a[0]`) must emit a real
+                    // Index LHS, not a flat ident literally named `a[0]`.
+                    lhs: make_net_lhs_expr(lhs),
+                    rhs,
+                    delay,
+                    rhs_parent_scoped: false,
+                    delay_fall: None,
+                    delay_off: None,
+                })
+            }
         }
     };
 
