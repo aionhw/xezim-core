@@ -30103,6 +30103,21 @@ fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width
     eval_const_expr_val_ctx(expr, params, width).resize_for_assign(width)
 }
 
+/// §6.11.3, §6.11.2: a package variable's initial value takes the DECLARED
+/// type's signedness, not the initializer's, and a 2-state type maps x/z to
+/// 0, as a module variable's declaration initializer does.
+fn package_var_init_value(
+    mut v: Value,
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> Value {
+    v.is_signed = is_type_signed_resolved(dt, typedef_types);
+    if is_type_two_state_resolved(dt, typedef_types) {
+        v = v.to_two_state();
+    }
+    v
+}
+
 /// §5.7.1 makes an unsized decimal literal SIGNED, and it is exactly 32 bits
 /// wide, so a value from 2^31 up reads back negative: `localparam real P =
 /// 3000000000` evaluates to -1294967296, and 4294967297 collapses to 1.
@@ -34771,8 +34786,12 @@ fn inline_instantiations_inner(
                                             );
                                             if is_real {
                                                 v = Value::from_f64(v.to_f64());
-                                            } else if is_signed {
-                                                v.is_signed = true;
+                                            } else {
+                                                v = package_var_init_value(
+                                                    v,
+                                                    &dd.data_type,
+                                                    &elab.typedef_types,
+                                                );
                                             }
                                             v
                                         }
@@ -55093,7 +55112,21 @@ fn process_import(
                                         elab.string_signals.insert(decl.name.name.clone());
                                     }
                                     let v = if let Some(init) = &decl.init {
-                                        eval_init_for_target(init, &elab.parameters, width, is_real)
+                                        let v = eval_init_for_target(
+                                            init,
+                                            &elab.parameters,
+                                            width,
+                                            is_real,
+                                        );
+                                        if is_real {
+                                            v
+                                        } else {
+                                            package_var_init_value(
+                                                v,
+                                                &dd.data_type,
+                                                &elab.typedef_types,
+                                            )
+                                        }
                                     } else {
                                         Value::zero(width)
                                     };
@@ -55501,12 +55534,19 @@ fn process_import(
                                         .or_insert(fd);
                                 }
                                 let v = if let Some(init) = &decl.init {
-                                    eval_init_for_target(
-                                        init,
-                                        &elab.parameters,
-                                        width,
-                                        is_type_real_resolved(&dd.data_type, &elab.typedef_types),
-                                    )
+                                    let real =
+                                        is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                                    let v =
+                                        eval_init_for_target(init, &elab.parameters, width, real);
+                                    if real {
+                                        v
+                                    } else {
+                                        package_var_init_value(
+                                            v,
+                                            &dd.data_type,
+                                            &elab.typedef_types,
+                                        )
+                                    }
                                 } else {
                                     Value::zero(width)
                                 };
