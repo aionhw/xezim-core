@@ -179,6 +179,9 @@ pub(super) struct ForeignOut {
     pub konst: Option<String>,
     /// The variable is declared by the boundary (a mirror, not a port).
     pub decl: bool,
+    /// The net of an `inout` port this variable drives: it holds the value
+    /// of the signal's VHDL drivers alone (`vh_so`), not the signal's.
+    pub drives: Option<String>,
 }
 
 impl<'a> Lw<'a> {
@@ -319,14 +322,48 @@ impl<'a> Lw<'a> {
                         sig: Some(sig),
                         konst: None,
                         decl: false,
+                        drives: None,
                     });
+                }
+                // A resolved std_ulogic scalar or vector: a net both sides
+                // drive (IEEE 1800 §23.3.3.2). The net's value is one more
+                // driver of the port's signal, and the VHDL drivers'
+                // resolved value (the port's driving value, §14.7.3.3)
+                // drives the net; a 'Z' there leaves it to SystemVerilog.
+                Mode::InOut
+                    if (bnd == Bnd::Bit(true)
+                        || matches!(bnd, Bnd::Vec(true, _))
+                            && matches!(self.repr(info.ty, &info.loc), Repr::Pk(4, _)))
+                        && self.resolution(info.ty).is_some()
+                        && self.sig_kind(sig.sig).is_none() =>
+                {
+                    decls.push(format!("inout wire {} {}", bnd.sv(), name));
+                    let io = format!("vh_io_{}", name);
+                    self.fouts.push(ForeignOut {
+                        sv: io,
+                        bnd: bnd.clone(),
+                        ty: info.ty,
+                        sig: Some(sig.clone()),
+                        konst: None,
+                        decl: true,
+                        drives: Some(name.clone()),
+                    });
+                    self.inouts
+                        .insert(sig.sig, super::elab::PSEUDO + self.links.len());
+                    self.foreign_driver(sig, name, bnd, info.ty, p);
                 }
                 Mode::InOut | Mode::Linkage => {
                     self.unconnectable(
                         &info.loc,
                         format!(
-                            "inout port '{}' cannot be connected to SystemVerilog yet",
-                            info.name
+                            "{} port '{}' cannot be connected to SystemVerilog yet{}",
+                            if mode == Mode::InOut { "inout" } else { "linkage" },
+                            info.name,
+                            if mode == Mode::InOut {
+                                " (only a resolved std_logic scalar or vector can)"
+                            } else {
+                                ""
+                            }
                         ),
                     );
                 }
@@ -384,6 +421,7 @@ impl<'a> Lw<'a> {
                 sig,
                 konst,
                 decl: true,
+                drives: None,
             });
         }
     }
@@ -420,6 +458,20 @@ impl<'a> Lw<'a> {
         });
     }
 
+    /// The driver of signal `s` that carries the net of the `inout` port
+    /// the signal belongs to, when it is one connected to SystemVerilog.
+    pub(super) fn inout_driver(&self, s: usize) -> Option<usize> {
+        self.inouts.get(&s).copied()
+    }
+
+    /// Whether the signal of an `inout` port has VHDL drivers.
+    fn inout_inner(&self, s: usize) -> bool {
+        let Some(fd) = self.inout_driver(s) else {
+            return false;
+        };
+        self.drivers.keys().any(|(x, p)| *x == s && *p != fd)
+    }
+
     /// Whether the design has a language boundary (the kernel then waits
     /// for SV instead of ending the simulation when VHDL is quiet).
     pub(super) fn has_boundary(&self) -> bool {
@@ -443,7 +495,7 @@ impl<'a> Lw<'a> {
         }
         s.push_str("  int vh_extn, vh_exts;\n");
         s.push_str(
-            "  // std_ulogic codes (U X 0 1 Z W L H -) and SV bits.\n  function automatic byte unsigned vh_l2u(logic b);\n    case (b)\n      1'b0: return 2;\n      1'b1: return 3;\n      1'bz: return 4;\n      default: return 1;\n    endcase\n  endfunction\n  function automatic logic vh_u2l(byte unsigned c);\n    case (c)\n      2, 6: return 1'b0;\n      3, 7: return 1'b1;\n      4: return 1'bz;\n      default: return 1'bx;\n    endcase\n  endfunction\n",
+            "  // std_ulogic codes (U X 0 1 Z W L H -) and SV bits.\n  function automatic byte unsigned vh_l2u(logic b);\n    case (b)\n      1'b0: return 2;\n      1'b1: return 3;\n      1'bz: return 4;\n      default: return 1;\n    endcase\n  endfunction\n  // The forcing or the weak part of a std_ulogic value for a net with drive strengths: 'Z' where the other part drives.\n  function automatic byte unsigned vh_iop(byte unsigned c, bit wk);\n    case (c)\n      5: return wk ? 1 : 4;\n      6: return wk ? 2 : 4;\n      7: return wk ? 3 : 4;\n      default: return wk ? 4 : c;\n    endcase\n  endfunction\n  function automatic logic vh_u2l(byte unsigned c);\n    case (c)\n      2, 6: return 1'b0;\n      3, 7: return 1'b1;\n      4: return 1'bz;\n      default: return 1'bx;\n    endcase\n  endfunction\n",
         );
         for (k, f) in self.fins.clone().into_iter().enumerate() {
             let loc = self.d.objects[0].loc.clone();
@@ -468,8 +520,32 @@ impl<'a> Lw<'a> {
         for (k, f) in self.fouts.clone().into_iter().enumerate() {
             let loc = self.d.objects[0].loc.clone();
             let r = self.repr(f.ty, &loc);
-            if f.decl {
-                let _ = writeln!(s, "  {} {}{};", f.bnd.sv(), f.sv, f.bnd.dims());
+            match &f.drives {
+                // The forcing values drive the net strongly and the weak
+                // ones ('W', 'L', 'H') weakly (IEEE 1800 §28.11), each
+                // from a variable that is z where the other one drives.
+                Some(net) => {
+                    let _ = writeln!(
+                        s,
+                        "  {b} {v} = 'z;\n  {b} {v}_w = 'z;\n  assign (strong0, strong1) {net} = {v};\n  assign (weak0, weak1) {net} = {v}_w;",
+                        b = f.bnd.sv(),
+                        v = f.sv,
+                        net = net
+                    );
+                    if let Repr::Pk(4, n) = r {
+                        let _ = write!(
+                            s,
+                            "  function automatic {t} vh_iop{k}({t} a, bit wk);\n    for (int i = 0; i < {n}; i++) a[4 * i +: 4] = vh_iop(a[4 * i +: 4], wk);\n    return a;\n  endfunction\n",
+                            t = r.sv(),
+                            k = k,
+                            n = n
+                        );
+                    }
+                }
+                None if f.decl => {
+                    let _ = writeln!(s, "  {} {}{};", f.bnd.sv(), f.sv, f.bnd.dims());
+                }
+                None => {}
             }
             let part = f
                 .sig
@@ -930,6 +1006,7 @@ impl<'a> Lw<'a> {
                         sig: Some(r),
                         konst: None,
                         decl: true,
+                        drives: None,
                     });
                 }
                 (Mode::In, None) => match self.d.eval(a).and_then(|v| self.sv_literal(ty, &v)) {
@@ -1102,6 +1179,28 @@ impl<'a> Lw<'a> {
     pub(super) fn boundary_write(&self, init: bool, ind: &str) -> String {
         let mut s = String::new();
         for (k, f) in self.fouts.iter().enumerate() {
+            // An `inout` port's net: the VHDL drivers' value, when the
+            // signal has any (`updates_sv` declares `vh_so` then).
+            if f.drives.is_some() {
+                if let Some(r) = &f.sig
+                    && self.inout_inner(r.sig)
+                {
+                    let part = match f.bnd {
+                        Bnd::Bit(_) => "vh_iop".to_string(),
+                        _ => format!("vh_iop{}", k),
+                    };
+                    let _ = writeln!(
+                        s,
+                        "{ind}{v} = vh_fco{k}({part}(vh_so{sig}, 0));\n{ind}{v}_w = vh_fco{k}({part}(vh_so{sig}, 1));",
+                        ind = ind,
+                        v = f.sv,
+                        k = k,
+                        part = part,
+                        sig = r.sig
+                    );
+                }
+                continue;
+            }
             let (v, sig) = match (&f.sig, &f.konst) {
                 (Some(r), _) => (format!("vh_s{}", r.sig), r.sig),
                 (None, Some(c)) if init => (c.clone(), 0),

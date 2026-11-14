@@ -2267,6 +2267,86 @@ impl<'a> Lw<'a> {
             .collect()
     }
 
+    /// The statements of an update function that leave the value of
+    /// signal `s` computed from drivers `ds` in `nv`.
+    fn update_body(&mut self, s: usize, ds: &[(usize, Driver)]) -> Option<String> {
+        let sig = self.sigs[s].clone();
+        let info = self.d.objects[sig.obj].clone();
+        let r = self.repr(sig.ty, &info.loc);
+        let res = self.resolution(sig.ty);
+        let kind = self.sig_kind(s);
+        let tsv = r.sv();
+        let mut body = String::new();
+        let any_slots = ds.iter().any(|(_, d)| d.slots);
+        match (&r, res) {
+            (_, Some((f, false))) if !any_slots => {
+                // A resolved signal: f over every driver's value.
+                let pt = self.d.objects[self.d.subprograms[f].params[0]].ty;
+                let (pname, per) = match self.repr(pt, &info.loc) {
+                    Repr::Arr(n, e) => (n, e.sv()),
+                    _ => return None,
+                };
+                self.need_sub(f);
+                let _ = writeln!(body, "    {} rv[];\n    {} nv;", per, tsv);
+                let _ = writeln!(body, "    rv = new[{}];", ds.len());
+                match kind {
+                    None => {
+                        for (i, (p, _)) in ds.iter().enumerate() {
+                            let _ = writeln!(body, "    rv[{}] = vh_dv{}_{};", i, s, p);
+                        }
+                        let _ = writeln!(
+                            body,
+                            "    nv = {}({}_mk(0, {}, 0, rv));",
+                            self.sub_name(f),
+                            pname,
+                            ds.len() as i64 - 1
+                        );
+                    }
+                    Some(k) => {
+                        // A guarded signal: the drivers that are on;
+                        // with none, a register keeps its value
+                        // (§14.7.3.2).
+                        let _ = writeln!(body, "    {} ra[];\n    int c;\n    c = 0;", per);
+                        for (p, _) in ds {
+                            let _ = writeln!(
+                                body,
+                                "    if (vh_don{s}_{p}) begin rv[c] = vh_dv{s}_{p}; c++; end",
+                                s = s,
+                                p = p
+                            );
+                        }
+                        let _ = writeln!(
+                            body,
+                            "    ra = new[c];\n    for (int j = 0; j < c; j++) ra[j] = rv[j];"
+                        );
+                        let call =
+                            format!("{}({}_mk(0, c - 1, 0, ra))", self.sub_name(f), pname);
+                        if k == SignalKind::Register {
+                            let _ = writeln!(body, "    nv = c == 0 ? vh_s{} : {};", s, call);
+                        } else {
+                            let _ = writeln!(body, "    nv = {};", call);
+                        }
+                    }
+                }
+            }
+            (Repr::Arr(..) | Repr::Rec(_) | Repr::Pk(..), _) => {
+                // Scalar by scalar (§14.7.3.2).
+                let Some(b) = self.leaf_update_body(s, &ds, &tsv, &info, kind) else {
+                    return None;
+                };
+                body.push_str(&b);
+            }
+            _ => {
+                self.err(
+                    &info.loc,
+                    format!("signal '{}' has several drivers", info.name),
+                );
+                return None;
+            }
+        }
+        Some(body)
+    }
+
     /// The update functions of signals computed from several drivers,
     /// parts, or a resolution function (§14.7.3.2): the new effective value,
     /// then the event. With `init`, the initial value only (§14.7.5.2).
@@ -2281,75 +2361,28 @@ impl<'a> Lw<'a> {
             let sig = self.sigs[s].clone();
             let info = self.d.objects[sig.obj].clone();
             let r = self.repr(sig.ty, &info.loc);
-            let res = self.resolution(sig.ty);
-            let kind = self.sig_kind(s);
             let tsv = r.sv();
-            let mut body = String::new();
-            let any_slots = ds.iter().any(|(_, d)| d.slots);
-            match (&r, res) {
-                (_, Some((f, false))) if !any_slots => {
-                    // A resolved signal: f over every driver's value.
-                    let pt = self.d.objects[self.d.subprograms[f].params[0]].ty;
-                    let (pname, per) = match self.repr(pt, &info.loc) {
-                        Repr::Arr(n, e) => (n, e.sv()),
-                        _ => continue,
-                    };
-                    self.need_sub(f);
-                    let _ = writeln!(body, "    {} rv[];\n    {} nv;", per, tsv);
-                    let _ = writeln!(body, "    rv = new[{}];", ds.len());
-                    match kind {
-                        None => {
-                            for (i, (p, _)) in ds.iter().enumerate() {
-                                let _ = writeln!(body, "    rv[{}] = vh_dv{}_{};", i, s, p);
-                            }
-                            let _ = writeln!(
-                                body,
-                                "    nv = {}({}_mk(0, {}, 0, rv));",
-                                self.sub_name(f),
-                                pname,
-                                ds.len() as i64 - 1
-                            );
-                        }
-                        Some(k) => {
-                            // A guarded signal: the drivers that are on;
-                            // with none, a register keeps its value
-                            // (§14.7.3.2).
-                            let _ = writeln!(body, "    {} ra[];\n    int c;\n    c = 0;", per);
-                            for (p, _) in &ds {
-                                let _ = writeln!(
-                                    body,
-                                    "    if (vh_don{s}_{p}) begin rv[c] = vh_dv{s}_{p}; c++; end",
-                                    s = s,
-                                    p = p
-                                );
-                            }
-                            let _ = writeln!(
-                                body,
-                                "    ra = new[c];\n    for (int j = 0; j < c; j++) ra[j] = rv[j];"
-                            );
-                            let call =
-                                format!("{}({}_mk(0, c - 1, 0, ra))", self.sub_name(f), pname);
-                            if k == SignalKind::Register {
-                                let _ = writeln!(body, "    nv = c == 0 ? vh_s{} : {};", s, call);
-                            } else {
-                                let _ = writeln!(body, "    nv = {};", call);
-                            }
-                        }
-                    }
-                }
-                (Repr::Arr(..) | Repr::Rec(_) | Repr::Pk(..), _) => {
-                    // Scalar by scalar (§14.7.3.2).
-                    let Some(b) = self.leaf_update_body(s, &ds, &tsv, &info, kind) else {
-                        continue;
-                    };
-                    body.push_str(&b);
-                }
-                _ => {
-                    self.err(
-                        &info.loc,
-                        format!("signal '{}' has several drivers", info.name),
+            let Some(mut body) = self.update_body(s, &ds) else {
+                continue;
+            };
+            // The signal of an `inout` port connected to SystemVerilog:
+            // the net is driven with the value of the VHDL drivers alone
+            // (the port's driving value, §14.7.3.3), `vh_so`, since the
+            // signal's own value includes the net's.
+            if let Some(fd) = self.inout_driver(s) {
+                let inner: Vec<(usize, Driver)> =
+                    ds.iter().filter(|(p, _)| *p != fd).cloned().collect();
+                if !inner.is_empty()
+                    && let Some(b2) = self.update_body(s, &inner)
+                {
+                    let _ = write!(
+                        out,
+                        "  {tsv} vh_so{s};\n  function automatic void vh_updo{s}();\n{b2}    vh_so{s} = nv;\n  endfunction\n",
+                        tsv = tsv,
+                        s = s,
+                        b2 = b2
                     );
-                    continue;
+                    let _ = writeln!(body, "    vh_updo{}();", s);
                 }
             }
             let eq = self.eq_expr(&r, "nv", &format!("vh_s{}", s));
