@@ -102,6 +102,8 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
                 left.common(infer(right, params, types))
             }
         }
+        // §11.4.13: `inside` yields a 1-bit result.
+        ExprKind::Inside { .. } => Type::integer(1, false),
         ExprKind::Binary { op, .. }
             if is_comparison(*op)
                 || matches!(
@@ -189,6 +191,24 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
 }
 
 fn function_type(func: &Expression, params: &HashMap<String, Value>) -> Option<Type> {
+    function_type_inner(func, params, false)
+}
+
+/// [`function_type`] only when the declared return type resolves past every
+/// type name: a typedef this scope cannot see would be sized from the width
+/// table but read as unsigned, which an untyped parameter must not take.
+pub(super) fn function_type_resolved(
+    func: &Expression,
+    params: &HashMap<String, Value>,
+) -> Option<Type> {
+    function_type_inner(func, params, true)
+}
+
+fn function_type_inner(
+    func: &Expression,
+    params: &HashMap<String, Value>,
+    require_resolved: bool,
+) -> Option<Type> {
     let (name, scoped) = const_fn_call_name(func)?;
     let declared = FUNCS_TLS.with(|f| {
         let funcs = f.borrow();
@@ -206,6 +226,9 @@ fn function_type(func: &Expression, params: &HashMap<String, Value>) -> Option<T
                 .map(|t| resolve_typedef_chain(&declared, t).clone())
         })
         .unwrap_or(declared);
+    if require_resolved && matches!(resolved, DataType::TypeReference { .. }) {
+        return None;
+    }
     let real = is_type_real(&resolved);
     let text = is_string_data_type(&resolved);
     let width = if real {

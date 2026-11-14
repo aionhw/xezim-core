@@ -23100,6 +23100,12 @@ fn untyped_param_is_signed(init: &Expression, params: &HashMap<String, Value>) -
             ..
         } => s(then_expr) && s(else_expr),
         ExprKind::SystemCall { name, .. } if name == "$unsigned" => false,
+        // §11.4.13: `inside` is an unsigned bit; §13.4.1: a call has its
+        // function's return type, the same one `untyped_param_width` sizes by.
+        ExprKind::Inside { .. } => false,
+        ExprKind::Call { func, .. } => const_context::function_type_resolved(func, params)
+            .filter(|t| t.integral)
+            .is_none_or(|t| t.signed),
         _ => true,
     }
 }
@@ -27762,6 +27768,12 @@ fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Optio
             "$clog2" | "$bits" | "$size" | "$countones" => Some(32),
             _ => None,
         },
+        // §11.4.13: `inside` is one bit.
+        ExprKind::Inside { .. } => Some(1),
+        // §6.20.2, §13.4.1: a call has its function's declared return type.
+        ExprKind::Call { func, .. } => const_context::function_type_resolved(func, params)
+            .filter(|t| t.integral)
+            .map(|t| t.width),
         _ => None,
     }
 }
