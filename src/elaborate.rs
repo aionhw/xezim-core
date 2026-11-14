@@ -23152,6 +23152,14 @@ fn default_value_for_type(dt: &DataType, width: u32) -> Value {
     ) {
         return Value::zero(width);
     }
+    // §8.4, §15.3, §15.4: a handle of a built-in class of package `std`
+    // (`mailbox`, `semaphore`, `process`) starts null, like a user class's.
+    if let DataType::TypeReference { name, .. } = dt
+        && name.scopes.iter().all(|s| s.name.name == "std")
+        && matches!(name.name.name.as_str(), "mailbox" | "semaphore" | "process")
+    {
+        return Value::zero(width);
+    }
     if is_type_two_state(dt) {
         Value::zero(width)
     } else {
