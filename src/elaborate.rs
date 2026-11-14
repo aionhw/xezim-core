@@ -7650,6 +7650,19 @@ fn port_actual_is_simple(
     }
 }
 
+/// §11.8.1: "Concatenation results are unsigned, regardless of the operands."
+/// A port actual that is a concatenation or replication therefore carries no
+/// sign into a signed formal — §23.3.3.8 keeps the sign of a bounded formal
+/// from the actual. Used to decide whether a simple INPUT actual may be
+/// substituted as a rename without silently dropping the formal's sign.
+fn port_actual_is_unsigned_concat(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Concatenation(_) | ExprKind::Replication { .. } => true,
+        ExprKind::Paren(inner) => port_actual_is_unsigned_concat(inner),
+        _ => false,
+    }
+}
+
 /// Where a §6.21 violation was found, for the diagnostic.
 #[derive(Clone, Copy)]
 pub(crate) struct StaticInitScope<'a> {
@@ -44816,10 +44829,11 @@ fn inline_module_items(
                     let Some(formal) = elab
                         .signals
                         .get(&cat2(&inst_prefix, &pname))
-                        .map(|s| s.width)
+                        .map(|s| (s.width, s.is_signed))
                     else {
                         continue;
                     };
+                    let (formal, formal_signed) = formal;
                     // Only a pure INPUT — one the body never drives — can be
                     // safely de-substituted. A driven port (illegal for an
                     // input, but xezim allows it) must keep reaching the
@@ -44845,6 +44859,20 @@ fn inline_module_items(
                     // select of one, a literal, a concatenation of those) is
                     // substituted.
                     if is_input && !port_actual_is_simple(actual, local_params, &elab.parameters) {
+                        no_subst_ports.insert(pname.clone());
+                    }
+                    // §23.3.3.8: "The sign attribute shall not cross hierarchy".
+                    // Substituting a signed formal `input int p` by an unsigned
+                    // whole-net or concatenation/replication actual renames the
+                    // formal onto the actual, so a pure SIGN flip silently stops
+                    // happening: `input int` bound to `{1{x}}` read 4294967291
+                    // instead of -5. §11.8.1 always leaves a concatenation or
+                    // replication unsigned; keep the formal so its own sign
+                    // governs the body and the connection assign converts.
+                    if is_input
+                        && formal_signed
+                        && port_actual_is_unsigned_concat(actual)
+                    {
                         no_subst_ports.insert(pname.clone());
                     }
                     // §7.4.1: a packed multi-D formal indexes by its OWN
