@@ -3330,6 +3330,10 @@ impl Parser {
                     | "$sva_strong"
                     | "$sva_weak"
                     | "$sva_implies"
+                    | "$sva_accept_on"
+                    | "$sva_reject_on"
+                    | "$sva_sync_accept_on"
+                    | "$sva_sync_reject_on"
             ),
             _ => false,
         }
