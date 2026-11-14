@@ -909,6 +909,8 @@ pub struct PendingInitial {
 #[derive(Debug, Clone)]
 pub struct PendingContAssign {
     pub lhs_source: std::rc::Rc<Expression>,
+    /// A net declaration target is qualified locally, without port substitution.
+    pub lhs_is_net_initializer: bool,
     pub rhs_source: std::rc::Rc<Expression>,
     pub ctx: std::rc::Rc<RewriteCtx>,
     /// §10.3.1 / §21.2.1.5 drive strength (`(weak0, weak1)`, …) of the
@@ -1033,6 +1035,27 @@ impl PendingInitial {
 }
 
 impl PendingContAssign {
+    /// §10.3.1: declaration targets name the instance net before port rewriting.
+    /// Keep only the bare source in shared storage; qualify on demand.
+    pub fn source_lhs(&self) -> std::borrow::Cow<'_, Expression> {
+        if self.lhs_is_net_initializer {
+            let name = ident_flat_name(&self.lhs_source).expect("net declaration target");
+            std::borrow::Cow::Owned(make_ident_expr(&cat2(&self.ctx.prefix, &name)))
+        } else {
+            std::borrow::Cow::Borrowed(&self.lhs_source)
+        }
+    }
+
+    pub fn materialize_lhs(&self) -> Expression {
+        rewrite_expr(
+            &self.source_lhs(),
+            &self.ctx.prefix,
+            &self.ctx.port_map,
+            &self.ctx.local_names,
+            &self.ctx.interface_map,
+        )
+    }
+
     pub fn materialize(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         set_type_bind_tls(&self.ctx);
         let out = self.materialize_inner(params);
@@ -1041,13 +1064,7 @@ impl PendingContAssign {
     }
 
     fn materialize_inner(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
-        let lhs = rewrite_expr(
-            &self.lhs_source,
-            &self.ctx.prefix,
-            &self.ctx.port_map,
-            &self.ctx.local_names,
-            &self.ctx.interface_map,
-        );
+        let lhs = self.materialize_lhs();
         let rhs = rewrite_expr(
             &self.rhs_source,
             &self.ctx.prefix,
@@ -18351,7 +18368,7 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
     for pending in &elab.pending_cont_assign {
         let prefix = &pending.ctx.prefix;
         let mut bare = Vec::new();
-        collect_implicit_net_candidates(&pending.lhs_source, &mut bare);
+        collect_implicit_net_candidates(&pending.source_lhs(), &mut bare);
         collect_implicit_net_candidates(&pending.rhs_source, &mut bare);
         for name in bare {
             // If the bare name is a port (in port_map), it gets rewritten
@@ -32651,7 +32668,7 @@ fn validate_member_visibility(elab: &ElaboratedModule) -> Result<(), String> {
     }
     for p in &elab.pending_cont_assign {
         record(check_assign_member_visibility(
-            &p.lhs_source,
+            &p.source_lhs(),
             elab,
             mod_scope,
             &empty_locals,
@@ -33113,9 +33130,10 @@ fn validate_inlined_bodies(
     }
     for p in &elab.pending_cont_assign {
         let locals = HashSet::default();
-        let (l, r) = (&p.lhs_source, &p.rhs_source);
+        let l = p.source_lhs();
+        let r = &p.rhs_source;
         check_body(std::rc::Rc::as_ptr(r) as usize, &p.ctx, &locals, &mut |f| {
-            f(l);
+            f(&l);
             f(r);
         });
     }
@@ -37042,7 +37060,7 @@ fn strip_modport_suffix(full_path: &str, definitions: &HashMap<String, Definitio
 enum BodySource {
     ContAssign(Vec<(std::rc::Rc<Expression>, std::rc::Rc<Expression>)>),
     GateInst(Vec<(std::rc::Rc<Expression>, std::rc::Rc<Expression>)>),
-    NetInits(Vec<(String, std::rc::Rc<Expression>)>),
+    NetInits(Vec<(std::rc::Rc<Expression>, std::rc::Rc<Expression>)>),
     Always(AlwaysKind, std::rc::Rc<Statement>, String),
     Initial(std::rc::Rc<Statement>, String),
     Other,
@@ -37756,9 +37774,12 @@ fn prepare_module_items(
                     nd.declarators
                         .iter()
                         .filter_map(|d| {
-                            d.init
-                                .as_ref()
-                                .map(|init| (d.name.name.clone(), std::rc::Rc::new(init.clone())))
+                            d.init.as_ref().map(|init| {
+                                (
+                                    std::rc::Rc::new(make_ident_expr(&d.name.name)),
+                                    std::rc::Rc::new(init.clone()),
+                                )
+                            })
                         })
                         .collect(),
                 ),
@@ -45025,6 +45046,7 @@ fn inline_module_items(
                             for (lhs_rc, rhs_rc) in pairs {
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
+                                    lhs_is_net_initializer: false,
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
                                     strength: ca_item.strength.clone(),
@@ -45073,6 +45095,7 @@ fn inline_module_items(
                                 }
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
+                                    lhs_is_net_initializer: false,
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
                                     strength: None,
@@ -45096,11 +45119,10 @@ fn inline_module_items(
                             };
                             let (delay_rc, delay_fall_rc, delay_off_rc) =
                                 (rc(&nd.delay), rc(&nd.delay_fall), rc(&nd.delay_off));
-                            for (decl_name, rhs_rc) in inits {
-                                let lhs_name = cat2(&inst_prefix, &decl_name);
-                                let new_lhs = make_ident_expr(&lhs_name);
+                            for (lhs_rc, rhs_rc) in inits {
                                 elab.pending_cont_assign.push(PendingContAssign {
-                                    lhs_source: std::rc::Rc::new(new_lhs),
+                                    lhs_source: std::rc::Rc::clone(lhs_rc),
+                                    lhs_is_net_initializer: true,
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
                                     // §6.7: `wire (weak0, weak1) w = v;`
@@ -47921,13 +47943,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for pca in pending {
-            let lhs = rewrite_expr(
-                &pca.lhs_source,
-                &pca.ctx.prefix,
-                &pca.ctx.port_map,
-                &pca.ctx.local_names,
-                &pca.ctx.interface_map,
-            );
+            let lhs = pca.materialize_lhs();
             if struct_target(elab, &lhs).is_some() {
                 let ca = pca.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
@@ -48015,13 +48031,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for pca in pending {
-            let lhs = rewrite_expr(
-                &pca.lhs_source,
-                &pca.ctx.prefix,
-                &pca.ctx.port_map,
-                &pca.ctx.local_names,
-                &pca.ctx.interface_map,
-            );
+            let lhs = pca.materialize_lhs();
             // A member of one too (`u.p.V`): a port connection taken apart.
             if ident_flat_name(&lhs).is_some_and(|n| {
                 net_resolver.contains_key(&n)
@@ -48652,13 +48662,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
     if !elab.pending_cont_assign.is_empty() {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for p in pending {
-            let lhs = rewrite_expr(
-                &p.lhs_source,
-                &p.ctx.prefix,
-                &p.ctx.port_map,
-                &p.ctx.local_names,
-                &p.ctx.interface_map,
-            );
+            let lhs = p.materialize_lhs();
             if targets_of(&lhs).iter().any(|(n, _)| is_net(n)) {
                 let ca = p.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
@@ -49056,13 +49060,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     let mut pending_spans: Vec<Option<(String, u32, u32)>> =
         Vec::with_capacity(elab.pending_cont_assign.len());
     for p in &elab.pending_cont_assign {
-        let lhs = rewrite_expr(
-            &p.lhs_source,
-            &p.ctx.prefix,
-            &p.ctx.port_map,
-            &p.ctx.local_names,
-            &p.ctx.interface_map,
-        );
+        let lhs = p.materialize_lhs();
         let span = if matches!(
             lhs.kind,
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
@@ -49425,13 +49423,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         .pending_cont_assign
         .iter()
         .map(|p| {
-            let lhs = rewrite_expr(
-                &p.lhs_source,
-                &p.ctx.prefix,
-                &p.ctx.port_map,
-                &p.ctx.local_names,
-                &p.ctx.interface_map,
-            );
+            let lhs = p.materialize_lhs();
             ident_flat_name(&lhs)
         })
         .collect();
