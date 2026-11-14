@@ -47117,19 +47117,57 @@ fn eval_const_user_function(
                 }
                 Some(Flow::Normal)
             }
-            SK::Case { expr, items, .. } => {
-                let sel = eval_fn_expr(expr, locals, elab, depth)?.to_i64()?;
+            SK::Case {
+                expr, items, kind, ..
+            } => {
+                use crate::ast::stmt::CaseKind;
+                if items.iter().any(|item| item.pattern.is_some()) {
+                    return None; // pattern-matching case: bail
+                }
+                // §12.5: the case expression and every case item expression
+                // are evaluated at the width of the widest of them, signed
+                // only when all are signed, and compared with `===`.
+                let mut types = const_context::Types::default();
+                let mut common = const_context::infer(expr, locals, &mut types);
+                for pat in items.iter().flat_map(|item| &item.patterns) {
+                    let ty = const_context::infer(pat, locals, &mut types);
+                    common.width = common.width.max(ty.width);
+                    common.signed &= ty.signed;
+                    common.integral &= ty.integral;
+                }
+                let context = common
+                    .integral
+                    .then_some((common.width, Some(common.signed)));
+                let fit = |v: Value| {
+                    if !common.integral || v.width == common.width {
+                        v
+                    } else {
+                        v.resize_for_assign(common.width)
+                    }
+                };
+                let sel = fit(eval_fn_expr_ctx(expr, locals, elab, depth, context)?);
+                if sel.is_real {
+                    return None;
+                }
                 let mut chosen: Option<&Statement> = None;
                 for item in items {
                     if item.is_default {
                         continue;
                     }
-                    if item.pattern.is_some() {
-                        return None; // pattern-matching case: bail
-                    }
                     let mut hit = false;
                     for pat in &item.patterns {
-                        if eval_fn_expr(pat, locals, elab, depth)?.to_i64()? == sel {
+                        let v = fit(eval_fn_expr_ctx(pat, locals, elab, depth, context)?);
+                        if v.is_real {
+                            return None;
+                        }
+                        let hit_now = match kind {
+                            CaseKind::Casex => sel.casex_eq(&v),
+                            CaseKind::Casez => sel.casez_eq(&v),
+                            // §12.5.4: a `case inside` value item matches as `==?`.
+                            CaseKind::CaseInside => sel.wildcard_eq(&v),
+                            CaseKind::Case => sel.case_eq(&v),
+                        };
+                        if hit_now.is_true() {
                             hit = true;
                             break;
                         }
