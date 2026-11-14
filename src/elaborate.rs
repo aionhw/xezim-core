@@ -28573,13 +28573,29 @@ pub fn struct_pattern_replication(
     items: &[AssignmentPatternItem],
     members: usize,
 ) -> Option<Vec<&Expression>> {
+    struct_pattern_replication_with(items, members, &mut |_| None)
+}
+
+/// `struct_pattern_replication` for a count that is not an integer literal:
+/// A.6.7.1 makes it a constant expression (a parameter, a localparam, a
+/// constant operation), which `count_of` evaluates in the caller's scope
+/// (`struct_pattern_count_value` gives the same lossless rule).
+pub fn struct_pattern_replication_with<'a>(
+    items: &'a [AssignmentPatternItem],
+    members: usize,
+    count_of: &mut dyn FnMut(&Expression) -> Option<i64>,
+) -> Option<Vec<&'a Expression>> {
     let [AssignmentPatternItem::Ordered(e)] = items else {
         return None;
     };
     let ExprKind::Replication { count, exprs } = &e.kind else {
         return None;
     };
-    let count = usize::try_from(struct_pattern_count(count)?).ok()?;
+    let count = match struct_pattern_count(count) {
+        Some(n) => n,
+        None => count_of(count)?,
+    };
+    let count = usize::try_from(count).ok()?;
     if exprs.is_empty() || count.checked_mul(exprs.len())? != members {
         return None;
     }
@@ -29797,10 +29813,13 @@ fn pack_struct_const_value(
     }
     // §7.2.1: packed structures cannot contain unpacked array members.
     // Unpacked const-eval uses the typedef shapes registered during elaboration.
-    if (su.packed
+    // §10.9.2, A.6.7.1: the count is a constant expression. Match the
+    // replication shape before the member scan.
+    if let Some(expanded) = struct_pattern_replication_with(items, members.len(), &mut |count| {
+        struct_pattern_count_value(&eval_const_expr_val(count, params))
+    }) && (su.packed
         || !TYPEDEF_SHAPES_TLS
             .with(|shapes| struct_pattern_has_array_member(&su, typedef_types, &shapes.borrow().1)))
-        && let Some(expanded) = struct_pattern_replication(items, members.len())
     {
         ordered = expanded;
     }
