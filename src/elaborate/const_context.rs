@@ -95,9 +95,13 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
                     | BinaryOp::ShiftRight
                     | BinaryOp::ArithShiftLeft
                     | BinaryOp::ArithShiftRight
-                    | BinaryOp::Power
             ) {
                 left
+            } else if matches!(op, BinaryOp::Power) {
+                // §11.4.5, §11.8.1: the exponent does not size the result,
+                // but a real exponent makes the power real.
+                let right = infer(right, params, types);
+                if right.real { left.common(right) } else { left }
             } else {
                 left.common(infer(right, params, types))
             }
