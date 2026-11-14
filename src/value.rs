@@ -874,6 +874,8 @@ impl Value {
                 ValueStorage::Inline { val_bits, .. } => f64::from_bits(*val_bits),
                 _ => 0.0,
             }
+        } else if let ValueStorage::Wide(planes) = &self.storage {
+            Self::wide_to_f64(planes, self.width, self.is_signed)
         } else {
             if self.is_signed {
                 self.to_i64().unwrap_or(0) as f64
@@ -881,6 +883,59 @@ impl Value {
                 self.to_u64().unwrap_or(0) as f64
             }
         }
+    }
+
+    /// §6.12.2: an integral value wider than 64 bits converted to real,
+    /// rounded to nearest; x and z bits read as 0. The top 64 significant
+    /// bits with a sticky bit for the rest round exactly as the whole value.
+    fn wide_to_f64(planes: &WidePlanes, width: u32, signed: bool) -> f64 {
+        let width = width as usize;
+        let mut words: Vec<u64> = planes
+            .val
+            .iter()
+            .zip(&planes.xz)
+            .map(|(v, x)| v & !x)
+            .collect();
+        if width % 64 != 0
+            && let Some(top) = words.get_mut(width / 64)
+        {
+            *top &= (1u64 << (width % 64)) - 1;
+        }
+        let negative =
+            signed && width > 0 && (words[(width - 1) / 64] >> ((width - 1) % 64)) & 1 == 1;
+        if negative {
+            // Two's complement magnitude at the value's width.
+            let mut carry = 1u64;
+            for w in words.iter_mut() {
+                let (sum, c) = (!*w).overflowing_add(carry);
+                *w = sum;
+                carry = c as u64;
+            }
+            if width % 64 != 0
+                && let Some(top) = words.get_mut(width / 64)
+            {
+                *top &= (1u64 << (width % 64)) - 1;
+            }
+        }
+        let Some(hi) = words.iter().rposition(|&w| w != 0) else {
+            return 0.0;
+        };
+        let msb = hi * 64 + 63 - words[hi].leading_zeros() as usize;
+        let bit = |i: usize| (words[i / 64] >> (i % 64)) & 1;
+        let magnitude = if msb < 64 {
+            words[0] as f64
+        } else {
+            let low = msb - 63;
+            let mut top = 0u64;
+            for i in (low..=msb).rev() {
+                top = (top << 1) | bit(i);
+            }
+            if (0..low).any(|i| bit(i) == 1) {
+                top |= 1;
+            }
+            top as f64 * 2f64.powi(low as i32)
+        };
+        if negative { -magnitude } else { magnitude }
     }
 
     /// Extract inline bits for caching. Returns None for Wide values.

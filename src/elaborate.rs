@@ -28300,8 +28300,17 @@ fn eval_param_init(
     if is_string_data_type(dt) {
         return string_param_value(init, params);
     }
-    let typed = !matches!(dt, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-        && !is_type_real_resolved(dt, typedef_types);
+    // §6.12.2: an integral value converts to a real parameter whole; fitting
+    // it to 64 bits first dropped the high bits of a wider value.
+    if is_type_real_resolved(dt, typedef_types) {
+        let v = eval_const_expr_val(init, params);
+        return if v.is_real {
+            v
+        } else {
+            Value::from_f64(v.to_f64())
+        };
+    }
+    let typed = !matches!(dt, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
     let mut v = if typed
         && !matches!(
             init.kind,
