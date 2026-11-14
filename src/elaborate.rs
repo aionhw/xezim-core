@@ -10909,6 +10909,24 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+    // §6.6.7: publish the nettype registry NOW, before the items are walked.
+    // A declaration inside a GENERATE scope has to tell a nettype from a
+    // plain typedef to store the net's members per member (the way the
+    // module-scope path does), and the registry is the only place that
+    // knows. Publishing it later left the generate-scope nettype net without
+    // member storage: the resolution function's write landed nowhere and the
+    // formal on the other side of the port read the default.
+    for (nt, (_, resolver)) in &nettype_info {
+        if let Some(r) = resolver {
+            elab.nettype_resolvers.insert(nt.clone(), r.clone());
+        } else {
+            // Declared without a resolution function: recorded with an empty
+            // name so the post-inline pass can still enforce the one-driver
+            // limit across the flattened design.
+            elab.nettype_resolvers.entry(nt.clone()).or_default();
+        }
+    }
+
     // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
     // the items, so a declaration whose width depends on one of them is sized
     // correctly no matter what ORDER the parameters appear in.
@@ -14665,17 +14683,9 @@ pub fn elaborate_module_with_defs(
     // only for an additive resolver, wrong for any other.
     //
     // Publish the registry instead; `resolve_user_nettype_drivers` folds each
-    // net's whole driver set once, after inlining.
-    for (nt, (_, resolver)) in &nettype_info {
-        if let Some(r) = resolver {
-            elab.nettype_resolvers.insert(nt.clone(), r.clone());
-        } else {
-            // Declared without a resolution function: recorded with an empty
-            // name so the post-inline pass can still enforce the one-driver
-            // limit across the flattened design.
-            elab.nettype_resolvers.entry(nt.clone()).or_default();
-        }
-    }
+    // net's whole driver set once, after inlining. (The registry itself was
+    // published right after the pre-pass above, before the items were walked,
+    // so that a generate-scope declaration could recognise the nettype.)
 
     // §7.2.2: whole-struct continuous assigns expand member-wise.
     // §35.5.4: an `export "DPI-C"` declared in a package this module never
@@ -19964,10 +19974,24 @@ fn elaborate_items(
                             // the suffix scan into ANOTHER struct's member — two
                             // distinct variables (e.g. `g.a` and `g.b`) silently
                             // SHARED one cell.
+                            //
+                            // §6.6.7: a NETTYPE over an unpacked struct is
+                            // stored the same way. Its resolution function
+                            // writes the members one by one, so a nettype net
+                            // declared in a generate scope needs the member
+                            // leaves too — without them the resolved value
+                            // landed nowhere and the formal on the other side
+                            // of a port connection read the default.
+                            let is_nettype = match &dd.data_type {
+                                DataType::TypeReference { name, .. } => {
+                                    elab.nettype_resolvers.contains_key(&name.name.name)
+                                }
+                                _ => false,
+                            };
                             if !su.packed
                                 && !(matches!(su.kind, StructUnionKind::Union)
                                     && !su.tagged)
-                                && struct_contains_real(su, elab)
+                                && (struct_contains_real(su, elab) || is_nettype)
                             {
                                 register_unpacked_aggregate(
                                     elab,
@@ -36841,7 +36865,27 @@ fn ai_conn_expr_width(
             let r = const_eval_i64_with_params(right, Some(params))?;
             Some(((l - r).unsigned_abs() as u32) + 1)
         }
-        EK::Index { .. } => Some(1),
+        EK::Index { .. } => {
+            // §27.6: `g[1]` names an indexed SCOPE, `g[1].w` a net inside
+            // it. The scope's own declarations are flattened into the same
+            // name space, so a scope-indexed net resolves against the
+            // scope's declared widths — which is what lets an instance array
+            // distribute such an actual (§23.3.3.5).
+            if let Some(flat) = scope_indexed_flat_name_params(&e, params) {
+                if let Some(w) = widths.get(&flat) {
+                    return Some(*w);
+                }
+            }
+            Some(1)
+        }
+        EK::MemberAccess { .. } => {
+            if let Some(flat) = scope_indexed_flat_name_params(&e, params) {
+                if let Some(w) = widths.get(&flat) {
+                    return Some(*w);
+                }
+            }
+            None
+        }
         EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(s), .. }) => Some(*s),
         EK::Concatenation(parts) => {
             let mut sum = 0u32;
@@ -40117,6 +40161,29 @@ fn inline_module_items(
                                         interface_map,
                                         elab,
                                     );
+                                    // §27.6: a hierarchical actual that names a net
+                                    // inside an indexed SCOPE (`g[1].w`) names that
+                                    // WHOLE net. Flatten it to the absolute name the
+                                    // signal table uses, so the port connection, the
+                                    // child's own drivers and the nettype resolver
+                                    // all act on ONE net instead of on a name nothing
+                                    // can resolve.
+                                    //
+                                    // An actual that reaches an INTERFACE member
+                                    // is left alone: it resolves through the
+                                    // interface binding, which the simulator does
+                                    // from the rooted path (§23.3.3.4). Flattening
+                                    // it here would bind it to a same-named LOCAL
+                                    // instance instead of the connected one.
+                                    let if_derived = path_head_name(e)
+                                        .is_some_and(|h| interface_map.contains_key(&h));
+                                    if !sub_iface_ports.contains(&name.name) && !if_derived {
+                                        if let Some(flat) =
+                                            scope_indexed_net_name(&rewritten_e, prefix, elab)
+                                        {
+                                            rewritten_e = make_ident_expr(&flat);
+                                        }
+                                    }
                                     // Whole-net identity actuals keep the plain
                                     // substitution machinery (port_aliases &
                                     // friends key on un-rooted idents).
@@ -40253,6 +40320,20 @@ fn inline_module_items(
                                         interface_map,
                                     );
                                     // See the named-connection site above.
+                                    let if_derived = path_head_name(e)
+                                        .is_some_and(|h| interface_map.contains_key(&h));
+                                    let iface_port = sub_mod
+                                        .ports()
+                                        .get(i)
+                                        .map(|p| p.name().to_string())
+                                        .is_some_and(|pn| sub_iface_ports.contains(&pn));
+                                    if !iface_port && !if_derived {
+                                        if let Some(flat) =
+                                            scope_indexed_net_name(&rewritten_e, prefix, elab)
+                                        {
+                                            rewritten_e = make_ident_expr(&flat);
+                                        }
+                                    }
                                     if whole_net_ident_name(&rewritten_e).is_none() {
                                         mark_actual_rooted(&mut rewritten_e);
                                     }
@@ -44705,51 +44786,65 @@ fn inline_module_items(
                     // are ONE physical net (see `ElaboratedModule::port_aliases`).
                     // Anything that is not a plain hierarchical identifier — a
                     // bit/part-select, a concat, an expression, a literal — is a
-                    // separate object and gets no alias.
-                    if let Some(actual) = whole_net_ident_name(parent_expr) {
-                        elab.port_aliases
-                            .insert(sub_sig_name.clone(), actual.clone());
-                        // §23.3.3.7, Table 23-1: the formal and the actual
-                        // become ONE net, and an internal tri0, tri1 or
-                        // supply net dominates an external `wire`: the
-                        // merged net is tri0/tri1/supply. After port
-                        // substitution the sub-module's writes land on the
-                        // ACTUAL (`w`/`p`), so the implicit pull has to be
-                        // there, not only on the leftover port signal
-                        // (`u_diff.p`) — otherwise the outside wire reads z
-                        // while the port reads 1 (#1060). An actual with a
-                        // net type of its own other than `wire` keeps it
-                        // (the table's "external" cells).
-                        if elab.nets.contains(&actual) {
-                            let formal_kind = elab.resolved_net_kinds.get(&sub_sig_name).cloned();
-                            let formal_supply = elab.supply_nets.contains(&sub_sig_name);
-                            let have_own = elab.resolved_net_kinds.contains_key(&actual)
-                                || elab.supply_nets.contains(&actual);
-                            if !have_own {
-                                // §6.6.5, §6.6.6: with no driver at all the
-                                // merged net rests at the dominating net's
-                                // value (1 for tri1), which no fold computes.
-                                let rest = matches!(
-                                    formal_kind,
-                                    Some(ResolvedNetKind::Tri0 | ResolvedNetKind::Tri1)
-                                ) || formal_supply;
-                                if let Some(k) = formal_kind {
-                                    elab.resolved_net_kinds.insert(actual.clone(), k);
-                                }
-                                if formal_supply {
-                                    elab.supply_nets.insert(actual.clone());
-                                }
-                                if rest
-                                    && let Some(v) = elab
-                                        .signals
-                                        .get(&sub_sig_name)
-                                        .filter(|f| !f.is_real)
-                                        .map(|f| (f.width, f.value.clone()))
-                                    && let Some(asig) = elab.signals.get_mut(&actual)
-                                    && !asig.is_real
-                                    && asig.width == v.0
-                                {
-                                    asig.value = v.1;
+                    // separate object and gets no alias. A net reached through
+                    // an indexed SCOPE (`g[1].w`, §27.6) names a whole net, so
+                    // it does get one.
+                    if let Some(actual) = whole_net_ident_name_scoped(parent_expr, elab) {
+                        // §23.3.3.2: only a formal that is a NET is merged with
+                        // its actual. A formal that declares a VARIABLE
+                        // (`input var`) is connected by an implied continuous
+                        // assignment — a COPY — so the formal keeps its own
+                        // storage and a force on it does not reach the actual.
+                        let formal_is_net = is_net_name(elab, &sub_sig_name);
+                        let actual_is_net = is_net_name(elab, &actual);
+                        if formal_is_net || !actual_is_net {
+                            elab.port_aliases
+                                .insert(sub_sig_name.clone(), actual.clone());
+                            // §23.3.3.7, Table 23-1: the formal and the
+                            // actual become ONE net, and an internal tri0,
+                            // tri1 or supply net dominates an external
+                            // `wire`: the merged net is tri0/tri1/supply.
+                            // After port substitution the sub-module's writes
+                            // land on the ACTUAL (`w`/`p`), so the implicit
+                            // pull has to be there, not only on the leftover
+                            // port signal (`u_diff.p`) — otherwise the
+                            // outside wire reads z while the port reads 1
+                            // (#1060). An actual with a net type of its own
+                            // other than `wire` keeps it (the table's
+                            // "external" cells).
+                            if elab.nets.contains(&actual) {
+                                let formal_kind =
+                                    elab.resolved_net_kinds.get(&sub_sig_name).cloned();
+                                let formal_supply = elab.supply_nets.contains(&sub_sig_name);
+                                let have_own = elab.resolved_net_kinds.contains_key(&actual)
+                                    || elab.supply_nets.contains(&actual);
+                                if !have_own {
+                                    // §6.6.5, §6.6.6: with no driver at all
+                                    // the merged net rests at the dominating
+                                    // net's value (1 for tri1), which no fold
+                                    // computes.
+                                    let rest = matches!(
+                                        formal_kind,
+                                        Some(ResolvedNetKind::Tri0 | ResolvedNetKind::Tri1)
+                                    ) || formal_supply;
+                                    if let Some(k) = formal_kind {
+                                        elab.resolved_net_kinds.insert(actual.clone(), k);
+                                    }
+                                    if formal_supply {
+                                        elab.supply_nets.insert(actual.clone());
+                                    }
+                                    if rest
+                                        && let Some(v) = elab
+                                            .signals
+                                            .get(&sub_sig_name)
+                                            .filter(|f| !f.is_real)
+                                            .map(|f| (f.width, f.value.clone()))
+                                        && let Some(asig) = elab.signals.get_mut(&actual)
+                                        && !asig.is_real
+                                        && asig.width == v.0
+                                    {
+                                        asig.value = v.1;
+                                    }
                                 }
                             }
                         }
@@ -44766,6 +44861,7 @@ fn inline_module_items(
                     // A port on a variable or an expression, or left open,
                     // stays a net of its own and keeps its delay.
                     if elab.net_delays.contains_key(&sub_sig_name)
+                        && elab.nets.contains(&sub_sig_name)
                         && is_net_lvalue(parent_expr, &|n| elab.nets.contains(n))
                     {
                         elab.net_delays.remove(&sub_sig_name);
@@ -44908,6 +45004,20 @@ fn inline_module_items(
                         prepared_sub.port_directions.get(pname.as_str()),
                         Some(PortDirection::Input)
                     ) && !prepared_sub.body_driven_ports.contains(pname.as_str());
+                    // §23.3.3.2: a formal that declares a VARIABLE
+                    // (`input var`) is connected by an implied continuous
+                    // assignment — a COPY of the actual, not a merge with
+                    // it. The body reads the formal's own storage, which
+                    // the connection drives; substituting the actual would
+                    // rename the formal onto the actual and make the two
+                    // one object, so a force on the formal would reach the
+                    // actual as well (§10.6.2).
+                    let formal_is_net = is_net_name(elab, &cat2(&inst_prefix, &pname));
+                    let actual_is_net = whole_net_ident_name_scoped(actual, elab)
+                        .is_some_and(|n| is_net_name(elab, &n));
+                    if is_input && !formal_is_net && actual_is_net {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     // §6.7.1: an input port whose net keeps a net delay (see
                     // the port-collapsing note above) is read THROUGH that
                     // delay; substituting the actual would read around it.
@@ -51854,6 +51964,151 @@ fn whole_net_ident_name(expr: &Expression) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// §27.4, §27.6: a hierarchical path that names a net INSIDE an indexed
+/// scope (`g[1].w`) denotes that WHOLE net — the `[1]` selects a
+/// generate-block INSTANCE (§27.6), not a bit of a vector and not an element
+/// of an unpacked array. `w[3]` names a bit of `w` and `arr[2]` an element of
+/// an unpacked array; those are different objects and get no alias.
+///
+/// The scope-indexed flat name is built from the path itself; whether it
+/// names a real net is decided by the caller, which looks the name up in
+/// the elaborated tables.
+fn scope_indexed_flat_name(expr: &Expression, elab: &ElaboratedModule) -> Option<String> {
+    scope_indexed_flat_name_params(expr, &elab.parameters)
+}
+
+/// `scope_indexed_flat_name` with the parameter table it needs to fold the
+/// constant index of an indexed scope.
+fn scope_indexed_flat_name_params(
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+) -> Option<String> {
+    match &expr.kind {
+        // A bare scope name: the base of an indexed scope.
+        ExprKind::Ident(h) => {
+            if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                return None;
+            }
+            Some(h.path[0].name.name.clone())
+        }
+        ExprKind::Index { expr: base, index } => {
+            let prefix = scope_indexed_flat_name_params(base, params)?;
+            let idx = eval_const_expr(index, params);
+            Some(format!("{prefix}[{idx}]"))
+        }
+        ExprKind::MemberAccess { expr: base, member } => {
+            let prefix = scope_indexed_flat_name_params(base, params)?;
+            Some(format!("{prefix}.{}", member.name))
+        }
+        _ => None,
+    }
+}
+
+/// The flat, absolute name of a NET reached through an indexed scope
+/// (`g[1].w`), or `None` when the path names no net.
+///
+/// `prefix` is the scope the path was written in: a path whose head is a
+/// scope of that scope (`g[1].w` inside `mid`) names `mid.g[1].w`, while a
+/// path that already reaches outside it keeps its own name. The candidate
+/// names are looked up in the elaborated tables, so only a name that really
+/// exists is accepted — an interface instance's member (`k.g[1].w`, whose
+/// flat name depends on the binding) and an unpacked array element are not
+/// there and are left alone.
+fn scope_indexed_net_name(
+    expr: &Expression,
+    prefix: &str,
+    elab: &ElaboratedModule,
+) -> Option<String> {
+    if !path_has_index_step(expr) || !scope_index_selects_scopes(expr, elab) {
+        return None;
+    }
+    let rel = scope_indexed_flat_name(expr, elab)?;
+    let scoped = cat2(prefix, &rel);
+    if is_net_name(elab, &scoped) {
+        return Some(scoped);
+    }
+    if is_net_name(elab, &rel) {
+        return Some(rel);
+    }
+    None
+}
+
+/// Is `name` a net — a wire-like declaration, or a net of a user-defined
+/// nettype (§6.6.7), which permits several drivers just like a wire?
+fn is_net_name(elab: &ElaboratedModule, name: &str) -> bool {
+    if elab.nets.contains(name) {
+        return true;
+    }
+    elab.signals.get(name).is_some_and(|s| {
+        s.type_name
+            .as_deref()
+            .is_some_and(|t| elab.nettype_resolvers.contains_key(t))
+    })
+}
+
+/// The head name of a hierarchical path expression — `g[1].w` names the
+/// scope `g`, `a.b.c` names `a`. `None` for anything that is not a path.
+fn path_head_name(expr: &Expression) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(h) => h.path.first().map(|s| s.name.name.clone()),
+        ExprKind::Index { expr, .. } | ExprKind::MemberAccess { expr, .. } => path_head_name(expr),
+        _ => None,
+    }
+}
+
+/// `whole_net_ident_name`, extended to a net reached through an indexed
+/// SCOPE (`g[1].w`). A port actual that names such a net connects the port
+/// to that net, so the formal and the actual are ONE physical net and their
+/// drivers resolve together (§23.3.3.7, Table 23-1).
+fn whole_net_ident_name_scoped(expr: &Expression, elab: &ElaboratedModule) -> Option<String> {
+    if let Some(n) = whole_net_ident_name(expr) {
+        return Some(n);
+    }
+    if !path_has_index_step(expr) || !scope_index_selects_scopes(expr, elab) {
+        return None;
+    }
+    let flat = scope_indexed_flat_name(expr, elab)?;
+    is_net_name(elab, &flat).then_some(flat)
+}
+
+/// Does the path contain an index step at all? A plain hierarchical name
+/// (`a.b.c`) names no scope instance, so it is never rewritten into a
+/// scope-indexed flat name — its own segments already are the path.
+fn path_has_index_step(expr: &Expression) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(h) => h.path.iter().any(|s| !s.selects.is_empty()),
+        ExprKind::Index { .. } => true,
+        ExprKind::MemberAccess { expr: base, .. } => path_has_index_step(base),
+        _ => false,
+    }
+}
+
+/// §27.6 vs §7.4.2: an index in a path selects a SCOPE INSTANCE when it
+/// names a generate block (`g[1].w` is the net `w` inside the scope `g[1]`),
+/// and an ARRAY ELEMENT when it names an unpacked array (`arr[2]` is the
+/// second element of `arr`, a separate object with its own drivers). Only
+/// the former can name a whole net.
+fn scope_index_selects_scopes(expr: &Expression, elab: &ElaboratedModule) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(h) => match h.path.first() {
+            Some(first) => !is_unpacked_array_name(elab, &first.name.name),
+            None => true,
+        },
+        ExprKind::Index { expr: base, .. } | ExprKind::MemberAccess { expr: base, .. } => {
+            scope_index_selects_scopes(base, elab)
+        }
+        _ => true,
+    }
+}
+
+/// Is `name` an unpacked array in the elaborated tables? Such a name
+/// selects ELEMENTS (§7.4.2), not scope instances (§27.6).
+fn is_unpacked_array_name(elab: &ElaboratedModule, name: &str) -> bool {
+    elab.arrays.contains_key(name)
+        || elab.arrays_2d.contains_key(name)
+        || elab.arrays_nd.contains_key(name)
 }
 
 /// The base interconnect name of an ELEMENT select (`iBus[1]`, `m.ic[2]`) —
