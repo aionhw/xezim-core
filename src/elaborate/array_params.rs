@@ -259,7 +259,8 @@ fn pattern_items(
     for it in items {
         match it {
             AssignmentPatternItem::Keyed(key, v) => {
-                let index = const_eval_i64_with_params(key, Some(params))?;
+                let index =
+                    const_eval_pattern_index(key, Some(params), (*outer.first()?, *outer.last()?))?;
                 *slots.get_mut(outer.iter().position(|&i| i == index)?)? = Some(v);
             }
             // A bare identifier key (`'{K: v}`) parses as a member name; in
