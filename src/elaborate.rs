@@ -23908,7 +23908,7 @@ pub fn const_eval_i64_with_params(
                 }
             }
             let p = params?;
-            eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
+            eval_const_expr_val(expr, p).to_i64()
         }
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
             let r = match base {
@@ -24604,9 +24604,11 @@ pub fn const_eval_i64_with_params(
         // to ~u32::MAX (black-parrot config widths used directly in a range).
         // (`Index` moved to the dedicated arm above, which tries the
         // unpacked-array element env keys first.)
+        // §26.3, §6.20.2: a signed value keeps its sign (`pk::LO` of -1 is
+        // -1, not 4294967295).
         ExprKind::MemberAccess { .. } => {
             let p = params?;
-            eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
+            eval_const_expr_val(expr, p).to_i64()
         }
         // §11.4.12: a constant concatenation or replication, such as the
         // `{Width{1'b1}}` bound of a covergroup bin range.

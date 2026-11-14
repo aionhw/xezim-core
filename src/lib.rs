@@ -2952,27 +2952,89 @@ fn parse_and_elaborate(
         {
             type PTable =
                 std::collections::HashMap<String, Value, crate::hasher::DeterministicState>;
+            /// The package an expression belongs to and its own parameters
+            /// declared so far (§26.3).
+            struct PkgScope<'a> {
+                name: &'a str,
+                own: &'a crate::hasher::HashSet<String>,
+            }
+            thread_local! {
+                static PKG_SCOPE: std::cell::RefCell<Option<(String, crate::hasher::HashSet<String>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
             fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
-                if table.is_empty() || matches!(e.kind, ast::expr::ExprKind::Number(_)) {
+                if matches!(e.kind, ast::expr::ExprKind::Number(_)) {
                     return;
                 }
-                if let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table)) {
-                    if v >= 0 {
-                        *e = ast::expr::Expression::new(
-                            // UNSIZED literal — a sized one would trip the
-                            // §6.19 enum-member width check against narrow
-                            // base types.
-                            ast::expr::ExprKind::Number(ast::expr::NumberLiteral::Integer {
-                                size: None,
-                                signed: true,
-                                base: ast::expr::NumberBase::Decimal,
-                                value: v.to_string(),
-                                cached_val: crate::ast::cache::LiteralCache::new(None),
-                            }),
-                            e.span,
-                        );
-                    }
+                if !table.is_empty()
+                    && let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table))
+                    && v >= 0
+                {
+                    *e = ast::expr::Expression::new(
+                        // UNSIZED literal — a sized one would trip the
+                        // §6.19 enum-member width check against narrow
+                        // base types.
+                        ast::expr::ExprKind::Number(ast::expr::NumberLiteral::Integer {
+                            size: None,
+                            signed: true,
+                            base: ast::expr::NumberBase::Decimal,
+                            value: v.to_string(),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                        }),
+                        e.span,
+                    );
+                    return;
                 }
+                // §26.3, §6.18: a negative value, or one this early fold cannot
+                // model, stays an expression; a package typedef names its OWN
+                // package's constants, so qualify them (`LO` becomes `pk::LO`)
+                // and the later resolution reads that package's typed value,
+                // in any scope the type is used from, imported or not.
+                PKG_SCOPE.with(|scope| {
+                    if let Some((name, own)) = scope.borrow().as_ref() {
+                        qualify_package_params(e, &PkgScope { name, own });
+                    }
+                });
+            }
+            fn qualify_package_params(e: &mut ast::expr::Expression, scope: &PkgScope<'_>) {
+                elaborate::for_each_sub_expr_mut(e, &mut |x| {
+                    let ast::expr::ExprKind::Ident(h) = &x.kind else {
+                        return;
+                    };
+                    if h.root.is_some()
+                        || h.path.len() != 1
+                        || !h.path[0].selects.is_empty()
+                        || !scope.own.contains(&h.path[0].name.name)
+                    {
+                        return;
+                    }
+                    let member = h.path[0].name.clone();
+                    let span = x.span;
+                    let pkg = ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![ast::expr::HierPathSegment {
+                            name: ast::Identifier {
+                                name: scope.name.to_string(),
+                                span,
+                            },
+                            selects: Vec::new(),
+                        }],
+                        span,
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
+                    };
+                    *x = ast::expr::Expression::new(
+                        ast::expr::ExprKind::MemberAccess {
+                            expr: Box::new(ast::expr::Expression::new(
+                                ast::expr::ExprKind::Ident(pkg),
+                                span,
+                            )),
+                            member,
+                        },
+                        span,
+                    );
+                });
             }
             fn fold_packed(dims: &mut [ast::types::PackedDimension], table: &PTable) {
                 for d in dims.iter_mut() {
@@ -3065,11 +3127,18 @@ fn parse_and_elaborate(
                 }
             }
             fn eval_params_into(pd: &ast::decl::ParameterDeclaration, table: &mut PTable) {
-                if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                if let ast::decl::ParameterKind::Data {
+                    data_type,
+                    assignments,
+                } = &pd.kind
+                {
                     for a in assignments {
+                        // A later same-named parameter replaces an earlier one.
+                        table.remove(&a.name.name);
                         if let Some(init) = &a.init {
                             if let Some(v) =
                                 elaborate::const_eval_i64_with_params(init, Some(table))
+                                && holds_unchanged(data_type, v, table)
                             {
                                 let mut val = Value::from_u64(v as u64, 32);
                                 val.is_signed = true;
@@ -3077,6 +3146,77 @@ fn parse_and_elaborate(
                             }
                         }
                     }
+                }
+            }
+            /// §6.20.2: whether a parameter of type `dt` holds the integer `v`
+            /// unchanged, so the early fold may use it: the value fits the
+            /// declared integer atom or one-dimensional vector (its range
+            /// foldable here), or the parameter is untyped and the value fits
+            /// 32 bits. Any other type, or a value the type would truncate or
+            /// re-sign (`localparam byte LO = 2147483646`), is left to the
+            /// typed evaluation in the package scope.
+            fn holds_unchanged(dt: &ast::types::DataType, v: i64, table: &PTable) -> bool {
+                use ast::types::{DataType as D, IntegerAtomType as A, PackedDimension as P};
+                let fits = |w: u32, signed: bool| {
+                    if w >= 64 {
+                        return signed || v >= 0;
+                    }
+                    if signed {
+                        let half = 1i64 << (w - 1);
+                        (-half..half).contains(&v)
+                    } else {
+                        (0..(1i64 << w)).contains(&v)
+                    }
+                };
+                let signed_of = |s: &Option<ast::types::Signing>, default: bool| match s {
+                    Some(ast::types::Signing::Signed) => true,
+                    Some(ast::types::Signing::Unsigned) => false,
+                    None => default,
+                };
+                let vector = |dims: &[P], signing: &Option<ast::types::Signing>| match dims {
+                    [] => fits(1, signed_of(signing, false)),
+                    [P::Range { left, right, .. }] => {
+                        match (
+                            elaborate::const_eval_i64_with_params(left, Some(table)),
+                            elaborate::const_eval_i64_with_params(right, Some(table)),
+                        ) {
+                            (Some(l), Some(r)) => fits(
+                                ((l - r).unsigned_abs() + 1).min(64) as u32,
+                                signed_of(signing, false),
+                            ),
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                match dt {
+                    D::Implicit {
+                        dimensions,
+                        signing,
+                        ..
+                    } => {
+                        if dimensions.is_empty() {
+                            fits(32, true)
+                        } else {
+                            vector(dimensions, signing)
+                        }
+                    }
+                    D::IntegerVector {
+                        dimensions,
+                        signing,
+                        ..
+                    } => vector(dimensions, signing),
+                    D::IntegerAtom { kind, signing, .. } => {
+                        let (w, default) = match kind {
+                            A::Byte => (8, true),
+                            A::ShortInt => (16, true),
+                            A::Int | A::Integer => (32, true),
+                            A::LongInt => (64, true),
+                            A::Time => (64, false),
+                        };
+                        fits(w, signed_of(signing, default))
+                    }
+                    _ => false,
                 }
             }
             // $unit typedefs fold against the $unit params.
@@ -3104,14 +3244,25 @@ fn parse_and_elaborate(
                 };
                 let pkg = Rc::make_mut(pkg);
                 let mut table = unit_params.clone();
+                let pkg_name = pkg.name.name.clone();
+                let mut own: crate::hasher::HashSet<String> = Default::default();
                 for item in pkg.items.iter_mut() {
                     match item {
-                        ast::decl::PackageItem::Parameter(pd) => eval_params_into(pd, &mut table),
+                        ast::decl::PackageItem::Parameter(pd) => {
+                            eval_params_into(pd, &mut table);
+                            if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                                own.extend(assignments.iter().map(|a| a.name.name.clone()));
+                            }
+                        }
                         ast::decl::PackageItem::Typedef(td) => {
+                            PKG_SCOPE.with(|scope| {
+                                *scope.borrow_mut() = Some((pkg_name.clone(), own.clone()))
+                            });
                             fold_dt(&mut td.data_type, &table, 0);
                             for d in td.dimensions.iter_mut() {
                                 fold_unpacked(d, &table);
                             }
+                            PKG_SCOPE.with(|scope| *scope.borrow_mut() = None);
                         }
                         _ => {}
                     }
