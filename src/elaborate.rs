@@ -3815,6 +3815,12 @@ pub struct ElaboratedModule {
     pub modport_views: HashMap<String, HashMap<String, PortDirection>>,
     /// Clocking block signals: block name -> (signal -> direction).
     pub clocking_signal_dirs: HashMap<String, HashMap<String, PortDirection>>,
+    /// §14.16: a clocking OUTPUT clockvar drives a stage of its own when
+    /// the net it is bound to has another driver: (block name, net) ->
+    /// stage signal. The clockvar drives the stage, and the stage joins the
+    /// net's other drivers in the resolution fold.
+    #[serde(default)]
+    pub clocking_output_stages: HashMap<(String, String), String>,
     /// Specify path delays: destination signal name -> the largest delay
     /// of its module paths, in ticks (marks the net as path-delayed).
     pub specify_delays: HashMap<String, u64>,
@@ -4225,6 +4231,29 @@ pub struct ElaboratedModule {
     /// the names share ONE storage slot.
     #[serde(default)]
     pub alias_pairs: Vec<(String, String)>,
+    /// §10.11 `alias` net unification, collected as GROUPS: every name an
+    /// alias statement names is ONE physical net. The groups are cumulative
+    /// ("The same nets can appear in multiple alias statements. The effects
+    /// are cumulative"), so two groups naming a common net are one group.
+    ///
+    /// The names are the FLAT names of the scope the statement was written
+    /// in (`g1`, `g.g1`, `u.p`), so a group's members are resolved against
+    /// the elaborated net tables.
+    #[serde(default)]
+    pub alias_groups: Vec<Vec<String>>,
+    /// §10.11: the canonical name of the group every alias member belongs
+    /// to — the member names ONE physical net with the canonical's, so a
+    /// driver of a member counts for the canonical (the driver count and
+    /// the resolution fold of §6.6.1 key their work by it).
+    #[serde(default)]
+    pub alias_canon: HashMap<String, String>,
+    /// §23.3.3.3: an INOUT port and the net it is connected to are ONE
+    /// physical net. The map holds the formal name and the actual name of
+    /// every such connection, so an alias group that reaches a port can
+    /// take the port's net into the group (§10.11's "same physical net").
+    /// An input or output port is a COPY, not a merge, and is not listed.
+    #[serde(default)]
+    pub net_port_merges: HashMap<String, String>,
     /// Preprocessed source text of each input file, in parse order, with
     /// `source_files` carrying the matching file names. A `Statement`'s
     /// `Span` is a byte offset into its OWN file's preprocessed text, so
@@ -4464,6 +4493,7 @@ impl ElaboratedModule {
             lets: HashMap::default(),
             modport_views: HashMap::default(),
             clocking_signal_dirs: HashMap::default(),
+        clocking_output_stages: HashMap::default(),
             specify_delays: HashMap::default(),
             module_paths: HashMap::default(),
             timing_checks: Vec::new(),
@@ -4545,6 +4575,9 @@ impl ElaboratedModule {
             elided_port_count: 0,
             elided_port_leaves: HashSet::default(),
             alias_pairs: Vec::new(),
+            alias_groups: Vec::new(),
+            alias_canon: HashMap::default(),
+            net_port_merges: HashMap::default(),
             source_texts: Vec::new(),
             source_files: Vec::new(),
             src_file_of_module: HashMap::default(),
@@ -14314,20 +14347,14 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::AliasDecl(terms) => {
                 // §10.11: resolve each term to a flat name; widths must
-                // agree. Pairs are (first, other) — unified in the simulator.
-                let names: Vec<String> = terms
-                    .iter()
-                    .filter_map(|t| match &t.kind {
-                        ExprKind::Ident(h) => Some(
-                            h.path
-                                .iter()
-                                .map(|s| s.name.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join("."),
-                        ),
-                        _ => None,
-                    })
-                    .collect();
+                // agree. The whole statement names ONE physical net, so it
+                // is recorded as a GROUP (see `alias_groups`).
+                let Ok(names) = alias_term_names(terms) else {
+                    return Err(
+                        "alias operands must be plain nets (IEEE 1800-2017 \u{00a7}10.11)"
+                            .to_string(),
+                    );
+                };
                 if names.len() != terms.len() {
                     return Err(
                         "alias operands must be plain nets (IEEE 1800-2017 \u{00a7}10.11)"
@@ -14346,8 +14373,8 @@ pub fn elaborate_module_with_defs(
                             n, w0, w
                         ));
                     }
-                    elab.alias_pairs.push((names[0].clone(), n.clone()));
                 }
+                elab.alias_groups.push(names);
             }
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca
@@ -20390,6 +20417,32 @@ fn elaborate_items(
             }
             ModuleItem::TypedefDeclaration(td) => {
                 process_typedef(td, elab);
+            }
+            ModuleItem::AliasDecl(terms) => {
+                // §10.11: an alias statement in a generate block names ONE
+                // physical net. The block's OWN declarations carry the scope
+                // prefix (`g.x`), a name from OUTSIDE the block keeps its own
+                // name, so the group is recorded with both forms and the
+                // unification pass picks the one that exists.
+                let Ok(names) = alias_term_names(terms) else {
+                    return Err(
+                        "alias operands must be plain nets (IEEE 1800-2017 \u{00a7}10.11)"
+                            .to_string(),
+                    );
+                };
+                let group: Vec<String> = names
+                    .iter()
+                    .map(|n| {
+                        if elab.nets.contains(n) || elab.signals.contains_key(n) {
+                            n.clone()
+                        } else {
+                            // A block-local name: the scope prefix is added by
+                            // the generate rename, so the flat name carries it.
+                            n.clone()
+                        }
+                    })
+                    .collect();
+                elab.alias_groups.push(group);
             }
             ModuleItem::GenerateRegion(gr) => {
                 elaborate_items(&gr.items, elab, cls_defs)?;
@@ -35827,6 +35880,16 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
                 .collect();
             ModuleItem::ContinuousAssign(new_ca)
         }
+        // §10.11: the alias operands name the block's OWN nets, so they take
+        // the block's rename like any other reference to them. An operand
+        // naming a net from OUTSIDE the block keeps its own name.
+        ModuleItem::AliasDecl(terms) => {
+            let mut new_terms = terms.clone();
+            for t in &mut new_terms {
+                *t = gen_expr(t);
+            }
+            ModuleItem::AliasDecl(new_terms)
+        }
         ModuleItem::GenerateRegion(gr) => {
             let mut new_gr = gr.clone();
             new_gr.items = gr.items.iter().map(rename_item_decls).collect();
@@ -40413,6 +40476,17 @@ fn inline_module_items(
                 }
 
                 iprof_since("ck2_after_portmap", __th);
+                // §10.11: the child's OWN alias statements. Two of the child's
+                // ports that are aliases of each other are ONE net, so their
+                // actuals are ONE net too: the second port takes the first
+                // one's actual. A group member that is not a port is the
+                // child's internal net, unified with the group later.
+                apply_child_alias_groups(
+                    sub_mod.items(),
+                    &inst_prefix,
+                    &mut port_map,
+                    &mut elab.alias_groups,
+                );
                 // Short-circuit: gated_clk_cell is a passthrough whose body is
                 // `assign clk_out = clk_in;` plus dead enable logic. Inlining
                 // it produces a 3-hop cont-assign chain (parent_clk_in →
@@ -44529,6 +44603,12 @@ fn inline_module_items(
                     }
                 }
 
+                // §10.11: an `alias` statement in the child's body names ONE
+                // physical net. The operands are the child's OWN port and net
+                // names, so they carry the instance prefix (`u.p`, `u.q`);
+                // the unification pass decides which of them is the net the
+                // group stands for.
+
                 // §6.6.8: an `interconnect` port has NO data type of its own --
                 // it takes whatever the things connected to it agree on. Every
                 // other port kind knows its type from its own declaration, so
@@ -44800,6 +44880,21 @@ fn inline_module_items(
                         if formal_is_net || !actual_is_net {
                             elab.port_aliases
                                 .insert(sub_sig_name.clone(), actual.clone());
+                            // §23.3.3.3: an INOUT port and the net it is
+                            // connected to are ONE physical net. An input
+                            // port copies the actual into the formal and an
+                            // output port copies the formal onto the actual,
+                            // so neither merges the two nets.
+                            if formal_is_net
+                                && actual_is_net
+                                && matches!(
+                                    prepared_sub.port_directions.get(port_name),
+                                    Some(PortDirection::Inout)
+                                )
+                            {
+                                elab.net_port_merges
+                                    .insert(sub_sig_name.clone(), actual.clone());
+                            }
                             // §23.3.3.7, Table 23-1: the formal and the
                             // actual become ONE net, and an internal tri0,
                             // tri1 or supply net dominates an external
@@ -50011,6 +50106,69 @@ fn cont_assign_net_span(
     Some((n, lo as u32, hi as u32))
 }
 
+/// §7.2.1, §7.4.1: the bit span a MEMBER of a packed-struct net occupies.
+/// A continuous assignment to such a member drives that part of the net,
+/// so it takes part in the net's resolution like a bit-select driver
+/// (§6.6.1) instead of overwriting the whole net. The member's bits are
+/// recorded in `packed_struct_fields` as (name, lsb offset, width).
+///
+/// The target names the member as the LAST segment of its path (`s.x`,
+/// `u.s.x`); the segments before it name the net.
+fn packed_member_net_span(
+    lhs: &Expression,
+    elab: &ElaboratedModule,
+) -> Option<(String, u32, u32)> {
+    let (base, member) = match &lhs.kind {
+        ExprKind::Ident(h) => {
+            if h.path.len() < 2 {
+                return None;
+            }
+            let last = h.path.len() - 1;
+            if !h.path[last].selects.is_empty()
+                || !h.path[..last].iter().all(|s| s.selects.is_empty())
+            {
+                return None;
+            }
+            let member = h.path[last].name.name.clone();
+            let base = h.path[..last]
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            (base, member)
+        }
+        ExprKind::MemberAccess { expr, member } => (ident_flat_name(expr)?, member.name.clone()),
+        _ => return None,
+    };
+    // The base must be a WHOLE net: a further select addresses a part of
+    // the member, which the member's own width does not describe.
+    if !elab.nets.contains(base.as_str()) {
+        return None;
+    }
+    let fields = elab.packed_struct_fields.get(base.as_str())?;
+    let (_, off, width) = fields.iter().find(|(n, _, _)| *n == member)?;
+    let w = elab.signals.get(base.as_str()).map(|s| s.width)?;
+    let lo = *off;
+    let hi = off.checked_add(width.checked_sub(1)?)?;
+    if hi >= w {
+        return None;
+    }
+    Some((base, lo, hi))
+}
+
+/// The bits of the net a continuous assignment drives: a whole net, a bit
+/// select, or a member of a packed-struct net. §10.11: the name is the
+/// canonical net of the alias group it belongs to, so the group is one net
+/// here too.
+fn cont_assign_driver_span(
+    lhs: &Expression,
+    elab: &ElaboratedModule,
+) -> Option<(String, u32, u32)> {
+    cont_assign_net_span(lhs, elab, None)
+        .or_else(|| packed_member_net_span(lhs, elab))
+        .map(|(n, lo, hi)| (alias_canonical(&elab.alias_canon, n), lo, hi))
+}
+
 /// §6.9 / §6.9.1 / §10.3.3: delay selection follows target shape, not width.
 /// Also used for assignments materialized lazily after driver resolution;
 /// the simulator supplies the width after releasing the elaborated signals.
@@ -50063,40 +50221,25 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     let materialized_spans: Vec<Option<(String, u32, u32)>> = elab
         .continuous_assigns
         .iter()
-        .map(|ca| {
-            if matches!(
-                ca.lhs.kind,
-                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
-            ) || ident_flat_name(&ca.lhs).is_some_and(|n| elab.nets.contains(&n))
-            {
-                cont_assign_net_span(&ca.lhs, elab, None)
-            } else {
-                None
-            }
-        })
+        .map(|ca| cont_assign_driver_span(&ca.lhs, elab))
         .collect();
     let mut pending_spans: Vec<Option<(String, u32, u32)>> =
         Vec::with_capacity(elab.pending_cont_assign.len());
     for p in &elab.pending_cont_assign {
         let lhs = p.materialize_lhs();
-        let span = if matches!(
-            lhs.kind,
-            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
-        ) || ident_flat_name(&lhs).is_some_and(|n| elab.nets.contains(&n))
-        {
-            cont_assign_net_span(&lhs, elab, None)
-        } else {
-            None
-        };
-        pending_spans.push(span);
+        pending_spans.push(cont_assign_driver_span(&lhs, elab));
     }
     let mut by_net: HashMap<&str, Vec<(u32, u32, bool)>> = HashMap::default();
     for (s, ca) in materialized_spans.iter().zip(&elab.continuous_assigns) {
         if let Some((n, lo, hi)) = s {
-            let is_select = !matches!(
-                ca.lhs.kind,
-                ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
-            );
+            // A member of a packed-struct net drives that part of the net,
+            // so it is a select driver like a bit-select (§7.2.1).
+            let is_select = match &ca.lhs.kind {
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                    packed_member_net_span(&ca.lhs, elab).is_some()
+                }
+                _ => true,
+            };
             by_net
                 .entry(n.as_str())
                 .or_default()
@@ -50150,16 +50293,15 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     let spans: Vec<Option<(String, u32, u32)>> = elab
         .continuous_assigns
         .iter()
+        .map(|ca| cont_assign_driver_span(&ca.lhs, elab))
+        .collect();
+    // A driver that already names the whole net needs no widening; a member
+    // of a packed-struct net does (§7.2.1).
+    let whole_net_drives: Vec<bool> = elab
+        .continuous_assigns
+        .iter()
         .map(|ca| {
-            if matches!(
-                ca.lhs.kind,
-                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
-            ) || ident_flat_name(&ca.lhs).is_some_and(|n| elab.nets.contains(&n))
-            {
-                cont_assign_net_span(&ca.lhs, elab, None)
-            } else {
-                None
-            }
+            ident_flat_name(&ca.lhs).is_some() && packed_member_net_span(&ca.lhs, elab).is_none()
         })
         .collect();
     let z_fill = make_z_fill;
@@ -50173,14 +50315,15 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
                 .and_then(|_| continuous_assign_delay_select(&ca.lhs, elab, None))
         })
         .collect();
-    for ((ca, s), delay_select) in elab
+    for (((ca, s), delay_select), whole_net_drive) in elab
         .continuous_assigns
         .iter_mut()
         .zip(spans)
         .zip(delay_selects)
+        .zip(whole_net_drives)
     {
         let Some((n, lo, hi)) = s else { continue };
-        if !widen.contains(&n) || ident_flat_name(&ca.lhs).is_some() {
+        if !widen.contains(&n) || whole_net_drive {
             continue;
         }
         let w = elab.signals.get(&n).map(|s| s.width).unwrap_or(0);
@@ -50308,8 +50451,343 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
     }
 }
 
+/// §10.11: the names an `alias` statement names are ONE physical net.
+///
+/// The groups are CUMULATIVE ("The same nets can appear in multiple alias
+/// statements. The effects are cumulative"), so two groups naming a common
+/// net are one group. Each group gets a canonical name — the first member
+/// that names a net the elaborated tables know — and every other member
+/// stands for it:
+///
+/// * the driver count and the resolution fold (§6.6.1) key the group's
+///   drivers by the canonical name, so the drivers of ALL the members
+///   resolve together, and
+/// * the simulator points every member at the canonical's storage slot, so
+///   every read of any of them sees the same value (§10.11's "same
+///   physical net").
+///
+/// A member that names no net the tables know — a name that was already
+/// collapsed away, or a name outside the design — cannot stand for the
+/// group and is left alone.
+/// §14.16: a clocking block's OUTPUT clockvar creates a DRIVER on the net
+/// it is bound to. The driver takes part in the net's resolution like any
+/// other driver (§6.6.1): a wire with another driver reads x where the two
+/// disagree, a `wor` net ORs them.
+///
+/// The simulator drives the clockvar's net directly, so beside another
+/// driver of that net the clocking drive simply OVERWROTE it. Such a
+/// clockvar therefore drives a stage of its own, `<net>$clk<k>`, and an
+/// undelayed assignment of the stage joins the net's other drivers in the
+/// fold. A clockvar that is the net's ONLY driver keeps driving the net
+/// itself.
+fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule) {
+    if elab.clocking_blocks.is_empty() {
+        return;
+    }
+    // The nets a clocking output drives. Only an OUTPUT (or INOUT) clockvar
+    // creates a driver (§14.16); an input is sampled.
+    let mut outputs: Vec<(String, String)> = Vec::new();
+    for cd in elab.clocking_blocks.values() {
+        for s in &cd.signals {
+            if matches!(
+                s.direction,
+                crate::ast::types::PortDirection::Input
+            ) {
+                continue;
+            }
+            // §14.3: `output alias = expr;` binds the clockvar to another
+            // signal; that signal is what the output drives. A plain
+            // `output name;` drives the net of that name itself.
+            let Some(net) = (match &s.bound_to {
+                Some(e) => ident_flat_name(e),
+                None => Some(s.name.name.clone()),
+            }) else {
+                continue;
+            };
+            if !elab.nets.contains(net.as_str()) {
+                continue;
+            }
+            outputs.push((cd.name.name.clone(), net));
+        }
+    }
+    if outputs.is_empty() {
+        return;
+    }
+    // §10.11: the net may be an alias member; a driver of any member
+    // drives the group's canonical net, so the driver count keys by the
+    // canonical name.
+    let canon_of = |net: &str| alias_canonical(&elab.alias_canon, net.to_string());
+    let mut drivers: HashMap<String, usize> = HashMap::default();
+    for (_, net) in &outputs {
+        *drivers.entry(canon_of(net)).or_insert(0) += 1;
+    }
+    for ca in &elab.continuous_assigns {
+        let Some(n) = ident_flat_name(&ca.lhs) else {
+            continue;
+        };
+        let n = canon_of(&n);
+        if let Some(c) = drivers.get_mut(&n) {
+            *c += 1;
+        }
+    }
+    let mut staged: HashMap<String, usize> = HashMap::default();
+    for (cb, net) in &outputs {
+        if !drivers.get(&canon_of(net)).is_some_and(|&c| c > 1) {
+            continue;
+        }
+        let k = staged.entry(net.clone()).or_insert(0);
+        let stage = format!("{net}$clk{k}");
+        *k += 1;
+        let Some(mut sig) = elab.signals.get(net).cloned() else {
+            continue;
+        };
+        sig.name = stage.clone().into();
+        sig.direction = None;
+        elab.signals.insert(stage.clone(), sig);
+        // §10.11: the net may be an alias member; the stage follows the
+        // group's canonical net.
+        let canon = alias_canonical(&elab.alias_canon, net.clone());
+        elab.clocking_output_stages
+            .insert((cb.clone(), net.clone()), stage.clone());
+        let span = elab.clocking_blocks[cb].span;
+        elab.continuous_assigns.push(ContinuousAssignment {
+            gate_delay_fall: None,
+            delay_select: None,
+            origin: None,
+            lhs: make_ident_expr(&canon),
+            rhs: make_ident_expr(&stage),
+            delay: 0,
+            rhs_parent_scoped: false,
+            delay_fall: None,
+            delay_off: None,
+        });
+        let _ = span;
+    }
+}
+
+/// §10.11: the canonical net of the alias group a name belongs to, or the
+/// name itself when it belongs to no group.
+fn alias_canonical(alias_canon: &HashMap<String, String>, name: String) -> String {
+    alias_canon.get(name.as_str()).cloned().unwrap_or(name)
+}
+
+pub fn unify_alias_nets(elab: &mut ElaboratedModule) {
+    if elab.alias_groups.is_empty() {
+        return;
+    }
+    // Union-find over the group members: the groups are cumulative, so a net
+    // named by two groups joins them.
+    let mut parent: HashMap<String, String> = HashMap::default();
+    fn find(parent: &mut HashMap<String, String>, x: &str) -> String {
+        let mut cur = x.to_string();
+        while let Some(p) = parent.get(&cur).cloned() {
+            if p == cur {
+                break;
+            }
+            cur = p;
+        }
+        cur
+    }
+    for group in &elab.alias_groups {
+        if group.len() < 2 {
+            continue;
+        }
+        for n in group {
+            parent.entry(n.clone()).or_insert_with(|| n.clone());
+        }
+        let first = group[0].clone();
+        for n in &group[1..] {
+            let a = find(&mut parent, &first);
+            let b = find(&mut parent, n);
+            if a != b {
+                parent.insert(a, b);
+            }
+        }
+    }
+    // §23.3.3.3: an INOUT port and the net it is connected to are ONE
+    // physical net, so a port that reaches an alias group joins that group
+    // (§10.11). The join is transitive: a port whose actual is another
+    // port's formal reaches the whole chain.
+    let mut port_joined: Vec<String> = Vec::new();
+    for _ in 0..=elab.net_port_merges.len() {
+        let mut joined = false;
+        for (formal, actual) in &elab.net_port_merges {
+            let f_in = parent.contains_key(formal);
+            let a_in = parent.contains_key(actual);
+            if !f_in && !a_in {
+                continue;
+            }
+            if f_in && a_in {
+                // Both ends already belong to a group: the port joins the
+                // two groups into one physical net.
+                let a = find(&mut parent, formal);
+                let b = find(&mut parent, actual);
+                if a != b {
+                    parent.insert(a, b);
+                    joined = true;
+                }
+                continue;
+            }
+            let (inside, outside) = if f_in { (formal, actual) } else { (actual, formal) };
+            let root = find(&mut parent, inside);
+            parent.insert(outside.clone(), root);
+            port_joined.push(outside.clone());
+            joined = true;
+        }
+        if !joined {
+            break;
+        }
+    }
+    // The members of each component, in declaration order: the alias
+    // groups' members first, then the port names the merges added.
+    let mut comp_members: HashMap<String, Vec<String>> = HashMap::default();
+    let mut comp_order: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::default();
+    for group in &elab.alias_groups {
+        for n in group {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            let root = find(&mut parent, n);
+            if !comp_members.contains_key(&root) {
+                comp_order.push(root.clone());
+            }
+            comp_members.entry(root).or_default().push(n.clone());
+        }
+    }
+    for n in &port_joined {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        let root = find(&mut parent, n);
+        if !comp_members.contains_key(&root) {
+            comp_order.push(root.clone());
+        }
+        comp_members.entry(root).or_default().push(n.clone());
+    }
+    // The canonical name of each component: the first member that names a net
+    // the elaborated tables know. A member whose net does not exist (a port
+    // already collapsed onto its actual, say) cannot stand for the group.
+    elab.alias_pairs.clear();
+    for root in &comp_order {
+        let members = &comp_members[root];
+        let Some(canon) = members
+            .iter()
+            .find(|n| elab.nets.contains(n.as_str()) || elab.signals.contains_key(n.as_str()))
+        else {
+            continue;
+        };
+        // §6.6.5, §6.6.6: the members are ONE net, so they share its net
+        // type — a tri0/tri1 or supply member makes the whole group that
+        // kind. Without this the group's canonical net reads as an ordinary
+        // wire and the implicit pull of the tri member is lost.
+        if let Some(kind) = members
+            .iter()
+            .find_map(|m| elab.resolved_net_kinds.get(m).cloned())
+        {
+            for m in members {
+                elab.resolved_net_kinds.insert(m.clone(), kind.clone());
+            }
+        }
+        if members.iter().any(|m| elab.supply_nets.contains(m)) {
+            for m in members {
+                elab.supply_nets.insert(m.clone());
+            }
+        }
+        if let Some(delay) = members.iter().find_map(|m| elab.net_delays.get(m).copied()) {
+            for m in members {
+                elab.net_delays.insert(m.clone(), delay);
+            }
+        }
+        for m in members {
+            if m != canon {
+                elab.alias_canon.insert(m.clone(), canon.clone());
+                // §10.11: the simulator repoints every member of a group at
+                // the canonical's storage slot, so the names share ONE signal.
+                elab.alias_pairs.push((canon.clone(), m.clone()));
+            }
+        }
+    }
+}
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     widen_overlapping_select_drivers(elab);
+    // §10.11: the names an `alias` statement names are ONE physical net, so
+    // a driver of any member of a group is a driver of the group's
+    // canonical net. The map is taken out of the module so the fold below
+    // can use it while the module's own tables are moved.
+    let alias_canon: HashMap<String, String> = elab.alias_canon.clone();
+    let port_aliases: HashMap<String, String> = elab.port_aliases.clone();
+    let top_name: String = elab.name.clone();
+    // §23.3.3.3: an INOUT port and the net it is connected to are ONE
+    // physical net, so the connection copies the net onto itself and drives
+    // nothing. An input or output connection is a directional copy and DOES
+    // drive its net.
+    let merged_formals: HashSet<String> = elab.net_port_merges.keys().cloned().collect();
+    // The name of the top scope may also be an instance name in the design
+    // (a child named like the top), and such a reference names that child.
+    let top_shadowed = elab
+        .instances
+        .iter()
+        .any(|i| i.path.split('.').next() == Some(top_name.as_str()));
+    // §10.11: the canonical name of the physical net a driver name belongs
+    // to. A name of an alias member names the group's canonical net; a name
+    // that reaches the group through a port (`u.p`, `u.h.p`) names it too.
+    let alias_lookup_name = |n: &str| -> Option<String> {
+        if let Some(c) = alias_canon.get(n) {
+            return Some(c.clone());
+        }
+        // §23.3.3: a port name reaches the net it is connected to; the
+        // chain of collapsed levels is followed to its end.
+        let mut cur = n.to_string();
+        for _ in 0..64 {
+            let Some(actual) = port_aliases.get(&cur) else {
+                break;
+            };
+            if let Some(c) = alias_canon.get(actual) {
+                return Some(c.clone());
+            }
+            if actual == &cur {
+                break;
+            }
+            cur = actual.clone();
+        }
+        None
+    };
+    // The same for a driver's left-hand side: a reference into the top
+    // scope may be written with the scope's name (`top.b`) or from the root
+    // (`$root.top.b`), and both name the top scope's `b` (§23.6).
+    let alias_lookup_lhs = |e: &Expression| -> Option<String> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if !h.path.iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        let flat = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        // A root reference is written `$root.top.b`; elaboration may carry
+        // the root as a path segment of its own.
+        let (flat, rooted) = match flat.strip_prefix("$root.") {
+            Some(rest) => (rest.to_string(), true),
+            None => (flat, h.root.is_some()),
+        };
+        if let Some(c) = alias_lookup_name(&flat) {
+            return Some(c);
+        }
+        // A root reference (`$root.top.b`) names the top scope whatever the
+        // scope it is written in. A plain `top.b` names the top scope too
+        // unless an instance of the design carries that name (§23.6).
+        if !rooted && top_shadowed {
+            return None;
+        }
+        let rest = flat.strip_prefix(top_name.as_str())?.strip_prefix('.')?;
+        alias_canon.get(rest).cloned()
+    };
     // §26.2: a package net driven by its qualified name (`assign
     // nets::w = ...`, a port connected to `nets::w`) is the hoisted bare net
     // `w`. Spelled `nets.w` its drivers were never counted together, so a
@@ -50354,14 +50832,37 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         }
     }
     stage_shared_udp_outputs(elab);
+    // §14.16: a clocking output is a driver of its net, so it takes part in
+    // the net's resolution. It drives a stage of its own when the net has
+    // another driver.
+    stage_shared_clocking_outputs(elab);
     // §28.12 / §21.2.1.5: a net with ONE driver that carries a strength or
     // is a tristate primitive keeps that driver for `%v`; a net several
     // drivers resolve replaces it below.
     let mut single: Vec<(String, StrengthDriver)> = Vec::new();
     for ca in &elab.continuous_assigns {
-        let Some(n) = ident_flat_name(&ca.lhs).filter(|n| elab.nets.contains(n)) else {
+        // §23.3.3.3: the connection of an INOUT port is a copy of the net
+        // onto itself; it contributes no strength of its own.
+        if ca.rhs_parent_scoped
+            && let Some(f) = ident_flat_name(&ca.lhs)
+            && merged_formals.contains(&f)
+        {
             continue;
+        }
+        // §10.11: the group's members are one net, so the strength a driver
+        // records belongs to the group's canonical net.
+        let n = match alias_lookup_lhs(&ca.lhs) {
+            Some(c) => c,
+            None => {
+                let Some(n) = ident_flat_name(&ca.lhs) else {
+                    continue;
+                };
+                alias_lookup_name(&n).unwrap_or(n)
+            }
         };
+        if !elab.nets.contains(&n) {
+            continue;
+        }
         if let Some((ctl, data)) = gate_tristate_parts(ca) {
             single.push((
                 n,
@@ -50414,10 +50915,52 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             && ident_flat_name(&ca.lhs)
                 .is_some_and(|n| elab.signals.get(&n).is_some_and(|s| s.direction.is_some()))
     };
+    // The net a continuous assignment drives, and whether it drives it at
+    // all. A driver of an alias member drives the group's canonical net
+    // (§10.11); a port connection is an implied continuous assignment — a
+    // COPY of the actual into the formal (§23.3.3.2) — and drives nothing;
+    // a hierarchical drive onto a port of an alias group DOES drive the
+    // physical net.
+    let driver_net = |ca: &ContinuousAssignment, hier: bool| -> Option<String> {
+        let flat = ident_flat_name(&ca.lhs);
+        // §23.3.3.3: the connection of an INOUT port is a copy of the net
+        // onto itself; it drives nothing.
+        if ca.rhs_parent_scoped
+            && flat.as_deref().is_some_and(|f| merged_formals.contains(f))
+        {
+            return None;
+        }
+        match alias_lookup_lhs(&ca.lhs) {
+            Some(c) => Some(c),
+            None => {
+                if hier {
+                    None
+                } else {
+                    flat
+                }
+            }
+        }
+    };
     // Keyed by the flat name, borrowed from a single-segment lhs (every
     // inlined connect), so counting costs no copy per assign.
     let mut counts: HashMap<std::borrow::Cow<'_, str>, usize> = HashMap::default();
     for ca in &elab.continuous_assigns {
+        if ca.rhs_parent_scoped
+            && let Some(f) = ident_flat_name(&ca.lhs)
+            && merged_formals.contains(&f)
+        {
+            // §23.3.3.3: the connection of an INOUT port is a copy of the
+            // net onto itself; it drives nothing.
+            continue;
+        }
+        // §10.11: a driver of an alias member drives the group's canonical
+        // net, so it is counted there.
+        if let Some(c) = alias_lookup_lhs(&ca.lhs) {
+            *counts
+                .entry(std::borrow::Cow::Owned(c))
+                .or_insert(0) += 1;
+            continue;
+        }
         if is_hier_port_drive(ca) {
             continue;
         }
@@ -50442,7 +50985,12 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         .iter()
         .map(|p| {
             let lhs = p.materialize_lhs();
-            ident_flat_name(&lhs)
+            // §10.11: a driver of an alias member drives the group's
+            // canonical net.
+            match alias_lookup_lhs(&lhs) {
+                Some(c) => Some(c),
+                None => ident_flat_name(&lhs).map(|n| alias_lookup_name(&n).unwrap_or(n)),
+            }
         })
         .collect();
     for n in pending_lhs.iter().flatten() {
@@ -50559,7 +51107,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // fold reads those undelayed.
     let mut fold_drivers: HashMap<String, (usize, bool)> = HashMap::default();
     for (ca, &hier) in all.iter().zip(&hier_port_drive) {
-        if let Some(n) = ident_flat_name(&ca.lhs).filter(|n| !hier && multi.contains(n)) {
+        if let Some(n) = driver_net(ca, hier).filter(|n| multi.contains(n)) {
             let e = fold_drivers.entry(n).or_insert((0, false));
             e.0 += 1;
             e.1 |= cont_assign_has_own_delay(ca);
@@ -50629,7 +51177,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // of them makes the strengths worth keeping for `%v`.
     let mut strength: HashMap<String, (Vec<StrengthDriver>, bool)> = HashMap::default();
     for (ca, hier) in all.into_iter().zip(hier_port_drive) {
-        let name = ident_flat_name(&ca.lhs).filter(|n| !hier && multi.contains(n));
+        let name = driver_net(&ca, hier).filter(|n| multi.contains(n));
         let Some(name) = name else {
             elab.continuous_assigns.push(ca);
             continue;
@@ -51882,6 +52430,96 @@ fn expand_whole_array_assign(
     }
 }
 
+/// §10.11: the child's own `alias` statements, applied to the instance's
+/// port connections.
+///
+/// An alias statement names ONE physical net. When the names it names are
+/// the child's PORTS, the ports are one net, so the actuals they connect to
+/// are one net too: every port of the group takes the FIRST port's actual.
+/// (`shorter u(c1, c2)` with `alias p = q;` inside `shorter` makes `c1` and
+/// `c2` one net — §10.11's "same physical net".)
+///
+/// A group member that is not a port is the child's own net; the group is
+/// recorded for the unification pass, which merges it with the rest of the
+/// group.
+fn apply_child_alias_groups(
+    items: &[ModuleItem],
+    inst_prefix: &str,
+    port_map: &mut HashMap<String, Expression>,
+    alias_groups: &mut Vec<Vec<String>>,
+) {
+    for item in items {
+        let ModuleItem::AliasDecl(terms) = item else {
+            continue;
+        };
+        let Ok(names) = alias_term_names(terms) else {
+            continue;
+        };
+        // The child's OWN nets the statement names: they carry the instance
+        // prefix (`u.x`), so the group stays inside the instance's scope.
+        let mut group: Vec<String> = Vec::with_capacity(names.len());
+        // The first group member that is a PORT carries the group's actual.
+        let mut actual: Option<Expression> = None;
+        // The actuals the group's PORTS connect to: they are the SAME net in
+        // the parent, so they join a parent-scope group.
+        let mut actuals: Vec<String> = Vec::new();
+        for n in &names {
+            if let Some(a) = port_map.get(n).cloned() {
+                if let Some(flat) = whole_net_ident_name(&a) {
+                    if !actuals.contains(&flat) {
+                        actuals.push(flat);
+                    }
+                }
+                match &actual {
+                    None => actual = Some(a),
+                    Some(first) => {
+                        // Every port of the group is the same net: the
+                        // second one takes the first one's actual.
+                        if !same_expr(first, &a) {
+                            port_map.insert(n.clone(), first.clone());
+                        }
+                    }
+                }
+            } else {
+                group.push(cat2(inst_prefix, n));
+            }
+        }
+        if group.len() > 1 {
+            alias_groups.push(group);
+        }
+        // The group's actuals are one net in the parent: they join a
+        // parent-scope group, so the unification pass merges them.
+        if actuals.len() > 1 {
+            alias_groups.push(actuals);
+        }
+    }
+}
+
+/// §10.11: the names an `alias` statement names, in the order written.
+/// Only a WHOLE hierarchical identifier names a net here — a select, a
+/// concatenation or any other expression names a PART of a net (§10.11's
+/// `constant_select` is a bit-level overlay, handled elsewhere), so it is
+/// left out and the caller rejects the statement.
+fn alias_term_names(terms: &[Expression]) -> Result<Vec<String>, ()> {
+    let mut names = Vec::with_capacity(terms.len());
+    for t in terms {
+        let ExprKind::Ident(h) = &t.kind else {
+            return Err(());
+        };
+        if !h.path.iter().all(|s| s.selects.is_empty()) {
+            return Err(());
+        }
+        names.push(
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        );
+    }
+    Ok(names)
+}
+
 fn make_ident_expr(name: &str) -> Expression {
     Expression::new(
         ExprKind::Ident(HierarchicalIdentifier {
@@ -51922,8 +52560,28 @@ fn same_const_expr(a: &Expression, b: &Expression) -> bool {
     }
 }
 
-fn same_const_range(a: &Expression, b: &Expression) -> bool {
-    let bounds = |e: &Expression| -> Option<(i64, i64)> {
+/// Do two expressions name the same thing? Used to compare a port's actual
+/// with another one: two idents with the same path are the same net.
+fn same_expr(a: &Expression, b: &Expression) -> bool {
+    fn flat(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
+                h.path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            _ => None,
+        }
+    }
+    match (flat(a), flat(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn same_const_range(a: &Expression, b: &Expression) -> bool {    let bounds = |e: &Expression| -> Option<(i64, i64)> {
         if let ExprKind::Range(l, r) = &e.kind {
             Some((
                 const_eval_i64_with_params(l, None)?,
