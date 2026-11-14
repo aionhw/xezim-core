@@ -23185,6 +23185,14 @@ fn declared_vector_shape(
                 | DataType::TypeReference { dimensions, .. },
             ) => return !dimensions.is_empty(),
             Some(DataType::Struct(st)) => return st.packed,
+            Some(DataType::Enum(et)) => {
+                // §6.19 / §7.4.1 / §10.3.3: an enum keeps its base's
+                // shape, including a one-bit packed vector or scalar logic.
+                if !et.dimensions.is_empty() {
+                    return true;
+                }
+                dt = et.base_type.as_deref();
+            }
             _ => return false,
         }
     }
