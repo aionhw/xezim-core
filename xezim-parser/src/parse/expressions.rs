@@ -2114,6 +2114,14 @@ impl Parser {
                 let _ = self.eat(TokenKind::RParen);
                 Self::sva_marker("$sva_first_match", vec![seq], self.span_from(start))
             }
+            // §16.12.14 abort properties: `accept_on (b) p`, `reject_on (b)
+            // p` and their `sync_` forms, kept as `$sva_<operator>(b, p)`
+            // for the assertion engine. Table 16-3: the lowest precedence,
+            // so `p` extends as far right as it can.
+            TokenKind::KwAccept_on
+            | TokenKind::KwReject_on
+            | TokenKind::KwSync_accept_on
+            | TokenKind::KwSync_reject_on => self.parse_sva_abort(),
             TokenKind::KwIf => {
                 // LRM §16.12.7 `if (expression_or_dist) property_expr
                 // [else property_expr]`. The LRM defines it by equivalence, so
@@ -3032,6 +3040,27 @@ impl Parser {
         };
         self.in_sva_seq = previous;
         events
+    }
+
+    /// §16.12.14 `accept_on (b) p` and its kin; the keyword is current.
+    fn parse_sva_abort(&mut self) -> Expression {
+        let start = self.current().span.start;
+        let (word, marker) = match self.current_kind() {
+            TokenKind::KwAccept_on => ("accept_on", "$sva_accept_on"),
+            TokenKind::KwReject_on => ("reject_on", "$sva_reject_on"),
+            TokenKind::KwSync_accept_on => ("sync_accept_on", "$sva_sync_accept_on"),
+            _ => ("sync_reject_on", "$sva_sync_reject_on"),
+        };
+        self.bump();
+        if self.eat(TokenKind::LParen).is_none() {
+            self.error(format!(
+                "`{word}` needs its abort condition in parentheses, `{word} (b) p` (IEEE 1800-2017 §16.12.14)"
+            ));
+        }
+        let cond = self.parse_expr_bp(0);
+        self.expect(TokenKind::RParen);
+        let body = self.parse_expr_bp(1);
+        Self::sva_marker(marker, vec![cond, body], self.span_from(start))
     }
 
     /// Wrap a sequence in a marker the assertion engine recognises
