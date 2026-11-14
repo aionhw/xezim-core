@@ -2450,7 +2450,8 @@ fn range_refs_class_header_param(c: &ClassDeclaration, l: &Expression, r: &Expre
 
 /// The unpacked dimensions a class property's element typedef adds after
 /// the declarator's own (§7.4.5): the class's typedef of that name, else an
-/// enclosing module or `$unit` typedef. Empty for any other type.
+/// enclosing module, `$unit` or package typedef (`p::q_t qq[$];`, §26.3).
+/// Empty for any other type.
 fn typedef_row_dims(
     data_type: &DataType,
     local_typedef_dims: &HashMap<String, Vec<UnpackedDimension>>,
@@ -2464,15 +2465,11 @@ fn typedef_row_dims(
     if !dimensions.is_empty() {
         return Vec::new();
     }
-    let n = &name.name.name;
-    local_typedef_dims
-        .get(n)
-        .cloned()
-        .or_else(|| {
-            name.scopes
-                .is_empty()
-                .then(|| TYPEDEF_SHAPES_TLS.with(|c| c.borrow().1.get(n).cloned()))?
-        })
+    name.scopes
+        .is_empty()
+        .then(|| local_typedef_dims.get(&name.name.name).cloned())
+        .flatten()
+        .or_else(|| TYPEDEF_SHAPES_TLS.with(|c| lookup_scoped_type(name, &c.borrow().1).cloned()))
         .unwrap_or_default()
 }
 
