@@ -464,6 +464,21 @@ impl Parser {
                 continue;
             }
 
+            // §16.12.8: `p implies q` holds when `p` does not hold or `q`
+            // does, both evaluated from the same tick: lowered to
+            // `(not p) or q`, which the assertion engine runs. Right
+            // associative, at the `until` level of Table 16-3.
+            if self.in_sva_seq && self.at(TokenKind::KwImplies) {
+                if min_bp > 2 {
+                    break;
+                }
+                self.bump();
+                let rhs = self.parse_expr_bp_ctx(2, no_arrow);
+                let span = self.span_from(start);
+                lhs = Self::sva_bin(BinaryOp::SeqOr, Self::sva_not(lhs, span), rhs, span);
+                continue;
+            }
+
             // §16.12.9 / Table 16-3: the RHS is a right-associated
             // property. Keep a marker to retain its vacuous outcome.
             if self.in_sva_seq
@@ -1999,7 +2014,22 @@ impl Parser {
             // LRM §16.12.6 strong temporal operators in property context.
             // Parse as a prefix unary expression: `s_eventually <expr>`,
             // `s_always <expr>`. The SVA executor treats these as
-            // future-cycle obligations.
+            // future-cycle obligations. A bracketed range takes
+            // `parse_sva_ranged_operator`.
+            TokenKind::KwS_eventually | TokenKind::KwEventually
+                if self.peek_kind() == TokenKind::LBracket =>
+            {
+                self.parse_sva_ranged_operator()
+            }
+            TokenKind::KwEventually => {
+                // §16.12.13: `eventually` is only the ranged weak form.
+                self.error(
+                    "`eventually` needs a bounded range, `eventually [m:n] p` (IEEE 1800-2017 §16.12.13)"
+                        .to_string(),
+                );
+                self.bump();
+                self.parse_expr_bp(3)
+            }
             TokenKind::KwS_eventually => {
                 let start = self.current().span.start;
                 self.bump();
@@ -2011,6 +2041,11 @@ impl Parser {
                     },
                     self.span_from(start),
                 )
+            }
+            TokenKind::KwS_always | TokenKind::KwAlways
+                if self.peek_kind() == TokenKind::LBracket =>
+            {
+                self.parse_sva_ranged_operator()
             }
             // §16.12.11: `always p` shares the `s_always` node. An always
             // block is parsed at item level and never reaches this arm.
@@ -2026,32 +2061,34 @@ impl Parser {
                     self.span_from(start),
                 )
             }
-            // LRM §16.12.5 — `nexttime <expr>` and `s_nexttime <expr>`.
-            // Desugar to `Binary{HashHash, 1, expr}` which the SVA
-            // executor already treats as a 1-cycle delay.
+            // LRM §16.12.10 — `nexttime [n] <expr>` and `s_nexttime [n]
+            // <expr>`, `n` defaulting to 1. Desugar to `Binary{HashHash, n,
+            // expr}`, which the SVA executor already treats as an n-cycle
+            // delay. `s_nexttime` of a sequence is the strong form, which
+            // fails when the clock stops before the n-th tick.
             TokenKind::KwNexttime | TokenKind::KwS_nexttime => {
                 let start = self.current().span.start;
+                let strong = self.at(TokenKind::KwS_nexttime);
                 self.bump();
+                let count = if self.eat(TokenKind::LBracket).is_some() {
+                    let n = self.parse_expr_bp(0);
+                    self.expect(TokenKind::RBracket);
+                    n
+                } else {
+                    Self::sva_int("1", self.span_from(start))
+                };
                 let operand = self.parse_expr_bp(3);
-                let one = Expression::new(
-                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                        size: None,
-                        signed: false,
-                        base: crate::ast::expr::NumberBase::Decimal,
-                        value: "1".to_string(),
-                        cached_val: crate::ast::cache::LiteralCache::new(None),
-                    }),
-                    self.span_from(start),
-                );
-                Expression::new(
-                    ExprKind::Binary {
-                        op: BinaryOp::HashHash,
-                        left: Box::new(one),
-                        right: Box::new(operand),
-                    },
-                    self.span_from(start),
-                )
+                let span = self.span_from(start);
+                let strong = strong && !Self::sva_property_ast(&operand);
+                let delayed = Self::sva_bin(BinaryOp::HashHash, count, operand, span);
+                if strong {
+                    Self::sva_marker("$sva_strong", vec![delayed], span)
+                } else {
+                    delayed
+                }
             }
+            // §16.12.16: the property `case`.
+            TokenKind::KwCase if self.in_sva_seq => self.parse_sva_property_case(),
             // LRM §16.12.9 — `not property_expr`: the property holds iff the
             // operand does NOT. For a boolean property (the common assertion
             // form, e.g. `not (a && b)`) this is logical negation, so desugar to
@@ -3032,6 +3069,256 @@ impl Parser {
         };
         self.in_sva_seq = previous;
         events
+    }
+
+    /// A decimal integer literal for a lowered SVA form.
+    fn sva_int(v: &str, span: Span) -> Expression {
+        Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: crate::ast::expr::NumberBase::Decimal,
+                value: v.to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        )
+    }
+
+    fn sva_bin(op: BinaryOp, left: Expression, right: Expression, span: Span) -> Expression {
+        Expression::new(
+            ExprKind::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        )
+    }
+
+    fn sva_not(operand: Expression, span: Span) -> Expression {
+        Expression::new(
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand: Box::new(operand),
+            },
+            span,
+        )
+    }
+
+    /// §16.12.11 / §16.12.13: `always [m:n] p`, `s_always [m:n] p`,
+    /// `eventually [m:n] p` and `s_eventually [m:n] p` (also `[m:$]` for
+    /// `always` and `s_eventually`), lowered onto forms the assertion engine
+    /// already runs:
+    ///
+    /// ```text
+    /// eventually [m:n] s    ==  weak(##[m:n] s)
+    /// s_eventually [m:n] s  ==  strong(##[m:n] s)
+    /// always [m:n] b        ==  weak(##m b[*n-m+1])
+    /// s_always [m:n] b      ==  strong(##m b[*n-m+1])
+    /// always [m:$] b        ==  (1 ##m 1) |-> always b
+    /// ```
+    ///
+    /// The `always` forms take a Boolean operand and the `eventually` forms a
+    /// sequence. Other operands are reported, not run with other semantics.
+    /// The keyword is current and `[` follows it.
+    fn parse_sva_ranged_operator(&mut self) -> Expression {
+        let start = self.current().span.start;
+        let kind = self.current_kind();
+        let word = match kind {
+            TokenKind::KwEventually => "eventually",
+            TokenKind::KwS_eventually => "s_eventually",
+            TokenKind::KwAlways => "always",
+            _ => "s_always",
+        };
+        self.bump();
+        self.bump(); // `[`
+        let lo = self.parse_expr_bp(0);
+        let hi = if self.eat(TokenKind::Colon).is_some() {
+            self.parse_expr_bp(0)
+        } else {
+            lo.clone()
+        };
+        self.expect(TokenKind::RBracket);
+        let unbounded = matches!(hi.kind, ExprKind::Dollar);
+        let operand = self.parse_expr_bp(3);
+        let span = self.span_from(start);
+        match kind {
+            TokenKind::KwEventually | TokenKind::KwS_eventually => {
+                if kind == TokenKind::KwEventually && unbounded {
+                    self.error(
+                        "`eventually` needs a bounded range, `eventually [m:n] p` (IEEE 1800-2017 §16.12.13)"
+                            .to_string(),
+                    );
+                }
+                if Self::sva_property_ast(&operand) {
+                    self.error(format!(
+                        "`{word} [m:n]` of a property is not supported; only of a sequence or Boolean (IEEE 1800-2017 §16.12.13)"
+                    ));
+                }
+                let range = Expression::new(ExprKind::Range(Box::new(lo), Box::new(hi)), span);
+                let delayed = Self::sva_bin(BinaryOp::HashHash, range, operand, span);
+                let marker = if kind == TokenKind::KwS_eventually {
+                    "$sva_strong"
+                } else {
+                    "$sva_weak"
+                };
+                Self::sva_marker(marker, vec![delayed], span)
+            }
+            _ => {
+                if Self::sva_temporal_ast(&operand) {
+                    self.error(format!(
+                        "`{word} [m:n]` of a sequence or property is not supported; only of a Boolean (IEEE 1800-2017 §16.12.11)"
+                    ));
+                }
+                if unbounded {
+                    if kind == TokenKind::KwS_always {
+                        self.error(
+                            "`s_always` needs a bounded range, `s_always [m:n] p` (IEEE 1800-2017 §16.12.11)"
+                                .to_string(),
+                        );
+                    }
+                    // The antecedent `1 ##m 1` ends at the m-th tick, where
+                    // `always b` starts.
+                    let tick =
+                        Self::sva_bin(BinaryOp::HashHash, lo, Self::sva_int("1", span), span);
+                    let ante =
+                        Self::sva_bin(BinaryOp::SeqAnd, Self::sva_int("1", span), tick, span);
+                    let always = Expression::new(
+                        ExprKind::Unary {
+                            op: UnaryOp::SAlways,
+                            operand: Box::new(operand),
+                        },
+                        span,
+                    );
+                    return Self::sva_bin(BinaryOp::OrMinusArrow, ante, always, span);
+                }
+                let width = Self::sva_bin(
+                    BinaryOp::Add,
+                    Self::sva_bin(BinaryOp::Sub, hi, lo.clone(), span),
+                    Self::sva_int("1", span),
+                    span,
+                );
+                let rep =
+                    Self::sva_marker("$sva_rep_consec", vec![operand, width.clone(), width], span);
+                let delayed = Self::sva_bin(BinaryOp::HashHash, lo, rep, span);
+                let marker = if kind == TokenKind::KwS_always {
+                    "$sva_strong"
+                } else {
+                    "$sva_weak"
+                };
+                Self::sva_marker(marker, vec![delayed], span)
+            }
+        }
+    }
+
+    /// §16.12.16 `case (e) item {, item} : p; ... [default [:] p;] endcase`,
+    /// lowered like the property `if`: each item's property is guarded by its
+    /// match and by no earlier item matching, and the arms are joined by the
+    /// property `and`:
+    ///
+    /// ```text
+    /// case (s) e1: p1; default: pd; endcase
+    ///     ==  (s === e1 |-> p1) and (!(s === e1) |-> pd)
+    /// ```
+    ///
+    /// With no item matching and no default, the property holds vacuously.
+    fn parse_sva_property_case(&mut self) -> Expression {
+        let start = self.current().span.start;
+        self.bump(); // `case`
+        self.expect(TokenKind::LParen);
+        let sel = self.parse_expr_bp(0);
+        self.expect(TokenKind::RParen);
+        let mut matched: Option<Expression> = None;
+        let mut arms: Vec<Expression> = Vec::new();
+        let mut default: Option<Expression> = None;
+        while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
+            if self.eat(TokenKind::KwDefault).is_some() {
+                let _ = self.eat(TokenKind::Colon);
+                let p = self.parse_expr_bp(0);
+                self.expect(TokenKind::Semicolon);
+                if default.is_some() {
+                    self.error(
+                        "a property case has more than one default item (IEEE 1800-2017 §16.12.16)"
+                            .to_string(),
+                    );
+                }
+                default = Some(p);
+                continue;
+            }
+            let mut cond: Option<Expression> = None;
+            loop {
+                let item = self.parse_expr_bp(0);
+                let span = self.span_from(start);
+                let eq = Self::sva_bin(BinaryOp::CaseEq, sel.clone(), item, span);
+                cond = Some(match cond {
+                    None => eq,
+                    Some(c) => Self::sva_bin(BinaryOp::LogOr, c, eq, span),
+                });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Colon);
+            let p = self.parse_expr_bp(0);
+            self.expect(TokenKind::Semicolon);
+            let span = self.span_from(start);
+            let Some(cond) = cond else { break };
+            let guard = match &matched {
+                None => cond.clone(),
+                Some(m) => Self::sva_bin(
+                    BinaryOp::LogAnd,
+                    Self::sva_not(m.clone(), span),
+                    cond.clone(),
+                    span,
+                ),
+            };
+            arms.push(Self::sva_bin(BinaryOp::OrMinusArrow, guard, p, span));
+            matched = Some(match matched {
+                None => cond,
+                Some(m) => Self::sva_bin(BinaryOp::LogOr, m, cond, span),
+            });
+        }
+        self.expect(TokenKind::KwEndcase);
+        let span = self.span_from(start);
+        if let Some(p) = default {
+            arms.push(match matched {
+                None => p,
+                Some(m) => Self::sva_bin(BinaryOp::OrMinusArrow, Self::sva_not(m, span), p, span),
+            });
+        }
+        arms.into_iter()
+            .reduce(|a, b| Self::sva_bin(BinaryOp::SvaAnd, a, b, span))
+            .unwrap_or_else(|| Self::sva_int("1", span))
+    }
+
+    /// Whether an expression uses a property operator, not only sequence
+    /// operators: a lowering through `##[m:n]` cannot take it.
+    fn sva_property_ast(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(x) => Self::sva_property_ast(x),
+            ExprKind::Binary { op, left, right } => {
+                matches!(
+                    op,
+                    BinaryOp::OrMinusArrow
+                        | BinaryOp::OrFatArrow
+                        | BinaryOp::Iff
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
+                ) || Self::sva_property_ast(left)
+                    || Self::sva_property_ast(right)
+            }
+            ExprKind::Unary { op, operand } => {
+                matches!(op, UnaryOp::SEventually | UnaryOp::SAlways)
+                    || (matches!(op, UnaryOp::LogNot) && Self::sva_temporal_ast(operand))
+                    || Self::sva_property_ast(operand)
+            }
+            ExprKind::SystemCall { name, .. } => matches!(
+                name.as_str(),
+                "$sva_follow_overlap" | "$sva_follow_nonoverlap" | "$sva_strong" | "$sva_weak"
+            ),
+            _ => false,
+        }
     }
 
     /// Wrap a sequence in a marker the assertion engine recognises
