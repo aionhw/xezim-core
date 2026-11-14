@@ -51548,7 +51548,14 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 lhs: acc.lhs,
                 rhs,
                 delay: acc.delay,
-                rhs_parent_scoped: false,
+                // A multi-driver fold merges driver expressions from several
+                // scopes (§23.3.3.7 strand resolution); the merged `$__wres`/
+                // `$__wor` reads are already bound in their own scopes. Mark it
+                // parent-scoped so the simulator does NOT re-infer a parent
+                // scope hint from the folded LHS (`l.n`) and requalify a bare
+                // driver read that collides with a child declaration into the
+                // folded net itself (self-read -> x).
+                rhs_parent_scoped: true,
                 delay_fall: acc.delay_fall,
                 delay_off: acc.delay_off,
             });
