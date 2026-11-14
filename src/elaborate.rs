@@ -32768,6 +32768,18 @@ fn collect_stmt_declared_types(
                 collect_stmt_declared_types(f, out);
             }
         }
+        // §16.3: an immediate assertion's pass and fail statements may
+        // declare block-locals, as `collect_stmt_declared_names` collects;
+        // without their types a member access through one escaped the
+        // §8.18 visibility check.
+        StatementKind::Assertion(a) => {
+            if let Some(s) = &a.action {
+                collect_stmt_declared_types(s, out);
+            }
+            if let Some(s) = &a.else_action {
+                collect_stmt_declared_types(s, out);
+            }
+        }
         _ => {}
     }
 }
