@@ -308,3 +308,29 @@ endmodule
     };
     assert!(xezim_core::elaborate::struct_pattern_replication(items, 2).is_none());
 }
+
+/// §10.9.2, A.6.7.1: the count of a replicated constant structure is a
+/// constant expression. A parameter, a localparam and a constant operation
+/// count like a literal.
+#[test]
+fn constant_expression_counts_fold_constant_structures() {
+    let design = elaborate(
+        r#"
+module top;
+  parameter int P = 2;
+  localparam int L = 1 + 1;
+  typedef struct { int a; int b; } pair_t;
+  typedef struct packed { bit [7:0] a, b, c, d; } four_t;
+  localparam pair_t KP = '{P{5}};
+  localparam pair_t KL = '{L{6}};
+  localparam pair_t KE = '{(P - 1 + 1){7}};
+  localparam four_t KF = '{L{8'h12, 8'h34}};
+endmodule
+"#,
+    );
+    let pair = |name: &str| design.parameters[name].to_u64();
+    assert_eq!(pair("KP"), Some((5 << 32) | 5));
+    assert_eq!(pair("KL"), Some((6 << 32) | 6));
+    assert_eq!(pair("KE"), Some((7 << 32) | 7));
+    assert_eq!(pair("KF"), Some(0x1234_1234));
+}
