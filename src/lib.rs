@@ -2,6 +2,9 @@
 //! artifact format used by both the `xezim` bytecode interpreter and the
 //! `xezim-b` native compiler.
 
+#[macro_use]
+mod stdio;
+
 // Rust permits exactly ONE `#[global_allocator]` per binary, so this lives here
 // rather than in the `xezim` bin: declaring it in the shared library means the
 // xezim binary, xezim-b, AND every test binary get it, whereas a declaration in
@@ -57,6 +60,7 @@ pub fn release_free_memory() {
 /// `XEZIM_COMPILE_PHASES`: print the wall time of one elaboration pass,
 /// measured from `since`, and restart the clock.
 pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
+    oom_trace::checkpoint(label, &[]);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("XEZIM_COMPILE_PHASES").is_some()) {
         eprintln!(
@@ -69,6 +73,7 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
 }
 
 mod ast_intern;
+pub mod oom_trace;
 pub mod bits2;
 mod body_type_params;
 pub mod elaborate;
@@ -77,6 +82,8 @@ mod param_override_lists;
 pub mod scope_tree;
 pub mod shared_names;
 mod unit_subroutine_usage;
+#[cfg(test)]
+mod unit_assertion_retention_tests;
 pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;
@@ -204,7 +211,14 @@ pub use value::Value;
 /// constructs.
 /// \x3c = \x3b + the full path of a `disable` target (§9.6.2).
 /// \x3d = \x3c + clocking skew edges (§14.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x3d";
+/// \x3e = \x3d + per-driver primitive fall delays (§28.16); old elaborations
+/// kept only the last primitive's delay on the shared net and lost its owner.
+/// ContinuousAssignment::gate_delay_fall keeps this metadata separate from
+/// the ordinary transition fields used by legacy primitive and net delays.
+/// \x3f = \x3e + assignment target bits/vector shape and declared vector nets (§10.3.3).
+/// \x40 = \x3f + corrected constant real math and signature parameter types (§11.2.1, §6.20.2).
+/// \x41 = \x40 + constant operand contexts, typed function storage and unit parameter scope (§11.8.2, §13.4.1, §3.12.1).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x41";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -387,6 +401,8 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the file size and decompression info.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
+    let _oom_trace = oom_trace::session();
+    let _oom_read = oom_trace::scope("read compiled artifact", path, "", "");
     let _name_registry = shared_names::registry_scope();
     use std::io::Read;
 
@@ -1070,11 +1086,18 @@ pub fn preprocess_design(
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
 ) -> PreprocessedSources {
+    let _oom_trace = oom_trace::session();
     let mut pp = new_design_preprocessor(include_dirs, defines);
     let mut texts = Vec::with_capacity(sources.len());
     let mut line_maps = Vec::with_capacity(sources.len());
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
+        let _oom_source = oom_trace::scope(
+            "preprocess",
+            source_files.get(i).map(String::as_str).unwrap_or("<unnamed>"),
+            "",
+            "",
+        );
         pp.begin_top_level_file();
         texts.push(pp.preprocess_file(source, source_path.as_deref()));
         line_maps.push(pp.take_line_map());
@@ -1155,6 +1178,8 @@ pub fn parse_and_elaborate_multi_preprocessed(
     ),
     String,
 > {
+    let _oom_trace = oom_trace::session();
+    let _census_session = sv_parser::census_session();
     let mut pre = pre.filter(|p| p.matches(sources, source_files, include_dirs, defines));
     if let Some(p) = pre.as_ref() {
         if p.default_nettype_none {
@@ -1195,6 +1220,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("<unnamed>");
+        let _oom_source = oom_trace::scope("preprocess", label, "", "");
         if compile_verbose() {
             eprintln!("[compile] ({}/{}) parsing {}", i + 1, sources.len(), label);
         } else {
@@ -1235,7 +1261,21 @@ pub fn parse_and_elaborate_multi_preprocessed(
             ));
         }
 
+        oom_trace::checkpoint(
+            "lex",
+            &[
+                ("source_bytes", source.len()),
+                ("preprocessed_bytes", preprocessed.len()),
+            ],
+        );
         let tokens = lexer::Lexer::new(&preprocessed).tokenize();
+        oom_trace::checkpoint(
+            "parse",
+            &[
+                ("tokens", tokens.len()),
+                ("preprocessed_bytes", preprocessed.len()),
+            ],
+        );
         let mut parser = sv_parser::parse::Parser::new(tokens);
         let source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
@@ -1323,6 +1363,13 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 src_file_of_module.entry(name.clone()).or_insert(i as u32);
             }
         }
+        oom_trace::checkpoint(
+            "parsed file",
+            &[
+                ("descriptions", source_ast.descriptions.len()),
+                ("preprocessed_bytes", preprocessed.len()),
+            ],
+        );
         all_descriptions.extend(source_ast.descriptions);
         preprocessed_texts.push(preprocessed);
         line_maps.push(line_map);
@@ -1722,6 +1769,7 @@ fn parse_and_elaborate(
     ),
     String,
 > {
+    let _oom_prepare = oom_trace::scope("prepare definitions", "", "", "");
     let _name_registry = shared_names::registry_scope();
     let _declaration_order_scope = elaborate::declaration_order_scope();
     // Every elaboration starts from the same state, whatever the thread
@@ -2352,6 +2400,7 @@ fn parse_and_elaborate(
     let unit_carrier = if top_level_functions.is_empty()
         && top_level_tasks.is_empty()
         && top_level_params.is_empty()
+        && top_level_assertion_decls.is_empty()
     {
         None
     } else if let Some(name) = named_top {
@@ -2396,6 +2445,38 @@ fn parse_and_elaborate(
         &top_level_dpi_exports,
     ));
 
+    // §3.12.1 / §16.8 / §16.12: retain unused unit properties/sequences on
+    // the carrier for validation, rather than cloning their expression trees
+    // into every unrelated definition. A use anywhere conservatively keeps
+    // its declaration and dependencies everywhere, including hierarchical
+    // references from another module.
+    let unit_assertion_usage = unit_subroutine_usage::Usage::assertions(&top_level_assertion_decls);
+    let mut needed_unit_assertions = unit_assertion_usage.references(&(
+        (&top_level_functions, &top_level_tasks, &top_level_nettypes),
+        (&top_level_vars, &top_level_nets, &top_level_covergroups),
+        (&top_level_dpi_imports, &top_level_dpi_exports),
+        (
+            &top_level_lets,
+            &top_level_binds,
+            &top_level_ooc_constraints,
+        ),
+        (&top_level_imports, &class_defs, &typedef_defs),
+    ));
+    if !top_level_assertion_decls.is_empty() {
+        for def in definitions.values() {
+            let references = match def {
+                SourceDefinition::Module(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Interface(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Program(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Class(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Package(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Typedef(d) => unit_assertion_usage.references(d),
+                SourceDefinition::Udp(d) => unit_assertion_usage.references(d),
+            };
+            needed_unit_assertions.extend(references);
+        }
+    }
+
     // §3.12.1 / §6.20: compilation-unit constants need not become owned
     // declarations and parameter/signal/type entries in every unrelated
     // definition and instance. Retain all constants on the root carrier for
@@ -2435,8 +2516,10 @@ fn parse_and_elaborate(
     let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         needed_unit_params.extend(unit_param_usage.references(&top_level_params));
+        needed_unit_assertions.extend(unit_assertion_usage.references(&top_level_assertion_decls));
     }
     let needed_unit_params = unit_param_usage.close(needed_unit_params);
+    let needed_unit_assertions = unit_assertion_usage.close(needed_unit_assertions);
 
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
@@ -2451,7 +2534,28 @@ fn parse_and_elaborate(
         || !top_level_dpi_imports.is_empty()
         || !top_level_dpi_exports.is_empty()
     {
+        let _oom_unit = oom_trace::scope("compilation-unit declarations", "", "", "");
         for (def_name, def) in definitions.iter_mut() {
+            let _oom_definition = if oom_trace::enabled() {
+                let definition = match &*def {
+                    SourceDefinition::Module(d) => Some(elaborate::Definition::Module(d)),
+                    SourceDefinition::Interface(d) => Some(elaborate::Definition::Interface(d)),
+                    SourceDefinition::Program(d) => Some(elaborate::Definition::Program(d)),
+                    _ => None,
+                };
+                definition.map(|d| oom_trace::definition(d, "inject unit declarations", ""))
+            } else {
+                None
+            };
+            oom_trace::checkpoint(
+                "inject unit declarations",
+                &[
+                    ("unit_variables", top_level_vars.len()),
+                    ("unit_nets", top_level_nets.len()),
+                    ("unit_parameters", top_level_params.len()),
+                    ("unit_assertions", top_level_assertion_decls.len()),
+                ],
+            );
             let retain_all = unit_carrier.as_ref().is_none_or(|name| name == def_name);
             // §3.12.1 / §13.4.3: programs and interfaces share compilation-
             // unit declarations with modules, including constant functions.
@@ -2512,6 +2616,21 @@ fn parse_and_elaborate(
                             )
                         }),
                 );
+                shadowed_unit_vars.extend(top_level_params.iter().flat_map(|p| {
+                    match &p.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } => assignments
+                            .iter()
+                            .filter(|a| local_decl_names.contains(&a.name.name))
+                            .map(|a| {
+                                (
+                                    a.name.name.clone(),
+                                    sv_parser::unit_scope_name(&a.name.name),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    }
+                }));
                 let subst_body = |items: &[ast::stmt::Statement],
                                   ports: &[ast::decl::FunctionPort]|
                  -> Option<Vec<ast::stmt::Statement>> {
@@ -2598,6 +2717,12 @@ fn parse_and_elaborate(
                 };
                 for d in top_level_assertion_decls.iter().rev() {
                     let n = decl_name(d);
+                    if !retain_all
+                        && n.as_ref()
+                            .is_some_and(|name| !needed_unit_assertions.contains(name))
+                    {
+                        continue;
+                    }
                     if !items
                         .iter()
                         .any(|it| decl_name(it).is_some() && decl_name(it) == n)
@@ -2616,21 +2741,14 @@ fn parse_and_elaborate(
                         items.insert(0, ast::decl::ModuleItem::CovergroupDeclaration(cg.clone()));
                     }
                 }
-                // $unit-scope parameters become body localparams (constants):
-                // visible inside the module, not part of its override interface.
-                // A module-local declaration of the same name SHADOWS the $unit
-                // one (LRM §3.12.1 name resolution) — skip injecting any $unit
-                // param the module already declares, else the two collide as a
-                // "Duplicate declaration". The skip is per DECLARATOR: with
-                // `localparam int A = 1, B = 2;` at $unit scope and a module
-                // declaring only `B`, dropping the whole declaration would have
-                // lost `A` and keeping it re-declared `B`.
+                // §3.12.1: keep shadowed constants under their qualified
+                // names, and bind dependent initializers/ranges to that copy.
                 for p in top_level_params.iter().rev() {
                     let needed = |name: &str| retain_all || needed_unit_params.contains(name);
                     let keep = match &p.kind {
-                        ast::decl::ParameterKind::Data { assignments, .. } => assignments
-                            .iter()
-                            .any(|a| !local_decl_names.contains(&a.name.name) && needed(&a.name.name)),
+                        ast::decl::ParameterKind::Data { assignments, .. } => {
+                            assignments.iter().any(|a| needed(&a.name.name))
+                        }
                         ast::decl::ParameterKind::Type { assignments } => {
                             assignments.iter().any(|a| needed(&a.name.name))
                         }
@@ -2638,12 +2756,20 @@ fn parse_and_elaborate(
                     if !keep {
                         continue;
                     }
-                    let mut p = p.clone();
+                    let mut p = if shadowed_unit_vars.is_empty() {
+                        p.clone()
+                    } else {
+                        elaborate::substitute_bare_idents_param(p, &shadowed_unit_vars)
+                    };
                     match &mut p.kind {
                         ast::decl::ParameterKind::Data { assignments, .. } => {
-                            assignments.retain(|a| {
-                                !local_decl_names.contains(&a.name.name) && needed(&a.name.name)
-                            });
+                            assignments.retain(|a| needed(&a.name.name));
+                            for assignment in assignments.iter_mut() {
+                                if local_decl_names.contains(&assignment.name.name) {
+                                    assignment.name.name =
+                                        sv_parser::unit_scope_name(&assignment.name.name);
+                                }
+                            }
                             if assignments.is_empty() {
                                 continue;
                             }
@@ -2722,6 +2848,12 @@ fn parse_and_elaborate(
                     }
                     items.insert(0, ast::decl::ModuleItem::NetDeclaration(net));
                 }
+                oom_trace::checkpoint(
+                    "unit declarations injected",
+                    &[
+                        ("module_items", items.len()),
+                    ],
+                );
             }
         }
     }
@@ -3192,6 +3324,7 @@ fn parse_and_elaborate(
     // §3.12.1/§6.20/§23.11: evaluate the compilation unit's bind
     // constants with ordinary typed parameter elaboration, before a top's
     // declarations can shadow them.
+    let _unit_bind_instances = elaborate::unit_bind_instances_scope(&top_level_binds);
     let unit_bind_params = if top_level_binds.is_empty() {
         crate::hasher::HashMap::default()
     } else {
@@ -3424,6 +3557,7 @@ fn parse_and_elaborate(
         try_size("specify_delays   ", bincode::serde::encode_to_vec(&elab.specify_delays, cfg));
     }
     elab_phase("post-inline passes", &mut phase_t);
+    oom_trace::model("elaboration complete", &elab, None);
     Ok((definitions, elab))
 }
 

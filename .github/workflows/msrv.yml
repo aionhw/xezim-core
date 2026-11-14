@@ -4,11 +4,19 @@ on:
   push:
   pull_request:
 
+env:
+  CC: clang
+  CXX: clang++
+  AR: llvm-ar
+  RANLIB: llvm-ranlib
+
 jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-llvm
 
       # `cargo msrv verify` downloaded the Rust release index on every run
       # and failed the job with "HTTP error: http status: 429" whenever that
@@ -39,9 +47,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-msrv-${{ env.MSRV }}-${{ hashFiles('**/Cargo.toml') }}-${{ github.sha }}
+          key: ${{ runner.os }}-msrv-${{ env.MSRV }}-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml') }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-msrv-${{ env.MSRV }}-${{ hashFiles('**/Cargo.toml') }}-
+            ${{ runner.os }}-msrv-${{ env.MSRV }}-${{ hashFiles('**/Cargo.toml', '.cargo/config.toml') }}-
             ${{ runner.os }}-msrv-${{ env.MSRV }}-
 
       - name: Core builds on the MSRV

@@ -48,7 +48,8 @@ The same section is in `../xezim/AGENTS.md`; change both together.
   it. Core's own CI runs only the core and parser tests.
 - **Develop against the local checkout.** Run `../xezim/scripts/use-local-core.sh`
   once; plain `cargo build`/`cargo test` in xezim then uses this checkout
-  through a git-ignored `.cargo/config.toml` `[patch]`. `cargo tree -p xezim-core`
+  through a git-ignored `.cargo/local-core.toml` `[patch]`, included by
+  the tracked `.cargo/config.toml` compiler configuration. `cargo tree -p xezim-core`
   in xezim shows a path when the patch is active.
 - **Validate the exact commit you will pin.** Commit everything here first
   (`git status` clean), then run this repo's tests (`cargo test` and
@@ -61,7 +62,7 @@ The same section is in `../xezim/AGENTS.md`; change both together.
      `rev =` lines to the pushed core `HEAD`
      (`git -C ../xezim-core rev-parse HEAD`).
   3. Check that the pin resolves without the local patch: move
-     `.cargo/config.toml` aside, run `cargo fetch` in xezim, put it back.
+     `.cargo/local-core.toml` aside, run `cargo fetch` in xezim, put it back.
   4. Push xezim, with the commits that need the new core in the same push.
 - **Never pin a core commit that is not on core's `origin/main`**
   (`git -C ../xezim-core merge-base --is-ancestor <rev> origin/main`). A
@@ -129,9 +130,13 @@ vhdl-lang/                rust_hdl's vhdl_lang + vhdl_lang_macros 0.88 (MPL-2.0)
 
 ## Build & test
 
-Toolchain: Rust **1.92** MSRV (`rust-version` in `Cargo.toml`), edition 2024.
+Toolchain: Rust **1.100** MSRV (`rust-version` in `Cargo.toml`), edition 2024.
 CI (`test.yml`) runs core and parser tests separately; `msrv.yml` verifies
 both crates. The parser is a path dependency, not a workspace member.
+
+Native C/C++ builds use Clang and LLVM archive tools. Install `clang`,
+`clang++`, `llvm-ar` and `llvm-ranlib` on `PATH`. Linux x86_64 Rust links
+use Clang with the Rust toolchain's bundled LLD.
 
 ```bash
 cargo build                          # debug
@@ -185,10 +190,10 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
   this is the shared lib — declaring it here covers xezim, xezim-b, and every
   test binary. **Never add another `#[global_allocator]`.** A consumer opting
   out uses `xezim-core = { path = "../xezim-core", default-features = false }`.
-- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x3d"`
+- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x41"`
   (`src/lib.rs`). The last byte is the serialized-format version. When you add
   or change a serialized field in `ElaboratedModule` (or any bincode-serialized
-  type), **bump the version byte** (for example, `\x3d` to `\x3e`) and add one line to the
+  type), **bump the version byte** (for example, `\x40` to `\x41`) and add one line to the
   version-ladder comment above it, so stale `.xez` artifacts fail with a clear "recompile with
   current xezim" error instead of deserializing garbage.
 - **Artifacts are zstd-compressed bincode 2** (serde, standard configuration).
@@ -209,7 +214,7 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
 
 ## Coding conventions
 
-snake_case; Rust 2024 edition; MSRV 1.92 (`rust-version` in `Cargo.toml`);
+snake_case; Rust 2024 edition; MSRV 1.100 (`rust-version` in `Cargo.toml`);
 clippy-clean. Modules carry `//!` doc comments. Hard fixes get explanatory
 comments with **LRM § citations** (e.g. `§6.6.7`) and regression tests
 referencing the same section. User-facing errors are `Result<_, String>` /

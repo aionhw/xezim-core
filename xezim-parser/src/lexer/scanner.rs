@@ -201,6 +201,7 @@ impl<'a> Lexer<'a> {
             }
             tokens.push(self.scan_token());
         }
+        tokens.shrink_to_fit();
         tokens
     }
 

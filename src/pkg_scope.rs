@@ -64,7 +64,7 @@ pub fn member_is_qualified(name: &str) -> bool {
 /// What a package declares and imports, for owner lookups.
 #[derive(Default)]
 struct PkgInfo {
-    /// Typedef and class names declared directly in the package.
+    /// Typedef, nettype and class names declared directly in the package.
     types: HashSet<String>,
     /// Members of the package's own enum typedefs.
     members: HashSet<String>,
@@ -908,6 +908,11 @@ fn collect(descs: &[Description]) -> Option<Info> {
                             pi.types.insert(td.name.name.clone());
                             enum_members(&td.data_type, &mut pi.members);
                         }
+                        // §6.6.7 / §26.3: nettypes retain their package identity
+                        // under the same import rules as other named types.
+                        PackageItem::Nettype(n) => {
+                            pi.types.insert(n.name.name.clone());
+                        }
                         PackageItem::Class(c) => {
                             pi.types.insert(c.name.name.clone());
                         }
@@ -943,6 +948,9 @@ fn collect(descs: &[Description]) -> Option<Info> {
             }
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
                 other.insert(c.name.name.clone());
+            }
+            Description::PackageItem(PackageItem::Nettype(n)) => {
+                other.insert(n.name.name.clone());
             }
             Description::PackageItem(PackageItem::Covergroup(cg)) => {
                 other.insert(cg.name.name.clone());
@@ -1149,6 +1157,9 @@ fn module_level_types(
                 out.insert(td.name.name.clone());
                 enum_members(&td.data_type, members);
             }
+            ModuleItem::NettypeDeclaration(n) => {
+                out.insert(n.name.name.clone());
+            }
             ModuleItem::DataDeclaration(d) => enum_members(&d.data_type, members),
             ModuleItem::ClassDeclaration(c) => {
                 out.insert(c.name.name.clone());
@@ -1217,6 +1228,9 @@ fn unit_frame(descs: &[Description]) -> Frame {
             }
             Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
                 f.types.insert(c.name.name.clone());
+            }
+            Description::PackageItem(PackageItem::Nettype(n)) => {
+                f.types.insert(n.name.name.clone());
             }
             // §26.3: a `$unit` import counts from where it appears; the walk
             // adds it then (`Rw::description`).
@@ -3313,7 +3327,12 @@ impl Rw<'_> {
                 self.frames.pop();
             }
             PackageItem::Let(l) => self.expr(&mut l.expr),
-            PackageItem::Nettype(n) => self.dtype(&mut n.data_type),
+            PackageItem::Nettype(n) => {
+                if let Some(m) = renamed(&n.name.name) {
+                    n.name.name = m;
+                }
+                self.dtype(&mut n.data_type);
+            }
             PackageItem::Property(p) => {
                 p.items.iter_mut().for_each(|s| self.stmt(s));
                 self.opt(&mut p.body);
@@ -3378,14 +3397,16 @@ impl Rw<'_> {
                 self.unpacked(&mut td.dimensions);
             }
             Description::ImportDecl(imp) => {
-                self.import_decl(imp);
+                // §26.3: keep the source spelling in the lexical frame before
+                // rewriting a colliding declaration to its qualified key.
                 self.unit_import(imp);
+                self.import_decl(imp);
             }
             Description::PackageItem(pi) => {
-                self.package_item(None, pi);
                 if let PackageItem::Import(imp) = pi {
                     self.unit_import(imp);
                 }
+                self.package_item(None, pi);
             }
             Description::DPIImport(di) => self.dpi(&mut di.proto),
             Description::DPIExport(de) => self.dpi(&mut de.proto),
@@ -3424,6 +3445,9 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             ModuleItem::TypedefDeclaration(td) => {
                 f.types.insert(td.name.name.clone());
                 enum_members(&td.data_type, &mut f.values);
+            }
+            ModuleItem::NettypeDeclaration(n) => {
+                f.types.insert(n.name.name.clone());
             }
             ModuleItem::ClassDeclaration(c) => {
                 f.types.insert(c.name.name.clone());

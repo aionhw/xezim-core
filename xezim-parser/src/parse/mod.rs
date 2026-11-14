@@ -271,40 +271,52 @@ impl Parser {
         // was never instantiated and every hierarchical call into it was a
         // no-op.
         let bind_params = self.parse_instantiation_params();
-        if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
+        // §23.11: the bind instantiation is an ordinary instantiation, so it
+        // can name several instances, `bind t c a(), b();`. Only the first
+        // was read, and the comma then dropped the whole directive.
+        let mut instances = Vec::new();
+        let mut complete = false;
+        while self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
             let inst_start = self.current().span.start;
-            let iname = self.parse_identifier();
-            let dims = self.parse_unpacked_dimensions();
-            let conns = self.parse_port_connections();
-            if self.at(TokenKind::Semicolon) {
-                self.bump();
-                let span = self.span_from(start_byte);
-                let instance = crate::ast::decl::HierarchicalInstance {
-                    decl: crate::ast::binding::Bound::UNSET,
-                    name: iname,
-                    dimensions: dims,
-                    connections: conns,
-                    gen_indices: Vec::new(),
-                    span: self.span_from(inst_start),
-                };
-                let instantiation = crate::ast::decl::ModuleInstantiation {
-                    module_name: bind_mod,
-                    params: bind_params,
-                    instances: vec![instance],
-                    scope: None,
-                    span,
-                };
-                return Some(crate::ast::decl::BindDirective {
-                    target_module: target,
-                    target_path,
-                    extra_paths,
-                    gen_scope: String::new(),
-                    instantiation,
-                    span,
-                });
+            let name = self.parse_identifier();
+            let dimensions = self.parse_unpacked_dimensions();
+            let connections = self.parse_port_connections();
+            instances.push(crate::ast::decl::HierarchicalInstance {
+                decl: crate::ast::binding::Bound::UNSET,
+                name,
+                dimensions,
+                connections,
+                gen_indices: Vec::new(),
+                span: self.span_from(inst_start),
+            });
+            if self.eat(TokenKind::Comma).is_none() {
+                complete = true;
+                break;
             }
         }
-        // Heuristic parse failed — rewind and swallow until the next ';'.
+        // `complete` is false when a comma was not followed by an instance.
+        if complete && self.at(TokenKind::Semicolon) {
+            self.bump();
+            let span = self.span_from(start_byte);
+            let instantiation = crate::ast::decl::ModuleInstantiation {
+                module_name: bind_mod,
+                params: bind_params,
+                instances,
+                scope: None,
+                span,
+            };
+            return Some(crate::ast::decl::BindDirective {
+                target_module: target,
+                target_path,
+                extra_paths,
+                gen_scope: String::new(),
+                instantiation,
+                span,
+            });
+        }
+        // Not a bind directive this parser reads. Report it rather than drop
+        // it silently, then rewind and swallow until the next ';'.
+        self.error("bind directive not understood: expected a bind target, a module name and instances (IEEE 1800-2017 §23.11)");
         self.pos = restart;
         let mut depth_paren = 0i32;
         while !self.at(TokenKind::Eof) {

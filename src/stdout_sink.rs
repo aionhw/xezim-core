@@ -157,20 +157,26 @@ impl StdoutSink {
     }
 
     pub fn threaded() -> Self {
+        Self::threaded_with_builder(std::thread::Builder::new().name("xezim-stdout".to_string()))
+    }
+
+    fn threaded_with_builder(builder: std::thread::Builder) -> Self {
         let (tx, rx) = mpsc::channel::<Msg>();
         let (recycle_tx, recycle) = mpsc::channel::<Vec<u8>>();
-        let handle = std::thread::Builder::new()
-            .name("xezim-stdout".to_string())
-            .spawn(move || {
-                // Do NOT hold an exclusive `stdout.lock()` on the worker —
-                // it would deadlock anything on the main thread that
-                // touches stdout (e.g. `println!` after sim.run() returns).
-                // The unlocked `Stdout` handle acquires the lock per write
-                // and releases it between calls.
-                let w = BufWriter::with_capacity(BUF_CAPACITY, io::stdout());
-                run_threaded_writer(rx, w, Some(recycle_tx));
-            })
-            .expect("spawn xezim-stdout writer thread");
+        let handle = builder.spawn(move || {
+            // Do NOT hold an exclusive `stdout.lock()` on the worker —
+            // it would deadlock anything on the main thread that
+            // touches stdout (e.g. `println!` after sim.run() returns).
+            // The unlocked `Stdout` handle acquires the lock per write
+            // and releases it between calls.
+            let w = BufWriter::with_capacity(BUF_CAPACITY, io::stdout());
+            run_threaded_writer(rx, w, Some(recycle_tx));
+        });
+        // A worker may fit under RLIMIT_AS while a second stack does not.
+        // The synchronous sink preserves output when that reservation fails.
+        let Ok(handle) = handle else {
+            return Self::inline();
+        };
         StdoutSink {
             mode: Mode::Threaded {
                 buf: Vec::with_capacity(BUF_CAPACITY),
@@ -350,6 +356,17 @@ impl StdoutSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn writer_thread_reservation_failure_keeps_an_inline_sink() {
+        // A PiB stack exceeds the Linux user address range without consuming
+        // resident memory. Exercise the real spawn error, not a mock writer.
+        let sink =
+            StdoutSink::threaded_with_builder(std::thread::Builder::new().stack_size(1usize << 50));
+        assert!(matches!(sink.mode, Mode::Inline(_)));
+    }
+
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]

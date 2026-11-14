@@ -68,7 +68,7 @@ enum WorkerMsg {
     /// Force the worker's `BufWriter` (and any streaming zstd encoder) to
     /// flush accumulated bytes to the OS file, so a later crash/SIGKILL of
     /// the main process leaves a readable partial dump.
-    Flush,
+    Flush(Option<mpsc::SyncSender<io::Result<()>>>),
     Shutdown,
 }
 
@@ -85,12 +85,15 @@ enum Mode {
 
 pub struct VcdSink {
     mode: Mode,
+    /// Work accepted since the last successful acknowledged flush.
+    dirty: bool,
 }
 
 impl VcdSink {
     pub fn inline(w: DumpWriter) -> Self {
         VcdSink {
             mode: Mode::Inline(BufWriter::new(w)),
+            dirty: false,
         }
     }
 
@@ -120,8 +123,11 @@ impl VcdSink {
                                 write_xtrace_timestep(&mut bw, ts);
                             }
                         }
-                        WorkerMsg::Flush => {
-                            let _ = bw.flush();
+                        WorkerMsg::Flush(reply) => {
+                            let result = bw.flush();
+                            if let Some(reply) = reply {
+                                let _ = reply.send(result);
+                            }
                         }
                         WorkerMsg::Shutdown => break,
                     }
@@ -139,7 +145,41 @@ impl VcdSink {
                 tx: Some(tx),
                 handle: Some(handle),
             },
+            dirty: false,
         }
+    }
+
+    /// §21.7.1.6: return only after preceding output is visible to readers.
+    /// Ordinary asynchronous flushes retain their existing behavior.
+    pub fn flush_sync(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        match &mut self.mode {
+            Mode::Inline(w) => w.flush()?,
+            Mode::Threaded {
+                buf,
+                pending,
+                pending_xt,
+                tx: Some(tx),
+                ..
+            } => {
+                if !buf.is_empty() {
+                    let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
+                    tx.send(WorkerMsg::Chunk(chunk))
+                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                }
+                dispatch_batches(pending, pending_xt, tx);
+                let (reply, done) = mpsc::sync_channel(1);
+                tx.send(WorkerMsg::Flush(Some(reply)))
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                done.recv()
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))??;
+            }
+            Mode::Threaded { .. } => return Err(io::ErrorKind::BrokenPipe.into()),
+        }
+        self.dirty = false;
+        Ok(())
     }
 
     /// Open a dump sink writing to `file`.
@@ -163,6 +203,7 @@ impl VcdSink {
     /// batch (dispatched when the batch is full). In inline mode: format
     /// immediately on the caller thread.
     pub fn post_vcd_changes(&mut self, time: Option<u64>, changes: Vec<(Arc<str>, Value)>) {
+        self.dirty |= time.is_some() || !changes.is_empty();
         match &mut self.mode {
             Mode::Inline(w) => {
                 if let Some(t) = time {
@@ -201,6 +242,7 @@ impl VcdSink {
     /// simulator holds separate sinks for the two dumps), so only the byte
     /// buffer has to be ordered against this one.
     pub fn post_xtrace_changes(&mut self, ts: XtraceTimestep) {
+        self.dirty = true;
         match &mut self.mode {
             Mode::Inline(w) => write_xtrace_timestep(w, &ts),
             Mode::Threaded {
@@ -423,6 +465,7 @@ fn dispatch_batches(
 
 impl Write for VcdSink {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.dirty |= !data.is_empty();
         match &mut self.mode {
             Mode::Inline(w) => w.write(data),
             Mode::Threaded {
@@ -461,7 +504,7 @@ impl Write for VcdSink {
                     let _ = tx.send(WorkerMsg::Chunk(chunk));
                 }
                 dispatch_batches(pending, pending_xt, tx);
-                let _ = tx.send(WorkerMsg::Flush);
+                let _ = tx.send(WorkerMsg::Flush(None));
                 Ok(())
             }
             Mode::Threaded { .. } => Ok(()),
@@ -589,5 +632,85 @@ pub fn write_vcd_value<W: Write>(w: &mut W, val: &Value, id: &str) {
         let _ = writeln!(w, "{}{}", ch, id);
     } else {
         let _ = writeln!(w, "b{} {}", vcd_vector_bits(val), id);
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingWriter(Arc<Mutex<(Vec<u8>, usize)>>);
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().1 += 1;
+            Ok(())
+        }
+    }
+
+    /// §21.7.1.6: flush acknowledges every preceding byte, including work
+    /// already dispatched by an asynchronous flush; clean calls do no IO.
+    #[test]
+    fn acknowledged_flush_tracks_new_work() {
+        let state = Arc::new(Mutex::new((Vec::new(), 0)));
+        let mut sink = VcdSink::threaded(Box::new(RecordingWriter(state.clone())));
+        sink.write_all(b"header\n").unwrap();
+        sink.flush_sync().unwrap();
+        assert_eq!(*state.lock().unwrap(), (b"header\n".to_vec(), 1));
+        for _ in 0..100 {
+            sink.flush_sync().unwrap();
+        }
+        assert_eq!(state.lock().unwrap().1, 1);
+        sink.post_vcd_changes(Some(1), vec![]);
+        sink.flush().unwrap();
+        sink.flush_sync().unwrap();
+        assert_eq!(*state.lock().unwrap(), (b"header\n#1\n".to_vec(), 3));
+    }
+
+    /// §21.7.1.6: hold the writer inside flush so completion cannot be
+    /// confused with enqueueing. Always release it before asserting failure.
+    #[test]
+    fn acknowledged_flush_waits_for_the_writer() {
+        struct GatedWriter {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            gated: bool,
+        }
+        impl Write for GatedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if !self.gated {
+                    self.gated = true;
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+        let (entered, waiting) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (done, returned) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut sink = VcdSink::threaded(Box::new(GatedWriter {
+                entered,
+                release: resume,
+                gated: false,
+            }));
+            sink.write_all(b"data").unwrap();
+            sink.flush_sync().unwrap();
+            done.send(()).unwrap();
+        });
+        waiting.recv().unwrap();
+        let early = returned.recv_timeout(std::time::Duration::from_millis(100));
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        returned.recv().unwrap();
     }
 }
