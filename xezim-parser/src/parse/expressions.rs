@@ -465,8 +465,10 @@ impl Parser {
             }
 
             // §16.12.8: `p implies q` holds when `p` does not hold or `q`
-            // does, both evaluated from the same tick: lowered to
-            // `(not p) or q`, which the assertion engine runs. Right
+            // does, both evaluated from the same tick. Kept as the marker
+            // `$sva_implies(p, q)`: as `(not p) or q` its attempt would be
+            // nonvacuous when `p` fails, where §16.14.8 (z) makes it
+            // vacuous, and an `x` antecedent would fail it. Right
             // associative, at the `until` level of Table 16-3.
             if self.in_sva_seq && self.at(TokenKind::KwImplies) {
                 if min_bp > 2 {
@@ -475,7 +477,7 @@ impl Parser {
                 self.bump();
                 let rhs = self.parse_expr_bp_ctx(2, no_arrow);
                 let span = self.span_from(start);
-                lhs = Self::sva_bin(BinaryOp::SeqOr, Self::sva_not(lhs, span), rhs, span);
+                lhs = Self::sva_marker("$sva_implies", vec![lhs, rhs], span);
                 continue;
             }
 
@@ -3323,7 +3325,11 @@ impl Parser {
             }
             ExprKind::SystemCall { name, .. } => matches!(
                 name.as_str(),
-                "$sva_follow_overlap" | "$sva_follow_nonoverlap" | "$sva_strong" | "$sva_weak"
+                "$sva_follow_overlap"
+                    | "$sva_follow_nonoverlap"
+                    | "$sva_strong"
+                    | "$sva_weak"
+                    | "$sva_implies"
             ),
             _ => false,
         }
