@@ -16,6 +16,7 @@ mod files;
 mod intrinsics;
 mod leaves;
 mod mixed;
+mod nested;
 mod packed;
 mod reflect;
 mod runtime;
@@ -152,6 +153,11 @@ struct Lw<'a> {
     /// declared in an architecture.
     subs_done: BTreeSet<(SubId, usize)>,
     subs_todo: Vec<(SubId, usize)>,
+    /// The objects of enclosing subprograms each nested subprogram takes
+    /// as extra formals (`nested.rs`), computed on first use, and the
+    /// subprograms that are not specialised because of them.
+    captures: Option<BTreeMap<SubId, Vec<ObjId>>>,
+    capture_fixed: BTreeSet<SubId>,
     sub_items: String,
     /// Process being lowered (for waits and drivers).
     cur_proc: Option<usize>,
@@ -196,6 +202,9 @@ struct Lw<'a> {
     /// SV values driving VHDL signals, VHDL signals written to SV.
     fins: Vec<mixed::ForeignIn>,
     fouts: Vec<mixed::ForeignOut>,
+    /// The signals of `inout` ports connected to SystemVerilog, with the
+    /// driver that carries the net's value.
+    inouts: BTreeMap<usize, usize>,
     /// SV module instances (VHDL components bound to SV modules) and their
     /// wires; a counter naming their nets.
     sv_items: String,
@@ -320,6 +329,8 @@ impl<'a> Lw<'a> {
             read_last: false,
             subs_done: BTreeSet::new(),
             subs_todo: Vec::new(),
+            captures: None,
+            capture_fixed: BTreeSet::new(),
             sub_items: String::new(),
             cur_proc: None,
             imps: Vec::new(),
@@ -341,6 +352,7 @@ impl<'a> Lw<'a> {
             boundary,
             fins: Vec::new(),
             fouts: Vec::new(),
+            inouts: BTreeMap::new(),
             sv_items: String::new(),
             sv_wires: String::new(),
             sv_nets: 0,
@@ -1375,6 +1387,7 @@ impl<'a> Lw<'a> {
                 for (p, x) in params.iter().zip(args) {
                     a.extend(self.arg_values(*p, x));
                 }
+                a.extend(self.capture_args(s));
                 format!("{}({})", self.sub_name(s), a.join(", "))
             }
         }
@@ -3729,7 +3742,19 @@ impl<'a> Lw<'a> {
                 );
                 String::new()
             }
-            None if self.needs_spec(sub) => self.spec_call(sub, args, ind, loc),
+            None if self.needs_spec(sub) => {
+                if !self.captures(sub).is_empty() {
+                    self.err(
+                        loc,
+                        format!(
+                            "procedure '{}' waits or assigns signals and names objects of its enclosing subprogram: not supported yet",
+                            info.name
+                        ),
+                    );
+                    return String::new();
+                }
+                self.spec_call(sub, args, ind, loc)
+            }
             None => {
                 if let Some(k) = self.try_specialise(sub, args) {
                     return self.pspec_proc_call(k, args, ind, loc);
@@ -3761,6 +3786,7 @@ impl<'a> Lw<'a> {
                         a.extend(self.arg_values(*p, x));
                     }
                 }
+                a.extend(self.capture_args(sub));
                 format!(
                     "{}{}{}({});\n{}",
                     before,
@@ -3879,6 +3905,7 @@ impl<'a> Lw<'a> {
         for p in &info.params {
             params.extend(self.param_decls(*p, &loc));
         }
+        params.extend(self.capture_decls(s, &loc));
         let mut locals = String::new();
         let mut inits = String::new();
         for l in &body.locals {

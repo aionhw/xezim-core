@@ -121,7 +121,7 @@ fn range_objs(r: &HRange, out: &mut BTreeSet<ObjId>) {
 }
 
 /// The expressions of the non-static bounds of array subtype `t`.
-fn bound_exprs(lw: &Lw, t: TypeId, out: &mut Vec<HExpr>) {
+pub(super) fn bound_exprs(lw: &Lw, t: TypeId, out: &mut Vec<HExpr>) {
     if let Some(cons) = lw.d.array_constraint(t) {
         for r in cons.into_iter().flatten() {
             if r.static_val.is_none() {
@@ -214,6 +214,9 @@ impl<'a> Lw<'a> {
             return None;
         }
         if !info.is_function && self.needs_spec(s) {
+            return None;
+        }
+        if self.capture_fixed(s) {
             return None;
         }
         let shaping = self.shaping_ints(s);
