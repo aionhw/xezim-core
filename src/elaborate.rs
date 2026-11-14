@@ -31582,13 +31582,15 @@ fn const_ctx_fold(
             then_expr,
             else_expr,
         } => {
+            // §11.4.11: a condition with a known 1 bit is true even when
+            // other bits are x or z; only an ambiguous one merges the arms.
             let c = eval_const_expr_val_inner(condition, params, types);
-            if c.has_xz() {
+            let Some(taken) = c.is_nonzero() else {
                 let left = const_ctx_fold(then_expr, params, w, signed, types)?;
                 let right = const_ctx_fold(else_expr, params, w, signed, types)?;
                 return Some(left.merge_unknown(&right));
-            }
-            let arm = if c.is_true() { then_expr } else { else_expr };
+            };
+            let arm = if taken { then_expr } else { else_expr };
             const_ctx_fold(arm, params, w, signed, types)?
         }
         // Self-determined leaf: extend it into the context.
@@ -47220,7 +47222,8 @@ fn eval_const_user_function(
                 context.map_or(ty.width, |(w, _)| w.max(ty.width)),
                 Some(context.and_then(|(_, s)| s).unwrap_or(ty.signed)),
             ));
-            if c.has_xz() && ty.integral {
+            // §11.4.11: only a condition with no known 1 bit is ambiguous.
+            if c.is_nonzero().is_none() && ty.integral {
                 let left = eval_fn_expr_ctx(then_expr, locals, elab, depth, arm_context)?;
                 let right = eval_fn_expr_ctx(else_expr, locals, elab, depth, arm_context)?;
                 return Some(left.merge_unknown(&right));
