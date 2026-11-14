@@ -23667,6 +23667,122 @@ fn const_parameter_path(
     }
 }
 
+/// §5.7.1, §11.6.1, §11.8.2: fold literal-only pattern keys with their
+/// widths and signedness. Other expressions retain the scalar evaluator.
+/// Bounds only guard admission; they do not supply an expression context.
+pub fn const_eval_pattern_index(
+    expr: &Expression,
+    params: Option<&HashMap<String, Value>>,
+    bounds: (i64, i64),
+) -> Option<i64> {
+    const_eval_literal_pattern_index(expr, bounds)
+        .or_else(|| const_eval_i64_with_params(expr, params))
+}
+
+/// The typed part of pattern-index evaluation; callers keep their own fallback.
+pub fn const_eval_literal_pattern_index(expr: &Expression, bounds: (i64, i64)) -> Option<i64> {
+    fn literals(e: &Expression, max_width: u32) -> Option<()> {
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer {
+                size, signed, base, value, ..
+            }) => {
+                let radix = match base {
+                    NumberBase::Binary => 2,
+                    NumberBase::Octal => 8,
+                    NumberBase::Decimal => 10,
+                    NumberBase::Hex => 16,
+                };
+                let digits = value.replace('_', "");
+                let digits = u64::from_str_radix(&digits, radix)
+                    .or_else(|_| i64::from_str_radix(&digits, radix).map(|v| v as u64))
+                    .ok()?;
+                let width = size.unwrap_or(32);
+                // Keep the scalar path for large unsized decimal integers;
+                // their minimum width is a separate §5.7.1 limitation.
+                let unsized_max = if *signed && matches!(base, NumberBase::Decimal) {
+                    i32::MAX as u64
+                } else {
+                    u32::MAX as u64
+                };
+                (width > 0 && width <= max_width && (size.is_some() || digits <= unsized_max))
+                    .then_some(())
+            }
+            ExprKind::Paren(inner) => literals(inner, max_width),
+            ExprKind::Unary {
+                op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot | UnaryOp::LogNot,
+                operand,
+            } => literals(operand, max_width),
+            ExprKind::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::BitXnor
+                        | BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                        | BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::Lt
+                        | BinaryOp::Leq
+                        | BinaryOp::Gt
+                        | BinaryOp::Geq
+                ) =>
+            {
+                literals(left, max_width)?;
+                // §11.4.10: counts are unsigned and self-determined. The
+                // typed evaluator narrows them to u32; retain the old path
+                // when the count's tree can have more than 32 bits.
+                let shift = matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                );
+                literals(right, if shift { 32 } else { max_width })
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                literals(condition, max_width)?;
+                literals(then_expr, max_width)?;
+                literals(else_expr, max_width)
+            }
+            _ => None,
+        }
+    }
+    if literals(expr, 64).is_some() {
+        let empty = HashMap::default();
+        let value = eval_const_expr_val(expr, &empty);
+        // Preserve the old index conversion for unsigned high-bit 32-bit
+        // keys, and the old fallback for unresolved or out-of-range keys.
+        let unsigned_max = if value.width == 32 {
+            i32::MAX as u64
+        } else {
+            i64::MAX as u64
+        };
+        if (value.is_signed || value.to_u64().is_some_and(|v| v <= unsigned_max))
+            && let Some(index) = value.to_index()
+            && (bounds.0.min(bounds.1)..=bounds.0.max(bounds.1)).contains(&index)
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
 pub fn const_eval_i64_with_params(
     expr: &Expression,
     params: Option<&HashMap<String, Value>>,
@@ -28055,7 +28171,7 @@ fn pack_vector_pattern_dims(
                 next_ordered += 1;
             }
             AssignmentPatternItem::Keyed(k, v) => {
-                let idx = const_eval_i64_with_params(k, Some(params))?;
+                let idx = const_eval_pattern_index(k, Some(params), (l, r))?;
                 *slots.get_mut(slot_of(idx)?)? = Some(eval_elem(v, true)?);
             }
             AssignmentPatternItem::Default(v) => {
@@ -29225,9 +29341,14 @@ impl ArraySlot<'_> {
         let mut keys = PatternKeys::default();
         for item in items {
             let (index, v) = match item {
-                AssignmentPatternItem::Keyed(k, v) => {
-                    (const_eval_i64_with_params(k, Some(self.params))?, v)
-                }
+                AssignmentPatternItem::Keyed(k, v) => (
+                    const_eval_pattern_index(
+                        k,
+                        Some(self.params),
+                        (*list.first()?, *list.last()?),
+                    )?,
+                    v,
+                ),
                 // A parameter name is an index key, not a member name.
                 AssignmentPatternItem::Named(k, v) if self.param(&k.name).is_some() => {
                     (self.param(&k.name)?.to_i64()?, v)
@@ -51011,7 +51132,7 @@ fn pattern_leaves(
             match it {
                 AssignmentPatternItem::Default(x) => default = Some(x),
                 AssignmentPatternItem::Keyed(key, x) => {
-                    let ix = const_eval_i64_with_params(key, params)?;
+                    let ix = const_eval_pattern_index(key, params, (l, r))?;
                     if ix < l.min(r) || ix > l.max(r) {
                         return None;
                     }
