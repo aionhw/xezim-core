@@ -23675,14 +23675,72 @@ pub fn const_eval_pattern_index(
     params: Option<&HashMap<String, Value>>,
     bounds: (i64, i64),
 ) -> Option<i64> {
-    const_eval_literal_pattern_index(expr, bounds)
+    const_eval_typed_pattern_index(expr, params, bounds)
         .or_else(|| const_eval_i64_with_params(expr, params))
 }
 
 /// The typed part of pattern-index evaluation; callers keep their own fallback.
 pub fn const_eval_literal_pattern_index(expr: &Expression, bounds: (i64, i64)) -> Option<i64> {
-    fn literals(e: &Expression, max_width: u32) -> Option<()> {
+    const_eval_typed_pattern_index(expr, None, bounds)
+}
+
+/// [`const_eval_literal_pattern_index`] whose leaves may also be integral
+/// parameters bound in `params` (bare, or `pkg::NAME`): a parameter has its
+/// declared width and sign (§6.20.2), so `'{(F + 4'd1): v}` over a 4-bit `F`
+/// of 15 keys element 0 (§11.6.1).
+pub fn const_eval_typed_pattern_index(
+    expr: &Expression,
+    params: Option<&HashMap<String, Value>>,
+    bounds: (i64, i64),
+) -> Option<i64> {
+    fn literals(
+        e: &Expression,
+        params: Option<&HashMap<String, Value>>,
+        max_width: u32,
+    ) -> Option<()> {
+        let literals = |e: &Expression, max_width: u32| literals(e, params, max_width);
         match &e.kind {
+            // §6.20, §26.3: a parameter operand has its declared type.
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && (1..=2).contains(&h.path.len())
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let name = &h.path.last()?.name.name;
+                let key = match h.path.len() {
+                    1 => name.clone(),
+                    _ => format!("{}::{}", h.path[0].name.name, name),
+                };
+                let v = params?.get(&key)?;
+                (!v.is_real
+                    && !v.has_xz()
+                    && !tls_is_string_param(name)
+                    && v.width > 0
+                    && v.width <= max_width)
+                    .then_some(())
+            }
+            // `pkg::NAME` parses as a member access of the package name.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let ExprKind::Ident(h) = &base.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let v = params?.get(&format!("{}::{}", h.path[0].name.name, member.name))?;
+                (!v.is_real
+                    && !v.has_xz()
+                    && !tls_is_string_param(&member.name)
+                    && v.width > 0
+                    && v.width <= max_width)
+                    .then_some(())
+            }
+            // §11.7: the sign casts keep their operand's width.
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$signed" | "$unsigned") && args.len() == 1 =>
+            {
+                literals(&args[0], max_width)
+            }
             ExprKind::Number(NumberLiteral::Integer {
                 size, signed, base, value, ..
             }) => {
@@ -23763,9 +23821,9 @@ pub fn const_eval_literal_pattern_index(expr: &Expression, bounds: (i64, i64)) -
             _ => None,
         }
     }
-    if literals(expr, 64).is_some() {
+    if literals(expr, params, 64).is_some() {
         let empty = HashMap::default();
-        let value = eval_const_expr_val(expr, &empty);
+        let value = eval_const_expr_val(expr, params.unwrap_or(&empty));
         // Preserve the old index conversion for unsigned high-bit 32-bit
         // keys, and the old fallback for unresolved or out-of-range keys.
         let unsigned_max = if value.width == 32 {
