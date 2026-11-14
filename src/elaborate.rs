@@ -52093,7 +52093,7 @@ fn rewrite_expr_impl(
                 local_names,
                 interface_map,
             )),
-            type_args_text: type_args_text.clone(),
+            type_args_text: module_class_scope::spec_args_text(type_args_text, prefix, local_names),
         },
         ExprKind::MemberAccess { expr: base, member } => {
             // §6.20.2: `Cfg.VLEN` as member access on a packed-struct
