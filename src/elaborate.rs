@@ -30207,7 +30207,7 @@ fn eval_const_expr_val_inner(
             }
         }
     }
-    let res = match &expr.kind {
+    let mut res = match &expr.kind {
         // §3.14.3: an elaborated `1step` delay is one tick.
         ExprKind::SystemCall { name, .. } if name == ONE_STEP_DELAY => Value::from_u64(1, 64),
         // §25.5: a parameter reached through an interface PORT formal
@@ -31350,7 +31350,29 @@ fn eval_const_expr_val_inner(
             .unwrap_or_else(|| Value::zero(32)),
         _ => Value::zero(32),
     };
-    // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
+    // §20.6.2, §20.7, §20.8.1, §20.9: the size, array query, `$clog2` and
+    // bit-count functions return `integer` or `int`, which are signed, so
+    // `(~2'sb10) + $clog2(8)` is a signed expression (§11.8.1).
+    if let ExprKind::SystemCall { name, .. } = &expr.kind
+        && !res.is_real
+        && matches!(
+            name.as_str(),
+            "$bits"
+                | "$clog2"
+                | "$countones"
+                | "$countbits"
+                | "$size"
+                | "$left"
+                | "$right"
+                | "$low"
+                | "$high"
+                | "$increment"
+                | "$dimensions"
+                | "$unpacked_dimensions"
+        )
+    {
+        res.is_signed = true;
+    }
     res
 }
 
