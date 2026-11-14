@@ -770,6 +770,20 @@ impl Design {
                                 }
                             }
                         }
+                        // An element or a slice of an attribute's or a
+                        // call's value (`T'image(x)(1)`, §8.4, §8.5), or an
+                        // attribute with a parameter: analysed, as an
+                        // attribute name is (they are not overloaded).
+                        if matches!(prefix.kind, NameKind::Call(..) | NameKind::Attribute(..))
+                            && let Some(h) = self.name_expr(r, n, None)
+                        {
+                            let b = self.base(h.ty);
+                            match &self.types[b].kind {
+                                TypeKind::UniversalInteger => out.univ_int = true,
+                                TypeKind::UniversalReal => out.univ_real = true,
+                                _ => out.add(b),
+                            }
+                        }
                         if out.is_empty() {
                             out.any = true;
                         }
