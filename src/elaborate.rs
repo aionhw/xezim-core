@@ -28461,6 +28461,117 @@ fn member_ref_expr(base: &Expression, member: &Identifier) -> Expression {
     )
 }
 
+/// IEEE 1800-2023 §10.9.2: a count must match before expansion. Unlike
+/// `to_i64`, this conversion neither masks x/z nor discards high bits.
+pub fn struct_pattern_count_value(value: &Value) -> Option<i64> {
+    if value.is_real
+        || value.has_xz()
+        || (value.is_signed
+            && value.width > 0
+            && value.get_bit(value.width as usize - 1) == crate::value::LogicBit::One)
+        || (63..value.width as usize).any(|i| value.get_bit(i) != crate::value::LogicBit::Zero)
+    {
+        return None;
+    }
+    value.to_i64().filter(|&n| n >= 0)
+}
+
+/// IEEE 1800-2023 §5.7.1, §10.9.2: only integer literals need no
+/// expression evaluation. All other count forms keep the existing handling.
+pub fn struct_pattern_count(expr: &Expression) -> Option<i64> {
+    let ExprKind::Number(NumberLiteral::Integer {
+        size,
+        signed,
+        base,
+        value,
+        ..
+    }) = &expr.kind
+    else {
+        return None;
+    };
+    let radix = match base {
+        NumberBase::Binary => 2,
+        NumberBase::Octal => 8,
+        NumberBase::Hex => 16,
+        NumberBase::Decimal => 10,
+    };
+    let digits = value.replace('_', "");
+    if digits.contains(['x', 'X', 'z', 'Z', '?']) || size.is_some_and(|w| w > Value::MAX_WIDTH) {
+        return None;
+    }
+    let mut value = Value::from_str_radix(&digits, radix, size.unwrap_or(32));
+    value.is_signed = *signed;
+    let count = struct_pattern_count_value(&value)?;
+    // Do not accept a wider unsized literal after a 32-bit truncation.
+    if size.is_none() && i64::from_str_radix(&digits, radix).ok() != Some(count) {
+        return None;
+    }
+    Some(count)
+}
+
+/// IEEE 1800-2023 §10.9.2: remove a structure replication's inner braces,
+/// mapping each expression to a member rather than concatenating its bits.
+/// Check the exact member count before allocating, including overflow. Side
+/// effects may be evaluated per member: §10.9.2 leaves their count undefined.
+pub fn struct_pattern_replication(
+    items: &[AssignmentPatternItem],
+    members: usize,
+) -> Option<Vec<&Expression>> {
+    let [AssignmentPatternItem::Ordered(e)] = items else {
+        return None;
+    };
+    let ExprKind::Replication { count, exprs } = &e.kind else {
+        return None;
+    };
+    let count = usize::try_from(struct_pattern_count(count)?).ok()?;
+    if exprs.is_empty() || count.checked_mul(exprs.len())? != members {
+        return None;
+    }
+    Some((0..count).flat_map(|_| exprs.iter()).collect())
+}
+
+/// IEEE 1800-2023 §10.9.1/§10.9.2: array-member patterns need their own
+/// binding. Until that path handles replication, keep the existing structure
+/// handling, including when the array is inside a nested structure.
+/// Visit each referenced structure once, without scanning the typedef table.
+pub fn struct_pattern_has_array_member(
+    su: &crate::ast::types::StructUnionType,
+    typedef_types: &HashMap<String, DataType>,
+    typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
+) -> bool {
+    let mut pending = vec![su];
+    let mut seen = HashSet::default();
+    while let Some(su) = pending.pop() {
+        if !seen.insert(su as *const crate::ast::types::StructUnionType) {
+            continue;
+        }
+        for member in &su.members {
+            if member.declarators.iter().any(|d| !d.dimensions.is_empty()) {
+                return true;
+            }
+            let mut dt = &member.data_type;
+            for _ in 0..64 {
+                let DataType::TypeReference { name, .. } = dt else {
+                    break;
+                };
+                if lookup_scoped_type(name, typedef_unpacked_dims)
+                    .is_some_and(|dims| !dims.is_empty())
+                {
+                    return true;
+                }
+                let Some(next) = lookup_scoped_type(name, typedef_types) else {
+                    break;
+                };
+                dt = next;
+            }
+            if let DataType::Struct(inner) = dt {
+                pending.push(inner);
+            }
+        }
+    }
+    false
+}
+
 /// Emit one continuous assign per LEAF of an unpacked struct, recursing into
 /// members that are themselves unpacked structs.
 ///
@@ -28476,6 +28587,7 @@ fn emit_struct_member_assigns(
     su: &crate::ast::types::StructUnionType,
     ca: &ContinuousAssignment,
     typedef_types: &HashMap<String, DataType>,
+    typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
     params: &HashMap<String, Value>,
     out: &mut Vec<ContinuousAssignment>,
     depth: u32,
@@ -28518,6 +28630,16 @@ fn emit_struct_member_assigns(
         }
         _ => None,
     };
+    let pat_items = match &peel_unpacked_typed_pattern(rhs).kind {
+        ExprKind::AssignmentPattern(items)
+            if !struct_pattern_has_array_member(su, typedef_types, typedef_unpacked_dims) =>
+        {
+            struct_pattern_replication(items, flat.len())
+                .map(|items| items.into_iter().cloned().collect())
+                .or(pat_items)
+        }
+        _ => pat_items,
+    };
     for (i, (mname, mdt, mdims)) in flat.iter().enumerate() {
         let mident = Identifier {
             name: mname.clone(),
@@ -28536,6 +28658,7 @@ fn emit_struct_member_assigns(
             mdims,
             ca,
             typedef_types,
+            typedef_unpacked_dims,
             params,
             out,
             depth,
@@ -28560,6 +28683,7 @@ fn emit_member_elem_assigns(
     mdims: &[UnpackedDimension],
     ca: &ContinuousAssignment,
     typedef_types: &HashMap<String, DataType>,
+    typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
     params: &HashMap<String, Value>,
     out: &mut Vec<ContinuousAssignment>,
     depth: u32,
@@ -28574,6 +28698,7 @@ fn emit_member_elem_assigns(
                     &inner,
                     ca,
                     typedef_types,
+                    typedef_unpacked_dims,
                     params,
                     out,
                     depth + 1,
@@ -29211,6 +29336,7 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
                     &su,
                     &ca,
                     &elab.typedef_types,
+                    &elab.typedef_unpacked_dims,
                     &elab.parameters,
                     &mut expanded,
                     0,
@@ -29606,6 +29732,15 @@ fn pack_struct_const_value(
             }
             _ => {}
         }
+    }
+    // §7.2.1: packed structures cannot contain unpacked array members.
+    // Unpacked const-eval uses the typedef shapes registered during elaboration.
+    if (su.packed
+        || !TYPEDEF_SHAPES_TLS
+            .with(|shapes| struct_pattern_has_array_member(&su, typedef_types, &shapes.borrow().1)))
+        && let Some(expanded) = struct_pattern_replication(items, members.len())
+    {
+        ordered = expanded;
     }
     let use_ordered = named.is_empty() && !ordered.is_empty();
     // Build MSB-first parts (declaration order) and concat.
@@ -47952,6 +48087,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                 &su,
                 &ca,
                 &elab.typedef_types,
+                &elab.typedef_unpacked_dims,
                 &elab.parameters,
                 &mut out,
                 0,
@@ -48225,6 +48361,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 delay: u64,
                 span: Span,
                 typedef_types: &HashMap<String, DataType>,
+                typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
                 params: &HashMap<String, Value>| {
         match members {
             Some(ms) => {
@@ -48265,6 +48402,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             mdims,
                             &template,
                             typedef_types,
+                            typedef_unpacked_dims,
                             params,
                             kept,
                             0,
@@ -48406,6 +48544,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             delay,
             span,
             &elab.typedef_types,
+            &elab.typedef_unpacked_dims,
             &elab.parameters,
         );
 
@@ -48424,6 +48563,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     0,
                     span,
                     &elab.typedef_types,
+                    &elab.typedef_unpacked_dims,
                     &elab.parameters,
                 );
             }
@@ -52063,7 +52203,30 @@ fn rewrite_expr_impl(
                         rewrite_expr_impl(e, prefix, port_map, local_names, interface_map)
                     };
                     match it {
-                        Api::Ordered(e) => Api::Ordered(rw(e)),
+                        Api::Ordered(e) => {
+                            let mut rewritten = rw(e);
+                            // §10.9.2: substituting a genvar/port or folding a
+                            // type query must not admit a nonliteral count to
+                            // literal-only structure expansion. Parentheses
+                            // retain its value for the existing handling.
+                            if let ExprKind::Replication { count, .. } = &e.kind
+                                && !matches!(
+                                    count.kind,
+                                    ExprKind::Number(NumberLiteral::Integer { .. })
+                                )
+                                && let ExprKind::Replication {
+                                    count: new_count, ..
+                                } = &mut rewritten.kind
+                                && matches!(
+                                    new_count.kind,
+                                    ExprKind::Number(NumberLiteral::Integer { .. })
+                                )
+                            {
+                                **new_count =
+                                    Expression::new(ExprKind::Paren(new_count.clone()), count.span);
+                            }
+                            Api::Ordered(rewritten)
+                        }
                         Api::Named(n, e) => Api::Named(n.clone(), rw(e)),
                         Api::Typed(t, e) => Api::Typed(t.clone(), rw(e)),
                         Api::Default(e) => Api::Default(rw(e)),
