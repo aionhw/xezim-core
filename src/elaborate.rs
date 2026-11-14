@@ -28290,15 +28290,31 @@ fn eval_param_init(
     }
     let typed = !matches!(dt, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
         && !is_type_real_resolved(dt, typedef_types);
-    if typed
+    let mut v = if typed
         && !matches!(
             init.kind,
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_))
+        ) {
+        eval_const_expr_val_ctx(init, params, width).resize_for_assign(width)
+    } else {
+        eval_const_expr_val(init, params).resize_for_assign(width)
+    };
+    // §6.20.2, §6.11.2: the declared type, not the initializer, gives a typed
+    // parameter its signedness, and a 2-state type holds x/z as 0. A type
+    // name this scope cannot resolve keeps the value's own representation.
+    if typed
+        && !v.is_real
+        && !matches!(
+            resolve_typedef_chain(dt, typedef_types),
+            DataType::TypeReference { .. }
         )
     {
-        return eval_const_expr_val_ctx(init, params, width).resize_for_assign(width);
+        v.is_signed = is_type_signed_resolved(dt, typedef_types);
+        if is_type_two_state_resolved(dt, typedef_types) {
+            v = v.to_two_state();
+        }
     }
-    eval_const_expr_val(init, params).resize_for_assign(width)
+    v
 }
 
 /// Follow a bare type name through `local` — an instance's type-parameter
@@ -41565,6 +41581,20 @@ fn inline_module_items(
                                 scoped_eval_params,
                                 t,
                             );
+                            sub_local_params.insert(a.name.name.clone(), v);
+                        } else if let DataType::Implicit {
+                            signing: Some(s),
+                            dimensions,
+                            ..
+                        } = data_type
+                            && dimensions.is_empty()
+                            && !cur.is_real
+                        {
+                            // §6.20.2: `signed`/`unsigned` with no range keeps
+                            // the value's width but takes the declared sign, as
+                            // for a header parameter.
+                            let mut v = cur.clone();
+                            v.is_signed = matches!(s, Signing::Signed);
                             sub_local_params.insert(a.name.name.clone(), v);
                         }
                     }
