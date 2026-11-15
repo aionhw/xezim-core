@@ -27859,7 +27859,7 @@ fn string_literal_width(init: &Expression) -> Option<u32> {
 /// known here (a function call, an element select, a cast), which keeps the
 /// 32-bit default. Only sized literals were handled, so `localparam C =
 /// {8'h1, 8'h2}` was 32 bits where the reference simulator gives 16.
-fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
+pub fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
     let w = |x: &Expression| untyped_param_width(x, params);
     match &e.kind {
         ExprKind::Number(NumberLiteral::Integer { size, .. }) => Some(size.unwrap_or(32)),
@@ -47515,16 +47515,43 @@ fn eval_const_user_function(
             }
             SK::VarDecl {
                 data_type,
+                lifetime,
                 declarators,
                 ..
             } => {
-                let storage = declared_storage(data_type, locals, elab)?;
-                for d in declarators {
-                    let v = match &d.init {
-                        Some(e) => eval_for_storage(e, &storage, locals, elab, depth)?,
-                        None => storage.clone(),
-                    };
-                    locals.insert(d.name.name.clone(), v);
+                // §6.20.2: an UNTYPED block-scope `localparam`/`parameter`
+                // takes the type of its initializer (self-determined), NOT
+                // the parser's 32-bit `int` placeholder or the 1-bit implicit
+                // `logic`. The parser marks such a decl `Static`+`Implicit`;
+                // a genuine `var`/`static var` keeps its 1-bit type. Evaluate
+                // the initializer with no storage-width context so `Q =
+                // 4'd0-4'd1` stays 4-bit 15 instead of folding to 32'hffffffff.
+                let self_determined = {
+                    matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                        && matches!(
+                            data_type,
+                            crate::ast::types::DataType::Implicit {
+                                dimensions, ..
+                            } if dimensions.is_empty()
+                        )
+                };
+                if self_determined {
+                    for d in declarators {
+                        let v = match &d.init {
+                            Some(e) => eval_fn_expr(e, locals, elab, depth)?,
+                            None => Value::zero(32),
+                        };
+                        locals.insert(d.name.name.clone(), v);
+                    }
+                } else {
+                    let storage = declared_storage(data_type, locals, elab)?;
+                    for d in declarators {
+                        let v = match &d.init {
+                            Some(e) => eval_for_storage(e, &storage, locals, elab, depth)?,
+                            None => storage.clone(),
+                        };
+                        locals.insert(d.name.name.clone(), v);
+                    }
                 }
                 Some(Flow::Normal)
             }

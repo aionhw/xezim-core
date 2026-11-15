@@ -130,11 +130,15 @@ impl Parser {
                                     span,
                                 }
                             }
-                            _ => crate::ast::types::DataType::IntegerAtom {
-                                kind: crate::ast::types::IntegerAtomType::Int,
-                                signing: Some(crate::ast::types::Signing::Signed),
-                                span,
-                            },
+                            // §6.20.2: an untyped `localparam` with any OTHER
+                            // initializer keeps its IMPLICIT (self-determined)
+                            // type here; the const-function evaluator and the
+                            // bytecode compiler then size it from the RHS so
+                            // `Q = 4'd0-4'd1` stays 4-bit (15), NOT the 32-bit
+                            // `int` that folds `0-1` to `32'hffffffff`. The
+                            // `Static` lifetime (set below) flags this decl as
+                            // a localparam for those consumers.
+                            _ => data_type,
                         }
                     } else {
                         data_type
