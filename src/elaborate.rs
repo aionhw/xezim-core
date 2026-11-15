@@ -678,11 +678,11 @@ pub fn path_transition_delays(d: &[u64]) -> [u64; 12] {
 /// the net as path-delayed). `params` evaluates the delays in the instance's
 /// own parameter scope; `rewrite` maps a module-local expression into the
 /// flat namespace. The delays were scaled to ticks by the module-delay
-/// rewrite.
+/// rewrite. `delay_vals[i][j]` is the pre-evaluated `paths[i].delays[j]`.
 fn elaborate_module_paths(
     elab: &mut ElaboratedModule,
     paths: &[crate::ast::decl::SpecifyPath],
-    params: &HashMap<String, Value>,
+    delay_vals: &[Vec<u64>],
     rewrite: &dyn Fn(&Expression) -> Expression,
 ) {
     let flat = |id: &Identifier| -> Option<String> {
@@ -697,13 +697,8 @@ fn elaborate_module_paths(
             _ => None,
         }
     };
-    for p in paths {
-        let vals: Vec<u64> = p
-            .delays
-            .iter()
-            .map(|d| eval_const_expr(d, params))
-            .collect();
-        let delays = path_transition_delays(&vals);
+    for (p, vals) in paths.iter().zip(delay_vals.iter()) {
+        let delays = path_transition_delays(vals);
         let srcs: Vec<String> = p.srcs.iter().filter_map(|s| flat(s)).collect();
         let cond = p.cond.as_ref().map(rewrite);
         let most = delays.iter().copied().max().unwrap_or(0);
@@ -724,39 +719,18 @@ fn elaborate_module_paths(
 }
 
 /// Flatten one specify block's timing checks into `elab.timing_checks`.
-/// `params` evaluates the limits in the instance's own parameter scope;
-/// `rewrite` maps a module-local expression into the flat namespace.
+/// `consts[i][j]` holds the pre-evaluated limit/flag value (or `None`) for
+/// `checks[i].args[j]`; `rewrite` maps a module-local expression into the flat
+/// namespace.
 fn elaborate_timing_checks(
     elab: &mut ElaboratedModule,
     checks: &[crate::ast::decl::TimingCheck],
     scope: &str,
     def_name: &str,
-    params: &HashMap<String, Value>,
+    consts: &[Vec<Option<i64>>],
     rewrite: &dyn Fn(&Expression) -> Expression,
 ) {
-    for tc in checks {
-        let limits = timing_check_limit_args(&tc.name);
-        let flags = timing_check_flag_args(&tc.name);
-        let consts = tc
-            .args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let a = a.as_ref()?;
-                if !limits.contains(&i) && !flags.contains(&i) {
-                    return None;
-                }
-                let v = eval_const_expr_val(&a.expr, params);
-                if v.is_real {
-                    let f = v.to_f64();
-                    f.is_finite().then(|| f.round() as i64)
-                } else if v.has_xz() {
-                    None
-                } else {
-                    v.to_i64()
-                }
-            })
-            .collect();
+    for (tc, tc_consts) in checks.iter().zip(consts.iter()) {
         let args = tc
             .args
             .iter()
@@ -774,7 +748,7 @@ fn elaborate_timing_checks(
             scope: scope.to_string(),
             def_name: def_name.to_string(),
             args,
-            consts,
+            consts: tc_consts.clone(),
             span: tc.span,
         });
     }
@@ -1968,14 +1942,14 @@ fn parse_spec_args(text: &str) -> Vec<(Option<String>, Option<Expression>)> {
 /// §8.25.1: constant `member` of the specialization `cls#(text)`: the header
 /// parameters take the arguments (evaluated in the referencing scope), the
 /// rest their defaults, and the body constants follow from them.
-fn class_spec_const(
+fn class_spec_const<P: ParamLookup>(
     cls: &str,
     args: &[(Option<String>, Option<Expression>)],
     member: &str,
-    params: &HashMap<String, Value>,
+    params: &P,
 ) -> Option<Value> {
     let mut consts = Vec::new();
-    class_spec_consts(cls, args, params, 0, &mut consts)?;
+    class_spec_consts(cls, args, params.as_hashmap_base().expect("param base"), 0, &mut consts)?;
     consts
         .into_iter()
         .rev()
@@ -2013,7 +1987,7 @@ fn class_spec_consts(
                 None => continue,
             },
         };
-        overrides.insert(pname, eval_const_expr_val(e, params));
+        overrides.insert(pname, eval_const_expr_val_inner(e, params, &mut const_context::Types::default()));
     }
     // Header parameters first: the base's arguments may read them.
     let mut env = params.clone();
@@ -2057,10 +2031,10 @@ fn class_spec_consts(
 /// §8.23 / §8.25.1: the value of a class-scoped constant reference
 /// `base::member` — `C::N`, `pkg::C::N`, `Outer::Inner::N` or `C#(args)::N`
 /// — or `None` when `base` names no registered class scope.
-fn class_scoped_const(
+fn class_scoped_const<P: ParamLookup>(
     base: &Expression,
     member: &str,
-    params: &HashMap<String, Value>,
+    params: &P,
 ) -> Option<Value> {
     fn walk<'a>(e: &'a Expression, segs: &mut Vec<&'a str>) -> bool {
         match &e.kind {
@@ -4975,7 +4949,7 @@ fn const_value_literal(v: &Value, span: Span) -> Option<Expression> {
     ))
 }
 
-fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
+fn is_const_expr<P: ParamLookup>(expr: &Expression, params: &P) -> bool {
     match &expr.kind {
         ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
         ExprKind::Ident(hier) => {
@@ -5857,7 +5831,7 @@ fn hoist_package_struct_params(defs: &HashMap<String, Definition>, elab: &mut El
                     }
                     let subbed;
                     let init: &Expression = if expr_has_call(init) {
-                        match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                        match substitute_const_fn_calls(init,Some(&elab.parameters), elab, 0)
                             .filter(|e| !expr_has_call(e))
                         {
                             Some(e) => {
@@ -6089,7 +6063,6 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                         } else {
                             data_type
                         };
-                        let params_snapshot = elab.parameters.clone();
                         let scoped_name = format!("{}::{}", p.name.name, assign.name.name);
                         if register_array_param(
                             &mut *elab,
@@ -6099,7 +6072,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                             assign.init.as_ref(),
                             None,
                             data_type,
-                            &params_snapshot,
+                            None,
                         ) {
                             // §26.3: later declarations in this package can
                             // use its own array without a qualification. Keep
@@ -6129,7 +6102,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     // §13.4.3 const-function calls, mirroring the import path.
                     let subbed;
                     let init: &Expression = if expr_has_call(init) {
-                        match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                        match substitute_const_fn_calls(init,Some(&elab.parameters), elab, 0)
                             .filter(|e| !expr_has_call(e))
                         {
                             Some(e) => {
@@ -9970,15 +9943,16 @@ pub fn elaborate_module_with_defs(
                                     Some(&p.name.name),
                                     &mut elab,
                                 );
-                                // Snapshot so the closure does not hold a borrow
-                                // of `elab` while `elab.classes` is borrowed.
-                                let params_snapshot = elab.parameters.clone();
-                                elab.classes.entry(c.name.name.clone()).or_insert_with(|| {
-                                    std::sync::Arc::new(elaborate_class_with_params(
+                                // Compute the elaborated class before taking
+                                // `&mut elab.classes`, so no parameter-snapshot
+                                // clone is needed.
+                                if !elab.classes.contains_key(&c.name.name) {
+                                    let cls = std::sync::Arc::new(elaborate_class_with_params(
                                         c,
-                                        Some(&params_snapshot),
-                                    ))
-                                });
+                                        Some(&elab.parameters),
+                                    ));
+                                    elab.classes.insert(c.name.name.clone(), cls);
+                                }
                             }
                             // Hoist package typedefs (loads enum members + typedef
                             // widths) so an explicit scoped reference `pkg::CONST`
@@ -10206,7 +10180,6 @@ pub fn elaborate_module_with_defs(
                 // §6.20.2 unpacked-array parameter: `u32_t A[N] = {a, b}`.
                 if !assign.dimensions.is_empty() {
                     let ov = param_overrides.get(&assign.name.name).cloned();
-                    let params_snapshot = elab.parameters.clone();
                     if register_array_param(
                         &mut elab,
                         "",
@@ -10215,7 +10188,7 @@ pub fn elaborate_module_with_defs(
                         assign.init.as_ref(),
                         ov.as_ref(),
                         data_type,
-                        &params_snapshot,
+                        None,
                     ) {
                         continue;
                     }
@@ -10240,7 +10213,7 @@ pub fn elaborate_module_with_defs(
                             // the type of its final value).
                             let subst;
                             let e: &Expression = if expr_has_call(init) {
-                                match substitute_const_fn_calls(init, &elab.parameters, &elab, 0) {
+                                match substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0) {
                                     Some(x) => {
                                         subst = x;
                                         &subst
@@ -10305,7 +10278,7 @@ pub fn elaborate_module_with_defs(
                 } else if let Some(init) = &assign.init {
                     let subbed_init3;
                     let init_eval: &Expression = if expr_has_call(init) {
-                        match substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                        match substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0)
                             .filter(|e| !expr_has_call(e))
                         {
                             Some(e) => {
@@ -10715,8 +10688,7 @@ pub fn elaborate_module_with_defs(
                                 let subbed_init5;
                                 let init_eval: &Expression = if expr_has_call(init) {
                                     match substitute_const_fn_calls(
-                                        init,
-                                        &elab.parameters,
+                                        init,Some(&elab.parameters),
                                         &elab,
                                         0,
                                     )
@@ -11031,7 +11003,7 @@ pub fn elaborate_module_with_defs(
                 }
                 let subbed;
                 let init_eval: &Expression = if expr_has_call(init) {
-                    match substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                    match substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0)
                         .filter(|e| !expr_has_call(e))
                     {
                         Some(e) => {
@@ -13712,7 +13684,6 @@ pub fn elaborate_module_with_defs(
                         // decl fell to the scalar path and every element read
                         // 0. Same registration as the header site.
                         if !assign.dimensions.is_empty() {
-                            let params_snapshot = elab.parameters.clone();
                             if register_array_param(
                                 &mut elab,
                                 "",
@@ -13721,7 +13692,7 @@ pub fn elaborate_module_with_defs(
                                 assign.init.as_ref(),
                                 None,
                                 data_type,
-                                &params_snapshot,
+                                None,
                             ) {
                                 continue;
                             }
@@ -13852,8 +13823,7 @@ pub fn elaborate_module_with_defs(
                                 let subst;
                                 let e: &Expression = if expr_has_call(init) {
                                     match substitute_const_fn_calls(
-                                        init,
-                                        &elab.parameters,
+                                        init,Some(&elab.parameters),
                                         &elab,
                                         0,
                                     ) {
@@ -13949,7 +13919,7 @@ pub fn elaborate_module_with_defs(
                                 // wraps ([LOG_X-6-1:0] → 4-billion-bit bus
                                 // collapsed to 1 bit).
                                 if let Some(subbed) =
-                                    substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                                    substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0)
                                         .filter(|e| !expr_has_call(e))
                                 {
                                     let mut v = if is_string_data_type(data_type) {
@@ -14622,8 +14592,18 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::SpecifyBlock(sb) => {
-                let params = elab.parameters.clone();
-                elaborate_module_paths(&mut elab, &sb.paths, &params, &|e| e.clone());
+                // Evaluate delays against `&elab.parameters` (read-only)
+                // before the `&mut` borrow, so no whole-table clone is needed.
+                let delay_vals: Vec<Vec<u64>> = {
+                    let params = &elab.parameters;
+                    sb.paths
+                        .iter()
+                        .map(|p| {
+                            p.delays.iter().map(|d| eval_const_expr(d, params)).collect()
+                        })
+                        .collect()
+                };
+                elaborate_module_paths(&mut elab, &sb.paths, &delay_vals, &|e| e.clone());
                 // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
@@ -14640,14 +14620,42 @@ pub fn elaborate_module_with_defs(
                     });
                 }
                 if !sb.timing_checks.is_empty() {
-                    let params = elab.parameters.clone();
+                    let timing_consts: Vec<Vec<Option<i64>>> = {
+                        let params = &elab.parameters;
+                        sb.timing_checks
+                            .iter()
+                            .map(|tc| {
+                                let limits = timing_check_limit_args(&tc.name);
+                                let flags = timing_check_flag_args(&tc.name);
+                                tc.args
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, a)| {
+                                        let a = a.as_ref()?;
+                                        if !limits.contains(&i) && !flags.contains(&i) {
+                                            return None;
+                                        }
+                                        let v = eval_const_expr_val(&a.expr, params);
+                                        if v.is_real {
+                                            let f = v.to_f64();
+                                            f.is_finite().then(|| f.round() as i64)
+                                        } else if v.has_xz() {
+                                            None
+                                        } else {
+                                            v.to_i64()
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    };
                     let def_name = elab.name.clone();
                     elaborate_timing_checks(
                         &mut elab,
                         &sb.timing_checks,
                         "",
                         &def_name,
-                        &params,
+                        &timing_consts,
                         &|e| e.clone(),
                     );
                 }
@@ -20164,7 +20172,6 @@ fn elaborate_items(
                         // no elements, so every `A[i]` read 0, and an index of
                         // a packed array bit-selected.
                         if !assign.dimensions.is_empty() {
-                            let params_snapshot = elab.parameters.clone();
                             if register_array_param(
                                 elab,
                                 "",
@@ -20173,7 +20180,7 @@ fn elaborate_items(
                                 assign.init.as_ref(),
                                 None,
                                 data_type,
-                                &params_snapshot,
+                                None,
                             ) {
                                 continue;
                             }
@@ -20220,7 +20227,7 @@ fn elaborate_items(
                                 // dependent declaration widths don't wrap.
                                 let subbed_init4;
                                 let init_eval: &Expression = if expr_has_call(init) {
-                                    match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                                    match substitute_const_fn_calls(init,Some(&elab.parameters), elab, 0)
                                         .filter(|e| !expr_has_call(e))
                                     {
                                         Some(e) => {
@@ -20560,8 +20567,18 @@ fn elaborate_items(
                 elaborate_items(&body, elab, all_defs)?;
             }
             ModuleItem::SpecifyBlock(sb) => {
-                let params = elab.parameters.clone();
-                elaborate_module_paths(elab, &sb.paths, &params, &|e| e.clone());
+                // Evaluate delays against `&elab.parameters` (read-only)
+                // before the `&mut` borrow, so no whole-table clone is needed.
+                let delay_vals: Vec<Vec<u64>> = {
+                    let params = &elab.parameters;
+                    sb.paths
+                        .iter()
+                        .map(|p| {
+                            p.delays.iter().map(|d| eval_const_expr(d, params)).collect()
+                        })
+                        .collect()
+                };
+                elaborate_module_paths(elab, &sb.paths, &delay_vals, &|e| e.clone());
                 // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
@@ -20578,14 +20595,42 @@ fn elaborate_items(
                     });
                 }
                 if !sb.timing_checks.is_empty() {
-                    let params = elab.parameters.clone();
+                    let timing_consts: Vec<Vec<Option<i64>>> = {
+                        let params = &elab.parameters;
+                        sb.timing_checks
+                            .iter()
+                            .map(|tc| {
+                                let limits = timing_check_limit_args(&tc.name);
+                                let flags = timing_check_flag_args(&tc.name);
+                                tc.args
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, a)| {
+                                        let a = a.as_ref()?;
+                                        if !limits.contains(&i) && !flags.contains(&i) {
+                                            return None;
+                                        }
+                                        let v = eval_const_expr_val(&a.expr, params);
+                                        if v.is_real {
+                                            let f = v.to_f64();
+                                            f.is_finite().then(|| f.round() as i64)
+                                        } else if v.has_xz() {
+                                            None
+                                        } else {
+                                            v.to_i64()
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    };
                     let def_name = elab.name.clone();
                     elaborate_timing_checks(
                         elab,
                         &sb.timing_checks,
                         "",
                         &def_name,
-                        &params,
+                        &timing_consts,
                         &|e| e.clone(),
                     );
                 }
@@ -20789,7 +20834,7 @@ fn fold_const_fn_in_generate(expr: &Expression, elab: &ElaboratedModule) -> Opti
     if !expr_has_call(expr) {
         return None;
     }
-    substitute_const_fn_calls(expr, &elab.parameters, elab, 0).filter(|f| !expr_has_call(f))
+    substitute_const_fn_calls(expr,Some(&elab.parameters), elab, 0).filter(|f| !expr_has_call(f))
 }
 
 /// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
@@ -22741,10 +22786,172 @@ fn register_assoc_element_key_type(
     elab.associative_arrays.insert(name, string_key);
 }
 
+/// A name→`Value` environment a constant-expression evaluator can resolve
+/// parameter names against. The plain `&HashMap` is the common case; a
+/// `ParamEnv::Overlay` backs a lookup with a second map without copying the
+/// first, which is what lets a constant-function call read the whole module
+/// parameter table (`base`) with only a small map of locals (`top`) stacked
+/// on it.
+pub trait ParamLookup {
+    fn get(&self, key: &str) -> Option<&Value>;
+    #[inline]
+    fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+    /// Every key this lookup answers for. Rows underneath an `Overlay` are
+    /// reported too, so the rare whole-table scans (`name.starts_with(...)`)
+    /// keep seeing every candidate.
+    fn keys(&self) -> crate::hasher::HashSet<&str>;
+
+    /// Every `(key, value)` row this lookup answers for, top rows first and
+    /// deduplicated (a row shadowed by an overlaid row is dropped). Materializing
+    /// the caller scope for a nested constant-function call needs the values,
+    /// not just the keys.
+    fn rows(&self) -> Vec<(&str, &Value)>;
+
+    /// The base `&HashMap` backing this lookup when it has one (an overlay's
+    /// bottom row, or a plain map itself). `None` for a hypothetical lookup
+    /// with no flat table — used only by the associative-dimension probe,
+    /// which resolves type-name indexes in the module scope (never a
+    /// function-local), so the base row alone is authoritative.
+    #[inline]
+    fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
+        None
+    }
+}
+
+impl ParamLookup for HashMap<String, Value> {
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.get(key)
+    }
+    #[inline]
+    fn contains_key(&self, key: &str) -> bool {
+        self.contains_key(key)
+    }
+    #[inline]
+    fn keys(&self) -> crate::hasher::HashSet<&str> {
+        self.iter().map(|(k, _)| k.as_str()).collect()
+    }
+    #[inline]
+    fn rows(&self) -> Vec<(&str, &Value)> {
+        self.iter().map(|(k, v)| (k.as_str(), v)).collect()
+    }
+    #[inline]
+    fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
+        Some(self)
+    }
+}
+
+impl<'a> ParamLookup for &'a HashMap<String, Value> {
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        (**self).get(key)
+    }
+    #[inline]
+    fn contains_key(&self, key: &str) -> bool {
+        (**self).contains_key(key)
+    }
+    #[inline]
+    fn keys(&self) -> crate::hasher::HashSet<&str> {
+        (**self).iter().map(|(k, _)| k.as_str()).collect()
+    }
+    #[inline]
+    fn rows(&self) -> Vec<(&str, &Value)> {
+        (**self).iter().map(|(k, v)| (k.as_str(), v)).collect()
+    }
+    #[inline]
+    fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
+        Some(*self)
+    }
+}
+
+/// A parameter environment: one table, or one laid over a base (top wins).
+#[derive(Clone, Copy)]
+pub enum ParamEnv<'a> {
+    /// Just one table.
+    Single(&'a HashMap<String, Value>),
+    /// `top` wins; `base` is consulted only for keys `top` lacks.
+    Overlay {
+        base: &'a HashMap<String, Value>,
+        top: &'a HashMap<String, Value>,
+    },
+}
+
+impl<'a> ParamLookup for ParamEnv<'a> {
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        match self {
+            ParamEnv::Single(m) => m.get(key),
+            ParamEnv::Overlay { base, top } => top.get(key).or_else(|| base.get(key)),
+        }
+    }
+    #[inline]
+    fn contains_key(&self, key: &str) -> bool {
+        match self {
+            ParamEnv::Single(m) => m.contains_key(key),
+            ParamEnv::Overlay { base, top } => top.contains_key(key) || base.contains_key(key),
+        }
+    }
+    #[inline]
+    fn keys(&self) -> crate::hasher::HashSet<&str> {
+        use crate::hasher::HashSet;
+        match self {
+            ParamEnv::Single(m) => m.iter().map(|(k, _)| k.as_str()).collect::<HashSet<&str>>(),
+            ParamEnv::Overlay { base, top } => base
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .chain(top.iter().map(|(k, _)| k.as_str()))
+                .collect(),
+        }
+    }
+    #[inline]
+    fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
+        Some(match self {
+            ParamEnv::Single(m) => m,
+            ParamEnv::Overlay { base, .. } => base,
+        })
+    }
+
+    #[inline]
+    fn rows(&self) -> Vec<(&str, &Value)> {
+        use crate::hasher::HashSet;
+        match self {
+            ParamEnv::Single(m) => m.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+            ParamEnv::Overlay { base, top } => {
+                let mut out: Vec<(&str, &Value)> = Vec::new();
+                let mut seen: HashSet<&str> = HashSet::default();
+                // top wins: emit top rows first, then base rows not shadowed.
+                for (k, v) in top.iter() {
+                    out.push((k.as_str(), v));
+                    seen.insert(k.as_str());
+                }
+                for (k, v) in base.iter() {
+                    if !seen.contains(k.as_str()) {
+                        out.push((k.as_str(), v));
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
 /// Resolve the width of a data type.
 pub fn resolve_type_width(
     dt: &DataType,
     params: Option<&HashMap<String, Value>>,
+    typedefs: Option<&HashMap<String, u32>>,
+) -> u32 {
+    resolve_type_width_env(dt, params, typedefs)
+}
+
+/// Generic core of [`resolve_type_width`]: same logic, but `params` may be any
+/// [`ParamLookup`] so a constant-function body overlays its small locals on
+/// the whole elaboration parameter table instead of cloning it.
+pub fn resolve_type_width_env<P: ParamLookup>(
+    dt: &DataType,
+    params: Option<&P>,
     typedefs: Option<&HashMap<String, u32>>,
 ) -> u32 {
     match dt {
@@ -22758,12 +22965,12 @@ pub fn resolve_type_width(
             let mut first_span: Option<u32> = None;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
-                    let lv = const_eval_i64_with_params(left, params);
-                    let rv = const_eval_i64_with_params(right, params);
+                    let lv = const_eval_i64_with_params_env(left, params);
+                    let rv = const_eval_i64_with_params_env(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
                         let w = ((l - r).abs() + 1) as u64;
                         if w > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
-                            culprit = Some(describe_packed_range(left, right, l, r, params));
+                            culprit = Some(describe_packed_range(left, right, l, r, params.map(|p| p.as_hashmap_base()).flatten()));
                         }
                         dims_desc.push_str(&format!("[{}:{}]", l, r));
                         if first_span.is_none() {
@@ -22805,8 +23012,8 @@ pub fn resolve_type_width(
             let mut total = 1u64;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
-                    let lv = const_eval_i64_with_params(left, params);
-                    let rv = const_eval_i64_with_params(right, params);
+                    let lv = const_eval_i64_with_params_env(left, params);
+                    let rv = const_eval_i64_with_params_env(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
                         let w = ((l - r).abs() + 1) as u64;
                         total = total.saturating_mul(w);
@@ -22846,8 +23053,8 @@ pub fn resolve_type_width(
                 for dim in dimensions {
                     if let PackedDimension::Range { left, right, .. } = dim {
                         if let (Some(l), Some(r)) = (
-                            const_eval_i64_with_params(left, params),
-                            const_eval_i64_with_params(right, params),
+                            const_eval_i64_with_params_env(left, params),
+                            const_eval_i64_with_params_env(right, params),
                         ) {
                             let w = ((l - r).abs() + 1) as u64;
                             total = total.saturating_mul(w);
@@ -22880,7 +23087,7 @@ pub fn resolve_type_width(
         },
         DataType::Enum(e) => {
             let base = if let Some(bt) = &e.base_type {
-                resolve_type_width(bt, params, typedefs)
+                resolve_type_width_env(bt, params, typedefs)
             } else {
                 32
             };
@@ -22890,8 +23097,8 @@ pub fn resolve_type_width(
             for d in &e.dimensions {
                 if let PackedDimension::Range { left, right, .. } = d {
                     if let (Some(l), Some(r)) = (
-                        const_eval_i64_with_params(left, params),
-                        const_eval_i64_with_params(right, params),
+                        const_eval_i64_with_params_env(left, params),
+                        const_eval_i64_with_params_env(right, params),
                     ) {
                         total = total.saturating_mul((l - r).unsigned_abs() + 1);
                     }
@@ -22905,7 +23112,7 @@ pub fn resolve_type_width(
             let mut max_w = 0u32;
             let mut member_count = 0u32;
             for member in &s.members {
-                let mw = resolve_type_width(&member.data_type, params, typedefs);
+                let mw = resolve_type_width_env(&member.data_type, params, typedefs);
                 for mdecl in &member.declarators {
                     // §7.4.2: an UNPACKED dimension on the member multiplies its
                     // contribution — `logic [7:0] arr [3]` is 24 bits of the
@@ -22941,8 +23148,8 @@ pub fn resolve_type_width(
             for dim in &s.dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
                     if let (Some(l), Some(r)) = (
-                        const_eval_i64_with_params(left, params),
-                        const_eval_i64_with_params(right, params),
+                        const_eval_i64_with_params_env(left, params),
+                        const_eval_i64_with_params_env(right, params),
                     ) {
                         w = w.saturating_mul(((l - r).abs() + 1) as u64);
                     }
@@ -23700,12 +23907,12 @@ fn const_eval_user_call(
     for a in args {
         // A pattern actual of a packed-struct formal (#680), as in a constant.
         if let Some(v) =
-            const_fn_struct_pattern_actual(fd.ports.get(argv.len()), a, &shell.parameters, &shell)
+            const_fn_struct_pattern_actual(fd.ports.get(argv.len()), a, Some(&shell.parameters), &shell)
         {
             argv.push(v);
             continue;
         }
-        let folded = substitute_const_fn_calls(a, &shell.parameters, &shell, 0)?;
+        let folded = substitute_const_fn_calls(a,Some(&shell.parameters), &shell, 0)?;
         if expr_has_call(&folded) || !is_const_expr(&folded, &shell.parameters) {
             return None;
         }
@@ -23714,7 +23921,7 @@ fn const_eval_user_call(
         argv.push(const_function_actual(
             fd.ports.get(argv.len()),
             &folded,
-            &shell.parameters,
+            Some(&shell.parameters),
             &shell,
         ));
     }
@@ -23740,7 +23947,7 @@ fn const_eval_user_call(
             .with(|c| c.borrow().as_ref().is_some_and(|own| !own.contains(&fname)));
     let prev_in_unit = CONST_FN_IN_UNIT.with(|c| c.replace(foreign));
     let prev_owner = CONST_FN_PACKAGE.with(|c| c.replace(owner));
-    let v = eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0);
+    let v = eval_const_user_function(&fd, &argv, Some(&shell.parameters), &shell, 0);
     CONST_FN_PACKAGE.with(|c| *c.borrow_mut() = prev_owner);
     CONST_FN_IN_UNIT.with(|c| c.set(prev_in_unit));
     v
@@ -23754,9 +23961,9 @@ fn const_eval_user_call(
 /// either as a multi-segment Ident or as a MemberAccess, so enumerate the
 /// `::` and `.` spellings (bare leaf last, matching the existing bare-leaf
 /// fallback for Ident bases).
-pub(super) fn const_index_base_keys(
+pub(super) fn const_index_base_keys<P: ParamLookup>(
     e: &Expression,
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
     out: &mut Vec<String>,
 ) {
     match &e.kind {
@@ -23781,7 +23988,7 @@ pub(super) fn const_index_base_keys(
             }
         }
         ExprKind::Index { expr, index } => {
-            if let Some(index) = const_eval_i64_with_params(index, params) {
+            if let Some(index) = const_eval_i64_with_params_env(index, params) {
                 let mut bases = Vec::new();
                 const_index_base_keys(expr, params, &mut bases);
                 out.extend(bases.into_iter().map(|base| format!("{base}[{index}]")));
@@ -23794,9 +24001,9 @@ pub(super) fn const_index_base_keys(
 
 /// Full spelling of a hierarchical path with constant selects, for parameter
 /// lookup and member-wise storage. Retain every selected instance or element.
-fn const_parameter_path(
+fn const_parameter_path<P: ParamLookup>(
     expr: &Expression,
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> Option<String> {
     match &expr.kind {
         ExprKind::Ident(h) => {
@@ -23807,7 +24014,7 @@ fn const_parameter_path(
                 }
                 path.push_str(&segment.name.name);
                 for select in &segment.selects {
-                    let index = const_eval_i64_with_params(select, params)?;
+                    let index = const_eval_i64_with_params_env(select, params)?;
                     path.push_str(&format!("[{index}]"));
                 }
             }
@@ -23821,7 +24028,7 @@ fn const_parameter_path(
         ExprKind::Index { expr, index } => Some(format!(
             "{}[{}]",
             const_parameter_path(expr, params)?,
-            const_eval_i64_with_params(index, params)?
+            const_eval_i64_with_params_env(index, params)?
         )),
         ExprKind::Paren(inner) => const_parameter_path(inner, params),
         _ => None,
@@ -23984,7 +24191,10 @@ pub fn const_eval_typed_pattern_index(
     }
     if literals(expr, params, 64).is_some() {
         let empty = HashMap::default();
-        let value = eval_const_expr_val(expr, params.unwrap_or(&empty));
+        let value = match params {
+            Some(p) => eval_const_expr_val_inner(expr, p, &mut const_context::Types::default()),
+            None => eval_const_expr_val(expr, &empty),
+        };
         // Preserve the old index conversion for unsigned high-bit 32-bit
         // keys, and the old fallback for unresolved or out-of-range keys.
         let unsigned_max = if value.width == 32 {
@@ -24002,9 +24212,9 @@ pub fn const_eval_typed_pattern_index(
     None
 }
 
-pub fn const_eval_i64_with_params(
+pub fn const_eval_i64_with_params_env<P: ParamLookup>(
     expr: &Expression,
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> Option<i64> {
     if matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
         || matches!(&expr.kind, ExprKind::MemberAccess { .. })
@@ -24053,7 +24263,7 @@ pub fn const_eval_i64_with_params(
             // inlined instances). Try those env keys first; everything else
             // keeps the former `Index | MemberAccess` tail below (delegate
             // to the full value evaluator).
-            if let Some(idx) = const_eval_i64_with_params(index, params) {
+            if let Some(idx) = const_eval_i64_with_params_env(index, params) {
                 let mut keys = Vec::new();
                 const_index_base_keys(base, params, &mut keys);
                 for k in &keys {
@@ -24063,7 +24273,7 @@ pub fn const_eval_i64_with_params(
                 }
             }
             let p = params?;
-            eval_const_expr_val(expr, p).to_i64()
+            eval_const_expr_val_inner(expr, p, &mut const_context::Types::default()).to_i64()
         }
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
             let r = match base {
@@ -24147,24 +24357,24 @@ pub fn const_eval_i64_with_params(
             // short-circuit semantics).
             match op {
                 BinaryOp::LogAnd => {
-                    let l = const_eval_i64_with_params(left, params)?;
+                    let l = const_eval_i64_with_params_env(left, params)?;
                     if l == 0 {
                         return Some(0);
                     }
-                    let r = const_eval_i64_with_params(right, params)?;
+                    let r = const_eval_i64_with_params_env(right, params)?;
                     Some(if r != 0 { 1 } else { 0 })
                 }
                 BinaryOp::LogOr => {
-                    let l = const_eval_i64_with_params(left, params)?;
+                    let l = const_eval_i64_with_params_env(left, params)?;
                     if l != 0 {
                         return Some(1);
                     }
-                    let r = const_eval_i64_with_params(right, params)?;
+                    let r = const_eval_i64_with_params_env(right, params)?;
                     Some(if r != 0 { 1 } else { 0 })
                 }
                 _ => {
-                    let l = const_eval_i64_with_params(left, params)?;
-                    let r = const_eval_i64_with_params(right, params)?;
+                    let l = const_eval_i64_with_params_env(left, params)?;
+                    let r = const_eval_i64_with_params_env(right, params)?;
                     match op {
                         BinaryOp::Add => l.checked_add(r),
                         BinaryOp::Sub => l.checked_sub(r),
@@ -24214,7 +24424,7 @@ pub fn const_eval_i64_with_params(
             }
         }
         ExprKind::Unary { op, operand } => {
-            let scalar = const_eval_i64_with_params(operand, params);
+            let scalar = const_eval_i64_with_params_env(operand, params);
             // §11.4.9: reduction operands are self-determined. Reduce before
             // narrowing to i64: high bits, narrow signed operands and literals
             // too wide for i64 must all retain their declared width. Do not
@@ -24230,20 +24440,40 @@ pub fn const_eval_i64_with_params(
                     | UnaryOp::BitXnor
             ) {
                 let empty = HashMap::default();
-                let env = params.unwrap_or(&empty);
-                if scalar.is_some() || is_const_expr(operand, env) {
-                    let val = eval_const_expr_val(operand, env);
-                    if !val.is_real {
-                        let reduced = match op {
-                            UnaryOp::BitAnd => val.reduce_and(),
-                            UnaryOp::BitNand => val.reduce_and().logic_not(),
-                            UnaryOp::BitOr => val.reduce_or(),
-                            UnaryOp::BitNor => val.reduce_or().logic_not(),
-                            UnaryOp::BitXor => val.reduce_xor(),
-                            _ => val.reduce_xor().logic_not(),
-                        };
-                        return reduced.to_index();
+                match params {
+                    Some(env) if scalar.is_some() || is_const_expr(operand, env) => {
+                        let val = eval_const_expr_val_inner(
+                            operand,
+                            env,
+                            &mut const_context::Types::default(),
+                        );
+                        if !val.is_real {
+                            let reduced = match op {
+                                UnaryOp::BitAnd => val.reduce_and(),
+                                UnaryOp::BitNand => val.reduce_and().logic_not(),
+                                UnaryOp::BitOr => val.reduce_or(),
+                                UnaryOp::BitNor => val.reduce_or().logic_not(),
+                                UnaryOp::BitXor => val.reduce_xor(),
+                                _ => val.reduce_xor().logic_not(),
+                            };
+                            return reduced.to_index();
+                        }
                     }
+                    None if scalar.is_some() || is_const_expr(operand, &empty) => {
+                        let val = eval_const_expr_val(operand, &empty);
+                        if !val.is_real {
+                            let reduced = match op {
+                                UnaryOp::BitAnd => val.reduce_and(),
+                                UnaryOp::BitNand => val.reduce_and().logic_not(),
+                                UnaryOp::BitOr => val.reduce_or(),
+                                UnaryOp::BitNor => val.reduce_or().logic_not(),
+                                UnaryOp::BitXor => val.reduce_xor(),
+                                _ => val.reduce_xor().logic_not(),
+                            };
+                            return reduced.to_index();
+                        }
+                    }
+                    _ => {}
                 }
             }
             let v = scalar?;
@@ -24268,14 +24498,14 @@ pub fn const_eval_i64_with_params(
             then_expr,
             else_expr,
         } => {
-            let c = const_eval_i64_with_params(condition, params)?;
+            let c = const_eval_i64_with_params_env(condition, params)?;
             if c != 0 {
-                const_eval_i64_with_params(then_expr, params)
+                const_eval_i64_with_params_env(then_expr, params)
             } else {
-                const_eval_i64_with_params(else_expr, params)
+                const_eval_i64_with_params_env(else_expr, params)
             }
         }
-        ExprKind::Paren(e) => const_eval_i64_with_params(e, params),
+        ExprKind::Paren(e) => const_eval_i64_with_params_env(e, params),
         // LRM §20.8 / §20.9 — constant integer system functions commonly used
         // in array bounds: $clog2, $unsigned, $signed are size-preserving;
         // $min/$max take two args. Real math reaches integer dimensions
@@ -24283,10 +24513,14 @@ pub fn const_eval_i64_with_params(
         ExprKind::SystemCall { name, args } => match name.as_str() {
             "$rtoi" if args.len() == 1 && const_fn_expr_supported(&args[0]) => {
                 let empty = HashMap::default();
-                eval_const_expr_val(expr, params.unwrap_or(&empty)).to_i64()
+                match params {
+                    Some(p) => eval_const_expr_val_inner(expr, p, &mut const_context::Types::default())
+                        .to_i64(),
+                    None => eval_const_expr_val(expr, &empty).to_i64(),
+                }
             }
             "$clog2" => {
-                let val = const_eval_i64_with_params(args.first()?, params)?;
+                let val = const_eval_i64_with_params_env(args.first()?, params)?;
                 if val <= 1 {
                     Some(0)
                 } else {
@@ -24299,13 +24533,13 @@ pub fn const_eval_i64_with_params(
                     Some(res)
                 }
             }
-            "$unsigned" | "$signed" => const_eval_i64_with_params(args.first()?, params),
+            "$unsigned" | "$signed" => const_eval_i64_with_params_env(args.first()?, params),
             // §6.24.1 casts (`int'(e)`, `N'(e)`, `T'(e)`) — the value
             // evaluator applies the cast width as the operand's context. A
             // cast in a dimension (`logic [int'(A + B) - 1:0]`) left the range
             // unresolved.
             "$__xz_size_cast" | "$__xz_type_cast" | "$__xz_named_cast" => {
-                let v = eval_const_expr_val(expr, params?);
+                let v = eval_const_expr_val_inner(expr, params?, &mut const_context::Types::default());
                 if v.is_real || v.has_xz() {
                     return None;
                 }
@@ -24319,16 +24553,16 @@ pub fn const_eval_i64_with_params(
             // For const-eval we operate on the const-evaluated i64 value
             // (X/Z bits aren't preserved, so $isunknown is 0 here).
             "$countones" => {
-                let v = const_eval_i64_with_params(args.first()?, params)?;
+                let v = const_eval_i64_with_params_env(args.first()?, params)?;
                 Some((v as u64).count_ones() as i64)
             }
             "$onehot" => {
-                let v = const_eval_i64_with_params(args.first()?, params)?;
+                let v = const_eval_i64_with_params_env(args.first()?, params)?;
                 let v = v as u64;
                 Some(if v != 0 && v & (v - 1) == 0 { 1 } else { 0 })
             }
             "$onehot0" => {
-                let v = const_eval_i64_with_params(args.first()?, params)?;
+                let v = const_eval_i64_with_params_env(args.first()?, params)?;
                 let v = v as u64;
                 Some(if v == 0 || v & (v - 1) == 0 { 1 } else { 0 })
             }
@@ -24338,7 +24572,7 @@ pub fn const_eval_i64_with_params(
                 // place to check x/z; this just keeps parameter
                 // expressions like `parameter int K = $isunknown(N);`
                 // from falling through to a generic 0.
-                let _ = const_eval_i64_with_params(args.first()?, params)?;
+                let _ = const_eval_i64_with_params_env(args.first()?, params)?;
                 Some(0)
             }
             "$countbits" => {
@@ -24346,11 +24580,11 @@ pub fn const_eval_i64_with_params(
                 // any of the control values (0/1/X/Z encoded as 2'b
                 // const). For const-eval we only count 0/1 controls
                 // since X/Z are stripped.
-                let v = const_eval_i64_with_params(args.first()?, params)? as u64;
+                let v = const_eval_i64_with_params_env(args.first()?, params)? as u64;
                 let mut want_zero = false;
                 let mut want_one = false;
                 for ctl in &args[1..] {
-                    if let Some(c) = const_eval_i64_with_params(ctl, params) {
+                    if let Some(c) = const_eval_i64_with_params_env(ctl, params) {
                         match c {
                             0 => want_zero = true,
                             1 => want_one = true,
@@ -24540,9 +24774,9 @@ pub fn const_eval_i64_with_params(
                     ExprKind::Concatenation(_)
                     | ExprKind::Replication { .. }
                     | ExprKind::Paren(_) => {
-                        fn expr_bits(
+                        fn expr_bits<P: ParamLookup>(
                             e: &Expression,
-                            params: Option<&HashMap<String, Value>>,
+                            params: Option<&P>,
                         ) -> Option<i64> {
                             match &e.kind {
                                 ExprKind::Number(NumberLiteral::Integer {
@@ -24561,7 +24795,7 @@ pub fn const_eval_i64_with_params(
                                     Some(t)
                                 }
                                 ExprKind::Replication { count, exprs } => {
-                                    let c = const_eval_i64_with_params(count, params)?;
+                                    let c = const_eval_i64_with_params_env(count, params)?;
                                     if c < 0 {
                                         return None;
                                     }
@@ -24622,7 +24856,7 @@ pub fn const_eval_i64_with_params(
                     // `logic [VLD_W-1:0]` then declared a degenerate vector and
                     // half the bits silently vanished.
                     ExprKind::TypeLiteral(dt) => {
-                        typedefs_snapshot(|td| Some(resolve_type_width(dt, params, td) as i64))
+                        typedefs_snapshot(|td| Some(resolve_type_width_env(dt, params, td) as i64))
                     }
                     // §20.6.2 over a TYPEDEF with packed dimensions —
                     // `$bits(pkg::t [0:0][1:0])`. A scoped type name is not a
@@ -24645,8 +24879,8 @@ pub fn const_eval_i64_with_params(
                             if !matches!(kind, crate::ast::expr::RangeKind::Constant) {
                                 return None;
                             }
-                            let l = const_eval_i64_with_params(left, params)?;
-                            let r = const_eval_i64_with_params(right, params)?;
+                            let l = const_eval_i64_with_params_env(left, params)?;
+                            let r = const_eval_i64_with_params_env(right, params)?;
                             dims.push((l, r));
                             cur = expr.as_ref();
                         }
@@ -24743,7 +24977,7 @@ pub fn const_eval_i64_with_params(
                             return None;
                         }
                         let dim = match args.get(1) {
-                            Some(d) => const_eval_i64_with_params(d, params)? as usize,
+                            Some(d) => const_eval_i64_with_params_env(d, params)? as usize,
                             None => 1,
                         };
                         type_query_bound(name, &q, dim)
@@ -24763,7 +24997,7 @@ pub fn const_eval_i64_with_params(
         // -1, not 4294967295).
         ExprKind::MemberAccess { .. } => {
             let p = params?;
-            eval_const_expr_val(expr, p).to_i64()
+            eval_const_expr_val_inner(expr, p, &mut const_context::Types::default()).to_i64()
         }
         // §11.4.12: a constant concatenation or replication, such as the
         // `{Width{1'b1}}` bound of a covergroup bin range.
@@ -24775,7 +25009,7 @@ pub fn const_eval_i64_with_params(
         // fallback below only fires when the declaration isn't visible, and
         // silently assumes $clog2 semantics (wrong for floor-log2 variants).
         ExprKind::Call { func, args } => {
-            if let Some(v) = const_eval_user_call(expr, params) {
+            if let Some(v) = const_eval_user_call(expr, params.map(|p| p.as_hashmap_base()).flatten()) {
                 return v.to_i64();
             }
             let fname = match &func.kind {
@@ -24785,7 +25019,7 @@ pub fn const_eval_i64_with_params(
             };
             // Name-based ceil-log2 fallback (HardFloat `clog2` == $clog2).
             if fname == "clog2" {
-                let n = const_eval_i64_with_params(args.first()?, params)? as u64;
+                let n = const_eval_i64_with_params_env(args.first()?, params)? as u64;
                 return Some(ceil_log2(n) as i64);
             }
             None
@@ -24794,19 +25028,33 @@ pub fn const_eval_i64_with_params(
     }
 }
 
+/// Const-evaluate `expr` against a plain parameter table (`None` = empty).
+/// The generic core [`const_eval_i64_with_params_env`] additionally accepts a
+/// [`ParamLookup`] overlay for constant-function bodies.
+pub fn const_eval_i64_with_params(
+    expr: &Expression,
+    params: Option<&HashMap<String, Value>>,
+) -> Option<i64> {
+    const_eval_i64_with_params_env(expr, params)
+}
+
 /// Value and width of a constant concatenation operand (§11.4.12), when
 /// every operand is a sized literal, a parameter, or a nested concatenation
 /// or replication, and the whole fits in 64 bits. A zero replication has
 /// width 0 (§11.4.12.1); 65 copies of a nonzero width are already too wide.
-fn const_concat_bits(
+fn const_concat_bits<P: ParamLookup>(
     e: &Expression,
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> Option<(u64, u32)> {
     let mask = |v: u64, w: u32| if w >= 64 { v } else { v & ((1u64 << w) - 1) };
     let (v, w) = match &e.kind {
         ExprKind::Paren(x) => return const_concat_bits(x, params),
         ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => {
-            let lit = eval_const_expr_val(e, params.unwrap_or(&HashMap::default()));
+            let empty = HashMap::default();
+            let lit = match params {
+                Some(p) => eval_const_expr_val_inner(e, p, &mut const_context::Types::default()),
+                None => eval_const_expr_val(e, &empty),
+            };
             (lit.to_u64().filter(|_| !lit.has_xz())?, *s)
         }
         ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
@@ -24826,7 +25074,7 @@ fn const_concat_bits(
             (v, w)
         }
         ExprKind::Replication { count, exprs } => {
-            let n = u32::try_from(const_eval_i64_with_params(count, params)?).ok()?;
+            let n = u32::try_from(const_eval_i64_with_params_env(count, params)?).ok()?;
             let mut inner = Vec::with_capacity(exprs.len());
             for x in exprs {
                 inner.push(const_concat_bits(x, params)?);
@@ -25060,7 +25308,7 @@ fn const_struct_select_root(expr: &Expression) -> Option<(String, String)> {
     // Package and instance prefixes are part of the array's registered key.
     // Resolve that key before interpreting a suffix as a struct member.
     let mut keys = Vec::new();
-    const_index_base_keys(expr, None, &mut keys);
+    const_index_base_keys::<HashMap<String, Value>>(expr, None, &mut keys);
     if let Some(root) = STRUCT_FIELDS_TLS.with(|c| {
         let map = c.borrow();
         keys.into_iter().find(|key| map.contains_key(key))
@@ -25227,11 +25475,11 @@ fn register_struct_member_elem_widths(
 /// Element `idx` of a packed-array value whose element width was registered
 /// for `base` (`Implementation.UnitTypes[opgrp]`). `[0:N]` keeps element 0 in
 /// the MS bits; `[N:0]` keeps it at the LSB.
-fn const_packed_array_elem(
+fn const_packed_array_elem<P: ParamLookup>(
     base: &Expression,
     base_val: &Value,
     idx: u64,
-    params: &HashMap<String, Value>,
+    params: &P,
 ) -> Option<Value> {
     let mut keys = Vec::new();
     if let Some(path) = const_parameter_path(base, Some(params)) {
@@ -26525,19 +26773,19 @@ fn collect_decl_shapes(
 /// `[l:r]` / `[n]` bounds of fixed unpacked dimensions, declared order. None
 /// for a dynamic, queue or associative dimension (not a constant shape) or a
 /// bound that does not fold.
-fn fixed_unpacked_bounds(
+fn fixed_unpacked_bounds<P: ParamLookup>(
     dims: &[UnpackedDimension],
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> Option<Vec<(i64, i64)>> {
     let mut out = Vec::with_capacity(dims.len());
     for d in dims {
         match d {
             UnpackedDimension::Range { left, right, .. } => out.push((
-                const_eval_i64_with_params(left, params)?,
-                const_eval_i64_with_params(right, params)?,
+                const_eval_i64_with_params_env(left, params)?,
+                const_eval_i64_with_params_env(right, params)?,
             )),
             UnpackedDimension::Expression { expr, .. } => {
-                let n = const_eval_i64_with_params(expr, params)?;
+                let n = const_eval_i64_with_params_env(expr, params)?;
                 if n <= 0 {
                     return None;
                 }
@@ -26563,9 +26811,9 @@ fn fixed_unpacked_bounds(
 /// §20.7 dimensions and §20.6.2 bit count of a declared fixed-size VARIABLE
 /// named `name` in the scope being elaborated. Unpacked dimensions come first
 /// (§7.4.5: the declarator's, then a typedef's), then the packed ones.
-fn decl_shape_query(
+fn decl_shape_query<P: ParamLookup>(
     name: &str,
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> Option<(TypeQueryDims, Option<i64>)> {
     let shape = decl_shape_of(name)?;
     if !shape.param && params.is_some_and(|p| p.contains_key(name)) {
@@ -26577,7 +26825,7 @@ fn decl_shape_query(
         whole: None,
     };
     let (elem_w, inner) = typedefs_snapshot(|td| {
-        let elem_w = resolve_type_width(&shape.data_type, params, td) as i64;
+        let elem_w = resolve_type_width_env(&shape.data_type, params, td) as i64;
         let inner = TYPEDEF_SHAPES_TLS.with(|c| {
             let c = c.borrow();
             match &shape.data_type {
@@ -26623,7 +26871,7 @@ fn decl_shape_query(
 /// variable `v` of the scope: its width over the dimensions, unpacked then
 /// packed, that the selects leave. None for any other operand, or when the
 /// selects reach past the declared dimensions.
-fn decl_select_bits(e: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
+fn decl_select_bits<P: ParamLookup>(e: &Expression, params: Option<&P>) -> Option<i64> {
     // A final part-select (`pk[3:2]`, `pk[i +: 2]`) keeps that many elements
     // of the next dimension.
     let (mut cur, slice) = match &e.kind {
@@ -26635,11 +26883,11 @@ fn decl_select_bits(e: &Expression, params: Option<&HashMap<String, Value>>) -> 
         } => {
             let n = match kind {
                 crate::ast::expr::RangeKind::Constant => {
-                    let l = const_eval_i64_with_params(left, params)?;
-                    let r = const_eval_i64_with_params(right, params)?;
+                    let l = const_eval_i64_with_params_env(left, params)?;
+                    let r = const_eval_i64_with_params_env(right, params)?;
                     (l - r).abs() + 1
                 }
-                _ => const_eval_i64_with_params(right, params)?,
+                _ => const_eval_i64_with_params_env(right, params)?,
             };
             (expr.as_ref(), Some(n))
         }
@@ -26683,10 +26931,10 @@ fn decl_select_bits(e: &Expression, params: Option<&HashMap<String, Value>>) -> 
 /// scope being elaborated: `$bits(fx)`, `$size(fx2, 2)`, `$increment(pu)`.
 /// None when the operand is not such a variable (a parameter or a type keeps
 /// its own resolution) or the queried dimension does not exist.
-fn decl_var_query(
+fn decl_var_query<P: ParamLookup>(
     fname: &str,
     args: &[Expression],
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> Option<i64> {
     let arg = args.first()?;
     if !is_decl_shape_operand(arg) {
@@ -26697,7 +26945,7 @@ fn decl_var_query(
         return bits;
     }
     let dim = match args.get(1) {
-        Some(d) => const_eval_i64_with_params(d, params)?,
+        Some(d) => const_eval_i64_with_params_env(d, params)?,
         None => 1,
     };
     if dim < 1 {
@@ -26708,17 +26956,17 @@ fn decl_var_query(
 
 /// §20.7 array query over an explicit type operand (`$size(logic [7:0])`,
 /// `$left(bit [3:0][7:0], 2)`). None when the dimension does not exist.
-fn type_literal_query(
+fn type_literal_query<P: ParamLookup>(
     fname: &str,
     dt: &DataType,
     args: &[Expression],
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> Option<i64> {
     let q = typedefs_snapshot(|td| {
         TYPEDEF_SHAPES_TLS.with(|c| type_query_dims_of(dt, params, td, Some(&c.borrow().0)))
     });
     let dim = match args.get(1) {
-        Some(d) => const_eval_i64_with_params(d, params)?,
+        Some(d) => const_eval_i64_with_params_env(d, params)?,
         None => 1,
     };
     if dim < 1 {
@@ -26730,7 +26978,7 @@ fn type_literal_query(
 /// §20.6.2 `$bits` of a typedef carrying UNPACKED dimensions
 /// (`typedef int arr_t [3:0][1:5]`): the width table records one element, so
 /// multiply in every unpacked dimension. None for any other name.
-fn typedef_unpacked_bits(name: &str, params: Option<&HashMap<String, Value>>) -> Option<i64> {
+fn typedef_unpacked_bits<P: ParamLookup>(name: &str, params: Option<&P>) -> Option<i64> {
     let dims = TYPEDEF_SHAPES_TLS.with(|c| c.borrow().1.get(name).cloned())?;
     let bounds = fixed_unpacked_bounds(&dims, params)?;
     let elem =
@@ -27150,7 +27398,7 @@ fn atom_keyword_width(name: &str) -> Option<u32> {
 /// §20.6.2 + §6.24.1: `$bits` of a cast is the width of the cast's target,
 /// whatever the operand (`$bits(int'(45))` is 32, `$bits(5'(45))` is 5).
 /// None when the target width is not known here.
-fn const_cast_bits(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
+fn const_cast_bits<P: ParamLookup>(e: &Expression, params: &P) -> Option<u32> {
     let ExprKind::SystemCall { name, args } = &e.kind else {
         return None;
     };
@@ -27159,11 +27407,11 @@ fn const_cast_bits(e: &Expression, params: &HashMap<String, Value>) -> Option<u3
     }
     let w = match name.as_str() {
         "$__xz_size_cast" => {
-            u32::try_from(const_eval_i64_with_params(&args[0], Some(params))?).ok()?
+            u32::try_from(const_eval_i64_with_params_env(&args[0], Some(params))?).ok()?
         }
         "$__xz_type_cast" | "$__xz_named_cast" => match &args[0].kind {
             ExprKind::TypeLiteral(dt) => {
-                typedefs_snapshot(|td| resolve_type_width(dt, Some(params), td))
+                typedefs_snapshot(|td| resolve_type_width_env(dt, Some(params), td))
             }
             // `N'(e)` with a constant `N` lowers to a named cast too.
             ExprKind::Ident(h) if h.path.len() == 1 => {
@@ -27199,7 +27447,7 @@ fn const_cast_bits(e: &Expression, params: &HashMap<String, Value>) -> Option<u3
 /// `$bits(c ? a : b)`, `$bits(f(1))`. A leaf (an identifier, member or
 /// select) is answered by the `$bits` evaluator itself, a cast by its
 /// target. None when a width is not known here.
-fn const_self_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
+fn const_self_width<P: ParamLookup>(e: &Expression, params: &P) -> Option<u32> {
     use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
     let leaf = |x: &Expression| -> Option<u32> {
         let call = Expression::new(
@@ -27209,9 +27457,9 @@ fn const_self_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u
             },
             x.span,
         );
-        let w = const_eval_i64_with_params(&call, Some(params))
+        let w = const_eval_i64_with_params_env(&call, Some(params))
             .filter(|&w| w > 0)
-            .or_else(|| eval_const_expr_val(&call, params).to_i64())?;
+            .or_else(|| eval_const_expr_val_inner(&call, params, &mut const_context::Types::default()).to_i64())?;
         u32::try_from(w).ok().filter(|&w| w > 0)
     };
     match &e.kind {
@@ -27232,7 +27480,7 @@ fn const_self_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u
             .iter()
             .try_fold(0u32, |t, x| t.checked_add(const_self_width(x, params)?)),
         ExprKind::Replication { count, exprs } => {
-            let n = u32::try_from(const_eval_i64_with_params(count, Some(params))?).ok()?;
+            let n = u32::try_from(const_eval_i64_with_params_env(count, Some(params))?).ok()?;
             exprs
                 .iter()
                 .try_fold(0u32, |t, x| t.checked_add(const_self_width(x, params)?))?
@@ -27291,7 +27539,7 @@ fn const_self_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u
                 let f = f.borrow();
                 f.as_ref()?.get(name).map(|fd| fd.return_type.clone())
             })?;
-            typedefs_snapshot(|td| Some(resolve_type_width(&rt, Some(params), td))).filter(|&w| w > 0)
+            typedefs_snapshot(|td| Some(resolve_type_width_env(&rt, Some(params), td))).filter(|&w| w > 0)
         }
         ExprKind::Ident(_)
         | ExprKind::MemberAccess { .. }
@@ -27311,9 +27559,9 @@ fn is_cast_call(name: &str) -> bool {
 
 /// Append a type's packed dimensions, declared order preserved. Stops at the
 /// first non-constant / unsized dimension.
-fn push_packed_query_dims(
+fn push_packed_query_dims<P: ParamLookup>(
     dimensions: &[PackedDimension],
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
     out: &mut Vec<(i64, i64)>,
 ) {
     for d in dimensions {
@@ -27321,8 +27569,8 @@ fn push_packed_query_dims(
             return;
         };
         let (Some(l), Some(r)) = (
-            const_eval_i64_with_params(left, params),
-            const_eval_i64_with_params(right, params),
+            const_eval_i64_with_params_env(left, params),
+            const_eval_i64_with_params_env(right, params),
         ) else {
             return;
         };
@@ -27332,9 +27580,9 @@ fn push_packed_query_dims(
 
 /// §20.7 over an explicit type — the packed shape of `dt`, following any
 /// typedef chain. See `type_query_dims_by_name` for the name-keyed form.
-pub fn type_query_dims_of(
+pub fn type_query_dims_of<P: ParamLookup>(
     dt: &DataType,
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
     typedefs: Option<&HashMap<String, u32>>,
     typedef_types: Option<&HashMap<String, DataType>>,
 ) -> TypeQueryDims {
@@ -27353,7 +27601,7 @@ pub fn type_query_dims_of(
                 if cur.is_none() {
                     // The chain bottoms out on a typedef known only by width
                     // (an enum, or one whose definition was never registered).
-                    let w = resolve_type_width(&t, params, typedefs);
+                    let w = resolve_type_width_env(&t, params, typedefs);
                     if w > 0 && dimensions.is_empty() {
                         q.whole = Some((w as i64 - 1, 0));
                     }
@@ -27366,7 +27614,7 @@ pub fn type_query_dims_of(
                 break;
             }
             DataType::IntegerAtom { .. } => {
-                let w = resolve_type_width(&t, params, typedefs).max(1);
+                let w = resolve_type_width_env(&t, params, typedefs).max(1);
                 q.dims.push((w as i64 - 1, 0));
                 break;
             }
@@ -27374,7 +27622,7 @@ pub fn type_query_dims_of(
                 // Neither an enum nor a packed struct/union has an array
                 // dimension of its own, so `$dimensions` is 0 — but the bound
                 // queries still describe its whole packed extent.
-                let w = resolve_type_width(&t, params, typedefs);
+                let w = resolve_type_width_env(&t, params, typedefs);
                 if w > 0 {
                     q.whole = Some((w as i64 - 1, 0));
                 }
@@ -27395,9 +27643,9 @@ pub fn type_query_dims_of(
 /// name->width typedef table, can still answer: without it a typedef is
 /// described by its width alone (`whole`), which gets the bound queries right
 /// for every zero-based type but cannot report `$dimensions`.
-pub fn type_query_dims_by_name(
+pub fn type_query_dims_by_name<P: ParamLookup>(
     name: &str,
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
     typedefs: Option<&HashMap<String, u32>>,
     typedef_types: Option<&HashMap<String, DataType>>,
     typedef_unpacked_dims: Option<&HashMap<String, Vec<UnpackedDimension>>>,
@@ -27426,15 +27674,15 @@ pub fn type_query_dims_by_name(
             match d {
                 UnpackedDimension::Range { left, right, .. } => {
                     let (Some(l), Some(r)) = (
-                        const_eval_i64_with_params(left, params),
-                        const_eval_i64_with_params(right, params),
+                        const_eval_i64_with_params_env(left, params),
+                        const_eval_i64_with_params_env(right, params),
                     ) else {
                         break;
                     };
                     q.dims.push((l, r));
                 }
                 UnpackedDimension::Expression { expr, .. } => {
-                    match const_eval_i64_with_params(expr, params) {
+                    match const_eval_i64_with_params_env(expr, params) {
                         Some(n) if n > 0 => q.dims.push((0, n - 1)),
                         _ => break,
                     }
@@ -28069,7 +28317,7 @@ fn register_visible_array_param(
         assign.init.as_ref(),
         None,
         data_type,
-        &params,
+        Some(&params),
     ) {
         return false;
     }
@@ -28081,7 +28329,7 @@ fn register_visible_array_param(
         assign.init.as_ref(),
         None,
         data_type,
-        &params,
+        Some(&params),
     );
     true
 }
@@ -28224,7 +28472,7 @@ fn pack_packed_array_const_value(
     if !matches!(elem_dt, DataType::Struct(_)) {
         return None;
     }
-    let elem_w = resolve_type_width(elem_dt, Some(params), Some(typedefs));
+    let elem_w = resolve_type_width_env(elem_dt, Some(params), Some(typedefs));
     if elem_w == 0 {
         return None;
     }
@@ -28602,16 +28850,21 @@ fn real_to_integral(f: f64, w: u32) -> Value {
 /// context (`.P(4'hF + 4'h1)` on `[7:0]` is 16, not 0); a real rounds; the
 /// result wraps to the declared width, takes the declared signedness, and a
 /// 2-state type maps X/Z to 0.
-fn convert_param_value(
+fn convert_param_value<P: ParamLookup>(
     val: &Value,
     expr: Option<&Expression>,
-    scope: &HashMap<String, Value>,
+    scope: &P,
     (w, signed, two_state): (u32, bool, bool),
 ) -> Value {
     let ctx;
     let src = match expr {
         Some(e) if !val.is_real => {
-            ctx = eval_const_expr_val_ctx(e, scope, w);
+            ctx = eval_const_expr_val_ctx_inner(
+                e,
+                scope,
+                w,
+                &mut const_context::Types::default(),
+            );
             &ctx
         }
         _ => val,
@@ -28677,22 +28930,22 @@ pub fn normalize_unpacked_dims(
 /// Element count of a declarator's FIXED unpacked dimensions (§7.4.2), for
 /// width computations. Dynamic / queue / associative dimensions have no static
 /// size and count as one, leaving the pre-existing behaviour for those.
-fn unpacked_dims_elem_count(
+fn unpacked_dims_elem_count<P: ParamLookup>(
     dims: &[UnpackedDimension],
-    params: Option<&HashMap<String, Value>>,
+    params: Option<&P>,
 ) -> u32 {
     let mut n: u32 = 1;
     for d in dims {
         let c = match d {
             UnpackedDimension::Expression { expr, .. } => {
-                match const_eval_i64_with_params(expr, params) {
+                match const_eval_i64_with_params_env(expr, params) {
                     Some(v) if v > 0 => v as u32,
                     _ => 1,
                 }
             }
             UnpackedDimension::Range { left, right, .. } => match (
-                const_eval_i64_with_params(left, params),
-                const_eval_i64_with_params(right, params),
+                const_eval_i64_with_params_env(left, params),
+                const_eval_i64_with_params_env(right, params),
             ) {
                 (Some(l), Some(r)) => ((l - r).abs() + 1) as u32,
                 _ => 1,
@@ -28701,7 +28954,8 @@ fn unpacked_dims_elem_count(
             // dimension keyed by a "type" (the parser cannot tell a type from
             // a constant); a parameter that names no type is a size.
             UnpackedDimension::Associative { .. } => params
-                .and_then(|p| assoc_dim_const_size(d, p))
+                .and_then(|p| p.as_hashmap_base())
+                .and_then(|base| assoc_dim_const_size(d, base))
                 .map_or(1, |v| v.clamp(1, u32::MAX as i64) as u32),
             _ => 1,
         };
@@ -28861,6 +29115,11 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
 /// `{a, b}` puts `a` in the high bits (§11.4.12) and `a` is element 0.
 /// Returns false when the size or the element values can't be resolved, so the
 /// caller falls back to treating the parameter as a scalar.
+///
+/// `params` is optional: when `None`, the elaboration-wide parameter map is
+/// used directly (the common case, avoiding a whole-table clone borrow
+/// workaround); pass `Some(map)` when the elements must resolve against a
+/// different overlay (e.g. a package-visible or sub-instance scope).
 fn register_array_param(
     elab: &mut ElaboratedModule,
     prefix: &str,
@@ -28869,19 +29128,36 @@ fn register_array_param(
     init: Option<&Expression>,
     override_val: Option<&Value>,
     data_type: &DataType,
-    params: &HashMap<String, Value>,
+    params: Option<&HashMap<String, Value>>,
 ) -> bool {
-    array_params::register(
-        elab,
-        prefix,
-        name,
-        dims,
-        init,
-        override_val,
-        data_type,
-        params,
-        params,
-    )
+    // Compute the registration data against a read-only view, so `params` may
+    // borrow `&elab.parameters` without conflicting with the later `&mut`.
+    let computed = match params {
+        Some(p) => array_params::compute(
+            &*elab, prefix, name, dims, init, override_val, data_type, p, p,
+        ),
+        None => {
+            let read_only: &ElaboratedModule = elab;
+            array_params::compute(
+                read_only,
+                prefix,
+                name,
+                dims,
+                init,
+                override_val,
+                data_type,
+                &read_only.parameters,
+                &read_only.parameters,
+            )
+        }
+    };
+    match computed {
+        Some(registered) => {
+            registered.apply(elab, prefix);
+            true
+        }
+        None => false,
+    }
 }
 
 /// An index of a multi-dimensional packed parameter is an element select, not
@@ -30218,7 +30494,7 @@ fn pack_struct_const_value(
     // Top-level members in declaration order (first = MSB).
     let mut members: Vec<(String, u32, DataType)> = Vec::new();
     for member in &su.members {
-        let mw = resolve_type_width(&member.data_type, Some(params), Some(typedefs));
+        let mw = resolve_type_width_env(&member.data_type, Some(params), Some(typedefs));
         for mdecl in &member.declarators {
             members.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
         }
@@ -30399,9 +30675,9 @@ pub fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &s
 /// (the other side of a relational operator, the other arm of `?:`). The real
 /// type reaches its top operator, whose own operands are self-determined and
 /// converted; anything else is converted whole (§6.12.2).
-fn const_eval_in_real_context(e: &Expression, params: &HashMap<String, Value>) -> Value {
+fn const_eval_in_real_context<P: ParamLookup>(e: &Expression, params: &P) -> Value {
     let real = |e: &Expression| {
-        let v = eval_const_expr_val(e, params);
+        let v = eval_const_expr_val_inner(e, params, &mut const_context::Types::default());
         if v.is_real {
             v
         } else {
@@ -30453,9 +30729,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
     eval_const_expr_val_inner(expr, params, &mut const_context::Types::default())
 }
 
-fn eval_const_expr_val_inner(
+fn eval_const_expr_val_inner<P: ParamLookup>(
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: &P,
     types: &mut const_context::Types,
 ) -> Value {
     if let Some(value) = types.take_value(expr) {
@@ -30469,30 +30745,27 @@ fn eval_const_expr_val_inner(
             }
         }
     }
+    // §25.5: a parameter reached through an interface PORT formal
+    // (`c.DEPTH`) parses as MemberAccess; the child's param map carries
+    // it under the dotted spelling (seeded at inlining). Resolve the two
+    // spellings once (a single `format!` pair), returning early only when
+    // the key exists so an unbound member falls through to the general
+    // struct/field handler below.
+    if let ExprKind::MemberAccess { expr: base, member } = &expr.kind
+        && let ExprKind::Ident(h) = &base.kind
+        && h.path.len() == 1
+        && h.path[0].selects.is_empty()
+    {
+        let name = &h.path[0].name.name;
+        let dotted = format!("{}.{}", name, member.name);
+        let doubledash = format!("{}::{}", name, member.name);
+        if let Some(v) = params.get(&dotted).or_else(|| params.get(&doubledash)) {
+            return v.clone();
+        }
+    }
     let mut res = match &expr.kind {
         // §3.14.3: an elaborated `1step` delay is one tick.
         ExprKind::SystemCall { name, .. } if name == ONE_STEP_DELAY => Value::from_u64(1, 64),
-        // §25.5: a parameter reached through an interface PORT formal
-        // (`c.DEPTH`) parses as MemberAccess; the child's param map carries
-        // it under the dotted spelling (seeded at inlining). Without this
-        // arm the expression fell into the default and evaluated 0.
-        ExprKind::MemberAccess { expr: base, member }
-            if matches!(&base.kind,
-                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty()
-                    && (params.contains_key(&format!("{}.{}", h.path[0].name.name, member.name))
-                        || params.contains_key(&format!("{}::{}", h.path[0].name.name, member.name)))) =>
-        {
-            let base_name = if let ExprKind::Ident(h) = &base.kind {
-                h.path[0].name.name.clone()
-            } else {
-                unreachable!()
-            };
-            params
-                .get(&format!("{}.{}", base_name, member.name))
-                .or_else(|| params.get(&format!("{}::{}", base_name, member.name)))
-                .cloned()
-                .unwrap_or_else(|| Value::new(32))
-        }
         ExprKind::Number(num) => {
             match num {
                 NumberLiteral::Integer {
@@ -30867,7 +31140,7 @@ fn eval_const_expr_val_inner(
                 // default made the enclosing localparam 0 — and
                 // `logic [W-1:0]` then declared a degenerate vector.
                 ExprKind::TypeLiteral(dt) => {
-                    typedefs_snapshot(|td| resolve_type_width(dt, Some(params), td))
+                    typedefs_snapshot(|td| resolve_type_width_env(dt, Some(params), td))
                 }
                 // §20.6.2 over a TYPEDEF carrying packed dimensions —
                 // `$bits(pkg::t [0:0][1:0])`. A scoped type name is not a
@@ -30893,8 +31166,8 @@ fn eval_const_expr_val_inner(
                             break;
                         }
                         match (
-                            const_eval_i64_with_params(left, Some(params)),
-                            const_eval_i64_with_params(right, Some(params)),
+                            const_eval_i64_with_params_env(left, Some(params)),
+                            const_eval_i64_with_params_env(right, Some(params)),
                         ) {
                             (Some(l), Some(r)) => dims.push((l, r)),
                             _ => {
@@ -31087,7 +31360,7 @@ fn eval_const_expr_val_inner(
                 let w = TYPEDEFS_TLS
                     .with(|c| {
                         let b = c.borrow();
-                        resolve_type_width(dt, Some(params), b.as_ref())
+                        resolve_type_width_env(dt, Some(params), b.as_ref())
                     })
                     .max(1);
                 // §6.24.1: an integral target is the operand's context width.
@@ -31288,7 +31561,7 @@ fn eval_const_expr_val_inner(
                     // elaborated to `[-1:0]` — two bits.
                     let dim = args
                         .get(1)
-                        .and_then(|d| const_eval_i64_with_params(d, Some(params)))
+                        .and_then(|d| const_eval_i64_with_params_env(d, Some(params)))
                         .unwrap_or(1) as usize;
                     type_query_bound(name, &q, dim)
                 })
@@ -31517,7 +31790,7 @@ fn eval_const_expr_val_inner(
                         if !packed
                             && (k.contains("::")
                                 || !params.contains_key(k)
-                                || params.keys().any(|name| name.starts_with(&prefix)))
+                                || params.keys().iter().any(|name| name.starts_with(&prefix)))
                         {
                             return value;
                         }
@@ -31580,18 +31853,21 @@ fn eval_const_expr_val_inner(
         // in a generate-for body, which otherwise packed as 0. The result
         // keeps the function's declared return type.
         ExprKind::Call { .. } => {
-            const_eval_user_call(expr, Some(params)).unwrap_or_else(|| Value::zero(32))
+            const_eval_user_call(expr, Some(params.as_hashmap_base().expect("param base")))
+                .unwrap_or_else(|| Value::zero(32))
         }
         // §10.9: a typed pattern has its type's value, packed against the
         // typedef snapshot.
-        ExprKind::TypedPattern { ty, pattern } => TYPEDEF_TYPES_TLS
-            .with(|types| {
+        ExprKind::TypedPattern { ty, pattern } => {
+            let base = params.as_hashmap_base().expect("param base");
+            TYPEDEF_TYPES_TLS.with(|types| {
                 TYPEDEF_WIDTHS_TLS.with(|widths| {
                     let (types, widths) = (types.borrow(), widths.borrow());
-                    pack_typed_pattern(ty, pattern, params, widths.as_ref()?, types.as_ref()?)
+                    pack_typed_pattern(ty, pattern, base, widths.as_ref()?, types.as_ref()?)
                 })
             })
-            .unwrap_or_else(|| Value::zero(32)),
+            .unwrap_or_else(|| Value::zero(32))
+        }
         _ => Value::zero(32),
     };
     // §20.6.2, §20.7, §20.8.1, §20.9: the size, array query, `$clog2` and
@@ -31636,9 +31912,9 @@ fn eval_const_expr_val_ctx(
     eval_const_expr_val_ctx_inner(expr, params, ctx_w, &mut const_context::Types::default())
 }
 
-fn eval_const_expr_val_ctx_inner(
+fn eval_const_expr_val_ctx_inner<P: ParamLookup>(
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: &P,
     ctx_w: u32,
     types: &mut const_context::Types,
 ) -> Value {
@@ -31662,10 +31938,10 @@ fn eval_const_expr_val_ctx_inner(
 /// (the width table can still hold a type parameter's default); any other
 /// comes from the current scope's width table when it has the name. `None` for a name with no known definition, or a string,
 /// real or unpacked type: the caller keeps its pass-through.
-fn const_typedef_cast_target(
+fn const_typedef_cast_target<P: ParamLookup>(
     nm: &str,
     scoped: Option<&str>,
-    params: &HashMap<String, Value>,
+    params: &P,
 ) -> Option<(u32, bool)> {
     let local = |n: &str| CONST_FN_LOCAL_TYPES.with(|c| c.borrow().as_ref()?.get(n).cloned());
     let dt = TYPEDEF_SHAPES_TLS.with(|sh| {
@@ -31715,7 +31991,7 @@ fn const_typedef_cast_target(
         })
         .filter(|&w| w > 0)
         .unwrap_or_else(|| {
-            TYPEDEFS_TLS.with(|c| resolve_type_width(&dt, Some(params), c.borrow().as_ref()))
+            TYPEDEFS_TLS.with(|c| resolve_type_width_env(&dt, Some(params), c.borrow().as_ref()))
         });
     (w > 0).then(|| (w, is_type_signed(&dt)))
 }
@@ -31753,9 +32029,9 @@ fn is_context_operator(expr: &Expression) -> bool {
 /// The context fold behind `eval_const_expr_val_ctx`: `None` when a
 /// sub-expression cannot take part (for example a real leaf),
 /// and the caller keeps the self-determined value.
-fn const_ctx_fold(
+fn const_ctx_fold<P: ParamLookup>(
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: &P,
     w: u32,
     signed: bool,
     types: &mut const_context::Types,
@@ -34399,8 +34675,7 @@ fn inline_instantiations_inner(
                                             let subbed_init6;
                                             let init: &Expression = if expr_has_call(init) {
                                                 match substitute_const_fn_calls(
-                                                    init,
-                                                    &elab.parameters,
+                                                    init,Some(&elab.parameters),
                                                     elab,
                                                     0,
                                                 )
@@ -34581,8 +34856,7 @@ fn inline_instantiations_inner(
                                         let subbed_init7;
                                         let init: &Expression = if expr_has_call(init) {
                                             match substitute_const_fn_calls(
-                                                init,
-                                                &elab.parameters,
+                                                init,Some(&elab.parameters),
                                                 elab,
                                                 0,
                                             )
@@ -40702,8 +40976,7 @@ fn inline_module_items(
                                     let subbed_ov;
                                     let v: &Expression = if expr_has_call(v) {
                                         match substitute_const_fn_calls(
-                                            v,
-                                            scoped_eval_params,
+                                            v,Some(scoped_eval_params),
                                             elab,
                                             0,
                                         )
@@ -40826,8 +41099,7 @@ fn inline_module_items(
                                         let subbed_ov;
                                         let v: &Expression = if expr_has_call(v) {
                                             match substitute_const_fn_calls(
-                                                v,
-                                                scoped_eval_params,
+                                                v,Some(scoped_eval_params),
                                                 elab,
                                                 0,
                                             )
@@ -41145,7 +41417,7 @@ fn inline_module_items(
                                                     let subbed_init;
                                                     let init: &Expression = if expr_has_call(init) {
                                                         match substitute_const_fn_calls(
-                                                            init, local_map, elab_ro, 0,
+                                                            init,Some(local_map), elab_ro, 0,
                                                         )
                                                         .filter(|e| !expr_has_call(e))
                                                         {
@@ -41727,7 +41999,7 @@ fn inline_module_items(
                                     assign.init.as_ref(),
                                     ov.as_ref(),
                                     data_type,
-                                    &snapshot,
+                                    Some(&snapshot),
                                 ) {
                                     // A child override `.R(R)` evaluates the
                                     // name in this local env.
@@ -41851,8 +42123,7 @@ fn inline_module_items(
                                     let subbed_init2;
                                     let init_eval: &Expression = if expr_has_call(init) {
                                         match substitute_const_fn_calls(
-                                            init,
-                                            &sub_local_params,
+                                            init,Some(&sub_local_params),
                                             elab,
                                             0,
                                         )
@@ -46165,7 +46436,17 @@ fn inline_module_items(
                         // Delays evaluate in the INSTANCE's parameter scope:
                         // a specparam-valued delay (`(a => y) = tpd;`) read
                         // the flat map, missed its bare name and became 0.
-                        elaborate_module_paths(elab, &sb.paths, &sub_merged_params, &|e| {
+                        let delay_vals: Vec<Vec<u64>> = sb
+                            .paths
+                            .iter()
+                            .map(|p| {
+                                p.delays
+                                    .iter()
+                                    .map(|d| eval_const_expr(d, &sub_merged_params))
+                                    .collect()
+                            })
+                            .collect();
+                        elaborate_module_paths(elab, &sb.paths, &delay_vals, &|e| {
                             rewrite_expr(
                                 e,
                                 &inst_prefix,
@@ -46208,12 +46489,42 @@ fn inline_module_items(
                         }
                         if !sb.timing_checks.is_empty() {
                             let scope = inst_prefix.strip_suffix('.').unwrap_or(&inst_prefix);
+                            let timing_consts: Vec<Vec<Option<i64>>> = sb
+                                .timing_checks
+                                .iter()
+                                .map(|tc| {
+                                    let limits = timing_check_limit_args(&tc.name);
+                                    let flags = timing_check_flag_args(&tc.name);
+                                    tc.args
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, a)| {
+                                            let a = a.as_ref()?;
+                                            if !limits.contains(&i) && !flags.contains(&i) {
+                                                return None;
+                                            }
+                                            let v = eval_const_expr_val(
+                                                &a.expr,
+                                                &sub_merged_params,
+                                            );
+                                            if v.is_real {
+                                                let f = v.to_f64();
+                                                f.is_finite().then(|| f.round() as i64)
+                                            } else if v.has_xz() {
+                                                None
+                                            } else {
+                                                v.to_i64()
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .collect();
                             elaborate_timing_checks(
                                 elab,
                                 &sb.timing_checks,
                                 scope,
                                 sub_mod_name,
-                                &sub_merged_params,
+                                &timing_consts,
                                 &|e| {
                                     rewrite_expr(
                                         e,
@@ -46913,10 +47224,10 @@ fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
 /// A pattern actual (`pick('{b: 7, a: 5})`) of a packed-struct formal,
 /// packed by the formal's type (the instance's own types first). `None` for
 /// any other actual or formal.
-fn const_fn_struct_pattern_actual(
+fn const_fn_struct_pattern_actual<P: ParamLookup>(
     port: Option<&crate::ast::decl::FunctionPort>,
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: Option<&P>,
     elab: &ElaboratedModule,
 ) -> Option<Value> {
     if !matches!(expr.kind, ExprKind::AssignmentPattern(_)) {
@@ -46924,31 +47235,48 @@ fn const_fn_struct_pattern_actual(
     }
     let port = port.filter(|p| p.dimensions.is_empty())?;
     let inlined = inline_instance_typedefs(&port.data_type);
+    let empty = HashMap::default();
+    let base = params
+        .and_then(ParamLookup::as_hashmap_base)
+        .unwrap_or(&empty);
     pack_struct_const_value(
         inlined.as_ref().unwrap_or(&port.data_type),
         expr,
-        params,
+        base,
         &elab.typedefs,
         &elab.typedef_types,
     )
 }
 
-fn const_function_actual(
+fn const_function_actual<P: ParamLookup>(
     port: Option<&crate::ast::decl::FunctionPort>,
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: Option<&P>,
     elab: &ElaboratedModule,
 ) -> Value {
-    let value = eval_const_expr_val(expr, params);
+    let value = match params {
+        Some(p) => eval_const_expr_val_inner(expr, p, &mut const_context::Types::default()),
+        None => {
+            let empty = HashMap::default();
+            eval_const_expr_val(expr, &empty)
+        }
+    };
     if let Some(port) = port.filter(|p| p.dimensions.is_empty()) {
+        let empty = HashMap::default();
+        let base = params
+            .and_then(ParamLookup::as_hashmap_base)
+            .unwrap_or(&empty);
         if let Some(target) = param_integral_target(
             &port.data_type,
             &HashMap::default(),
-            params,
+            base,
             &elab.typedefs,
             &elab.typedef_types,
         ) {
-            return convert_param_value(&value, Some(expr), params, target);
+            return match params {
+                Some(p) => convert_param_value(&value, Some(expr), p, target),
+                None => convert_param_value(&value, Some(expr), &empty, target),
+            };
         }
     }
     value
@@ -47227,10 +47555,10 @@ fn const_fn_member_target(target: &Expression) -> Option<(String, String)> {
     }
 }
 
-fn eval_const_user_function(
+fn eval_const_user_function<P: ParamLookup>(
     fd: &FunctionDeclaration,
     arg_vals: &[Value],
-    caller_params: &HashMap<String, Value>,
+    caller_params: Option<&P>,
     elab: &ElaboratedModule,
     depth: u32,
 ) -> Option<Value> {
@@ -47239,13 +47567,26 @@ fn eval_const_user_function(
     }
     let fname = fd.name.name.name.clone();
     let mut locals = const_function_scope::initial_locals(fd, caller_params, elab);
+    // Geometry helpers (struct layouts, packed-element widths, declared
+    // storage, return width) resolve type dimensions against module params
+    // AND the caller/instance params — the first instance's constants resolve
+    // `[W-1:0]` with `W` present only in `caller_params`, and `elab.parameters`
+    // is empty during that propagation (#680). Materialize that fused scope
+    // once so the concrete layout/packing sinks see it (they take `&HashMap`).
+    let geom: HashMap<String, Value> = {
+        let mut m = locals.clone();
+        for (k, v) in elab.parameters.iter() {
+            m.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        m
+    };
     for (i, port) in fd.ports.iter().enumerate() {
         let mut v = arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32));
         // §13.3: the actual CONVERTS to the formal's declared type — a REAL
         // formal bound to the integer literal `5` otherwise did integer
         // arithmetic throughout (`x /= 2` gave 2, not 2.5).
         if port.dimensions.is_empty() {
-            let storage = declared_storage(&port.data_type, &locals, elab)?;
+            let storage = declared_storage(&port.data_type, &geom, elab)?;
             v = store_value(v, &storage);
         }
         locals.insert(port.name.name.clone(), v);
@@ -47259,15 +47600,15 @@ fn eval_const_user_function(
     let mut layouts = ConstFnStructLayouts::default();
     let mut packed_elems = ConstFnPackedElems::default();
     for port in &fd.ports {
-        layouts.bind(&port.name.name, &port.data_type, &locals, elab);
-        packed_elems.bind(&port.name.name, &port.data_type, &locals, elab);
+        layouts.bind(&port.name.name, &port.data_type, &geom, elab);
+        packed_elems.bind(&port.name.name, &port.data_type, &geom, elab);
     }
-    layouts.bind(&fname, &fd.return_type, &locals, elab);
+    layouts.bind(&fname, &fd.return_type, &geom, elab);
     fn bind_decls(
         stmts: &[Statement],
         layouts: &mut ConstFnStructLayouts,
         packed_elems: &mut ConstFnPackedElems,
-        locals: &HashMap<String, Value>,
+        geom: &HashMap<String, Value>,
         elab: &ElaboratedModule,
     ) {
         use crate::ast::stmt::StatementKind as SK;
@@ -47279,12 +47620,12 @@ fn eval_const_user_function(
                     ..
                 } => {
                     for d in declarators {
-                        layouts.bind(&d.name.name, data_type, locals, elab);
-                        packed_elems.bind(&d.name.name, data_type, locals, elab);
+                        layouts.bind(&d.name.name, data_type, geom, elab);
+                        packed_elems.bind(&d.name.name, data_type, geom, elab);
                     }
                 }
                 SK::SeqBlock { stmts, .. } => {
-                    bind_decls(stmts, layouts, packed_elems, locals, elab)
+                    bind_decls(stmts, layouts, packed_elems, geom, elab)
                 }
                 _ => {}
             }
@@ -47294,12 +47635,13 @@ fn eval_const_user_function(
         &fd.items,
         &mut layouts,
         &mut packed_elems,
-        &locals,
+        &geom,
         elab,
     );
     // The implicit return variable (typed per the declared return type).
     let return_type = resolve_typedef_chain(&fd.return_type, &elab.typedef_types);
-    let return_width = resolve_type_width(return_type, Some(&locals), Some(&elab.typedefs));
+    let return_width =
+        resolve_type_width(return_type, Some(&geom), Some(&elab.typedefs));
     let ret_init = if is_type_real(return_type) {
         Value::from_f64(0.0)
     } else {
@@ -47324,14 +47666,14 @@ fn eval_const_user_function(
     // converts the completed RHS; it does not turn integer division real.
     fn declared_storage(
         dt: &DataType,
-        locals: &HashMap<String, Value>,
+        geom: &HashMap<String, Value>,
         elab: &ElaboratedModule,
     ) -> Option<Value> {
         let dt = resolve_typedef_chain(dt, &elab.typedef_types);
         if is_type_real(dt) {
             return Some(Value::from_f64(0.0));
         }
-        let width = resolve_type_width(dt, Some(locals), Some(&elab.typedefs));
+        let width = resolve_type_width(dt, Some(geom), Some(&elab.typedefs));
         if width == 0 {
             return None;
         }
@@ -47493,6 +47835,7 @@ fn eval_const_user_function(
         stmt: &Statement,
         locals: &mut HashMap<String, Value>,
         fname: &str,
+        geom: &HashMap<String, Value>,
         elab: &ElaboratedModule,
         depth: u32,
         fuel: &mut u32,
@@ -47506,7 +47849,7 @@ fn eval_const_user_function(
             SK::Null => Some(Flow::Normal),
             SK::SeqBlock { stmts, .. } => {
                 for st in stmts {
-                    match exec_stmt(st, locals, fname, elab, depth, fuel)? {
+                    match exec_stmt(st, locals, fname, geom, elab, depth, fuel)? {
                         Flow::Returned => return Some(Flow::Returned),
                         Flow::Normal => {}
                     }
@@ -47544,7 +47887,7 @@ fn eval_const_user_function(
                         locals.insert(d.name.name.clone(), v);
                     }
                 } else {
-                    let storage = declared_storage(data_type, locals, elab)?;
+                    let storage = declared_storage(data_type, geom, elab)?;
                     for d in declarators {
                         let v = match &d.init {
                             Some(e) => eval_for_storage(e, &storage, locals, elab, depth)?,
@@ -47568,9 +47911,9 @@ fn eval_const_user_function(
             } => {
                 let c = eval_fn_expr(condition, locals, elab, depth)?;
                 if c.is_true() {
-                    exec_stmt(then_stmt, locals, fname, elab, depth, fuel)
+                    exec_stmt(then_stmt, locals, fname, geom, elab, depth, fuel)
                 } else if let Some(e) = else_stmt {
-                    exec_stmt(e, locals, fname, elab, depth, fuel)
+                    exec_stmt(e, locals, fname, geom, elab, depth, fuel)
                 } else {
                     Some(Flow::Normal)
                 }
@@ -47588,7 +47931,7 @@ fn eval_const_user_function(
                             name,
                             init: e,
                         } => {
-                            let storage = declared_storage(data_type, locals, elab)?;
+                            let storage = declared_storage(data_type, geom, elab)?;
                             let v = eval_for_storage(e, &storage, locals, elab, depth)?;
                             locals.insert(name.name.clone(), v);
                         }
@@ -47606,7 +47949,7 @@ fn eval_const_user_function(
                     } else {
                         return None; // unbounded
                     }
-                    match exec_stmt(body, locals, fname, elab, depth, fuel)? {
+                    match exec_stmt(body, locals, fname, geom, elab, depth, fuel)? {
                         Flow::Returned => return Some(Flow::Returned),
                         Flow::Normal => {}
                     }
@@ -47625,7 +47968,7 @@ fn eval_const_user_function(
                     if !eval_fn_expr(condition, locals, elab, depth)?.is_true() {
                         break;
                     }
-                    match exec_stmt(body, locals, fname, elab, depth, fuel)? {
+                    match exec_stmt(body, locals, fname, geom, elab, depth, fuel)? {
                         Flow::Returned => return Some(Flow::Returned),
                         Flow::Normal => {}
                     }
@@ -47646,9 +47989,9 @@ fn eval_const_user_function(
                 // are evaluated at the width of the widest of them, signed
                 // only when all are signed, and compared with `===`.
                 let mut types = const_context::Types::default();
-                let mut common = const_context::infer(expr, locals, &mut types);
+                let mut common = const_context::infer(expr, &ParamEnv::Overlay { base: &elab.parameters, top: &*locals }, &mut types);
                 for pat in items.iter().flat_map(|item| &item.patterns) {
-                    let ty = const_context::infer(pat, locals, &mut types);
+                    let ty = const_context::infer(pat, &ParamEnv::Overlay { base: &elab.parameters, top: &*locals }, &mut types);
                     common.width = common.width.max(ty.width);
                     common.signed &= ty.signed;
                     common.integral &= ty.integral;
@@ -47699,7 +48042,7 @@ fn eval_const_user_function(
                     chosen = items.iter().find(|i| i.is_default).map(|i| &i.stmt);
                 }
                 match chosen {
-                    Some(st) => exec_stmt(st, locals, fname, elab, depth, fuel),
+                    Some(st) => exec_stmt(st, locals, fname, geom, elab, depth, fuel),
                     None => Some(Flow::Normal),
                 }
             }
@@ -47844,7 +48187,7 @@ fn eval_const_user_function(
             }
             _ => {}
         });
-        let resolved = has_cast.then(|| resolve_const_fn_cast_targets(e, locals, elab));
+        let resolved = has_cast.then(|| resolve_const_fn_cast_targets(e, Some(&elab.parameters), elab));
         let e = resolved.as_ref().unwrap_or(e);
         if !const_fn_expr_supported(e) {
             return None;
@@ -47859,7 +48202,7 @@ fn eval_const_user_function(
         } = &e.kind
         {
             let c = eval_fn_expr(condition, locals, elab, depth)?;
-            let ty = const_context::infer(e, locals, &mut const_context::Types::default());
+            let ty = const_context::infer(e, &ParamEnv::Overlay { base: &elab.parameters, top: &*locals }, &mut const_context::Types::default());
             let arm_context = ty.integral.then_some((
                 context.map_or(ty.width, |(w, _)| w.max(ty.width)),
                 Some(context.and_then(|(_, s)| s).unwrap_or(ty.signed)),
@@ -47879,7 +48222,7 @@ fn eval_const_user_function(
             });
         }
         let subbed = if has_call {
-            Some(substitute_const_fn_calls(e, locals, elab, depth + 1)?)
+            Some(substitute_const_fn_calls(e, Some(&ParamEnv::Overlay { base: &elab.parameters, top: &*locals }), elab, depth + 1)?)
         } else {
             None
         };
@@ -47889,23 +48232,23 @@ fn eval_const_user_function(
         }
         let mut types = const_context::Types::default();
         if let Some((width, signed)) = context {
-            let ty = const_context::infer(e, locals, &mut types);
+            let ty = const_context::infer(e, &ParamEnv::Overlay { base: &elab.parameters, top: &*locals }, &mut types);
             if ty.integral {
                 return const_ctx_fold(
                     e,
-                    locals,
+                    &ParamEnv::Overlay { base: &elab.parameters, top: &*locals },
                     width.max(ty.width),
                     signed.unwrap_or(ty.signed),
                     &mut types,
                 );
             }
         }
-        Some(eval_const_expr_val_inner(e, locals, &mut types))
+        Some(eval_const_expr_val_inner(e, &ParamEnv::Overlay { base: &elab.parameters, top: &*locals }, &mut types))
     }
 
     let mut fuel: u32 = 100_000;
     for st in &fd.items {
-        match exec_stmt(st, &mut locals, &fname, elab, depth, &mut fuel)? {
+        match exec_stmt(st, &mut locals, &fname, &geom, elab, depth, &mut fuel)? {
             Flow::Returned => break,
             Flow::Normal => {}
         }
@@ -48262,9 +48605,9 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
 /// from the type itself. A named positive integral value in the call's
 /// parameter/local scope is a size cast instead (§6.24.1, §13.4.3).
 /// Other expressions are rebuilt unchanged.
-fn resolve_const_fn_cast_targets(
+fn resolve_const_fn_cast_targets<P: ParamLookup>(
     e: &Expression,
-    params: &HashMap<String, Value>,
+    params: Option<&P>,
     elab: &ElaboratedModule,
 ) -> Expression {
     let rec = |x: &Expression| resolve_const_fn_cast_targets(x, params, elab);
@@ -48286,8 +48629,14 @@ fn resolve_const_fn_cast_targets(
                 // a named cast made the support check reject the whole call.
                 // Only admit a known positive integral size, so an unresolved
                 // type/name still takes the prior deferral path.
-                None if name == "$__xz_named_cast" && is_const_expr(&args[0], params) && {
-                    let size = eval_const_expr_val(&args[0], params);
+                None if name == "$__xz_named_cast"
+                    && is_const_expr(&args[0], params.expect("cast params")) &&
+                {
+                    let size = eval_const_expr_val_inner(
+                        &args[0],
+                        params.expect("cast params"),
+                        &mut const_context::Types::default(),
+                    );
                     !size.is_real && size.to_i64().is_some_and(|n| n > 0)
                 } =>
                 {
@@ -48437,9 +48786,9 @@ fn const_class_static_call(
 /// literal it evaluates to (arguments const-evaluated against `params`).
 /// Returns None when a call can't be resolved — callers then fall back to
 /// the old deferral behavior.
-fn substitute_const_fn_calls(
+fn substitute_const_fn_calls<P: ParamLookup>(
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: Option<&P>,
     elab: &ElaboratedModule,
     depth: u32,
 ) -> Option<Expression> {
@@ -48523,7 +48872,7 @@ fn substitute_const_fn_calls(
                     .with(|c| c.borrow().as_ref().is_some_and(|own| !own.contains(&fname)));
             let prev_in_unit = CONST_FN_IN_UNIT.with(|c| c.replace(foreign));
             let prev_owner = CONST_FN_PACKAGE.with(|c| c.replace(owner));
-            let v = eval_const_user_function(&fd, &argv, params, elab, depth);
+    let v = eval_const_user_function(&fd, &argv, params, elab, depth);
             CONST_FN_PACKAGE.with(|c| *c.borrow_mut() = prev_owner);
             CONST_FN_IN_UNIT.with(|c| c.set(prev_in_unit));
             let v = v?;
@@ -56381,8 +56730,7 @@ fn process_import(
                                             let subbed_init7;
                                             let init: &Expression = if expr_has_call(init) {
                                                 match substitute_const_fn_calls(
-                                                    init,
-                                                    &elab.parameters,
+                                                    init,Some(&elab.parameters),
                                                     elab,
                                                     0,
                                                 )
@@ -56830,8 +57178,7 @@ fn process_import(
                                         let subbed_init8;
                                         let init: &Expression = if expr_has_call(init) {
                                             match substitute_const_fn_calls(
-                                                init,
-                                                &elab.parameters,
+                                                init,Some(&elab.parameters),
                                                 elab,
                                                 0,
                                             )

@@ -47,6 +47,12 @@ fn shape_params<'a>(
     if declared_unpacked_dims(&local, params).is_some() {
         return std::borrow::Cow::Borrowed(params);
     }
+    // When `params` already IS the elaboration-wide map (the caller passes
+    // `&elab.parameters` directly), merging it with itself is a no-op that
+    // would clone the whole table for nothing.
+    if std::ptr::eq(params, &elab.parameters) {
+        return std::borrow::Cow::Borrowed(params);
+    }
     let mut merged = elab.parameters.clone();
     merged.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
     std::borrow::Cow::Owned(merged)
@@ -296,6 +302,126 @@ pub(super) fn packed(values: &[(String, Value)]) -> Value {
     Value::concat_refs(values.iter().map(|(_, v)| v))
 }
 
+/// Everything `register` computes off a read-only module, so a caller can
+/// compute against `&elab.parameters` without holding a `&mut ElaboratedModule`
+/// (eliminating the whole-table `parameters.clone()` borrow workarounds).
+pub(super) struct RegisteredArray {
+    full_name: String,
+    shape: Vec<(i64, i64)>,
+    width: u32,
+    fields: Option<Vec<(String, u32, u32)>>,
+    whole: Value,
+    values: Vec<(String, Value)>,
+    var_decl_type: Option<DataType>,
+}
+
+/// Read-only phase of `register`: derive every value / shape / width a
+/// registered unpacked-array parameter materializes. The caller may pass
+/// `params` (and `init_params`) as `&elab.parameters` directly — the only
+/// borrows are immutable.
+pub(super) fn compute(
+    elab: &ElaboratedModule,
+    prefix: &str,
+    name: &str,
+    dims: &[UnpackedDimension],
+    init: Option<&Expression>,
+    override_val: Option<&Value>,
+    data_type: &DataType,
+    params: &HashMap<String, Value>,
+    init_params: &HashMap<String, Value>,
+) -> Option<RegisteredArray> {
+    let shape_params = shape_params(elab, dims, params);
+    let params = &*shape_params;
+    remember_default(&format!("{prefix}{name}"), data_type, params, elab);
+    let values = elements(
+        elab,
+        name,
+        dims,
+        init,
+        override_val,
+        data_type,
+        params,
+        init_params,
+    )?;
+    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
+    let shape = declared_unpacked_dims(&dims, params)?;
+    let width = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    let full_name = format!("{prefix}{name}");
+    let fields = super::packed_struct_field_layout(
+        data_type,
+        params,
+        &elab.typedefs,
+        &elab.typedef_types,
+    );
+    if let Some(fields) = &fields {
+        // §7.2.2: `array[i].field.subfield` slices the element Value. The
+        // layout has to be on the array name; a scalar struct parameter
+        // already records it, an unpacked array of that struct did not.
+        super::tls_register_struct_layout(&full_name, fields);
+    }
+    // §6.20.2: aggregate parameter elements use whole Value storage.
+    // An unpacked variable type would route their member reads to separate
+    // field signals, which this constant representation does not allocate.
+    let var_decl_type = (!matches!(resolve_typedef_chain(data_type, &elab.typedef_types),
+        DataType::Struct(s) if !s.packed))
+        .then(|| data_type.clone());
+    Some(RegisteredArray {
+        full_name,
+        shape,
+        width,
+        fields,
+        whole: packed(&values),
+        values,
+        var_decl_type,
+    })
+}
+
+impl RegisteredArray {
+    /// Write-only phase: apply the data computed by `compute` into an
+    /// `ElaboratedModule`. Takes the `prefix` separately (not threaded through
+    /// the struct) so the same computed value can back several prefixes.
+    pub(super) fn apply(self, elab: &mut ElaboratedModule, prefix: &str) {
+        let RegisteredArray {
+            full_name,
+            shape,
+            width,
+            fields,
+            whole,
+            values,
+            var_decl_type,
+        } = self;
+        if let Some(fields) = fields {
+            elab.packed_struct_fields
+                .entry(full_name.clone())
+                .or_insert(fields);
+        }
+        register_shape(elab, &full_name, &shape, width);
+        elab.set_param(line!(), full_name.clone(), whole);
+        if let Some(dt) = var_decl_type {
+            elab.var_decl_types.insert(full_name, dt);
+        }
+        for (name, value) in values {
+            let name = format!("{prefix}{name}");
+            elab.set_param(line!(), name.clone(), value.clone());
+            signals_insert_traced(
+                &mut elab.signals,
+                line!(),
+                name.clone(),
+                Signal {
+                    is_const: true,
+                    name: name.into(),
+                    width,
+                    is_signed: value.is_signed,
+                    is_real: value.is_real,
+                    direction: None,
+                    value,
+                    type_name: None,
+                },
+            );
+        }
+    }
+}
+
 pub(super) fn register(
     elab: &mut ElaboratedModule,
     prefix: &str,
@@ -307,11 +433,9 @@ pub(super) fn register(
     params: &HashMap<String, Value>,
     init_params: &HashMap<String, Value>,
 ) -> bool {
-    let shape_params = shape_params(elab, dims, params);
-    let params = &*shape_params;
-    remember_default(&format!("{prefix}{name}"), data_type, params, elab);
-    let Some(values) = elements(
-        elab,
+    let Some(registered) = compute(
+        &*elab,
+        prefix,
         name,
         dims,
         init,
@@ -322,56 +446,7 @@ pub(super) fn register(
     ) else {
         return false;
     };
-    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
-    let Some(shape) = declared_unpacked_dims(&dims, params) else {
-        return false;
-    };
-    let width = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
-    let full_name = format!("{prefix}{name}");
-    if let Some(fields) = super::packed_struct_field_layout(
-        data_type,
-        params,
-        &elab.typedefs,
-        &elab.typedef_types,
-    ) {
-        // §7.2.2: `array[i].field.subfield` slices the element Value. The
-        // layout has to be on the array name; a scalar struct parameter
-        // already records it, an unpacked array of that struct did not.
-        super::tls_register_struct_layout(&full_name, &fields);
-        elab.packed_struct_fields
-            .entry(full_name.clone())
-            .or_insert(fields);
-    }
-    register_shape(elab, &full_name, &shape, width);
-    let whole = packed(&values);
-    elab.set_param(line!(), full_name.clone(), whole);
-    // §6.20.2: aggregate parameter elements use whole Value storage.
-    // An unpacked variable type would route their member reads to separate
-    // field signals, which this constant representation does not allocate.
-    if !matches!(resolve_typedef_chain(data_type, &elab.typedef_types),
-        DataType::Struct(s) if !s.packed)
-    {
-        elab.var_decl_types.insert(full_name, data_type.clone());
-    }
-    for (name, value) in values {
-        let name = format!("{prefix}{name}");
-        elab.set_param(line!(), name.clone(), value.clone());
-        signals_insert_traced(
-            &mut elab.signals,
-            line!(),
-            name.clone(),
-            Signal {
-                is_const: true,
-                name: name.into(),
-                width,
-                is_signed: value.is_signed,
-                is_real: value.is_real,
-                direction: None,
-                value,
-                type_name: None,
-            },
-        );
-    }
+    registered.apply(elab, prefix);
     true
 }
 
