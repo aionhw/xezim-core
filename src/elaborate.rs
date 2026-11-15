@@ -42420,6 +42420,23 @@ fn inline_module_items(
                                                 &inst_prefix,
                                             ),
                                         );
+                                    } else if matches!(dt, DataType::TypeReference { dimensions, .. }
+                                        if !dimensions.is_empty())
+                                    {
+                                        // §7.4.1: a port that is a packed array
+                                        // of a named type (`lane_t [0:8] p`)
+                                        // keeps its declared type, as a variable
+                                        // does: an element of a named signed
+                                        // type is signed (aionhw/xezim#1107).
+                                        elab.var_decl_types.entry(sig_name.clone()).or_insert_with(
+                                            || {
+                                                scope_local_typerefs(
+                                                    dt,
+                                                    &sub_typedef_names_all,
+                                                    &inst_prefix,
+                                                )
+                                            },
+                                        );
                                     }
                                 }
                                 // §23.2.2.4: an output-variable default is its
