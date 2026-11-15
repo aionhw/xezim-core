@@ -1078,7 +1078,7 @@ impl PendingContAssign {
         // marker and `resolve_multi_driver_nets` folded it as STRONG, so a
         // `(weak0, weak1)` pull lost to—and fought—the net's real driver
         // (#1063).
-        let rhs = match self.strength.as_deref().and_then(strength_marker) {
+        let mut rhs = match self.strength.as_deref().and_then(strength_marker) {
             Some((marker, code)) => make_syscall(
                 marker,
                 vec![rhs.clone(), strength_code_literal(code, rhs.span)],
@@ -1086,6 +1086,10 @@ impl PendingContAssign {
             ),
             None => rhs,
         };
+        // §23.6: a hierarchical-LHS continuous assign in a sub-module writes
+        // into a child scope (`lp.v = ~v`), so its RHS names are lexical to
+        // the writing scope and must not be re-qualified into the target.
+        root_mark_hier_ca_rhs(&self.lhs_source, &mut rhs, &|_| false);
         let eval_delay = |src: &Option<std::rc::Rc<Expression>>| -> Option<u64> {
             src.as_ref().map(|d| {
                 let d = rewrite_expr(
@@ -7690,7 +7694,10 @@ fn port_actual_is_simple(
 /// substituted as a rename without silently dropping the formal's sign.
 fn port_actual_is_unsigned_concat(e: &Expression) -> bool {
     match &e.kind {
-        ExprKind::Concatenation(_) | ExprKind::Replication { .. } => true,
+        ExprKind::Concatenation(_)
+        | ExprKind::Replication { .. }
+        | ExprKind::RangeSelect { .. }
+        | ExprKind::Index { .. } => true,
         ExprKind::Paren(inner) => port_actual_is_unsigned_concat(inner),
         _ => false,
     }
