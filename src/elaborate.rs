@@ -49304,14 +49304,37 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
     // the net to be a stage of its own.
     let mut drivers: HashMap<String, Vec<usize>> = HashMap::default();
     let mut staged: HashSet<String> = HashSet::default();
+    let mut gate_staged: HashSet<String> = HashSet::default();
     for (i, ca) in elab.continuous_assigns.iter().enumerate() {
         let ts = targets_of(&ca.lhs);
         let own_delay = ca.delay != 0 || ca.delay_fall.is_some() || ca.delay_off.is_some();
+        let gate_delay = !own_delay && cont_assign_has_own_delay(ca);
         for (n, whole) in ts.iter().filter(|(n, _)| is_net(n)) {
             let ds = drivers.entry(n.clone()).or_default();
             ds.push(i);
+            // §10.3.3, §28.16: a zero-rise primitive with a fall delay
+            // needs its own stage before the net's declaration delay.
+            // §28.12: keep implicit supply, pull and charge drivers on
+            // their existing path; extra stages can lose their strengths.
+            // Keep existing names that would collide with the new stage.
+            let gate_delay = gate_delay
+                && gate_tristate_parts(ca).is_none()
+                && !elab.supply_nets.contains(n)
+                && !matches!(
+                    elab.resolved_net_kinds.get(n),
+                    Some(ResolvedNetKind::Tri0)
+                        | Some(ResolvedNetKind::Tri1)
+                        | Some(ResolvedNetKind::ChargeStorage)
+                )
+                && !elab.signals.contains_key(&format!("{n}$netdrv"))
+                && !elab.parameters.contains_key(&format!("{n}$netdrv"))
+                && !elab.arrays.contains_key(&format!("{n}$netdrv"));
             if own_delay || ts.len() > 1 || !whole || ds.len() > 1 {
                 staged.insert(n.clone());
+                gate_staged.remove(n);
+            } else if gate_delay {
+                staged.insert(n.clone());
+                gate_staged.insert(n.clone());
             }
         }
     }
@@ -49319,6 +49342,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         for (n, _) in targets_of(&u.output) {
             if is_net(&n) {
                 drivers.entry(n.clone()).or_default();
+                gate_staged.remove(&n);
                 staged.insert(n);
             }
         }
@@ -49337,6 +49361,20 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         // simulator's delayed update is per signal, so a vector net takes the
         // driver-net route and follows it bit by bit.
         let per_bit = width > 1 && !is_real;
+        if gate_staged.contains(&net) && !per_bit {
+            // §28.4/§28.5: retain z→x even on the delayed evaluator path.
+            // A conditional ending in z could be a MOS or a buf input;
+            // those indistinguishable lowered forms keep the old path.
+            let ca = &mut elab.continuous_assigns[drivers[&net][0]];
+            ca.rhs = Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::BitXor,
+                    left: Box::new(ca.rhs.clone()),
+                    right: Box::new(make_fill_expr(false, ca.rhs.span)),
+                },
+                ca.rhs.span,
+            );
+        }
         if !staged.contains(&net) && !per_bit {
             // A lone undelayed driver of the whole net IS the net's value:
             // the net delay is simply its delay.
