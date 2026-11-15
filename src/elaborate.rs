@@ -2158,6 +2158,138 @@ fn int_literal(n: i64, span: Span) -> Expression {
     )
 }
 
+/// Fold `PackedDimension::Range` bounds to integer literals where `pred`
+/// accepts the range and the bounds require `params` to evaluate (so ranges
+/// that are already plain literals are untouched). Used for package typedefs
+/// (whose imported parameters are not in the importer's bare parameter map)
+/// and for class properties/typedefs sized by enclosing or localparam constants
+/// rather than overridable class header parameters.
+fn fold_packed_dims_with(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    pred: &dyn Fn(&Expression, &Expression) -> bool,
+) -> Option<DataType> {
+    let lit = |n: i64, span: Span| Box::new(int_literal(n, span));
+    let fold_dims = |dims: &[PackedDimension]| -> Option<Vec<PackedDimension>> {
+        let mut out: Option<Vec<PackedDimension>> = None;
+        for (i, d) in dims.iter().enumerate() {
+            if let PackedDimension::Range { left, right, span } = d
+                && pred(left, right)
+                && (const_eval_i64_with_params(left, None).is_none()
+                    || const_eval_i64_with_params(right, None).is_none())
+                && let (Some(l), Some(r)) = (
+                    const_eval_i64_with_params(left, Some(params)),
+                    const_eval_i64_with_params(right, Some(params)),
+                )
+            {
+                out.get_or_insert_with(|| dims.to_vec())[i] = PackedDimension::Range {
+                    left: lit(l, left.span),
+                    right: lit(r, right.span),
+                    span: *span,
+                };
+            }
+        }
+        out
+    };
+    match dt {
+        DataType::IntegerVector {
+            kind,
+            signing,
+            dimensions,
+            span,
+        } => fold_dims(dimensions).map(|dimensions| DataType::IntegerVector {
+            kind: *kind,
+            signing: *signing,
+            dimensions,
+            span: *span,
+        }),
+        DataType::Implicit {
+            signing,
+            dimensions,
+            span,
+        } => fold_dims(dimensions).map(|dimensions| DataType::Implicit {
+            signing: *signing,
+            dimensions,
+            span: *span,
+        }),
+        DataType::TypeReference { dimensions, .. } => fold_dims(dimensions).map(|dims| {
+            let mut copy = dt.clone();
+            if let DataType::TypeReference { dimensions, .. } = &mut copy {
+                *dimensions = dims;
+            }
+            copy
+        }),
+        DataType::Struct(su) => {
+            let mut out = fold_dims(&su.dimensions).map(|dims| {
+                let mut s = su.clone();
+                s.dimensions = dims;
+                s
+            });
+            for (mi, m) in su.members.iter().enumerate() {
+                if let Some(inner) = fold_packed_dims_with(&m.data_type, params, pred) {
+                    out.get_or_insert_with(|| su.clone()).members[mi].data_type = inner;
+                }
+            }
+            out.map(DataType::Struct)
+        }
+        DataType::Enum(et) => {
+            let mut out = fold_dims(&et.dimensions).map(|dims| {
+                let mut e = et.clone();
+                e.dimensions = dims;
+                e
+            });
+            if let Some(base) = &et.base_type
+                && let Some(inner) = fold_packed_dims_with(base, params, pred)
+            {
+                out.get_or_insert_with(|| et.clone()).base_type = Some(Box::new(inner));
+            }
+            out.map(DataType::Enum)
+        }
+        _ => None,
+    }
+}
+
+fn fold_unpacked_dims(
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Vec<UnpackedDimension> {
+    let lit = |n: i64, span: Span| Box::new(int_literal(n, span));
+    normalize_unpacked_dims(dims, params, typedef_types)
+        .into_iter()
+        .map(|d| match d {
+            UnpackedDimension::Expression { expr, span }
+                if const_eval_i64_with_params(&expr, None).is_none() =>
+            {
+                match const_eval_i64_with_params(&expr, Some(params)) {
+                    Some(n) => UnpackedDimension::Expression {
+                        expr: lit(n, expr.span),
+                        span,
+                    },
+                    None => UnpackedDimension::Expression { expr, span },
+                }
+            }
+            UnpackedDimension::Range { left, right, span }
+                if const_eval_i64_with_params(&left, None).is_none()
+                    || const_eval_i64_with_params(&right, None).is_none() =>
+            {
+                match (
+                    const_eval_i64_with_params(&left, Some(params)),
+                    const_eval_i64_with_params(&right, Some(params)),
+                ) {
+                    (Some(l), Some(r)) => UnpackedDimension::Range {
+                        left: lit(l, left.span),
+                        right: lit(r, right.span),
+                        span,
+                    },
+                    _ => UnpackedDimension::Range { left, right, span },
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
 /// §7.4.2 / §8.23: an unpacked STRUCT member `m[N]` / `m[cls::N]` parses
 /// with an associative dimension keyed by a "type" `N` (see
 /// `normalize_unpacked_dims`); a struct type records it so, and every later
@@ -2686,8 +2818,17 @@ fn elaborate_class_in_scope(
                         virtual_iface_properties.insert(decl.name.name.clone(), info.clone());
                     }
                     // Retained for per-specialization re-sizing; see
-                    // `ElaboratedClass::property_types`.
-                    property_types.insert(decl.name.name.clone(), p.data_type.clone());
+                    // `ElaboratedClass::property_types`. Fold any packed
+                    // ranges that do not depend on a class header parameter
+                    // so imported package constants (`bit [AW-1:0] p;`) do
+                    // not remain raw identifiers at runtime.
+                    let prop_dt = fold_packed_dims_with(
+                        &p.data_type,
+                        const_scope,
+                        &|l, r| !range_refs_class_header_param(c, l, r),
+                    )
+                    .unwrap_or_else(|| p.data_type.clone());
+                    property_types.insert(decl.name.name.clone(), prop_dt);
                     // Static member collections share one global store; route
                     // them out of the per-instance maps.
                     if is_static {
@@ -3583,16 +3724,22 @@ fn elaborate_class_in_scope(
             .iter()
             .filter_map(|it| match it {
                 // §8.23: a struct member sized by a constant (`m[Q]`).
-                ClassItem::Typedef(td) => Some((
-                    td.name.name.clone(),
-                    size_struct_member_dims(
+                ClassItem::Typedef(td) => {
+                    let dt = size_struct_member_dims(
                         &td.data_type,
                         const_scope,
                         &HashMap::default(),
                         !class_has_value_params(c),
                     )
-                    .unwrap_or_else(|| td.data_type.clone()),
-                )),
+                    .unwrap_or_else(|| td.data_type.clone());
+                    let dt = fold_packed_dims_with(
+                        &dt,
+                        const_scope,
+                        &|l, r| !range_refs_class_header_param(c, l, r),
+                    )
+                    .unwrap_or(dt);
+                    Some((td.name.name.clone(), dt))
+                }
                 _ => None,
             })
             .collect(),
@@ -3905,6 +4052,13 @@ pub struct ElaboratedModule {
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
     /// Members are stored by bit offset so MemberAccess can slice the container.
     pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    /// For the port width-mismatch diagnostic: typedef name -> (field name ->
+    /// identifiers its range expression reads), captured from the ORIGINAL
+    /// (pre-fold) struct declaration. The stored `typedef_types` folds these
+    /// dimensions away (`[P:0]` becomes `[0:0]`), erasing the parameter the
+    /// underflow can be traced to, so we keep the identifier list alongside.
+    pub struct_field_range_idents:
+        HashMap<String, std::collections::HashMap<String, Vec<String>>>,
     /// Variable -> its declared (element) data type. For an array this is the
     /// ELEMENT type; array-ness comes from `arrays`/`dynamic_arrays`/
     /// `associative_arrays`. Drives the type-directed `%p` renderer
@@ -4497,6 +4651,7 @@ impl ElaboratedModule {
             def_pkg_imports: HashMap::default(),
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
+            struct_field_range_idents: HashMap::default(),
             var_decl_types: HashMap::default(),
             param_decl_types: SharedNameMap::default(),
             struct_members: HashMap::default(),
@@ -5374,7 +5529,7 @@ pub fn register_class_scoped_typedef_aliases(
         .iter()
         .any(|i| matches!(i, ClassItem::Typedef(_) | ClassItem::Class(_)))
     {
-        let params = class_const_scope(c, None);
+        let params = class_const_scope(c, Some(&elab.parameters));
         walk_class_typedefs(c, &prefixes, &params, elab);
     }
     type_trace_tls_refresh("class_scope_alias", &elab.typedefs);
@@ -5398,6 +5553,12 @@ fn walk_class_typedefs(
                 let fold_class = !class_has_value_params(c);
                 let sized =
                     size_struct_member_dims(&td.data_type, params, &elab.typedef_types, fold_class);
+                let sized = fold_packed_dims_with(
+                    sized.as_ref().unwrap_or(&td.data_type),
+                    params,
+                    &|l, r| !range_refs_class_header_param(c, l, r),
+                )
+                .or(sized);
                 let dt = sized.as_ref().unwrap_or(&td.data_type);
                 for pfx in prefixes {
                     let key = format!("{}::{}", pfx, td.name.name);
@@ -5561,11 +5722,67 @@ fn typedef_specialization<'a>(
 /// without the overlay the width came from whatever the bare slot held
 /// design-wide, and with a permanent bare insert an un-imported parameter
 /// would leak into every scope.
-fn overlay_pkg_params(
+fn overlay_pkg_imports(
     p: &crate::ast::module::PackageDeclaration,
     elab: &mut ElaboratedModule,
 ) -> Vec<(String, Option<Value>)> {
     let mut saved: Vec<(String, Option<Value>)> = Vec::new();
+    for item in &p.items {
+        let crate::ast::decl::PackageItem::Import(imp) = item else {
+            continue;
+        };
+        for ii in &imp.items {
+            let src_pkg = &ii.package.name;
+            if let Some(sym) = &ii.item {
+                let key = format!("{src_pkg}::{}", sym.name);
+                if let Some(v) = elab.parameters.get(&key).cloned() {
+                    saved.push((sym.name.clone(), elab.parameters.get(&sym.name).cloned()));
+                    elab.set_param(line!(), sym.name.clone(), v);
+                }
+                let arr_prefix = format!("{key}[");
+                let dot_prefix = format!("{key}.");
+                let sub_values: Vec<_> = elab
+                    .parameters
+                    .iter()
+                    .filter(|(name, _)| {
+                        name.starts_with(&arr_prefix) || name.starts_with(&dot_prefix)
+                    })
+                    .map(|(name, value)| {
+                        (name[src_pkg.len() + 2..].to_string(), value.clone())
+                    })
+                    .collect();
+                for (name, value) in sub_values {
+                    saved.push((name.clone(), elab.parameters.get(&name).cloned()));
+                    elab.set_param(line!(), name, value);
+                }
+            } else {
+                let prefix = format!("{src_pkg}::");
+                let values: Vec<_> = elab
+                    .parameters
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        let rest = name.strip_prefix(&prefix)?;
+                        if rest.contains("::") {
+                            return None;
+                        }
+                        Some((rest.to_string(), value.clone()))
+                    })
+                    .collect();
+                for (name, value) in values {
+                    saved.push((name.clone(), elab.parameters.get(&name).cloned()));
+                    elab.set_param(line!(), name, value);
+                }
+            }
+        }
+    }
+    saved
+}
+
+fn overlay_pkg_params(
+    p: &crate::ast::module::PackageDeclaration,
+    elab: &mut ElaboratedModule,
+) -> Vec<(String, Option<Value>)> {
+    let mut saved = overlay_pkg_imports(p, elab);
     for item in &p.items {
         let crate::ast::decl::PackageItem::Parameter(pd) = item else {
             continue;
@@ -6138,6 +6355,52 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     register_pkg_param_elem(elab, "", &scoped, data_type);
                 }
             }
+            // §26.6: alias exported parameters from imported packages under
+            // this package's name (`p::sym`), so downstream packages that
+            // import `p` see re-exported parameters in `overlay_pkg_imports`.
+            let referenced = package_referenced_names(p);
+            for item in &p.items {
+                let PackageItem::Import(inner) = item else {
+                    continue;
+                };
+                for ii2 in &inner.items {
+                    match &ii2.item {
+                        Some(sym) => {
+                            if package_exports(p, &ii2.package.name, Some(&sym.name))
+                                && let Some(v) = elab.parameters.get(&sym.name).cloned()
+                            {
+                                alias_pkg_param(elab, &p.name.name, &sym.name, &v);
+                            }
+                        }
+                        None => {
+                            if !package_exports(p, &ii2.package.name, None) {
+                                continue;
+                            }
+                            if let Some(src) = pkgs.iter().find(|q| q.name.name == ii2.package.name)
+                            {
+                                for spi in &src.items {
+                                    for n in package_item_names(spi) {
+                                        let explicit = p.items.iter().any(|pi| {
+                                            matches!(pi, PackageItem::Export(e) if e.items.iter().any(|it|
+                                                (it.package.name == "*" || it.package.name == ii2.package.name)
+                                                    && it.item.as_ref().is_some_and(|i| i.name == n)))
+                                        });
+                                        if (explicit || referenced.contains(&n))
+                                            && let Some(v) = elab
+                                                .parameters
+                                                .get(&format!("{}::{}", ii2.package.name, n))
+                                                .or_else(|| elab.parameters.get(&n))
+                                                .cloned()
+                                        {
+                                            alias_pkg_param(elab, &p.name.name, &n, &v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             restore_overlay(elab, pkg_overlay);
             restore_overlay(elab, own_overlay);
             for (k, prev) in fn_overlay.into_iter().rev() {
@@ -6669,8 +6932,9 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             td.name.name.clone(),
             base_width,
         );
-        elab.typedef_types
-            .insert(td.name.name.clone(), td.data_type.clone());
+        let enum_dt = fold_packed_dims_with(&td.data_type, &elab.parameters, &|_, _| true)
+            .unwrap_or_else(|| td.data_type.clone());
+        elab.typedef_types.insert(td.name.name.clone(), enum_dt);
         elab.enum_members
             .insert(td.name.name.clone(), members_ordered);
     } else {
@@ -6683,7 +6947,13 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             bound_dt.as_ref().unwrap_or(&td.data_type),
             &elab.parameters,
             &elab.typedef_types,
-            false,
+            true,
+        )
+        .or(bound_dt);
+        let bound_dt = fold_packed_dims_with(
+            bound_dt.as_ref().unwrap_or(&td.data_type),
+            &elab.parameters,
+            &|_, _| true,
         )
         .or(bound_dt);
         let eff_dt: &DataType = bound_dt.as_ref().unwrap_or(&td.data_type);
@@ -6713,6 +6983,34 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             }
             elab.typedef_types
                 .insert(td.name.name.clone(), eff_dt.clone());
+            // Keep the field range IDENTIFIERS of a struct typedef before they
+            // are folded away (captured from the pre-fold declared type), so
+            // the port width-mismatch diagnostic can name the underflowed
+            // parameter (`[P:0]` collapses to `[0:0]` in `typedef_types`).
+            let mut range_ids = std::collections::HashMap::new();
+            if let DataType::Struct(su) = &td.data_type {
+                for m in &su.members {
+                    let mut ids: Vec<String> = Vec::new();
+                    if let DataType::IntegerVector { dimensions, .. } = &m.data_type {
+                        for d in dimensions {
+                            if let PackedDimension::Range { left, right, .. } = d {
+                                collect_ident_names(left, &mut ids);
+                                collect_ident_names(right, &mut ids);
+                            }
+                        }
+                    }
+                    ids.dedup();
+                    if !ids.is_empty() {
+                        for d in &m.declarators {
+                            range_ids.insert(d.name.name.clone(), ids.clone());
+                        }
+                    }
+                }
+            }
+            if !range_ids.is_empty() {
+                elab.struct_field_range_idents
+                    .insert(td.name.name.clone(), range_ids);
+            }
         }
     }
     // §6.18/§7.4: record any unpacked dimensions on the typedef
@@ -6732,7 +7030,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         _ => None,
     };
     if let Some((bd, elem)) = base_dims {
-        let mut dims = td.dimensions.clone();
+        let mut dims = fold_unpacked_dims(&td.dimensions, &elab.parameters, &elab.typedef_types);
         dims.extend(bd);
         elab.typedef_unpacked_dims
             .insert(td.name.name.clone(), dims);
@@ -6740,8 +7038,9 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             elab.typedef_types.insert(td.name.name.clone(), elem);
         }
     } else if !td.dimensions.is_empty() {
+        let dims = fold_unpacked_dims(&td.dimensions, &elab.parameters, &elab.typedef_types);
         elab.typedef_unpacked_dims
-            .insert(td.name.name.clone(), td.dimensions.clone());
+            .insert(td.name.name.clone(), dims);
     } else if !matches!(td.data_type, DataType::Void(_)) {
         elab.typedef_unpacked_dims.remove(&td.name.name);
     }
@@ -9983,7 +10282,7 @@ pub fn elaborate_module_with_defs(
     // Process top-level imports
     for imp in top_level_imports {
         if let Some(defs) = all_defs {
-            process_import(imp, &mut elab, defs)?;
+            process_import(imp, &mut elab, defs, false)?;
         }
     }
 
@@ -10051,7 +10350,7 @@ pub fn elaborate_module_with_defs(
     for item in module.items() {
         if let ModuleItem::ImportDeclaration(imp) = item {
             if let Some(defs) = all_defs {
-                process_import(imp, &mut elab, defs)?;
+                process_import(imp, &mut elab, defs, false)?;
             }
         }
     }
@@ -10463,6 +10762,7 @@ pub fn elaborate_module_with_defs(
             }
         }
         set_funcs_tls(&elab.functions);
+        let __pkg_imp_overlay = overlay_pkg_imports(p, &mut elab);
         for item in &p.items {
             match item {
                 crate::ast::decl::PackageItem::Typedef(td) => {
@@ -10622,6 +10922,7 @@ pub fn elaborate_module_with_defs(
                 _ => {}
             }
         }
+        restore_overlay(&mut elab, __pkg_imp_overlay);
     }
 
     // Pre-pass: collect user-defined nettype names so variables declared with
@@ -14360,7 +14661,7 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::ImportDeclaration(imp) => {
                 if let Some(defs) = all_defs {
-                    process_import(imp, &mut elab, defs)?;
+                    process_import(imp, &mut elab, defs, false)?;
                 }
             }
             ModuleItem::DPIImport(di) => {
@@ -20443,7 +20744,7 @@ fn elaborate_items(
             }
             ModuleItem::ImportDeclaration(imp) => {
                 if let Some(defs) = all_defs {
-                    process_import(imp, elab, defs)?;
+                    process_import(imp, elab, defs, false)?;
                 }
             }
             ModuleItem::DPIImport(di) => {
@@ -25004,6 +25305,22 @@ fn set_typedef_widths_tls(widths: &TypedefTable) {
 /// Look up `name` in the global parameter fallback (package/$unit params).
 fn param_fallback_get(name: &str) -> Option<Value> {
     PARAM_FALLBACK_TLS.with(|c| c.borrow().get(name).cloned())
+}
+
+/// Fold a bare alias into the global parameter fallback so an inlined
+/// submodule's const-eval (`localparam X = PW`, an unpacked `[N]` dimension)
+/// can resolve a package parameter its OWN `import P::*` brings in. The
+/// fallback snapshot is taken from the top/$unit params before inlining;
+/// module-scope imports bind only later (during inlining), so their aliases
+/// must be added here to reach the const-eval that reads via
+/// `param_fallback_get`.
+fn param_fallback_set(name: &str, v: &Value) {
+    PARAM_FALLBACK_TLS.with(|c| {
+        let mut c = c.borrow_mut();
+        if !c.contains_key(name) {
+            c.insert(name.to_string(), v.clone());
+        }
+    });
 }
 
 /// Record a struct param/localparam's packed field layout for const-eval
@@ -34576,29 +34893,68 @@ fn inline_instantiations_inner(
         })
         .collect();
 
-    // §26.3: each design unit's package imports, for the runtime's
-    // resolution of a contested package-variable name (see
-    // `pkg_var_decls`).
+    let mut imports: Vec<(String, Option<String>)> = Vec::new();
     for (name, def) in definitions {
-        if !matches!(
-            def,
-            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_)
-        ) {
-            continue;
-        }
-        let mut imports: Vec<(String, Option<String>)> = Vec::new();
-        for item in def.items() {
-            if let ModuleItem::ImportDeclaration(imp) = item {
-                for ii in &imp.items {
-                    imports.push((
-                        ii.package.name.clone(),
-                        ii.item.as_ref().map(|i| i.name.clone()),
-                    ));
+        match def {
+            Definition::Module(d) => {
+                for item in &d.items {
+                    if let ModuleItem::ImportDeclaration(imp) = item {
+                        for ii in &imp.items {
+                            imports.push((
+                                ii.package.name.clone(),
+                                ii.item.as_ref().map(|i| i.name.clone()),
+                            ));
+                        }
+                    }
                 }
             }
+            Definition::Interface(d) => {
+                for item in &d.items {
+                    if let ModuleItem::ImportDeclaration(imp) = item {
+                        for ii in &imp.items {
+                            imports.push((
+                                ii.package.name.clone(),
+                                ii.item.as_ref().map(|i| i.name.clone()),
+                            ));
+                        }
+                    }
+                }
+            }
+            Definition::Program(d) => {
+                for item in &d.items {
+                    if let ModuleItem::ImportDeclaration(imp) = item {
+                        for ii in &imp.items {
+                            imports.push((
+                                ii.package.name.clone(),
+                                ii.item.as_ref().map(|i| i.name.clone()),
+                            ));
+                        }
+                    }
+                }
+            }
+            // §26.3: a package's OWN imports (a class method / package
+            // function in `p` reading a bare name that `p` `import`s) are
+            // `PackageItem::Import` items; include them so the runtime can
+            // resolve such a bare name to its exporting package.
+            Definition::Package(p) => {
+                use crate::ast::decl::PackageItem as PI;
+                for item in &p.items {
+                    if let PI::Import(imp) = item {
+                        for ii in &imp.items {
+                            imports.push((
+                                ii.package.name.clone(),
+                                ii.item.as_ref().map(|i| i.name.clone()),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         if !imports.is_empty() {
-            elab.def_pkg_imports.insert(name.clone(), imports);
+            imports.dedup();
+            elab.def_pkg_imports.insert(name.clone(), imports.clone());
+            imports.clear();
         }
     }
     // Populate class and covergroup definitions from global scope
@@ -34641,6 +34997,7 @@ fn inline_instantiations_inner(
                     }
                 }
                 set_funcs_tls(&elab.functions);
+                let mut __pkg_imp_overlay = overlay_pkg_params(p, elab);
                 for _ in 0..3 {
                     for item in &p.items {
                         match item {
@@ -34724,6 +35081,10 @@ fn inline_instantiations_inner(
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
                                             let scoped = format!("{name}.{}", assign.name.name);
                                             register_pkg_param_elem(elab, "", &scoped, data_type);
+                                            __pkg_imp_overlay.push((
+                                                assign.name.name.clone(),
+                                                elab.parameters.get(&assign.name.name).cloned(),
+                                            ));
                                             elab.set_param(line!(), assign.name.name.clone(), v);
                                             // The package's own elaboration records this
                                             // layout; the design top that actually
@@ -34902,6 +35263,10 @@ fn inline_instantiations_inner(
                                                 &elab.parameters,
                                             );
                                         }
+                                        __pkg_imp_overlay.push((
+                                            assign.name.name.clone(),
+                                            elab.parameters.get(&assign.name.name).cloned(),
+                                        ));
                                         elab.set_param(line!(), assign.name.name.clone(), v);
                                     }
                                 }
@@ -35342,6 +35707,13 @@ fn inline_instantiations_inner(
                                                 .or_insert(fields);
                                         }
                                     }
+                                    if unpacked_struct_typed {
+                                        register_unpacked_aggregate(
+                                            elab,
+                                            &decl.name.name,
+                                            &dd.data_type,
+                                        );
+                                    }
                                     elab.var_decl_types
                                         .entry(decl.name.name.clone())
                                         .or_insert_with(|| dd.data_type.clone());
@@ -35511,6 +35883,7 @@ fn inline_instantiations_inner(
                         _ => {}
                     }
                 }
+                restore_overlay(elab, __pkg_imp_overlay);
             }
             _ => {}
         }
@@ -38290,6 +38663,11 @@ struct InlineCache {
     imports: HashMap<(String, usize), Rc<[ImportedTypedefs]>>,
     /// Per package, the typedefs `import P::*` binds.
     wildcards: HashMap<String, ImportedTypedefs>,
+    /// Module/interface/program definitions whose `import P::*` bindings
+    /// (bare params, functions, tasks) were folded into the elaborated
+    /// module. `process_import` has design-wide effects, so it must run once
+    /// per definition, not once per instance of the definition.
+    param_imports_done: std::collections::HashSet<String>,
 }
 
 /// The typedefs an import binds, as (bare name, qualified key) in binding
@@ -39272,17 +39650,20 @@ fn explain_conn_width(actual: &Expression, elab: &ElaboratedModule, parent_def: 
             .typedef_types
             .get(&tn)
             .map(|dt| resolve_typedef_chain(dt, &elab.typedef_types));
+        // The identifiers each struct field's range reads, from the ORIGINAL
+        // (pre-fold) declaration — the folded `typedef_types` collapses
+        // `[P:0]` to `[0:0]` and would lose the parameter's name.
+        let range_ids = elab.struct_field_range_idents.get(&tn);
         if let Some(DataType::Struct(su)) = chain_root {
             let mut named_any = false;
             for m in &su.members {
                 let w =
                     resolve_type_width(&m.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let mut idents: Vec<String> = Vec::new();
-                if let DataType::IntegerVector { dimensions, .. } = &m.data_type {
-                    for d in dimensions {
-                        if let PackedDimension::Range { left, right, .. } = d {
-                            collect_ident_names(left, &mut idents);
-                            collect_ident_names(right, &mut idents);
+                if let Some(map) = range_ids {
+                    for d in &m.declarators {
+                        if let Some(ids) = map.get(&d.name.name) {
+                            idents.extend(ids.iter().cloned());
                         }
                     }
                 }
@@ -39939,6 +40320,24 @@ fn register_modport_expressions(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// §26.3: bind the bare names that `def`'s own `import P::*` / `import P::x`
+/// items bring into scope, for the const-eval of `def`'s body during inlining.
+/// Mirrors what `elaborate_module_with_defs` does for the top module's own
+/// imports but runs once per inlined definition so a flattened submodule's
+/// localparams and dimensions can name its imported package parameters.
+fn bind_inlined_import_params(
+    elab: &mut ElaboratedModule,
+    def: Definition,
+    definitions: &HashMap<String, Definition>,
+) -> Result<(), String> {
+    for item in def.items() {
+        if let ModuleItem::ImportDeclaration(imp) = item {
+            process_import(imp, elab, definitions, true)?;
+        }
+    }
+    Ok(())
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -39976,6 +40375,16 @@ fn inline_module_items(
     );
     let imports = cache.imported_typedefs(elab, source_def, definitions)?;
     rebind_imported_typedefs(elab, &imports);
+    // §26.3: fold a flattened submodule's OWN imports (bare params, public
+    // functions/tasks) into the top-level elaboration once per definition.
+    // `elaborate_module_with_defs` processes only the top module's imports;
+    // an inlined instance's `import P::*` never reached `process_import`, so
+    // its own `localparam X = PW` and dimensions (unpacked `[N]`) read the
+    // bare imported name as 0. Type imports are already bound above.
+    if !cache.param_imports_done.contains(source_def.name()) {
+        cache.param_imports_done.insert(source_def.name().to_string());
+        bind_inlined_import_params(elab, source_def, definitions)?;
+    }
     INLINE_CHAIN_TLS.with(|c| {
         c.borrow_mut()
             .push((prefix.to_string(), source_def.name().to_string()))
@@ -40330,6 +40739,12 @@ fn inline_module_items(
                 // `P::*` took whichever package last hoisted that bare name.
                 let imports = cache.imported_typedefs(elab, sub_mod, definitions)?;
                 rebind_imported_typedefs(elab, &imports);
+                if !cache.param_imports_done.contains(sub_mod.name()) {
+                    cache
+                        .param_imports_done
+                        .insert(sub_mod.name().to_string());
+                    bind_inlined_import_params(elab, sub_mod, definitions)?;
+                }
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -48640,6 +49055,32 @@ fn const_fn_cast_typedef(target: &Expression, elab: &ElaboratedModule) -> Option
 /// from the type itself. A named positive integral value in the call's
 /// parameter/local scope is a size cast instead (§6.24.1, §13.4.3).
 /// Other expressions are rebuilt unchanged.
+/// §26.3: is `t` a BARE const-fn param (`PW`) that the active package
+/// (`CONST_FN_PACKAGE`) declares, so a size cast `PW'(e)` inside a package
+/// function body should lower to `$__xz_size_cast`? `is_const_expr` only
+/// consults the caller's param map, which does not re-import the package's
+/// own bare name; this resolves through the qualified fallback the way
+/// `eval_const_expr_val_inner` does.
+fn const_fn_bare_param_is_const<P: ParamLookup>(t: &Expression, params: Option<&P>) -> bool {
+    let ExprKind::Ident(h) = &t.kind else {
+        return false;
+    };
+    if h.path.len() != 1 {
+        return false;
+    }
+    let name = h.path[0].name.name.as_str();
+    if params.is_some_and(|p| p.contains_key(name)) {
+        return true;
+    }
+    CONST_FN_PACKAGE.with(|c| {
+        let Some(pkg) = c.borrow().clone() else {
+            return false;
+        };
+        param_fallback_get(&format!("{pkg}::{name}")).is_some()
+            || param_fallback_get(&format!("{pkg}.{name}")).is_some()
+    })
+}
+
 fn resolve_const_fn_cast_targets<P: ParamLookup>(
     e: &Expression,
     params: Option<&P>,
@@ -48665,7 +49106,15 @@ fn resolve_const_fn_cast_targets<P: ParamLookup>(
                 // Only admit a known positive integral size, so an unresolved
                 // type/name still takes the prior deferral path.
                 None if name == "$__xz_named_cast"
-                    && is_const_expr(&args[0], params.expect("cast params")) &&
+                    && (is_const_expr(&args[0], params.expect("cast params"))
+                        // §26.3 / §13.4.3: inside a package function body a
+                        // bare size cast names the package's OWN parameter
+                        // (`PW'(x)` where `widths::PW`). `is_const_expr` above
+                        // only sees the caller's map, which does not re-import
+                        // the bare name; resolve it through the active package
+                        // like `eval_const_expr_val_inner` does, so the
+                        // size-cast lowering still happens.
+                        || const_fn_bare_param_is_const(&args[0], params)) &&
                 {
                     let size = eval_const_expr_val_inner(
                         &args[0],
@@ -56745,10 +57194,13 @@ fn process_import(
     imp: &ImportDeclaration,
     elab: &mut ElaboratedModule,
     defs: &HashMap<String, Definition>,
+    inline_only: bool,
 ) -> Result<(), String> {
     for ii in &imp.items {
         let pkg_name = &ii.package.name;
         if let Some(Definition::Package(pkg)) = defs.get(pkg_name) {
+            let mut pkg_overlay = overlay_pkg_params(pkg, elab);
+            let mut imported_params: HashSet<String> = HashSet::default();
             if let Some(sym) = &ii.item {
                 let sym_name = &sym.name;
                 let mut found = false;
@@ -56762,6 +57214,7 @@ fn process_import(
                             {
                                 for assign in assignments {
                                     if &assign.name.name == sym_name {
+                                        imported_params.insert(assign.name.name.clone());
                                         if register_visible_array_param(
                                             elab, pkg_name, assign, data_type,
                                         ) {
@@ -56864,6 +57317,8 @@ fn process_import(
                                             &assign.name.name,
                                             data_type,
                                         );
+                                        param_fallback_set(&assign.name.name, &v);
+                                        
                                         elab.set_param(
                                             line!(),
                                             assign.name.name.clone(),
@@ -56899,6 +57354,15 @@ fn process_import(
                         }
                         PackageItem::Typedef(td) if &td.name.name == sym_name => {
                             process_typedef(td, elab);
+                            if matches!(&td.data_type, DataType::Enum(_))
+                                && let Some(members) = elab.enum_members.get(&td.name.name)
+                            {
+                                for (m, _) in members {
+                                    if !elab.local_decl_displaces(m) {
+                                        imported_params.insert(m.clone());
+                                    }
+                                }
+                            }
                             found = true;
                         }
                         // §26.2.2: an enum MEMBER can be imported by name —
@@ -56945,6 +57409,7 @@ fn process_import(
                                                 &format!("imported from package '{}'", pkg_name),
                                                 false,
                                             );
+                                            imported_params.insert(nm.clone());
                                             elab.set_param(line!(), nm.clone(), v.clone());
                                             signals_insert_traced(
                                                 &mut elab.signals,
@@ -56982,7 +57447,8 @@ fn process_import(
                             }
                         }
                         PackageItem::Function(fd)
-                            if &fd.name.name.name == sym_name && fd.name.scopes.is_empty() =>
+                            if &fd.name.name.name == sym_name
+                                && fd.name.scopes.is_empty() =>
                         {
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                             elab.functions
@@ -56994,7 +57460,8 @@ fn process_import(
                             found = true;
                         }
                         PackageItem::Task(td)
-                            if &td.name.name.name == sym_name && td.name.scopes.is_empty() =>
+                            if &td.name.name.name == sym_name
+                                && td.name.scopes.is_empty() =>
                         {
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
                             elab.tasks
@@ -57112,6 +57579,16 @@ fn process_import(
                                             type_name: get_type_name(&dd.data_type),
                                         },
                                     );
+                                    if matches!(
+                                        resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
+                                        DataType::Struct(su) if !su.packed
+                                    ) {
+                                        register_unpacked_aggregate(
+                                            elab,
+                                            &decl.name.name,
+                                            &dd.data_type,
+                                        );
+                                    }
                                 }
                             }
                             found = true;
@@ -57122,6 +57599,13 @@ fn process_import(
                         break;
                     }
                 }
+                pkg_overlay.retain(|(k, _)| {
+                    !imported_params.contains(k)
+                        && !imported_params
+                            .iter()
+                            .any(|p| k.starts_with(&format!("{p}[")) || k.starts_with(&format!("{p}.")))
+                });
+                restore_overlay(elab, pkg_overlay);
                 if !found {
                     // §26.6 re-export: `package P2; import P1::x; export P1::*;`
                     // makes P1's `x` visible to importers of P2. Non-DPI exports
@@ -57166,7 +57650,7 @@ fn process_import(
                                         }],
                                         span: Span::dummy(),
                                     };
-                                    if process_import(&synth, elab, defs).is_ok() { ok = true; break; }
+                                    if process_import(&synth, elab, defs, inline_only).is_ok() { ok = true; break; }
                                 }
                             }
                             if ok { break; }
@@ -57213,6 +57697,7 @@ fn process_import(
                                     if elab.local_decl_displaces(&assign.name.name) {
                                         continue;
                                     }
+                                    imported_params.insert(assign.name.name.clone());
                                     if register_visible_array_param(
                                         elab, pkg_name, assign, data_type,
                                     ) {
@@ -57305,6 +57790,8 @@ fn process_import(
                                             &assign.name.name,
                                             data_type,
                                         );
+                                        param_fallback_set(&assign.name.name, &v);
+                                        
                                         elab.set_param(
                                             line!(),
                                             assign.name.name.clone(),
@@ -57348,10 +57835,19 @@ fn process_import(
                                 }
                             }
                         }
-                        PackageItem::Typedef(td) => {
+                        PackageItem::Typedef(td) if !inline_only => {
                             process_typedef(td, elab);
+                            if matches!(&td.data_type, DataType::Enum(_))
+                                && let Some(members) = elab.enum_members.get(&td.name.name)
+                            {
+                                for (m, _) in members {
+                                    if !elab.local_decl_displaces(m) {
+                                        imported_params.insert(m.clone());
+                                    }
+                                }
+                            }
                         }
-                        PackageItem::Function(fd) if fd.name.scopes.is_empty() => {
+                        PackageItem::Function(fd) if fd.name.scopes.is_empty() && !inline_only => {
                             elab.func_decl_scope
                                 .insert(fd.name.name.name.clone(), pkg_name.clone());
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
@@ -57360,7 +57856,7 @@ fn process_import(
                             elab.pkg_subr_owner
                                 .insert(fd.name.name.name.clone(), pkg_name.clone());
                         }
-                        PackageItem::Task(td) if td.name.scopes.is_empty() => {
+                        PackageItem::Task(td) if td.name.scopes.is_empty() && !inline_only => {
                             elab.func_decl_scope
                                 .insert(td.name.name.name.clone(), pkg_name.clone());
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
@@ -57369,19 +57865,19 @@ fn process_import(
                             elab.pkg_subr_owner
                                 .insert(td.name.name.name.clone(), pkg_name.clone());
                         }
-                        PackageItem::DPIImport(di) => {
+                        PackageItem::DPIImport(di) if !inline_only => {
                             register_dpi_import(di, elab, Some(pkg_name.as_str()))?;
                         }
-                        PackageItem::DPIExport(e) => {
+                        PackageItem::DPIExport(e) if !inline_only => {
                             register_dpi_export(e, elab);
                         }
                         // §26.3 / §11.13: a wildcard import makes a package
                         // `let` visible by its bare name, as the explicit
                         // import above does.
-                        PackageItem::Let(l) => {
+                        PackageItem::Let(l) if !inline_only => {
                             elab.lets.insert(l.name.name.clone(), l.clone());
                         }
-                        PackageItem::Class(c) => {
+                        PackageItem::Class(c) if !inline_only => {
                             register_class_enum_members(c, elab);
                             register_class_scoped_typedef_aliases(c, Some(&pkg_name), elab);
                             elab.classes.insert(
@@ -57392,7 +57888,7 @@ fn process_import(
                                 )),
                             );
                         }
-                        PackageItem::Data(dd) => {
+                        PackageItem::Data(dd) if !inline_only => {
                             // §26.2: a package net is registered as a net, so a
                             // supply net reads its constant and a wired net
                             // resolves its drivers (#610). The bare name is the
@@ -57541,11 +58037,28 @@ fn process_import(
                                     elab.packed_struct_fields
                                         .insert(decl.name.name.clone(), fields.clone());
                                 }
+                                if matches!(
+                                    resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
+                                    DataType::Struct(su) if !su.packed
+                                ) {
+                                    register_unpacked_aggregate(
+                                        elab,
+                                        &decl.name.name,
+                                        &dd.data_type,
+                                    );
+                                }
                             }
                         }
                         _ => {}
                     }
                 }
+                pkg_overlay.retain(|(k, _)| {
+                    !imported_params.contains(k)
+                        && !imported_params
+                            .iter()
+                            .any(|p| k.starts_with(&format!("{p}[")) || k.starts_with(&format!("{p}.")))
+                });
+                restore_overlay(elab, pkg_overlay);
                 // §26.2: follow the package's OWN wildcard imports one hop per
                 // level (depth-guarded). `import P::*;` where P itself does
                 // `import CHIP::*;` is how large testbenches reach core types —
@@ -57597,7 +58110,7 @@ fn process_import(
                                                 }],
                                                 span: Span::dummy(),
                                             };
-                                            let _ = process_import(&synth, elab, defs);
+                                            let _ = process_import(&synth, elab, defs, inline_only);
                                         }
                                     }
                                 }
