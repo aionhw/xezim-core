@@ -21,10 +21,25 @@ impl<T> Default for AstInterner<T> {
     }
 }
 
-struct CompareWriter<'a> {
+pub(crate) struct CompareWriter<'a> {
     expected: &'a [u8],
     position: usize,
     equal: bool,
+}
+
+impl<'a> CompareWriter<'a> {
+    pub(crate) fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            position: 0,
+            equal: true,
+        }
+    }
+
+    /// Whether everything written equals `expected` exactly.
+    pub(crate) fn matched(&self) -> bool {
+        self.equal && self.position == self.expected.len()
+    }
 }
 
 impl Write for CompareWriter<'_> {
@@ -32,6 +47,10 @@ impl Write for CompareWriter<'_> {
         let end = self.position.saturating_add(bytes.len());
         self.equal &= self.expected.get(self.position..end) == Some(bytes);
         self.position = end;
+        if !self.equal {
+            // The first difference decides; stop encoding the rest.
+            return Err(io::Error::other("syntax differs"));
+        }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {

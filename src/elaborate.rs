@@ -37787,6 +37787,11 @@ fn collect_body_driven_names(
 struct InlineCache {
     /// Prepared bodies (`prepare_module_items`).
     prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
+    /// §23.10 / §27 (#721): the distinct prepared bodies of each definition,
+    /// by content. Parameter values that change no generate choice, range or
+    /// declaration (an index passed down a generate loop) yield equal bodies;
+    /// those instances share one instead of each retaining its own copy.
+    equal_prepared: HashMap<(String, usize), EqualPrepared>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
     /// §6.20.3 / §20.7: equal type bindings and their independent width/query
@@ -38344,7 +38349,7 @@ fn prepare_module_items(
         })
         .collect();
 
-    let prepared = Rc::new(PreparedModuleItems {
+    let mut prepared = Rc::new(PreparedModuleItems {
         effective_items,
         body_sources,
         has_subroutines,
@@ -38355,9 +38360,120 @@ fn prepare_module_items(
         body_driven_ports,
     });
     if let Some((key, _)) = cache_key {
+        Rc::make_mut(&mut prepared).effective_items.shrink_to_fit();
+        prepared = share_equal_prepared(cache, param_scope::def_key(&source_def), prepared);
         cache.prepared.insert(key, Rc::clone(&prepared));
     }
     prepared
+}
+
+/// The distinct prepared bodies of one definition. The first body is kept
+/// unencoded: most definitions are prepared under one parameter environment
+/// only, and comparison is needed only once a second one appears.
+#[derive(Default)]
+struct EqualPrepared {
+    first: Option<Rc<PreparedModuleItems>>,
+    by_content: HashMap<(u64, usize), Vec<Rc<PreparedModuleItems>>>,
+}
+
+/// The canonical copy of a freshly prepared body: an equal body of the same
+/// definition prepared earlier (under other parameter values), else `fresh`.
+/// Equality compares the complete encoded syntax, spans included, and every
+/// derived name set; hashes only select candidates.
+fn share_equal_prepared(
+    cache: &mut InlineCache,
+    def: (String, usize),
+    fresh: Rc<PreparedModuleItems>,
+) -> Rc<PreparedModuleItems> {
+    use std::hash::{BuildHasher, Hasher};
+    let entry = cache.equal_prepared.entry(def).or_default();
+    let key = |bytes: &[u8]| {
+        let mut hash = crate::hasher::DeterministicState::default().build_hasher();
+        hash.write(bytes);
+        (hash.finish(), bytes.len())
+    };
+    let encode = |p: &PreparedModuleItems| {
+        bincode::serde::encode_to_vec(PreparedView(p), crate::xez_bincode_config()).ok()
+    };
+    if entry.first.is_none() && entry.by_content.is_empty() {
+        entry.first = Some(Rc::clone(&fresh));
+        return fresh;
+    }
+    if let Some(first) = entry.first.take() {
+        let Some(bytes) = encode(&first) else {
+            entry.first = Some(first);
+            return fresh;
+        };
+        entry.by_content.entry(key(&bytes)).or_default().push(first);
+    }
+    let Some(bytes) = encode(&fresh) else {
+        return fresh;
+    };
+    let bucket = entry.by_content.entry(key(&bytes)).or_default();
+    for candidate in bucket.iter() {
+        let mut compare = crate::ast_intern::CompareWriter::new(&bytes);
+        if bincode::serde::encode_into_std_write(
+            PreparedView(candidate),
+            &mut compare,
+            crate::xez_bincode_config(),
+        )
+        .is_ok()
+            && compare.matched()
+        {
+            return Rc::clone(candidate);
+        }
+    }
+    bucket.push(Rc::clone(&fresh));
+    fresh
+}
+
+/// Everything a prepared body holds, encoded in a fixed order (sets sorted).
+struct PreparedView<'a>(&'a PreparedModuleItems);
+
+impl serde::Serialize for PreparedView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        fn sorted<'a>(set: impl IntoIterator<Item = &'a String>) -> Vec<&'a String> {
+            let mut v: Vec<_> = set.into_iter().collect();
+            v.sort_unstable();
+            v
+        }
+        struct Sources<'a>(&'a [BodySource]);
+        impl serde::Serialize for Sources<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = s.serialize_seq(Some(self.0.len()))?;
+                for source in self.0 {
+                    match source {
+                        BodySource::ContAssign(pairs) => seq.serialize_element(&(0u8, pairs))?,
+                        BodySource::GateInst(pairs) => seq.serialize_element(&(1u8, pairs))?,
+                        BodySource::NetInits(pairs) => seq.serialize_element(&(2u8, pairs))?,
+                        BodySource::Always(kind, stmt, scope) => {
+                            seq.serialize_element(&(3u8, kind, stmt, scope))?
+                        }
+                        BodySource::Initial(stmt, scope) => {
+                            seq.serialize_element(&(4u8, stmt, scope))?
+                        }
+                        BodySource::Other => seq.serialize_element(&5u8)?,
+                    }
+                }
+                seq.end()
+            }
+        }
+        let p = self.0;
+        let mut directions: Vec<_> = p.port_directions.iter().collect();
+        directions.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut t = s.serialize_tuple(8)?;
+        t.serialize_element(&p.effective_items)?;
+        t.serialize_element(&Sources(&p.body_sources))?;
+        t.serialize_element(&p.has_subroutines)?;
+        t.serialize_element(&sorted(&p.local_typedefs))?;
+        t.serialize_element(&sorted(&p.interface_ports))?;
+        t.serialize_element(&directions)?;
+        t.serialize_element(&sorted(p.local_names.iter()))?;
+        t.serialize_element(&sorted(&p.body_driven_ports))?;
+        t.end()
+    }
 }
 
 /// Fill the value cache of every integer literal reachable from the
