@@ -56472,8 +56472,10 @@ mod package_net_tests {
 mod prepared_process_ownership_tests {
     use super::*;
 
-    /// §23.10/§27.5: prepared environments stay distinct, while identical
-    /// source syntax shares ownership; selecting another branch must differ.
+    /// §23.10/§27.5: each parameter environment keeps its own cache entry.
+    /// Environments that prepare equal bodies share one body (#721), and
+    /// identical source syntax shares ownership; selecting another branch
+    /// must differ.
     #[test]
     fn different_prepared_keys_share_only_identical_process_sources() {
         let parsed = crate::parse(
@@ -56505,7 +56507,8 @@ mod prepared_process_ownership_tests {
         let b = prepare(2, 0);
         let c = prepare(2, 1);
         assert_eq!(cache.len(), 3);
-        assert!(!Rc::ptr_eq(&a, &b));
+        assert!(Rc::ptr_eq(&a, &b));
+        assert!(!Rc::ptr_eq(&b, &c));
         let sources = |prepared: &PreparedModuleItems| {
             prepared.body_sources.iter().filter_map(|body| match body {
                 BodySource::Initial(body, _) => Some(Rc::clone(body)),

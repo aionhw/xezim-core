@@ -630,4 +630,32 @@ mod tests {
         drop(signals);
         NAMES.with(|names| assert_eq!(names.borrow().capacity(), 0));
     }
+
+    /// #721: net classification sets share the signal map's name text and
+    /// keep the bytes a `HashSet<String>` encodes to, so artifacts and design
+    /// caches read the same.
+    #[test]
+    fn shared_name_set_shares_text_and_encodes_like_a_string_set() {
+        let _scope = registry_scope();
+        let names: Vec<String> = (0..64).map(|i| format!("top.g[{i}].u.lane_{i}")).collect();
+        let mut signals: SharedNameMap<u8> = SharedNameMap::default();
+        for name in &names {
+            signals.insert(name.as_str(), 0);
+        }
+        let plain: crate::hasher::HashSet<String> = names.iter().cloned().collect();
+        let shared: SharedNameSet = names.iter().map(String::as_str).collect();
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&shared, config).unwrap();
+        assert_eq!(bincode::serde::encode_to_vec(&plain, config).unwrap(), bytes);
+        for name in &names {
+            let key = signals.shared_key(name.as_str()).unwrap();
+            assert!(shared.0.get(name.as_str()).unwrap().ptr_eq(key));
+        }
+        assert!(shared.contains("top.g[3].u.lane_3"));
+        assert!(!shared.contains("top.g[3].u"));
+        let (back, _): (SharedNameSet, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(back.len(), names.len());
+        assert!(names.iter().all(|n| back.contains(n)));
+    }
 }
