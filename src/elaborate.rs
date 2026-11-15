@@ -2080,7 +2080,7 @@ fn class_scoped_const<P: ParamLookup>(
 /// keyed by a "type" named `cls::N` (the parser cannot tell a type from a
 /// constant). The constant's value when the scoped name is a registered
 /// class-scoped (or package) constant rather than a typedef.
-fn scoped_type_name_const(name: &TypeName, params: &HashMap<String, Value>) -> Option<Value> {
+fn scoped_type_name_const(name: &TypeName, params: &dyn ParamLookup) -> Option<Value> {
     if name.scopes.is_empty() {
         return None;
     }
@@ -2104,14 +2104,14 @@ fn scoped_type_name_const(name: &TypeName, params: &HashMap<String, Value>) -> O
                 _ => (None, Some(e.clone())),
             })
             .collect();
-        return class_spec_const(&last.name.name, &args, &name.name.name, params);
+        return class_spec_const(&last.name.name, &args, &name.name.name, &params);
     }
     let lookup = |k: &str| params.get(k).cloned().or_else(|| param_fallback_get(k));
     lookup(&joined)
         .or_else(|| lookup(&leaf2))
         // `C#()::N` keeps no args on its scope link: the default
         // specialization of a class with value parameters.
-        .or_else(|| class_spec_const(&last.name.name, &[], &name.name.name, params))
+        .or_else(|| class_spec_const(&last.name.name, &[], &name.name.name, &params))
 }
 
 /// Rewrite an associative-looking `[cls::N]` dimension (see
@@ -2119,7 +2119,7 @@ fn scoped_type_name_const(name: &TypeName, params: &HashMap<String, Value>) -> O
 /// dimension has another shape or the name is no such constant.
 fn scoped_const_dim(
     d: &UnpackedDimension,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
 ) -> Option<UnpackedDimension> {
     let UnpackedDimension::Associative {
         data_type: Some(dt),
@@ -12255,19 +12255,24 @@ pub fn elaborate_module_with_defs(
                     let register_packed_for_array = |elab: &mut ElaboratedModule| {
                         fn flatten_elem(
                             dt: &DataType,
-                            params: &HashMap<String, Value>,
+                            params: &dyn ParamLookup,
                             typedefs: &HashMap<String, u32>,
                             typedef_types: &HashMap<String, DataType>,
                         ) -> Option<Vec<(String, u32, u32)>> {
                             // Scoped element types (`p::r_t arr[4]`): member
                             // dims bind the OWNING package's params bare —
                             // re-derive per level (see scoped_type_owner).
-                            let owner_aug;
-                            let params: &HashMap<String, Value> =
+                            let owner_own;
+                            let stacked;
+                            let params: &dyn ParamLookup =
                                 match scoped_type_owner(dt, typedef_types) {
                                     Some(pkg) => {
-                                        owner_aug = overlay_owner_params(&pkg, params);
-                                        &owner_aug
+                                        owner_own = owner_param_overrides(&pkg, params);
+                                        stacked = StackedParamEnv {
+                                            base: params,
+                                            top: &owner_own,
+                                        };
+                                        &stacked
                                     }
                                     None => params,
                                 };
@@ -12276,9 +12281,9 @@ pub fn elaborate_module_with_defs(
                                 let is_union = matches!(su.kind, StructUnionKind::Union);
                                 let mut raw: Vec<(String, u32, DataType)> = Vec::new();
                                 for member in &su.members {
-                                    let mw = resolve_type_width(
+                                    let mw = resolve_type_width_env(
                                         &member.data_type,
-                                        Some(params),
+                                        Some(&params),
                                         Some(typedefs),
                                     );
                                     for mdecl in &member.declarators {
@@ -12997,13 +13002,17 @@ pub fn elaborate_module_with_defs(
                         // scoped_type_owner) — overlay them for the layout walk;
                         // dt_resolved is already the raw Struct, so the walk
                         // itself can't recover the owner.
-                        let layout_params_owned;
-                        let layout_params: &HashMap<String, Value> =
+                        let layout_own;
+                        let layout_stacked;
+                        let layout_params: &dyn ParamLookup =
                             match scoped_type_owner(&dd.data_type, &elab.typedef_types) {
                                 Some(pkg) => {
-                                    layout_params_owned =
-                                        overlay_owner_params(&pkg, &elab.parameters);
-                                    &layout_params_owned
+                                    layout_own = owner_param_overrides(&pkg, &elab.parameters);
+                                    layout_stacked = StackedParamEnv {
+                                        base: &elab.parameters,
+                                        top: &layout_own,
+                                    };
+                                    &layout_stacked
                                 }
                                 None => &elab.parameters,
                             };
@@ -13011,7 +13020,7 @@ pub fn elaborate_module_with_defs(
                         // paths like u.s.a resolve via a single packed_struct_fields lookup.
                         fn flatten_subfields(
                             dt: &DataType,
-                            params: &HashMap<String, Value>,
+                            params: &dyn ParamLookup,
                             typedefs: &HashMap<String, u32>,
                             typedef_types: &HashMap<String, DataType>,
                         ) -> Option<Vec<(String, u32, u32)>> {
@@ -13019,12 +13028,17 @@ pub fn elaborate_module_with_defs(
                             // scoped typedef (`q::inner_t` inside p's struct)
                             // needs q's params bare for ITS member dims —
                             // re-derive the owner at every nesting level.
-                            let owner_aug;
-                            let params: &HashMap<String, Value> =
+                            let owner_own;
+                            let stacked;
+                            let params: &dyn ParamLookup =
                                 match scoped_type_owner(dt, typedef_types) {
                                     Some(pkg) => {
-                                        owner_aug = overlay_owner_params(&pkg, params);
-                                        &owner_aug
+                                        owner_own = owner_param_overrides(&pkg, params);
+                                        stacked = StackedParamEnv {
+                                            base: params,
+                                            top: &owner_own,
+                                        };
+                                        &stacked
                                     }
                                     None => params,
                                 };
@@ -13060,9 +13074,9 @@ pub fn elaborate_module_with_defs(
                                 let is_union = matches!(su.kind, StructUnionKind::Union);
                                 let mut raw: Vec<(String, u32, DataType)> = Vec::new();
                                 for member in &su.members {
-                                    let mw = resolve_type_width(
+                                    let mw = resolve_type_width_env(
                                         &member.data_type,
-                                        Some(params),
+                                        Some(&params),
                                         Some(typedefs),
                                     );
                                     for mdecl in &member.declarators {
@@ -13084,7 +13098,7 @@ pub fn elaborate_module_with_defs(
                                                      base_off: u32,
                                                      out: &mut Vec<(String, u32, u32)>| {
                                     if let Some((dims, elem_dt)) =
-                                        packed_struct_array_info(mdt, params, typedef_types)
+                                        packed_struct_array_info_env(mdt, params, typedef_types)
                                     {
                                         let counts: Vec<u64> = dims
                                             .iter()
@@ -22843,7 +22857,7 @@ impl ParamLookup for HashMap<String, Value> {
     }
 }
 
-impl<'a> ParamLookup for &'a HashMap<String, Value> {
+impl<T: ParamLookup + ?Sized> ParamLookup for &T {
     #[inline]
     fn get(&self, key: &str) -> Option<&Value> {
         (**self).get(key)
@@ -22854,15 +22868,56 @@ impl<'a> ParamLookup for &'a HashMap<String, Value> {
     }
     #[inline]
     fn keys(&self) -> crate::hasher::HashSet<&str> {
-        (**self).iter().map(|(k, _)| k.as_str()).collect()
+        (**self).keys()
     }
     #[inline]
     fn rows(&self) -> Vec<(&str, &Value)> {
-        (**self).iter().map(|(k, v)| (k.as_str(), v)).collect()
+        (**self).rows()
     }
     #[inline]
     fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
-        Some(*self)
+        (**self).as_hashmap_base()
+    }
+}
+
+/// An overlay stacked onto any `&dyn ParamLookup` (`top` wins), used to avoid
+/// cloning `base` when materializing package-local bare aliases.
+struct StackedParamEnv<'a> {
+    base: &'a dyn ParamLookup,
+    top: &'a HashMap<String, Value>,
+}
+
+impl ParamLookup for StackedParamEnv<'_> {
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.top.get(key).or_else(|| self.base.get(key))
+    }
+    #[inline]
+    fn contains_key(&self, key: &str) -> bool {
+        self.top.contains_key(key) || self.base.contains_key(key)
+    }
+    fn keys(&self) -> crate::hasher::HashSet<&str> {
+        let mut set = self.base.keys();
+        set.extend(self.top.keys().map(String::as_str));
+        set
+    }
+    fn rows(&self) -> Vec<(&str, &Value)> {
+        let mut out: Vec<(&str, &Value)> = Vec::new();
+        let mut seen: crate::hasher::HashSet<&str> = crate::hasher::HashSet::default();
+        for (k, v) in self.top {
+            out.push((k.as_str(), v));
+            seen.insert(k.as_str());
+        }
+        for (k, v) in self.base.rows() {
+            if !seen.contains(k) {
+                out.push((k, v));
+            }
+        }
+        out
+    }
+    #[inline]
+    fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
+        self.base.as_hashmap_base()
     }
 }
 
@@ -24043,13 +24098,22 @@ pub fn const_eval_pattern_index(
     params: Option<&HashMap<String, Value>>,
     bounds: (i64, i64),
 ) -> Option<i64> {
-    const_eval_typed_pattern_index(expr, params, bounds)
-        .or_else(|| const_eval_i64_with_params(expr, params))
+    let p_dyn = params.map(|p| p as &dyn ParamLookup);
+    const_eval_pattern_index_env(expr, p_dyn.as_ref(), bounds)
+}
+
+fn const_eval_pattern_index_env<P: ParamLookup>(
+    expr: &Expression,
+    params: Option<&P>,
+    bounds: (i64, i64),
+) -> Option<i64> {
+    const_eval_typed_pattern_index_env(expr, params, bounds)
+        .or_else(|| const_eval_i64_with_params_env(expr, params))
 }
 
 /// The typed part of pattern-index evaluation; callers keep their own fallback.
 pub fn const_eval_literal_pattern_index(expr: &Expression, bounds: (i64, i64)) -> Option<i64> {
-    const_eval_typed_pattern_index(expr, None, bounds)
+    const_eval_typed_pattern_index_env::<HashMap<String, Value>>(expr, None, bounds)
 }
 
 /// [`const_eval_literal_pattern_index`] whose leaves may also be integral
@@ -24061,9 +24125,17 @@ pub fn const_eval_typed_pattern_index(
     params: Option<&HashMap<String, Value>>,
     bounds: (i64, i64),
 ) -> Option<i64> {
-    fn literals(
+    const_eval_typed_pattern_index_env(expr, params, bounds)
+}
+
+fn const_eval_typed_pattern_index_env<P: ParamLookup>(
+    expr: &Expression,
+    params: Option<&P>,
+    bounds: (i64, i64),
+) -> Option<i64> {
+    fn literals<P: ParamLookup>(
         e: &Expression,
-        params: Option<&HashMap<String, Value>>,
+        params: Option<&P>,
         max_width: u32,
     ) -> Option<()> {
         let literals = |e: &Expression, max_width: u32| literals(e, params, max_width);
@@ -24223,28 +24295,24 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
             return value.to_i64();
         }
     }
-    match &expr.kind {
-        // §25.5 interface-port parameter (`c.DEPTH`) — dotted key seeded at
-        // child inlining; parses as MemberAccess.
-        ExprKind::MemberAccess { expr: base, member }
-            if matches!(&base.kind,
-                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty()
-                    && params.is_some_and(|p|
-                        p.contains_key(&format!("{}.{}", h.path[0].name.name, member.name))
-                            || p.contains_key(&format!("{}::{}", h.path[0].name.name, member.name)))) =>
+    // §25.5 interface-port parameter (`c.DEPTH`) — dotted key seeded at
+    // child inlining; parses as MemberAccess. Resolve once without building
+    // format! strings in a match guard.
+    if let ExprKind::MemberAccess { expr: base, member } = &expr.kind
+        && let ExprKind::Ident(h) = &base.kind
+        && h.path.len() == 1
+        && h.path[0].selects.is_empty()
+        && let Some(p) = params
+    {
+        let base_name = &h.path[0].name.name;
+        if let Some(v) = p
+            .get(&format!("{base_name}.{}", member.name))
+            .or_else(|| p.get(&format!("{base_name}::{}", member.name)))
         {
-            let base_name = if let ExprKind::Ident(h) = &base.kind {
-                h.path[0].name.name.as_str()
-            } else {
-                unreachable!()
-            };
-            params
-                .and_then(|p| {
-                    p.get(&format!("{}.{}", base_name, member.name))
-                        .or_else(|| p.get(&format!("{}::{}", base_name, member.name)))
-                })
-                .and_then(|v| v.to_i64())
+            return v.to_i64();
         }
+    }
+    match &expr.kind {
         // §6.20.2/§26.3: element of an UNPACKED-ARRAY parameter in a
         // constant context — `pkg::LIM[3]`, `LIM[1]`, `u.mod.A[2]`.
         // `register_array_param` stores each element under `base[idx]`
@@ -27087,6 +27155,13 @@ pub fn declared_unpacked_dims(
     dims: &[crate::ast::types::UnpackedDimension],
     params: &HashMap<String, Value>,
 ) -> Option<Vec<(i64, i64)>> {
+    declared_unpacked_dims_env(dims, params)
+}
+
+fn declared_unpacked_dims_env(
+    dims: &[crate::ast::types::UnpackedDimension],
+    params: &dyn ParamLookup,
+) -> Option<Vec<(i64, i64)>> {
     if dims.is_empty() {
         return None;
     }
@@ -27098,12 +27173,14 @@ pub fn declared_unpacked_dims(
         let d = resolved.as_ref().unwrap_or(d);
         match d {
             crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
-                let l = const_eval_i64_with_params(left, Some(params))?;
-                let r = const_eval_i64_with_params(right, Some(params))?;
+                let p_ref = &params;
+                let l = const_eval_i64_with_params_env(left, Some(&p_ref))?;
+                let r = const_eval_i64_with_params_env(right, Some(&p_ref))?;
                 out.push((l, r));
             }
             crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
-                let size = const_eval_i64_with_params(expr, Some(params))?;
+                let p_ref = &params;
+                let size = const_eval_i64_with_params_env(expr, Some(&p_ref))?;
                 if size <= 0 {
                     return None;
                 }
@@ -27806,6 +27883,14 @@ pub fn packed_struct_array_info(
     params: &HashMap<String, Value>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<(Vec<(i64, i64)>, DataType)> {
+    packed_struct_array_info_env(dt, params, typedef_types)
+}
+
+fn packed_struct_array_info_env(
+    dt: &DataType,
+    params: &dyn ParamLookup,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<(Vec<(i64, i64)>, DataType)> {
     let mut dims: Vec<(i64, i64)> = Vec::new();
     let mut cur: DataType = dt.clone();
     for _ in 0..64 {
@@ -27817,8 +27902,8 @@ pub fn packed_struct_array_info(
             } => {
                 for d in dimensions {
                     if let PackedDimension::Range { left, right, .. } = d {
-                        let l = const_eval_i64_with_params(left, Some(params))?;
-                        let r = const_eval_i64_with_params(right, Some(params))?;
+                        let l = const_eval_i64_with_params_env(left, Some(&params))?;
+                        let r = const_eval_i64_with_params_env(right, Some(&params))?;
                         dims.push((l, r));
                     } else {
                         return None;
@@ -27833,8 +27918,8 @@ pub fn packed_struct_array_info(
                 }
                 for d in &su.dimensions {
                     if let PackedDimension::Range { left, right, .. } = d {
-                        let l = const_eval_i64_with_params(left, Some(params))?;
-                        let r = const_eval_i64_with_params(right, Some(params))?;
+                        let l = const_eval_i64_with_params_env(left, Some(&params))?;
+                        let r = const_eval_i64_with_params_env(right, Some(&params))?;
                         dims.push((l, r));
                     } else {
                         return None;
@@ -28297,40 +28382,52 @@ fn register_visible_array_param(
     if assign.dimensions.is_empty() {
         return false;
     }
-    let mut params = elab.parameters.clone();
     // The initializer and bounds belong to the exporting package, even
     // when only this array is imported into a scope with scalar homonyms.
     let prefix = format!("{pkg}::");
-    let own: Vec<_> = params
+    let own: HashMap<String, Value> = elab
+        .parameters
         .iter()
         .filter_map(|(key, value)| {
             key.strip_prefix(&prefix)
                 .map(|key| (key.to_string(), value.clone()))
         })
         .collect();
-    params.extend(own);
-    if !register_array_param(
-        elab,
-        "",
-        &assign.name.name,
-        &assign.dimensions,
-        assign.init.as_ref(),
-        None,
-        data_type,
-        Some(&params),
-    ) {
-        return false;
+    let (r1, r2) = {
+        let env = ParamEnv::Overlay {
+            base: &elab.parameters,
+            top: &own,
+        };
+        let Some(r1) = array_params::compute(
+            &*elab,
+            "",
+            &assign.name.name,
+            &assign.dimensions,
+            assign.init.as_ref(),
+            None,
+            data_type,
+            &env,
+            &env,
+        ) else {
+            return false;
+        };
+        let r2 = array_params::compute(
+            &*elab,
+            "",
+            &format!("{pkg}::{}", assign.name.name),
+            &assign.dimensions,
+            assign.init.as_ref(),
+            None,
+            data_type,
+            &env,
+            &env,
+        );
+        (r1, r2)
+    };
+    r1.apply(elab, "");
+    if let Some(r2) = r2 {
+        r2.apply(elab, "");
     }
-    register_array_param(
-        elab,
-        "",
-        &format!("{pkg}::{}", assign.name.name),
-        &assign.dimensions,
-        assign.init.as_ref(),
-        None,
-        data_type,
-        Some(&params),
-    );
     true
 }
 
@@ -28448,7 +28545,7 @@ fn struct_typedef_self_reference(
 fn pack_packed_array_const_value(
     dt: &DataType,
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
@@ -28472,7 +28569,7 @@ fn pack_packed_array_const_value(
     if !matches!(elem_dt, DataType::Struct(_)) {
         return None;
     }
-    let elem_w = resolve_type_width_env(elem_dt, Some(params), Some(typedefs));
+    let elem_w = resolve_type_width_env(elem_dt, Some(&params), Some(typedefs));
     if elem_w == 0 {
         return None;
     }
@@ -28511,20 +28608,17 @@ pub(crate) fn pack_packed_vector_pattern(
     params: &HashMap<String, Value>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
-    // A SINGLE packed dim is a vector of bits — `'{1'b1, 2.0, 2+1}` on
-    // `bit [2:0]` converts each item to ONE bit (§10.9.2 element-by-element),
-    // exactly like the multi-D case with 1-bit elements. The old `< 2` guard
-    // sent it to the raw-concat fallback, which kept every item at its own
-    // width and scrambled the result.
-    //
-    // A typedef chain (`typedef enum_t [0:4] row; typedef row [0:3] grid`)
-    // keeps each packed range on its own type reference. Following the chain
-    // to the enum and dropping those ranges made `'{default: MERGED}` look
-    // like a scalar pattern, so the whole member stayed 0 — fpnew then saw
-    // every format unit as DISABLED and never asserted in_ready.
-    // §10.9: a typed pattern takes its own type.
+    pack_packed_vector_pattern_env(dt, expr, params, typedef_types)
+}
+
+pub(crate) fn pack_packed_vector_pattern_env(
+    dt: &DataType,
+    expr: &Expression,
+    params: &dyn ParamLookup,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
     if let ExprKind::TypedPattern { ty, pattern } = &expr.kind {
-        return pack_packed_vector_pattern(ty, pattern, params, typedef_types);
+        return pack_packed_vector_pattern_env(ty, pattern, params, typedef_types);
     }
     let (dims, leaf_w) = packed_pattern_shape(dt, params, typedef_types)?;
     if dims.is_empty() {
@@ -28538,13 +28632,13 @@ pub(crate) fn pack_packed_vector_pattern(
 fn pack_typed_pattern(
     ty: &DataType,
     pattern: &Expression,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
     pack_packed_array_const_value(ty, pattern, params, typedefs, typedef_types)
         .or_else(|| pack_struct_const_value(ty, pattern, params, typedefs, typedef_types))
-        .or_else(|| pack_packed_vector_pattern(ty, pattern, params, typedef_types))
+        .or_else(|| pack_packed_vector_pattern_env(ty, pattern, params, typedef_types))
 }
 
 /// Packed dimensions of `dt`, outermost first, and the width of one leaf
@@ -28553,7 +28647,7 @@ fn pack_typed_pattern(
 /// `typedef T [L:R]` along the chain contributes its range outside that.
 fn packed_pattern_shape(
     dt: &DataType,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<(Vec<PackedDimension>, u32)> {
     let mut dims = Vec::new();
@@ -28574,7 +28668,7 @@ fn packed_pattern_shape(
                 let w = e
                     .base_type
                     .as_ref()
-                    .map(|bt| resolve_type_width(bt, Some(params), None))
+                    .map(|bt| resolve_type_width_env(bt, Some(&params), None))
                     .unwrap_or(32);
                 return Some((dims, w.max(1)));
             }
@@ -28589,7 +28683,7 @@ fn packed_pattern_shape(
 fn pack_vector_pattern_dims(
     dims: &[PackedDimension],
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     leaf_w: u32,
 ) -> Option<Value> {
     use crate::ast::expr::AssignmentPatternItem;
@@ -28601,8 +28695,8 @@ fn pack_vector_pattern_dims(
             return None;
         };
         Some((
-            const_eval_i64_with_params(left, Some(params))?,
-            const_eval_i64_with_params(right, Some(params))?,
+            const_eval_i64_with_params_env(left, Some(&params))?,
+            const_eval_i64_with_params_env(right, Some(&params))?,
         ))
     };
     let (l, r) = bounds(dims.first()?)?;
@@ -28619,7 +28713,7 @@ fn pack_vector_pattern_dims(
         }
         // §6.12.2: a real item CONVERTS (rounds) to the element type — the
         // width-fit path would reinterpret its IEEE-754 bits.
-        let raw = eval_const_expr_val(e, params);
+        let raw = eval_const_expr_val_env(e, &params);
         if raw.is_real {
             let r = raw.to_f64().round() as i64;
             let m = if elem_w >= 64 {
@@ -28658,7 +28752,7 @@ fn pack_vector_pattern_dims(
                 // elements. Treating it as one element left the remaining
                 // slots unfilled, so the whole pattern bailed to 0.
                 if let ExprKind::Replication { count, exprs } = &v.kind {
-                    let reps = const_eval_i64_with_params(count, Some(params))?;
+                    let reps = const_eval_i64_with_params_env(count, Some(&params))?;
                     if reps < 0 {
                         return None;
                     }
@@ -28680,7 +28774,7 @@ fn pack_vector_pattern_dims(
                 next_ordered += 1;
             }
             AssignmentPatternItem::Keyed(k, v) => {
-                let idx = const_eval_pattern_index(k, Some(params), (l, r))?;
+                let idx = const_eval_pattern_index_env(k, Some(&params), (l, r))?;
                 *slots.get_mut(slot_of(idx)?)? = Some(eval_elem(v, true)?);
             }
             AssignmentPatternItem::Default(v) => {
@@ -28859,10 +28953,10 @@ fn convert_param_value<P: ParamLookup>(
     let ctx;
     let src = match expr {
         Some(e) if !val.is_real => {
-            ctx = eval_const_expr_val_ctx_inner(
+            ctx = eval_const_expr_val_with_ctx(
                 e,
                 scope,
-                w,
+                Some(w),
                 &mut const_context::Types::default(),
             );
             &ctx
@@ -28898,6 +28992,14 @@ fn convert_param_value<P: ParamLookup>(
 pub fn normalize_unpacked_dims(
     dims: &[UnpackedDimension],
     params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Vec<UnpackedDimension> {
+    normalize_unpacked_dims_env(dims, params, typedef_types)
+}
+
+pub(crate) fn normalize_unpacked_dims_env(
+    dims: &[UnpackedDimension],
+    params: &dyn ParamLookup,
     typedef_types: &HashMap<String, DataType>,
 ) -> Vec<UnpackedDimension> {
     dims.iter()
@@ -28996,20 +29098,21 @@ fn assoc_dim_const_size(d: &UnpackedDimension, params: &HashMap<String, Value>) 
 
 fn const_dim_indices(
     dims: &[UnpackedDimension],
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
 ) -> Option<Vec<i64>> {
+    let p_ref = &params;
     match dims.first() {
         None => Some(Vec::new()),
         Some(UnpackedDimension::Expression { expr, .. }) => {
-            match const_eval_i64_with_params(expr, Some(params)) {
+            match const_eval_i64_with_params_env(expr, Some(&p_ref)) {
                 Some(n) if n > 0 && n <= 4096 => Some((0..n).collect()),
                 _ => None,
             }
         }
         Some(UnpackedDimension::Range { left, right, .. }) => {
             match (
-                const_eval_i64_with_params(left, Some(params)),
-                const_eval_i64_with_params(right, Some(params)),
+                const_eval_i64_with_params_env(left, Some(&p_ref)),
+                const_eval_i64_with_params_env(right, Some(&p_ref)),
             ) {
                 (Some(l), Some(r)) => {
                     let (lo, hi) = if l <= r { (l, r) } else { (r, l) };
@@ -30378,10 +30481,10 @@ fn scoped_type_owner(dt: &DataType, typedef_types: &HashMap<String, DataType>) -
 /// Overlay `pkg::X` parameter aliases as bare `X` for evaluating the members
 /// of a scoped package type. Package params override same-named module ones
 /// here — inside the package's own typedef, bare names bind to the package.
-fn overlay_owner_params(owner: &str, params: &HashMap<String, Value>) -> HashMap<String, Value> {
-    let mut m = params.clone();
+fn owner_param_overrides(owner: &str, params: &dyn ParamLookup) -> HashMap<String, Value> {
     let pfx = format!("{}::", owner);
-    for (k, v) in params.iter() {
+    let mut m = HashMap::default();
+    for (k, v) in params.rows() {
         if let Some(bare) = k.strip_prefix(&pfx) {
             if !bare.contains("::") {
                 m.insert(bare.to_string(), v.clone());
@@ -30397,6 +30500,15 @@ pub fn packed_struct_field_layout(
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Vec<(String, u32, u32)>> {
+    packed_struct_field_layout_env(dt, params, typedefs, typedef_types)
+}
+
+pub(crate) fn packed_struct_field_layout_env(
+    dt: &DataType,
+    params: &dyn ParamLookup,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<(String, u32, u32)>> {
     match resolve_typedef_chain(dt, typedef_types) {
         DataType::Struct(su) if su.packed => {}
         _ => return None,
@@ -30406,17 +30518,22 @@ pub fn packed_struct_field_layout(
 
 fn flatten_struct_fields(
     dt: &DataType,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Vec<(String, u32, u32)>> {
     // See scoped_type_owner — member dims of a `pkg::T` struct need the
     // package's own params visible bare.
-    let owner_aug;
-    let params: &HashMap<String, Value> = match scoped_type_owner(dt, typedef_types) {
+    let owner_own;
+    let stacked;
+    let params: &dyn ParamLookup = match scoped_type_owner(dt, typedef_types) {
         Some(pkg) => {
-            owner_aug = overlay_owner_params(&pkg, params);
-            &owner_aug
+            owner_own = owner_param_overrides(&pkg, params);
+            stacked = StackedParamEnv {
+                base: params,
+                top: &owner_own,
+            };
+            &stacked
         }
         None => params,
     };
@@ -30425,7 +30542,7 @@ fn flatten_struct_fields(
         let is_union = matches!(su.kind, StructUnionKind::Union);
         let mut raw: Vec<(String, u32, DataType)> = Vec::new();
         for member in &su.members {
-            let mw = resolve_type_width(&member.data_type, Some(params), Some(typedefs));
+            let mw = resolve_type_width_env(&member.data_type, Some(&params), Some(typedefs));
             for mdecl in &member.declarators {
                 raw.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
             }
@@ -30467,16 +30584,21 @@ fn flatten_struct_fields(
 fn pack_struct_const_value(
     dt: &DataType,
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
     // See scoped_type_owner — same bare-name rule as flatten_struct_fields.
-    let owner_aug;
-    let params: &HashMap<String, Value> = match scoped_type_owner(dt, typedef_types) {
+    let owner_own;
+    let stacked;
+    let params: &dyn ParamLookup = match scoped_type_owner(dt, typedef_types) {
         Some(pkg) => {
-            owner_aug = overlay_owner_params(&pkg, params);
-            &owner_aug
+            owner_own = owner_param_overrides(&pkg, params);
+            stacked = StackedParamEnv {
+                base: params,
+                top: &owner_own,
+            };
+            &stacked
         }
         None => params,
     };
@@ -30494,7 +30616,7 @@ fn pack_struct_const_value(
     // Top-level members in declaration order (first = MSB).
     let mut members: Vec<(String, u32, DataType)> = Vec::new();
     for member in &su.members {
-        let mw = resolve_type_width_env(&member.data_type, Some(params), Some(typedefs));
+        let mw = resolve_type_width_env(&member.data_type, Some(&params), Some(typedefs));
         for mdecl in &member.declarators {
             members.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
         }
@@ -30526,7 +30648,7 @@ fn pack_struct_const_value(
     // §10.9.2, A.6.7.1: the count is a constant expression. Match the
     // replication shape before the member scan.
     if let Some(expanded) = struct_pattern_replication_with(items, members.len(), &mut |count| {
-        struct_pattern_count_value(&eval_const_expr_val(count, params))
+        struct_pattern_count_value(&eval_const_expr_val_env(count, &params))
     }) && (su.packed
         || !TYPEDEF_SHAPES_TLS
             .with(|shapes| struct_pattern_has_array_member(&su, typedef_types, &shapes.borrow().1)))
@@ -30548,7 +30670,8 @@ fn pack_struct_const_value(
                 if let Some(sub) = pack_struct_const_value(mdt, e, params, typedefs, typedef_types)
                 {
                     sub.resize(*mw)
-                } else if let Some(sub) = pack_packed_vector_pattern(mdt, e, params, typedef_types)
+                } else if let Some(sub) =
+                    pack_packed_vector_pattern_env(mdt, e, params, typedef_types)
                 {
                     // A nested pattern on a packed-VECTOR member
                     // (`bit [2:0][3:0] y` given `'{4,5,6}`).
@@ -30556,7 +30679,7 @@ fn pack_struct_const_value(
                 } else {
                     // §6.12.2: a real item CONVERTS (rounds) to the member
                     // type; the width-fit would reinterpret its IEEE-754 bits.
-                    let raw = eval_const_expr_val(e, params);
+                    let raw = eval_const_expr_val_env(e, &params);
                     if raw.is_real {
                         let r = raw.to_f64().round() as i64;
                         let m = if *mw >= 64 {
@@ -30584,18 +30707,18 @@ fn pack_struct_const_value(
 // its 64-bit representation is not an integral operand width.
 fn eval_init_for_target(
     expr: &Expression,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     width: u32,
     real: bool,
 ) -> Value {
     if real {
-        Value::from_f64(eval_const_expr_val(expr, params).to_f64())
+        Value::from_f64(eval_const_expr_val_env(expr, &params).to_f64())
     } else {
         eval_init_for_width(expr, params, width)
     }
 }
 
-fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width: u32) -> Value {
+fn eval_init_for_width(expr: &Expression, params: &dyn ParamLookup, width: u32) -> Value {
     if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &expr.kind {
         return match c {
             '0' => Value::zero(width),
@@ -30607,7 +30730,13 @@ fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width
     }
     // §10.7 assignment resize: a signed source with an X/Z MSB widens with X/Z
     // (resize_for_assign), matching a procedural assignment to the same target.
-    eval_const_expr_val_ctx(expr, params, width).resize_for_assign(width)
+    eval_const_expr_val_with_ctx(
+        expr,
+        &params,
+        Some(width),
+        &mut const_context::Types::default(),
+    )
+    .resize_for_assign(width)
 }
 
 /// §6.11.3, §6.11.2: a package variable's initial value takes the DECLARED
@@ -30725,22 +30854,39 @@ fn const_real_math_arity(name: &str) -> Option<usize> {
     }
 }
 
-fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
-    eval_const_expr_val_inner(expr, params, &mut const_context::Types::default())
+pub fn eval_const_expr_val_env<P: ParamLookup>(expr: &Expression, params: &P) -> Value {
+    eval_const_expr_val_with_ctx(expr, params, None, &mut const_context::Types::default())
 }
 
+fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
+    eval_const_expr_val_with_ctx(expr, params, None, &mut const_context::Types::default())
+}
+
+#[inline]
 fn eval_const_expr_val_inner<P: ParamLookup>(
     expr: &Expression,
     params: &P,
     types: &mut const_context::Types,
 ) -> Value {
-    if let Some(value) = types.take_value(expr) {
-        return value;
+    eval_const_expr_val_with_ctx(expr, params, None, types)
+}
+
+fn eval_const_expr_val_with_ctx<P: ParamLookup>(
+    expr: &Expression,
+    params: &P,
+    ctx_w: Option<u32>,
+    types: &mut const_context::Types,
+) -> Value {
+    if ctx_w.is_none() {
+        if let Some(value) = types.take_value(expr) {
+            return value;
+        }
     }
     if is_context_operator(expr) {
         let ty = const_context::infer(expr, params, types);
         if ty.integral {
-            if let Some(value) = const_ctx_fold(expr, params, ty.width, ty.signed, types) {
+            let width = ctx_w.map_or(ty.width, |w| w.max(ty.width));
+            if let Some(value) = const_ctx_fold(expr, params, width, ty.signed, types) {
                 return value;
             }
         }
@@ -31270,7 +31416,7 @@ fn eval_const_expr_val_inner<P: ParamLookup>(
                 .max(1) as u32;
             // §6.24.1: the cast width is the operand's evaluation CONTEXT —
             // `5'(3'd7 + 3'd6)` is 13, not the 3-bit-wrapped 5.
-            let v = eval_const_expr_val_ctx_inner(&args[1], params, n, types);
+            let v = eval_const_expr_val_with_ctx(&args[1], params, Some(n), types);
             if v.is_real {
                 let f = v.to_f64();
                 let r = if f >= 0.0 {
@@ -31312,7 +31458,7 @@ fn eval_const_expr_val_inner<P: ParamLookup>(
                 {
                     let w = (w.max(1)) as u32;
                     let mut out =
-                        eval_const_expr_val_ctx_inner(&args[1], params, w, types).resize(w);
+                        eval_const_expr_val_with_ctx(&args[1], params, Some(w), types).resize(w);
                     out.is_signed = false;
                     return out;
                 }
@@ -31321,7 +31467,7 @@ fn eval_const_expr_val_inner<P: ParamLookup>(
                 // context, as for a keyword type cast below.
                 if let Some((w, signed)) = const_typedef_cast_target(&nm, scoped.as_deref(), params)
                 {
-                    let v = eval_const_expr_val_ctx_inner(&args[1], params, w, types);
+                    let v = eval_const_expr_val_with_ctx(&args[1], params, Some(w), types);
                     if !v.is_real {
                         let mut out = v.resize(w);
                         out.is_signed = signed;
@@ -31342,7 +31488,7 @@ fn eval_const_expr_val_inner<P: ParamLookup>(
                     })
                 });
                 if let Some(w) = td.filter(|&w| w > 0 && is_context_operator(&args[1])) {
-                    let v = eval_const_expr_val_ctx_inner(&args[1], params, w, types);
+                    let v = eval_const_expr_val_with_ctx(&args[1], params, Some(w), types);
                     if !v.is_real {
                         return v.resize(w);
                     }
@@ -31369,7 +31515,7 @@ fn eval_const_expr_val_inner<P: ParamLookup>(
                     DataType::IntegerAtom { .. } | DataType::IntegerVector { .. }
                 );
                 let v = if integral {
-                    eval_const_expr_val_ctx_inner(&args[1], params, w, types)
+                    eval_const_expr_val_with_ctx(&args[1], params, Some(w), types)
                 } else {
                     eval_const_expr_val_inner(&args[1], params, types)
                 };
@@ -31909,25 +32055,12 @@ fn eval_const_expr_val_ctx(
     params: &HashMap<String, Value>,
     ctx_w: u32,
 ) -> Value {
-    eval_const_expr_val_ctx_inner(expr, params, ctx_w, &mut const_context::Types::default())
-}
-
-fn eval_const_expr_val_ctx_inner<P: ParamLookup>(
-    expr: &Expression,
-    params: &P,
-    ctx_w: u32,
-    types: &mut const_context::Types,
-) -> Value {
-    if is_context_operator(expr) {
-        let ty = const_context::infer(expr, params, types);
-        if ty.integral {
-            if let Some(value) = const_ctx_fold(expr, params, ctx_w.max(ty.width), ty.signed, types)
-            {
-                return value;
-            }
-        }
-    }
-    eval_const_expr_val_inner(expr, params, types)
+    eval_const_expr_val_with_ctx(
+        expr,
+        params,
+        Some(ctx_w),
+        &mut const_context::Types::default(),
+    )
 }
 
 /// Width and signing of the integral typedef a cast target `nm` (`scoped`

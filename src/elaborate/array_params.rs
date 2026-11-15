@@ -21,10 +21,10 @@ pub(super) fn default_value(name: &str) -> Option<Value> {
 fn remember_default(
     name: &str,
     data_type: &DataType,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     elab: &ElaboratedModule,
 ) {
-    let width = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    let width = resolve_type_width_env(data_type, Some(&params), Some(&elab.typedefs)).max(1);
     let mut value = if is_type_two_state_resolved(data_type, &elab.typedef_types) {
         Value::zero(width)
     } else {
@@ -34,28 +34,55 @@ fn remember_default(
     DEFAULTS.with(|values| values.borrow_mut().insert(name.to_string(), value));
 }
 
-/// An instance's local parameter environment lacks the names its module
-/// imports from a package (`import pkg::*; ... A [N]`). The elaboration-wide
-/// map has them, so resolve the declared shape against it, overlaid with the
-/// local environment, when the local environment alone does not.
-fn shape_params<'a>(
+/// Overlay `elab.parameters` beneath `params` (as `top` in `ParamEnv::Overlay`)
+/// when `params` alone cannot resolve the unpacked bounds (e.g. package-imported
+/// bounds like `import pkg::*; ... A [N]`), without cloning `elab.parameters`.
+struct ArrayShapeEnv<'a> {
+    base: &'a HashMap<String, Value>,
+    top: &'a dyn ParamLookup,
+}
+
+impl ParamLookup for ArrayShapeEnv<'_> {
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.top.get(key).or_else(|| self.base.get(key))
+    }
+    #[inline]
+    fn contains_key(&self, key: &str) -> bool {
+        self.top.contains_key(key) || self.base.contains_key(key)
+    }
+    fn keys(&self) -> crate::hasher::HashSet<&str> {
+        let mut set = self.top.keys();
+        set.extend(self.base.keys().map(String::as_str));
+        set
+    }
+    fn rows(&self) -> Vec<(&str, &Value)> {
+        let mut out = self.top.rows();
+        let seen: crate::hasher::HashSet<&str> = out.iter().map(|(k, _)| *k).collect();
+        for (k, v) in self.base {
+            if !seen.contains(k.as_str()) {
+                out.push((k.as_str(), v));
+            }
+        }
+        out
+    }
+    #[inline]
+    fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
+        Some(self.base)
+    }
+}
+
+fn needs_elab_fallback(
     elab: &ElaboratedModule,
     dims: &[UnpackedDimension],
-    params: &'a HashMap<String, Value>,
-) -> std::borrow::Cow<'a, HashMap<String, Value>> {
-    let local = normalize_unpacked_dims(dims, params, &elab.typedef_types);
-    if declared_unpacked_dims(&local, params).is_some() {
-        return std::borrow::Cow::Borrowed(params);
-    }
-    // When `params` already IS the elaboration-wide map (the caller passes
-    // `&elab.parameters` directly), merging it with itself is a no-op that
-    // would clone the whole table for nothing.
-    if std::ptr::eq(params, &elab.parameters) {
-        return std::borrow::Cow::Borrowed(params);
-    }
-    let mut merged = elab.parameters.clone();
-    merged.extend(params.iter().map(|(k, v)| (k.clone(), v.clone())));
-    std::borrow::Cow::Owned(merged)
+    params: &dyn ParamLookup,
+) -> bool {
+    let local = normalize_unpacked_dims_env(dims, params, &elab.typedef_types);
+    declared_unpacked_dims_env(&local, params).is_none()
+        && !std::ptr::eq(
+            params as *const dyn ParamLookup as *const (),
+            (&elab.parameters as &dyn ParamLookup) as *const dyn ParamLookup as *const (),
+        )
 }
 
 /// Share element folding with the instance-local parameter environment, so
@@ -67,14 +94,22 @@ pub(super) fn elements(
     init: Option<&Expression>,
     override_val: Option<&Value>,
     data_type: &DataType,
-    params: &HashMap<String, Value>,
-    init_params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
+    init_params: &dyn ParamLookup,
 ) -> Option<Vec<(String, Value)>> {
-    let shape_params = shape_params(elab, dims, params);
-    let params = &*shape_params;
+    let overlay;
+    let params: &dyn ParamLookup = if needs_elab_fallback(elab, dims, params) {
+        overlay = ArrayShapeEnv {
+            base: &elab.parameters,
+            top: params,
+        };
+        &overlay
+    } else {
+        params
+    };
     remember_default(name, data_type, params, elab);
-    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
-    let shape = declared_unpacked_dims(&dims, params)?;
+    let dims = normalize_unpacked_dims_env(dims, params, &elab.typedef_types);
+    let shape = declared_unpacked_dims_env(&dims, params)?;
     let &(left, right) = shape.first()?;
     // Keep the existing parameter-materialization limit before allocating
     // indices, including bounds whose signed difference would overflow.
@@ -98,14 +133,14 @@ pub(super) fn elements(
     );
     let items =
         init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, struct_elem, init_params));
-    let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    let elem_w = resolve_type_width_env(data_type, Some(&params), Some(&elab.typedefs)).max(1);
     // An initializer that names another unpacked-array parameter (`= pkg::A`)
     // evaluates to that array packed (see `packed`), so slice it like an
     // override.
     let referenced;
     let override_val = match (override_val, &items, init) {
         (None, None, Some(e)) => {
-            referenced = eval_const_expr_val(e, init_params);
+            referenced = eval_const_expr_val_env(e, &init_params);
             Some(&referenced)
         }
         (v, _, _) => v,
@@ -168,11 +203,11 @@ pub(super) fn elements(
                 &elab.typedefs,
                 &elab.typedef_types,
             )
-            .or_else(|| {
-                pack_packed_vector_pattern(data_type, item, init_params, &elab.typedef_types)
-            })
-            .map(|v| v.resize(elem_w))
-            .unwrap_or_else(|| eval_init_for_width(item, init_params, elem_w))
+                .or_else(|| {
+                    pack_packed_vector_pattern_env(data_type, item, init_params, &elab.typedef_types)
+                })
+                .map(|v| v.resize(elem_w))
+                .unwrap_or_else(|| eval_init_for_width(item, init_params, elem_w))
         };
         if !value.is_real {
             value.is_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
@@ -192,11 +227,11 @@ fn referenced_array_elements(
     name: &str,
     outer: &[i64],
     init: &Expression,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     elab: &ElaboratedModule,
 ) -> Option<Vec<(String, Value)>> {
     let mut keys = Vec::new();
-    super::const_index_base_keys(init, Some(params), &mut keys);
+    super::const_index_base_keys(init, Some(&params), &mut keys);
     for key in keys {
         let mut out = Vec::with_capacity(outer.len());
         let mut complete = true;
@@ -231,7 +266,7 @@ fn pattern_items(
     outer: &[i64],
     nested: bool,
     struct_elem: bool,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
 ) -> Option<Vec<Expression>> {
     let items = match &super::peel_unpacked_typed_pattern(e).kind {
         ExprKind::Concatenation(v) => return Some(v.clone()),
@@ -245,7 +280,7 @@ fn pattern_items(
         if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
             && let ExprKind::Replication { count, exprs } = &only.kind
         {
-            let reps = usize::try_from(const_eval_i64_with_params(count, Some(params))?).ok()?;
+            let reps = usize::try_from(const_eval_i64_with_params_env(count, Some(&params))?).ok()?;
             if reps.checked_mul(exprs.len())? > outer.len() {
                 return None;
             }
@@ -265,14 +300,18 @@ fn pattern_items(
     for it in items {
         match it {
             AssignmentPatternItem::Keyed(key, v) => {
-                let index =
-                    const_eval_pattern_index(key, Some(params), (*outer.first()?, *outer.last()?))?;
+                let index = const_eval_pattern_index_env(
+                    key,
+                    Some(&params),
+                    (*outer.first()?, *outer.last()?),
+                )?;
                 *slots.get_mut(outer.iter().position(|&i| i == index)?)? = Some(v);
             }
             // A bare identifier key (`'{K: v}`) parses as a member name; in
             // an array pattern it is a constant index.
             AssignmentPatternItem::Named(key, v) => {
-                let index = const_eval_i64_with_params(&make_ident_expr(&key.name), Some(params))?;
+                let index =
+                    const_eval_i64_with_params_env(&make_ident_expr(&key.name), Some(&params))?;
                 *slots.get_mut(outer.iter().position(|&i| i == index)?)? = Some(v);
             }
             AssignmentPatternItem::Default(v) => default = Some(v),
@@ -327,11 +366,19 @@ pub(super) fn compute(
     init: Option<&Expression>,
     override_val: Option<&Value>,
     data_type: &DataType,
-    params: &HashMap<String, Value>,
-    init_params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
+    init_params: &dyn ParamLookup,
 ) -> Option<RegisteredArray> {
-    let shape_params = shape_params(elab, dims, params);
-    let params = &*shape_params;
+    let overlay;
+    let params: &dyn ParamLookup = if needs_elab_fallback(elab, dims, params) {
+        overlay = ArrayShapeEnv {
+            base: &elab.parameters,
+            top: params,
+        };
+        &overlay
+    } else {
+        params
+    };
     remember_default(&format!("{prefix}{name}"), data_type, params, elab);
     let values = elements(
         elab,
@@ -343,11 +390,11 @@ pub(super) fn compute(
         params,
         init_params,
     )?;
-    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
-    let shape = declared_unpacked_dims(&dims, params)?;
-    let width = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    let dims = normalize_unpacked_dims_env(dims, params, &elab.typedef_types);
+    let shape = declared_unpacked_dims_env(&dims, params)?;
+    let width = resolve_type_width_env(data_type, Some(&params), Some(&elab.typedefs)).max(1);
     let full_name = format!("{prefix}{name}");
-    let fields = super::packed_struct_field_layout(
+    let fields = super::packed_struct_field_layout_env(
         data_type,
         params,
         &elab.typedefs,
@@ -430,8 +477,8 @@ pub(super) fn register(
     init: Option<&Expression>,
     override_val: Option<&Value>,
     data_type: &DataType,
-    params: &HashMap<String, Value>,
-    init_params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
+    init_params: &dyn ParamLookup,
 ) -> bool {
     let Some(registered) = compute(
         &*elab,
