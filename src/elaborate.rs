@@ -19980,6 +19980,14 @@ fn elaborate_items(
                                         }
                                     }
                                 }
+                            } else {
+                                // §7.2, §27: an unpacked struct declared in
+                                // a generate block is stored member by
+                                // member, as the module-scope arm stores
+                                // one. Left as a single vector, a 4-state
+                                // or handle member kept x through every
+                                // write (aionhw/xezim#1161).
+                                register_unpacked_aggregate(elab, &decl.name.name, &dd.data_type);
                             }
                         }
                     }
