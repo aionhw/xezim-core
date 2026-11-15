@@ -47855,6 +47855,76 @@ fn const_fn_call_name(func: &Expression) -> Option<(String, Option<String>)> {
     }
 }
 
+/// §13.4.3, §8.10, §13.8: a call of a static function of a class, possibly a
+/// specialization (`C#(PW)::id()`, `C::f(3)`), in a constant expression. The
+/// function is a parameterized function of §13.8: its body is evaluated as a
+/// constant function with the constants of the class (its parameters bound
+/// from the `#(...)` arguments, read in the calling scope) in view. None
+/// when `func` names no static function of a class, or it cannot be folded.
+fn const_class_static_call(
+    func: &Expression,
+    args: &[Expression],
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+    depth: u32,
+) -> Option<Value> {
+    let (base, method): (&Expression, &str) = match &func.kind {
+        ExprKind::MemberAccess { expr, member } => (expr, member.name.as_str()),
+        _ => return None,
+    };
+    let (scope, spec_args) = match &base.kind {
+        ExprKind::Specialization {
+            base: inner,
+            type_args_text,
+        } => (&**inner, parse_spec_args(type_args_text)),
+        _ => (base, Vec::new()),
+    };
+    let cls_name = match &scope.kind {
+        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+            h.path.last()?.name.name.as_str()
+        }
+        ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+        _ => return None,
+    };
+    let cls = elab.classes.get(cls_name)?;
+    let m = cls.methods.get(method)?;
+    let crate::ast::decl::ClassMethodKind::Function(fd) = &m.kind else {
+        return None;
+    };
+    if !m
+        .qualifiers
+        .iter()
+        .any(|q| matches!(q, crate::ast::decl::ClassQualifier::Static))
+    {
+        return None;
+    }
+    let mut env = params.clone();
+    let mut consts = Vec::new();
+    if class_spec_consts(cls_name, &spec_args, params, 0, &mut consts).is_some() {
+        env.extend(consts);
+    } else if !spec_args.is_empty() {
+        return None;
+    }
+    let mut argv = Vec::with_capacity(args.len());
+    for a in args {
+        let a = resolve_const_fn_cast_targets(a, params, elab);
+        if !const_fn_expr_supported(&a) {
+            return None;
+        }
+        let sa = substitute_const_fn_calls(&a, params, elab, depth)?;
+        if expr_has_call(&sa) {
+            return None;
+        }
+        argv.push(const_function_actual(
+            fd.ports.get(argv.len()),
+            &sa,
+            params,
+            elab,
+        ));
+    }
+    eval_const_user_function(fd, &argv, &env, elab, depth + 1)
+}
+
 /// Rewrite `expr`, replacing each call to a KNOWN simple user function with the
 /// literal it evaluates to (arguments const-evaluated against `params`).
 /// Returns None when a call can't be resolved — callers then fall back to
@@ -47876,6 +47946,9 @@ fn substitute_const_fn_calls(
             // MemberAccess{Ident(pkg), f} in inlined-submodule items (the
             // top-module path sees a flat 2-segment Ident) — both forms
             // resolve, preferring the package-qualified registration.
+            if let Some(v) = const_class_static_call(func, args, params, elab, depth) {
+                return const_value_literal(&v, expr.span);
+            }
             let (fname, scoped_key) = match &func.kind {
                 ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => const_fn_call_name(func)?,
                 other => {
