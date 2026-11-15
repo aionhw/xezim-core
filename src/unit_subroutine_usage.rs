@@ -129,6 +129,45 @@ impl Usage {
         usage
     }
 
+    /// §3.12.1 / §6.7 / §6.8: compilation-unit variables and nets, with the
+    /// unit storage each declarator's type, dimensions, delays and
+    /// initializer read. Qualified (`$unit::v`) and hierarchical spellings
+    /// count as uses.
+    pub(crate) fn storage(
+        variables: &[crate::ast::decl::DataDeclaration],
+        nets: &[crate::ast::decl::NetDeclaration],
+    ) -> Self {
+        let mut usage = Self {
+            names: variables
+                .iter()
+                .flat_map(|d| d.declarators.iter().map(|v| v.name.name.clone()))
+                .chain(
+                    nets.iter()
+                        .flat_map(|n| n.declarators.iter().map(|v| v.name.name.clone())),
+                )
+                .collect(),
+            deps: HashMap::default(),
+            qualified_components: true,
+        };
+        for d in variables {
+            for v in &d.declarators {
+                let refs = usage.references(&(&d.data_type, v));
+                usage.deps.entry(v.name.name.clone()).or_default().extend(refs);
+            }
+        }
+        for n in nets {
+            for v in &n.declarators {
+                let refs = usage.references(&(
+                    &n.data_type,
+                    (&n.delay, &n.delay_fall, &n.delay_off),
+                    v,
+                ));
+                usage.deps.entry(v.name.name.clone()).or_default().extend(refs);
+            }
+        }
+        usage
+    }
+
     pub(crate) fn references<T: Serialize + ?Sized>(&self, value: &T) -> HashSet<String> {
         let mut found = HashSet::default();
         if self.names.is_empty() {

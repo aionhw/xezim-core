@@ -2403,6 +2403,8 @@ fn parse_and_elaborate(
         && top_level_tasks.is_empty()
         && top_level_params.is_empty()
         && top_level_assertion_decls.is_empty()
+        && top_level_vars.is_empty()
+        && top_level_nets.is_empty()
     {
         None
     } else if let Some(name) = named_top {
@@ -2523,6 +2525,54 @@ fn parse_and_elaborate(
     let needed_unit_params = unit_param_usage.close(needed_unit_params);
     let needed_unit_assertions = unit_assertion_usage.close(needed_unit_assertions);
 
+    // §3.12.1 / §6.7 / §6.8 (#721): compilation-unit variables and nets are
+    // declarations of the unit, not of every module. A definition receives
+    // only the unit storage its own ports, parameters and items name, that
+    // the unit subroutines it receives read, or that a declaration injected
+    // into every definition (or a unit class, typedef, package, let or bind)
+    // names. Copying all of them into every definition cloned each
+    // declaration once per definition and created its signals and drivers
+    // once per instance. The carrier keeps all of them; with library
+    // modules, whose bodies are adopted later, every definition does.
+    let unit_storage_usage =
+        unit_subroutine_usage::Usage::storage(&top_level_vars, &top_level_nets);
+    let retain_all_storage = !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty();
+    let mut common_storage_refs = unit_storage_usage.references(&(
+        (&top_level_nettypes, &top_level_params, &top_level_covergroups),
+        (
+            &top_level_assertion_decls,
+            &top_level_dpi_imports,
+            &top_level_dpi_exports,
+        ),
+        (&top_level_lets, &top_level_binds, &top_level_ooc_constraints),
+        (&top_level_imports, &class_defs, &typedef_defs),
+    ));
+    if !(top_level_vars.is_empty() && top_level_nets.is_empty()) {
+        for def in definitions.values() {
+            let refs = match def {
+                SourceDefinition::Class(d) => unit_storage_usage.references(d),
+                SourceDefinition::Package(d) => unit_storage_usage.references(d),
+                SourceDefinition::Typedef(d) => unit_storage_usage.references(d),
+                SourceDefinition::Udp(d) => unit_storage_usage.references(d),
+                _ => continue,
+            };
+            common_storage_refs.extend(refs);
+        }
+    }
+    let unit_sub_storage_refs: std::collections::HashMap<String, crate::hasher::HashSet<String>> =
+        top_level_functions
+            .iter()
+            .filter(|f| !f.name.has_scope())
+            .map(|f| (f.name.name.name.clone(), unit_storage_usage.references(f)))
+            .chain(
+                top_level_tasks
+                    .iter()
+                    .filter(|t| !t.name.has_scope())
+                    .map(|t| (t.name.name.name.clone(), unit_storage_usage.references(t))),
+            )
+            .filter(|(_, refs)| !refs.is_empty())
+            .collect();
+
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
     if !top_level_functions.is_empty()
@@ -2582,6 +2632,23 @@ fn parse_and_elaborate(
                     let mut refs = unit_usage.references(&(ports, params, &*items));
                     refs.extend(common_unit_refs.iter().cloned());
                     Some(unit_usage.close(refs))
+                };
+                let needed_unit_storage = if retain_all || retain_all_storage {
+                    None
+                } else {
+                    let mut refs = unit_storage_usage.references(&(ports, params, &*items));
+                    refs.extend(common_storage_refs.iter().cloned());
+                    for sub in needed_unit_subs.iter().flatten() {
+                        if let Some(sub_refs) = unit_sub_storage_refs.get(sub) {
+                            refs.extend(sub_refs.iter().cloned());
+                        }
+                    }
+                    Some(unit_storage_usage.close(refs))
+                };
+                let storage_needed = |name: &str| {
+                    needed_unit_storage
+                        .as_ref()
+                        .is_none_or(|needed| needed.contains(name))
                 };
                 // What this module declares ITSELF, captured before anything is
                 // injected — a name in here shadows the $unit declaration of
@@ -2798,6 +2865,17 @@ fn parse_and_elaborate(
                 // reference resolves to; the module's own `gv` keeps the bare
                 // name, so the two no longer share one storage slot.
                 for d in top_level_vars.iter().rev() {
+                    let retained;
+                    let d = if d.declarators.iter().all(|v| storage_needed(&v.name.name)) {
+                        d
+                    } else if d.declarators.iter().any(|v| storage_needed(&v.name.name)) {
+                        let mut kept = d.clone();
+                        kept.declarators.retain(|v| storage_needed(&v.name.name));
+                        retained = kept;
+                        &retained
+                    } else {
+                        continue;
+                    };
                     if !d
                         .declarators
                         .iter()
@@ -2830,7 +2908,11 @@ fn parse_and_elaborate(
                 // §3.12.1: unit nets remain distinct from module-local
                 // declarations, and their driver expressions use unit scope.
                 for net in top_level_nets.iter().rev() {
+                    if !net.declarators.iter().any(|v| storage_needed(&v.name.name)) {
+                        continue;
+                    }
                     let mut net = net.clone();
+                    net.declarators.retain(|v| storage_needed(&v.name.name));
                     for decl in &mut net.declarators {
                         if local_decl_names.contains(&decl.name.name) {
                             decl.name.name = sv_parser::unit_scope_name(&decl.name.name);
