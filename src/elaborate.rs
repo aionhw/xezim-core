@@ -14420,7 +14420,9 @@ pub fn elaborate_module_with_defs(
                         ),
                         None => rhs.clone(),
                     };
-                    root_mark_hier_ca_rhs(lhs, &mut rhs_final);
+                    root_mark_hier_ca_rhs(lhs, &mut rhs_final, &|n| {
+                        elab.struct_members.contains_key(n)
+                    });
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
@@ -20322,7 +20324,9 @@ fn elaborate_items(
                         ),
                         None => rhs.clone(),
                     };
-                    root_mark_hier_ca_rhs(lhs, &mut rhs_final);
+                    root_mark_hier_ca_rhs(lhs, &mut rhs_final, &|n| {
+                        elab.struct_members.contains_key(n)
+                    });
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
@@ -45145,6 +45149,24 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // §23.3.3.8 (generalized): "The sign attribute shall not
+                    // cross hierarchy." The concat rule above is one instance;
+                    // an equal-width WHOLE-NET actual of the opposite sign
+                    // breaks substitution the same way. A signed `input int p`
+                    // bound to an UNSIGNED `logic [31:0] u` — or an unsigned
+                    // `input [31:0] p` bound to a SIGNED `int s` — must keep
+                    // its own storage so the connection assign converts the
+                    // bits through the FORMAL's sign; renaming the formal onto
+                    // the actual reads the actual's bits with the actual's sign
+                    // and the sign flip silently stops (`q = p` then zero- vs
+                    // sign-extended the wrong way).
+                    if is_input
+                        && let Some(n) = whole_net_ident_name(actual)
+                        && let Some(asig) = elab.signals.get(&n)
+                        && asig.is_signed != formal_signed
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     // §7.4.1: a packed multi-D formal indexes by its OWN
                     // element stride. Substituting the actual makes `p[i]`
                     // index the actual instead, so the stride silently becomes
@@ -49487,7 +49509,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             lhs: mlhs.clone(),
                             rhs: mrhs.clone(),
                             delay,
-                            rhs_parent_scoped: false,
+                            rhs_parent_scoped: true,
                             delay_fall: None,
                             delay_off: None,
                         };
@@ -49513,7 +49535,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         lhs: mlhs,
                         rhs: mrhs,
                         delay,
-                        rhs_parent_scoped: false,
+                        rhs_parent_scoped: true,
                         delay_fall: None,
                         delay_off: None,
                     });
@@ -49529,7 +49551,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     lhs: make_net_lhs_expr(lhs),
                     rhs,
                     delay,
-                    rhs_parent_scoped: false,
+                    rhs_parent_scoped: true,
                     delay_fall: None,
                     delay_off: None,
                 })
@@ -51641,7 +51663,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
                 span,
             ),
             delay: 0,
-            rhs_parent_scoped: false,
+            rhs_parent_scoped: true,
             delay_fall: None,
             delay_off: None,
         });
@@ -51652,7 +51674,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
             lhs: term_b,
             rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
             delay: 0,
-            rhs_parent_scoped: false,
+            rhs_parent_scoped: true,
             delay_fall: None,
             delay_off: None,
         });
@@ -52972,21 +52994,47 @@ fn tri_port_select_pull(
 /// had no deep twin worked — the asymmetry that hid this). Root-mark the
 /// RHS so its names resolve absolutely (top-level lexical names ARE the
 /// absolute names); anything unresolvable falls through to the normal path.
-fn root_mark_hier_ca_rhs(lhs: &Expression, rhs: &mut Expression) {
-    fn hier_lhs(e: &Expression) -> bool {
+///
+/// `is_struct` tells whether a FIRST-IDENTIFIER name is a struct-typed data
+/// variable (a member access on it is a record read, NOT a scope descent; the
+/// netlist registers module instances as signals typed by their definition
+/// name, which never appears here). A continuous assign whose LHS passes
+/// through a member-access on a NON-struct base targets a foreign (instance /
+/// generate) scope, whose RHS names are lexical to the WRITING scope — so
+/// they must be rooted. This is the `assign l.n = n`/`assign bif.vec = ~vec`/
+/// `assign ga[0].lpg.v = ~v` form that parsed as a bare-ident MemberAccess
+/// and was invisible to the multi-segment check. A struct-member write
+/// (`assign s.b = x`) leaves the first identifier a struct, so it stays
+/// un-rooted (its RHS is the same scope).
+fn root_mark_hier_ca_rhs(
+    lhs: &Expression,
+    rhs: &mut Expression,
+    is_struct: &dyn Fn(&str) -> bool,
+) {
+    /// `crossed_member` tracks whether the LHS reached the first identifier
+    /// THROUGH a member access (`a.b`, `gen[0].sig`). A bare index (`arr[2]`)
+    /// writes a data element, not a scope, and must never root its RHS.
+    fn hier_lhs(e: &Expression, is_struct: &dyn Fn(&str) -> bool, crossed_member: bool) -> bool {
         match &e.kind {
             ExprKind::Ident(h) => {
-                h.path.len() > 1 || h.path.first().is_some_and(|s| s.name.name.contains('.'))
+                h.path.len() > 1
+                    || h.path.first().is_some_and(|s| s.name.name.contains('.'))
+                    // A member access on a bare identifier that is NOT a
+                    // struct variable reaches into an instance / generate
+                    // scope, so the RHS is the writer's scope.
+                    || (crossed_member
+                        && h.path.first().is_some_and(|s| !is_struct(&s.name.name)))
             }
             // `tb.uut.u_core.sig = x` parses the LHS as a MemberAccess chain,
             // not a multi-segment Ident.
-            ExprKind::MemberAccess { expr, .. }
-            | ExprKind::Index { expr, .. }
-            | ExprKind::RangeSelect { expr, .. } => hier_lhs(expr),
+            ExprKind::MemberAccess { expr, .. } => hier_lhs(expr, is_struct, true),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                hier_lhs(expr, is_struct, crossed_member)
+            }
             _ => false,
         }
     }
-    if hier_lhs(lhs) {
+    if hier_lhs(lhs, is_struct, false) {
         mark_actual_rooted(rhs);
     }
 }
