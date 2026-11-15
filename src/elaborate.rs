@@ -37924,6 +37924,20 @@ fn prepare_module_items(
         }
     }
 
+    // §23.9, §27.5 (aionhw/xezim#1110): a generate block of this module is
+    // a scope of it, as a child instance is: `h.a` in the module body names
+    // this instance's `h.a`, not a same-named block of the top module. The
+    // block's declarations arrive renamed (`h.a`, `g[0].x`); the path's head
+    // takes the instance prefix as well.
+    let gen_heads: Vec<String> = local_names
+        .iter()
+        .filter_map(|n| {
+            let (head, _) = n.split_once('.')?;
+            let base = head.split_once('[').map_or(head, |(b, _)| b);
+            (!base.is_empty() && !base.starts_with('\\')).then(|| base.to_string())
+        })
+        .collect();
+    local_names.extend(gen_heads);
     // §23.8: `<own definition name>.x` in a continuous assign is this
     // instance's `x`.
     // A local declaration of that name would be what the head names instead.
