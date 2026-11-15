@@ -220,7 +220,10 @@ pub use value::Value;
 /// \x42 = \x41 + a child module's paths into its own generate blocks take the instance prefix (§23.9, §27.5).
 ///         Also covers typed constant-expression results, typed assignment-pattern keys, package typedef
 ///         ranges and instance-qualified class specialization arguments (§11.8.1, §10.9.1, §26.3, §8.25).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x42";
+/// \x43 = \x42 + an unpacked struct in a generate block stored member by member, class static functions
+///         folded in parameter initializers, and the declared type of named packed array ports
+///         (§7.2, §13.8, §7.4.1).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x43";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
