@@ -3830,7 +3830,7 @@ pub struct ElaboratedModule {
     /// `resolve_multi_driver_nets` (which picks the fold function) and by the
     /// tri0/tri1 pull driver below.
     #[serde(default)]
-    pub resolved_net_kinds: HashMap<String, ResolvedNetKind>,
+    pub resolved_net_kinds: crate::shared_names::SharedNameMap<ResolvedNetKind>,
     /// §28.16 primitive fall delays, keyed by the driven signal (the private
     /// driver stage where a net's drivers were split). This map also lets
     /// the runtime apply primitive delay-mode overrides. Only differing
@@ -3954,7 +3954,7 @@ pub struct ElaboratedModule {
     pub packed_full_dims: HashMap<String, Vec<(i64, i64)>>,
     /// §6.9.1 / §10.3.3: declared vector net shape, including equal bounds.
     /// Keyed by final flat net name; independent of array query/select tables.
-    pub vector_nets: HashSet<String>,
+    pub vector_nets: crate::shared_names::SharedNameSet,
     /// Signals declared as `string` (LRM §6.16). The bytecode compiler
     /// consults this so that `{a, b}` concatenations involving any
     /// string-typed operand bail to the AST interpreter — the bit-concat
@@ -4030,7 +4030,7 @@ pub struct ElaboratedModule {
     /// Names declared as nets (wire, supply0/1, tri, etc). Variables are everything else.
     /// Used to enforce §6.5 driver-conflict rules only against variables.
     #[serde(default)]
-    pub nets: HashSet<String>,
+    pub nets: crate::shared_names::SharedNameSet,
     /// Subset of `nets` that §6.10 created IMPLICITLY (referenced but never
     /// declared). `--primitive-verbose` flags UDP terminals landing on one of
     /// these — the classic signature of a dropped/unresolved vendor cell.
@@ -4467,7 +4467,7 @@ impl ElaboratedModule {
             specify_delays: HashMap::default(),
             module_paths: HashMap::default(),
             timing_checks: Vec::new(),
-            resolved_net_kinds: HashMap::default(),
+            resolved_net_kinds: Default::default(),
             gate_fall_delays: HashMap::default(),
             gate_driven_nets: HashSet::default(),
             assoc_defaults: HashMap::default(),
@@ -4495,7 +4495,7 @@ impl ElaboratedModule {
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
             packed_full_dims: HashMap::default(),
-            vector_nets: HashSet::default(),
+            vector_nets: Default::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
             class_type_args: HashMap::default(),
@@ -4509,7 +4509,7 @@ impl ElaboratedModule {
             coll_shapes: HashMap::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
-            nets: HashSet::default(),
+            nets: Default::default(),
             implicit_nets: HashSet::default(),
             interconnect_nets: HashSet::default(),
             elab_diagnostics: Vec::new(),

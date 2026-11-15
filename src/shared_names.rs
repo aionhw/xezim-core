@@ -401,6 +401,81 @@ impl<V> IntoIterator for SharedNameMap<V> {
     }
 }
 
+/// Deterministic set of shared names with the borrowed String-key API of a
+/// `HashSet<String>`. Serde keeps the ordinary set representation, so an
+/// encoded set is the same bytes as before.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SharedNameSet(crate::hasher::HashSet<SharedName>);
+
+impl SharedNameSet {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub fn contains<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> bool
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.0.contains(key)
+    }
+    pub fn remove<Q: ?Sized + Hash + Eq>(&mut self, key: &Q) -> bool
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.0.remove(key)
+    }
+    pub fn insert<K: Into<SharedName>>(&mut self, key: K) -> bool {
+        self.0.insert(key.into())
+    }
+    pub fn retain(&mut self, mut predicate: impl FnMut(&String) -> bool) {
+        self.0.retain(|key| predicate(key));
+    }
+    pub fn iter(&self) -> SetIter<'_> {
+        SetIter(self.0.iter())
+    }
+}
+impl<K: Into<SharedName>> Extend<K> for SharedNameSet {
+    fn extend<T: IntoIterator<Item = K>>(&mut self, iter: T) {
+        self.0.extend(iter.into_iter().map(Into::into));
+    }
+}
+impl<K: Into<SharedName>> FromIterator<K> for SharedNameSet {
+    fn from_iter<T: IntoIterator<Item = K>>(iter: T) -> Self {
+        let mut set = Self::default();
+        set.extend(iter);
+        set
+    }
+}
+pub struct SetIter<'a>(std::collections::hash_set::Iter<'a, SharedName>);
+impl<'a> Iterator for SetIter<'a> {
+    type Item = &'a String;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|k| &**k)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+impl ExactSizeIterator for SetIter<'_> {}
+impl Clone for SetIter<'_> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<'a> IntoIterator for &'a SharedNameSet {
+    type Item = &'a String;
+    type IntoIter = SetIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
