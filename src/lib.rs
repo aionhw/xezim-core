@@ -218,6 +218,8 @@ pub use value::Value;
 /// \x40 = \x3f + corrected constant real math and signature parameter types (§11.2.1, §6.20.2).
 /// \x41 = \x40 + constant operand contexts, typed function storage and unit parameter scope (§11.8.2, §13.4.1, §3.12.1).
 /// \x42 = \x41 + a child module's paths into its own generate blocks take the instance prefix (§23.9, §27.5).
+///         Also covers typed constant-expression results, typed assignment-pattern keys, package typedef
+///         ranges and instance-qualified class specialization arguments (§11.8.1, §10.9.1, §26.3, §8.25).
 pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x42";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
