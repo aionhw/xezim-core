@@ -8237,6 +8237,11 @@ fn check_module_use_before_decl(
                         declarators,
                         data_type,
                         ..
+                    }
+                    | StatementKind::ParamDecl {
+                        declarators,
+                        data_type,
+                        ..
                     } => {
                         for d in declarators {
                             inner.locals.insert(d.name.name.clone());
@@ -8284,6 +8289,11 @@ fn check_module_use_before_decl(
                     self.expr(rvalue, scope);
                 }
                 K::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                }
+                | K::ParamDecl {
                     data_type,
                     declarators,
                     ..
@@ -14998,15 +15008,22 @@ fn validate_enum_assignments(elab: &ElaboratedModule) -> Result<(), String> {
     fn declarations(stmts: &[Statement], elab: &ElaboratedModule) -> Scope {
         let mut scope = Scope::default();
         for stmt in stmts {
-            if let StatementKind::VarDecl {
-                data_type,
-                declarators,
-                ..
-            } = &stmt.kind
-            {
-                for decl in declarators {
-                    bind(&mut scope, &decl.name.name, data_type, elab);
+            match &stmt.kind {
+                StatementKind::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
                 }
+                | StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => {
+                    for decl in declarators {
+                        bind(&mut scope, &decl.name.name, data_type, elab);
+                    }
+                }
+                _ => {}
             }
         }
         scope
@@ -17716,7 +17733,8 @@ fn validate_stmt_idents(
         StatementKind::Return(Some(expr)) => {
             validate_expr_idents(expr, elab, locals)?;
         }
-        StatementKind::VarDecl { declarators, .. } => {
+        StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } => {
             for d in declarators {
                 if let Some(init) = &d.init {
                     validate_expr_idents(init, elab, locals)?;
@@ -21114,7 +21132,8 @@ fn scope_time_stmt(stmt: &mut Statement, u: i32, p: i32) {
         StatementKind::BlockingAssign { rvalue, .. }
         | StatementKind::NonblockingAssign { rvalue, .. } => scope_time_expr(rvalue, u, p),
         StatementKind::Return(Some(e)) => scope_time_expr(e, u, p),
-        StatementKind::VarDecl { declarators, .. } => {
+        StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } => {
             for d in declarators.iter_mut() {
                 if let Some(init) = d.init.as_mut() {
                     scope_time_expr(init, u, p);
@@ -21699,6 +21718,11 @@ fn lsdd_may_fold_decl(s: &Statement) -> bool {
             data_type,
             declarators,
             ..
+        }
+        | StatementKind::ParamDecl {
+            data_type,
+            declarators,
+            ..
         } => {
             lsdd_may_fold_type(data_type)
                 || declarators.iter().any(|d| {
@@ -21775,12 +21799,9 @@ fn lsdd_body(
 
 /// Fold one lexical scope, having first bound what the scope itself declares.
 ///
-/// §6.20.4: a block-scope `localparam` lowers to a plain `VarDecl` with a
-/// constant initializer, so it is the only thing that can legally size a
-/// declaration in that block — and it SHADOWS a module parameter of the same
-/// name. A declaration whose initializer is not constant un-binds the name
-/// instead, which stops the enclosing parameter from being folded in where the
-/// source never meant it.
+/// §6.20.4: a block-scope `localparam`/`parameter` shadows any outer parameter
+/// of the same name for sizing declarations in that block; a `VarDecl` un-binds
+/// the name so an enclosing parameter is not folded in where a variable shadows it.
 ///
 /// Bindings are pushed and popped on one map (rather than cloning it per
 /// block) because this walks every statement of every module.
@@ -21791,24 +21812,33 @@ fn lsdd_scope(
 ) {
     let mut saved: Vec<(String, Option<Value>)> = Vec::new();
     for s in stmts.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
-            for d in declarators {
-                let cv = d
-                    .init
-                    .as_ref()
-                    .and_then(|i| const_eval_i64_with_params(i, Some(env)));
-                saved.push((d.name.name.clone(), env.get(&d.name.name).cloned()));
-                match cv {
-                    Some(v) => {
-                        let mut val = Value::from_u64(v as u64, 64);
-                        val.is_signed = true;
-                        env.insert(d.name.name.clone(), val);
-                    }
-                    None => {
-                        env.remove(&d.name.name);
+        match &s.kind {
+            StatementKind::ParamDecl { declarators, .. } => {
+                for d in declarators {
+                    let cv = d
+                        .init
+                        .as_ref()
+                        .and_then(|i| const_eval_i64_with_params(i, Some(env)));
+                    saved.push((d.name.name.clone(), env.get(&d.name.name).cloned()));
+                    match cv {
+                        Some(v) => {
+                            let mut val = Value::from_u64(v as u64, 64);
+                            val.is_signed = true;
+                            env.insert(d.name.name.clone(), val);
+                        }
+                        None => {
+                            env.remove(&d.name.name);
+                        }
                     }
                 }
             }
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    saved.push((d.name.name.clone(), env.get(&d.name.name).cloned()));
+                    env.remove(&d.name.name);
+                }
+            }
+            _ => {}
         }
     }
     for s in stmts.iter_mut() {
@@ -21829,6 +21859,11 @@ fn lsdd_scope(
 fn lsdd_stmt(s: &mut Statement, env: &mut HashMap<String, Value>, tds: &HashMap<String, DataType>) {
     match &mut s.kind {
         StatementKind::VarDecl {
+            data_type,
+            declarators,
+            ..
+        }
+        | StatementKind::ParamDecl {
             data_type,
             declarators,
             ..
@@ -23051,7 +23086,7 @@ pub fn is_type_signed_resolved(dt: &DataType, typedef_types: &HashMap<String, Da
 /// self-determined width, the old signed default for them would turn
 /// `UP + SP` (8-bit, one operand unsigned) into -6 instead of 250. Any other
 /// shape keeps the signed default.
-fn untyped_param_is_signed(init: &Expression, params: &HashMap<String, Value>) -> bool {
+pub fn untyped_param_is_signed(init: &Expression, params: &HashMap<String, Value>) -> bool {
     let s = |x: &Expression| untyped_param_is_signed(x, params);
     let lookup = |name: &str| params.get(name).filter(|v| !v.is_real).map(|v| v.is_signed);
     match &init.kind {
@@ -32349,7 +32384,7 @@ pub fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
             }
         }
         K::Return(Some(e)) => f(e),
-        K::VarDecl { declarators, .. } => {
+        K::VarDecl { declarators, .. } | K::ParamDecl { declarators, .. } => {
             for d in declarators {
                 if let Some(i) = &d.init {
                     f(i);
@@ -33144,6 +33179,11 @@ fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
             data_type,
             declarators,
             ..
+        }
+        | K::ParamDecl {
+            data_type,
+            declarators,
+            ..
         } => {
             for d in declarators {
                 out.insert(d.name.name.clone());
@@ -33412,6 +33452,11 @@ fn collect_stmt_declared_types(
             }
         }
         StatementKind::VarDecl {
+            data_type,
+            declarators,
+            ..
+        }
+        | StatementKind::ParamDecl {
             data_type,
             declarators,
             ..
@@ -39676,7 +39721,7 @@ fn scope_local_decl_types(stmts: &mut [Statement], rename: &dyn Fn(&DataType) ->
 
 fn scope_local_decl_types_in(s: &mut Statement, rename: &dyn Fn(&DataType) -> Option<DataType>) {
     match &mut s.kind {
-        StatementKind::VarDecl { data_type, .. } => {
+        StatementKind::VarDecl { data_type, .. } | StatementKind::ParamDecl { data_type, .. } => {
             if let Some(dt) = rename(data_type) {
                 *data_type = dt;
             }
@@ -47588,6 +47633,11 @@ fn eval_const_user_function<P: ParamLookup>(
                     data_type,
                     declarators,
                     ..
+                }
+                | SK::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
                 } => {
                     for d in declarators {
                         layouts.bind(&d.name.name, data_type, geom, elab);
@@ -47828,32 +47878,47 @@ fn eval_const_user_function<P: ParamLookup>(
             }
             SK::VarDecl {
                 data_type,
-                lifetime,
+                declarators,
+                ..
+            } => {
+                let storage = declared_storage(data_type, geom, elab)?;
+                for d in declarators {
+                    let v = match &d.init {
+                        Some(e) => eval_for_storage(e, &storage, locals, elab, depth)?,
+                        None => storage.clone(),
+                    };
+                    locals.insert(d.name.name.clone(), v);
+                }
+                Some(Flow::Normal)
+            }
+            SK::ParamDecl {
+                data_type,
                 declarators,
                 ..
             } => {
                 // §6.20.2: an UNTYPED block-scope `localparam`/`parameter`
-                // takes the type of its initializer (self-determined), NOT
-                // the parser's 32-bit `int` placeholder or the 1-bit implicit
-                // `logic`. The parser marks such a decl `Static`+`Implicit`;
-                // a genuine `var`/`static var` keeps its 1-bit type. Evaluate
-                // the initializer with no storage-width context so `Q =
-                // 4'd0-4'd1` stays 4-bit 15 instead of folding to 32'hffffffff.
-                let self_determined = {
-                    matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
-                        && matches!(
-                            data_type,
-                            crate::ast::types::DataType::Implicit {
-                                dimensions, ..
-                            } if dimensions.is_empty()
-                        )
-                };
-                if self_determined {
+                // takes the type and self-determined width of each
+                // declarator's initializer (so `A = 1.5, B = 2` keeps A real
+                // and B 32-bit int, and `Q = 4'd0 - 4'd1` stays 4-bit 15).
+                if let crate::ast::types::DataType::Implicit {
+                    signing,
+                    dimensions,
+                    ..
+                } = data_type
+                    && dimensions.is_empty()
+                {
                     for d in declarators {
-                        let v = match &d.init {
+                        let mut v = match &d.init {
                             Some(e) => eval_fn_expr(e, locals, elab, depth)?,
                             None => Value::zero(32),
                         };
+                        if !v.is_real {
+                            match signing {
+                                Some(crate::ast::types::Signing::Signed) => v.is_signed = true,
+                                Some(crate::ast::types::Signing::Unsigned) => v.is_signed = false,
+                                None => {}
+                            }
+                        }
                         locals.insert(d.name.name.clone(), v);
                     }
                 } else {
@@ -55037,6 +55102,24 @@ fn substitute_type_params_stmts(
 /// rewritten (to the full resolved concrete DataType); everything else passes
 /// through untouched, recursing into compound statements. No-op (identity,
 /// no clone churn beyond the move) when the binding map is empty.
+fn subst_type_param_dt(data_type: DataType, binds: &HashMap<String, DataType>) -> DataType {
+    match &data_type {
+        DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } if dimensions.is_empty()
+            && type_args.is_empty()
+            && name.scopes.is_empty()
+            && binds.contains_key(&name.name.name) =>
+        {
+            binds[&name.name.name].clone()
+        }
+        _ => data_type,
+    }
+}
+
 fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType>) -> Statement {
     if binds.is_empty() {
         return stmt;
@@ -55048,28 +55131,20 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
             data_type,
             lifetime,
             declarators,
-        } => {
-            let data_type = match &data_type {
-                DataType::TypeReference {
-                    name,
-                    dimensions,
-                    type_args,
-                    ..
-                } if dimensions.is_empty()
-                    && type_args.is_empty()
-                    && name.scopes.is_empty()
-                    && binds.contains_key(&name.name.name) =>
-                {
-                    binds[&name.name.name].clone()
-                }
-                _ => data_type,
-            };
-            StatementKind::VarDecl {
-                data_type,
-                lifetime,
-                declarators,
-            }
-        }
+        } => StatementKind::VarDecl {
+            data_type: subst_type_param_dt(data_type, binds),
+            lifetime,
+            declarators,
+        },
+        StatementKind::ParamDecl {
+            is_local,
+            data_type,
+            declarators,
+        } => StatementKind::ParamDecl {
+            is_local,
+            data_type: subst_type_param_dt(data_type, binds),
+            declarators,
+        },
         StatementKind::If {
             unique_priority,
             condition,
@@ -55320,7 +55395,9 @@ pub fn rename_process_shadowed_locals(
     let mut map: HashMap<String, Expression> = HashMap::default();
     let mut renames: HashMap<String, String> = HashMap::default();
     for s in stmts.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &s.kind
+        {
             for d in declarators {
                 if module_names.contains(&d.name.name) && !renames.contains_key(&d.name.name) {
                     let fresh = match label {
@@ -55364,7 +55441,10 @@ pub fn rename_process_shadowed_locals(
         top: bool,
     ) {
         match &s.kind {
-            StatementKind::VarDecl { declarators, .. } if !top => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. }
+                if !top =>
+            {
                 for d in declarators {
                     if names.contains_key(&d.name.name) {
                         hits.push(d.name.name.clone());
@@ -55408,7 +55488,7 @@ pub fn rename_process_shadowed_locals(
     let mut hits: Vec<String> = Vec::new();
     for s in stmts.iter() {
         match &s.kind {
-            StatementKind::VarDecl { .. } => {}
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. } => {}
             _ => nested_redeclares(s, &renames, &mut hits, false),
         }
     }
@@ -55435,6 +55515,11 @@ pub fn rename_process_shadowed_locals(
         let interfaces = HashMap::default();
         match &mut stmt.kind {
             StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | StatementKind::ParamDecl {
                 data_type,
                 declarators,
                 ..
@@ -55506,7 +55591,9 @@ pub fn rename_process_shadowed_locals(
 fn stmt_list_declared_names(stmts: &[Statement]) -> Vec<&str> {
     let mut out = Vec::new();
     for st in stmts {
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             for d in declarators {
                 out.push(d.name.name.as_str());
             }
@@ -55554,7 +55641,8 @@ fn rewrite_stmt_list_scoped(
         stmts
             .iter()
             .filter_map(|st| match &st.kind {
-                StatementKind::VarDecl { declarators, .. } => Some(declarators),
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => Some(declarators),
                 _ => None,
             })
             .flatten()
@@ -55566,7 +55654,9 @@ fn rewrite_stmt_list_scoped(
         let names = cur.as_ref().unwrap_or(local_names);
         let ports = cur_ports.as_ref().unwrap_or(port_map);
         out.push(rewrite_stmt(st, prefix, ports, names, interface_map));
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             if let Some(reduced) =
                 without_declared(names, declarators.iter().map(|d| d.name.name.as_str()))
             {
@@ -55603,6 +55693,32 @@ fn without_declared<'a>(
         }
     }
     reduced
+}
+
+fn rewrite_decl_list(
+    declarators: &[crate::ast::stmt::VarDeclarator],
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<crate::ast::stmt::VarDeclarator> {
+    let renaming = gen_renames_local_types(prefix);
+    declarators
+        .iter()
+        .map(|d| crate::ast::stmt::VarDeclarator {
+            decl: d.decl,
+            name: d.name.clone(),
+            dimensions: match renaming {
+                true => with_gen_part(local_type_takes, || gen_dims(&d.dimensions)),
+                false => d.dimensions.clone(),
+            },
+            init: d
+                .init
+                .as_ref()
+                .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+            span: d.span,
+        })
+        .collect()
 }
 
 fn rewrite_stmt(
@@ -55862,30 +55978,20 @@ fn rewrite_stmt(
             data_type,
             lifetime,
             declarators,
-        } => {
-            let renaming = gen_renames_local_types(prefix);
-            let data_type = rewrite_local_type(data_type, prefix, port_map);
-            StatementKind::VarDecl {
-                data_type,
-                lifetime: *lifetime,
-                declarators: declarators
-                    .iter()
-                    .map(|d| crate::ast::stmt::VarDeclarator {
-                        decl: d.decl,
-                        name: d.name.clone(),
-                        dimensions: match renaming {
-                            true => with_gen_part(local_type_takes, || gen_dims(&d.dimensions)),
-                            false => d.dimensions.clone(),
-                        },
-                        init: d
-                            .init
-                            .as_ref()
-                            .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
-                        span: d.span,
-                    })
-                    .collect(),
-            }
-        }
+        } => StatementKind::VarDecl {
+            data_type: rewrite_local_type(data_type, prefix, port_map),
+            lifetime: *lifetime,
+            declarators: rewrite_decl_list(declarators, prefix, port_map, local_names, interface_map),
+        },
+        StatementKind::ParamDecl {
+            is_local,
+            data_type,
+            declarators,
+        } => StatementKind::ParamDecl {
+            is_local: *is_local,
+            data_type: rewrite_local_type(data_type, prefix, port_map),
+            declarators: rewrite_decl_list(declarators, prefix, port_map, local_names, interface_map),
+        },
         // A process-local typedef's type reads as a local's does.
         StatementKind::Typedef(td) if prefix.is_empty() => {
             let mut td = td.clone();
@@ -58459,7 +58565,7 @@ mod prepared_callable_ownership_tests {
                     assert!(!Arc::ptr_eq(&source_body, &body), "{wrapper}");
                     fn declared_width(s: &Statement) -> Option<u32> {
                         match &s.kind {
-                            StatementKind::VarDecl { data_type, .. } => {
+                            StatementKind::VarDecl { data_type, .. } | StatementKind::ParamDecl { data_type, .. } => {
                                 Some(resolve_type_width(data_type, None, None))
                             }
                             StatementKind::Typedef(td) => {

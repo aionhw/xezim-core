@@ -123,6 +123,11 @@ fn stmt(st: &Statement, elab: &ElaboratedModule, names: &mut Vec<String>) -> Opt
             data_type,
             declarators,
             ..
+        }
+        | SK::ParamDecl {
+            data_type,
+            declarators,
+            ..
         } => {
             if !literal_type(data_type) {
                 return None;

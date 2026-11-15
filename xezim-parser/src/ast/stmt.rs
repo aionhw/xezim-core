@@ -222,6 +222,13 @@ pub enum StatementKind {
         idx: u32,
         span: Span,
     },
+    /// §6.20: block-scope `parameter` / `localparam` declaration. Appended
+    /// LAST so existing bincode variant discriminants stay stable.
+    ParamDecl {
+        is_local: bool,
+        data_type: DataType,
+        declarators: Vec<VarDeclarator>,
+    },
 }
 
 #[derive(Debug, Clone)]

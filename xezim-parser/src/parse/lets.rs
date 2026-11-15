@@ -51,7 +51,9 @@ impl Parser {
         if self.let_live == 0 {
             return;
         }
-        if let crate::ast::stmt::StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let crate::ast::stmt::StatementKind::VarDecl { declarators, .. }
+        | crate::ast::stmt::StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             for d in declarators {
                 self.hide_let_name(&d.name.name);
             }

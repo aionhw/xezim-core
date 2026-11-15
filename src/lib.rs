@@ -2716,10 +2716,14 @@ fn parse_and_elaborate(
                         map.remove(&p.name.name);
                     }
                     for it in items {
-                        if let ast::stmt::StatementKind::VarDecl { declarators, .. } = &it.kind {
-                            for d in declarators {
-                                map.remove(&d.name.name);
+                        match &it.kind {
+                            ast::stmt::StatementKind::VarDecl { declarators, .. }
+                            | ast::stmt::StatementKind::ParamDecl { declarators, .. } => {
+                                for d in declarators {
+                                    map.remove(&d.name.name);
+                                }
                             }
+                            _ => {}
                         }
                     }
                     if map.is_empty() {

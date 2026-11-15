@@ -752,7 +752,9 @@ impl Parser {
         let mut decls: Vec<(&Identifier, Option<(usize, usize)>)> =
             body_ports.iter().map(|p| (&p.name, None)).collect();
         for (si, it) in items.iter().enumerate() {
-            if let StatementKind::VarDecl { declarators, .. } = &it.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &it.kind
+            {
                 decls.extend(
                     declarators
                         .iter()
@@ -808,7 +810,9 @@ impl Parser {
         items.retain_mut(|it| {
             let here = si;
             si += 1;
-            let StatementKind::VarDecl { declarators, .. } = &mut it.kind else {
+            let (StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. }) = &mut it.kind
+            else {
                 return true;
             };
             let mut di = 0;

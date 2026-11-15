@@ -92,8 +92,7 @@ impl Parser {
                 self.parse_case_statement()
             }
             TokenKind::KwParameter | TokenKind::KwLocalparam => {
-                // Local `parameter`/`localparam` inside a procedural block is
-                // semantically equivalent to a const var decl with an init.
+                let is_local = self.at(TokenKind::KwLocalparam);
                 let decl = self.parse_parameter_decl_stmt();
                 let span = self.span_from(start);
                 if let crate::ast::decl::ParameterKind::Data {
@@ -101,48 +100,6 @@ impl Parser {
                     assignments,
                 } = decl.kind
                 {
-                    // §6.20.2: an UNTYPED local `localparam`/`parameter` is
-                    // SELF-DETERMINED from its initializer — NOT the 1-bit that
-                    // an implicit `logic` resolves to (which truncates
-                    // `localparam Q = 24;` to 0). Infer a concrete type from
-                    // the first init: a real literal → real, a string → string,
-                    // otherwise a 32-bit signed integer. (A genuine `var v =
-                    // 24;` keeps its 1-bit `logic` type — this only rewrites the
-                    // localparam/parameter path, where the identity is known.)
-                    let is_implicit_untyped = matches!(
-                        &data_type,
-                        crate::ast::types::DataType::Implicit { dimensions, .. }
-                            if dimensions.is_empty()
-                    );
-                    let data_type = if is_implicit_untyped {
-                        use crate::ast::expr::{ExprKind, NumberLiteral};
-                        let init0 = assignments.first().and_then(|a| a.init.as_ref());
-                        match init0.map(|e| &e.kind) {
-                            Some(ExprKind::Number(NumberLiteral::Real(_))) => {
-                                crate::ast::types::DataType::Real {
-                                    kind: crate::ast::types::RealType::Real,
-                                    span,
-                                }
-                            }
-                            Some(ExprKind::StringLiteral(_)) => {
-                                crate::ast::types::DataType::Simple {
-                                    kind: crate::ast::types::SimpleType::String,
-                                    span,
-                                }
-                            }
-                            // §6.20.2: an untyped `localparam` with any OTHER
-                            // initializer keeps its IMPLICIT (self-determined)
-                            // type here; the const-function evaluator and the
-                            // bytecode compiler then size it from the RHS so
-                            // `Q = 4'd0-4'd1` stays 4-bit (15), NOT the 32-bit
-                            // `int` that folds `0-1` to `32'hffffffff`. The
-                            // `Static` lifetime (set below) flags this decl as
-                            // a localparam for those consumers.
-                            _ => data_type,
-                        }
-                    } else {
-                        data_type
-                    };
                     let declarators: Vec<VarDeclarator> = assignments
                         .into_iter()
                         .map(|a| VarDeclarator {
@@ -153,17 +110,10 @@ impl Parser {
                             span: a.span,
                         })
                         .collect();
-                    // §6.20.4: a block-scope localparam/parameter is a
-                    // CONSTANT — mark the lowered decl `static` so the §6.21
-                    // implicitly-static check (which targets variables with
-                    // initializers) does not fire on it. A localparam MUST
-                    // carry an initializer; the reference accepts it inside
-                    // static tasks (customer testbench task-body
-                    // `localparam int MIN = 24;` was wrongly rejected).
                     return Statement::new(
-                        StatementKind::VarDecl {
+                        StatementKind::ParamDecl {
+                            is_local,
                             data_type,
-                            lifetime: Some(crate::ast::types::Lifetime::Static),
                             declarators,
                         },
                         span,
