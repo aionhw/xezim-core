@@ -6031,7 +6031,6 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 };
                 let base_width =
                     resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                 for assign in assignments {
                     let Some(init) = &assign.init else { continue };
                     // §6.20.2/§26.3: an UNPACKED-ARRAY package parameter
@@ -6094,68 +6093,34 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                             continue;
                         }
                     }
-                    let width = if is_implicit {
-                        untyped_param_width(init, &elab.parameters).unwrap_or(32)
-                    } else {
-                        base_width
-                    };
-                    // §13.4.3 const-function calls, mirroring the import path.
-                    let subbed;
-                    let init: &Expression = if expr_has_call(init) {
-                        match substitute_const_fn_calls(init,Some(&elab.parameters), elab, 0)
-                            .filter(|e| !expr_has_call(e))
-                        {
-                            Some(e) => {
-                                subbed = e;
-                                &subbed
-                            }
-                            None => {
-                                // The call didn't reduce — registering the
-                                // 0 that eval_init_for_width would produce
-                                // poisons every dimension sized by this
-                                // param. Leave it for a later pass / the
-                                // import path.
-                                continue;
-                            }
-                        }
-                    } else {
-                        init
-                    };
-                    let mut v = if is_string_data_type(data_type) {
-                        string_param_value(init, &elab.parameters)
-                    } else if let Some(sv) = pack_struct_const_value(
+                    let res = resolve_param_decl_value(
+                        &mut *elab,
                         data_type,
-                        init,
-                        &elab.parameters,
-                        &elab.typedefs,
-                        &elab.typedef_types,
-                    ) {
-                        // §10.9.2: a struct-typed package parameter with an
-                        // assignment pattern packs by member. The width-only
-                        // fold made it 0 until a later pass, so a module
-                        // localparam computed from it in between
-                        // (`build_config(cva6_config_pkg::cva6_cfg)`) read 0.
-                        sv.resize(width)
-                    } else {
-                        eval_param_init(
-                            data_type,
-                            init,
-                            &elab.parameters,
-                            &elab.typedef_types,
-                            width,
-                        )
-                    };
-                    if !v.is_real {
-                        v.is_signed = pkg_param_is_signed(
-                            data_type,
-                            Some(init),
-                            &elab.typedef_types,
-                            &elab.parameters,
-                        );
+                        Some(init),
+                        None,
+                        None,
+                        base_width,
+                        false,
+                        is_type_real(data_type),
+                        ParamDeclPolicy {
+                            unresolved_call: UnresolvedCallPolicy::SkipIfUnresolved,
+                            promote_implicit_real: false,
+                            narrow_implicit_string_lit: false,
+                            force_signed_on_override: false,
+                            eval_packed_aggregate: true,
+                            require_known_idents: false,
+                            signed_from_pkg_helper: true,
+                        },
+                    );
+                    if res.skipped {
+                        // The call didn't reduce — registering the
+                        // 0 that eval_init_for_width would produce
+                        // poisons every dimension sized by this
+                        // param. Leave it for a later pass / the
+                        // import path.
+                        continue;
                     }
-                    if is_type_real(data_type) {
-                        v = Value::from_f64(v.to_f64());
-                    }
+                    let v = res.val;
                     pkg_overlay.push((
                         assign.name.name.clone(),
                         elab.parameters.get(&assign.name.name).cloned(),
@@ -10193,73 +10158,10 @@ pub fn elaborate_module_with_defs(
                         continue;
                     }
                 }
-                let mut width =
+                let base_width =
                     resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let mut signed = is_type_signed(data_type);
-                let mut is_real = is_type_real(data_type);
-
-                // IEEE 1800-2017 §6.20.2: Parameters with implicit type (no explicit type)
-                // default to 32-bit signed integer.
-                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                {
-                    // Check if the initialization value is real. If so, parameter is real.
-                    let init_is_real =
-                        if let Some(override_val) = param_overrides.get(&assign.name.name) {
-                            override_val.is_real
-                        } else if let Some(init) = &assign.init {
-                            // A const-FUNCTION call in the initializer must be
-                            // substituted first, or a real-returning function reads
-                            // as non-real (§6.20.2: an implicit parameter takes
-                            // the type of its final value).
-                            let subst;
-                            let e: &Expression = if expr_has_call(init) {
-                                match substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0) {
-                                    Some(x) => {
-                                        subst = x;
-                                        &subst
-                                    }
-                                    None => init,
-                                }
-                            } else {
-                                init
-                            };
-                            eval_const_expr_val(e, &elab.parameters).is_real
-                        } else {
-                            false
-                        };
-
-                    if init_is_real {
-                        width = 64;
-                        is_real = true;
-                    } else if let Some(w) = assign
-                        .init
-                        .as_ref()
-                        .filter(|e| matches!(e.kind, ExprKind::StringLiteral(_)))
-                        .and_then(string_literal_width)
-                    {
-                        width = w;
-                    } else {
-                        width = assign
-                            .init
-                            .as_ref()
-                            .filter(|_| !param_overrides.contains_key(&assign.name.name))
-                            .and_then(|i| untyped_param_width(i, &elab.parameters))
-                            .unwrap_or(32);
-                        // An explicit `signed`/`unsigned` wins over the value.
-                        signed = match (data_type, &assign.init) {
-                            (
-                                DataType::Implicit {
-                                    signing: Some(_), ..
-                                },
-                                _,
-                            ) => is_type_signed(data_type),
-                            (_, Some(i)) if !param_overrides.contains_key(&assign.name.name) => {
-                                untyped_param_is_signed(i, &elab.parameters)
-                            }
-                            _ => true,
-                        };
-                    }
-                }
+                let base_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
+                let base_is_real = is_type_real(data_type);
 
                 // IEEE 1800-2017 §6.20: a struct/union-typed parameter whose
                 // value is an assignment pattern (`parameter cfg_t C = '{f:v}`)
@@ -10271,92 +10173,27 @@ pub fn elaborate_module_with_defs(
                     &elab.typedefs,
                     &elab.typedef_types,
                 );
-                let is_struct_param = struct_fields.as_ref().is_some_and(|f| !f.is_empty());
-
-                let mut val = if let Some(override_val) = param_overrides.get(&assign.name.name) {
-                    override_val.clone()
-                } else if let Some(init) = &assign.init {
-                    let subbed_init3;
-                    let init_eval: &Expression = if expr_has_call(init) {
-                        match substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0)
-                            .filter(|e| !expr_has_call(e))
-                        {
-                            Some(e) => {
-                                subbed_init3 = e;
-                                &subbed_init3
-                            }
-                            None => init,
-                        }
-                    } else {
-                        init
-                    };
-                    let mut v = if is_struct_param {
-                        pack_struct_const_value(
-                            data_type,
-                            init_eval,
-                            &elab.parameters,
-                            &elab.typedefs,
-                            &elab.typedef_types,
-                        )
-                        .map(|sv| sv.resize(width))
-                        .unwrap_or_else(|| {
-                            eval_param_init(
-                                data_type,
-                                init_eval,
-                                &elab.parameters,
-                                &elab.typedef_types,
-                                width,
-                            )
-                        })
-                    } else {
-                        eval_param_init(
-                            data_type,
-                            init_eval,
-                            &elab.parameters,
-                            &elab.typedef_types,
-                            width,
-                        )
-                    };
-                    // §6.20.2: an EXPLICIT type's signedness is authoritative.
-                    // Only setting it when signed let a signed init literal
-                    // leak through, so `parameter bit [7:0] P = 200` read -56
-                    // (the body-item path already assigns it). An untyped
-                    // parameter's signedness was decided above (`parameter
-                    // unsigned P = 5` is unsigned); the value's own flag must
-                    // not survive it.
-                    if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                    {
-                        if signed || !is_real {
-                            v.is_signed = signed;
-                        }
-                    } else if !v.is_real {
-                        v.is_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
-                    }
-                    v
-                } else {
-                    let mut v = Value::zero(width);
-                    if signed {
-                        v.is_signed = true;
-                    }
-                    v
-                };
-
-                if is_real {
-                    val = Value::from_f64(val.to_f64());
-                } else if val.is_real
-                    && width > 0
-                    && !matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                    && !is_string_data_type(data_type)
-                {
-                    // §6.12.2: a real value of an INTEGRAL parameter converts
-                    // to its type (see the module-body twin).
-                    val = real_to_integral(val.to_f64(), width);
-                    val.is_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
-                } else if !val.is_real && is_type_two_state_resolved(data_type, &elab.typedef_types)
-                {
-                    // §6.11.1/§10.7: a 2-state parameter type holds no X/Z.
-                    val = val.to_two_state();
-                }
+                let ov = param_overrides.get(&assign.name.name).cloned();
+                let res = resolve_param_decl_value(
+                    &mut elab,
+                    data_type,
+                    assign.init.as_ref(),
+                    None,
+                    ov.as_ref(),
+                    base_width,
+                    base_signed,
+                    base_is_real,
+                    ParamDeclPolicy {
+                        unresolved_call: UnresolvedCallPolicy::ContinueOriginal,
+                        promote_implicit_real: true,
+                        narrow_implicit_string_lit: true,
+                        force_signed_on_override: false,
+                        eval_packed_aggregate: true,
+                        require_known_idents: false,
+                        signed_from_pkg_helper: false,
+                    },
+                );
+                let mut val = res.val;
 
                 // §6.20.2 + §5.7.1: an IMPLICIT-type parameter initialized with
                 // an unbased-unsized literal keeps its fill-ness, so
@@ -10995,67 +10832,32 @@ pub fn elaborate_module_with_defs(
         for _ in 0..8 {
             let mut changed = false;
             for (name, data_type, init) in &decls {
-                let mut width =
+                let base_width =
                     resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                {
-                    width = untyped_param_width(init, &elab.parameters).unwrap_or(32);
-                }
-                let subbed;
-                let init_eval: &Expression = if expr_has_call(init) {
-                    match substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0)
-                        .filter(|e| !expr_has_call(e))
-                    {
-                        Some(e) => {
-                            subbed = e;
-                            &subbed
-                        }
-                        None => init,
-                    }
-                } else {
-                    init
-                };
-                // Only seed once EVERY name the initializer reads is already
-                // known. Otherwise an unresolved reference silently evaluates
-                // to 0 and we would store that wrong value — the very failure
-                // this pass exists to prevent. The fixpoint lets a chain
-                // resolve one link per iteration.
-                if !expr_idents_all_known(init_eval, &elab.parameters) {
-                    continue;
-                }
-                // §10.8 / §11.6.1: a parameter with a declared type is ASSIGNED
-                // its initializer, so the declared width is the operands'
-                // context — the same fold the walk below performs. This seed
-                // used the self-determined fold, so `localparam int A =
-                // (8'd128 + 8'd128) >> 8` was 0 here (the sum wrapped at
-                // 8 bits), so the declarations sized from it (`logic [A:0] v`)
-                // kept that width while the value itself was later corrected
-                // to 1 (#894).
-                let mut v = eval_param_init(
+                let base_is_real = is_type_real_resolved(data_type, &elab.typedef_types);
+                let res = resolve_param_decl_value(
+                    &mut elab,
                     data_type,
-                    init_eval,
-                    &elab.parameters,
-                    &elab.typedef_types,
-                    width,
+                    Some(init),
+                    None,
+                    None,
+                    base_width,
+                    is_type_signed(data_type),
+                    base_is_real,
+                    ParamDeclPolicy {
+                        unresolved_call: UnresolvedCallPolicy::ContinueOriginal,
+                        promote_implicit_real: false,
+                        narrow_implicit_string_lit: false,
+                        force_signed_on_override: false,
+                        eval_packed_aggregate: false,
+                        require_known_idents: true,
+                        signed_from_pkg_helper: false,
+                    },
                 );
-                // §6.20.2: the DECLARED signedness is authoritative. Setting it
-                // only when true let a signed INITIALIZER leak its signedness
-                // into an unsigned parameter: `parameter [7:0] UP = -3` kept
-                // `is_signed` from the `-3`, so `UP` behaved as -3 in every
-                // signed-sensitive operation — `UP >>> 1` gave -2 instead of
-                // 126, `UP < 0` was 1, `UP / 2` was -1. An implicit type with
-                // no range is signed 32-bit per §6.20.2; a real keeps its own.
-                let declared_signed = is_type_signed(data_type)
-                    || matches!(data_type,
-                        DataType::Implicit { dimensions, signing: None, .. }
-                            if dimensions.is_empty())
-                        && untyped_param_is_signed(init, &elab.parameters);
-                if !v.is_real {
-                    v.is_signed = declared_signed;
+                if res.skipped || res.val.is_real {
+                    continue; // unresolved ident or real param keeps the walk's handling
                 }
-                if v.is_real {
-                    continue; // real parameters keep the walk's own handling
-                }
+                let v = res.val;
                 if elab.parameters.get(*name) != Some(&v) {
                     elab.set_param(line!(), (*name).to_string(), v);
                     preseeded_params.insert((*name).to_string());
@@ -13780,87 +13582,6 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         register_packed_param_shape(&mut elab, &assign.name.name, data_type);
-                        let mut current_width = width;
-                        let mut current_is_real = is_real;
-                        let mut current_signed = signed;
-
-                        // §6.20.2: a parameter with NO type and NO range takes
-                        // the SIZE of its final value when that value is a
-                        // sized literal — `localparam P = 16'b...` is 16 bits,
-                        // so `$left(P)` is 15 and `$bits(P)` 16. Only the
-                        // sized-literal case is narrowed; unsized values keep
-                        // the 32-bit default. (The package path already did
-                        // this; the module path pinned 32.)
-                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                        {
-                            if let Some(w) = assign
-                                .init
-                                .as_ref()
-                                .and_then(|i| untyped_param_width(i, &elab.parameters))
-                            {
-                                current_width = w;
-                            }
-                            // §5.7.1: the value's SIGNEDNESS comes with its
-                            // width — a sized literal is unsigned unless it
-                            // carries `s`, so `parameter P = 8'hF0;` is 240,
-                            // not -16 (and `P > 100` is true). But an EXPLICIT
-                            // `signed`/`unsigned` keyword wins over the value
-                            // (§6.20.2): `localparam signed s = 4'd15` is a
-                            // signed 4-bit -1 (ivtest localparam_type2 snv15).
-                            if let Some(init) = &assign.init {
-                                let declared_signing = matches!(
-                                    data_type,
-                                    DataType::Implicit {
-                                        signing: Some(_),
-                                        ..
-                                    }
-                                );
-                                if !declared_signing {
-                                    current_signed =
-                                        untyped_param_is_signed(init, &elab.parameters);
-                                }
-                            }
-                        }
-
-                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                        {
-                            let init_is_real = if elab.parameters.contains_key(&assign.name.name)
-                                && !preseeded_params.contains(&assign.name.name)
-                            {
-                                elab.parameters
-                                    .get(&assign.name.name)
-                                    .map(|v| v.is_real)
-                                    .unwrap_or(false)
-                            } else if let Some(init) = &assign.init {
-                                // Substitute const-function calls first (see
-                                // the header-param twin above).
-                                let subst;
-                                let e: &Expression = if expr_has_call(init) {
-                                    match substitute_const_fn_calls(
-                                        init,Some(&elab.parameters),
-                                        &elab,
-                                        0,
-                                    ) {
-                                        Some(x) => {
-                                            subst = x;
-                                            &subst
-                                        }
-                                        None => init,
-                                    }
-                                } else {
-                                    init
-                                };
-                                eval_const_expr_val(e, &elab.parameters).is_real
-                            } else {
-                                false
-                            };
-
-                            if init_is_real {
-                                current_width = 64;
-                                current_is_real = true;
-                                current_signed = false;
-                            }
-                        }
 
                         // IEEE 1800-2017 §6.20: struct/union-typed parameter with
                         // an assignment-pattern value — pack by field offset and
@@ -13872,21 +13593,23 @@ pub fn elaborate_module_with_defs(
                             &elab.typedef_types,
                         );
 
-                        let mut val = if elab.parameters.contains_key(&assign.name.name)
+                        let existing_ov = if elab.parameters.contains_key(&assign.name.name)
                             && !preseeded_params.contains(&assign.name.name)
                         {
-                            elab.parameters
-                                .get(&assign.name.name)
-                                .cloned()
-                                .unwrap_or(Value::zero(current_width))
-                        } else if let Some(init) = &assign.init {
-                            // §20.7 `$bits(<signal>)` — const-eval has no
-                            // signal table, so `$bits` of a variable, a port,
-                            // or `port.member` silently evaluated to 0 and
-                            // sized everything downstream to nothing. Bind
-                            // those to literals before any eval below.
-                            let prebound_init;
-                            let init: &Expression = if expr_mentions_bits(init) {
+                            Some(
+                                elab.parameters
+                                    .get(&assign.name.name)
+                                    .cloned()
+                                    .unwrap_or(Value::zero(width)),
+                            )
+                        } else {
+                            None
+                        };
+                        let prebound_init: Option<Expression> = assign
+                            .init
+                            .as_ref()
+                            .filter(|init| existing_ov.is_none() && expr_mentions_bits(init))
+                            .map(|init| {
                                 let via_signals = prebind_bits_of_signals(
                                     init,
                                     &elab.signals,
@@ -13897,11 +13620,7 @@ pub fn elaborate_module_with_defs(
                                     &elab.packed_struct_fields,
                                     &elab.arrays,
                                 );
-                                // Anything the signal table could not size —
-                                // an UNPACKED array element, whose declaration
-                                // name is not itself a signal — is resolved
-                                // from the declared type instead.
-                                prebound_init = if expr_mentions_bits(&via_signals) {
+                                if expr_mentions_bits(&via_signals) {
                                     let mut decls = HashMap::default();
                                     let mut elem_decls = HashMap::default();
                                     collect_declared_types(
@@ -13920,101 +13639,33 @@ pub fn elaborate_module_with_defs(
                                     )
                                 } else {
                                     via_signals
-                                };
-                                &prebound_init
-                            } else {
-                                init
-                            };
-                            if expr_has_call(init) {
-                                // §13.4.3: try to CONST-EVALUATE the calls
-                                // (LOG2-style sizing helpers) right now —
-                                // deferring leaves the parameter 0 during
-                                // elaboration, so every dependent width
-                                // wraps ([LOG_X-6-1:0] → 4-billion-bit bus
-                                // collapsed to 1 bit).
-                                if let Some(subbed) =
-                                    substitute_const_fn_calls(init,Some(&elab.parameters), &elab, 0)
-                                        .filter(|e| !expr_has_call(e))
-                                {
-                                    let mut v = if is_string_data_type(data_type) {
-                                        string_param_value(&subbed, &elab.parameters)
-                                    } else {
-                                        eval_param_init(
-                                            data_type,
-                                            &subbed,
-                                            &elab.parameters,
-                                            &elab.typedef_types,
-                                            current_width,
-                                        )
-                                    };
-                                    // §6.20.2: the DECLARED signedness is authoritative. Assigning
-                                    // only when true let a signed INIT LITERAL leak its
-                                    // signedness into an unsigned parameter — `parameter
-                                    // [7:0] UP = -3` kept is_signed, so `UP + 1` sign-
-                                    // extended to -2 instead of 254. A real keeps its own.
-                                    if !v.is_real {
-                                        v.is_signed = current_signed;
-                                    }
-                                    v
-                                } else {
-                                    elab.deferred_param_exprs
-                                        .push((assign.name.name.clone(), init.clone()));
-                                    let mut v = Value::zero(current_width);
-                                    if !v.is_real {
-                                        v.is_signed = current_signed;
-                                    }
-                                    v
                                 }
-                            } else {
-                                // eval_param_value = struct-pattern packing +
-                                // packed-vector-pattern packing + the plain
-                                // const-eval fallback, so this covers the old
-                                // is_struct_param branch and also gives
-                                // `parameter bit [1:0][7:0] M = '{..}` a value
-                                // instead of 0.
-                                let mut v = eval_param_value(
-                                    data_type,
-                                    init,
-                                    &elab.parameters,
-                                    &elab.typedefs,
-                                    &elab.typedef_types,
-                                    current_width,
-                                );
-                                if !v.is_real {
-                                    v.is_signed = current_signed;
-                                }
-                                v
-                            }
-                        } else {
-                            let mut v = Value::zero(current_width);
-                            if !v.is_real {
-                                v.is_signed = current_signed;
-                            }
-                            v
-                        };
-
-                        if current_is_real {
-                            val = Value::from_f64(val.to_f64());
-                        } else {
-                            // §6.12.2: a real value of an INTEGRAL parameter
-                            // converts to its type (a 64-bit one stayed real:
-                            // `localparam longint P = 2.0**64` read 1.8e19).
-                            if val.is_real && !is_string_data_type(data_type) {
-                                val = real_to_integral(val.to_f64(), current_width);
-                            }
-                            // §10.7: the parameter's declared type governs the
-                            // stored value — force its signedness (so a signed
-                            // source in an UNSIGNED param reads unsigned, e.g.
-                            // `bit unsigned [3:0] p = -7` is 9, not -7) and drop
-                            // X/Z for a 2-state parameter type.
-                            val.is_signed = current_signed;
-                            if is_type_two_state(data_type) {
-                                val = val.to_two_state();
-                            }
-                            if is_string_data_type(data_type) {
-                                current_width = val.width;
-                            }
-                        }
+                            });
+                        let res = resolve_param_decl_value(
+                            &mut elab,
+                            data_type,
+                            prebound_init.as_ref().or(assign.init.as_ref()),
+                            assign.init.as_ref(),
+                            existing_ov.as_ref(),
+                            width,
+                            signed,
+                            is_real,
+                            ParamDeclPolicy {
+                                unresolved_call: UnresolvedCallPolicy::DeferZero {
+                                    name: &assign.name.name,
+                                },
+                                promote_implicit_real: true,
+                                narrow_implicit_string_lit: false,
+                                force_signed_on_override: true,
+                                eval_packed_aggregate: true,
+                                require_known_idents: false,
+                                signed_from_pkg_helper: false,
+                            },
+                        );
+                        let mut current_width = res.width;
+                        let current_is_real = res.is_real;
+                        let mut current_signed = res.signed;
+                        let mut val = res.val;
 
                         // §6.20.2: an implicit-type parameter takes the SELF-
                         // DETERMINED size of its init; an unbased-unsized
@@ -20116,12 +19767,13 @@ fn elaborate_items(
                     assignments,
                 } = &pd.kind
                 {
-                    let mut width =
+                    let base_width =
                         resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     // §6.20.2: resolve through typedefs (see the module-scope
                     // pre-pass above) — a typedef'd SIGNED declared type must
                     // read the typedef's sign.
-                    let signed = is_type_signed_resolved(data_type, &elab.typedef_types);
+                    let base_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
+                    let base_is_real = is_type_real(data_type);
                     if matches!(
                         data_type,
                         DataType::Simple {
@@ -20134,28 +19786,7 @@ fn elaborate_items(
                         }
                     }
                     let implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
-                    if implicit {
-                        width = 32;
-                    }
                     for assign in assignments {
-                        let width = match &assign.init {
-                            Some(i) if implicit => {
-                                untyped_param_width(i, &elab.parameters).unwrap_or(width)
-                            }
-                            _ => width,
-                        };
-                        let signed = match &assign.init {
-                            Some(i)
-                                if implicit
-                                    && matches!(
-                                        data_type,
-                                        DataType::Implicit { signing: None, .. }
-                                    ) =>
-                            {
-                                untyped_param_is_signed(i, &elab.parameters)
-                            }
-                            _ => signed,
-                        };
                         if elab.signals.contains_key(&assign.name.name)
                             || elab.parameters.contains_key(&assign.name.name)
                         {
@@ -20201,67 +19832,39 @@ fn elaborate_items(
                         }
                         register_packed_param_shape(elab, &assign.name.name, data_type);
                         if !elab.parameters.contains_key(&assign.name.name) {
-                            let val = if let Some(init) = &assign.init {
-                                // §6.20.2 + §5.7.1: an implicit-type parameter
-                                // keeps an unbased-unsized init as a FILL value
-                                // so consumers replicate it at their own width.
-                                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                                {
-                                    if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) =
-                                        &init.kind
-                                    {
-                                        // §6.20.2 self-determined: 1-bit, unsigned, plain.
-                                        let mut pv = Value::fill_of(*c);
-                                        pv.is_fill = false;
-                                        elab.set_param(
-                                            line!(),
-                                            assign.name.name.clone(),
-                                            pv.clone(),
-                                        );
-                                        signals_insert_traced(
-                                            &mut elab.signals,
-                                            line!(),
-                                            assign.name.name.clone(),
-                                            Signal {
-                                                is_const: false,
-                                                name: assign.name.name.clone().into(),
-                                                width: 1,
-                                                is_signed: false,
-                                                direction: None,
-                                                value: pv,
-                                                is_real: false,
-                                                type_name: get_type_name(data_type),
-                                            },
-                                        );
-                                        continue;
-                                    }
-                                }
-                                // §13.4.3 const-function calls (log2-style
-                                // sizing helpers): substitute before eval so
-                                // dependent declaration widths don't wrap.
-                                let subbed_init4;
-                                let init_eval: &Expression = if expr_has_call(init) {
-                                    match substitute_const_fn_calls(init,Some(&elab.parameters), elab, 0)
-                                        .filter(|e| !expr_has_call(e))
-                                    {
-                                        Some(e) => {
-                                            subbed_init4 = e;
-                                            &subbed_init4
-                                        }
-                                        None => init,
-                                    }
-                                } else {
-                                    init
-                                };
-                                // §20.7 `$bits(<signal>)` / `$bits(port.member)`
-                                // in a body localparam: const-eval has no
-                                // signal table and would yield 0, silently
-                                // sizing whatever the localparam feeds to
-                                // nothing. Bind those to literals first.
-                                let prebound;
-                                let init_eval: &Expression = if expr_mentions_bits(init_eval) {
-                                    prebound = prebind_bits_of_signals(
-                                        init_eval,
+                            if implicit
+                                && let Some(init) = &assign.init
+                                && let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) =
+                                    &init.kind
+                            {
+                                // §6.20.2 self-determined: 1-bit, unsigned, plain.
+                                let mut pv = Value::fill_of(*c);
+                                pv.is_fill = false;
+                                elab.set_param(line!(), assign.name.name.clone(), pv.clone());
+                                signals_insert_traced(
+                                    &mut elab.signals,
+                                    line!(),
+                                    assign.name.name.clone(),
+                                    Signal {
+                                        is_const: false,
+                                        name: assign.name.name.clone().into(),
+                                        width: 1,
+                                        is_signed: false,
+                                        direction: None,
+                                        value: pv,
+                                        is_real: false,
+                                        type_name: get_type_name(data_type),
+                                    },
+                                );
+                                continue;
+                            }
+                            let prebound: Option<Expression> = assign
+                                .init
+                                .as_ref()
+                                .filter(|init| expr_mentions_bits(init))
+                                .map(|init| {
+                                    prebind_bits_of_signals(
+                                        init,
                                         &elab.signals,
                                         &elab.parameters,
                                         "",
@@ -20269,25 +19872,31 @@ fn elaborate_items(
                                         &elab.typedef_types,
                                         &elab.packed_struct_fields,
                                         &elab.arrays,
-                                    );
-                                    &prebound
-                                } else {
-                                    init_eval
-                                };
-                                let mut v = eval_param_init(
-                                    data_type,
-                                    init_eval,
-                                    &elab.parameters,
-                                    &elab.typedef_types,
-                                    width,
-                                );
-                                if !v.is_real {
-                                    v.is_signed = signed;
-                                }
-                                v
-                            } else {
-                                Value::zero(width)
-                            };
+                                    )
+                                });
+                            let res = resolve_param_decl_value(
+                                elab,
+                                data_type,
+                                prebound.as_ref().or(assign.init.as_ref()),
+                                None,
+                                None,
+                                base_width,
+                                base_signed,
+                                base_is_real,
+                                ParamDeclPolicy {
+                                    unresolved_call: UnresolvedCallPolicy::ContinueOriginal,
+                                    promote_implicit_real: false,
+                                    narrow_implicit_string_lit: false,
+                                    force_signed_on_override: false,
+                                    eval_packed_aggregate: false,
+                                    require_known_idents: false,
+                                    signed_from_pkg_helper: false,
+                                },
+                            );
+                            let val = res.val;
+                            let width = res.width;
+                            let signed = res.signed;
+                            let is_real = res.is_real;
                             elab.set_param(line!(), assign.name.name.clone(), val.clone());
                             signals_insert_traced(
                                 &mut elab.signals,
@@ -20300,7 +19909,7 @@ fn elaborate_items(
                                     is_signed: signed,
                                     direction: None,
                                     value: val,
-                                    is_real: is_type_real(data_type),
+                                    is_real,
                                     type_name: get_type_name(data_type),
                                 },
                             );
@@ -24007,6 +23616,7 @@ fn const_eval_user_call(
     CONST_FN_IN_UNIT.with(|c| c.set(prev_in_unit));
     v
 }
+
 
 /// Candidate ENV KEYS for the base of a constant `base[index]` element
 /// select. `register_array_param` stores each element of an unpacked-array
@@ -28871,6 +28481,231 @@ fn eval_param_init(
     v
 }
 
+#[derive(Clone, Copy)]
+enum UnresolvedCallPolicy<'a> {
+    ContinueOriginal,
+    SkipIfUnresolved,
+    DeferZero { name: &'a str },
+}
+
+struct ParamDeclPolicy<'a> {
+    unresolved_call: UnresolvedCallPolicy<'a>,
+    promote_implicit_real: bool,
+    narrow_implicit_string_lit: bool,
+    force_signed_on_override: bool,
+    eval_packed_aggregate: bool,
+    require_known_idents: bool,
+    signed_from_pkg_helper: bool,
+}
+
+struct ParamResolution {
+    val: Value,
+    width: u32,
+    is_real: bool,
+    signed: bool,
+    skipped: bool,
+}
+
+/// Shared scalar parameter/localparam resolution pipeline used by package,
+/// module header, pre-seed, module body, and generate-scope elaboration.
+fn resolve_param_decl_value(
+    elab: &mut ElaboratedModule,
+    data_type: &DataType,
+    init: Option<&Expression>,
+    raw_init_for_defer: Option<&Expression>,
+    override_val: Option<&Value>,
+    base_width: u32,
+    base_signed: bool,
+    base_is_real: bool,
+    policy: ParamDeclPolicy<'_>,
+) -> ParamResolution {
+    let is_implicit =
+        matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
+    let mut width = if is_implicit { 32 } else { base_width };
+    let mut signed = base_signed;
+    let mut is_real = base_is_real;
+
+    // Substitute constant-function calls once so implicit real/width/signed
+    // checks and final value evaluation reuse the same reduced expression.
+    let subbed_holder: Option<Expression>;
+    let init_eval: Option<&Expression> = if override_val.is_none() {
+        if let Some(e) = init {
+            if expr_has_call(e) {
+                match substitute_const_fn_calls(e, Some(&elab.parameters), elab, 0)
+                    .filter(|sub| !expr_has_call(sub))
+                {
+                    Some(sub) => {
+                        subbed_holder = Some(sub);
+                        subbed_holder.as_ref()
+                    }
+                    None => match policy.unresolved_call {
+                        UnresolvedCallPolicy::SkipIfUnresolved => {
+                            return ParamResolution {
+                                val: Value::zero(width),
+                                width,
+                                is_real,
+                                signed,
+                                skipped: true,
+                            };
+                        }
+                        UnresolvedCallPolicy::DeferZero { name } => {
+                            if is_implicit && !matches!(data_type, DataType::Implicit { signing: Some(_), .. }) {
+                                width = untyped_param_width(e, &elab.parameters).unwrap_or(width);
+                                signed = untyped_param_is_signed(e, &elab.parameters);
+                            } else if is_implicit {
+                                width = untyped_param_width(e, &elab.parameters).unwrap_or(width);
+                            }
+                            if let Some(raw) = raw_init_for_defer.or(Some(e)) {
+                                elab.deferred_param_exprs
+                                    .push((name.to_string(), raw.clone()));
+                            }
+                            let mut v = Value::zero(width);
+                            if !v.is_real {
+                                v.is_signed = signed;
+                            }
+                            return ParamResolution {
+                                val: v,
+                                width,
+                                is_real,
+                                signed,
+                                skipped: false,
+                            };
+                        }
+                        UnresolvedCallPolicy::ContinueOriginal => Some(e),
+                    },
+                }
+            } else {
+                Some(e)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if policy.require_known_idents {
+        if let Some(e) = init_eval {
+            if !expr_idents_all_known(e, &elab.parameters) {
+                return ParamResolution {
+                    val: Value::zero(width),
+                    width,
+                    is_real,
+                    signed,
+                    skipped: true,
+                };
+            }
+        }
+    }
+
+    let explicit_signing = matches!(
+        data_type,
+        DataType::Implicit {
+            signing: Some(_),
+            dimensions,
+            ..
+        } if dimensions.is_empty()
+    );
+    let implicit_sign_expr = if override_val.is_some() && policy.force_signed_on_override {
+        init
+    } else {
+        init_eval
+    };
+    if is_implicit {
+        let init_is_real = if policy.promote_implicit_real {
+            if let Some(ov) = override_val {
+                ov.is_real
+            } else if let Some(e) = init_eval {
+                eval_const_expr_val(e, &elab.parameters).is_real
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if init_is_real {
+            width = 64;
+            is_real = true;
+            if policy.force_signed_on_override {
+                signed = false;
+            }
+        } else if policy.narrow_implicit_string_lit
+            && override_val.is_none()
+            && let Some(w) = init
+                .filter(|e| matches!(e.kind, ExprKind::StringLiteral(_)))
+                .and_then(string_literal_width)
+        {
+            width = w;
+        } else {
+            if let Some(e) = implicit_sign_expr {
+                width = untyped_param_width(e, &elab.parameters).unwrap_or(width);
+            }
+            if explicit_signing {
+                signed = is_type_signed(data_type);
+            } else {
+                signed = match implicit_sign_expr {
+                    Some(e) => untyped_param_is_signed(e, &elab.parameters),
+                    None => true,
+                };
+            }
+        }
+    } else if policy.signed_from_pkg_helper {
+        signed = pkg_param_is_signed(data_type, init_eval, &elab.typedef_types, &elab.parameters);
+    }
+
+    let mut val = if let Some(ov) = override_val {
+        let mut v = ov.clone();
+        if policy.force_signed_on_override && !v.is_real {
+            v.is_signed = signed;
+        }
+        v
+    } else if let Some(e) = init_eval {
+        let mut v = if policy.eval_packed_aggregate {
+            eval_param_value(
+                data_type,
+                e,
+                &elab.parameters,
+                &elab.typedefs,
+                &elab.typedef_types,
+                width,
+            )
+        } else {
+            eval_param_init(data_type, e, &elab.parameters, &elab.typedef_types, width)
+        };
+        if !v.is_real && (!is_implicit || signed || !is_real) {
+            v.is_signed = signed;
+        }
+        v
+    } else {
+        let mut v = Value::zero(width);
+        if !v.is_real {
+            v.is_signed = signed;
+        }
+        v
+    };
+
+    if is_real {
+        val = Value::from_f64(val.to_f64());
+    } else if val.is_real && width > 0 && !is_implicit && !is_string_data_type(data_type) {
+        val = real_to_integral(val.to_f64(), width);
+        val.is_signed = signed;
+    } else if !val.is_real && is_type_two_state_resolved(data_type, &elab.typedef_types) {
+        val = val.to_two_state();
+    }
+    if is_string_data_type(data_type) && !val.is_real {
+        width = val.width;
+    }
+
+    ParamResolution {
+        val,
+        width,
+        is_real,
+        signed,
+        skipped: false,
+    }
+}
+
 /// Follow a bare type name through `local` — an instance's type-parameter
 /// defaults and body typedefs, which the global tables do not hold. `None`
 /// for a local name used with extra packed dimensions (`T [1:0] P`), which
@@ -28974,6 +28809,7 @@ fn convert_param_value<P: ParamLookup>(
     }
     v
 }
+
 
 /// assigned LSB-first by walking members in reverse. Returns None if `dt`
 /// does not resolve to a struct/union.
@@ -30753,6 +30589,7 @@ fn package_var_init_value(
     }
     v
 }
+
 
 /// §5.7.1 makes an unsized decimal literal SIGNED, and it is exactly 32 bits
 /// wide, so a value from 2^31 up reads back negative: `localparam real P =
