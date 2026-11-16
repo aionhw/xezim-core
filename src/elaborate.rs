@@ -56493,6 +56493,41 @@ mod package_net_tests {
 mod prepared_process_ownership_tests {
     use super::*;
 
+    /// #721, §6.20 / §23.10: symbolic declaration ranges and initializers
+    /// share preparation, while value-dependent transformations stay distinct.
+    #[test]
+    fn symbolic_declarations_use_one_prepared_key() {
+        for (body, expected) in [
+            ("logic [W-1:0] v = W; wire [W-1:0] n = v; assign out = n;", 1),
+            ("if (W == 4) begin:a wire x; end else begin:b wire y; end", 2),
+            ("typedef logic [W-1:0] word_t; word_t v;", 2),
+            ("initial begin logic [W-1:0] v; v = W; end", 2),
+        ] {
+            let parsed = crate::parse(&format!(
+                "module leaf #(parameter W=4)(output logic [W-1:0] out); {body} endmodule"
+            ));
+            assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+            let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+                panic!("module expected");
+            };
+            let definitions = HashMap::from_iter([("leaf".to_string(), Definition::Module(module))]);
+            let empty = HashMap::default();
+            let scope = param_scope::ParamScope::new(
+                &empty, &definitions, &HashMap::default(), &HashMap::default(),
+            );
+            let mut cache = InlineCache::default();
+            let mut bodies = Vec::new();
+            for width in [4, 9, 4] {
+                let params = HashMap::from_iter([("W".into(), Value::from_u64(width, 32))]);
+                bodies.push(prepare_module_items(definitions["leaf"], &definitions,
+                    &params, &HashMap::default(), &mut cache, &scope));
+            }
+            assert_eq!(cache.len(), expected, "{body}");
+            assert_eq!(Rc::ptr_eq(&bodies[0], &bodies[1]), expected == 1, "{body}");
+            assert!(Rc::ptr_eq(&bodies[0], &bodies[2]), "{body}");
+        }
+    }
+
     /// §23.10/§27.5: each parameter environment keeps its own cache entry.
     /// Environments that prepare equal bodies share one body (#721), and
     /// identical source syntax shares ownership; selecting another branch
