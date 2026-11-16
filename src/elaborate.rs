@@ -35386,6 +35386,33 @@ fn inline_instantiations_inner(
                                     }
                                     _ => decl,
                                 };
+                                // §26.3: package arrays own their qualified
+                                // storage. A module declaration with the same
+                                // leaf must not share either cells or shape.
+                                let qualified_decl;
+                                let decl = if !decl.dimensions.is_empty() {
+                                    let mut d = decl.clone();
+                                    if !d.name.name.starts_with(&format!("{}::", name)) {
+                                        d.name.name = format!("{}::{}", name, decl.name.name);
+                                    }
+                                    elab.pkg_var_decls.insert(
+                                        d.name.name.clone(),
+                                        Signal {
+                                            is_const: dd.const_kw,
+                                            name: d.name.name.clone().into(),
+                                            width,
+                                            is_signed,
+                                            is_real: false,
+                                            direction: None,
+                                            value: Value::zero(width),
+                                            type_name: get_type_name(&dd.data_type),
+                                        },
+                                    );
+                                    qualified_decl = d;
+                                    &qualified_decl
+                                } else {
+                                    decl
+                                };
                                 // §10.9.1: package array patterns need the same
                                 // element type and declared bounds as module arrays.
                                 if !decl.dimensions.is_empty() {
@@ -35395,8 +35422,16 @@ fn inline_instantiations_inner(
                                     if let Some(dims) =
                                         declared_unpacked_dims(&decl.dimensions, &elab.parameters)
                                     {
-                                        elab.unpacked_decl_dims
-                                            .insert(decl.name.name.clone(), dims);
+                                        register_fixed_unpacked_array(
+                                            elab,
+                                            &decl.name.name,
+                                            &dims,
+                                            width,
+                                            is_type_two_state_resolved(
+                                                &dd.data_type,
+                                                &elab.typedef_types,
+                                            ),
+                                        );
                                     }
                                 }
                                 let shape_dims = normalize_unpacked_dims(
@@ -58039,6 +58074,20 @@ fn process_import(
                                 }
                             );
                             for decl in &dd.declarators {
+                                let qualified =
+                                    if decl.name.name.starts_with(&format!("{}::", pkg_name)) {
+                                        decl.name.name.clone()
+                                    } else {
+                                        format!("{}::{}", pkg_name, decl.name.name)
+                                    };
+                                if elab.arrays.contains_key(&qualified)
+                                    || elab.arrays_2d.contains_key(&qualified)
+                                    || elab.arrays_nd.contains_key(&qualified)
+                                    || elab.dynamic_arrays.contains(&qualified)
+                                    || elab.associative_arrays.contains_key(&qualified)
+                                {
+                                    continue;
+                                }
                                 if is_string {
                                     elab.string_signals.insert(decl.name.name.clone());
                                 }
