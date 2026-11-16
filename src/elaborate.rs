@@ -6926,11 +6926,14 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         // (`eb_t e;`) could not be resolved back to the enum — the type walkers
         // stopped at the bare TypeReference and the variable read UNSIGNED even
         // when the enum's base was signed.
+        let enum_width = resolve_type_width(
+            &td.data_type, Some(&elab.parameters), Some(&elab.typedefs),
+        );
         typedefs_insert_traced(
             &mut elab.typedefs,
             "insert:process_typedef_enum",
             td.name.name.clone(),
-            resolve_type_width(&td.data_type, Some(&elab.parameters), None),
+            enum_width,
         );
         let enum_dt = fold_packed_dims_with(&td.data_type, &elab.parameters, &|_, _| true)
             .unwrap_or_else(|| td.data_type.clone());
