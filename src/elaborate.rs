@@ -32199,11 +32199,10 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
         // §10.9: a typed pattern has its type's value, packed against the
         // typedef snapshot.
         ExprKind::TypedPattern { ty, pattern } => {
-            let base = &params.to_hashmap();
             TYPEDEF_TYPES_TLS.with(|types| {
                 TYPEDEF_WIDTHS_TLS.with(|widths| {
                     let (types, widths) = (types.borrow(), widths.borrow());
-                    pack_typed_pattern(ty, pattern, base, widths.as_ref()?, types.as_ref()?)
+                    pack_typed_pattern(ty, pattern, params, widths.as_ref()?, types.as_ref()?)
                 })
             })
             .unwrap_or_else(|| Value::zero(32))
