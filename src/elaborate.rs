@@ -35390,7 +35390,10 @@ fn inline_instantiations_inner(
                                 // storage. A module declaration with the same
                                 // leaf must not share either cells or shape.
                                 let qualified_decl;
-                                let decl = if !decl.dimensions.is_empty() {
+                                let decl = if !decl.dimensions.is_empty()
+                                    && (elab.local_decl_displaces(&decl.name.name)
+                                        || decl.name.name.starts_with(&format!("{}::", name)))
+                                {
                                     let mut d = decl.clone();
                                     if !d.name.name.starts_with(&format!("{}::", name)) {
                                         d.name.name = format!("{}::{}", name, decl.name.name);
