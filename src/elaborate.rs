@@ -38575,6 +38575,19 @@ fn collect_body_driven_names(
             }
             ModuleItem::ModuleInstantiation(mi) => {
                 let child = definitions.get(&mi.module_name.name);
+                // §29.3/§29.7: a UDP's first terminal is its sole output.
+                // Definition::ports() is empty for UDPs; treating all of their
+                // terminals as unknown marked input reads as body writes and
+                // disabled the enclosing formal's §23.3.3 shape preservation.
+                if matches!(child, Some(Definition::Udp(_))) {
+                    for inst in &mi.instances {
+                        if let Some(PortConnection::Ordered(Some(output))) = inst.connections.first()
+                        {
+                            lvalue_base_names(output, out);
+                        }
+                    }
+                    continue;
+                }
                 // §23.2.2.1 (#572): a non-ANSI header lists names only; the
                 // directions are the body's port declarations. Reading them
                 // here keeps an input bound to such a child's input from
