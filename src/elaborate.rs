@@ -6930,7 +6930,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             &mut elab.typedefs,
             "insert:process_typedef_enum",
             td.name.name.clone(),
-            base_width,
+            resolve_type_width(&td.data_type, Some(&elab.parameters), None),
         );
         let enum_dt = fold_packed_dims_with(&td.data_type, &elab.parameters, &|_, _| true)
             .unwrap_or_else(|| td.data_type.clone());
@@ -28083,7 +28083,46 @@ pub fn packed_member_meta(
     typedef_types: &HashMap<String, DataType>,
 ) -> (Option<u32>, Option<Vec<(i64, i64)>>) {
     let fd = packed_full_dims_of(dt, params)
-        .or_else(|| packed_full_dims_chained(dt, params, typedef_types));
+        .or_else(|| packed_full_dims_chained(dt, params, typedef_types))
+        .or_else(|| {
+            // §7.4.1: dimensions following a struct/enum body select whole
+            // aggregate elements. Add the element's bit range after them.
+            let mut dims = Vec::new();
+            let mut cur = dt;
+            for _ in 0..64 {
+                let base = match cur {
+                    DataType::TypeReference { name, dimensions, .. } => {
+                        dims.extend(dimensions.iter().cloned());
+                        cur = lookup_scoped_type(name, typedef_types)?;
+                        continue;
+                    }
+                    DataType::Struct(su) if su.packed => {
+                        dims.extend(su.dimensions.iter().cloned());
+                        let mut su = su.clone();
+                        su.dimensions.clear();
+                        DataType::Struct(su)
+                    }
+                    DataType::Enum(en) => {
+                        dims.extend(en.dimensions.iter().cloned());
+                        let mut en = en.clone();
+                        en.dimensions.clear();
+                        DataType::Enum(en)
+                    }
+                    _ => return None,
+                };
+                if dims.is_empty() { return None; }
+                let w = resolve_type_width(&base, Some(params), Some(typedefs)).max(1);
+                let mut bounds = Vec::new();
+                for d in &dims {
+                    let PackedDimension::Range { left, right, .. } = d else { return None; };
+                    bounds.push((const_eval_i64_with_params(left, Some(params))?,
+                                 const_eval_i64_with_params(right, Some(params))?));
+                }
+                bounds.push((i64::from(w) - 1, 0));
+                return Some(bounds);
+            }
+            None
+        });
     let ew = packed_inner_elem_width(dt, params, typedefs).or_else(|| {
         // An element of the outermost dimension spans all the others.
         let dims = fd.as_ref().filter(|d| d.len() >= 2)?;
@@ -30434,6 +30473,12 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
     if su.packed {
         return;
     }
+    // §23.6: aggregate member paths retain their owning declaration;
+    // they must not fall back to a namesake in another generate scope.
+    elab.struct_members.entry(base.to_string()).or_insert_with(|| {
+        su.members.iter().flat_map(|m| m.declarators.iter())
+            .map(|d| d.name.name.clone()).collect()
+    });
     // IEEE 1800-2017 §7.3: a union is ONE piece of storage accessed through any
     // of its member names — writing `u.a` must be readable as `u.b`. So an
     // untagged union gets a single signal whose members all start at bit 0,
