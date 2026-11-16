@@ -1949,7 +1949,7 @@ fn class_spec_const<P: ParamLookup>(
     params: &P,
 ) -> Option<Value> {
     let mut consts = Vec::new();
-    class_spec_consts(cls, args, params.as_hashmap_base().expect("param base"), 0, &mut consts)?;
+    class_spec_consts(cls, args, &params.to_hashmap(), 0, &mut consts)?;
     consts
         .into_iter()
         .rev()
@@ -22768,14 +22768,20 @@ pub trait ParamLookup {
     /// not just the keys.
     fn rows(&self) -> Vec<(&str, &Value)>;
 
-    /// The base `&HashMap` backing this lookup when it has one (an overlay's
-    /// bottom row, or a plain map itself). `None` for a hypothetical lookup
-    /// with no flat table — used only by the associative-dimension probe,
-    /// which resolves type-name indexes in the module scope (never a
-    /// function-local), so the base row alone is authoritative.
-    #[inline]
+    /// A complete flat view, only when no overlay needs materialization.
     fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
         None
+    }
+
+    /// Preserve all visible bindings at boundaries that require a flat map.
+    /// Plain tables remain borrowed; overlay rows retain their precedence.
+    fn to_hashmap(&self) -> std::borrow::Cow<'_, HashMap<String, Value>> {
+        if let Some(map) = self.as_hashmap_base() {
+            std::borrow::Cow::Borrowed(map)
+        } else {
+            std::borrow::Cow::Owned(self.rows().into_iter()
+                .map(|(name, value)| (name.to_owned(), value.clone())).collect())
+        }
     }
 }
 
@@ -22862,7 +22868,7 @@ impl ParamLookup for StackedParamEnv<'_> {
     }
     #[inline]
     fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
-        self.base.as_hashmap_base()
+        None
     }
 }
 
@@ -22907,10 +22913,10 @@ impl<'a> ParamLookup for ParamEnv<'a> {
     }
     #[inline]
     fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
-        Some(match self {
-            ParamEnv::Single(m) => m,
-            ParamEnv::Overlay { base, .. } => base,
-        })
+        match self {
+            ParamEnv::Single(m) => Some(m),
+            ParamEnv::Overlay { .. } => None,
+        }
     }
 
     #[inline]
@@ -22970,7 +22976,7 @@ pub fn resolve_type_width_env<P: ParamLookup>(
                     if let (Some(l), Some(r)) = (lv, rv) {
                         let w = ((l - r).abs() + 1) as u64;
                         if w > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
-                            culprit = Some(describe_packed_range(left, right, l, r, params.map(|p| p.as_hashmap_base()).flatten()));
+                            culprit = Some(describe_packed_range(left, right, l, r, params.map(ParamLookup::to_hashmap).as_deref()));
                         }
                         dims_desc.push_str(&format!("[{}:{}]", l, r));
                         if first_span.is_none() {
@@ -25023,7 +25029,7 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
         // fallback below only fires when the declaration isn't visible, and
         // silently assumes $clog2 semantics (wrong for floor-log2 variants).
         ExprKind::Call { func, args } => {
-            if let Some(v) = const_eval_user_call(expr, params.map(|p| p.as_hashmap_base()).flatten()) {
+            if let Some(v) = const_eval_user_call(expr, params.map(ParamLookup::to_hashmap).as_deref()) {
                 return v.to_i64();
             }
             let fname = match &func.kind {
@@ -29244,8 +29250,7 @@ fn unpacked_dims_elem_count<P: ParamLookup>(
             // dimension keyed by a "type" (the parser cannot tell a type from
             // a constant); a parameter that names no type is a size.
             UnpackedDimension::Associative { .. } => params
-                .and_then(|p| p.as_hashmap_base())
-                .and_then(|base| assoc_dim_const_size(d, base))
+                .and_then(|p| assoc_dim_const_size(d, &p.to_hashmap()))
                 .map_or(1, |v| v.clamp(1, u32::MAX as i64) as u32),
             _ => 1,
         };
@@ -32188,13 +32193,13 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
         // in a generate-for body, which otherwise packed as 0. The result
         // keeps the function's declared return type.
         ExprKind::Call { .. } => {
-            const_eval_user_call(expr, Some(params.as_hashmap_base().expect("param base")))
+            const_eval_user_call(expr, Some(&params.to_hashmap()))
                 .unwrap_or_else(|| Value::zero(32))
         }
         // §10.9: a typed pattern has its type's value, packed against the
         // typedef snapshot.
         ExprKind::TypedPattern { ty, pattern } => {
-            let base = params.as_hashmap_base().expect("param base");
+            let base = &params.to_hashmap();
             TYPEDEF_TYPES_TLS.with(|types| {
                 TYPEDEF_WIDTHS_TLS.with(|widths| {
                     let (types, widths) = (types.borrow(), widths.borrow());
@@ -47666,9 +47671,8 @@ fn const_fn_struct_pattern_actual<P: ParamLookup>(
     let port = port.filter(|p| p.dimensions.is_empty())?;
     let inlined = inline_instance_typedefs(&port.data_type);
     let empty = HashMap::default();
-    let base = params
-        .and_then(ParamLookup::as_hashmap_base)
-        .unwrap_or(&empty);
+    let snapshot = params.map(ParamLookup::to_hashmap);
+    let base = snapshot.as_deref().unwrap_or(&empty);
     pack_struct_const_value(
         inlined.as_ref().unwrap_or(&port.data_type),
         expr,
@@ -47693,9 +47697,8 @@ fn const_function_actual<P: ParamLookup>(
     };
     if let Some(port) = port.filter(|p| p.dimensions.is_empty()) {
         let empty = HashMap::default();
-        let base = params
-            .and_then(ParamLookup::as_hashmap_base)
-            .unwrap_or(&empty);
+        let snapshot = params.map(ParamLookup::to_hashmap);
+        let base = snapshot.as_deref().unwrap_or(&empty);
         if let Some(target) = param_integral_target(
             &port.data_type,
             &HashMap::default(),
@@ -49202,10 +49205,10 @@ fn const_fn_call_name(func: &Expression) -> Option<(String, Option<String>)> {
 /// constant function with the constants of the class (its parameters bound
 /// from the `#(...)` arguments, read in the calling scope) in view. None
 /// when `func` names no static function of a class, or it cannot be folded.
-fn const_class_static_call(
+fn const_class_static_call<P: ParamLookup>(
     func: &Expression,
     args: &[Expression],
-    params: &HashMap<String, Value>,
+    params: Option<&P>,
     elab: &ElaboratedModule,
     depth: u32,
 ) -> Option<Value> {
@@ -49239,9 +49242,9 @@ fn const_class_static_call(
     {
         return None;
     }
-    let mut env = params.clone();
+    let mut env = params.map(|p| p.to_hashmap().into_owned()).unwrap_or_default();
     let mut consts = Vec::new();
-    if class_spec_consts(cls_name, &spec_args, params, 0, &mut consts).is_some() {
+    if class_spec_consts(cls_name, &spec_args, &env, 0, &mut consts).is_some() {
         env.extend(consts);
     } else if !spec_args.is_empty() {
         return None;
@@ -49263,7 +49266,7 @@ fn const_class_static_call(
             elab,
         ));
     }
-    eval_const_user_function(fd, &argv, &env, elab, depth + 1)
+    eval_const_user_function(fd, &argv, Some(&env), elab, depth + 1)
 }
 
 /// Rewrite `expr`, replacing each call to a KNOWN simple user function with the

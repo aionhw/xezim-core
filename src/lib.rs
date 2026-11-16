@@ -226,7 +226,9 @@ pub use value::Value;
 ///         folded in parameter initializers, and the declared type of named packed array ports
 ///         (§7.2, §13.8, §7.4.1).
 /// \x44 = \x43 + compilation-unit variables and nets only in the definitions that name them (§3.12.1, §6.7).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x44";
+/// \x45 = \x44 + procedural parameter declarations, corrected parameter overlays,
+///         alias/port resolution and separate zero-rise gate/net delays.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x45";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

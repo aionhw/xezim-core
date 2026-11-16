@@ -68,7 +68,7 @@ impl ParamLookup for ArrayShapeEnv<'_> {
     }
     #[inline]
     fn as_hashmap_base(&self) -> Option<&HashMap<String, Value>> {
-        Some(self.base)
+        None
     }
 }
 
