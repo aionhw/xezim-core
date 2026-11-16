@@ -621,7 +621,9 @@ pub(crate) fn for_each_block_label(stmt: &Statement, f: &mut dyn FnMut(&Identifi
             let opens_scope = stmts.iter().any(|s| {
                 matches!(
                     s.kind,
-                    StatementKind::VarDecl { .. } | StatementKind::Typedef(_)
+                    StatementKind::VarDecl { .. }
+                        | StatementKind::ParamDecl { .. }
+                        | StatementKind::Typedef(_)
                 )
             });
             if !opens_scope {

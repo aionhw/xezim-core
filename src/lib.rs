@@ -2716,10 +2716,14 @@ fn parse_and_elaborate(
                         map.remove(&p.name.name);
                     }
                     for it in items {
-                        if let ast::stmt::StatementKind::VarDecl { declarators, .. } = &it.kind {
-                            for d in declarators {
-                                map.remove(&d.name.name);
+                        match &it.kind {
+                            ast::stmt::StatementKind::VarDecl { declarators, .. }
+                            | ast::stmt::StatementKind::ParamDecl { declarators, .. } => {
+                                for d in declarators {
+                                    map.remove(&d.name.name);
+                                }
                             }
+                            _ => {}
                         }
                     }
                     if map.is_empty() {
@@ -3706,6 +3710,11 @@ fn parse_and_elaborate(
     // §6.7.1: a net delay delays every driver of the net. Before the fold
     // below, which then resolves the drivers it moves onto a driver-side net.
     elaborate::apply_net_delays(&mut elab);
+    // §10.11: the names an `alias` statement names are ONE physical net.
+    // The unification renames the group's members onto one name, so their
+    // drivers resolve together and every read of any of them sees the
+    // resolved value.
+    elaborate::unify_alias_nets(&mut elab);
     // §6.6.1: a net with several continuous drivers resolves them all.
     elaborate::resolve_multi_driver_nets(&mut elab);
     elab_phase("net delays and multi-driver nets", &mut phase_t);

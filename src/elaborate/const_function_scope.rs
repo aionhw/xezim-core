@@ -8,7 +8,7 @@
 //! listed starts from just the entries it can read; any other body keeps the
 //! whole copy, and its result cannot differ from before.
 
-use super::{CONST_FN_PACKAGE, ElaboratedModule, const_fn_call_name};
+use super::{CONST_FN_PACKAGE, ElaboratedModule, ParamLookup, const_fn_call_name};
 use crate::ast::decl::FunctionDeclaration;
 use crate::ast::expr::{BinaryOp, ExprKind, Expression, UnaryOp};
 use crate::ast::stmt::{ForInit, Statement, StatementKind as SK};
@@ -20,9 +20,9 @@ use crate::value::Value;
 /// its body can read (all of them when `read_names` cannot list them), with
 /// `caller_params` laid over them. A caller whose scope is the table itself
 /// (a call from the top module or a package) adds nothing to it.
-pub(super) fn initial_locals(
+pub(super) fn initial_locals<P: ParamLookup>(
     fd: &FunctionDeclaration,
-    caller_params: &HashMap<String, Value>,
+    caller_params: Option<&P>,
     elab: &ElaboratedModule,
 ) -> HashMap<String, Value> {
     let mut locals = match read_names(fd, elab) {
@@ -45,14 +45,23 @@ pub(super) fn initial_locals(
             }
             locals
         }
-        None => elab.parameters.clone(),
+        // The body reads a construct `read_names` cannot enumerate, so it may
+        // read ANY module parameter. They are served by the overlay's `base`
+        // row (the whole module parameter table) during evaluation, so the
+        // locals map does not clone them here — only caller-scope rows that
+        // differ from the module table (enclosing-function locals, instance
+        // value parameters) reach this owned map.
+        None => HashMap::default(),
     };
-    if !std::ptr::eq(caller_params, &elab.parameters) {
-        locals.extend(
-            caller_params
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
-        );
+    if let Some(cp) = caller_params {
+        for (name, value) in cp.rows() {
+            // A module-parameter row is already answered by the overlay base;
+            // copying it into locals would be a redundant per-call clone.
+            if elab.parameters.get(name) == Some(value) {
+                continue;
+            }
+            locals.insert(name.to_owned(), value.clone());
+        }
     }
     locals
 }
@@ -111,6 +120,11 @@ fn stmt(st: &Statement, elab: &ElaboratedModule, names: &mut Vec<String>) -> Opt
             }
         }
         SK::VarDecl {
+            data_type,
+            declarators,
+            ..
+        }
+        | SK::ParamDecl {
             data_type,
             declarators,
             ..
