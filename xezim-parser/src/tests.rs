@@ -261,6 +261,43 @@ fn test_interfaces_modports() {
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
 }
 
+// IEEE 1800-2023 §25.3 / §25.7: a method prototype ends before the signal item.
+#[test]
+fn test_modport_method_prototypes() {
+    let prefix = "interface bus_if; int value; task put(input int n); endtask function int get(input int a, input int b); return a+b; endfunction ";
+    for member in [
+        "import task put(input int n)",
+        "export task put(input int)",
+        "import function int get(input int a, input int b)",
+    ] {
+        let result = parse(&format!(
+            "{prefix} modport user({member}, input value); endinterface"
+        ));
+        assert!(result.errors.is_empty(), "{member}: {:?}", result.errors);
+    }
+    for member in [
+        "import task (input int n)",
+        "import task put(input int n int)",
+        "import task put(input int n) input value",
+        "import function :final int get()",
+    ] {
+        let result = parse(&format!("{prefix} modport user({member}); endinterface"));
+        assert!(!result.errors.is_empty(), "accepted {member}");
+    }
+    // An unclosed argument list must diagnose the semicolon, before trailing modules.
+    let source = format!(
+        "{prefix} modport user(import task put(input int n; endinterface {}",
+        "module m; endmodule ".repeat(1000)
+    );
+    let result = parse(&source);
+    assert!(!result.errors.is_empty());
+    assert!(
+        result.errors[0].span.start <= source.find("n; endinterface").unwrap() + 1,
+        "{:?}",
+        result.errors[0]
+    );
+}
+
 #[test]
 fn test_module_header_imports() {
     let source = "
