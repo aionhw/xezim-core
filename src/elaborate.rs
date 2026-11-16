@@ -19990,36 +19990,11 @@ fn elaborate_items(
                         let chain2 =
                             resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone();
                         if let DataType::Struct(su) = &chain2 {
-                            // IEEE 1800-2023 §7.2: an UNPACKED generate-scope
-                            // struct (or tagged-union-free plain union gone
-                            // through register_unpacked_aggregate below) is
-                            // PER-MEMBER storage, mirroring the
-                            // module-scope/`elaborate_module_with_defs` arm at
-                            // ~13462 and the child-instance path in
-                            // `inline_module_items`. Without the member leaves,
-                            // a member write created an ad-hoc runtime entry and
-                            // a member read of an unwritten struct fell through
-                            // the suffix scan into ANOTHER struct's member — two
-                            // distinct variables (e.g. `g.a` and `g.b`) silently
-                            // SHARED one cell.
-                            //
-                            // §6.6.7: a NETTYPE over an unpacked struct is
-                            // stored the same way. Its resolution function
-                            // writes the members one by one, so a nettype net
-                            // declared in a generate scope needs the member
-                            // leaves too — without them the resolved value
-                            // landed nowhere and the formal on the other side
-                            // of a port connection read the default.
-                            let is_nettype = match &dd.data_type {
-                                DataType::TypeReference { name, .. } => {
-                                    elab.nettype_resolvers.contains_key(&name.name.name)
-                                }
-                                _ => false,
-                            };
+                            // §7.2 / §27.3: each generated aggregate owns its
+                            // member cells and collection/type metadata, just
+                            // like a module-scope aggregate.
                             if !su.packed
-                                && !(matches!(su.kind, StructUnionKind::Union)
-                                    && !su.tagged)
-                                && (struct_contains_real(su, elab) || is_nettype)
+                                && !(matches!(su.kind, StructUnionKind::Union) && !su.tagged)
                             {
                                 register_unpacked_aggregate(
                                     elab,
@@ -23315,30 +23290,6 @@ pub fn is_type_real_resolved(dt: &DataType, typedef_types: &HashMap<String, Data
         }
     }
     is_type_real(cur)
-}
-
-/// Whether an UNPACKED struct (or union) contains at least one REAL/shortreal
-/// member, resolving each member's type through typedefs. Issue #1099's shared-
-/// storage bug bites REAL members only: integral members are already stored per
-/// variable in the distinct base signals (`g.a`, `g.b`), but an unregistered
-/// real member read falls through into another struct variable's member and
-/// two variables silently share one cell. Registering the member leaves of a
-/// real-containing struct gives each variable independent real storage. Pure-
-/// integral / collection / packed structs are left on their (working) lazy
-/// paths so unrelated collection/string/event behavior is untouched.
-fn struct_contains_real(su: &crate::ast::types::StructUnionType, elab: &ElaboratedModule) -> bool {
-    // Recursive: a nested unpacked struct member counts too (its own leaves
-    // are registered by the nested `register_unpacked_aggregate` call).
-    su.members.iter().any(|member| {
-        if is_type_real_resolved(&member.data_type, &elab.typedef_types) {
-            return true;
-        }
-        let chain = resolve_typedef_chain(&member.data_type, &elab.typedef_types);
-        match chain {
-            DataType::Struct(nested) => struct_contains_real(&nested, elab),
-            _ => false,
-        }
-    })
 }
 
 /// `is_type_signed` that resolves a typedef reference (`typedef logic signed
@@ -29332,6 +29283,24 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
     // typedef names the SAME type it aliases).
     let real = is_type_real_resolved(dt, &elab.typedef_types);
     let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
+    // §7.2 / §6.16 / §6.17: member access retains the declared type,
+    // including string formatting, event identity and packed dimensions.
+    elab.var_decl_types.insert(name.to_string(), dt.clone());
+    if matches!(&resolved, DataType::Simple { kind: SimpleType::String, .. }) {
+        elab.string_signals.insert(name.to_string());
+    }
+    if matches!(&resolved, DataType::Simple { kind: SimpleType::Event, .. }) {
+        elab.events.insert(name.to_string());
+    }
+    let (elem_width, dims) = packed_member_meta(
+        dt, &elab.parameters, &elab.typedefs, &elab.typedef_types,
+    );
+    if let Some(width) = elem_width {
+        elab.packed_signal_elem_widths.insert(name.to_string(), width);
+    }
+    if let Some(dims) = dims {
+        elab.packed_full_dims.insert(name.to_string(), dims);
+    }
     // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
     // rounds to binary32 (16777216.25 -> 16777216.0). Mark the leaf so the
     // runtime rounds it; a `real` (binary64) keeps every bit.
@@ -57358,7 +57327,7 @@ fn process_import(
                                             data_type,
                                         );
                                         param_fallback_set(&assign.name.name, &v);
-                                        
+
                                         elab.set_param(
                                             line!(),
                                             assign.name.name.clone(),
@@ -57831,7 +57800,7 @@ fn process_import(
                                             data_type,
                                         );
                                         param_fallback_set(&assign.name.name, &v);
-                                        
+
                                         elab.set_param(
                                             line!(),
                                             assign.name.name.clone(),
