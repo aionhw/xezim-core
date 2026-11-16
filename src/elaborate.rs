@@ -59203,3 +59203,25 @@ mod shared_map_tests {
         reset_const_eval_snapshots();
     }
 }
+
+#[cfg(test)]
+mod review_overlay_probe {
+    use super::*;
+    #[test]
+    fn overlay_values_reach_constant_call_arguments() {
+        let parsed = crate::parse("module m; function automatic int f(input int x); return x; endfunction localparam X=f(P); endmodule");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(m) = &parsed.source.descriptions[0] else { panic!() };
+        let ModuleItem::FunctionDeclaration(fd) = &m.items[0] else { panic!() };
+        let ModuleItem::LocalparamDeclaration(pd) = &m.items[1] else { panic!() };
+        let ParameterKind::Data { assignments, .. } = &pd.kind else { panic!() };
+        let expr = assignments[0].init.as_ref().unwrap();
+        let old = FUNCS_TLS.with(|c| c.replace(Some(Rc::new(HashMap::from_iter([("f".into(),fd.clone())])))));
+        let base = HashMap::from_iter([("P".into(),Value::from_u64(3,32))]);
+        let top = HashMap::from_iter([("P".into(),Value::from_u64(9,32))]);
+        let env = ParamEnv::Overlay { base: &base, top: &top };
+        let actual = eval_const_expr_val_env(expr,&env).to_u64();
+        FUNCS_TLS.with(|c| c.replace(old));
+        assert_eq!(actual,Some(9));
+    }
+}
