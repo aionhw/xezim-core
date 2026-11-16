@@ -37787,6 +37787,8 @@ fn collect_body_driven_names(
 struct InlineCache {
     /// Prepared bodies (`prepare_module_items`).
     prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
+    /// Whether preparation leaves value-parameter references symbolic.
+    value_independent: HashMap<(String, usize), bool>,
     /// §23.10 / §27 (#721): the distinct prepared bodies of each definition,
     /// by content. Parameter values that change no generate choice, range or
     /// declaration (an index passed down a generate loop) yield equal bodies;
@@ -37999,8 +38001,27 @@ fn prepare_module_items(
     cache: &mut InlineCache,
     param_scope: &param_scope::ParamScope,
 ) -> Rc<PreparedModuleItems> {
+    // §6.20 / §23.10 (#721): these items retain symbolic ranges and
+    // initializers until instance elaboration. Preparing them again for each
+    // parameter value only clones and compares the same syntax. Keep this
+    // whitelist conservative: generate expansion, statement-local dimensions,
+    // typedef folding and instance-array expansion consume parameter values.
+    let value_independent = *cache.value_independent
+        .entry(param_scope::def_key(&source_def))
+        .or_insert_with(|| source_def.items().iter().all(|item| matches!(item,
+            ModuleItem::DataDeclaration(_)
+                | ModuleItem::NetDeclaration(_)
+                | ModuleItem::ParameterDeclaration(_)
+                | ModuleItem::LocalparamDeclaration(_)
+                | ModuleItem::PortDeclaration(_)
+                | ModuleItem::ContinuousAssign(_)
+        )));
     let cache_key = type_bindings(source_def, typedef_widths)
-        .map(|types| param_scope.prepared_key(source_def, definitions, local_params, types));
+        .map(|types| if value_independent {
+            param_scope::PreparedKey::value_independent(source_def, types)
+        } else {
+            param_scope.prepared_key(source_def, definitions, local_params, types)
+        });
     if let Some(prepared) = cache_key.as_ref().and_then(|(k, _)| cache.prepared.get(k)) {
         note_prep_lookup(true, 0);
         return Rc::clone(prepared);
