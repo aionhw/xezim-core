@@ -59204,7 +59204,7 @@ mod shared_map_tests {
 }
 
 #[cfg(test)]
-mod review_overlay_probe {
+mod constant_overlay_tests {
     use super::*;
     #[test]
     fn overlay_values_reach_constant_call_arguments() {
@@ -59219,8 +59219,14 @@ mod review_overlay_probe {
         let base = HashMap::from_iter([("P".into(),Value::from_u64(3,32))]);
         let top = HashMap::from_iter([("P".into(),Value::from_u64(9,32))]);
         let env = ParamEnv::Overlay { base: &base, top: &top };
-        let actual = eval_const_expr_val_env(expr,&env).to_u64();
+        let upper = HashMap::from_iter([("P".into(), Value::from_u64(11, 32))]);
+        let stacked = StackedParamEnv { base: &env, top: &upper };
+        let actual = eval_const_expr_val_env(expr, &env).to_u64();
+        let nested = eval_const_expr_val_env(expr, &stacked).to_u64();
+        let integer = const_eval_i64_with_params_env(expr, Some(&env));
         FUNCS_TLS.with(|c| c.replace(old));
-        assert_eq!(actual,Some(9));
+        assert_eq!(actual, Some(9));
+        assert_eq!(nested, Some(11));
+        assert_eq!(integer, Some(9));
     }
 }
