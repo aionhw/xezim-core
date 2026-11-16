@@ -20068,13 +20068,27 @@ fn elaborate_items(
                                     }
                                 }
                             } else {
-                                // §7.2, §27: an unpacked struct declared in
-                                // a generate block is stored member by
-                                // member, as the module-scope arm stores
-                                // one. Left as a single vector, a 4-state
-                                // or handle member kept x through every
-                                // write (aionhw/xezim#1161).
-                                register_unpacked_aggregate(elab, &decl.name.name, &dd.data_type);
+                                // §7.2, §27: upstream #1161 added an unconditional
+                                // per-member re-registration for unpacked structs
+                                // declared in a generate block, to keep a 4-state or
+                                // handle (mailbox/semaphore) member from staying x
+                                // through every write. That storage is ALREADY
+                                // established by the top-of-arm
+                                // `register_unpacked_aggregate`/member machinery this
+                                // branch refactored (#1099), which registers each
+                                // member (real, packed, string, event, handle,
+                                // associative/dynamic/queue) with its true type and
+                                // independent storage. Re-running it here fires only
+                                // for non-real non-packed unpacked structs and
+                                // RE-registers string/event/enum members against the
+                                // preceding member's offset, re-introducing leading
+                                // padding (`%s`), broken event waits, packed/enum
+                                // selects reading the flattened vector, and
+                                // module/generate name-sake aliasing. #1161's handles
+                                // already construct and start null without it
+                                // (builtin_class_struct_members_1161 passes either
+                                // way), so the unconditional re-registration is
+                                // redundant and is dropped.
                             }
                         }
                     }
@@ -49202,10 +49216,10 @@ fn const_fn_call_name(func: &Expression) -> Option<(String, Option<String>)> {
 /// constant function with the constants of the class (its parameters bound
 /// from the `#(...)` arguments, read in the calling scope) in view. None
 /// when `func` names no static function of a class, or it cannot be folded.
-fn const_class_static_call(
+fn const_class_static_call<P: ParamLookup>(
     func: &Expression,
     args: &[Expression],
-    params: &HashMap<String, Value>,
+    params: Option<&P>,
     elab: &ElaboratedModule,
     depth: u32,
 ) -> Option<Value> {
@@ -49239,9 +49253,11 @@ fn const_class_static_call(
     {
         return None;
     }
-    let mut env = params.clone();
+    let mut env: HashMap<String, Value> = params
+        .map(|p| p.rows().into_iter().map(|(k, v)| (k.to_owned(), v.clone())).collect())
+        .unwrap_or_default();
     let mut consts = Vec::new();
-    if class_spec_consts(cls_name, &spec_args, params, 0, &mut consts).is_some() {
+    if class_spec_consts(cls_name, &spec_args, &env, 0, &mut consts).is_some() {
         env.extend(consts);
     } else if !spec_args.is_empty() {
         return None;
@@ -49263,7 +49279,7 @@ fn const_class_static_call(
             elab,
         ));
     }
-    eval_const_user_function(fd, &argv, &env, elab, depth + 1)
+    eval_const_user_function(fd, &argv, Some(&env), elab, depth + 1)
 }
 
 /// Rewrite `expr`, replacing each call to a KNOWN simple user function with the
