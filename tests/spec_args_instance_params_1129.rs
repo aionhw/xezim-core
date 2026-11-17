@@ -78,3 +78,31 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn virtual_interface_types_do_not_qualify_homonymous_instances() {
+    let mut d = elaborate(r#"
+interface bus #(parameter W=4); logic [W-1:0] data; endinterface
+package p;
+  class db #(type T=int); static function int id(); return 1; endfunction endclass
+endpackage
+module leaf #(parameter W=4)(output int a, b);
+  import p::*;
+  bus #(W) bus();
+  assign a = db#(virtual bus#(W))::id();
+  assign b = db#(virtual interface bus#(W))::id();
+endmodule
+module top;
+  int a,b;
+  leaf u(a,b);
+endmodule
+"#);
+    d.materialize_pending();
+    let mut texts = Vec::new();
+    for ca in &d.continuous_assigns { spec_texts(&ca.rhs, &mut texts); }
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    for text in texts {
+        assert!(!text.contains("u.bus"), "{text}");
+        assert!(text.contains("u.W"), "{text}");
+    }
+}
