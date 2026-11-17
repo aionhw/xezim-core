@@ -622,7 +622,8 @@ impl Value {
     }
 
     /// Normalize a binary op's operands when either is a §5.7.1 fill value:
-    /// the fill side widens (by bit replication) to the other side's width.
+    /// the fill side widens (by bit replication) to the other side's integral
+    /// width, or keeps its self-determined 1-bit width for a real operand.
     /// Returns None on the hot path (no fill involved).
     ///
     /// Every binary operator starts with this, so the hot path must be nothing
@@ -633,7 +634,18 @@ impl Value {
     #[inline(always)]
     fn fill_pair(&self, other: &Value) -> Option<(Value, Value)> {
         if self.is_fill || other.is_fill {
-            Some(self.fill_pair_cold(other))
+            Some(self.fill_pair_cold(other, true))
+        } else {
+            None
+        }
+    }
+
+    /// Keep the existing case-matching path (§12.5) separate from numeric
+    /// comparison normalization.
+    #[inline(always)]
+    fn case_fill_pair(&self, other: &Value) -> Option<(Value, Value)> {
+        if self.is_fill || other.is_fill {
+            Some(self.fill_pair_cold(other, false))
         } else {
             None
         }
@@ -641,8 +653,14 @@ impl Value {
 
     #[cold]
     #[inline(never)]
-    fn fill_pair_cold(&self, other: &Value) -> (Value, Value) {
-        let w = self.width.max(other.width).max(1);
+    fn fill_pair_cold(&self, other: &Value, real_context: bool) -> (Value, Value) {
+        // §5.7.1, §11.8.2: a non-real operand is self-determined before
+        // conversion to real. A real's storage width is not a fill context.
+        let w = if real_context && (self.is_real || other.is_real) {
+            1
+        } else {
+            self.width.max(other.width).max(1)
+        };
         let a = if self.is_fill {
             self.fill_at(w)
         } else {
@@ -3423,7 +3441,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn case_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.fill_pair(other) {
+        if let Some((a, b)) = self.case_fill_pair(other) {
             return a.case_eq(&b);
         }
         // === operator: compares including X/Z. §11.4.5/§11.6.1: operands of
@@ -3494,7 +3512,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn casez_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.fill_pair(other) {
+        if let Some((a, b)) = self.case_fill_pair(other) {
             return a.casez_eq(&b);
         }
         let w = self.width.max(other.width) as usize;
@@ -3552,7 +3570,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn casex_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.fill_pair(other) {
+        if let Some((a, b)) = self.case_fill_pair(other) {
             return a.casex_eq(&b);
         }
         let w = self.width.max(other.width) as usize;
