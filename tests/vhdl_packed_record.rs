@@ -226,3 +226,80 @@ end architecture;
         "an aggregate initial value was packed"
     );
 }
+
+const PROCEDURE_DELAYED_FIELDS: &str = r#"
+entity t is end;
+architecture a of t is
+  type rec_t is record
+    a : bit;
+    b : bit;
+  end record;
+  type arr_t is array (0 to 1) of rec_t;
+  signal r : arr_t;
+  procedure put(signal a : out bit; signal b : out bit) is
+  begin
+    a <= '1' after 2 ns;
+    b <= '1' after 1 ns;
+  end procedure;
+begin
+  process begin
+    put(r(0).a, r(0).b);
+    wait for 3 ns;
+    assert r(0).a = '1' and r(0).b = '1'
+      report "delayed procedure fields lost a transaction" severity failure;
+    report "PASS procedure delayed fields" severity note;
+    wait;
+  end process;
+end architecture;
+"#;
+
+/// §14.7.2 / §10.5.2.2: signal formals can hide independently timed field
+/// writes; passing scalar fields must retain the per-element drivers.
+#[test]
+fn procedure_signal_fields_keep_the_per_element_form() {
+    let sv = lowered(PROCEDURE_DELAYED_FIELDS);
+    assert!(
+        !sv.contains("bit [3:0] vh_s"),
+        "procedure signal actuals bypassed the packing gate"
+    );
+    assert!(sv.contains("vh_drs_"), "the delayed transactions were lost");
+}
+
+const NESTED_INITIAL_VALUE: &str = r#"
+entity t is end;
+architecture a of t is
+  type rec_t is record
+    a : bit;
+    b : bit;
+  end record;
+  type arr_t is array (0 to 1) of rec_t;
+  type outer_t is record
+    child : arr_t;
+  end record;
+  constant initial_value : outer_t :=
+    (child => (others => (a => '1', b => '0')));
+  signal holder : outer_t := initial_value;
+  signal r : arr_t;
+begin
+  process begin
+    r(0).a <= '1';
+    wait for 1 ns;
+    assert holder.child(0).a = '1' and holder.child(0).b = '0'
+       and holder.child(1).a = '1' and holder.child(1).b = '0'
+      report "nested initialized array lost its record fields" severity failure;
+    report "PASS nested initial value" severity note;
+    wait;
+  end process;
+end architecture;
+"#;
+
+/// §14.4.2.5: admitting one direct signal must not change the same base
+/// type's initialized values when it is stored inside another record.
+#[test]
+fn nested_record_array_type_reuse_is_not_packed() {
+    let sv = lowered(NESTED_INITIAL_VALUE);
+    assert!(
+        !sv.contains("bit [3:0] vh_s"),
+        "a nested use of the admitted base type was packed"
+    );
+}
