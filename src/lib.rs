@@ -2561,17 +2561,26 @@ fn parse_and_elaborate(
         (&top_level_lets, &top_level_binds, &top_level_ooc_constraints),
         (&top_level_imports, &class_defs, &typedef_defs),
     ));
-    for def in definitions.values() {
-        let refs = match def {
-            SourceDefinition::Module(d) => unit_param_usage.references(d),
-            SourceDefinition::Interface(d) => unit_param_usage.references(d),
-            SourceDefinition::Program(d) => unit_param_usage.references(d),
-            SourceDefinition::Class(d) => unit_param_usage.references(d),
-            SourceDefinition::Package(d) => unit_param_usage.references(d),
-            SourceDefinition::Typedef(d) => unit_param_usage.references(d),
-            SourceDefinition::Udp(d) => unit_param_usage.references(d),
+    // §23.9 (#721): a constant a module, interface or program reads by its
+    // bare name resolves in that definition, so only that definition needs
+    // its declaration. Every other spelling keeps the constant everywhere,
+    // as do the uses of the other kinds of definition.
+    let mut own_unit_params: std::collections::HashMap<String, crate::hasher::HashSet<String>> =
+        Default::default();
+    for (def_name, def) in definitions.iter() {
+        let (refs, heads) = match def {
+            SourceDefinition::Module(d) => unit_param_usage.references_by_scope(d),
+            SourceDefinition::Interface(d) => unit_param_usage.references_by_scope(d),
+            SourceDefinition::Program(d) => unit_param_usage.references_by_scope(d),
+            SourceDefinition::Class(d) => (unit_param_usage.references(d), Default::default()),
+            SourceDefinition::Package(d) => (unit_param_usage.references(d), Default::default()),
+            SourceDefinition::Typedef(d) => (unit_param_usage.references(d), Default::default()),
+            SourceDefinition::Udp(d) => (unit_param_usage.references(d), Default::default()),
         };
         needed_unit_params.extend(refs);
+        if !heads.is_empty() {
+            own_unit_params.insert(def_name.clone(), unit_param_usage.close(heads));
+        }
     }
     // Library modules are adopted below, after unit injection. Their bodies
     // may contain hierarchical references into these definitions that this
@@ -2885,8 +2894,13 @@ fn parse_and_elaborate(
                 }
                 // §3.12.1: keep shadowed constants under their qualified
                 // names, and bind dependent initializers/ranges to that copy.
+                let own_params = own_unit_params.get(def_name);
                 for p in top_level_params.iter().rev() {
-                    let needed = |name: &str| retain_all || needed_unit_params.contains(name);
+                    let needed = |name: &str| {
+                        retain_all
+                            || needed_unit_params.contains(name)
+                            || own_params.is_some_and(|own| own.contains(name))
+                    };
                     let keep = match &p.kind {
                         ast::decl::ParameterKind::Data { assignments, .. } => {
                             assignments.iter().any(|a| needed(&a.name.name))
