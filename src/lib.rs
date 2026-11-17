@@ -1351,23 +1351,28 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 errs.join("\n")
             ));
         }
-        // §3.13, §8.3, §26.2: a scope holds one class or package of a name.
-        // The name-keyed tables used to replace (or be replaced by) the first
-        // without a word.
+        // §3.13, §6.18, §8.3, §26.2: a scope holds one class/typedef/package
+        // of a name. The name-keyed tables used to replace (or be replaced by)
+        // the first without a word.
         let dup = duplicate_definitions.check_file(
             &source_ast.descriptions,
             &preprocessed,
             line_map.as_ref(),
             label,
+            i,
         );
-        if !dup.is_empty() {
+        for w in dup.warnings {
+            progress_clear();
+            elab_diag(w);
+        }
+        if !dup.errors.is_empty() {
             progress_clear();
             return Err(format!(
                 "Duplicate definition in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
                 sources.len(),
-                dup.join("\n")
+                dup.errors.join("\n")
             ));
         }
         for d in &source_ast.descriptions {
@@ -2233,8 +2238,8 @@ fn parse_and_elaborate(
                 // §6.18: a bare forward typedef (`typedef name;`) must not
                 // displace a real definition of the same name — `typedef_test_0`
                 // restates the forward name after the full `typedef int name;`.
-                // Forward → insert only if absent; real → always (replaces a
-                // prior forward placeholder).
+                // Forward → insert only if absent; real → keep the first real
+                // definition (for cross-file identical typedefs).
                 if t.forward {
                     // A bare forward typedef (`typedef name;`) is a placeholder;
                     // it must not displace a real definition of the same name —
@@ -2245,6 +2250,13 @@ fn parse_and_elaborate(
                     definitions
                         .entry(name)
                         .or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
+                } else if !matches!(t.data_type, ast::types::DataType::Void(_))
+                    && typedef_defs
+                        .get(&name)
+                        .is_some_and(|prev| !matches!(prev.data_type, ast::types::DataType::Void(_)))
+                {
+                    // An identical cross-file typedef already filled this slot;
+                    // keep the first definition.
                 } else {
                     // Real typedef: keep it in the dedicated registry so a
                     // same-named hierarchy kind (module/interface/program/
