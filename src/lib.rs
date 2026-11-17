@@ -78,7 +78,7 @@ pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
 mod body_type_params;
-mod duplicate_classes;
+mod duplicate_definitions;
 mod param_override_lists;
 pub mod scope_tree;
 pub mod shared_names;
@@ -229,7 +229,8 @@ pub use value::Value;
 /// \x44 = \x43 + compilation-unit variables and nets only in the definitions that name them (§3.12.1, §6.7).
 /// \x45 = \x44 + procedural parameter declarations, corrected parameter overlays,
 ///         alias/port resolution and separate zero-rise gate/net delays.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x45";
+/// \x46 = \x45 + parameter declaration ownership for waveform scopes (§26.3, §21.7.2.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x46";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1224,7 +1225,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     let mut src_file_of_module: crate::hasher::HashMap<String, u32> =
         crate::hasher::HashMap::default();
     let mut pp = new_design_preprocessor(include_dirs, defines);
-    let mut duplicate_classes = duplicate_classes::DuplicateClasses::default();
+    let mut duplicate_definitions = duplicate_definitions::DuplicateDefinitions::default();
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
@@ -1350,23 +1351,28 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 errs.join("\n")
             ));
         }
-        // §3.13, §8.3: a scope holds one class of a name. The class tables
-        // are keyed by name, so a second definition used to replace (or be
-        // replaced by) the first without a word.
-        let dup = duplicate_classes.check_file(
+        // §3.13, §6.18, §8.3, §26.2: a scope holds one class/typedef/package
+        // of a name. The name-keyed tables used to replace (or be replaced by)
+        // the first without a word.
+        let dup = duplicate_definitions.check_file(
             &source_ast.descriptions,
             &preprocessed,
             line_map.as_ref(),
             label,
+            i,
         );
-        if !dup.is_empty() {
+        for w in dup.warnings {
+            progress_clear();
+            elab_diag(w);
+        }
+        if !dup.errors.is_empty() {
             progress_clear();
             return Err(format!(
-                "Duplicate class definition in '{}' (file {} of {}):\n{}",
+                "Duplicate definition in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
                 sources.len(),
-                dup.join("\n")
+                dup.errors.join("\n")
             ));
         }
         for d in &source_ast.descriptions {
@@ -1768,19 +1774,44 @@ fn design_declared_names(
     names
 }
 
-/// A module, interface or program name already taken by another of them: only
-/// one definition survives, so a list written for another cannot be judged.
-fn note_if_redefined(definitions: &crate::hasher::HashMap<String, SourceDefinition>, name: &str) {
-    if matches!(
-        definitions.get(name),
-        Some(
-            SourceDefinition::Module(_)
-                | SourceDefinition::Interface(_)
-                | SourceDefinition::Program(_)
-        )
-    ) {
-        param_override_lists::note_redefined_module(name);
+fn def_kind_name(def: &SourceDefinition) -> Option<&'static str> {
+    match def {
+        SourceDefinition::Module(_) => Some("module"),
+        SourceDefinition::Interface(_) => Some("interface"),
+        SourceDefinition::Program(_) => Some("program"),
+        SourceDefinition::Udp(_) => Some("primitive"),
+        _ => None,
     }
+}
+
+/// A module, interface, program or primitive name already taken by another of
+/// them (§3.13): warn that the later definition overwrites the earlier one,
+/// and mark the name so parameter-override lists are not judged against the
+/// wrong body.
+fn note_if_redefined(
+    definitions: &crate::hasher::HashMap<String, SourceDefinition>,
+    name: &str,
+    new_kind: &str,
+) {
+    let Some(prev_kind) = definitions.get(name).and_then(def_kind_name) else {
+        return;
+    };
+    param_override_lists::note_redefined_module(name);
+    let msg = if prev_kind == new_kind {
+        let clause = match new_kind {
+            "module" => "§3.3",
+            "interface" => "§3.13, §25.3",
+            _ => "§3.13",
+        };
+        format!(
+            "[xezim][warning] {new_kind} '{name}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 {clause})"
+        )
+    } else {
+        format!(
+            "[xezim][warning] {new_kind} '{name}' redefines earlier {prev_kind} '{name}'; the later definition overwrites the earlier one (IEEE 1800-2017 §3.13)"
+        )
+    };
+    elab_diag(msg);
 }
 
 fn parse_and_elaborate(
@@ -2110,13 +2141,7 @@ fn parse_and_elaborate(
                 hoist_nested(&mut m, &mut nested);
                 for n in nested {
                     let nname = n.name.name.clone();
-                    if definitions.contains_key(&nname) {
-                        param_override_lists::note_redefined_module(&nname);
-                        log_eprintln(&format!(
-                            "[xezim][warning] module '{}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 \u{00a7}3.3)",
-                            nname
-                        ));
-                    }
+                    note_if_redefined(&definitions, &nname, "module");
                     let (unit_s, prec_s) = eff_ts.get(&nname).copied().unwrap_or((tick_s, tick_s));
                     let mut n = n;
                     elaborate::rewrite_module_delays_pub(&mut n.items, unit_s, prec_s, tick_s);
@@ -2124,24 +2149,13 @@ fn parse_and_elaborate(
                     definitions.insert(nname, SourceDefinition::Module(Rc::new(n)));
                 }
                 let name = m.name.name.clone();
-                // Only a same-kind collision (module overwriting module) is a
-                // genuine §3.3 redefinition worth warning about — and the module
-                // then legitimately wins. A module with the SAME name as an
-                // existing class/interface/package is legal (§3.13: hierarchy
-                // and data namespaces are separate); `class_defs` preserves the
-                // class, so no warning and no data loss.
-                note_if_redefined(&definitions, &name);
-                if matches!(definitions.get(&name), Some(SourceDefinition::Module(_))) {
-                    // The reference simulator ACCEPTS a redefinition with a
-                    // warning and the LAST definition wins (measured:
-                    // "Existing module 'm' ... will be overwritten", the
-                    // second body's output appears). Rejecting broke multi-
-                    // file flows that deliberately override a module.
-                    log_eprintln(&format!(
-                        "[xezim][warning] module '{}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 \u{00a7}3.3)",
-                        name
-                    ));
-                }
+                // The reference simulator ACCEPTS a definitions-namespace
+                // redefinition with a warning and the LAST definition wins.
+                // Rejecting broke multi-file flows that deliberately override a
+                // module/interface. A class/package/typedef with the SAME name
+                // is legal (§3.13: separate namespaces), so `note_if_redefined`
+                // matches only module/interface/program/primitive.
+                note_if_redefined(&definitions, &name, "module");
                 // Pre-scale this module's delays from its own timeunit to the
                 // global tick (no-op when both are 1 ns).
                 // Every module's delays are pre-scaled to the global tick, even
@@ -2164,7 +2178,7 @@ fn parse_and_elaborate(
                 let mut i = i;
                 elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut i.params, unit_s, prec_s);
-                note_if_redefined(&definitions, &name);
+                note_if_redefined(&definitions, &name, "interface");
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
             ast::Description::Program(mut p) => {
@@ -2175,7 +2189,7 @@ fn parse_and_elaborate(
                 elaborate::rewrite_module_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut p.params, unit_s, prec_s);
                 top_module = Some(name.clone());
-                note_if_redefined(&definitions, &name);
+                note_if_redefined(&definitions, &name, "program");
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
             ast::Description::Class(mut c) => {
@@ -2186,7 +2200,7 @@ fn parse_and_elaborate(
                 // Always keep the class in its own registry so a same-named
                 // module cannot clobber it (see `class_defs`). Into
                 // `definitions` it goes ONLY when the name is free of a
-                // hierarchy kind (module/interface/program) — a class and a
+                // hierarchy kind (module/interface/program/UDP) — a class and a
                 // module may share a name (§3.13), and if the module came
                 // first we must not evict it from the name-keyed slot the
                 // top-module/instantiation walkers rely on. In that case the
@@ -2195,7 +2209,8 @@ fn parse_and_elaborate(
                 match definitions.get(&name) {
                     Some(SourceDefinition::Module(_))
                     | Some(SourceDefinition::Interface(_))
-                    | Some(SourceDefinition::Program(_)) => {}
+                    | Some(SourceDefinition::Program(_))
+                    | Some(SourceDefinition::Udp(_)) => {}
                     _ => {
                         definitions.insert(name, SourceDefinition::Class(rc));
                     }
@@ -2232,8 +2247,8 @@ fn parse_and_elaborate(
                 // §6.18: a bare forward typedef (`typedef name;`) must not
                 // displace a real definition of the same name — `typedef_test_0`
                 // restates the forward name after the full `typedef int name;`.
-                // Forward → insert only if absent; real → always (replaces a
-                // prior forward placeholder).
+                // Forward → insert only if absent; real → keep the first real
+                // definition (for cross-file identical typedefs).
                 if t.forward {
                     // A bare forward typedef (`typedef name;`) is a placeholder;
                     // it must not displace a real definition of the same name —
@@ -2244,6 +2259,13 @@ fn parse_and_elaborate(
                     definitions
                         .entry(name)
                         .or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
+                } else if !matches!(t.data_type, ast::types::DataType::Void(_))
+                    && typedef_defs
+                        .get(&name)
+                        .is_some_and(|prev| !matches!(prev.data_type, ast::types::DataType::Void(_)))
+                {
+                    // An identical cross-file typedef already filled this slot;
+                    // keep the first definition.
                 } else {
                     // Real typedef: keep it in the dedicated registry so a
                     // same-named hierarchy kind (module/interface/program/
@@ -2257,7 +2279,8 @@ fn parse_and_elaborate(
                     match definitions.get(&name) {
                         Some(SourceDefinition::Module(_))
                         | Some(SourceDefinition::Interface(_))
-                        | Some(SourceDefinition::Program(_)) => {}
+                        | Some(SourceDefinition::Program(_))
+                        | Some(SourceDefinition::Udp(_)) => {}
                         _ => {
                             definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
                         }
@@ -2353,6 +2376,7 @@ fn parse_and_elaborate(
                 // leaving the cursor on a trailing UDP (an instantiated,
                 // non-candidate name) correctly forces that heuristic instead of
                 // pinning a trivial trailing program/package.
+                note_if_redefined(&definitions, &name, "primitive");
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Udp(Rc::new(u)));
             }

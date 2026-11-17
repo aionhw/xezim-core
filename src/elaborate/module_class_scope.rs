@@ -50,6 +50,7 @@ pub(super) fn spec_args_text(
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
+    let mut virtual_type = false;
     while i < b.len() {
         let c = b[i];
         let start = i;
@@ -72,7 +73,12 @@ pub(super) fn spec_args_text(
             let tok = &text[start..i];
             let before = text[..start].trim_end();
             let after = text[i..].trim_start();
-            if local_names.contains(tok)
+            // §25.9 / §3.13: the name after `virtual [interface]` is
+            // an interface TYPE, even when an instance has the same name.
+            // Its parameter expressions still refer to the module scope.
+            let interface_type = virtual_type && tok != "interface";
+            virtual_type = tok == "virtual" || (virtual_type && tok == "interface");
+            if !interface_type && local_names.contains(tok)
                 && !before.ends_with('.')
                 && !before.ends_with("::")
                 && !after.starts_with("::")

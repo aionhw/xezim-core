@@ -3729,11 +3729,13 @@ impl Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.less_than(&b);
         }
-        if self.has_xz() || other.has_xz() {
-            return Value::new(1);
-        }
+        // §11.4.4, §6.12.1: convert to real (X/Z bits become zero)
+        // before applying the integral-only unknown-operand rule.
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() < other.to_f64()) as u64, 1);
+        }
+        if self.has_xz() || other.has_xz() {
+            return Value::new(1);
         }
         if self.width > 64 || other.width > 64 {
             return Value::from_u64((self.wide_cmp(other) == std::cmp::Ordering::Less) as u64, 1);
@@ -3757,11 +3759,13 @@ impl Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.less_equal(&b);
         }
-        if self.has_xz() || other.has_xz() {
-            return Value::new(1);
-        }
+        // §11.4.4, §6.12.1: convert to real (X/Z bits become zero)
+        // before applying the integral-only unknown-operand rule.
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() <= other.to_f64()) as u64, 1);
+        }
+        if self.has_xz() || other.has_xz() {
+            return Value::new(1);
         }
         if self.width > 64 || other.width > 64 {
             return Value::from_u64(
@@ -4283,6 +4287,10 @@ impl fmt::Display for Value {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "value_real_relational_tests.rs"]
+mod real_relational_tests;
 
 #[cfg(test)]
 mod tests {

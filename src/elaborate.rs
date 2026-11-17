@@ -3857,6 +3857,8 @@ pub struct ElaboratedModule {
     #[serde(default)]
     pub program_initial_blocks: Vec<InitialBlock>,
     pub parameters: HashMap<String, Value>,
+    /// §26.3 / §21.7.2.3: actual parameter declarations, excluding lookup aliases.
+    pub declared_parameters: HashSet<String>,
     /// Typedef name -> width mapping for user-defined types.
     pub typedefs: TypedefTable,
     /// §7.4.1: for a typedef whose target is a packed array of packed
@@ -4493,6 +4495,9 @@ impl ElaboratedModule {
     /// somewhere else (a package's enum member, an imported parameter) the
     /// hint would confidently name the wrong file.
     pub fn note_decl_site(&mut self, name: &str, span: Span, kind: &str, own_scope: bool) {
+        if own_scope && kind == "parameter/localparam" {
+            self.declared_parameters.insert(name.to_string());
+        }
         if span.start == 0 && span.end == 0 {
             return;
         }
@@ -4603,6 +4608,7 @@ impl ElaboratedModule {
             static_init_blocks: Vec::new(),
             program_initial_blocks: Vec::new(),
             parameters: HashMap::default(),
+            declared_parameters: HashSet::default(),
             typedefs: TypedefTable::default(),
             typedef_types: SharedMap::default(),
             nettype_resolvers: HashMap::default(),
@@ -10390,6 +10396,7 @@ pub fn elaborate_module_with_defs(
         } = &param.kind
         {
             for assign in assignments {
+                elab.declared_parameters.insert(assign.name.name.clone());
                 // IEEE 1800-2023: keyed assignment-pattern parameter
                 // (associative array literal). Materialize the entries
                 // as `<param>["key"]` signals before falling into the
@@ -10612,7 +10619,7 @@ pub fn elaborate_module_with_defs(
                     .as_ref()
                     .map(|dt| resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)))
                     .unwrap_or(1);
-                let is_signed = port.data_type.as_ref().map(is_type_signed).unwrap_or(false);
+                let is_signed = port.data_type.as_ref().map(|dt| is_type_signed_resolved(dt, &elab.typedef_types)).unwrap_or(false);
                 let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
                 // §6.18/§7.4: a port declared with an ARRAY typedef
                 // (`typedef logic [A-1:0] T[B]; input T x;`) inherits the
@@ -11273,7 +11280,7 @@ pub fn elaborate_module_with_defs(
                 };
                 let width =
                     resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&pd.data_type);
+                let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&pd.data_type);
                 let ranged = matches!(&pd.data_type,
                     DataType::Implicit { dimensions, .. } | DataType::IntegerVector { dimensions, .. }
@@ -11508,7 +11515,7 @@ pub fn elaborate_module_with_defs(
                 check_net_data_type(nd, &elab)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&nd.data_type);
+                let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
                     // §7.6: net arrays retain left-to-right declaration order too.
@@ -19256,7 +19263,7 @@ fn elaborate_items(
                 };
                 let width =
                     resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&pd.data_type);
+                let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
@@ -19361,7 +19368,7 @@ fn elaborate_items(
                 check_net_data_type(nd, elab)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&nd.data_type);
+                let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
                     // §7.6: net arrays retain left-to-right declaration order too.
@@ -29317,7 +29324,8 @@ fn const_dim_indices(
 
 fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) {
     let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
-    let signed = is_type_signed(dt);
+    // §6.18: unpacked members retain the signing of an aliased type.
+    let signed = is_type_signed_resolved(dt, &elab.typedef_types);
     // A member typed by a TYPEDEF (`typedef shortreal F; F v;`) reached this
     // point as a type REFERENCE, so the unresolved test said "not a real" and
     // the leaf was stored as an integral vector — the f64 bit pattern then
@@ -40495,6 +40503,20 @@ fn inline_module_items(
         cache,
         param_scope,
     );
+    // Keep declaration ownership after flattening (§26.3, §21.7.2.3).
+    // Imported lookup aliases never enter this set.
+    for pd in source_def.params().iter().chain(
+        prepared_source.effective_items.iter().filter_map(|item| match item {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+            _ => None,
+        }),
+    ) {
+        if let ParameterKind::Data { assignments, .. } = &pd.kind {
+            for a in assignments {
+                elab.declared_parameters.insert(format!("{}{}", prefix, a.name.name));
+            }
+        }
+    }
     // §23.11/§27: only active generate branches contribute declarations.
     for item in &prepared_source.effective_items {
         if let ModuleItem::Bind(b) = item {
@@ -43618,7 +43640,7 @@ fn inline_module_items(
                                         is_signed: port
                                             .data_type
                                             .as_ref()
-                                            .map(is_type_signed)
+                                            .map(|dt| is_type_signed_resolved(dt, &elab.typedef_types))
                                             .unwrap_or(false),
                                         is_real,
                                         direction: port.direction,
@@ -43970,7 +43992,7 @@ fn inline_module_items(
                                 Some(&sub_local_params),
                                 Some(&elab.typedefs),
                             );
-                            let is_signed = is_type_signed(&pd.data_type);
+                            let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
                             for decl in &pd.declarators {
                                 let sig_name = cat2(&inst_prefix, &decl.name.name);
                                 let dims = if decl.dimensions.is_empty() {
@@ -44269,6 +44291,25 @@ fn inline_module_items(
                                     // Simulator::new from the array metadata.
                                     continue;
                                 }
+                                // §6.18 / §7.2.1: a net keeps its typedef's
+                                // member layout, just like a variable or port.
+                                elab.var_decl_types.insert(sig_name.clone(),
+                                    scope_local_typerefs(&nd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                if matches!(resolve_typedef_chain(&nd.data_type, &elab.typedef_types),
+                                    DataType::Struct(su) if su.packed)
+                                    && let Some(fields) = flatten_struct_fields(
+                                    &nd.data_type, &sub_merged_params,
+                                    &elab.typedefs, &elab.typedef_types,
+                                ) {
+                                    if !fields.is_empty() {
+                                        let element_width = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                        if element_width > 0 && width > element_width && width % element_width == 0 {
+                                            elab.packed_signal_elem_widths.insert(sig_name.clone(), element_width);
+                                        }
+                                        tls_register_struct_layout(&sig_name, &fields);
+                                        elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                    }
+                                }
                                 let net_is_real =
                                     is_type_real_resolved(&nd.data_type, &elab.typedef_types);
                                 register_net_type(
@@ -44286,7 +44327,7 @@ fn inline_module_items(
                                         is_const: false,
                                         name: sig_name.into(),
                                         width,
-                                        is_signed: is_type_signed(&nd.data_type),
+                                        is_signed: is_type_signed_resolved(&nd.data_type, &elab.typedef_types),
                                         // Resolved through the typedef table so a
                                         // NETTYPE net declared in a submodule
                                         // (`rnet n;`) is real like its top-level
@@ -46239,8 +46280,13 @@ fn inline_module_items(
                                 .map(|(_, d)| d.clone())
                                 .or_else(|| a.init.clone());
                             if let Some(dt) = dt {
-                                let resolved =
+                                let mut resolved =
                                     resolve_typedef_chain(&dt, &elab.typedef_types).clone();
+                                // Same fold as the scoped alias below. Statement
+                                // substitution (`word_t'(imm)`) bakes this
+                                // binding in, and a later eval of `Cfg.W`
+                                // against the flat table reads 0.
+                                lsdd_data_type(&mut resolved, &sub_merged_params);
                                 pend_type_binds.insert(a.name.name.clone(), resolved);
                             }
                         }
@@ -46255,7 +46301,18 @@ fn inline_module_items(
                     // restored. Keep an instance-qualified alias for `new`,
                     // reflection and member access through those variables.
                     let key = cat2(&inst_prefix, name);
-                    let scoped = scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix);
+                    let mut scoped =
+                        scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix);
+                    // §6.20.3: `localparam type word_t = logic [Cfg.W-1:0]`
+                    // still names the member. The formal is renamed to this
+                    // scoped key and its geometry is read from the flat
+                    // parameter table. That table holds the struct value;
+                    // the dotted member is only in this instance's map, so
+                    // the bound evaluates as 0 and the formal is
+                    // `logic [-1:0]` while its value keeps the real width.
+                    // A part-select of it is then x. Fold the bounds with
+                    // this instance's map before the alias is stored.
+                    lsdd_data_type(&mut scoped, &sub_merged_params);
                     let width =
                         resolve_type_width(&scoped, Some(&sub_merged_params), Some(&elab.typedefs));
                     typedefs_insert_traced(
@@ -58774,10 +58831,13 @@ mod prepared_process_ownership_tests {
             ("typedef logic [W-1:0] word_t; word_t v;", 2),
             ("initial begin logic [W-1:0] v; v = W; end", 2),
         ] {
-            let parsed = crate::parse(&format!(
+            let mut parsed = crate::parse(&format!(
                 "module leaf #(parameter W=4)(output logic [W-1:0] out); {body} endmodule"
             ));
             assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+            // Preparation consumes the bound AST in production. Generate
+            // declarations need those identities before their scope is renamed.
+            let _ = bind::audit_design(&mut parsed.source.descriptions);
             let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
                 panic!("module expected");
             };
