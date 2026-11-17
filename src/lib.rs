@@ -2455,6 +2455,7 @@ fn parse_and_elaborate(
         && top_level_assertion_decls.is_empty()
         && top_level_vars.is_empty()
         && top_level_nets.is_empty()
+        && top_level_dpi_imports.is_empty()
     {
         None
     } else if let Some(name) = named_top {
@@ -2487,7 +2488,17 @@ fn parse_and_elaborate(
             })
             .map(|(name, _)| name.clone())
     };
-    let unit_usage = unit_subroutine_usage::Usage::new(&top_level_functions, &top_level_tasks);
+    // §3.12.1 / §35.5.4 (#721): a unit DPI import is a unit subroutine. A
+    // definition receives the imports it names, or that a unit subroutine
+    // or declaration it receives names; copying every import into every
+    // definition held one declaration per import and definition, twice
+    // (the injected item and its prepared copy). The carrier keeps them all,
+    // and an import registers under its one global name wherever it is.
+    let unit_usage = unit_subroutine_usage::Usage::new(
+        &top_level_functions,
+        &top_level_tasks,
+        &top_level_dpi_imports,
+    );
     let common_unit_refs = unit_usage.references(&(
         &top_level_nettypes,
         &top_level_params,
@@ -2495,7 +2506,6 @@ fn parse_and_elaborate(
         &top_level_nets,
         &top_level_covergroups,
         &top_level_assertion_decls,
-        &top_level_dpi_imports,
         &top_level_dpi_exports,
     ));
 
@@ -2620,6 +2630,12 @@ fn parse_and_elaborate(
                     .filter(|t| !t.name.has_scope())
                     .map(|t| (t.name.name.name.clone(), unit_storage_usage.references(t))),
             )
+            .chain(top_level_dpi_imports.iter().map(|di| {
+                (
+                    unit_subroutine_usage::dpi_import_name(di),
+                    unit_storage_usage.references(di),
+                )
+            }))
             .filter(|(_, refs)| !refs.is_empty())
             .collect();
 
@@ -2811,12 +2827,15 @@ fn parse_and_elaborate(
                     items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
                 }
                 for di in top_level_dpi_imports.iter().rev() {
+                    let name = unit_subroutine_usage::dpi_import_name(di);
+                    if needed_unit_subs
+                        .as_ref()
+                        .is_some_and(|needed| !needed.contains(&name))
+                    {
+                        continue;
+                    }
                     // A module's own import of the same name shadows the
                     // $unit one (§3.12.1); do not inject a duplicate.
-                    let name = match &di.proto {
-                        ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
-                        ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
-                    };
                     let own = items.iter().any(|it| {
                         matches!(it, ast::decl::ModuleItem::DPIImport(x)
                         if match &x.proto {

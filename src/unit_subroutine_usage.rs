@@ -10,6 +10,14 @@ use serde::{Serialize, ser};
 
 type Error = serde::de::value::Error;
 
+/// The SystemVerilog name a DPI import declares (§35.5.4).
+pub(crate) fn dpi_import_name(import: &crate::ast::decl::DPIImport) -> String {
+    match &import.proto {
+        crate::ast::decl::DPIProto::Function(f) => f.name.name.name.clone(),
+        crate::ast::decl::DPIProto::Task(t) => t.name.name.name.clone(),
+    }
+}
+
 pub(crate) struct Usage {
     names: HashSet<String>,
     deps: HashMap<String, HashSet<String>>,
@@ -20,6 +28,7 @@ impl Usage {
     pub(crate) fn new(
         functions: &[crate::ast::decl::FunctionDeclaration],
         tasks: &[crate::ast::decl::TaskDeclaration],
+        dpi_imports: &[crate::ast::decl::DPIImport],
     ) -> Self {
         let names = functions
             .iter()
@@ -31,6 +40,7 @@ impl Usage {
                     .filter(|t| !t.name.has_scope())
                     .map(|t| t.name.name.name.clone()),
             )
+            .chain(dpi_imports.iter().map(dpi_import_name))
             .collect();
         let mut usage = Self {
             names,
@@ -52,6 +62,14 @@ impl Usage {
                 .entry(t.name.name.name.clone())
                 .or_default()
                 .extend(refs);
+        }
+        // §35.5.4: an import has no body, but its prototype can read another
+        // unit subroutine (a default argument). Its own name is not a use.
+        for import in dpi_imports {
+            let name = dpi_import_name(import);
+            let mut refs = usage.references(import);
+            refs.remove(&name);
+            usage.deps.entry(name).or_default().extend(refs);
         }
         usage
     }
