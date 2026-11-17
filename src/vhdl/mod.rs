@@ -271,6 +271,12 @@ pub fn inject(
     let Some(cfg) = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return Ok(None);
     };
+    let _phase = crate::oom_trace::scope(
+        "vhdl.parse",
+        cfg.files.first().map_or("", |file| file.path.as_str()),
+        top.unwrap_or(""),
+        "",
+    );
     let mut msgs = Vec::new();
     let mut parsed = Vec::new();
     for f in &cfg.files {
@@ -323,8 +329,17 @@ pub fn inject(
         .map(|f| f.library.clone())
         .zip(parsed)
         .collect();
+    crate::oom_trace::checkpoint("vhdl.analyze", &[("vhdl_files", cfg.files.len())]);
     let mut analysed = sema::analyze(files, vhdl_top.as_deref(), &mixed, cfg.options.std)
         .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
+    crate::oom_trace::checkpoint(
+        "vhdl.lower",
+        &[
+            ("vhdl_objects", analysed.design.objects.len()),
+            ("vhdl_architectures", analysed.design.archs.len()),
+            ("vhdl_subprograms", analysed.design.subprograms.len()),
+        ],
+    );
     // An SV top (named, or an SV module nothing instantiates) leaves the
     // VHDL top level out unless that is named.
     let from_vhdl: std::collections::HashSet<String> = analysed
@@ -351,11 +366,22 @@ pub fn inject(
     }
     let lowered = lower::lower(&analysed, &names, cfg.options)
         .map_err(|e| format!("{}\nVHDL: {} error(s)", e.join("\n"), e.len()))?;
+    // The generated source owns the lowered design. Its SV parser does not
+    // need to retain the original VHDL syntax and semantic tables as well.
+    drop(analysed);
     if std::env::var_os("XEZIM_VHDL_DUMP").is_some() {
         eprintln!("{}", lowered.sv);
     }
     foreign::rewrite(descriptions, &roots, &names);
+    crate::oom_trace::checkpoint(
+        "vhdl.parse_generated",
+        &[("generated_sv_bytes", lowered.sv.len())],
+    );
     descriptions.extend(parse_generated(&lowered.sv)?);
+    crate::oom_trace::checkpoint(
+        "vhdl.injected",
+        &[("descriptions", descriptions.len())],
+    );
     Ok(lowered.top)
 }
 
@@ -385,12 +411,20 @@ const GENERATED_SPAN_BASE: usize = 1 << 41;
 /// Parse the lowered design's SystemVerilog text.
 fn parse_generated(text: &str) -> Result<Vec<Description>, String> {
     let mut tokens = crate::sv_parser::lexer::Lexer::new(text).tokenize();
+    crate::oom_trace::checkpoint(
+        "vhdl.generated_tokens",
+        &[("generated_sv_bytes", text.len()), ("tokens", tokens.len())],
+    );
     for t in &mut tokens {
         t.span.start += GENERATED_SPAN_BASE;
         t.span.end += GENERATED_SPAN_BASE;
     }
     let mut parser = crate::sv_parser::parse::Parser::new(tokens);
     let source = parser.parse_source_text();
+    crate::oom_trace::checkpoint(
+        "vhdl.generated_ast",
+        &[("descriptions", source.descriptions.len())],
+    );
     let errors: Vec<String> = parser
         .diagnostics()
         .iter()

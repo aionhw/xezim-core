@@ -1987,7 +1987,15 @@ impl<'a> Lw<'a> {
 
     pub(super) fn module(&mut self, top: usize) -> String {
         let d = self.d;
+        let arch = &d.archs[top];
+        let _phase = crate::oom_trace::scope(
+            "vhdl.lower.elaborate",
+            d.files.get(arch.loc.file).map_or("", |file| file.path.as_str()),
+            &arch.entity,
+            &arch.entity,
+        );
         self.elaborate(top);
+        self.trace_lowering("vhdl.lower.processes");
         // A root instantiated from SV: its ports.
         let ports = if self.boundary.is_some() {
             self.boundary_ports(top)
@@ -2255,11 +2263,13 @@ impl<'a> Lw<'a> {
         // Drivers and signal updates (their resolution functions are
         // lowered with the subprograms).
         self.temps.clear();
+        self.trace_lowering("vhdl.lower.drivers");
         let drv = self.drivers_sv(&mut elab);
         // Temporaries of drivers' initial values (port defaults).
         for (n, t) in std::mem::take(&mut self.temps) {
             let _ = writeln!(elab_temps, "    {} {};", t, n);
         }
+        self.trace_lowering("vhdl.lower.updates");
         let (upd, upd_sigs) = self.updates_sv();
         self.lower_subprograms();
         for n in 0..self.imps.len() {
@@ -2290,6 +2300,7 @@ impl<'a> Lw<'a> {
                 t = t
             );
         }
+        self.trace_lowering("vhdl.lower.kernel");
         let k = self.kernel(&upd_sigs);
 
         // Assemble.
@@ -2382,7 +2393,26 @@ impl<'a> Lw<'a> {
         m.push_str(&procs);
         m.push_str(&k);
         m.push_str("endmodule\n");
+        crate::oom_trace::checkpoint(
+            "vhdl.lower.assembled",
+            &[("generated_sv_bytes", m.len()), ("drivers", self.drivers.len())],
+        );
         m
+    }
+
+    /// O(1) table sizes identify the active lowering stage without an AST
+    /// census or retaining per-instance diagnostic history.
+    fn trace_lowering(&self, phase: &str) {
+        if crate::oom_trace::enabled() {
+            crate::oom_trace::checkpoint(phase, &[
+                ("instances", self.insts.len()),
+                ("signals", self.sigs.len()),
+                ("processes", self.procs.len()),
+                ("drivers", self.drivers.len()),
+                ("links", self.links.len()),
+                ("subprogram_bytes", self.sub_items.len()),
+            ]);
+        }
     }
 
     fn lower_subprograms(&mut self) {
@@ -2707,8 +2737,9 @@ impl<'a> Lw<'a> {
 
     fn sig_drivers(&self, s: usize) -> Vec<(usize, Driver)> {
         self.drivers
-            .iter()
-            .filter(|((x, _), _)| *x == s)
+            // Drivers are ordered by (signal, process). Visit only this
+            // signal's range, retaining process order and pseudo drivers.
+            .range((s, 0)..=(s, usize::MAX))
             .map(|((_, p), d)| (*p, d.clone()))
             .collect()
     }
