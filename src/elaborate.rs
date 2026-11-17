@@ -29324,7 +29324,8 @@ fn const_dim_indices(
 
 fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) {
     let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
-    let signed = is_type_signed(dt);
+    // §6.18: unpacked members retain the signing of an aliased type.
+    let signed = is_type_signed_resolved(dt, &elab.typedef_types);
     // A member typed by a TYPEDEF (`typedef shortreal F; F v;`) reached this
     // point as a type REFERENCE, so the unresolved test said "not a real" and
     // the leaf was stored as an integral vector — the f64 bit pattern then
