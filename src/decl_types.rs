@@ -1,0 +1,182 @@
+//! Declared types of signals (IEEE 1800-2023 §6.8), one shared copy per
+//! declaration (aionhw/xezim#721).
+//!
+//! Every signal records the data type it was declared with. The instances of
+//! a definition declare the same types, and so do the declarators of one
+//! declaration; holding a private copy of the type tree in each signal's
+//! entry made it the largest per-signal cost of a design. A [`DeclTypeMap`]
+//! holds each type behind an `Rc`, and a [`DeclTypeInterner`] hands the
+//! signals of one declaration the same one.
+//!
+//! A shared type is immutable. Its contextual evaluator caches (widths,
+//! resolved names) are disabled, so reading it for one instance never leaves
+//! a result behind for another; what a name in a dimension resolves to stays
+//! a property of the signal the type is read for.
+
+use crate::ast::types::DataType;
+use crate::hasher::{DeterministicState, HashMap};
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map;
+use std::hash::{BuildHasher, Hasher};
+use std::rc::Rc;
+
+/// Signal name to declared type, with the borrowed `String`-key API of the
+/// map it replaces. Serde keeps the plain map representation: a shared type
+/// is written once per entry and read back as an entry of its own.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeclTypeMap(HashMap<String, Rc<DataType>>);
+
+impl DeclTypeMap {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn get(&self, name: &str) -> Option<&DataType> {
+        self.0.get(name).map(|ty| &**ty)
+    }
+    /// The entry itself, for a caller that records the same type again.
+    pub fn get_shared(&self, name: &str) -> Option<&Rc<DataType>> {
+        self.0.get(name)
+    }
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+    /// The type of `name`, for changing it. A type other signals hold too is
+    /// copied first: they keep the one they had.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut DataType> {
+        self.0.get_mut(name).map(Rc::make_mut)
+    }
+    /// Record `ty` for `name` alone. Returns the type `name` had.
+    pub fn insert(&mut self, name: String, ty: DataType) -> Option<Rc<DataType>> {
+        self.0.insert(name, Rc::new(ty))
+    }
+    /// Record a type that other signals hold too.
+    pub fn insert_shared(&mut self, name: String, ty: Rc<DataType>) -> Option<Rc<DataType>> {
+        self.0.insert(name, ty)
+    }
+    pub fn remove(&mut self, name: &str) -> Option<Rc<DataType>> {
+        self.0.remove(name)
+    }
+    /// The entry of `name`, to give it a type when it has none.
+    pub fn entry(&mut self, name: String) -> Entry<'_> {
+        Entry(self.0.entry(name))
+    }
+    pub fn retain(&mut self, mut keep: impl FnMut(&String, &DataType) -> bool) {
+        self.0.retain(|name, ty| keep(name, ty));
+    }
+    /// The entries themselves, for code that moves them between tables.
+    pub fn as_map(&self) -> &HashMap<String, Rc<DataType>> {
+        &self.0
+    }
+    pub fn as_map_mut(&mut self) -> &mut HashMap<String, Rc<DataType>> {
+        &mut self.0
+    }
+    pub fn iter(&self) -> Iter<'_> {
+        Iter(self.0.iter())
+    }
+    pub fn keys(&self) -> hash_map::Keys<'_, String, Rc<DataType>> {
+        self.0.keys()
+    }
+    pub fn values(&self) -> impl Iterator<Item = &DataType> {
+        self.0.values().map(|ty| &**ty)
+    }
+}
+
+impl std::ops::Index<&str> for DeclTypeMap {
+    type Output = DataType;
+    fn index(&self, name: &str) -> &DataType {
+        &self.0[name]
+    }
+}
+
+pub struct Entry<'a>(hash_map::Entry<'a, String, Rc<DataType>>);
+
+impl Entry<'_> {
+    pub fn or_insert_with(self, make: impl FnOnce() -> DataType) {
+        self.0.or_insert_with(|| Rc::new(make()));
+    }
+    pub fn or_insert(self, ty: DataType) {
+        self.0.or_insert_with(|| Rc::new(ty));
+    }
+}
+
+pub struct Iter<'a>(hash_map::Iter<'a, String, Rc<DataType>>);
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a String, &'a DataType);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(name, ty)| (name, &**ty))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<'a> IntoIterator for &'a DeclTypeMap {
+    type Item = (&'a String, &'a DataType);
+    type IntoIter = Iter<'a>;
+    fn into_iter(self) -> Iter<'a> {
+        self.iter()
+    }
+}
+
+/// One shared copy of each declared type of each definition, for the length
+/// of an inlining pass.
+///
+/// The hash only selects candidates. Equality is the definition's name and
+/// the complete serialized syntax, spans included, kept beside each shared
+/// type so a lookup encodes the incoming type once: the fields serde skips
+/// are the evaluator caches, disabled in a shared copy, and the lexical
+/// bindings (§23.9), which one definition assigns the same way to the same
+/// source text.
+#[derive(Default)]
+pub(crate) struct DeclTypeInterner {
+    types: HashMap<(u64, usize), Vec<(Box<str>, Box<[u8]>, Rc<DataType>)>>,
+    encoded: Vec<u8>,
+    #[cfg(test)]
+    pub(crate) copies: usize,
+}
+
+impl DeclTypeInterner {
+    /// The shared copy of `ty` as definition `owner` declares it.
+    pub(crate) fn intern(&mut self, ty: &DataType, owner: &str) -> Rc<DataType> {
+        self.encoded.clear();
+        if bincode::serde::encode_into_std_write(ty, &mut self.encoded, crate::xez_bincode_config())
+            .is_err()
+        {
+            return Self::shared_copy(ty);
+        }
+        let mut hash = DeterministicState::default().build_hasher();
+        hash.write(owner.as_bytes());
+        hash.write_u8(0xff);
+        hash.write(&self.encoded);
+        let bucket = self
+            .types
+            .entry((hash.finish(), self.encoded.len()))
+            .or_default();
+        for (candidate_owner, candidate_syntax, candidate) in bucket.iter() {
+            if **candidate_owner == *owner && **candidate_syntax == *self.encoded {
+                return Rc::clone(candidate);
+            }
+        }
+        let shared = Self::shared_copy(ty);
+        #[cfg(test)]
+        {
+            self.copies += 1;
+        }
+        bucket.push((
+            owner.into(),
+            self.encoded.as_slice().into(),
+            Rc::clone(&shared),
+        ));
+        shared
+    }
+
+    /// A copy no evaluation can leave a scope-dependent result in.
+    fn shared_copy(ty: &DataType) -> Rc<DataType> {
+        Rc::new(crate::ast::cache::without_scope_caches(|| ty.clone()))
+    }
+}

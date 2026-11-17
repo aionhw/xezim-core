@@ -75,6 +75,7 @@ pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
 mod ast_intern;
 pub mod oom_trace;
 pub mod bits2;
+pub mod decl_types;
 pub mod elaborate;
 pub mod packed_value;
 mod body_type_params;

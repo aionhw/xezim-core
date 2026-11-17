@@ -4169,7 +4169,7 @@ pub struct ElaboratedModule {
     /// `associative_arrays`. Drives the type-directed `%p` renderer
     /// (LRM §21.2.1.7), which must walk nested structs/arrays/enums.
     #[serde(default)]
-    pub var_decl_types: HashMap<String, DataType>,
+    pub var_decl_types: crate::decl_types::DeclTypeMap,
     /// Value parameter -> its declared type, for an explicitly typed one
     /// (`localparam e_t RST`), keyed as in `parameters`. The self-determined
     /// type of a parameter (§6.20.2), e.g. for a `default:` key (§10.9.1).
@@ -4761,7 +4761,7 @@ impl ElaboratedModule {
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             struct_field_range_idents: HashMap::default(),
-            var_decl_types: HashMap::default(),
+            var_decl_types: Default::default(),
             param_decl_types: SharedNameMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
@@ -38840,6 +38840,9 @@ struct InlineCache {
     /// §6.20.3 / §20.7: equal type bindings and their independent width/query
     /// snapshots are immutable. Keep one copy through deferred rewriting.
     type_binds: context_maps::MapInterner<DataType>,
+    /// §6.8: one copy of each declared type of each definition, shared by
+    /// the signals its instances declare with it.
+    decl_types: crate::decl_types::DeclTypeInterner,
     type_widths: context_maps::MapInterner<u32>,
     type_queries: context_maps::MapInterner<TypeQueryDims>,
     /// Per definition, the typedefs its imports bind, one list per import.
@@ -40374,6 +40377,43 @@ fn scope_local_typerefs(
             DataType::Enum(e2)
         }
         _ => dt.clone(),
+    }
+}
+
+/// Whether `scope_local_typerefs` would change `dt`: it names a typedef the
+/// instance declares itself, directly or in a member or an enum base.
+fn names_local_typedef(dt: &DataType, local_names: &std::collections::HashSet<String>) -> bool {
+    match dt {
+        DataType::TypeReference { name, .. } => {
+            name.scopes.is_empty() && local_names.contains(&name.name.name)
+        }
+        DataType::Struct(su) => su
+            .members
+            .iter()
+            .any(|m| names_local_typedef(&m.data_type, local_names)),
+        DataType::Enum(e) => e
+            .base_type
+            .as_ref()
+            .is_some_and(|b| names_local_typedef(b, local_names)),
+        _ => false,
+    }
+}
+
+/// §6.8 (#721): the declared type a signal of an instance records. A type
+/// that names no typedef of the instance reads the same for every instance
+/// of the definition, so those signals share the definition's one copy; a
+/// type that does is scoped to the instance and belongs to the signal.
+fn instance_decl_type(
+    pool: &mut crate::decl_types::DeclTypeInterner,
+    dt: &DataType,
+    local_names: &std::collections::HashSet<String>,
+    prefix: &str,
+    owner: &str,
+) -> Rc<DataType> {
+    if names_local_typedef(dt, local_names) {
+        Rc::new(scope_local_typerefs(dt, local_names, prefix))
+    } else {
+        pool.intern(dt, owner)
     }
 }
 
@@ -43691,12 +43731,14 @@ fn inline_module_items(
                                         &elab.typedef_types,
                                         &saved_type_binds,
                                     ) {
-                                        elab.var_decl_types.insert(
+                                        elab.var_decl_types.insert_shared(
                                             sig_name.clone(),
-                                            scope_local_typerefs(
+                                            instance_decl_type(
+                                                &mut cache.decl_types,
                                                 dt,
                                                 &sub_typedef_names_all,
                                                 &inst_prefix,
+                                                sub_mod.name(),
                                             ),
                                         );
                                     } else if matches!(dt, DataType::TypeReference { dimensions, .. }
@@ -43707,15 +43749,18 @@ fn inline_module_items(
                                         // keeps its declared type, as a variable
                                         // does: an element of a named signed
                                         // type is signed (aionhw/xezim#1107).
-                                        elab.var_decl_types.entry(sig_name.clone()).or_insert_with(
-                                            || {
-                                                scope_local_typerefs(
+                                        if !elab.var_decl_types.contains_key(&sig_name) {
+                                            elab.var_decl_types.insert_shared(
+                                                sig_name.clone(),
+                                                instance_decl_type(
+                                                    &mut cache.decl_types,
                                                     dt,
                                                     &sub_typedef_names_all,
                                                     &inst_prefix,
-                                                )
-                                            },
-                                        );
+                                                    sub_mod.name(),
+                                                ),
+                                            );
+                                        };
                                     }
                                 }
                                 // §23.2.2.4: an output-variable default is its
@@ -43777,7 +43822,16 @@ fn inline_module_items(
                                     ) {
                                         mark_array_z_init_if_4state(elab, &sig_name, dt);
                                     }
-                                    elab.var_decl_types.insert(sig_name, scope_local_typerefs(&dt, &sub_typedef_names_all, &inst_prefix));
+                                    elab.var_decl_types.insert_shared(
+                                        sig_name,
+                                        instance_decl_type(
+                                            &mut cache.decl_types,
+                                            &dt,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                            sub_mod.name(),
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -44136,12 +44190,14 @@ fn inline_module_items(
                                         }
                                         elab.unpacked_decl_dims.insert(sig_name.clone(), declared);
                                     }
-                                    elab.var_decl_types.insert(
+                                    elab.var_decl_types.insert_shared(
                                         sig_name.clone(),
-                                        scope_local_typerefs(
+                                        instance_decl_type(
+                                            &mut cache.decl_types,
                                             &pd.data_type,
                                             &sub_typedef_names_all,
                                             &inst_prefix,
+                                            sub_mod.name(),
                                         ),
                                     );
                                 }
@@ -44371,8 +44427,16 @@ fn inline_module_items(
                                         is_type_two_state(&nd.data_type),
                                     );
                                     mark_array_z_init_if_4state(elab, &sig_name, &nd.data_type);
-                                    elab.var_decl_types
-                                        .insert(sig_name.clone(), scope_local_typerefs(&nd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                    elab.var_decl_types.insert_shared(
+                                        sig_name.clone(),
+                                        instance_decl_type(
+                                            &mut cache.decl_types,
+                                            &nd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                            sub_mod.name(),
+                                        ),
+                                    );
                                     if let Some(UnpackedDimension::Range { left, right, .. }) =
                                         effective_dims.first()
                                     {
@@ -44396,8 +44460,16 @@ fn inline_module_items(
                                 }
                                 // §6.18 / §7.2.1: a net keeps its typedef's
                                 // member layout, just like a variable or port.
-                                elab.var_decl_types.insert(sig_name.clone(),
-                                    scope_local_typerefs(&nd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                elab.var_decl_types.insert_shared(
+                                    sig_name.clone(),
+                                    instance_decl_type(
+                                        &mut cache.decl_types,
+                                        &nd.data_type,
+                                        &sub_typedef_names_all,
+                                        &inst_prefix,
+                                        sub_mod.name(),
+                                    ),
+                                );
                                 if matches!(resolve_typedef_chain(&nd.data_type, &elab.typedef_types),
                                     DataType::Struct(su) if su.packed)
                                     && let Some(fields) = flatten_struct_fields(
@@ -44991,8 +45063,16 @@ fn inline_module_items(
                                         elab.two_state_signals.insert(sig_name.clone());
                                     }
                                     unregister_net_type(elab, &sig_name);
-                                    elab.var_decl_types
-                                        .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                    elab.var_decl_types.insert_shared(
+                                        sig_name.clone(),
+                                        instance_decl_type(
+                                            &mut cache.decl_types,
+                                            &dd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                            sub_mod.name(),
+                                        ),
+                                    );
                                     continue;
                                 }
                                 if sig_name.contains("ram0.mem")
@@ -45051,8 +45131,16 @@ fn inline_module_items(
                                         // `push_back(item)` as one packed value
                                         // (always x) instead of copying member
                                         // signals, so the queue filled with x.
-                                        elab.var_decl_types
-                                            .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                        elab.var_decl_types.insert_shared(
+                                            sig_name.clone(),
+                                            instance_decl_type(
+                                                &mut cache.decl_types,
+                                                &dd.data_type,
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                                sub_mod.name(),
+                                            ),
+                                        );
                                     }
                                     Some(UnpackedDimension::Associative {
                                         data_type: kdt, ..
@@ -45212,8 +45300,16 @@ fn inline_module_items(
                                                     }
                                                     elab.arrays.insert(en, (0, 63, width));
                                                 }
-                                                elab.var_decl_types
-                                                    .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                                elab.var_decl_types.insert_shared(
+                                                    sig_name.clone(),
+                                                    instance_decl_type(
+                                                        &mut cache.decl_types,
+                                                        &dd.data_type,
+                                                        &sub_typedef_names_all,
+                                                        &inst_prefix,
+                                                        sub_mod.name(),
+                                                    ),
+                                                );
                                                 continue;
                                             }
                                         }
@@ -45262,8 +45358,16 @@ fn inline_module_items(
                                             elab.unpacked_decl_dims
                                                 .insert(sig_name.clone(), declared);
                                         }
-                                        elab.var_decl_types
-                                            .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                        elab.var_decl_types.insert_shared(
+                                            sig_name.clone(),
+                                            instance_decl_type(
+                                                &mut cache.decl_types,
+                                                &dd.data_type,
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                                sub_mod.name(),
+                                            ),
+                                        );
                                         // §6.8: its initializer is deferred like every
                                         // other instance declaration's (one whole-pattern
                                         // assignment, rewritten into the instance scope).
@@ -45322,9 +45426,18 @@ fn inline_module_items(
                                     // type-directed operation needs it
                                     // (`arr[i] = '{...}` resolves the element
                                     // struct through it).
-                                    elab.var_decl_types
-                                        .entry(sig_name.clone())
-                                        .or_insert_with(|| scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                    if !elab.var_decl_types.contains_key(&sig_name) {
+                                        elab.var_decl_types.insert_shared(
+                                            sig_name.clone(),
+                                            instance_decl_type(
+                                                &mut cache.decl_types,
+                                                &dd.data_type,
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                                sub_mod.name(),
+                                            ),
+                                        );
+                                    };
                                     // §7.2: an array of UNPACKED structs stores
                                     // each element member-wise, exactly as the
                                     // top-level path registers it. Without this
@@ -45460,8 +45573,16 @@ fn inline_module_items(
                                     }
                                     if unpacked_struct_decl {
                                         register_unpacked_aggregate(elab, &sig_name, &dd.data_type);
-                                        elab.var_decl_types
-                                            .insert(sig_name.clone(), scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                        elab.var_decl_types.insert_shared(
+                                            sig_name.clone(),
+                                            instance_decl_type(
+                                                &mut cache.decl_types,
+                                                &dd.data_type,
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                                sub_mod.name(),
+                                            ),
+                                        );
                                         continue;
                                     }
                                     // The declared type of a SCALAR child
@@ -45482,9 +45603,18 @@ fn inline_module_items(
                                     ) {
                                         elab.events.insert(sig_name.clone());
                                     }
-                                    elab.var_decl_types
-                                        .entry(sig_name.clone())
-                                        .or_insert_with(|| scope_local_typerefs(&dd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                    if !elab.var_decl_types.contains_key(&sig_name) {
+                                        elab.var_decl_types.insert_shared(
+                                            sig_name.clone(),
+                                            instance_decl_type(
+                                                &mut cache.decl_types,
+                                                &dd.data_type,
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                                sub_mod.name(),
+                                            ),
+                                        );
+                                    };
                                     // §6.11.1: a 2-state scalar drops x/z on
                                     // every write, as at top level.
                                     if is_type_two_state_resolved(
