@@ -30,6 +30,7 @@ pub mod interface_ports;
 mod module_class_scope;
 mod param_prefix_index;
 mod param_scope;
+pub(crate) mod unit_storage;
 pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);
@@ -19142,6 +19143,16 @@ fn create_implicit_nets(
 fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
+            // §3.12.1: a name the compilation unit declares is declared; the
+            // hierarchy root holds its storage.
+            let name = hier.path[0].name.name.as_str();
+            let unit = match crate::sv_parser::strip_unit_scope_name(name) {
+                Some(plain) => unit_storage::declares(plain),
+                None => hier.bound.as_decl().is_none() && unit_storage::declares(name),
+            };
+            if unit {
+                return;
+            }
             out.push(hier.path[0].name.name.clone());
         }
         ExprKind::MemberAccess { .. } => {}
@@ -54608,6 +54619,12 @@ fn rewrite_expr_impl(
             // the qualified name is rooted, so no later rewrite strips it and
             // the run time reads the unit's `x`.
             if let Some(bare) = crate::sv_parser::strip_unit_scope_name(&hier.path[0].name.name) {
+                // §3.12.1: the unit's one storage, held by the hierarchy root.
+                if let Some(e) = unit_storage::qualified(hier, bare, prefix, expr.span, &|s| {
+                    rewrite_expr_impl(s, prefix, port_map, local_names, interface_map)
+                }) {
+                    return e;
+                }
                 if gen_rename_declares(bare) {
                     let mut rooted = hier.clone();
                     rooted.root = Some("$root".to_string());
@@ -54907,6 +54924,12 @@ fn rewrite_expr_impl(
                 let mut new_hier = hier.clone();
                 new_hier.path[0].name.name = cat2(&prefix, &name);
                 ExprKind::Ident(new_hier)
+            } else if let Some(e) = unit_storage::bare(hier, prefix, expr.span, &|s| {
+                rewrite_expr_impl(s, prefix, port_map, local_names, interface_map)
+            }) {
+                // §3.12.1: a compilation-unit variable or net is declared
+                // once, in the hierarchy root.
+                return e;
             } else if let Some(key) = upward_subroutine_key(hier, prefix) {
                 let mut new_hier = hier.clone();
                 new_hier.path[0].name.name = key;

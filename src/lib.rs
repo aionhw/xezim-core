@@ -84,6 +84,7 @@ mod param_override_lists;
 pub mod scope_tree;
 pub mod shared_names;
 mod unit_subroutine_usage;
+mod unit_storage;
 #[cfg(test)]
 mod unit_assertion_retention_tests;
 #[cfg(test)]
@@ -2723,10 +2724,13 @@ fn parse_and_elaborate(
                     }
                     Some(unit_storage_usage.close(refs))
                 };
+                // §3.12.1: with a hierarchy root, the root alone declares the
+                // unit's storage (`unit_storage::settle`, once the root is known).
                 let storage_needed = |name: &str| {
-                    needed_unit_storage
-                        .as_ref()
-                        .is_none_or(|needed| needed.contains(name))
+                    unit_carrier.is_none()
+                        && needed_unit_storage
+                            .as_ref()
+                            .is_none_or(|needed| needed.contains(name))
                 };
                 // What this module declares ITSELF, captured before anything is
                 // injected — a name in here shadows the $unit declaration of
@@ -3612,6 +3616,16 @@ fn parse_and_elaborate(
 
     elaborate::relaxed_static::normalize(&mut definitions);
     let top_name = top_module.ok_or("No module found")?;
+    // §3.12.1: one storage for each compilation-unit variable and net.
+    unit_storage::settle(
+        &mut definitions,
+        unit_carrier.is_some(),
+        &top_name,
+        &top_level_vars,
+        &top_level_nets,
+        &top_level_params,
+        &mut class_defs,
+    );
     let top_def = definitions
         .get(&top_name)
         .ok_or_else(|| format!("Module '{}' not found", top_name))?;
