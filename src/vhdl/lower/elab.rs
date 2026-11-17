@@ -271,6 +271,38 @@ impl<'a> Lw<'a> {
                 | ObjKind::LoopParam => e.bad = true,
             }
         }
+        if st.is_empty() {
+            return;
+        }
+        for info in &objs {
+            // A permission applies to the base type wherever it is reused.
+            // Nested storage and unconstrained objects do not pass through
+            // the direct signal/driver checks above.
+            self.pack_reject_type_uses(
+                info.ty,
+                self.record_array_shape(info.ty).is_none(),
+                &mut BTreeSet::new(),
+                &mut st,
+            );
+            if let Some(init) = &info.init {
+                self.pack_visit_expr(init, None, false, &mut st);
+            }
+        }
+        // Procedure bodies are lowered per calling process. Without binding
+        // their signal actuals here, conservatively retain per-element drivers
+        // for global writes in any subprogram, including transitive calls.
+        let subprogram_driver = (usize::MAX, usize::MAX);
+        let design = self.d;
+        for sub in &design.subprograms {
+            if let Some(ret) = sub.ret {
+                self.pack_reject_type_uses(ret, true, &mut BTreeSet::new(), &mut st);
+            }
+            if let Some(body) = &sub.body {
+                for stmt in &body.stmts {
+                    self.pack_visit_stmt(subprogram_driver.0, subprogram_driver.1, stmt, &mut st);
+                }
+            }
+        }
         for (ai, arch) in self.d.archs.clone().iter().enumerate() {
             for (pi, p) in arch.processes.iter().enumerate() {
                 if let Some(sens) = &p.sens {
@@ -302,9 +334,42 @@ impl<'a> Lw<'a> {
             }
         }
         for (ty, e) in st {
-            if !e.bad && e.signals > 0 && e.drivers.len() <= 1 {
+            if !e.bad
+                && e.signals > 0
+                && e.drivers.len() <= 1
+                && !e.drivers.contains(&subprogram_driver)
+            {
                 self.record_pack_ok.insert(ty);
             }
+        }
+    }
+
+    /// A candidate used inside another type has storage and value paths the
+    /// direct-object gate does not inspect. Keep that base type unpacked.
+    fn pack_reject_type_uses(
+        &self,
+        ty: TypeId,
+        nested: bool,
+        seen: &mut BTreeSet<TypeId>,
+        st: &mut BTreeMap<TypeId, PackSt>,
+    ) {
+        if !seen.insert(ty) {
+            return;
+        }
+        let b = self.base(ty);
+        if nested && let Some(slot) = st.get_mut(&b) {
+            slot.bad = true;
+        }
+        match &self.d.types[b].kind {
+            TypeKind::Array { elem, .. } | TypeKind::Access(elem) | TypeKind::File(elem) => {
+                self.pack_reject_type_uses(*elem, true, seen, st);
+            }
+            TypeKind::Record(fields) => {
+                for (_, field) in fields {
+                    self.pack_reject_type_uses(*field, true, seen, st);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -376,9 +441,18 @@ impl<'a> Lw<'a> {
                     self.pack_visit_expr(v, key, false, st);
                 }
             }
-            HStmtKind::Call(_, args) => {
-                for e in args {
-                    self.pack_visit_expr(e, key, false, st);
+            HStmtKind::Call(sub, args) => {
+                let params = self.d.subprograms[*sub].params.clone();
+                for (i, e) in args.iter().enumerate() {
+                    if params.get(i).is_some_and(|p| {
+                        matches!(self.d.objects[*p].kind, ObjKind::Param(ObjClass::Signal, _))
+                    }) {
+                        // A scalar signal formal may assign a field after a
+                        // delay or from another process (§14.7.2, §10.5.2.2).
+                        self.pack_mark_connected(e, st);
+                    } else {
+                        self.pack_visit_expr(e, key, false, st);
+                    }
                 }
             }
             HStmtKind::If(arms, else_) => {
