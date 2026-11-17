@@ -5631,7 +5631,6 @@ impl Parser {
     /// one whose prefix is one of them names that item and a bin.
     fn parse_binsof_bins_expression(
         &mut self,
-        cross_items: &[crate::ast::Identifier],
     ) -> (crate::ast::Identifier, Option<crate::ast::Identifier>) {
         let mut cp = self.parse_identifier();
         let mut segs = Vec::new();
@@ -5642,9 +5641,10 @@ impl Parser {
             }
         }
         let path = |segs: &[crate::ast::Identifier]| {
-            segs.iter().fold(cp.name.clone(), |n, s| format!("{n}.{}", s.name))
+            segs.iter()
+                .fold(cp.name.clone(), |n, s| format!("{n}.{}", s.name))
         };
-        let is_item = |n: String| cross_items.iter().any(|i| i.name == n);
+        let is_item = |n: String| self.cross_items.contains(&n);
         // `cp.bin` keeps its standard meaning whenever `cp` is a cross item.
         let bin = match segs.len() {
             0 => None,
@@ -5665,35 +5665,26 @@ impl Parser {
         (cp, bin)
     }
 
-    fn parse_cross_select_or(
-        &mut self,
-        cross_items: &[crate::ast::Identifier],
-    ) -> crate::ast::decl::CrossSelect {
-        let mut l = self.parse_cross_select_and(cross_items);
+    fn parse_cross_select_or(&mut self) -> crate::ast::decl::CrossSelect {
+        let mut l = self.parse_cross_select_and();
         while self.eat(TokenKind::LogOr).is_some() {
-            let r = self.parse_cross_select_and(cross_items);
+            let r = self.parse_cross_select_and();
             l = crate::ast::decl::CrossSelect::Or(Box::new(l), Box::new(r));
         }
         l
     }
 
-    fn parse_cross_select_and(
-        &mut self,
-        cross_items: &[crate::ast::Identifier],
-    ) -> crate::ast::decl::CrossSelect {
-        let mut l = self.parse_cross_select_with(cross_items);
+    fn parse_cross_select_and(&mut self) -> crate::ast::decl::CrossSelect {
+        let mut l = self.parse_cross_select_with();
         while self.eat(TokenKind::LogAnd).is_some() {
-            let r = self.parse_cross_select_with(cross_items);
+            let r = self.parse_cross_select_with();
             l = crate::ast::decl::CrossSelect::And(Box::new(l), Box::new(r));
         }
         l
     }
 
-    fn parse_cross_select_with(
-        &mut self,
-        cross_items: &[crate::ast::Identifier],
-    ) -> crate::ast::decl::CrossSelect {
-        let mut s = self.parse_cross_select_primary(cross_items);
+    fn parse_cross_select_with(&mut self) -> crate::ast::decl::CrossSelect {
+        let mut s = self.parse_cross_select_primary();
         while self.eat(TokenKind::KwWith).is_some() {
             self.expect(TokenKind::LParen);
             let e = self.parse_expression();
@@ -5706,22 +5697,19 @@ impl Parser {
         s
     }
 
-    fn parse_cross_select_primary(
-        &mut self,
-        cross_items: &[crate::ast::Identifier],
-    ) -> crate::ast::decl::CrossSelect {
+    fn parse_cross_select_primary(&mut self) -> crate::ast::decl::CrossSelect {
         use crate::ast::decl::CrossSelect;
         if self.eat(TokenKind::LogNot).is_some() {
-            return CrossSelect::Not(Box::new(self.parse_cross_select_primary(cross_items)));
+            return CrossSelect::Not(Box::new(self.parse_cross_select_primary()));
         }
         if self.eat(TokenKind::LParen).is_some() {
-            let s = self.parse_cross_select_or(cross_items);
+            let s = self.parse_cross_select_or();
             self.expect(TokenKind::RParen);
             return s;
         }
         if self.eat(TokenKind::KwBinsof).is_some() {
             self.expect(TokenKind::LParen);
-            let (cp, bin) = self.parse_binsof_bins_expression(cross_items);
+            let (cp, bin) = self.parse_binsof_bins_expression();
             self.expect(TokenKind::RParen);
             let intersect = if self.eat(TokenKind::KwIntersect).is_some() {
                 self.expect(TokenKind::LBrace);
@@ -6125,7 +6113,11 @@ impl Parser {
                                 let set = self.parse_expression();
                                 self.cross_tuple_select(&set, &ids)
                             } else {
-                                self.parse_cross_select_or(&ids)
+                                let names = ids.iter().map(|i| i.name.clone()).collect();
+                                let saved = std::mem::replace(&mut self.cross_items, names);
+                                let select = self.parse_cross_select_or();
+                                self.cross_items = saved;
+                                select
                             };
                             let mut iff_guard = None;
                             if self.eat(TokenKind::KwIff).is_some() {
