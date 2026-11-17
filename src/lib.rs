@@ -233,7 +233,8 @@ pub use value::Value;
 ///         alias/port resolution and separate zero-rise gate/net delays.
 /// \x46 = \x45 + parameter declaration ownership for waveform scopes (§26.3, §21.7.2.3).
 /// \x47 = \x46 + compilation-unit DPI imports and constants only in the definitions that name them
-///         (§3.12.1, §35.5.4).
+///         (§3.12.1, §35.5.4), each compilation-unit variable and net declared once in the hierarchy
+///         root, and declared types shared per declaration.
 pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x47";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
