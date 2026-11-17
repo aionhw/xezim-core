@@ -10619,7 +10619,7 @@ pub fn elaborate_module_with_defs(
                     .as_ref()
                     .map(|dt| resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)))
                     .unwrap_or(1);
-                let is_signed = port.data_type.as_ref().map(is_type_signed).unwrap_or(false);
+                let is_signed = port.data_type.as_ref().map(|dt| is_type_signed_resolved(dt, &elab.typedef_types)).unwrap_or(false);
                 let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
                 // §6.18/§7.4: a port declared with an ARRAY typedef
                 // (`typedef logic [A-1:0] T[B]; input T x;`) inherits the
@@ -11280,7 +11280,7 @@ pub fn elaborate_module_with_defs(
                 };
                 let width =
                     resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&pd.data_type);
+                let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&pd.data_type);
                 let ranged = matches!(&pd.data_type,
                     DataType::Implicit { dimensions, .. } | DataType::IntegerVector { dimensions, .. }
@@ -11515,7 +11515,7 @@ pub fn elaborate_module_with_defs(
                 check_net_data_type(nd, &elab)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&nd.data_type);
+                let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
                     // §7.6: net arrays retain left-to-right declaration order too.
@@ -19263,7 +19263,7 @@ fn elaborate_items(
                 };
                 let width =
                     resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&pd.data_type);
+                let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
@@ -19368,7 +19368,7 @@ fn elaborate_items(
                 check_net_data_type(nd, elab)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed(&nd.data_type);
+                let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
                     // §7.6: net arrays retain left-to-right declaration order too.
@@ -43639,7 +43639,7 @@ fn inline_module_items(
                                         is_signed: port
                                             .data_type
                                             .as_ref()
-                                            .map(is_type_signed)
+                                            .map(|dt| is_type_signed_resolved(dt, &elab.typedef_types))
                                             .unwrap_or(false),
                                         is_real,
                                         direction: port.direction,
@@ -43991,7 +43991,7 @@ fn inline_module_items(
                                 Some(&sub_local_params),
                                 Some(&elab.typedefs),
                             );
-                            let is_signed = is_type_signed(&pd.data_type);
+                            let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
                             for decl in &pd.declarators {
                                 let sig_name = cat2(&inst_prefix, &decl.name.name);
                                 let dims = if decl.dimensions.is_empty() {
@@ -44290,6 +44290,23 @@ fn inline_module_items(
                                     // Simulator::new from the array metadata.
                                     continue;
                                 }
+                                // §6.18 / §7.2.1: a net keeps its typedef's
+                                // member layout, just like a variable or port.
+                                elab.var_decl_types.insert(sig_name.clone(),
+                                    scope_local_typerefs(&nd.data_type, &sub_typedef_names_all, &inst_prefix));
+                                if let Some(fields) = flatten_struct_fields(
+                                    &nd.data_type, &sub_merged_params,
+                                    &elab.typedefs, &elab.typedef_types,
+                                ) {
+                                    if !fields.is_empty() {
+                                        let element_width = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                        if element_width > 0 && width > element_width && width % element_width == 0 {
+                                            elab.packed_signal_elem_widths.insert(sig_name.clone(), element_width);
+                                        }
+                                        tls_register_struct_layout(&sig_name, &fields);
+                                        elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                    }
+                                }
                                 let net_is_real =
                                     is_type_real_resolved(&nd.data_type, &elab.typedef_types);
                                 register_net_type(
@@ -44307,7 +44324,7 @@ fn inline_module_items(
                                         is_const: false,
                                         name: sig_name.into(),
                                         width,
-                                        is_signed: is_type_signed(&nd.data_type),
+                                        is_signed: is_type_signed_resolved(&nd.data_type, &elab.typedef_types),
                                         // Resolved through the typedef table so a
                                         // NETTYPE net declared in a submodule
                                         // (`rnet n;`) is real like its top-level
