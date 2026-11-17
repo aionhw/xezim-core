@@ -45,8 +45,11 @@ endmodule
     let state = |inst: &str| {
         m.input_port_actuals
             .iter()
-            .find(|(f, ..)| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".c"))
-            .map(|(_, _, two_state)| *two_state)
+            .find(|port| {
+                let f = port.formal();
+                f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".c")
+            })
+            .map(|port| port.two_state())
     };
     assert_eq!(state("ul"), Some(false));
     assert_eq!(state("ub"), Some(true));

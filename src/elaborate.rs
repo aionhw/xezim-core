@@ -810,7 +810,8 @@ impl InitialBlock {
 // Sharing strategy: source ASTs are shared via Rc<Statement> / Rc<Expression>.
 // `local_names` is shared via Rc<HashSet<String>> across siblings of the same
 // submodule (a single Rc lives in PreparedModuleItems and is cloned cheaply
-// per instance). port_map and interface_map are per-instance owned.
+// per instance). port_map is per-instance and shared with the instance's
+// input-port actuals; interface_map is per-instance owned.
 //
 // A streaming consumer (the simulator's bytecode compiler) is expected to
 // drain `pending_*` one block at a time via the `drain_pending_*` helpers,
@@ -821,14 +822,116 @@ impl InitialBlock {
 // `continuous_assigns` — preserving prior semantics at the cost of peak.
 // ----------------------------------------------------------------------------
 
+/// §23.3.3: an input port whose reads inside the instance were renamed to
+/// its actual. The simulator needs the pair back (`formal` is the port's
+/// hierarchical name) to start the processes that read the port at time 0.
+///
+/// The actual is not copied: it is the entry of the instance's port table
+/// (`RewriteCtx::port_map`), which the instance's deferred bodies hold
+/// anyway. A design loaded from an artifact owns each actual instead; the
+/// serialized form is the `(formal, actual, two_state)` tuple either way.
+#[derive(Debug, Clone)]
+pub struct InputPortActual {
+    formal: String,
+    actual: InputActualExpr,
+    two_state: bool,
+}
+
+#[derive(Debug, Clone)]
+enum InputActualExpr {
+    Owned(Box<Expression>),
+    /// The entry of `ports` for the port name `formal[name_start..]`.
+    Shared {
+        ports: Rc<HashMap<String, Expression>>,
+        name_start: usize,
+    },
+}
+
+impl InputPortActual {
+    /// An actual that belongs to this record alone.
+    pub fn owned(formal: String, actual: Expression, two_state: bool) -> Self {
+        InputPortActual {
+            formal,
+            actual: InputActualExpr::Owned(Box::new(actual)),
+            two_state,
+        }
+    }
+
+    /// The actual `ports` holds for the port name `formal[name_start..]`.
+    /// The entry must exist.
+    fn shared(
+        formal: String,
+        name_start: usize,
+        ports: Rc<HashMap<String, Expression>>,
+        two_state: bool,
+    ) -> Self {
+        debug_assert!(ports.contains_key(&formal[name_start..]));
+        InputPortActual {
+            formal,
+            actual: InputActualExpr::Shared { ports, name_start },
+            two_state,
+        }
+    }
+
+    /// The port's hierarchical name (`u.v.port`).
+    pub fn formal(&self) -> &str {
+        &self.formal
+    }
+
+    /// The connected expression, in the parent's scope.
+    pub fn actual(&self) -> &Expression {
+        match &self.actual {
+            InputActualExpr::Owned(actual) => actual,
+            InputActualExpr::Shared { ports, name_start } => &ports[&self.formal[*name_start..]],
+        }
+    }
+
+    /// Whether the formal starts at 0 (a 2-state type) rather than x/z (§6.8).
+    pub fn two_state(&self) -> bool {
+        self.two_state
+    }
+
+    /// Whether `self` and `other` read their actuals from one port table.
+    pub fn shares_table_with(&self, other: &Self) -> bool {
+        match (&self.actual, &other.actual) {
+            (
+                InputActualExpr::Shared { ports: a, .. },
+                InputActualExpr::Shared { ports: b, .. },
+            ) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// Whether the actual is the entry of `ports` itself, not a copy of it.
+    pub fn reads_table(&self, ports: &Rc<HashMap<String, Expression>>) -> bool {
+        matches!(&self.actual, InputActualExpr::Shared { ports: own, .. } if Rc::ptr_eq(own, ports))
+    }
+}
+
+impl serde::Serialize for InputPortActual {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.formal, self.actual(), self.two_state).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InputPortActual {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (formal, actual, two_state) =
+            <(String, Expression, bool) as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(InputPortActual::owned(formal, actual, two_state))
+    }
+}
+
 /// Per-instance context needed to materialize a deferred procedural body.
 /// Held lightweight: cloning is cheap because shared structures sit behind Rc.
 #[derive(Debug, Clone)]
 pub struct RewriteCtx {
     pub prefix: String,
     /// Port name → connecting expression in the parent scope. Per-instance
-    /// (different connections per instantiation), so owned per ctx.
-    pub port_map: HashMap<String, Expression>,
+    /// (different connections per instantiation). The one table the
+    /// instance's own inlining rewrote with, shared rather than copied; the
+    /// instance's `InputPortActual`s read the same table (#721).
+    pub port_map: Rc<HashMap<String, Expression>>,
     /// Names declared locally inside the submodule. Shared across siblings of
     /// the same submodule via the prepared-items cache. Uses
     /// `std::collections::HashSet` to match `rewrite_expr`/`rewrite_stmt`
@@ -4345,7 +4448,7 @@ pub struct ElaboratedModule {
     /// 4-state type and 0 for a 2-state one (§6.8), which an elided port no
     /// longer records anywhere else.
     #[serde(default)]
-    pub input_port_actuals: Vec<(String, Expression, bool)>,
+    pub input_port_actuals: Vec<InputPortActual>,
     /// Input ports whose net was never built (see [`set_port_elision`]): the
     /// [`elided_port_hash`] of each `<inst>.<port>` flat name, sorted. The
     /// simulator checks a failed name lookup against it, so a reference the
@@ -46150,7 +46253,10 @@ fn inline_module_items(
                     })
                     .collect();
                 rewrite_port_map.extend(class_bindings.clone());
-                for (pname, actual) in &rewrite_port_map {
+                // The actuals themselves are read from the finished table
+                // below (`InputPortActual`), not copied out of it here.
+                let mut input_actuals: Vec<(String, usize, bool)> = Vec::new();
+                for pname in rewrite_port_map.keys() {
                     if matches!(
                         prepared_sub.port_directions.get(pname.as_str()),
                         Some(PortDirection::Input)
@@ -46165,8 +46271,8 @@ fn inline_module_items(
                                 .signals
                                 .get(&formal)
                                 .is_some_and(|s| !s.is_real && !s.value.has_xz());
-                        elab.input_port_actuals
-                            .push((formal, actual.clone(), two_state));
+                        let name_start = formal.len() - pname.len();
+                        input_actuals.push((formal, name_start, two_state));
                     }
                 }
 
@@ -46271,6 +46377,9 @@ fn inline_module_items(
                 // Per-instance type-parameter bindings for statement
                 // substitution — see `RewriteCtx::type_binds`.
                 let mut pend_type_binds: HashMap<String, DataType> = HashMap::default();
+                // An input actual whose table entry a type parameter's class
+                // receiver of the same name replaces below.
+                let mut displaced_actuals: HashMap<String, Expression> = HashMap::default();
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
@@ -46323,8 +46432,26 @@ fn inline_module_items(
                     );
                     elab.typedef_types.insert(key, scoped);
                     if let Some(receiver) = module_class_scope::receiver(dt) {
-                        rewrite_port_map.insert(name.clone(), receiver);
+                        if let Some(actual) = rewrite_port_map.insert(name.clone(), receiver) {
+                            displaced_actuals.insert(name.clone(), actual);
+                        }
                     }
+                }
+                // §23.3.3 (#721): the table is complete. The deferred bodies
+                // of this instance and its input-port actuals read this one
+                // copy; each used to retain a deep copy of every actual.
+                let rewrite_port_map = Rc::new(rewrite_port_map);
+                for (formal, name_start, two_state) in input_actuals {
+                    let actual = match displaced_actuals.remove(&formal[name_start..]) {
+                        Some(actual) => InputPortActual::owned(formal, actual, two_state),
+                        None => InputPortActual::shared(
+                            formal,
+                            name_start,
+                            Rc::clone(&rewrite_port_map),
+                            two_state,
+                        ),
+                    };
+                    elab.input_port_actuals.push(actual);
                 }
                 let pend_type_bind_widths: HashMap<String, u32> = pend_type_binds
                     .iter()
@@ -46356,7 +46483,7 @@ fn inline_module_items(
                     });
                 let pend_ctx = std::rc::Rc::new(RewriteCtx {
                     prefix: inst_prefix.clone(),
-                    port_map: rewrite_port_map.clone(),
+                    port_map: Rc::clone(&rewrite_port_map),
                     local_names: std::rc::Rc::clone(&prepared_sub.local_names),
                     interface_map: sub_interface_map.clone(),
                     type_binds: cache.type_binds.intern(pend_type_binds),
@@ -46655,7 +46782,7 @@ fn inline_module_items(
                         elab.sequences.insert(key.clone());
                         if let Some(body) = body {
                             let mut sva_locals = (*prepared_sub.local_names).clone();
-                            let mut sva_ports = rewrite_port_map.clone();
+                            let mut sva_ports = (*rewrite_port_map).clone();
                             for p in ports {
                                 sva_locals.remove(&p.name);
                                 sva_ports.remove(&p.name);
@@ -46788,7 +46915,7 @@ fn inline_module_items(
                     // instance scope. The formals stay bare.
                     if let ModuleItem::CovergroupDeclaration(cg) = sub_item {
                         let mut cg_locals = (*prepared_sub.local_names).clone();
-                        let mut cg_ports = rewrite_port_map.clone();
+                        let mut cg_ports = (*rewrite_port_map).clone();
                         for p in cg.ports.iter().chain(cg.sample_ports.iter()) {
                             cg_locals.remove(&p.name.name);
                             cg_ports.remove(&p.name.name);
