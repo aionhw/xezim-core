@@ -1,14 +1,14 @@
-//! §3.13, §8.3: two classes of the same name in one scope.
+//! §3.13, §8.3, §26.2: duplicate class and package definitions in one name space.
 //!
 //! A scope's name space holds one declaration per name (§3.13), so a second
-//! `class C` in the compilation unit, a package, a module or a class is
-//! illegal. Nothing checked: the name-keyed class tables kept one of the two
-//! (the later one in `$unit`, the earlier one in a package or module) and the
-//! design ran with whichever body survived.
+//! `class C` in the compilation unit, a package, a module or a class, or a
+//! second `package P` anywhere in the design (§26.2), is illegal. Nothing
+//! checked: the name-keyed tables kept one of the two and silently dropped
+//! the rest.
 //!
 //! The check runs on each file's parsed descriptions, the one point where a
 //! declaration's file is still known. All source files share one compilation
-//! unit, so the `$unit` table lives across files.
+//! unit and one package name space, so those tables live across files.
 
 use crate::ast::decl::{ClassDeclaration, ClassItem, ModuleItem, PackageItem};
 use crate::ast::{Description, Identifier};
@@ -28,16 +28,18 @@ impl FileText<'_> {
     }
 }
 
-/// The classes declared so far in one scope, each with where it is.
+/// The definitions declared so far in one name space/scope, each with where it is.
 type Seen = crate::hasher::HashMap<String, String>;
 
 #[derive(Default)]
-pub(crate) struct DuplicateClasses {
+pub(crate) struct DuplicateDefinitions {
     /// Compilation-unit classes of the files checked so far.
     unit: Seen,
+    /// Packages declared across the files checked so far (§3.13, §26.2).
+    packages: Seen,
 }
 
-impl DuplicateClasses {
+impl DuplicateDefinitions {
     /// The rendered errors for `descriptions`, the parse of one source file.
     pub(crate) fn check_file(
         &mut self,
@@ -51,15 +53,40 @@ impl DuplicateClasses {
         for d in descriptions {
             match d {
                 Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
-                    note(&mut self.unit, c, "the compilation unit", &ft, &mut diags);
+                    note(
+                        &mut self.unit,
+                        "class",
+                        &c.name,
+                        Some("the compilation unit"),
+                        "§3.13, §8.3",
+                        &ft,
+                        &mut diags,
+                    );
                     nested(c, &ft, &mut diags);
                 }
                 Description::Package(p) => {
+                    note(
+                        &mut self.packages,
+                        "package",
+                        &p.name,
+                        None,
+                        "§3.13, §26.2",
+                        &ft,
+                        &mut diags,
+                    );
                     let scope = format!("package '{}'", p.name.name);
                     let mut seen = Seen::default();
                     for it in &p.items {
                         if let PackageItem::Class(c) = it {
-                            note(&mut seen, c, &scope, &ft, &mut diags);
+                            note(
+                                &mut seen,
+                                "class",
+                                &c.name,
+                                Some(&scope),
+                                "§3.13, §8.3",
+                                &ft,
+                                &mut diags,
+                            );
                             nested(c, &ft, &mut diags);
                         }
                     }
@@ -92,25 +119,33 @@ impl DuplicateClasses {
     }
 }
 
-/// Record `c` in `seen`, or report it when the scope already has the name.
+/// Record `name` in `seen`, or report it when the scope already has the name.
 fn note(
     seen: &mut Seen,
-    c: &ClassDeclaration,
-    scope: &str,
+    kind: &str,
+    name: &Identifier,
+    scope: Option<&str>,
+    clause: &str,
     ft: &FileText,
     diags: &mut Vec<Diagnostic>,
 ) {
-    match seen.get(&c.name.name) {
-        Some(first) => diags.push(Diagnostic::error(
-            format!(
-                "duplicate definition of class '{}' in {}: it is already defined at {} \
-                 (IEEE 1800-2017 §3.13, §8.3)",
-                c.name.name, scope, first
-            ),
-            c.name.span,
-        )),
+    match seen.get(&name.name) {
+        Some(first) => {
+            let where_ = match scope {
+                Some(s) => format!(" in {s}"),
+                None => String::new(),
+            };
+            diags.push(Diagnostic::error(
+                format!(
+                    "duplicate definition of {kind} '{}'{where_}: it is already defined at {first} \
+                     (IEEE 1800-2017 {clause})",
+                    name.name
+                ),
+                name.span,
+            ));
+        }
         None => {
-            seen.insert(c.name.name.clone(), ft.locate(&c.name));
+            seen.insert(name.name.clone(), ft.locate(name));
         }
     }
 }
@@ -121,7 +156,15 @@ fn nested(c: &ClassDeclaration, ft: &FileText, diags: &mut Vec<Diagnostic>) {
     let mut seen = Seen::default();
     for it in &c.items {
         if let ClassItem::Class(inner) = it {
-            note(&mut seen, inner, &scope, ft, diags);
+            note(
+                &mut seen,
+                "class",
+                &inner.name,
+                Some(&scope),
+                "§3.13, §8.3",
+                ft,
+                diags,
+            );
             nested(inner, ft, diags);
         }
     }
@@ -143,7 +186,15 @@ fn scope_items(
     for it in list {
         match it {
             ModuleItem::ClassDeclaration(c) => {
-                note(seen, c, scope, ft, diags);
+                note(
+                    seen,
+                    "class",
+                    &c.name,
+                    Some(scope),
+                    "§3.13, §8.3",
+                    ft,
+                    diags,
+                );
                 nested(c, ft, diags);
             }
             // §27.3: `generate`/`endgenerate` open no scope of their own.

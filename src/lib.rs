@@ -78,7 +78,7 @@ pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
 mod body_type_params;
-mod duplicate_classes;
+mod duplicate_definitions;
 mod param_override_lists;
 pub mod scope_tree;
 pub mod shared_names;
@@ -1225,7 +1225,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     let mut src_file_of_module: crate::hasher::HashMap<String, u32> =
         crate::hasher::HashMap::default();
     let mut pp = new_design_preprocessor(include_dirs, defines);
-    let mut duplicate_classes = duplicate_classes::DuplicateClasses::default();
+    let mut duplicate_definitions = duplicate_definitions::DuplicateDefinitions::default();
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
@@ -1351,10 +1351,10 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 errs.join("\n")
             ));
         }
-        // §3.13, §8.3: a scope holds one class of a name. The class tables
-        // are keyed by name, so a second definition used to replace (or be
-        // replaced by) the first without a word.
-        let dup = duplicate_classes.check_file(
+        // §3.13, §8.3, §26.2: a scope holds one class or package of a name.
+        // The name-keyed tables used to replace (or be replaced by) the first
+        // without a word.
+        let dup = duplicate_definitions.check_file(
             &source_ast.descriptions,
             &preprocessed,
             line_map.as_ref(),
@@ -1363,7 +1363,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
         if !dup.is_empty() {
             progress_clear();
             return Err(format!(
-                "Duplicate class definition in '{}' (file {} of {}):\n{}",
+                "Duplicate definition in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
                 sources.len(),
