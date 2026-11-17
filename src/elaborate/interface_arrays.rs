@@ -105,7 +105,7 @@ impl View {
     fn base_expr(&self, span: Span) -> Expression {
         let mut e = make_ident_expr(&self.base);
         e.span = span;
-        mark_actual_rooted(&mut e);
+        mark_actual_rooted(&mut e, &|_| false);
         e
     }
 
