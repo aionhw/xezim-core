@@ -44295,7 +44295,9 @@ fn inline_module_items(
                                 // member layout, just like a variable or port.
                                 elab.var_decl_types.insert(sig_name.clone(),
                                     scope_local_typerefs(&nd.data_type, &sub_typedef_names_all, &inst_prefix));
-                                if let Some(fields) = flatten_struct_fields(
+                                if matches!(resolve_typedef_chain(&nd.data_type, &elab.typedef_types),
+                                    DataType::Struct(su) if su.packed)
+                                    && let Some(fields) = flatten_struct_fields(
                                     &nd.data_type, &sub_merged_params,
                                     &elab.typedefs, &elab.typedef_types,
                                 ) {
