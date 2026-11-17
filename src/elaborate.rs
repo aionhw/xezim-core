@@ -1063,7 +1063,9 @@ impl PendingContAssign {
         // §23.6: a hierarchical-LHS continuous assign in a sub-module writes
         // into a child scope (`lp.v = ~v`), so its RHS names are lexical to
         // the writing scope and must not be re-qualified into the target.
-        root_mark_hier_ca_rhs(&self.lhs_source, &mut rhs, &|_| false);
+        root_mark_hier_ca_rhs(&self.lhs_source, &mut rhs, &|_| false, &|n| {
+            self.ctx.upward.borrow().packages.contains(n)
+        });
         let eval_delay = |src: &Option<std::rc::Rc<Expression>>| -> Option<u64> {
             src.as_ref().map(|d| {
                 let d = rewrite_expr(
@@ -1520,6 +1522,15 @@ fn push_stmt_locals(names: HashSet<String>) -> Option<StmtLocalsFrame> {
 
 fn stmt_local_declared(name: &str) -> bool {
     STMT_LOCALS_TLS.with(|s| s.borrow().iter().any(|frame| frame.contains(name)))
+}
+
+/// §26.3: a package of the design being inlined.
+fn design_package(name: &str) -> bool {
+    UPWARD_SCOPES_TLS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|s| s.borrow().packages.contains(name))
+    })
 }
 
 /// §23.8: what an upward hierarchical name is resolved against — the
@@ -14383,9 +14394,12 @@ pub fn elaborate_module_with_defs(
                         ),
                         None => rhs.clone(),
                     };
-                    root_mark_hier_ca_rhs(lhs, &mut rhs_final, &|n| {
-                        elab.struct_members.contains_key(n)
-                    });
+                    root_mark_hier_ca_rhs(
+                        lhs,
+                        &mut rhs_final,
+                        &|n| elab.struct_members.contains_key(n),
+                        &|n| elab.packages.contains(n),
+                    );
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
@@ -20265,9 +20279,12 @@ fn elaborate_items(
                         ),
                         None => rhs.clone(),
                     };
-                    root_mark_hier_ca_rhs(lhs, &mut rhs_final, &|n| {
-                        elab.struct_members.contains_key(n)
-                    });
+                    root_mark_hier_ca_rhs(
+                        lhs,
+                        &mut rhs_final,
+                        &|n| elab.struct_members.contains_key(n),
+                        &|n| elab.packages.contains(n),
+                    );
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
@@ -41060,7 +41077,9 @@ fn inline_module_items(
                                     // substitution machinery (port_aliases &
                                     // friends key on un-rooted idents).
                                     if whole_net_ident_name(&rewritten_e).is_none() {
-                                        mark_actual_rooted(&mut rewritten_e);
+                                        mark_actual_rooted(&mut rewritten_e, &|n| {
+                                            elab.packages.contains(n)
+                                        });
                                     }
                                     if sub_iface_ports.contains(&name.name) {
                                         if let Some(if_full_path) =
@@ -41207,7 +41226,9 @@ fn inline_module_items(
                                         }
                                     }
                                     if whole_net_ident_name(&rewritten_e).is_none() {
-                                        mark_actual_rooted(&mut rewritten_e);
+                                        mark_actual_rooted(&mut rewritten_e, &|n| {
+                                            elab.packages.contains(n)
+                                        });
                                     }
                                     if let Some(port) = sub_mod.ports().get(i) {
                                         let port_name = port.name();
@@ -54042,6 +54063,7 @@ fn root_mark_hier_ca_rhs(
     lhs: &Expression,
     rhs: &mut Expression,
     is_struct: &dyn Fn(&str) -> bool,
+    is_package: &dyn Fn(&str) -> bool,
 ) {
     /// `crossed_member` tracks whether the LHS reached the first identifier
     /// THROUGH a member access (`a.b`, `gen[0].sig`). A bare index (`arr[2]`)
@@ -54067,7 +54089,7 @@ fn root_mark_hier_ca_rhs(
         }
     }
     if hier_lhs(lhs, is_struct, false) {
-        mark_actual_rooted(rhs);
+        mark_actual_rooted(rhs, is_package);
     }
 }
 
@@ -54262,43 +54284,44 @@ fn resolve_upward_module_name(
 /// the child's scope hint — `.d(d ^ 1)` with a child port also named `d` read
 /// the child's own `u1.d` and applied the map to its own output (issue #48).
 /// A rooted ident is skipped by `rewrite_expr_impl` (no re-prefixing, no
-/// re-substitution) and resolved absolutely by the simulator.
-fn mark_actual_rooted(e: &mut Expression) {
+/// re-substitution) and resolved absolutely by the simulator. A package
+/// member (`pkg::member`, §26.3) names no scope path and stays unrooted.
+fn mark_actual_rooted(e: &mut Expression, is_package: &dyn Fn(&str) -> bool) {
     match &mut e.kind {
         ExprKind::Ident(h) => {
-            if h.root.is_none() {
+            if h.root.is_none() && !(h.path.len() > 1 && is_package(&h.path[0].name.name)) {
                 h.root = Some("$root".to_string());
             }
             for seg in &mut h.path {
                 for sel in &mut seg.selects {
-                    mark_actual_rooted(sel);
+                    mark_actual_rooted(sel, is_package);
                 }
             }
         }
         ExprKind::Binary { left, right, .. } => {
-            mark_actual_rooted(left);
-            mark_actual_rooted(right);
+            mark_actual_rooted(left, is_package);
+            mark_actual_rooted(right, is_package);
         }
-        ExprKind::Unary { operand, .. } => mark_actual_rooted(operand),
+        ExprKind::Unary { operand, .. } => mark_actual_rooted(operand, is_package),
         ExprKind::Conditional {
             condition,
             then_expr,
             else_expr,
         } => {
-            mark_actual_rooted(condition);
-            mark_actual_rooted(then_expr);
-            mark_actual_rooted(else_expr);
+            mark_actual_rooted(condition, is_package);
+            mark_actual_rooted(then_expr, is_package);
+            mark_actual_rooted(else_expr, is_package);
         }
-        ExprKind::Paren(inner) => mark_actual_rooted(inner),
+        ExprKind::Paren(inner) => mark_actual_rooted(inner, is_package),
         ExprKind::Concatenation(parts) => {
             for p in parts {
-                mark_actual_rooted(p);
+                mark_actual_rooted(p, is_package);
             }
         }
         ExprKind::Replication { count, exprs } => {
-            mark_actual_rooted(count);
+            mark_actual_rooted(count, is_package);
             for p in exprs {
-                mark_actual_rooted(p);
+                mark_actual_rooted(p, is_package);
             }
         }
         ExprKind::Call { func, args } => {
@@ -54307,33 +54330,39 @@ fn mark_actual_rooted(e: &mut Expression) {
             if let ExprKind::Ident(h) = &mut func.kind {
                 for seg in &mut h.path {
                     for sel in &mut seg.selects {
-                        mark_actual_rooted(sel);
+                        mark_actual_rooted(sel, is_package);
                     }
                 }
             } else {
-                mark_actual_rooted(func);
+                mark_actual_rooted(func, is_package);
             }
             for a in args {
-                mark_actual_rooted(a);
+                mark_actual_rooted(a, is_package);
             }
         }
         ExprKind::SystemCall { args, .. } => {
             for a in args {
-                mark_actual_rooted(a);
+                mark_actual_rooted(a, is_package);
             }
         }
         ExprKind::Index { expr, index } => {
-            mark_actual_rooted(expr);
-            mark_actual_rooted(index);
+            mark_actual_rooted(expr, is_package);
+            mark_actual_rooted(index, is_package);
         }
         ExprKind::RangeSelect {
             expr, left, right, ..
         } => {
-            mark_actual_rooted(expr);
-            mark_actual_rooted(left);
-            mark_actual_rooted(right);
+            mark_actual_rooted(expr, is_package);
+            mark_actual_rooted(left, is_package);
+            mark_actual_rooted(right, is_package);
         }
-        ExprKind::MemberAccess { expr, .. } => mark_actual_rooted(expr),
+        ExprKind::MemberAccess { expr, .. } => {
+            if !matches!(&expr.kind, ExprKind::Ident(h)
+                if h.path.len() == 1 && is_package(&h.path[0].name.name))
+            {
+                mark_actual_rooted(expr, is_package);
+            }
+        }
         _ => {}
     }
 }
@@ -54533,12 +54562,14 @@ fn rewrite_expr_impl(
                         }
                         _ => name.as_str(),
                     };
-                    leaf != key_leaf && (local_names.contains(leaf) || port_map.contains_key(leaf))
+                    leaf != key_leaf
+                        && (local_names.contains(leaf) || port_map.contains_key(leaf))
+                        && !an.split_once('.').is_some_and(|(head, _)| design_package(head))
                 });
                 if !has_tail {
                     let mut m = mapped.clone();
                     if collides {
-                        mark_actual_rooted(&mut m);
+                        mark_actual_rooted(&mut m, &|_| false);
                     }
                     return m;
                 }
