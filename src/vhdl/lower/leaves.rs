@@ -103,6 +103,29 @@ impl<'a> Lw<'a> {
                 Some(())
             }
             TypeKind::Array { index, .. } => {
+                // One vector, not one class per field. A partial assign
+                // overlays that vector (`packed_record_drive`); two
+                // drivers overlap it and are rejected as an unresolved
+                // signal with several drivers.
+                if packed && let Some((ew, n)) = self.record_array_pack(t) {
+                    let total = ew as i64 * n;
+                    steps.push(Step::PDim(1, total as u32));
+                    let count = steps
+                        .iter()
+                        .map(|s| match s {
+                            Step::Dim(n) | Step::PDim(n, _) => *n,
+                            _ => 1,
+                        })
+                        .product();
+                    out.push(LeafClass {
+                        steps: steps.clone(),
+                        scalar: t,
+                        count,
+                        base: 0,
+                    });
+                    steps.pop();
+                    return Some(());
+                }
                 let ranges = self.d.array_index_ranges(t)?;
                 let n0 = steps.len();
                 if packed && let Some(Repr::Pk(w, n)) = self.pk_of(t) {
@@ -349,6 +372,10 @@ impl<'a> Lw<'a> {
     /// The global numbers of the leaves under a path; a step with an
     /// offset computed at run time covers every offset of its dimension.
     pub(super) fn path_cov(&self, t: TypeId, path: &[DSel]) -> Cov {
+        // The packed record array is one leaf: every part drives it.
+        if self.record_array_pack(t).is_some() {
+            return Cov::All;
+        }
         let Some(classes) = self.leaf_classes(t) else {
             return Cov::All;
         };
@@ -604,6 +631,24 @@ impl<'a> Lw<'a> {
         depth: usize,
     ) {
         let pad = " ".repeat(ind);
+        // A whole packed record array is one pending vector. Parts are
+        // overlaid by `drive_path` before this is reached.
+        if path.is_empty()
+            && slice_start.is_none()
+            && self.record_array_pack(t).is_some()
+            && let Some(ci) = self.packed_record_class(s)
+        {
+            let _ = writeln!(
+                out,
+                "{pad}if (vh_sqn{s}_{p}_c{ci} == 0) begin vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1; end else vh_drs_{s}_{p}_c{ci}(0, {val}, after, rej, mode);",
+                pad = pad,
+                s = s,
+                p = p,
+                ci = ci,
+                val = val
+            );
+            return;
+        }
         let b = self.base(t);
         match &self.d.types[b].kind.clone() {
             TypeKind::Record(_) => {
@@ -1202,6 +1247,118 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// The class index of a signal stored as one packed record array.
+    fn packed_record_class(&self, s: usize) -> Option<usize> {
+        if self.record_array_pack(self.sigs[s].ty).is_none() {
+            return None;
+        }
+        let classes = self.leaf_classes(self.sigs[s].ty)?;
+        classes
+            .iter()
+            .position(|c| matches!(c.steps.as_slice(), [Step::PDim(1, _)]))
+    }
+
+    /// Low bit and width of `path` in a packed record array of element
+    /// width `ew` and length `n`. `None` for a slice.
+    fn packed_record_span(
+        &self,
+        ty: TypeId,
+        path: &[DSel],
+        ew: u32,
+        n: i64,
+    ) -> Option<(String, u32)> {
+        if path.is_empty() {
+            return Some(("0".into(), (ew as i64 * n) as u32));
+        }
+        let DSel::Elem(off, _) = &path[0] else {
+            return None;
+        };
+        let mut lo = Lw::bit_mul(ew, n - 1, off);
+        let mut width = ew;
+        let mut cur = self.d.element_subtype(ty)?;
+        for sel in &path[1..] {
+            match sel {
+                DSel::Field(i) => {
+                    let (shift, fw) = self.record_field_lo(cur, *i)?;
+                    lo = Lw::bit_sum(lo, shift.to_string());
+                    width = fw;
+                    cur = self.field_storage(cur).get(*i).copied()?;
+                }
+                DSel::Elem(off2, _) => {
+                    let Repr::Pk(w, n2) = self.pk_of(cur)? else {
+                        return None;
+                    };
+                    lo = Lw::bit_sum(lo, Lw::bit_mul(w, n2 - 1, off2));
+                    width = w;
+                    cur = self.d.element_subtype(cur)?;
+                }
+                DSel::Slice(..) => return None,
+            }
+        }
+        Some((lo, width))
+    }
+
+    /// A zero-delay assign onto the pending packed vector, or one
+    /// transaction of that vector when the assign is delayed. `None` when
+    /// `s` is not a packed record array or the path is a slice.
+    fn packed_record_drive(
+        &self,
+        s: usize,
+        p: usize,
+        path: &[DSel],
+        val: &str,
+        timing: (&str, &str, i32),
+        ind: usize,
+    ) -> Option<String> {
+        let ty = self.sigs[s].ty;
+        let (ew, n) = self.record_array_pack(ty)?;
+        let (lo, width) = self.packed_record_span(ty, path, ew, n)?;
+        let ci = self.packed_record_class(s)?;
+        let (after, rej, mode) = timing;
+        let pad = " ".repeat(ind);
+        let zero = after == "64'sd0" && rej == "64'sd0" && mode == 1;
+        let inner = if zero {
+            format!(
+                "{pad}  if (vh_sqn{s}_{p}_c{ci} == 0) begin\n\
+                 {pad}    if (!vh_pwf{s}_{p}_c{ci}) begin vh_pw{s}_{p}_c{ci} = vh_dv{s}_{p}; vh_pwf{s}_{p}_c{ci} = 1; end\n\
+                 {pad}    vh_pw{s}_{p}_c{ci}[({lo}) +: {width}] = {val};\n\
+                 {pad}  end else vh_drs_{s}_{p}_c{ci}(0, vh_pw{s}_{p}_c{ci}, after, rej, mode);\n",
+                pad = pad,
+                s = s,
+                p = p,
+                ci = ci,
+                lo = lo,
+                width = width,
+                val = val
+            )
+        } else {
+            format!(
+                "{pad}  begin\n\
+                 {pad}    bit [{hi}:0] vh_pr;\n\
+                 {pad}    vh_pr = vh_dv{s}_{p};\n\
+                 {pad}    vh_pr[({lo}) +: {width}] = {val};\n\
+                 {pad}    vh_drs_{s}_{p}_c{ci}(0, vh_pr, after, rej, mode);\n\
+                 {pad}  end\n",
+                pad = pad,
+                hi = ew as i64 * n - 1,
+                s = s,
+                p = p,
+                lo = lo,
+                width = width,
+                val = val,
+                ci = ci
+            )
+        };
+        Some(format!(
+            "{pad}begin\n{pad}  longint after, rej;\n{pad}  int mode;\n{pad}  after = {after}; rej = {rej}; mode = {mode};\n{inner}{pad}end\n",
+            pad = pad,
+            after = after,
+            rej = rej,
+            mode = mode,
+            inner = inner
+        ))
+    }
+
     /// The transactions of an assignment of `val` (of type `t`) to path
     /// `path` of signal `s` by process `p`.
     pub(super) fn drive_path(
@@ -1215,6 +1372,9 @@ impl<'a> Lw<'a> {
         ind: usize,
     ) -> String {
         let pad = " ".repeat(ind);
+        if let Some(body) = self.packed_record_drive(s, p, path, val, timing, ind) {
+            return body;
+        }
         let mut prefix: Vec<(Option<usize>, String)> = Vec::new();
         let mut slice_start = None;
         let mut slice_len = None;

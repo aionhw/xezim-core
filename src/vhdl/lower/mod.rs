@@ -49,9 +49,11 @@ enum Repr {
     Arr(String, Box<Repr>),
     Rec(String),
     /// A one-dimensional array with static bounds of an enumeration
-    /// element: a packed vector of `n` elements of `w` bits each (the
-    /// element's position), the left element the most significant. Its
-    /// bounds are those of its subtype, known where it is used.
+    /// element, or of a record whose fields pack that way: a packed vector
+    /// of `n` elements of `w` bits each (an enumeration's position, or the
+    /// sum of a record's field widths), the left element the most
+    /// significant. Its bounds are those of its subtype, known where it
+    /// is used.
     Pk(u32, i64),
 }
 
@@ -179,6 +181,11 @@ struct Lw<'a> {
     read_drv: Option<(usize, usize)>,
     /// Signals forced or released (`elab::force`).
     forced: BTreeSet<usize>,
+    /// Base types of static record arrays stored as one packed vector.
+    /// Empty until `select_record_packs`: a type is here only when every
+    /// signal of it has one driver and only zero-delay field assigns, so
+    /// the packed form cannot be told from the per-element form.
+    record_pack_ok: BTreeSet<TypeId>,
     /// Procedures lowered per calling process and signal actuals.
     specs: Vec<elab::Spec>,
     spec_keys: HashMap<String, usize>,
@@ -341,6 +348,7 @@ impl<'a> Lw<'a> {
             drv_checks: Vec::new(),
             read_drv: None,
             forced: BTreeSet::new(),
+            record_pack_ok: BTreeSet::new(),
             specs: Vec::new(),
             spec_keys: HashMap::new(),
             spec_todo: Vec::new(),
@@ -890,6 +898,13 @@ impl<'a> Lw<'a> {
     /// element, n times (§14.4.2.5).
     fn pk_default(&self, t: TypeId, w: u32, n: i64) -> String {
         let et = self.d.element_subtype(t).unwrap_or(t);
+        if let Some(bits) = self.record_default_bits(et) {
+            let all = bits.repeat(n as usize);
+            if all.bytes().all(|b| b == b'0') {
+                return format!("{}'b0", w as i64 * n);
+            }
+            return format!("{}'b{}", all.len(), all);
+        }
         let code = self
             .d
             .scalar_range(et)
@@ -1037,6 +1052,11 @@ impl<'a> Lw<'a> {
             HExprKind::Convert(x) => self.convert(x, h.ty, &h.loc),
             HExprKind::Call(s, args) => self.call(*s, args, h),
             HExprKind::Index(b, idx) => {
+                if idx.len() == 1
+                    && let Some(s) = self.packed_field_elem_expr(b, &idx[0])
+                {
+                    return s;
+                }
                 // An element of a slice of a packed value: one select of
                 // the slice's base (a select of a select is not SV).
                 let (b, extra) = self.pk_slice_base(b);
@@ -1152,7 +1172,12 @@ impl<'a> Lw<'a> {
                     l
                 )
             }
-            HExprKind::Field(b, i) => format!("{}.f{}", self.ex(b), i),
+            HExprKind::Field(b, i) => {
+                if let Some(s) = self.packed_field_expr(b, *i) {
+                    return s;
+                }
+                format!("{}.f{}", self.ex(b), i)
+            }
             HExprKind::ArrayAgg(items) => self.array_agg(items, h),
             HExprKind::RecordAgg(vals) => {
                 // Built field by field into a temporary (a pattern of
@@ -3150,6 +3175,9 @@ impl<'a> Lw<'a> {
         let pad = " ".repeat(ind);
         let loc = target.loc.clone();
         let (f, l, _) = self.file_line(&loc);
+        if let Some(sel) = self.packed_record_lvalue(target) {
+            return format!("{}{} = {};\n", pad, sel, value);
+        }
         match &target.kind {
             HExprKind::Index(b, idx) => {
                 let (b, extra) = self.pk_slice_base(b);

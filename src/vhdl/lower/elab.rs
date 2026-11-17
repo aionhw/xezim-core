@@ -220,12 +220,384 @@ pub(super) struct Link {
     pub foreign: Option<usize>,
 }
 
+/// How an expression uses the object at its root.
+enum PackUse {
+    Whole,
+    Elem,
+    Field,
+    FieldElem,
+    Other,
+}
+
+/// A record-array type seen while deciding whether it can be one vector.
+#[derive(Default)]
+struct PackSt {
+    bad: bool,
+    signals: usize,
+    drivers: BTreeSet<(usize, usize)>,
+}
+
 impl<'a> Lw<'a> {
     // ---- the instance tree ----------------------------------------------------------
+
+    /// Record-array types that may be one packed vector. A type stays a
+    /// dynamic array of records unless every signal of it is driven by one
+    /// process, every assignment is zero-delay, and every use is a field
+    /// or a field element. Two drivers, a delayed assignment, an initial
+    /// value, a port and a whole-element use keep the per-element form
+    /// (§14.7.2, §10.5.2.2).
+    fn select_record_packs(&mut self) {
+        let mut st: BTreeMap<TypeId, PackSt> = BTreeMap::new();
+        let objs = self.d.objects.clone();
+        for (o, info) in objs.iter().enumerate() {
+            if self.record_array_shape(info.ty).is_none() {
+                continue;
+            }
+            let e = st.entry(self.base(info.ty)).or_default();
+            match info.kind {
+                ObjKind::Signal => {
+                    e.signals += 1;
+                    if info.init.is_some() || self.d.sig_kinds.contains_key(&o) {
+                        e.bad = true;
+                    }
+                }
+                ObjKind::Param(ObjClass::Signal, _) | ObjKind::Port(_) => e.bad = true,
+                ObjKind::Variable
+                | ObjKind::SharedVariable
+                | ObjKind::Constant
+                | ObjKind::Generic
+                | ObjKind::File
+                | ObjKind::Param(_, _)
+                | ObjKind::LoopParam => e.bad = true,
+            }
+        }
+        for (ai, arch) in self.d.archs.clone().iter().enumerate() {
+            for (pi, p) in arch.processes.iter().enumerate() {
+                if let Some(sens) = &p.sens {
+                    for e in sens {
+                        self.pack_visit_expr(e, None, false, &mut st);
+                    }
+                }
+                for s in &p.stmts {
+                    self.pack_visit_stmt(ai, pi, s, &mut st);
+                }
+            }
+            for inst in &arch.instances {
+                for (_, actual) in &inst.port_map {
+                    if let Some(e) = actual {
+                        self.pack_mark_connected(e, &mut st);
+                    }
+                }
+                for pc in &inst.port_conv {
+                    self.pack_mark_connected(&pc.target, &mut st);
+                    self.pack_mark_connected(&pc.value, &mut st);
+                }
+            }
+            for f in &arch.foreign {
+                for (_, actual) in &f.ports {
+                    if let Some(e) = actual {
+                        self.pack_mark_connected(e, &mut st);
+                    }
+                }
+            }
+        }
+        for (ty, e) in st {
+            if !e.bad && e.signals > 0 && e.drivers.len() <= 1 {
+                self.record_pack_ok.insert(ty);
+            }
+        }
+    }
+
+    /// A port actual shares drivers with the formal, so its type is not packed.
+    fn pack_mark_connected(&mut self, e: &HExpr, st: &mut BTreeMap<TypeId, PackSt>) {
+        if let Some(b) = self.pack_root_type(e) {
+            st.entry(b).or_default().bad = true;
+        }
+        self.pack_visit_expr(e, None, false, st);
+    }
+
+    fn pack_root_type(&self, e: &HExpr) -> Option<TypeId> {
+        let (o, _) = self.pack_access(e)?;
+        let ty = self.d.objects.get(o)?.ty;
+        // Bounds live on the subtype. `record_array_shape` needs that
+        // type; the decision is stored under the base.
+        self.record_array_shape(ty)?;
+        Some(self.base(ty))
+    }
+
+    fn pack_visit_stmt(
+        &mut self,
+        arch: usize,
+        pi: usize,
+        s: &HStmt,
+        st: &mut BTreeMap<TypeId, PackSt>,
+    ) {
+        let key = Some((arch, pi));
+        match &s.kind {
+            HStmtKind::SignalAssign { target, delay, waves } => {
+                let delayed = matches!(delay, Some(HDelay::Transport | HDelay::Inertial(Some(_))))
+                    || waves.iter().any(|w| w.after.is_some() || w.value.is_none());
+                if delayed && let Some(b) = self.pack_root_type(target) {
+                    st.entry(b).or_default().bad = true;
+                }
+                self.pack_visit_expr(target, key, true, st);
+                for w in waves {
+                    if let Some(v) = &w.value {
+                        self.pack_visit_expr(v, key, false, st);
+                    }
+                    if let Some(a) = &w.after {
+                        self.pack_visit_expr(a, key, false, st);
+                    }
+                }
+                if let Some(HDelay::Inertial(Some(r))) = delay {
+                    self.pack_visit_expr(r, key, false, st);
+                }
+            }
+            HStmtKind::Wait { on, until, timeout } => {
+                for e in on.iter().chain(until).chain(timeout) {
+                    self.pack_visit_expr(e, key, false, st);
+                }
+            }
+            HStmtKind::Assert { cond, report, severity } => {
+                for e in [cond, report, severity].into_iter().flatten() {
+                    self.pack_visit_expr(e, key, false, st);
+                }
+            }
+            HStmtKind::VarAssign { target, value } => {
+                self.pack_visit_expr(target, key, false, st);
+                self.pack_visit_expr(value, key, false, st);
+            }
+            HStmtKind::Force { target, value } => {
+                if let Some(b) = self.pack_root_type(target) {
+                    st.entry(b).or_default().bad = true;
+                }
+                self.pack_visit_expr(target, key, false, st);
+                if let Some(v) = value {
+                    self.pack_visit_expr(v, key, false, st);
+                }
+            }
+            HStmtKind::Call(_, args) => {
+                for e in args {
+                    self.pack_visit_expr(e, key, false, st);
+                }
+            }
+            HStmtKind::If(arms, else_) => {
+                for (c, body) in arms {
+                    self.pack_visit_expr(c, key, false, st);
+                    for s in body {
+                        self.pack_visit_stmt(arch, pi, s, st);
+                    }
+                }
+                if let Some(else_) = else_ {
+                    for s in else_ {
+                        self.pack_visit_stmt(arch, pi, s, st);
+                    }
+                }
+            }
+            HStmtKind::Case { expr, alts } => {
+                self.pack_visit_expr(expr, key, false, st);
+                for (_, body) in alts {
+                    for s in body {
+                        self.pack_visit_stmt(arch, pi, s, st);
+                    }
+                }
+            }
+            HStmtKind::Loop { body, scheme, .. } => {
+                if let HLoop::While(c) = scheme {
+                    self.pack_visit_expr(c, key, false, st);
+                }
+                if let HLoop::For(_, r) = scheme {
+                    self.pack_visit_expr(&r.left, key, false, st);
+                    self.pack_visit_expr(&r.right, key, false, st);
+                    if let Some((o, _, _)) = &r.of_obj {
+                        self.pack_visit_expr(o, key, false, st);
+                    }
+                }
+                for s in body {
+                    self.pack_visit_stmt(arch, pi, s, st);
+                }
+            }
+            HStmtKind::Next(_, c) | HStmtKind::Exit(_, c) => {
+                if let Some(c) = c {
+                    self.pack_visit_expr(c, key, false, st);
+                }
+            }
+            HStmtKind::Return(v) => {
+                if let Some(v) = v {
+                    self.pack_visit_expr(v, key, false, st);
+                }
+            }
+            HStmtKind::Null | HStmtKind::InitObj(_) => {}
+        }
+    }
+
+    fn pack_visit_expr(
+        &mut self,
+        e: &HExpr,
+        proc: Option<(usize, usize)>,
+        target: bool,
+        st: &mut BTreeMap<TypeId, PackSt>,
+    ) {
+        if let Some((o, kind)) = self.pack_access(e)
+            && let Some(info) = self.d.objects.get(o)
+            && let Some(b) = self.record_array_shape(info.ty).map(|_| self.base(info.ty))
+        {
+            let slot = st.entry(b).or_default();
+            match kind {
+                PackUse::Field | PackUse::FieldElem => {
+                    if target && let Some(p) = proc {
+                        slot.drivers.insert(p);
+                    }
+                }
+                PackUse::Whole | PackUse::Elem | PackUse::Other => slot.bad = true,
+            }
+            self.pack_visit_indexes(e, proc, st);
+            return;
+        }
+        self.pack_visit_children(e, proc, st);
+    }
+
+    /// Index and slice expressions under an access already classified.
+    fn pack_visit_indexes(
+        &mut self,
+        e: &HExpr,
+        proc: Option<(usize, usize)>,
+        st: &mut BTreeMap<TypeId, PackSt>,
+    ) {
+        match &e.kind {
+            HExprKind::Index(b, idx) => {
+                for i in idx {
+                    self.pack_visit_expr(i, proc, false, st);
+                }
+                self.pack_visit_indexes(b, proc, st);
+            }
+            HExprKind::Field(b, _) | HExprKind::Convert(b) | HExprKind::Qualified(b) => {
+                self.pack_visit_indexes(b, proc, st);
+            }
+            HExprKind::Slice(b, r) => {
+                self.pack_visit_expr(&r.left, proc, false, st);
+                self.pack_visit_expr(&r.right, proc, false, st);
+                self.pack_visit_indexes(b, proc, st);
+            }
+            _ => {}
+        }
+    }
+
+    fn pack_visit_children(
+        &mut self,
+        e: &HExpr,
+        proc: Option<(usize, usize)>,
+        st: &mut BTreeMap<TypeId, PackSt>,
+    ) {
+        match &e.kind {
+            HExprKind::Lit(_) | HExprKind::Obj(_) | HExprKind::NewOf(_) => {}
+            HExprKind::Call(_, args) => {
+                for a in args {
+                    self.pack_visit_expr(a, proc, false, st);
+                }
+            }
+            HExprKind::Index(b, idx) => {
+                self.pack_visit_expr(b, proc, false, st);
+                for i in idx {
+                    self.pack_visit_expr(i, proc, false, st);
+                }
+            }
+            HExprKind::Slice(b, r) => {
+                self.pack_visit_expr(b, proc, false, st);
+                self.pack_visit_expr(&r.left, proc, false, st);
+                self.pack_visit_expr(&r.right, proc, false, st);
+                if let Some((o, _, _)) = &r.of_obj {
+                    self.pack_visit_expr(o, proc, false, st);
+                }
+            }
+            HExprKind::Field(b, _)
+            | HExprKind::Convert(b)
+            | HExprKind::Qualified(b)
+            | HExprKind::Deref(b) => self.pack_visit_expr(b, proc, false, st),
+            HExprKind::ArrayAgg(items) => {
+                for (choices, v) in items {
+                    for c in choices {
+                        if let HChoice::Expr(x) = c {
+                            self.pack_visit_expr(x, proc, false, st);
+                        }
+                        if let HChoice::Range(r) = c {
+                            self.pack_visit_expr(&r.left, proc, false, st);
+                            self.pack_visit_expr(&r.right, proc, false, st);
+                        }
+                    }
+                    self.pack_visit_expr(v, proc, false, st);
+                }
+            }
+            HExprKind::RecordAgg(fs) => {
+                for f in fs {
+                    self.pack_visit_expr(f, proc, false, st);
+                }
+            }
+            HExprKind::Attr(_, p, param) => {
+                if let AttrPrefix::Expr(x) = p.as_ref() {
+                    self.pack_visit_expr(x, proc, false, st);
+                }
+                if let Some(x) = param {
+                    self.pack_visit_expr(x, proc, false, st);
+                }
+            }
+            HExprKind::New(v) => {
+                if let Some(v) = v {
+                    self.pack_visit_expr(v, proc, false, st);
+                }
+            }
+            HExprKind::Cond(arms, els) => {
+                for (c, v) in arms {
+                    self.pack_visit_expr(c, proc, false, st);
+                    self.pack_visit_expr(v, proc, false, st);
+                }
+                self.pack_visit_expr(els, proc, false, st);
+            }
+        }
+    }
+
+    /// How an expression uses an object, if the object is its root.
+    fn pack_access(&self, e: &HExpr) -> Option<(ObjId, PackUse)> {
+        match &e.kind {
+            HExprKind::Obj(o) => Some((*o, PackUse::Whole)),
+            HExprKind::Slice(b, _) => {
+                let (o, _) = self.pack_access(b)?;
+                Some((o, PackUse::Other))
+            }
+            HExprKind::Index(b, idx) => match &b.kind {
+                HExprKind::Field(_, _) => {
+                    let (o, inner) = self.pack_access(b)?;
+                    if matches!(inner, PackUse::Field) && idx.len() == 1 {
+                        Some((o, PackUse::FieldElem))
+                    } else {
+                        Some((o, PackUse::Other))
+                    }
+                }
+                _ => {
+                    let (o, inner) = self.pack_access(b)?;
+                    if matches!(inner, PackUse::Whole) && idx.len() == 1 {
+                        Some((o, PackUse::Elem))
+                    } else {
+                        Some((o, PackUse::Other))
+                    }
+                }
+            },
+            HExprKind::Field(b, _) => {
+                let (o, inner) = self.pack_access(b)?;
+                if matches!(inner, PackUse::Elem) {
+                    Some((o, PackUse::Field))
+                } else {
+                    Some((o, PackUse::Other))
+                }
+            }
+            _ => None,
+        }
+    }
 
     /// Elaborate the hierarchy below the top architecture: signals,
     /// port associations and processes in elaboration order.
     pub(super) fn elaborate(&mut self, top: usize) {
+        self.select_record_packs();
         // The objects each architecture's scope declares (for the scopes
         // of blocks and generate iterations).
         self.arch_objs = self
