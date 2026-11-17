@@ -58831,10 +58831,13 @@ mod prepared_process_ownership_tests {
             ("typedef logic [W-1:0] word_t; word_t v;", 2),
             ("initial begin logic [W-1:0] v; v = W; end", 2),
         ] {
-            let parsed = crate::parse(&format!(
+            let mut parsed = crate::parse(&format!(
                 "module leaf #(parameter W=4)(output logic [W-1:0] out); {body} endmodule"
             ));
             assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+            // Preparation consumes the bound AST in production. Generate
+            // declarations need those identities before their scope is renamed.
+            let _ = bind::audit_design(&mut parsed.source.descriptions);
             let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
                 panic!("module expected");
             };
