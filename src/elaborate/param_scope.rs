@@ -488,6 +488,20 @@ pub(super) struct PreparedKey {
 pub(super) type TypeBinding = (String, Option<u32>, Box<[u8]>);
 
 impl PreparedKey {
+    /// A body whose preparation does not inspect value parameters. Type
+    /// bindings still distinguish contexts; instance elaboration keeps its
+    /// complete parameter scope independently of this syntax cache.
+    pub(super) fn value_independent(def: Definition, types: Vec<TypeBinding>) -> (Self, usize) {
+        let key = Self {
+            definition: def_key(&def),
+            missing: Rc::from([]),
+            changed: Vec::new(),
+            types,
+        };
+        let bytes = key.retained_bytes();
+        (key, bytes)
+    }
+
     /// Retained key payload, excluding separately counted interned masks and
     /// allocator/hash-table overhead. Wide values include both complete planes.
     fn retained_bytes(&self) -> usize {

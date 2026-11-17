@@ -78,12 +78,15 @@ pub mod bits2;
 mod body_type_params;
 pub mod elaborate;
 pub mod packed_value;
+mod duplicate_definitions;
 mod param_override_lists;
 pub mod scope_tree;
 pub mod shared_names;
 mod unit_subroutine_usage;
 #[cfg(test)]
 mod unit_assertion_retention_tests;
+#[cfg(test)]
+mod unit_storage_retention_tests;
 pub mod pkg_scope;
 pub mod sdf;
 pub mod stdout_sink;
@@ -218,7 +221,17 @@ pub use value::Value;
 /// \x3f = \x3e + assignment target bits/vector shape and declared vector nets (§10.3.3).
 /// \x40 = \x3f + corrected constant real math and signature parameter types (§11.2.1, §6.20.2).
 /// \x41 = \x40 + constant operand contexts, typed function storage and unit parameter scope (§11.8.2, §13.4.1, §3.12.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x41";
+/// \x42 = \x41 + a child module's paths into its own generate blocks take the instance prefix (§23.9, §27.5).
+///         Also covers typed constant-expression results, typed assignment-pattern keys, package typedef
+///         ranges and instance-qualified class specialization arguments (§11.8.1, §10.9.1, §26.3, §8.25).
+/// \x43 = \x42 + an unpacked struct in a generate block stored member by member, class static functions
+///         folded in parameter initializers, and the declared type of named packed array ports
+///         (§7.2, §13.8, §7.4.1).
+/// \x44 = \x43 + compilation-unit variables and nets only in the definitions that name them (§3.12.1, §6.7).
+/// \x45 = \x44 + procedural parameter declarations, corrected parameter overlays,
+///         alias/port resolution and separate zero-rise gate/net delays.
+/// \x46 = \x45 + parameter declaration ownership for waveform scopes (§26.3, §21.7.2.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x46";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1213,6 +1226,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     let mut src_file_of_module: crate::hasher::HashMap<String, u32> =
         crate::hasher::HashMap::default();
     let mut pp = new_design_preprocessor(include_dirs, defines);
+    let mut duplicate_definitions = duplicate_definitions::DuplicateDefinitions::default();
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
@@ -1336,6 +1350,30 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 i + 1,
                 sources.len(),
                 errs.join("\n")
+            ));
+        }
+        // §3.13, §6.18, §8.3, §26.2: a scope holds one class/typedef/package
+        // of a name. The name-keyed tables used to replace (or be replaced by)
+        // the first without a word.
+        let dup = duplicate_definitions.check_file(
+            &source_ast.descriptions,
+            &preprocessed,
+            line_map.as_ref(),
+            label,
+            i,
+        );
+        for w in dup.warnings {
+            progress_clear();
+            elab_diag(w);
+        }
+        if !dup.errors.is_empty() {
+            progress_clear();
+            return Err(format!(
+                "Duplicate definition in '{}' (file {} of {}):\n{}",
+                label,
+                i + 1,
+                sources.len(),
+                dup.errors.join("\n")
             ));
         }
         for d in &source_ast.descriptions {
@@ -1740,19 +1778,44 @@ fn design_declared_names(
     names
 }
 
-/// A module, interface or program name already taken by another of them: only
-/// one definition survives, so a list written for another cannot be judged.
-fn note_if_redefined(definitions: &crate::hasher::HashMap<String, SourceDefinition>, name: &str) {
-    if matches!(
-        definitions.get(name),
-        Some(
-            SourceDefinition::Module(_)
-                | SourceDefinition::Interface(_)
-                | SourceDefinition::Program(_)
-        )
-    ) {
-        param_override_lists::note_redefined_module(name);
+fn def_kind_name(def: &SourceDefinition) -> Option<&'static str> {
+    match def {
+        SourceDefinition::Module(_) => Some("module"),
+        SourceDefinition::Interface(_) => Some("interface"),
+        SourceDefinition::Program(_) => Some("program"),
+        SourceDefinition::Udp(_) => Some("primitive"),
+        _ => None,
     }
+}
+
+/// A module, interface, program or primitive name already taken by another of
+/// them (§3.13): warn that the later definition overwrites the earlier one,
+/// and mark the name so parameter-override lists are not judged against the
+/// wrong body.
+fn note_if_redefined(
+    definitions: &crate::hasher::HashMap<String, SourceDefinition>,
+    name: &str,
+    new_kind: &str,
+) {
+    let Some(prev_kind) = definitions.get(name).and_then(def_kind_name) else {
+        return;
+    };
+    param_override_lists::note_redefined_module(name);
+    let msg = if prev_kind == new_kind {
+        let clause = match new_kind {
+            "module" => "§3.3",
+            "interface" => "§3.13, §25.3",
+            _ => "§3.13",
+        };
+        format!(
+            "[xezim][warning] {new_kind} '{name}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 {clause})"
+        )
+    } else {
+        format!(
+            "[xezim][warning] {new_kind} '{name}' redefines earlier {prev_kind} '{name}'; the later definition overwrites the earlier one (IEEE 1800-2017 §3.13)"
+        )
+    };
+    elab_diag(msg);
 }
 
 fn parse_and_elaborate(
@@ -2082,13 +2145,7 @@ fn parse_and_elaborate(
                 hoist_nested(&mut m, &mut nested);
                 for n in nested {
                     let nname = n.name.name.clone();
-                    if definitions.contains_key(&nname) {
-                        param_override_lists::note_redefined_module(&nname);
-                        log_eprintln(&format!(
-                            "[xezim][warning] module '{}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 \u{00a7}3.3)",
-                            nname
-                        ));
-                    }
+                    note_if_redefined(&definitions, &nname, "module");
                     let (unit_s, prec_s) = eff_ts.get(&nname).copied().unwrap_or((tick_s, tick_s));
                     let mut n = n;
                     elaborate::rewrite_module_delays_pub(&mut n.items, unit_s, prec_s, tick_s);
@@ -2096,24 +2153,13 @@ fn parse_and_elaborate(
                     definitions.insert(nname, SourceDefinition::Module(Rc::new(n)));
                 }
                 let name = m.name.name.clone();
-                // Only a same-kind collision (module overwriting module) is a
-                // genuine §3.3 redefinition worth warning about — and the module
-                // then legitimately wins. A module with the SAME name as an
-                // existing class/interface/package is legal (§3.13: hierarchy
-                // and data namespaces are separate); `class_defs` preserves the
-                // class, so no warning and no data loss.
-                note_if_redefined(&definitions, &name);
-                if matches!(definitions.get(&name), Some(SourceDefinition::Module(_))) {
-                    // The reference simulator ACCEPTS a redefinition with a
-                    // warning and the LAST definition wins (measured:
-                    // "Existing module 'm' ... will be overwritten", the
-                    // second body's output appears). Rejecting broke multi-
-                    // file flows that deliberately override a module.
-                    log_eprintln(&format!(
-                        "[xezim][warning] module '{}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 \u{00a7}3.3)",
-                        name
-                    ));
-                }
+                // The reference simulator ACCEPTS a definitions-namespace
+                // redefinition with a warning and the LAST definition wins.
+                // Rejecting broke multi-file flows that deliberately override a
+                // module/interface. A class/package/typedef with the SAME name
+                // is legal (§3.13: separate namespaces), so `note_if_redefined`
+                // matches only module/interface/program/primitive.
+                note_if_redefined(&definitions, &name, "module");
                 // Pre-scale this module's delays from its own timeunit to the
                 // global tick (no-op when both are 1 ns).
                 // Every module's delays are pre-scaled to the global tick, even
@@ -2136,7 +2182,7 @@ fn parse_and_elaborate(
                 let mut i = i;
                 elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut i.params, unit_s, prec_s);
-                note_if_redefined(&definitions, &name);
+                note_if_redefined(&definitions, &name, "interface");
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
             ast::Description::Program(mut p) => {
@@ -2147,7 +2193,7 @@ fn parse_and_elaborate(
                 elaborate::rewrite_module_delays_pub(&mut p.items, unit_s, prec_s, tick_s);
                 elaborate::scope_time_param_ports_pub(&mut p.params, unit_s, prec_s);
                 top_module = Some(name.clone());
-                note_if_redefined(&definitions, &name);
+                note_if_redefined(&definitions, &name, "program");
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
             ast::Description::Class(mut c) => {
@@ -2158,7 +2204,7 @@ fn parse_and_elaborate(
                 // Always keep the class in its own registry so a same-named
                 // module cannot clobber it (see `class_defs`). Into
                 // `definitions` it goes ONLY when the name is free of a
-                // hierarchy kind (module/interface/program) — a class and a
+                // hierarchy kind (module/interface/program/UDP) — a class and a
                 // module may share a name (§3.13), and if the module came
                 // first we must not evict it from the name-keyed slot the
                 // top-module/instantiation walkers rely on. In that case the
@@ -2167,7 +2213,8 @@ fn parse_and_elaborate(
                 match definitions.get(&name) {
                     Some(SourceDefinition::Module(_))
                     | Some(SourceDefinition::Interface(_))
-                    | Some(SourceDefinition::Program(_)) => {}
+                    | Some(SourceDefinition::Program(_))
+                    | Some(SourceDefinition::Udp(_)) => {}
                     _ => {
                         definitions.insert(name, SourceDefinition::Class(rc));
                     }
@@ -2204,8 +2251,8 @@ fn parse_and_elaborate(
                 // §6.18: a bare forward typedef (`typedef name;`) must not
                 // displace a real definition of the same name — `typedef_test_0`
                 // restates the forward name after the full `typedef int name;`.
-                // Forward → insert only if absent; real → always (replaces a
-                // prior forward placeholder).
+                // Forward → insert only if absent; real → keep the first real
+                // definition (for cross-file identical typedefs).
                 if t.forward {
                     // A bare forward typedef (`typedef name;`) is a placeholder;
                     // it must not displace a real definition of the same name —
@@ -2216,6 +2263,13 @@ fn parse_and_elaborate(
                     definitions
                         .entry(name)
                         .or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
+                } else if !matches!(t.data_type, ast::types::DataType::Void(_))
+                    && typedef_defs
+                        .get(&name)
+                        .is_some_and(|prev| !matches!(prev.data_type, ast::types::DataType::Void(_)))
+                {
+                    // An identical cross-file typedef already filled this slot;
+                    // keep the first definition.
                 } else {
                     // Real typedef: keep it in the dedicated registry so a
                     // same-named hierarchy kind (module/interface/program/
@@ -2229,7 +2283,8 @@ fn parse_and_elaborate(
                     match definitions.get(&name) {
                         Some(SourceDefinition::Module(_))
                         | Some(SourceDefinition::Interface(_))
-                        | Some(SourceDefinition::Program(_)) => {}
+                        | Some(SourceDefinition::Program(_))
+                        | Some(SourceDefinition::Udp(_)) => {}
                         _ => {
                             definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
                         }
@@ -2325,6 +2380,7 @@ fn parse_and_elaborate(
                 // leaving the cursor on a trailing UDP (an instantiated,
                 // non-candidate name) correctly forces that heuristic instead of
                 // pinning a trivial trailing program/package.
+                note_if_redefined(&definitions, &name, "primitive");
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Udp(Rc::new(u)));
             }
@@ -2401,6 +2457,8 @@ fn parse_and_elaborate(
         && top_level_tasks.is_empty()
         && top_level_params.is_empty()
         && top_level_assertion_decls.is_empty()
+        && top_level_vars.is_empty()
+        && top_level_nets.is_empty()
     {
         None
     } else if let Some(name) = named_top {
@@ -2521,6 +2579,54 @@ fn parse_and_elaborate(
     let needed_unit_params = unit_param_usage.close(needed_unit_params);
     let needed_unit_assertions = unit_assertion_usage.close(needed_unit_assertions);
 
+    // §3.12.1 / §6.7 / §6.8 (#721): compilation-unit variables and nets are
+    // declarations of the unit, not of every module. A definition receives
+    // only the unit storage its own ports, parameters and items name, that
+    // the unit subroutines it receives read, or that a declaration injected
+    // into every definition (or a unit class, typedef, package, let or bind)
+    // names. Copying all of them into every definition cloned each
+    // declaration once per definition and created its signals and drivers
+    // once per instance. The carrier keeps all of them; with library
+    // modules, whose bodies are adopted later, every definition does.
+    let unit_storage_usage =
+        unit_subroutine_usage::Usage::storage(&top_level_vars, &top_level_nets);
+    let retain_all_storage = !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty();
+    let mut common_storage_refs = unit_storage_usage.references(&(
+        (&top_level_nettypes, &top_level_params, &top_level_covergroups),
+        (
+            &top_level_assertion_decls,
+            &top_level_dpi_imports,
+            &top_level_dpi_exports,
+        ),
+        (&top_level_lets, &top_level_binds, &top_level_ooc_constraints),
+        (&top_level_imports, &class_defs, &typedef_defs),
+    ));
+    if !(top_level_vars.is_empty() && top_level_nets.is_empty()) {
+        for def in definitions.values() {
+            let refs = match def {
+                SourceDefinition::Class(d) => unit_storage_usage.references(d),
+                SourceDefinition::Package(d) => unit_storage_usage.references(d),
+                SourceDefinition::Typedef(d) => unit_storage_usage.references(d),
+                SourceDefinition::Udp(d) => unit_storage_usage.references(d),
+                _ => continue,
+            };
+            common_storage_refs.extend(refs);
+        }
+    }
+    let unit_sub_storage_refs: std::collections::HashMap<String, crate::hasher::HashSet<String>> =
+        top_level_functions
+            .iter()
+            .filter(|f| !f.name.has_scope())
+            .map(|f| (f.name.name.name.clone(), unit_storage_usage.references(f)))
+            .chain(
+                top_level_tasks
+                    .iter()
+                    .filter(|t| !t.name.has_scope())
+                    .map(|t| (t.name.name.name.clone(), unit_storage_usage.references(t))),
+            )
+            .filter(|(_, refs)| !refs.is_empty())
+            .collect();
+
     // §23.11: retain module/generate bind declarations in their lexical
     // scopes. Targets are resolved after the ordinary hierarchy is elaborated.
     if !top_level_functions.is_empty()
@@ -2580,6 +2686,23 @@ fn parse_and_elaborate(
                     let mut refs = unit_usage.references(&(ports, params, &*items));
                     refs.extend(common_unit_refs.iter().cloned());
                     Some(unit_usage.close(refs))
+                };
+                let needed_unit_storage = if retain_all || retain_all_storage {
+                    None
+                } else {
+                    let mut refs = unit_storage_usage.references(&(ports, params, &*items));
+                    refs.extend(common_storage_refs.iter().cloned());
+                    for sub in needed_unit_subs.iter().flatten() {
+                        if let Some(sub_refs) = unit_sub_storage_refs.get(sub) {
+                            refs.extend(sub_refs.iter().cloned());
+                        }
+                    }
+                    Some(unit_storage_usage.close(refs))
+                };
+                let storage_needed = |name: &str| {
+                    needed_unit_storage
+                        .as_ref()
+                        .is_none_or(|needed| needed.contains(name))
                 };
                 // What this module declares ITSELF, captured before anything is
                 // injected — a name in here shadows the $unit declaration of
@@ -2644,10 +2767,14 @@ fn parse_and_elaborate(
                         map.remove(&p.name.name);
                     }
                     for it in items {
-                        if let ast::stmt::StatementKind::VarDecl { declarators, .. } = &it.kind {
-                            for d in declarators {
-                                map.remove(&d.name.name);
+                        match &it.kind {
+                            ast::stmt::StatementKind::VarDecl { declarators, .. }
+                            | ast::stmt::StatementKind::ParamDecl { declarators, .. } => {
+                                for d in declarators {
+                                    map.remove(&d.name.name);
+                                }
                             }
+                            _ => {}
                         }
                     }
                     if map.is_empty() {
@@ -2796,6 +2923,17 @@ fn parse_and_elaborate(
                 // reference resolves to; the module's own `gv` keeps the bare
                 // name, so the two no longer share one storage slot.
                 for d in top_level_vars.iter().rev() {
+                    let retained;
+                    let d = if d.declarators.iter().all(|v| storage_needed(&v.name.name)) {
+                        d
+                    } else if d.declarators.iter().any(|v| storage_needed(&v.name.name)) {
+                        let mut kept = d.clone();
+                        kept.declarators.retain(|v| storage_needed(&v.name.name));
+                        retained = kept;
+                        &retained
+                    } else {
+                        continue;
+                    };
                     if !d
                         .declarators
                         .iter()
@@ -2828,7 +2966,11 @@ fn parse_and_elaborate(
                 // §3.12.1: unit nets remain distinct from module-local
                 // declarations, and their driver expressions use unit scope.
                 for net in top_level_nets.iter().rev() {
+                    if !net.declarators.iter().any(|v| storage_needed(&v.name.name)) {
+                        continue;
+                    }
                     let mut net = net.clone();
+                    net.declarators.retain(|v| storage_needed(&v.name.name));
                     for decl in &mut net.declarators {
                         if local_decl_names.contains(&decl.name.name) {
                             decl.name.name = sv_parser::unit_scope_name(&decl.name.name);
@@ -2955,27 +3097,89 @@ fn parse_and_elaborate(
         {
             type PTable =
                 std::collections::HashMap<String, Value, crate::hasher::DeterministicState>;
+            /// The package an expression belongs to and its own parameters
+            /// declared so far (§26.3).
+            struct PkgScope<'a> {
+                name: &'a str,
+                own: &'a crate::hasher::HashSet<String>,
+            }
+            thread_local! {
+                static PKG_SCOPE: std::cell::RefCell<Option<(String, crate::hasher::HashSet<String>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
             fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
-                if table.is_empty() || matches!(e.kind, ast::expr::ExprKind::Number(_)) {
+                if matches!(e.kind, ast::expr::ExprKind::Number(_)) {
                     return;
                 }
-                if let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table)) {
-                    if v >= 0 {
-                        *e = ast::expr::Expression::new(
-                            // UNSIZED literal — a sized one would trip the
-                            // §6.19 enum-member width check against narrow
-                            // base types.
-                            ast::expr::ExprKind::Number(ast::expr::NumberLiteral::Integer {
-                                size: None,
-                                signed: true,
-                                base: ast::expr::NumberBase::Decimal,
-                                value: v.to_string(),
-                                cached_val: crate::ast::cache::LiteralCache::new(None),
-                            }),
-                            e.span,
-                        );
-                    }
+                if !table.is_empty()
+                    && let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table))
+                    && v >= 0
+                {
+                    *e = ast::expr::Expression::new(
+                        // UNSIZED literal — a sized one would trip the
+                        // §6.19 enum-member width check against narrow
+                        // base types.
+                        ast::expr::ExprKind::Number(ast::expr::NumberLiteral::Integer {
+                            size: None,
+                            signed: true,
+                            base: ast::expr::NumberBase::Decimal,
+                            value: v.to_string(),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                        }),
+                        e.span,
+                    );
+                    return;
                 }
+                // §26.3, §6.18: a negative value, or one this early fold cannot
+                // model, stays an expression; a package typedef names its OWN
+                // package's constants, so qualify them (`LO` becomes `pk::LO`)
+                // and the later resolution reads that package's typed value,
+                // in any scope the type is used from, imported or not.
+                PKG_SCOPE.with(|scope| {
+                    if let Some((name, own)) = scope.borrow().as_ref() {
+                        qualify_package_params(e, &PkgScope { name, own });
+                    }
+                });
+            }
+            fn qualify_package_params(e: &mut ast::expr::Expression, scope: &PkgScope<'_>) {
+                elaborate::for_each_sub_expr_mut(e, &mut |x| {
+                    let ast::expr::ExprKind::Ident(h) = &x.kind else {
+                        return;
+                    };
+                    if h.root.is_some()
+                        || h.path.len() != 1
+                        || !h.path[0].selects.is_empty()
+                        || !scope.own.contains(&h.path[0].name.name)
+                    {
+                        return;
+                    }
+                    let member = h.path[0].name.clone();
+                    let span = x.span;
+                    let pkg = ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![ast::expr::HierPathSegment {
+                            name: ast::Identifier {
+                                name: scope.name.to_string(),
+                                span,
+                            },
+                            selects: Vec::new(),
+                        }],
+                        span,
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
+                    };
+                    *x = ast::expr::Expression::new(
+                        ast::expr::ExprKind::MemberAccess {
+                            expr: Box::new(ast::expr::Expression::new(
+                                ast::expr::ExprKind::Ident(pkg),
+                                span,
+                            )),
+                            member,
+                        },
+                        span,
+                    );
+                });
             }
             fn fold_packed(dims: &mut [ast::types::PackedDimension], table: &PTable) {
                 for d in dims.iter_mut() {
@@ -3068,11 +3272,18 @@ fn parse_and_elaborate(
                 }
             }
             fn eval_params_into(pd: &ast::decl::ParameterDeclaration, table: &mut PTable) {
-                if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                if let ast::decl::ParameterKind::Data {
+                    data_type,
+                    assignments,
+                } = &pd.kind
+                {
                     for a in assignments {
+                        // A later same-named parameter replaces an earlier one.
+                        table.remove(&a.name.name);
                         if let Some(init) = &a.init {
                             if let Some(v) =
                                 elaborate::const_eval_i64_with_params(init, Some(table))
+                                && holds_unchanged(data_type, v, table)
                             {
                                 let mut val = Value::from_u64(v as u64, 32);
                                 val.is_signed = true;
@@ -3080,6 +3291,77 @@ fn parse_and_elaborate(
                             }
                         }
                     }
+                }
+            }
+            /// §6.20.2: whether a parameter of type `dt` holds the integer `v`
+            /// unchanged, so the early fold may use it: the value fits the
+            /// declared integer atom or one-dimensional vector (its range
+            /// foldable here), or the parameter is untyped and the value fits
+            /// 32 bits. Any other type, or a value the type would truncate or
+            /// re-sign (`localparam byte LO = 2147483646`), is left to the
+            /// typed evaluation in the package scope.
+            fn holds_unchanged(dt: &ast::types::DataType, v: i64, table: &PTable) -> bool {
+                use ast::types::{DataType as D, IntegerAtomType as A, PackedDimension as P};
+                let fits = |w: u32, signed: bool| {
+                    if w >= 64 {
+                        return signed || v >= 0;
+                    }
+                    if signed {
+                        let half = 1i64 << (w - 1);
+                        (-half..half).contains(&v)
+                    } else {
+                        (0..(1i64 << w)).contains(&v)
+                    }
+                };
+                let signed_of = |s: &Option<ast::types::Signing>, default: bool| match s {
+                    Some(ast::types::Signing::Signed) => true,
+                    Some(ast::types::Signing::Unsigned) => false,
+                    None => default,
+                };
+                let vector = |dims: &[P], signing: &Option<ast::types::Signing>| match dims {
+                    [] => fits(1, signed_of(signing, false)),
+                    [P::Range { left, right, .. }] => {
+                        match (
+                            elaborate::const_eval_i64_with_params(left, Some(table)),
+                            elaborate::const_eval_i64_with_params(right, Some(table)),
+                        ) {
+                            (Some(l), Some(r)) => fits(
+                                ((l - r).unsigned_abs() + 1).min(64) as u32,
+                                signed_of(signing, false),
+                            ),
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                match dt {
+                    D::Implicit {
+                        dimensions,
+                        signing,
+                        ..
+                    } => {
+                        if dimensions.is_empty() {
+                            fits(32, true)
+                        } else {
+                            vector(dimensions, signing)
+                        }
+                    }
+                    D::IntegerVector {
+                        dimensions,
+                        signing,
+                        ..
+                    } => vector(dimensions, signing),
+                    D::IntegerAtom { kind, signing, .. } => {
+                        let (w, default) = match kind {
+                            A::Byte => (8, true),
+                            A::ShortInt => (16, true),
+                            A::Int | A::Integer => (32, true),
+                            A::LongInt => (64, true),
+                            A::Time => (64, false),
+                        };
+                        fits(w, signed_of(signing, default))
+                    }
+                    _ => false,
                 }
             }
             // $unit typedefs fold against the $unit params.
@@ -3107,14 +3389,25 @@ fn parse_and_elaborate(
                 };
                 let pkg = Rc::make_mut(pkg);
                 let mut table = unit_params.clone();
+                let pkg_name = pkg.name.name.clone();
+                let mut own: crate::hasher::HashSet<String> = Default::default();
                 for item in pkg.items.iter_mut() {
                     match item {
-                        ast::decl::PackageItem::Parameter(pd) => eval_params_into(pd, &mut table),
+                        ast::decl::PackageItem::Parameter(pd) => {
+                            eval_params_into(pd, &mut table);
+                            if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                                own.extend(assignments.iter().map(|a| a.name.name.clone()));
+                            }
+                        }
                         ast::decl::PackageItem::Typedef(td) => {
+                            PKG_SCOPE.with(|scope| {
+                                *scope.borrow_mut() = Some((pkg_name.clone(), own.clone()))
+                            });
                             fold_dt(&mut td.data_type, &table, 0);
                             for d in td.dimensions.iter_mut() {
                                 fold_unpacked(d, &table);
                             }
+                            PKG_SCOPE.with(|scope| *scope.borrow_mut() = None);
                         }
                         _ => {}
                     }
@@ -3468,6 +3761,11 @@ fn parse_and_elaborate(
     // §6.7.1: a net delay delays every driver of the net. Before the fold
     // below, which then resolves the drivers it moves onto a driver-side net.
     elaborate::apply_net_delays(&mut elab);
+    // §10.11: the names an `alias` statement names are ONE physical net.
+    // The unification renames the group's members onto one name, so their
+    // drivers resolve together and every read of any of them sees the
+    // resolved value.
+    elaborate::unify_alias_nets(&mut elab);
     // §6.6.1: a net with several continuous drivers resolves them all.
     elaborate::resolve_multi_driver_nets(&mut elab);
     elab_phase("net delays and multi-driver nets", &mut phase_t);

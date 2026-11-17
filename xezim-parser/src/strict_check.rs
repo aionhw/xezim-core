@@ -446,7 +446,8 @@ fn check_decl_order_list(stmts: &[Statement], out: &mut Vec<Diagnostic>) {
     let mut seen_stmt = false;
     for st in stmts {
         match &st.kind {
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 if seen_stmt {
                     let name = declarators
                         .first()

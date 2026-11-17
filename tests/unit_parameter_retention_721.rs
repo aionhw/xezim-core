@@ -193,8 +193,11 @@ module top; leaf a(), b(); endmodule
     assert!(!names.iter().any(|n| n == "UNUSED"));
     assert_eq!(design.parameters["a.RESULT"].to_u64(), Some(11));
     assert_eq!(design.signals["a.word"].width, 6);
-    assert!(design.signals.contains_key("a.unit_variable"));
-    assert!(design.signals.contains_key("b.unit_variable"));
+    // §3.12.1: the unit variable is the unit's, not a member of each `leaf`
+    // instance; `leaf` does not name it, so no instance holds a copy.
+    assert!(design.signals.contains_key("unit_variable"));
+    assert!(!design.signals.contains_key("a.unit_variable"));
+    assert!(!design.signals.contains_key("b.unit_variable"));
 }
 
 #[test]

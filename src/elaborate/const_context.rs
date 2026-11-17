@@ -51,7 +51,7 @@ impl Types {
     }
 }
 
-pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &mut Types) -> Type {
+pub(super) fn infer<P: ParamLookup>(expr: &Expression, params: &P, types: &mut Types) -> Type {
     // A bound name already carries its type. Reading it for type inference
     // must not clone its value or allocate a cache entry on each loop step.
     if let ExprKind::Ident(h) = &expr.kind {
@@ -95,13 +95,19 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
                     | BinaryOp::ShiftRight
                     | BinaryOp::ArithShiftLeft
                     | BinaryOp::ArithShiftRight
-                    | BinaryOp::Power
             ) {
                 left
+            } else if matches!(op, BinaryOp::Power) {
+                // §11.4.5, §11.8.1: the exponent does not size the result,
+                // but a real exponent makes the power real.
+                let right = infer(right, params, types);
+                if right.real { left.common(right) } else { left }
             } else {
                 left.common(infer(right, params, types))
             }
         }
+        // §11.4.13: `inside` yields a 1-bit result.
+        ExprKind::Inside { .. } => Type::integer(1, false),
         ExprKind::Binary { op, .. }
             if is_comparison(*op)
                 || matches!(
@@ -188,7 +194,25 @@ pub(super) fn infer(expr: &Expression, params: &HashMap<String, Value>, types: &
     ty
 }
 
-fn function_type(func: &Expression, params: &HashMap<String, Value>) -> Option<Type> {
+fn function_type<P: ParamLookup>(func: &Expression, params: &P) -> Option<Type> {
+    function_type_inner(func, params, false)
+}
+
+/// [`function_type`] only when the declared return type resolves past every
+/// type name: a typedef this scope cannot see would be sized from the width
+/// table but read as unsigned, which an untyped parameter must not take.
+pub(super) fn function_type_resolved<P: ParamLookup>(
+    func: &Expression,
+    params: &P,
+) -> Option<Type> {
+    function_type_inner(func, params, true)
+}
+
+fn function_type_inner<P: ParamLookup>(
+    func: &Expression,
+    params: &P,
+    require_resolved: bool,
+) -> Option<Type> {
     let (name, scoped) = const_fn_call_name(func)?;
     let declared = FUNCS_TLS.with(|f| {
         let funcs = f.borrow();
@@ -206,12 +230,15 @@ fn function_type(func: &Expression, params: &HashMap<String, Value>) -> Option<T
                 .map(|t| resolve_typedef_chain(&declared, t).clone())
         })
         .unwrap_or(declared);
+    if require_resolved && matches!(resolved, DataType::TypeReference { .. }) {
+        return None;
+    }
     let real = is_type_real(&resolved);
     let text = is_string_data_type(&resolved);
     let width = if real {
         64
     } else {
-        typedefs_snapshot(|td| resolve_type_width(&resolved, Some(params), td))
+        typedefs_snapshot(|td| resolve_type_width_env(&resolved, Some(params), td))
     };
     (width > 0 || text).then_some(Type {
         width,

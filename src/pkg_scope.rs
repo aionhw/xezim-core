@@ -1323,6 +1323,11 @@ fn stmt_locals(s: &Statement, f: &mut Frame) {
             data_type,
             declarators,
             ..
+        }
+        | StatementKind::ParamDecl {
+            data_type,
+            declarators,
+            ..
         } => {
             f.values
                 .extend(declarators.iter().map(|d| d.name.name.clone()));
@@ -2570,6 +2575,11 @@ impl Rw<'_> {
                 }
             },
             StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | StatementKind::ParamDecl {
                 data_type,
                 declarators,
                 ..

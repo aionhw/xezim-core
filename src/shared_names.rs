@@ -401,6 +401,81 @@ impl<V> IntoIterator for SharedNameMap<V> {
     }
 }
 
+/// Deterministic set of shared names with the borrowed String-key API of a
+/// `HashSet<String>`. Serde keeps the ordinary set representation, so an
+/// encoded set is the same bytes as before.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SharedNameSet(crate::hasher::HashSet<SharedName>);
+
+impl SharedNameSet {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub fn contains<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> bool
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.0.contains(key)
+    }
+    pub fn remove<Q: ?Sized + Hash + Eq>(&mut self, key: &Q) -> bool
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.0.remove(key)
+    }
+    pub fn insert<K: Into<SharedName>>(&mut self, key: K) -> bool {
+        self.0.insert(key.into())
+    }
+    pub fn retain(&mut self, mut predicate: impl FnMut(&String) -> bool) {
+        self.0.retain(|key| predicate(key));
+    }
+    pub fn iter(&self) -> SetIter<'_> {
+        SetIter(self.0.iter())
+    }
+}
+impl<K: Into<SharedName>> Extend<K> for SharedNameSet {
+    fn extend<T: IntoIterator<Item = K>>(&mut self, iter: T) {
+        self.0.extend(iter.into_iter().map(Into::into));
+    }
+}
+impl<K: Into<SharedName>> FromIterator<K> for SharedNameSet {
+    fn from_iter<T: IntoIterator<Item = K>>(iter: T) -> Self {
+        let mut set = Self::default();
+        set.extend(iter);
+        set
+    }
+}
+pub struct SetIter<'a>(std::collections::hash_set::Iter<'a, SharedName>);
+impl<'a> Iterator for SetIter<'a> {
+    type Item = &'a String;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|k| &**k)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+impl ExactSizeIterator for SetIter<'_> {}
+impl Clone for SetIter<'_> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<'a> IntoIterator for &'a SharedNameSet {
+    type Item = &'a String;
+    type IntoIter = SetIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +629,33 @@ mod tests {
         NAMES.with(|names| assert_eq!(names.borrow().capacity(), 0));
         drop(signals);
         NAMES.with(|names| assert_eq!(names.borrow().capacity(), 0));
+    }
+
+    /// #721: net classification sets share the signal map's name text and
+    /// keep the bytes a `HashSet<String>` encodes to, so artifacts and design
+    /// caches read the same.
+    #[test]
+    fn shared_name_set_shares_text_and_encodes_like_a_string_set() {
+        let _scope = registry_scope();
+        let names: Vec<String> = (0..64).map(|i| format!("top.g[{i}].u.lane_{i}")).collect();
+        let mut signals: SharedNameMap<u8> = SharedNameMap::default();
+        for name in &names {
+            signals.insert(name.as_str(), 0);
+        }
+        let plain: crate::hasher::HashSet<String> = names.iter().cloned().collect();
+        let shared: SharedNameSet = names.iter().map(String::as_str).collect();
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&shared, config).unwrap();
+        assert_eq!(bincode::serde::encode_to_vec(&plain, config).unwrap(), bytes);
+        for name in &names {
+            let key = signals.shared_key(name.as_str()).unwrap();
+            assert!(shared.0.get(name.as_str()).unwrap().ptr_eq(key));
+        }
+        assert!(shared.contains("top.g[3].u.lane_3"));
+        assert!(!shared.contains("top.g[3].u"));
+        let (back, _): (SharedNameSet, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(back.len(), names.len());
+        assert!(names.iter().all(|n| back.contains(n)));
     }
 }

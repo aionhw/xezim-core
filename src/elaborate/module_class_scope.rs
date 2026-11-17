@@ -31,6 +31,70 @@ pub(super) fn specialized_receiver(
     }
 }
 
+/// §8.25, §23.10: the arguments of a `C#(...)` written in a module instance
+/// name that instance's parameters. Qualify each name the instance declares
+/// as an expression reference to it is qualified, so instances with
+/// different parameter values name different specializations (a bare `W`
+/// resolved to one instance's value for every instance). Named-argument
+/// labels (`.W(`), scoped names (`p::N`, `C::N`), literals and strings keep
+/// their spelling.
+pub(super) fn spec_args_text(
+    text: &str,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+) -> String {
+    if prefix.is_empty() || local_names.is_empty() {
+        return text.to_string();
+    }
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut virtual_type = false;
+    while i < b.len() {
+        let c = b[i];
+        let start = i;
+        if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(b.len());
+        } else if c == b'\'' || c.is_ascii_digit() || c == b'$' {
+            // A based literal (`8'hFF`, `'1`), a number, a system name.
+            i += 1;
+            while i < b.len() && (ident(b[i]) || b[i] == b'\'') {
+                i += 1;
+            }
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            while i < b.len() && ident(b[i]) {
+                i += 1;
+            }
+            let tok = &text[start..i];
+            let before = text[..start].trim_end();
+            let after = text[i..].trim_start();
+            // §25.9 / §3.13: the name after `virtual [interface]` is
+            // an interface TYPE, even when an instance has the same name.
+            // Its parameter expressions still refer to the module scope.
+            let interface_type = virtual_type && tok != "interface";
+            virtual_type = tok == "virtual" || (virtual_type && tok == "interface");
+            if !interface_type && local_names.contains(tok)
+                && !before.ends_with('.')
+                && !before.ends_with("::")
+                && !after.starts_with("::")
+            {
+                out.push_str(prefix);
+                out.push_str(tok);
+                continue;
+            }
+        } else {
+            i += text[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        out.push_str(&text[start..i]);
+    }
+    out
+}
+
 fn receiver_text(e: &Expression) -> Option<String> {
     match &e.kind {
         ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|p| p.selects.is_empty()) => {

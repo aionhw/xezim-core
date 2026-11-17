@@ -874,6 +874,8 @@ impl Value {
                 ValueStorage::Inline { val_bits, .. } => f64::from_bits(*val_bits),
                 _ => 0.0,
             }
+        } else if let ValueStorage::Wide(planes) = &self.storage {
+            Self::wide_to_f64(planes, self.width, self.is_signed)
         } else {
             if self.is_signed {
                 self.to_i64().unwrap_or(0) as f64
@@ -881,6 +883,59 @@ impl Value {
                 self.to_u64().unwrap_or(0) as f64
             }
         }
+    }
+
+    /// §6.12.2: an integral value wider than 64 bits converted to real,
+    /// rounded to nearest; x and z bits read as 0. The top 64 significant
+    /// bits with a sticky bit for the rest round exactly as the whole value.
+    fn wide_to_f64(planes: &WidePlanes, width: u32, signed: bool) -> f64 {
+        let width = width as usize;
+        let mut words: Vec<u64> = planes
+            .val
+            .iter()
+            .zip(&planes.xz)
+            .map(|(v, x)| v & !x)
+            .collect();
+        if width % 64 != 0
+            && let Some(top) = words.get_mut(width / 64)
+        {
+            *top &= (1u64 << (width % 64)) - 1;
+        }
+        let negative =
+            signed && width > 0 && (words[(width - 1) / 64] >> ((width - 1) % 64)) & 1 == 1;
+        if negative {
+            // Two's complement magnitude at the value's width.
+            let mut carry = 1u64;
+            for w in words.iter_mut() {
+                let (sum, c) = (!*w).overflowing_add(carry);
+                *w = sum;
+                carry = c as u64;
+            }
+            if width % 64 != 0
+                && let Some(top) = words.get_mut(width / 64)
+            {
+                *top &= (1u64 << (width % 64)) - 1;
+            }
+        }
+        let Some(hi) = words.iter().rposition(|&w| w != 0) else {
+            return 0.0;
+        };
+        let msb = hi * 64 + 63 - words[hi].leading_zeros() as usize;
+        let bit = |i: usize| (words[i / 64] >> (i % 64)) & 1;
+        let magnitude = if msb < 64 {
+            words[0] as f64
+        } else {
+            let low = msb - 63;
+            let mut top = 0u64;
+            for i in (low..=msb).rev() {
+                top = (top << 1) | bit(i);
+            }
+            if (0..low).any(|i| bit(i) == 1) {
+                top |= 1;
+            }
+            top as f64 * 2f64.powi(low as i32)
+        };
+        if negative { -magnitude } else { magnitude }
     }
 
     /// Extract inline bits for caching. Returns None for Wide values.
@@ -3674,11 +3729,13 @@ impl Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.less_than(&b);
         }
-        if self.has_xz() || other.has_xz() {
-            return Value::new(1);
-        }
+        // §11.4.4, §6.12.1: convert to real (X/Z bits become zero)
+        // before applying the integral-only unknown-operand rule.
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() < other.to_f64()) as u64, 1);
+        }
+        if self.has_xz() || other.has_xz() {
+            return Value::new(1);
         }
         if self.width > 64 || other.width > 64 {
             return Value::from_u64((self.wide_cmp(other) == std::cmp::Ordering::Less) as u64, 1);
@@ -3702,11 +3759,13 @@ impl Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.less_equal(&b);
         }
-        if self.has_xz() || other.has_xz() {
-            return Value::new(1);
-        }
+        // §11.4.4, §6.12.1: convert to real (X/Z bits become zero)
+        // before applying the integral-only unknown-operand rule.
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() <= other.to_f64()) as u64, 1);
+        }
+        if self.has_xz() || other.has_xz() {
+            return Value::new(1);
         }
         if self.width > 64 || other.width > 64 {
             return Value::from_u64(
@@ -4228,6 +4287,10 @@ impl fmt::Display for Value {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "value_real_relational_tests.rs"]
+mod real_relational_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5840,6 +5903,24 @@ impl Value {
     /// Binary string representation  
     pub fn to_bin_string(&self) -> String {
         self.to_bin()
+    }
+
+    /// The value of the digits of an integer literal (`NumberLiteral::Integer`
+    /// text) at `width`. §5.7.1: a source literal never carries a sign (`-1`
+    /// is unary minus applied to `1`), but the elaborator writes a negative
+    /// value it substitutes or folds, such as a genvar (§27.4), as one
+    /// decimal token `-2`, which constant evaluation reads as negative. The
+    /// literal's cached value is not serialized, so a design loaded from the
+    /// design cache or an artifact evaluates that text again: read it as the
+    /// two's complement of the magnitude (`from_str_radix` leaves a sign to
+    /// the caller and reads it as x).
+    pub fn from_literal_text(s: &str, radix: u32, width: u32) -> Self {
+        match s.strip_prefix('-') {
+            Some(magnitude) if magnitude.bytes().next().is_some_and(|b| b.is_ascii_digit()) => {
+                Self::from_str_radix(magnitude, radix, width).negate()
+            }
+            _ => Self::from_str_radix(s, radix, width),
+        }
     }
 
     /// Parse from a string with given radix (2, 8, 10, 16)
