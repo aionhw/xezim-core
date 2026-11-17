@@ -39,6 +39,9 @@ pub struct Parser {
     /// Parsing a function or task prototype's ports, where a formal's name
     /// may be omitted (A.2.7 footnote 28).
     prototype_ports: bool,
+    /// The items of the cross whose bin selects are being parsed, so
+    /// `binsof` can name a hierarchical item (XEZIM_RELAX_CROSS_HIER_ITEM).
+    cross_items: Vec<String>,
     /// The classes of this file so far, for the strict inheritance checks.
     pub(super) class_infos: Vec<ClassInfo>,
     /// `pure constraint` names of the class being parsed.
@@ -137,6 +140,7 @@ impl Parser {
             in_sva_seq: false,
             sva_delay_count: false,
             prototype_ports: false,
+            cross_items: Vec::new(),
             class_infos: Vec::new(),
             pure_constraints: Vec::new(),
             in_constraint: false,
