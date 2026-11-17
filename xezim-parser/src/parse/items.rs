@@ -2495,6 +2495,7 @@ impl Parser {
                     // of defaulting to input (which mis-marked outputs as inputs,
                     // wrongly rejecting writes — veer-el2 / rsd).
                     let mut last_dir = PortDirection::Input;
+                    let mut tf_ports = false;
                     loop {
                         if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                             break;
@@ -2506,6 +2507,7 @@ impl Parser {
                         // block; downstream consumers that don't understand
                         // clocking still see *something* there.
                         if self.eat(TokenKind::KwClocking).is_some() {
+                            tf_ports = false;
                             let cb_name = self.parse_identifier();
                             ports.push(ModportPort {
                                 direction: PortDirection::Input,
@@ -2513,30 +2515,99 @@ impl Parser {
                                 span: self.span_from(pstart),
                                 expr: None,
                             });
-                        } else if self.at(TokenKind::KwImport) || self.at(TokenKind::KwExport) {
-                            // §25.5 modport import/export of a task/function.
-                            // Record the imported NAME as a synthetic Input port
-                            // (so it parses and stays reachable via the interface),
-                            // then skip any method prototype up to the separator.
-                            self.bump(); // import / export
-                            if self.at(TokenKind::Identifier) {
-                                let name = self.parse_identifier();
+                        } else if self.at(TokenKind::KwImport)
+                            || self.at(TokenKind::KwExport)
+                            || (tf_ports
+                                && matches!(
+                                    self.current_kind(),
+                                    TokenKind::KwTask | TokenKind::KwFunction
+                                ))
+                        {
+                            // IEEE 1800-2023 §25.3 Syntax 25-1, §25.7: each
+                            // import/export member is a name or method prototype.
+                            // Keep the callable name in the existing synthetic
+                            // Input port; the interface owns its declaration.
+                            if self.at(TokenKind::KwImport) || self.at(TokenKind::KwExport) {
+                                self.bump();
+                            }
+                            tf_ports = true;
+                            let prototype = matches!(
+                                self.current_kind(),
+                                TokenKind::KwTask | TokenKind::KwFunction
+                            );
+                            if prototype {
+                                let function = self.bump().kind == TokenKind::KwFunction;
+                                // Annex A footnote 25 excludes method specifiers here.
+                                if self.parse_optional_method_specifier().is_some() {
+                                    self.error(
+                                        "method specifier is not allowed in a modport prototype",
+                                    );
+                                }
+                                self.parse_optional_lifetime();
+                                if function {
+                                    self.parse_data_type();
+                                }
+                            }
+                            let callable = if prototype
+                                || matches!(
+                                    self.current_kind(),
+                                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                                ) {
+                                Some(self.parse_identifier())
+                            } else {
+                                None
+                            };
+                            if prototype {
+                                // §25.7: parse exactly one optional tf_port_list.
+                                // Reuse the port reader, including unnamed formals;
+                                // it stops at a missing ')' rather than scanning to EOF.
+                                let saved = std::mem::replace(&mut self.prototype_ports, true);
+                                let args = self.parse_function_ports();
+                                self.prototype_ports = saved;
+                                for arg in args {
+                                    if arg.default.is_some() {
+                                        // §25.7 / §13.5.3: prototype defaults require
+                                        // call metadata we do not retain. Keep an error.
+                                        self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                                            format!(
+                                                "default argument '{}' in modport '{}' subroutine '{}' prototype is not supported",
+                                                arg.name.name, name.name, callable.as_ref().unwrap().name
+                                            ),
+                                            arg.span,
+                                        ));
+                                    }
+                                }
+                                if !matches!(
+                                    self.current_kind(),
+                                    TokenKind::Comma | TokenKind::RParen
+                                ) {
+                                    self.error("expected ',' or ')' after modport prototype");
+                                }
+                            } else {
+                                // Preserve the existing name-only import/export path.
+                                while !matches!(
+                                    self.current_kind(),
+                                    TokenKind::Comma
+                                        | TokenKind::RParen
+                                        | TokenKind::Semicolon
+                                        | TokenKind::KwEndinterface
+                                        | TokenKind::Eof
+                                ) {
+                                    self.bump();
+                                }
+                            }
+                            if let Some(callable) = callable {
                                 ports.push(ModportPort {
                                     direction: PortDirection::Input,
-                                    name,
+                                    name: callable,
                                     span: self.span_from(pstart),
                                     expr: None,
                                 });
                             }
-                            while !self.at(TokenKind::Comma)
-                                && !self.at(TokenKind::RParen)
-                                && !self.at(TokenKind::Eof)
-                            {
-                                self.bump();
-                            }
                         } else {
                             if let Some(d) = self.parse_optional_direction() {
                                 last_dir = d;
+                                tf_ports = false;
                             }
                             // §25.5.4 modport expression: `.b(word[7:0])` —
                             // the member `b` stands for an expression over
