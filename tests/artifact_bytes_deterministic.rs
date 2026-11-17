@@ -3,7 +3,8 @@
 //! that is serialized, or that fills a serialized map, reorders the artifact
 //! between runs: the module timescales were filled from one, and the
 //! gate-driven nets, wildcard-shadowed names and foreign package names were
-//! held in them.
+//! held in them, and so were the names a struct typedef's member ranges read
+//! (§7.2), kept per member for the port width diagnostic.
 
 const SRC: &str = "\
 package p; localparam int a = 1; localparam int b = 2; localparam int c = 3; endpackage
@@ -19,9 +20,29 @@ module m4; m1 u1 (); endmodule
 module top; m3 a (); m4 b (); m2 c (); initial #1 $display(\"%0d\", p::c); endmodule
 ";
 
+/// Several typedefs, each with several members whose ranges read parameters.
+const STRUCT_SRC: &str = "\
+package cfg; parameter int AW = 12; parameter int DW = 32; parameter int SW = DW / 8; parameter int IW = 4; endpackage
+package bus;
+  import cfg::*;
+  typedef struct packed { logic [SW-1:0] strb; logic [AW-1:0] addr; logic [DW-1:0] data; logic [IW-1:0] id; } req_t;
+  typedef struct packed { logic [DW-1:0] data; logic [IW-1:0] id; logic [SW-1:0] keep; } rsp_t;
+  typedef struct packed { logic [AW-1:0] lo; logic [AW-1:0] hi; logic [IW:0] tag; logic [SW:0] mask; } range_t;
+endpackage
+module leaf (input bus::req_t req, output bus::rsp_t rsp);
+  bus::range_t r;
+  assign rsp = '{data: req.data, id: req.id, keep: req.strb};
+endmodule
+module top; bus::req_t q; bus::rsp_t p0, p1; leaf a (.req(q), .rsp(p0)); leaf b (.req(q), .rsp(p1)); endmodule
+";
+
 fn artifact(dir: &std::path::Path, n: usize) -> Vec<u8> {
+    artifact_of(SRC, dir, n)
+}
+
+fn artifact_of(src: &str, dir: &std::path::Path, n: usize) -> Vec<u8> {
     let (_, m) = xezim_core::parse_and_elaborate_multi(
-        &[SRC.to_string()],
+        &[src.to_string()],
         Some("top"),
         &[],
         &["top.sv".to_string()],
@@ -41,6 +62,20 @@ fn same_design_writes_same_bytes() {
     for n in 1..8 {
         assert!(
             first == artifact(&dir, n),
+            "elaboration {n} wrote different bytes"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn struct_member_range_names_write_same_bytes() {
+    let dir = std::env::temp_dir().join(format!("xezim_core_det_struct_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let first = artifact_of(STRUCT_SRC, &dir, 0);
+    for n in 1..8 {
+        assert!(
+            first == artifact_of(STRUCT_SRC, &dir, n),
             "elaboration {n} wrote different bytes"
         );
     }
