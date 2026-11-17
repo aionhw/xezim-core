@@ -46280,8 +46280,13 @@ fn inline_module_items(
                                 .map(|(_, d)| d.clone())
                                 .or_else(|| a.init.clone());
                             if let Some(dt) = dt {
-                                let resolved =
+                                let mut resolved =
                                     resolve_typedef_chain(&dt, &elab.typedef_types).clone();
+                                // Same fold as the scoped alias below. Statement
+                                // substitution (`word_t'(imm)`) bakes this
+                                // binding in, and a later eval of `Cfg.W`
+                                // against the flat table reads 0.
+                                lsdd_data_type(&mut resolved, &sub_merged_params);
                                 pend_type_binds.insert(a.name.name.clone(), resolved);
                             }
                         }
@@ -46296,7 +46301,18 @@ fn inline_module_items(
                     // restored. Keep an instance-qualified alias for `new`,
                     // reflection and member access through those variables.
                     let key = cat2(&inst_prefix, name);
-                    let scoped = scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix);
+                    let mut scoped =
+                        scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix);
+                    // §6.20.3: `localparam type word_t = logic [Cfg.W-1:0]`
+                    // still names the member. The formal is renamed to this
+                    // scoped key and its geometry is read from the flat
+                    // parameter table. That table holds the struct value;
+                    // the dotted member is only in this instance's map, so
+                    // the bound evaluates as 0 and the formal is
+                    // `logic [-1:0]` while its value keeps the real width.
+                    // A part-select of it is then x. Fold the bounds with
+                    // this instance's map before the alias is stored.
+                    lsdd_data_type(&mut scoped, &sub_merged_params);
                     let width =
                         resolve_type_width(&scoped, Some(&sub_merged_params), Some(&elab.typedefs));
                     typedefs_insert_traced(
