@@ -3614,3 +3614,44 @@ pub(super) fn cov_cond_var(c: &Cov, v: &str) -> String {
         }
     }
 }
+
+#[cfg(test)]
+mod driver_lookup_tests {
+    use super::*;
+
+    /// §14.7.2: select only one signal's drivers, in process order,
+    /// including the synthetic drivers used for port associations.
+    #[test]
+    fn signal_driver_lookup_keeps_boundaries_order_and_metadata() {
+        use crate::vhdl::{cst, sema, VhdlStd};
+        let parsed = cst::parse_std(
+            cst::SourceFile::new(
+                "drivers.vhd".into(),
+                b"entity t is end; architecture a of t is begin end;".to_vec(),
+            ),
+            VhdlStd::V2008,
+        );
+        assert!(parsed.errors.is_empty());
+        let analysed = sema::analyze(
+            vec![("work".into(), parsed)], None, &sema::Mixed::default(), VhdlStd::V2008,
+        ).expect("analyse");
+        let mut lowerer = Lw::new(&analysed.design, None);
+        for (signal, process) in [(2, 0), (1, PSEUDO), (0, 99), (1, 9),
+                                  (usize::MAX, 0), (1, usize::MAX), (1, 2)] {
+            lowerer.drivers.insert((signal, process), Driver {
+                cov: Cov::All,
+                slots: process == 9,
+                init: (process == 9).then_some((7, 11)),
+            });
+        }
+        let drivers = lowerer.sig_drivers(1);
+        assert_eq!(drivers.iter().map(|(process, _)| *process).collect::<Vec<_>>(),
+                   [2, 9, PSEUDO, usize::MAX]);
+        assert!(drivers[1].1.slots);
+        assert_eq!(drivers[1].1.init, Some((7, 11)));
+        assert_eq!(lowerer.sig_drivers(0)[0].0, 99);
+        assert_eq!(lowerer.sig_drivers(2)[0].0, 0);
+        assert!(lowerer.sig_drivers(3).is_empty());
+        assert_eq!(lowerer.sig_drivers(usize::MAX)[0].0, 0);
+    }
+}
