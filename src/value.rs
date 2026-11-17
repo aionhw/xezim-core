@@ -6866,3 +6866,7 @@ mod wide_arith_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "value_real_fill_tests.rs"]
+mod real_fill_tests;
