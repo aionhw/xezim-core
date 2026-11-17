@@ -1,6 +1,5 @@
-//! §3.12.1 / §6.7 / §6.8: compilation-unit variables and nets reach the
-//! definitions that name them (directly, through a unit subroutine, a unit
-//! class or another unit declaration) without being copied into the others.
+//! §3.12.1 / §6.7 / §6.8: a compilation-unit variable or net is one object.
+//! The hierarchy root declares it once; no other definition receives a copy.
 
 use crate::ast::decl::ModuleItem;
 use crate::{SourceDefinition, parse_and_elaborate_multi};
@@ -44,38 +43,94 @@ endmodule
 "#;
 
 #[test]
-fn unit_storage_reaches_only_the_definitions_that_name_it() {
+fn unit_storage_is_declared_once_in_the_root() {
     let (definitions, elab) =
         parse_and_elaborate_multi(&[SOURCE.to_string()], Some("top"), &[], &[], &[]).unwrap();
-    // The carrier keeps every unit declaration.
     assert_eq!(
         storage(&definitions["top"]),
-        ["a", "b", "base", "c", "derived", "f", "spare", "unused_net", "unused_var"]
+        [
+            "a",
+            "b",
+            "base",
+            "c",
+            "derived",
+            "f",
+            "spare",
+            "unused_net",
+            "unused_var"
+        ]
     );
-    // A net's initializer brings the variable it reads.
-    assert_eq!(storage(&definitions["via_net"]), ["base", "derived"]);
-    // A unit function brings the storage its body reads.
-    assert_eq!(storage(&definitions["via_func"]), ["spare"]);
-    // `$unit::base` names the unit variable beside a local `base`.
-    assert_eq!(storage(&definitions["via_qualified"]), ["$unit::base", "base"]);
+    // No other definition declares unit storage, whatever it names.
+    assert!(storage(&definitions["via_net"]).is_empty());
+    assert!(storage(&definitions["via_func"]).is_empty());
+    assert_eq!(storage(&definitions["via_qualified"]), ["base"]);
     assert!(storage(&definitions["plain"]).is_empty());
     assert_eq!(storage(&definitions["never_used"]), ["q"]);
-    // No signal of an unrelated instance stands for unit storage.
-    assert!(!elab.signals.contains_key("u4.base"));
-    assert!(!elab.signals.contains_key("u4.derived"));
-    assert!(elab.signals.contains_key("u1.derived"));
+    // One signal each, under the root's flat name.
+    for name in ["base", "spare", "derived", "unused_net", "unused_var"] {
+        assert!(elab.signals.contains_key(name), "{name}");
+        let copies: Vec<&String> = elab
+            .signals
+            .keys()
+            .filter(|k| k.ends_with(&format!(".{name}")) || k.ends_with(&format!("::{name}")))
+            .collect();
+        // `u3.base` is the module's own variable.
+        let own: &[&str] = if name == "base" { &["u3.base"] } else { &[] };
+        assert_eq!(copies, own, "{name}");
+    }
 }
 
 #[test]
-fn unit_storage_named_by_a_unit_class_stays_in_every_definition() {
+fn unit_storage_named_by_a_unit_class_is_not_copied() {
     let source = r#"
 int seen = 3;
 class reader; function int get(); return seen; endfunction endclass
 module child; endmodule
 module top; child u(); endmodule
 "#;
-    let (definitions, _) =
+    let (definitions, elab) =
         parse_and_elaborate_multi(&[source.to_string()], Some("top"), &[], &[], &[]).unwrap();
-    assert_eq!(storage(&definitions["child"]), ["seen"]);
+    assert!(storage(&definitions["child"]).is_empty());
     assert_eq!(storage(&definitions["top"]), ["seen"]);
+    assert!(!elab.signals.contains_key("u.seen"));
+}
+
+/// A root that declares the name keeps the unit object under the reserved
+/// name, and a child's plain reference names that object.
+#[test]
+fn root_declaration_shadows_and_unit_storage_keeps_reserved_name() {
+    let source = r#"
+int g = 5;
+module child(output int y); assign y = g; endmodule
+module top; int g = 7; int y; child u(y); endmodule
+"#;
+    let (definitions, elab) =
+        parse_and_elaborate_multi(&[source.to_string()], Some("top"), &[], &[], &[]).unwrap();
+    assert_eq!(storage(&definitions["top"]), ["$unit::g", "g", "y"]);
+    assert!(storage(&definitions["child"]).is_empty());
+    assert!(elab.signals.contains_key("$unit::g"));
+    assert!(!elab.signals.contains_key("u.g"));
+    assert!(!elab.signals.contains_key("u.$unit::g"));
+}
+
+/// Several roots: the wrapper that instantiates them holds the storage, so
+/// no top owns it.
+#[test]
+fn several_roots_share_one_unit_storage() {
+    let source = r#"
+int g = 5;
+wire [3:0] n = 4'd9;
+module ta; initial g = 6; endmodule
+module tb; int g = 1; logic [3:0] y; assign y = n; endmodule
+"#;
+    let (definitions, elab) =
+        parse_and_elaborate_multi(&[source.to_string()], None, &[], &[], &[]).unwrap();
+    assert_eq!(storage(&definitions[crate::MULTI_TOP_WRAPPER]), ["g", "n"]);
+    assert!(storage(&definitions["ta"]).is_empty());
+    assert_eq!(storage(&definitions["tb"]), ["g", "y"]);
+    assert!(elab.signals.contains_key("g"));
+    assert!(elab.signals.contains_key("n"));
+    assert!(elab.signals.contains_key("tb.g"));
+    assert!(!elab.signals.contains_key("ta.g"));
+    assert!(!elab.signals.contains_key("tb.n"));
 }
