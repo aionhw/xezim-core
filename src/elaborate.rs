@@ -4059,8 +4059,8 @@ pub struct ElaboratedModule {
     /// (pre-fold) struct declaration. The stored `typedef_types` folds these
     /// dimensions away (`[P:0]` becomes `[0:0]`), erasing the parameter the
     /// underflow can be traced to, so we keep the identifier list alongside.
-    pub struct_field_range_idents:
-        HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    /// Both levels iterate in a fixed order: the table is serialized.
+    pub struct_field_range_idents: HashMap<String, HashMap<String, Vec<String>>>,
     /// Variable -> its declared (element) data type. For an array this is the
     /// ELEMENT type; array-ness comes from `arrays`/`dynamic_arrays`/
     /// `associative_arrays`. Drives the type-directed `%p` renderer
@@ -6996,7 +6996,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             // are folded away (captured from the pre-fold declared type), so
             // the port width-mismatch diagnostic can name the underflowed
             // parameter (`[P:0]` collapses to `[0:0]` in `typedef_types`).
-            let mut range_ids = std::collections::HashMap::new();
+            let mut range_ids: HashMap<String, Vec<String>> = HashMap::default();
             if let DataType::Struct(su) = &td.data_type {
                 for m in &su.members {
                     let mut ids: Vec<String> = Vec::new();
