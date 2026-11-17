@@ -943,21 +943,52 @@ impl Parser {
             // §11.4.14 stream-expression form `expr with [ array_range ]`
             // (`<<8{ data with [0 +: len] }`). The bracketed range selects a
             // slice of the operand inside a streaming concatenation.
+            // §11.4.14.4: `with [ array_range ]` selects a sub-range of a
+            // one-dimensional unpacked operand inside a stream concatenation;
+            // the selected elements are what stream (pack) or are written
+            // (unpack). Keep the range in the AST by wrapping the operand in
+            // the matching select node — `Index` for the single-item `[e]`
+            // form, `RangeSelect` for `[lo:hi]`, `[lo+:w]`, `[lo-:w]` — so
+            // the runtime can enumerate just those elements.
             if self.at(TokenKind::KwWith) && self.peek_kind() == TokenKind::LBracket {
                 self.bump(); // with
                 self.bump(); // [
-                let _lo = self.parse_expression();
-                // optional `: hi` / `+: width` / `-: width`
+                let lo = self.parse_expression();
                 if self.at(TokenKind::Colon)
                     || self.at(TokenKind::PlusColon)
                     || self.at(TokenKind::MinusColon)
                 {
-                    self.bump();
-                    let _hi = self.parse_expression();
+                    let kind = if self.at(TokenKind::Colon) {
+                        self.bump();
+                        RangeKind::Constant
+                    } else if self.at(TokenKind::PlusColon) {
+                        self.bump();
+                        RangeKind::IndexedUp
+                    } else {
+                        self.bump();
+                        RangeKind::IndexedDown
+                    };
+                    let hi = self.parse_expression();
+                    self.expect(TokenKind::RBracket);
+                    lhs = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lhs),
+                            kind,
+                            left: Box::new(lo),
+                            right: Box::new(hi),
+                        },
+                        self.span_from(start),
+                    );
+                } else {
+                    self.expect(TokenKind::RBracket);
+                    lhs = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(lhs),
+                            index: Box::new(lo),
+                        },
+                        self.span_from(start),
+                    );
                 }
-                self.expect(TokenKind::RBracket);
-                // Pass the operand through unchanged — the range is a slice hint.
-                lhs = Expression::new(ExprKind::Paren(Box::new(lhs)), self.span_from(start));
                 continue;
             }
             if self.eat(TokenKind::KwWith).is_some() {
