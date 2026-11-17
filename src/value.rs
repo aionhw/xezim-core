@@ -4289,6 +4289,10 @@ impl fmt::Display for Value {
 }
 
 #[cfg(test)]
+#[path = "value_real_relational_tests.rs"]
+mod real_relational_tests;
+
+#[cfg(test)]
 mod tests {
     /// §11.4.9: every reduction against a bit-by-bit model, on widths that
     /// straddle the inline/wide boundary and 4-state contents.
