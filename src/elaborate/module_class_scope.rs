@@ -37,7 +37,24 @@ pub(super) fn specialized_receiver(
 /// different parameter values name different specializations (a bare `W`
 /// resolved to one instance's value for every instance). Named-argument
 /// labels (`.W(`), scoped names (`p::N`, `C::N`), literals and strings keep
-/// their spelling.
+/// their spelling. After `virtual` / `virtual interface`, the next identifier
+/// is a type name (§25.9), not the homonymous instance in `local_names`.
+fn type_name_after_virtual(before: &str) -> bool {
+    let mut s = before.trim_end();
+    if s.ends_with('\\') {
+        s = s[..s.len().saturating_sub(1)].trim_end();
+    }
+    if s.ends_with("interface")
+        && s.len() > "interface".len()
+        && !s.as_bytes()[s.len() - "interface".len() - 1].is_ascii_alphanumeric()
+    {
+        s = s[..s.len() - "interface".len()].trim_end();
+    }
+    s.ends_with("virtual")
+        && (s.len() == "virtual".len()
+            || !s.as_bytes()[s.len() - "virtual".len() - 1].is_ascii_alphanumeric())
+}
+
 pub(super) fn spec_args_text(
     text: &str,
     prefix: &str,
@@ -76,6 +93,7 @@ pub(super) fn spec_args_text(
                 && !before.ends_with('.')
                 && !before.ends_with("::")
                 && !after.starts_with("::")
+                && !type_name_after_virtual(before)
             {
                 out.push_str(prefix);
                 out.push_str(tok);
