@@ -13181,6 +13181,34 @@ pub fn elaborate_module_with_defs(
                         if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
+                        // §6.6.7 + §10.3.1: a USER-DEFINED-NETTYPE net's
+                        // declaration initializer is a CONTINUOUS DRIVER of
+                        // that net, subject to its resolution function — not
+                        // just the high-hold seed this declaration would
+                        // otherwise write. Without it the resolver never saw
+                        // the initializer, so a resolver that keys on driver
+                        // COUNT (issue #1204) resolved as if the net had one
+                        // fewer driver. Const only: a non-const initializer
+                        // still lowers to a procedural init below (a separate
+                        // path), and adding both would double-drive the net.
+                        if get_type_name(&dd.data_type)
+                            .is_some_and(|t| elab.nettype_resolvers.contains_key(&t))
+                            && decl.init.is_some()
+                            && procedural_init.is_none()
+                        {
+                            let init_expr = decl.init.as_ref().unwrap();
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                gate_delay_fall: None,
+                                delay_select: None,
+                                origin: Some((init_expr.span, String::new())),
+                                lhs: make_ident_expr(&decl.name.name),
+                                rhs: init_expr.clone(),
+                                delay: 0,
+                                rhs_parent_scoped: true,
+                                delay_fall: None,
+                                delay_off: None,
+                            });
+                        }
                         if let Some(view) = &data_modport_view {
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());
