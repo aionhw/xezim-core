@@ -25410,7 +25410,7 @@ fn tls_register_elem_msb0(name: &str) {
 /// 1) is left to the bit-select path.
 fn packed_outer_elem(
     dt: &DataType,
-    params: &HashMap<String, Value>,
+    params: &dyn ParamLookup,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<(u32, bool)> {
     let (dims, leaf) = packed_pattern_shape(dt, params, typedef_types)?;
@@ -25420,8 +25420,8 @@ fn packed_outer_elem(
             return None;
         };
         Some((
-            const_eval_i64_with_params(left, Some(params))?,
-            const_eval_i64_with_params(right, Some(params))?,
+            const_eval_i64_with_params_env(left, Some(&params))?,
+            const_eval_i64_with_params_env(right, Some(&params))?,
         ))
     };
     let mut ew = leaf.max(1);
@@ -47942,7 +47942,7 @@ impl ConstFnStructLayouts {
         &mut self,
         name: &str,
         dt: &DataType,
-        params: &HashMap<String, Value>,
+        params: &dyn ParamLookup,
         elab: &ElaboratedModule,
     ) {
         let inlined = inline_instance_typedefs(dt);
@@ -47987,7 +47987,7 @@ impl ConstFnPackedElems {
         &mut self,
         name: &str,
         dt: &DataType,
-        params: &HashMap<String, Value>,
+        params: &dyn ParamLookup,
         elab: &ElaboratedModule,
     ) {
         let inlined = inline_instance_typedefs(dt);
@@ -48128,14 +48128,13 @@ fn eval_const_user_function<P: ParamLookup>(
     // storage, return width) resolve type dimensions against module params
     // AND the caller/instance params — the first instance's constants resolve
     // `[W-1:0]` with `W` present only in `caller_params`, and `elab.parameters`
-    // is empty during that propagation (#680). Materialize that fused scope
-    // once so the concrete layout/packing sinks see it (they take `&HashMap`).
-    let geom: HashMap<String, Value> = {
-        let mut m = locals.clone();
-        for (k, v) in elab.parameters.iter() {
-            m.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        m
+    // is empty during that propagation (#680). The fused scope is the call's
+    // starting locals laid over the module table, read in place: copying the
+    // table for each call cost calls x parameters of the whole design (#721).
+    let geom_locals = locals.clone();
+    let geom = ParamEnv::Overlay {
+        base: &elab.parameters,
+        top: &geom_locals,
     };
     for (i, port) in fd.ports.iter().enumerate() {
         let mut v = arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32));
@@ -48143,7 +48142,7 @@ fn eval_const_user_function<P: ParamLookup>(
         // formal bound to the integer literal `5` otherwise did integer
         // arithmetic throughout (`x /= 2` gave 2, not 2.5).
         if port.dimensions.is_empty() {
-            let storage = declared_storage(&port.data_type, &geom, elab)?;
+            let storage = declared_storage(&port.data_type, geom, elab)?;
             v = store_value(v, &storage);
         }
         locals.insert(port.name.name.clone(), v);
@@ -48165,7 +48164,7 @@ fn eval_const_user_function<P: ParamLookup>(
         stmts: &[Statement],
         layouts: &mut ConstFnStructLayouts,
         packed_elems: &mut ConstFnPackedElems,
-        geom: &HashMap<String, Value>,
+        geom: ParamEnv,
         elab: &ElaboratedModule,
     ) {
         use crate::ast::stmt::StatementKind as SK;
@@ -48182,8 +48181,8 @@ fn eval_const_user_function<P: ParamLookup>(
                     ..
                 } => {
                     for d in declarators {
-                        layouts.bind(&d.name.name, data_type, geom, elab);
-                        packed_elems.bind(&d.name.name, data_type, geom, elab);
+                        layouts.bind(&d.name.name, data_type, &geom, elab);
+                        packed_elems.bind(&d.name.name, data_type, &geom, elab);
                     }
                 }
                 SK::SeqBlock { stmts, .. } => {
@@ -48193,17 +48192,10 @@ fn eval_const_user_function<P: ParamLookup>(
             }
         }
     }
-    bind_decls(
-        &fd.items,
-        &mut layouts,
-        &mut packed_elems,
-        &geom,
-        elab,
-    );
+    bind_decls(&fd.items, &mut layouts, &mut packed_elems, geom, elab);
     // The implicit return variable (typed per the declared return type).
     let return_type = resolve_typedef_chain(&fd.return_type, &elab.typedef_types);
-    let return_width =
-        resolve_type_width(return_type, Some(&geom), Some(&elab.typedefs));
+    let return_width = resolve_type_width_env(return_type, Some(&geom), Some(&elab.typedefs));
     let ret_init = if is_type_real(return_type) {
         Value::from_f64(0.0)
     } else {
@@ -48226,16 +48218,12 @@ fn eval_const_user_function<P: ParamLookup>(
     // §6.12.2 / §13.4.1: locals, formals and the return variable keep
     // their declared representation across every assignment. A real target
     // converts the completed RHS; it does not turn integer division real.
-    fn declared_storage(
-        dt: &DataType,
-        geom: &HashMap<String, Value>,
-        elab: &ElaboratedModule,
-    ) -> Option<Value> {
+    fn declared_storage(dt: &DataType, geom: ParamEnv, elab: &ElaboratedModule) -> Option<Value> {
         let dt = resolve_typedef_chain(dt, &elab.typedef_types);
         if is_type_real(dt) {
             return Some(Value::from_f64(0.0));
         }
-        let width = resolve_type_width(dt, Some(geom), Some(&elab.typedefs));
+        let width = resolve_type_width_env(dt, Some(&geom), Some(&elab.typedefs));
         if width == 0 {
             return None;
         }
@@ -48397,7 +48385,7 @@ fn eval_const_user_function<P: ParamLookup>(
         stmt: &Statement,
         locals: &mut HashMap<String, Value>,
         fname: &str,
-        geom: &HashMap<String, Value>,
+        geom: ParamEnv,
         elab: &ElaboratedModule,
         depth: u32,
         fuel: &mut u32,
@@ -48825,7 +48813,7 @@ fn eval_const_user_function<P: ParamLookup>(
 
     let mut fuel: u32 = 100_000;
     for st in &fd.items {
-        match exec_stmt(st, &mut locals, &fname, &geom, elab, depth, &mut fuel)? {
+        match exec_stmt(st, &mut locals, &fname, geom, elab, depth, &mut fuel)? {
             Flow::Returned => break,
             Flow::Normal => {}
         }
