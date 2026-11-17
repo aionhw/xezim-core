@@ -3857,6 +3857,8 @@ pub struct ElaboratedModule {
     #[serde(default)]
     pub program_initial_blocks: Vec<InitialBlock>,
     pub parameters: HashMap<String, Value>,
+    /// §26.3 / §21.7.2.3: actual parameter declarations, excluding lookup aliases.
+    pub declared_parameters: HashSet<String>,
     /// Typedef name -> width mapping for user-defined types.
     pub typedefs: TypedefTable,
     /// §7.4.1: for a typedef whose target is a packed array of packed
@@ -4493,6 +4495,9 @@ impl ElaboratedModule {
     /// somewhere else (a package's enum member, an imported parameter) the
     /// hint would confidently name the wrong file.
     pub fn note_decl_site(&mut self, name: &str, span: Span, kind: &str, own_scope: bool) {
+        if own_scope && kind == "parameter/localparam" {
+            self.declared_parameters.insert(name.to_string());
+        }
         if span.start == 0 && span.end == 0 {
             return;
         }
@@ -4603,6 +4608,7 @@ impl ElaboratedModule {
             static_init_blocks: Vec::new(),
             program_initial_blocks: Vec::new(),
             parameters: HashMap::default(),
+            declared_parameters: HashSet::default(),
             typedefs: TypedefTable::default(),
             typedef_types: SharedMap::default(),
             nettype_resolvers: HashMap::default(),
@@ -10390,6 +10396,7 @@ pub fn elaborate_module_with_defs(
         } = &param.kind
         {
             for assign in assignments {
+                elab.declared_parameters.insert(assign.name.name.clone());
                 // IEEE 1800-2023: keyed assignment-pattern parameter
                 // (associative array literal). Materialize the entries
                 // as `<param>["key"]` signals before falling into the
@@ -40495,6 +40502,20 @@ fn inline_module_items(
         cache,
         param_scope,
     );
+    // Keep declaration ownership after flattening (§26.3, §21.7.2.3).
+    // Imported lookup aliases never enter this set.
+    for pd in source_def.params().iter().chain(
+        prepared_source.effective_items.iter().filter_map(|item| match item {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+            _ => None,
+        }),
+    ) {
+        if let ParameterKind::Data { assignments, .. } = &pd.kind {
+            for a in assignments {
+                elab.declared_parameters.insert(format!("{}{}", prefix, a.name.name));
+            }
+        }
+    }
     // §23.11/§27: only active generate branches contribute declarations.
     for item in &prepared_source.effective_items {
         if let ModuleItem::Bind(b) = item {
