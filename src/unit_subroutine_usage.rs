@@ -576,6 +576,47 @@ mod tests {
         assert!(usage.references(&"$unit::escaped.name").contains("escaped.name"));
     }
 
+    /// §23.9 (#721): a name read as the head of a reference belongs to the
+    /// definition that writes it. The tail of a hierarchical name, a named
+    /// connection and anything in a bind directive may be resolved from
+    /// another scope and stay with the conservative set.
+    #[test]
+    fn reference_heads_are_split_from_names_another_scope_may_resolve() {
+        let parsed = crate::parse(
+            "module m;\n\
+               localparam int R = LOCAL + ARR[2] + u.TAIL + BOTH;\n\
+               logic [TYPEW-1:0] w;\n\
+               leaf #(.NAMED(1)) u ();\n\
+               initial $display(\"%0d\", u.BOTH);\n\
+               bind tgt chk #(.W(BOUND)) k ();\n\
+             endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        let usage = Usage {
+            names: [
+                "LOCAL", "ARR", "TAIL", "BOTH", "TYPEW", "NAMED", "BOUND", "UNUSED",
+            ]
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+            deps: HashMap::default(),
+            qualified_components: true,
+        };
+        let set =
+            |names: &[&str]| -> HashSet<String> { names.iter().map(|n| n.to_string()).collect() };
+        let (elsewhere, heads) = usage.references_by_scope(module);
+        assert_eq!(heads, set(&["LOCAL", "ARR", "TYPEW", "BOTH"]));
+        assert_eq!(elsewhere, set(&["TAIL", "BOTH", "NAMED", "BOUND"]));
+        // The undivided scan reports the union.
+        assert_eq!(
+            usage.references(module),
+            set(&["LOCAL", "ARR", "TYPEW", "TAIL", "BOTH", "NAMED", "BOUND"])
+        );
+    }
+
     #[test]
     fn qualified_parameter_names_and_dependencies_are_conservative() {
         let usage = Usage {

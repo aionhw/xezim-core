@@ -214,3 +214,54 @@ fn multiple_sources_and_automatic_roots_keep_one_unused_carrier() {
     assert_eq!(design.parameters["first.a.RESULT"].to_u64(), Some(5));
     assert_eq!(design.parameters["second.b.RESULT"].to_u64(), Some(5));
 }
+
+/// §23.9: a constant a definition reads by its bare name resolves in that
+/// definition, so it is that definition's alone. A constant read through a
+/// hierarchical name, or named in a bind directive (elaborated in its
+/// target), stays in every definition.
+#[test]
+fn constants_read_by_bare_name_belong_to_the_definitions_that_read_them() {
+    let (defs, design) = elaborate(
+        r#"
+localparam int ONLY_A=5;
+localparam int DEP=2, ONLY_B=DEP+1;
+localparam int HIER=17;
+localparam int BOUND=9;
+localparam logic [7:0] INDEXED=8'hA5;
+module a; localparam int R=ONLY_A; endmodule
+module b; logic [ONLY_B-1:0] w; localparam logic PICK=INDEXED[2]; endmodule
+module c; endmodule
+module chk #(parameter int W=1) (); endmodule
+module binder; bind c chk #(.W(BOUND)) k(); endmodule
+module top;
+  a ua(); b ub(); c uc(); binder ubd();
+  initial $display("%0d", uc.HIER);
+endmodule
+"#,
+    );
+    let sorted = |name: &str| {
+        let mut names = constants(&defs[name]);
+        names.sort_unstable();
+        names
+    };
+    // Each list ends with the definition's own constants (`R`, `PICK`).
+    assert_eq!(sorted("a"), ["BOUND", "HIER", "ONLY_A", "R"]);
+    assert_eq!(
+        sorted("b"),
+        ["BOUND", "DEP", "HIER", "INDEXED", "ONLY_B", "PICK"]
+    );
+    assert_eq!(sorted("c"), ["BOUND", "HIER"]);
+    assert_eq!(design.parameters["ua.R"].to_u64(), Some(5));
+    assert_eq!(design.parameters["ua.ONLY_A"].to_u64(), Some(5));
+    assert!(!design.parameters.contains_key("ub.ONLY_A"));
+    assert!(!design.parameters.contains_key("uc.ONLY_A"));
+    assert_eq!(design.signals["ub.w"].width, 3);
+    assert_eq!(design.parameters["ub.PICK"].to_u64(), Some(1));
+    assert!(!design.parameters.contains_key("ua.ONLY_B"));
+    assert_eq!(design.parameters["uc.HIER"].to_u64(), Some(17));
+    assert_eq!(design.parameters["uc.k.W"].to_u64(), Some(9));
+    // The root holds every constant of the unit.
+    for name in ["ONLY_A", "DEP", "ONLY_B", "HIER", "BOUND", "INDEXED"] {
+        assert!(design.parameters.contains_key(name), "{name}");
+    }
+}
