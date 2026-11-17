@@ -13066,6 +13066,34 @@ pub fn elaborate_module_with_defs(
                         if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
+                        // §6.6.7 + §10.3.1: a USER-DEFINED-NETTYPE net's
+                        // declaration initializer is a CONTINUOUS DRIVER of
+                        // that net, subject to its resolution function — not
+                        // just the high-hold seed this declaration would
+                        // otherwise write. Without it the resolver never saw
+                        // the initializer, so a resolver that keys on driver
+                        // COUNT (issue #1204) resolved as if the net had one
+                        // fewer driver. Const only: a non-const initializer
+                        // still lowers to a procedural init below (a separate
+                        // path), and adding both would double-drive the net.
+                        if get_type_name(&dd.data_type).is_some_and(|t| {
+                            elab.nettype_resolvers.contains_key(&t)
+                        }) && decl.init.is_some()
+                            && procedural_init.is_none()
+                        {
+                            let init_expr = decl.init.as_ref().unwrap();
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                gate_delay_fall: None,
+                                delay_select: None,
+                                origin: Some((init_expr.span, String::new())),
+                                lhs: make_ident_expr(&decl.name.name),
+                                rhs: init_expr.clone(),
+                                delay: 0,
+                                rhs_parent_scoped: true,
+                                delay_fall: None,
+                                delay_off: None,
+                            });
+                        }
                         if let Some(view) = &data_modport_view {
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());
@@ -50307,7 +50335,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         touch(&mut parent, n);
     }
 
-    let mut real_drivers: HashMap<String, Vec<Expression>> = HashMap::default();
+    // net -> its real drivers with their own delays (§10.3.3).
+    let mut real_drivers: HashMap<String, Vec<(Expression, u64)>> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
     let mut delays: HashMap<String, u64> = HashMap::default();
     let mut kept: Vec<ContinuousAssignment> = Vec::new();
@@ -50379,18 +50408,20 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 continue;
             }
         }
-        if !real_drivers.contains_key(&lhs_name) {
+        if !delays.contains_key(&lhs_name) {
             delays.insert(lhs_name.clone(), ca.delay);
         }
         if !order.contains(&lhs_name) {
             order.push(lhs_name.clone());
         }
-        real_drivers.entry(lhs_name).or_default().push(ca.rhs);
+        real_drivers.entry(lhs_name).or_default().push((ca.rhs, ca.delay));
     }
 
     // Component -> its drivers, in first-seen order (deterministic: the emitted
-    // CA order is observable through settle ordering).
-    let mut comp_drivers: HashMap<String, Vec<Expression>> = HashMap::default();
+    // CA order is observable through settle ordering). Each driver keeps its
+    // OWN delay (§10.3.3: a delay on one continuous assignment delays that
+    // driver's contribution alone, before resolution folds the others in).
+    let mut comp_drivers: HashMap<String, Vec<(Expression, u64)>> = HashMap::default();
     let mut comp_order: Vec<String> = Vec::new();
     let mut comp_delay: HashMap<String, u64> = HashMap::default();
     for n in &order {
@@ -50558,10 +50589,25 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         if drivers.is_empty() {
             continue;
         }
-        let delay = comp_delay.remove(&root).unwrap_or(0);
         let resolver = net_resolver[&root].clone();
-        let span = drivers[0].span;
+        let span = drivers[0].0.span;
         let members = struct_members(elab, &root);
+        // §10.3.3: a delay on one continuous assignment delays that driver's
+        // contribution alone, before resolution folds the others in. A single
+        // folded resolver call can carry only ONE delay, so when a SCALAR
+        // net's drivers reach it with DIFFERENT delays (issue #1204), stage
+        // each delayed driver onto its own `<net>$drv<k>` signal and fold the
+        // stages undelayed; the resolver then re-evaluates the moment any
+        // driver's staged contribution changes. Uniform delays (all equal, 0
+        // included) keep the current single folded call — equal-delay drivers
+        // collapse exactly onto it.
+        let staged = members.is_none()
+            && drivers.len() > 1
+            && drivers[1..].iter().any(|(_, d)| *d != drivers[0].1);
+        let mut delay = comp_delay.remove(&root).unwrap_or(0);
+        if staged {
+            delay = 0;
+        }
 
         let rhs = if resolver.is_empty() {
             // §6.6.7: a nettype declared without a resolution function accepts
@@ -50602,49 +50648,91 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // variable; the only restriction the clause places on a
             // user-defined nettype is on the LEFT ("shall not contain any
             // indexing or select"). So the fix is to expand, not to reject.
-            let items: Vec<crate::ast::expr::AssignmentPatternItem> = drivers
-                .into_iter()
-                .map(|d| {
-                    let d = match (&members, &d.kind) {
-                        // Already member-wise.
-                        (Some(_), ExprKind::AssignmentPattern(_)) => d,
-                        (Some(_), ExprKind::TypedPattern { pattern, .. }) => (**pattern).clone(),
-                        // Name it member by member instead: '{d.m0, d.m1, ..}
-                        (Some(ms), _) => {
-                            let span = d.span;
-                            let fields: Vec<crate::ast::expr::AssignmentPatternItem> = ms
-                                .iter()
-                                .map(|(m, _, mdims)| {
-                                    let mident = Identifier {
-                                        name: m.clone(),
-                                        span: Span::dummy(),
-                                    };
-                                    let mut e = member_ref_expr(&d, &mident);
-                                    e.span = span;
-                                    // An unpacked array member is read
-                                    // element by element (§7.4).
-                                    if let Some(lists) = (!mdims.is_empty())
-                                        .then(|| {
-                                            fixed_unpacked_index_lists(
-                                                mdims,
-                                                &elab.parameters,
-                                                &elab.typedef_types,
-                                            )
-                                        })
-                                        .flatten()
-                                    {
-                                        e = element_pattern(&e, &lists);
-                                    }
-                                    crate::ast::expr::AssignmentPatternItem::Ordered(e)
-                                })
-                                .collect();
-                            Expression::new(ExprKind::AssignmentPattern(fields), span)
-                        }
-                        _ => d,
-                    };
-                    crate::ast::expr::AssignmentPatternItem::Ordered(d)
-                })
-                .collect();
+            // Each driver keeps its own fold contribution: its ORIGINAL value
+            // when undelayed or uniform, or (when `staged`) the identifier of
+            // its own `<net>$drv<k>` delay stage.
+            let mut stage_rhs: Vec<(String, Expression, u64)> = Vec::new();
+            let mut items: Vec<crate::ast::expr::AssignmentPatternItem> =
+                Vec::with_capacity(drivers.len());
+            let mut k: u32 = 0;
+            for (driver, dly) in drivers.iter() {
+                let fold = if staged && *dly != 0 {
+                    let stage = format!("{root}$drv{k}");
+                    k += 1;
+                    // §10.3.3: synthesize the driver's own delay stage — a
+                    // signal cloned from the net, driven by the driver's value
+                    // behind its OWN delay, and read undelayed by the resolver.
+                    // The `<net>$drv<k>` spelling is the same stage-net shape
+                    // `resolve_multi_driver_nets` synthesizes for ordinary
+                    // nets, so it is not a design object in dumps/scope.
+                    if let Some(sig) = elab.signals.get(&root) {
+                        let mut s = sig.clone();
+                        s.name = stage.clone().into();
+                        s.direction = None;
+                        elab.signals.insert(stage.clone(), s);
+                    }
+                    stage_rhs.push((stage.clone(), driver.clone(), *dly));
+                    Expression::new(make_ident_expr(&stage).kind, driver.span)
+                } else {
+                    driver.clone()
+                };
+                let d = match (&members, &fold.kind) {
+                    // Already member-wise.
+                    (Some(_), ExprKind::AssignmentPattern(_)) => fold,
+                    (Some(_), ExprKind::TypedPattern { pattern, .. }) => (**pattern).clone(),
+                    // Name it member by member instead: '{d.m0, d.m1, ..}
+                    (Some(ms), _) => {
+                        let span = fold.span;
+                        let fields: Vec<crate::ast::expr::AssignmentPatternItem> = ms
+                            .iter()
+                            .map(|(m, _, mdims)| {
+                                let mident = Identifier {
+                                    name: m.clone(),
+                                    span: Span::dummy(),
+                                };
+                                let mut e = member_ref_expr(&fold, &mident);
+                                e.span = span;
+                                // An unpacked array member is read
+                                // element by element (§7.4).
+                                if let Some(lists) = (!mdims.is_empty())
+                                    .then(|| {
+                                        fixed_unpacked_index_lists(
+                                            mdims,
+                                            &elab.parameters,
+                                            &elab.typedef_types,
+                                        )
+                                    })
+                                    .flatten()
+                                {
+                                    e = element_pattern(&e, &lists);
+                                }
+                                crate::ast::expr::AssignmentPatternItem::Ordered(e)
+                            })
+                            .collect();
+                        Expression::new(ExprKind::AssignmentPattern(fields), span)
+                    }
+                    _ => fold,
+                };
+                items.push(crate::ast::expr::AssignmentPatternItem::Ordered(d));
+            }
+            // A delayed driver's stage is driven by its own value behind its
+            // OWN delay, so a change to that one driver re-resolves on its
+            // own schedule (and zeroes/holds the stage's initial 0 in the
+            // delay's first period — what the reference nettype resolution
+            // shows at 1 ns in issue #1204). Scalar stages have no members.
+            for (stage, drv, dly) in stage_rhs {
+                emit(
+                    &mut kept,
+                    &stage,
+                    drv,
+                    &None,
+                    dly,
+                    span,
+                    &elab.typedef_types,
+                    &elab.typedef_unpacked_dims,
+                    &elab.parameters,
+                );
+            }
             Expression::new(
                 ExprKind::Call {
                     func: Box::new(make_ident_expr(&resolver)),
