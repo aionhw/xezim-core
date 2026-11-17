@@ -180,3 +180,164 @@ impl DeclTypeInterner {
         Rc::new(crate::ast::cache::without_scope_caches(|| ty.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Span;
+    use crate::ast::expr::{ExprKind, Expression, NumberBase, NumberLiteral};
+    use crate::ast::types::{IntegerVectorType, PackedDimension};
+
+    fn number(text: &str, at: usize) -> Expression {
+        Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: NumberBase::Decimal,
+                value: text.to_string(),
+                cached_val: Default::default(),
+            }),
+            Span::new(at, at + text.len()),
+        )
+    }
+
+    fn vector(msb: &str, at: usize) -> DataType {
+        DataType::IntegerVector {
+            kind: IntegerVectorType::Logic,
+            signing: None,
+            dimensions: vec![PackedDimension::Range {
+                left: Box::new(number(msb, at + 7)),
+                right: Box::new(number("0", at + 10)),
+                span: Span::new(at + 6, at + 12),
+            }],
+            span: Span::new(at, at + 12),
+        }
+    }
+
+    /// §6.8: the signals of one declaration hold one type; a different
+    /// range, source position or definition is a different type.
+    #[test]
+    fn equal_declarations_of_one_definition_share_a_type() {
+        let mut pool = DeclTypeInterner::default();
+        let first = pool.intern(&vector("7", 40), "leaf");
+        let again = pool.intern(&vector("7", 40), "leaf");
+        assert!(Rc::ptr_eq(&first, &again));
+        assert_eq!(pool.copies, 1);
+        for (other, owner) in [
+            (vector("15", 40), "leaf"),
+            (vector("7", 80), "leaf"),
+            (vector("7", 40), "other_leaf"),
+        ] {
+            let distinct = pool.intern(&other, owner);
+            assert!(!Rc::ptr_eq(&first, &distinct));
+        }
+        assert_eq!(pool.copies, 4);
+    }
+
+    /// A shared type keeps no evaluation result: a width cached while it is
+    /// read for one instance must not answer for another.
+    #[test]
+    fn shared_types_keep_no_scope_dependent_cache() {
+        let mut pool = DeclTypeInterner::default();
+        let source = vector("7", 40);
+        let shared = pool.intern(&source, "leaf");
+        let DataType::IntegerVector { dimensions, .. } = &*shared else {
+            panic!("vector expected");
+        };
+        let PackedDimension::Range { left, .. } = &dimensions[0] else {
+            panic!("range expected");
+        };
+        left.cached_width.set(Some(32));
+        assert_eq!(left.cached_width.get(), None);
+        // The declaration it was copied from keeps working caches.
+        let DataType::IntegerVector { dimensions, .. } = &source else {
+            panic!("vector expected");
+        };
+        let PackedDimension::Range { left, .. } = &dimensions[0] else {
+            panic!("range expected");
+        };
+        left.cached_width.set(Some(32));
+        assert_eq!(left.cached_width.get(), Some(32));
+    }
+
+    /// The map answers with the type, whether an entry is shared or not, and
+    /// serializes as the plain map it replaces.
+    #[test]
+    fn map_reads_and_serializes_like_a_plain_map() {
+        let mut pool = DeclTypeInterner::default();
+        let shared = pool.intern(&vector("7", 40), "leaf");
+        let mut map = DeclTypeMap::default();
+        assert!(
+            map.insert_shared("u1.d".to_string(), Rc::clone(&shared))
+                .is_none()
+        );
+        assert!(
+            map.insert_shared("u2.d".to_string(), Rc::clone(&shared))
+                .is_none()
+        );
+        assert!(map.insert("top.q".to_string(), vector("3", 90)).is_none());
+        assert!(std::ptr::eq(
+            map.get("u1.d").unwrap(),
+            map.get("u2.d").unwrap()
+        ));
+        assert!(Rc::ptr_eq(map.get_shared("u1.d").unwrap(), &shared));
+        assert_eq!(map.len(), 3);
+
+        // The same inserts into the plain map it replaces write the same bytes.
+        let mut plain: HashMap<String, DataType> = HashMap::default();
+        plain.insert("u1.d".to_string(), vector("7", 40));
+        plain.insert("u2.d".to_string(), vector("7", 40));
+        plain.insert("top.q".to_string(), vector("3", 90));
+        let config = crate::xez_bincode_config();
+        let bytes = bincode::serde::encode_to_vec(&map, config).unwrap();
+        assert_eq!(
+            bytes,
+            bincode::serde::encode_to_vec(&plain, config).unwrap()
+        );
+        let (loaded, _): (DeclTypeMap, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(
+            bincode::serde::encode_to_vec(&loaded, config).unwrap(),
+            bytes
+        );
+        assert!(!std::ptr::eq(
+            loaded.get("u1.d").unwrap(),
+            loaded.get("u2.d").unwrap()
+        ));
+
+        assert!(map.remove("u2.d").is_some());
+        assert!(map.remove("u2.d").is_none());
+        assert!(map.contains_key("u1.d") && !map.contains_key("u2.d"));
+    }
+
+    /// Changing one signal's type leaves the signals it was shared with
+    /// alone (copy on write).
+    #[test]
+    fn changing_a_shared_entry_copies_it_first() {
+        let mut pool = DeclTypeInterner::default();
+        let shared = pool.intern(&vector("7", 40), "leaf");
+        let mut map = DeclTypeMap::default();
+        map.insert_shared("u1.d".to_string(), Rc::clone(&shared));
+        map.insert_shared("u2.d".to_string(), Rc::clone(&shared));
+        *map.get_mut("u1.d").unwrap() = vector("3", 90);
+        let msb = |ty: &DataType| {
+            let DataType::IntegerVector { dimensions, .. } = ty else {
+                panic!("vector expected");
+            };
+            let PackedDimension::Range { left, .. } = &dimensions[0] else {
+                panic!("range expected");
+            };
+            match &left.kind {
+                ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
+                other => panic!("literal expected, got {other:?}"),
+            }
+        };
+        assert_eq!(msb(map.get("u1.d").unwrap()), "3");
+        assert_eq!(msb(map.get("u2.d").unwrap()), "7");
+        assert!(Rc::ptr_eq(map.get_shared("u2.d").unwrap(), &shared));
+        assert_eq!(msb(&shared), "7");
+        map.retain(|name, _| name != "u2.d");
+        assert_eq!(map.len(), 1);
+    }
+}
