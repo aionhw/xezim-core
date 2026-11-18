@@ -135,6 +135,115 @@ fn root_same_range_select_still_collapses() {
     assert_eq!(name.path[0].name.name, "b");
 }
 
+/// §9.3/§23.6: rewriting an outer reference does not detach an unchanged
+/// nested sequential or parallel block's statement list.
+#[test]
+fn mixed_root_rewrite_shares_only_unchanged_nested_blocks() {
+    let source = "module child; bit q; endmodule module top; bit a,b; child u(); \
+                  initial begin begin:safe a=b; b=a; end \
+                  fork begin a=b; end join a=u.q; end endmodule";
+    let (definitions, model) = xezim_core::parse_and_elaborate_multi(
+        &[source.into()],
+        Some("top"),
+        &[],
+        &["mixed-root.sv".into()],
+        &[],
+    )
+    .expect("mixed root body elaborates");
+    let SourceDefinition::Module(module) = &definitions["top"] else {
+        panic!("module expected");
+    };
+    let source = module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ModuleItem::InitialConstruct(p) => Some(&p.stmt),
+            _ => None,
+        })
+        .unwrap();
+    let rewritten = &model.initial_blocks[0].stmt;
+    assert!(!Arc::ptr_eq(body(source).as_arc(), body(rewritten).as_arc()));
+    for index in [0, 1] {
+        assert!(Arc::ptr_eq(
+            body(&body(source)[index]).as_arc(),
+            body(&body(rewritten)[index]).as_arc()
+        ));
+    }
+    let StatementKind::BlockingAssign { rvalue, .. } = &body(rewritten)[2].kind else {
+        panic!("assignment expected");
+    };
+    let ExprKind::Ident(name) = &rvalue.kind else {
+        panic!("member reference must become hierarchical");
+    };
+    assert_eq!(
+        name.path
+            .iter()
+            .map(|part| part.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        "u.q"
+    );
+}
+
+/// §23.6: partial block reuse must still allocate private nested caches
+/// when the caller explicitly refreshes or disables contextual memoization.
+#[test]
+fn mixed_root_rewrite_honors_private_nested_cache_modes() {
+    use xezim_core::ast::cache::{with_fresh_scope_caches, without_scope_caches};
+    for fresh in [true, false] {
+        let parsed = xezim_core::parse(
+            "module top; bit [3:0] a,b; initial begin \
+             begin:safe a=b[0]; end a=b[3:0][3:0]; end endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let xezim_core::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        let definitions = HashMap::from_iter([("top".to_string(), Definition::Module(module))]);
+        let mut model = elaborate_module_with_defs(
+            Definition::Module(module),
+            &HashMap::default(),
+            Some(&definitions),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let rewrite = || inline_instantiations(&mut model, &definitions);
+        if fresh {
+            with_fresh_scope_caches(rewrite).unwrap();
+        } else {
+            without_scope_caches(rewrite).unwrap();
+        }
+        let original = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ModuleItem::InitialConstruct(p) => Some(&p.stmt),
+                _ => None,
+            })
+            .unwrap();
+        let source = body(&body(original)[0]);
+        let rewritten = body(&body(&model.initial_blocks[0].stmt)[0]);
+        assert!(!Arc::ptr_eq(source.as_arc(), rewritten.as_arc()));
+        let StatementKind::BlockingAssign { lvalue, .. } = &rewritten[0].kind else {
+            panic!("rewritten assignment expected");
+        };
+        let StatementKind::BlockingAssign {
+            lvalue: source_name,
+            ..
+        } = &source[0].kind
+        else {
+            panic!("source assignment expected");
+        };
+        lvalue.cached_width.set(Some(8));
+        assert_eq!(lvalue.cached_width.get(), fresh.then_some(8));
+        source_name.cached_width.set(Some(16));
+        assert_eq!(source_name.cached_width.get(), Some(16));
+        assert_eq!(lvalue.cached_width.get(), fresh.then_some(8));
+    }
+}
+
 /// §23.6: the integrated identity path honors explicit cache ownership,
 /// including refreshing a body whose source caches were disabled.
 #[test]
