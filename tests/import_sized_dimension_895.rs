@@ -95,3 +95,21 @@ endmodule
     );
     assert_eq!(bounds(&d, "u.a"), (0, 4));
 }
+
+/// With no second package to contest `N`, `[N]` reaches the inlined instance
+/// still bare, and only the module's own import can size it.
+#[test]
+fn an_uncontested_module_import_sizes_an_instance_array() {
+    let d = elaborate(
+        r#"
+package p; localparam int unsigned N = 2; endpackage
+module child import p::*; ();
+  logic [27:0] a [N];
+endmodule
+module top;
+  child u();
+endmodule
+"#,
+    );
+    assert_eq!(bounds(&d, "u.a"), (0, 1));
+}

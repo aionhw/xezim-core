@@ -29321,7 +29321,9 @@ pub(crate) fn normalize_unpacked_dims_env(
                 }
                 if let DataType::TypeReference { name, .. } = dt.as_ref() {
                     let n = &name.name.name;
-                    if !typedef_types.contains_key(n) && params.contains_key(n) {
+                    if !typedef_types.contains_key(n)
+                        && (params.contains_key(n) || param_fallback_get(n).is_some())
+                    {
                         return UnpackedDimension::Expression {
                             expr: Box::new(make_ident_expr(n)),
                             span: *span,
