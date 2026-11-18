@@ -15120,6 +15120,8 @@ pub fn elaborate_module_with_defs(
     // declared members. Casts bypass the check.
     validate_enum_assignments(&elab)?;
 
+    register_nd_struct_array_members(&mut elab);
+
     null_init_class_handles(&mut elab);
 
     // LRM §20.7 — populate ARRAYS_TLS so any subsequent const-eval
@@ -30607,6 +30609,56 @@ fn inlined_port_member_wise(
     )
 }
 
+/// §7.4.2, §7.2: an element of a fixed multi-dimensional unpacked array of
+/// unpacked structures keeps each member in a signal of its own
+/// (`a[1][0].v`), as an element of a one-dimensional one does. Without it a
+/// member had no signal, so a continuous assignment reading it never woke
+/// (§10.3.2) and a copy of the array (§13.5.1) had no members to copy.
+/// Runs after the top is elaborated (its generate blocks included) and
+/// again after the instances are inlined; an array of more than 4096
+/// elements keeps the lazy members, as a one-dimensional one does.
+fn register_nd_struct_array_members(elab: &mut ElaboratedModule) {
+    let mut arrays: Vec<(String, Vec<(i64, i64)>)> = elab
+        .arrays_2d
+        .iter()
+        .map(|(n, &(d0, d1, _))| (n.clone(), vec![d0, d1]))
+        .chain(
+            elab.arrays_nd
+                .iter()
+                .map(|(n, (shape, _))| (n.clone(), shape.clone())),
+        )
+        .filter(|(n, _)| {
+            !elab.dynamic_arrays.contains(n)
+                && !elab.queue_vars.contains(n)
+                && !elab.associative_arrays.contains_key(n)
+        })
+        .collect();
+    arrays.sort();
+    for (name, shape) in arrays {
+        let Some(dt) = elab.var_decl_types.get(&name).cloned() else {
+            continue;
+        };
+        if !matches!(
+            resolve_typedef_chain(&dt, &elab.typedef_types),
+            DataType::Struct(su) if !su.packed && matches!(su.kind, StructUnionKind::Struct)
+        ) {
+            continue;
+        }
+        let count = shape.iter().try_fold(1usize, |n, &(lo, hi)| {
+            (hi >= lo).then(|| n.saturating_mul((hi - lo + 1) as usize))
+        });
+        if !count.is_some_and(|n| n <= 4096) {
+            continue;
+        }
+        for suffix in index_tuples(&shape) {
+            let ebase = format!("{name}{suffix}");
+            if !elab.struct_members.contains_key(&ebase) {
+                register_unpacked_aggregate(elab, &ebase, &dt);
+            }
+        }
+    }
+}
+
 fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &DataType) {
     let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
     let DataType::Struct(su) = resolved else {
@@ -35024,6 +35076,8 @@ pub fn inline_instantiations(
     PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
     elab.elided_port_hashes.sort_unstable();
     elab.elided_port_hashes.dedup();
+    // The instances' and interfaces' own arrays, as the top's.
+    register_nd_struct_array_members(elab);
     result
 }
 
