@@ -58354,6 +58354,9 @@ fn package_item_names(pi: &PackageItem) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
+mod package_shadow_tests;
+
 /// Names declared LOCALLY in a module scope (§26.3 shadow tracking): params,
 /// vars, nets, ports, typedefs, functions, tasks, classes, instances.
 fn collect_local_scope_names(items: &[ModuleItem]) -> std::collections::HashSet<String> {
