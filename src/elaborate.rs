@@ -8054,6 +8054,9 @@ impl DeclaredModuleNames {
     }
 }
 
+#[cfg(test)]
+mod declaration_order_snapshot_tests;
+
 /// IEEE 1800-2017 §6.5: data shall be declared before use, except implicit
 /// nets (§6.10). Only names actually declared as module data are checked;
 /// unresolved names remain the responsibility of implicit-net/name resolution.
