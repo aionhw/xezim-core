@@ -148,7 +148,9 @@ impl LiteralCache {
 
 #[derive(Debug)]
 pub struct NameCache {
-    value: OnceLock<String>,
+    // Parsed/shared bodies usually never memoize a scope-specific name.
+    // Keep the empty cell small without changing publication or ownership.
+    value: OnceLock<Box<String>>,
     disabled: AtomicBool,
 }
 
@@ -161,7 +163,7 @@ impl NameCache {
         if self.disabled.load(Ordering::Relaxed) {
             None
         } else {
-            self.value.get()
+            self.value.get().map(Box::as_ref)
         }
     }
 
@@ -169,7 +171,7 @@ impl NameCache {
         if self.disabled.load(Ordering::Relaxed) {
             Err(value)
         } else {
-            self.value.set(value)
+            self.value.set(Box::new(value)).map_err(|value| *value)
         }
     }
 
@@ -206,6 +208,36 @@ impl Clone for NameCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_name_publication_preserves_rejected_values() {
+        let cache = NameCache::new();
+        let accepted = std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..8)
+                .map(|index| {
+                    let cache = &cache;
+                    scope.spawn(move || {
+                        let expected = format!("instance{index}.signal");
+                        match cache.set(expected.clone()) {
+                            Ok(()) => true,
+                            Err(returned) => {
+                                assert_eq!(returned, expected);
+                                false
+                            }
+                        }
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count()
+        });
+        assert_eq!(accepted, 1);
+        assert!(cache.get().unwrap().starts_with("instance"));
+        assert_eq!(cache.clone().get(), cache.get());
+    }
 
     #[test]
     fn disabled_scope_caches_stay_empty_after_writes_and_clones() {

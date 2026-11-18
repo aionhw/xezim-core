@@ -482,7 +482,7 @@ impl Parser {
                 decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
-                init,
+                init: init.map(Box::new),
                 span: self.span_from(start),
             });
             if self.eat(TokenKind::Comma).is_none() {
@@ -1584,12 +1584,12 @@ impl Parser {
                                     NetType::Supply0 => '0',
                                     _ => 'z',
                                 };
-                                crate::ast::expr::Expression::new(
+                                Box::new(crate::ast::expr::Expression::new(
                                     crate::ast::expr::ExprKind::Number(
                                         crate::ast::expr::NumberLiteral::UnbasedUnsized(fill),
                                     ),
                                     d.span,
-                                )
+                                ))
                             })),
                             name: d.name,
                             dimensions: d.dimensions,

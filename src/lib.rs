@@ -2899,11 +2899,11 @@ fn parse_and_elaborate(
                         })
                     });
                     if !own {
-                        items.insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
+                        items.insert(0, ast::decl::ModuleItem::DPIImport(Box::new(di.clone())));
                     }
                 }
                 for e in top_level_dpi_exports.iter() {
-                    items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
+                    items.push(ast::decl::ModuleItem::DPIExport(Box::new(e.clone())));
                 }
                 // A module's own property or sequence of the same name
                 // shadows the $unit one.
@@ -3052,14 +3052,14 @@ fn parse_and_elaborate(
                         }
                         if let Some(init) = &mut decl.init {
                             let stmt = ast::stmt::Statement::new(
-                                ast::stmt::StatementKind::Expr(init.clone()),
+                                ast::stmt::StatementKind::Expr(init.as_ref().clone()),
                                 init.span,
                             );
                             if let ast::stmt::StatementKind::Expr(expr) =
                                 elaborate::substitute_bare_idents_stmt(&stmt, &shadowed_unit_vars)
                                     .kind
                             {
-                                *init = expr;
+                                **init = expr;
                             }
                         }
                     }

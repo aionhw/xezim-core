@@ -329,13 +329,13 @@ pub(super) fn class(
                 p.data_type = data_type(&p.data_type, prefix, bindings);
                 for d in &mut p.declarators {
                     if let Some(e) = &d.init {
-                        d.init = Some(rewrite_expr(
+                        d.init = Some(Box::new(rewrite_expr(
                             e,
                             "",
                             bindings,
                             &empty_names,
                             &empty_interfaces,
-                        ));
+                        )));
                     }
                 }
             }

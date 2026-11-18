@@ -106,7 +106,7 @@ impl Parser {
                             decl: crate::ast::binding::Bound::UNSET,
                             name: a.name,
                             dimensions: a.dimensions,
-                            init: a.init,
+                            init: a.init.map(Box::new),
                             span: a.span,
                         })
                         .collect();
@@ -284,7 +284,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -751,7 +751,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -794,7 +794,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -839,7 +839,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -893,7 +893,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -974,7 +974,7 @@ impl Parser {
                         decl: crate::ast::binding::Bound::UNSET,
                         name,
                         dimensions,
-                        init,
+                        init: init.map(Box::new),
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() {
@@ -2782,7 +2782,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                         span,
                     },
                     dimensions: Vec::new(),
-                    init: Some(arg.clone()),
+                    init: Some(Box::new(arg.clone())),
                     span,
                 };
                 stmts.push(Statement::new(

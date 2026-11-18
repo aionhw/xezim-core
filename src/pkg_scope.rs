@@ -2721,7 +2721,7 @@ impl Rw<'_> {
     fn declarators(&mut self, ds: &mut [VarDeclarator]) {
         for d in ds {
             self.unpacked(&mut d.dimensions);
-            self.opt(&mut d.init);
+            self.opt_box(&mut d.init);
         }
     }
 
@@ -3150,12 +3150,12 @@ impl Rw<'_> {
             }
             ModuleItem::NetDeclaration(n) => {
                 self.dtype(&mut n.data_type);
-                self.opt(&mut n.delay);
-                self.opt(&mut n.delay_fall);
-                self.opt(&mut n.delay_off);
+                self.opt_box(&mut n.delay);
+                self.opt_box(&mut n.delay_fall);
+                self.opt_box(&mut n.delay_off);
                 for d in &mut n.declarators {
                     self.unpacked(&mut d.dimensions);
-                    self.opt(&mut d.init);
+                    self.opt_box(&mut d.init);
                 }
             }
             ModuleItem::DataDeclaration(d) => {
@@ -3179,9 +3179,9 @@ impl Rw<'_> {
             ModuleItem::InitialConstruct(i) => self.body(&mut i.stmt),
             ModuleItem::FinalConstruct(f) => self.body(&mut f.stmt),
             ModuleItem::ContinuousAssign(ca) => {
-                self.opt(&mut ca.delay);
-                self.opt(&mut ca.delay_fall);
-                self.opt(&mut ca.delay_off);
+                self.opt_box(&mut ca.delay);
+                self.opt_box(&mut ca.delay_fall);
+                self.opt_box(&mut ca.delay_off);
                 for (l, r) in &mut ca.assignments {
                     self.expr(l);
                     self.expr(r);
@@ -3252,8 +3252,8 @@ impl Rw<'_> {
             }
             ModuleItem::CovergroupDeclaration(cg) => self.covergroup(cg),
             ModuleItem::ClockingDeclaration(cd) => {
-                self.opt(&mut cd.default_input_skew);
-                self.opt(&mut cd.default_output_skew);
+                self.opt_box(&mut cd.default_input_skew);
+                self.opt_box(&mut cd.default_output_skew);
                 for s in &mut cd.signals {
                     self.opt(&mut s.skew);
                     self.opt(&mut s.bound_to);
@@ -3366,7 +3366,7 @@ impl Rw<'_> {
                 self.dtype(&mut nd.data_type);
                 for d in &mut nd.declarators {
                     self.unpacked(&mut d.dimensions);
-                    self.opt(&mut d.init);
+                    self.opt_box(&mut d.init);
                     if let Some(p) = pkg {
                         if self.info.mangled_vars.contains(&d.name.name) {
                             d.name.name = mangle(p, &d.name.name);

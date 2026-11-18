@@ -150,11 +150,12 @@ pub(crate) fn qualify_class_body(
             ClassItem::Property(p) => {
                 for d in &mut p.declarators {
                     if let Some(init) = &mut d.init {
-                        let stmt = Statement::new(StatementKind::Expr(init.clone()), init.span);
+                        let stmt =
+                            Statement::new(StatementKind::Expr(init.as_ref().clone()), init.span);
                         if let StatementKind::Expr(e) =
                             substitute_bare_idents_stmt(&stmt, &map).kind
                         {
-                            *init = e;
+                            **init = e;
                         }
                     }
                 }

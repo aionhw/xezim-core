@@ -125,11 +125,11 @@ pub(crate) fn settle(
                 decl.name.name = sv_parser::unit_scope_name(&decl.name.name);
             }
             if let Some(init) = &mut decl.init {
-                let stmt = Statement::new(StatementKind::Expr(init.clone()), init.span);
+                let stmt = Statement::new(StatementKind::Expr(init.as_ref().clone()), init.span);
                 if let StatementKind::Expr(expr) =
                     elaborate::substitute_bare_idents_stmt(&stmt, &renames).kind
                 {
-                    *init = expr;
+                    **init = expr;
                 }
             }
         }
