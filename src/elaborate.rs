@@ -13188,15 +13188,12 @@ pub fn elaborate_module_with_defs(
                         // otherwise write. Without it the resolver never saw
                         // the initializer, so a resolver that keys on driver
                         // COUNT (issue #1204) resolved as if the net had one
-                        // fewer driver. Const only: a non-const initializer
-                        // still lowers to a procedural init below (a separate
-                        // path), and adding both would double-drive the net.
-                        if get_type_name(&dd.data_type)
-                            .is_some_and(|t| elab.nettype_resolvers.contains_key(&t))
-                            && decl.init.is_some()
-                            && procedural_init.is_none()
-                        {
-                            let init_expr = decl.init.as_ref().unwrap();
+                        // fewer driver. A non-constant initializer drives the
+                        // net the same way, instead of the one-time
+                        // procedural write a variable gets below.
+                        let nettype_net = get_type_name(&dd.data_type)
+                            .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
+                        if nettype_net && let Some(init_expr) = decl.init.as_ref() {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
                                 delay_select: None,
@@ -13214,7 +13211,7 @@ pub fn elaborate_module_with_defs(
                                 .insert(decl.name.name.clone(), view.clone());
                         }
 
-                        if let Some(expr) = procedural_init {
+                        if let Some(expr) = procedural_init.filter(|_| !nettype_net) {
                             // §6.20.6: a `const` declaration's initializer is its
                             // one legal write — record it so the const-write
                             // check exempts this synthetic assignment.
@@ -41070,6 +41067,9 @@ fn inline_module_items(
                 // the declaration walk below and emitted once the instance's
                 // rewrite context exists.
                 let mut deferred_decl_inits: Vec<(String, Expression)> = Vec::new();
+                // §6.6.7, §10.3.1: initializers of user-defined nettype nets,
+                // by local name; they become net declaration assignments.
+                let mut nettype_decl_inits: Vec<(String, Expression)> = Vec::new();
                 if elab_trace_enabled() {
                     eprintln!(
                         "[xezim][elab] inline instance path='{}' target='{}'",
@@ -45604,6 +45604,18 @@ fn inline_module_items(
                                     // INSTANTIATED module lost its "HEAD_"
                                     // prefix, while the identical declaration
                                     // in the top module was correct).
+                                    // §6.6.7, §10.3.1: the initializer of a
+                                    // user-defined nettype net is one of its
+                                    // continuous drivers, as at top level; it
+                                    // joins the instance's net declaration
+                                    // assignments once the rewrite context
+                                    // exists.
+                                    let nettype_net = get_type_name(&dd.data_type)
+                                        .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
+                                    if nettype_net && let Some(init_expr) = &decl.init {
+                                        nettype_decl_inits
+                                            .push((decl.name.name.clone(), init_expr.clone()));
+                                    }
                                     let init_val = if let Some(init_expr) = &decl.init {
                                         // An initializer that is NOT a constant
                                         // expression reads a sibling VARIABLE
@@ -45616,8 +45628,10 @@ fn inline_module_items(
                                         // initial-block assignment exactly as the
                                         // top-level declaration path does.
                                         if !is_const_expr(init_expr, &sub_merged_params) {
-                                            deferred_decl_inits
-                                                .push((sig_name.clone(), init_expr.clone()));
+                                            if !nettype_net {
+                                                deferred_decl_inits
+                                                    .push((sig_name.clone(), init_expr.clone()));
+                                            }
                                             default_value_for_type_resolved(
                                                 &dd.data_type,
                                                 width,
@@ -46761,6 +46775,21 @@ fn inline_module_items(
                     owner: sub_mod.name().to_string(),
                     upward: Rc::clone(&elab.upward_scopes),
                 });
+                // §6.6.7, §10.3.1: a nettype net's initializer drives the net
+                // like a net declaration assignment, in the instance's scope.
+                for (name, init_expr) in nettype_decl_inits.drain(..) {
+                    elab.pending_cont_assign.push(PendingContAssign {
+                        lhs_source: std::rc::Rc::new(make_ident_expr(&name)),
+                        lhs_is_net_initializer: true,
+                        origin_span: Some(init_expr.span),
+                        rhs_source: std::rc::Rc::new(init_expr),
+                        ctx: std::rc::Rc::clone(&pend_ctx),
+                        strength: None,
+                        delay_source: None,
+                        delay_fall_source: None,
+                        delay_off_source: None,
+                    });
+                }
 
                 crate::oom_trace::checkpoint(
                     "retain instance context",
