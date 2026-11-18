@@ -36286,6 +36286,7 @@ fn inline_instantiations_inner(
         &root_defparams,
         &param_scope,
     )?;
+    crate::oom_trace::model("inline.top.ready", elab, Some(cache.prepared.len()));
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
@@ -36342,6 +36343,7 @@ fn inline_instantiations_inner(
         .keys()
         .cloned()
         .collect::<std::collections::HashSet<_>>();
+    crate::oom_trace::model("inline.local_names.ready", elab, Some(cache.prepared.len()));
     let port_map = HashMap::default();
     let mut interface_map = HashMap::default();
     for name in top_interface_names {
@@ -36370,8 +36372,11 @@ fn inline_instantiations_inner(
         assign.lhs = rewrite_expr(&assign.lhs, prefix, &port_map, &local_names, &interface_map);
         assign.rhs = rewrite_expr(&assign.rhs, prefix, &port_map, &local_names, &interface_map);
     }
+    drop(local_names);
+    crate::oom_trace::model("inline.root_rewrites.ready", elab, Some(cache.prepared.len()));
 
     validate_inlined_bodies(elab, definitions)?;
+    crate::oom_trace::model("inline.validation.ready", elab, Some(cache.prepared.len()));
 
     // §8.2: reject illegal `local`/`protected` member access at compile time
     // (the reference simulators report `Illegal access to local/protected
@@ -40782,6 +40787,39 @@ fn inline_module_items(
                 .insert(String::new(), source_def.name().to_string());
             scopes.packages.extend(elab.packages.iter().cloned());
         }
+    }
+    // This body's signals and processes were already elaborated by its
+    // caller. A flat leaf has no hierarchy work left, so avoid preparing a
+    // second owned copy of its items. Binds and generate constructs still
+    // need the complete preparation and active-scope handling below.
+    let has_hierarchy_work = source_def.items().iter().any(|item| {
+        matches!(
+            item,
+            ModuleItem::ModuleInstantiation(_)
+                | ModuleItem::Bind(_)
+                | ModuleItem::GenerateRegion(_)
+                | ModuleItem::GenerateIf(_)
+                | ModuleItem::GenerateCase(_)
+                | ModuleItem::GenerateFor(_)
+        )
+    }) || elab
+        .resolved_binds
+        .get(prefix.trim_end_matches('.'))
+        .is_some_and(|binds| !binds.is_empty());
+    if !has_hierarchy_work {
+        for pd in source_def
+            .params()
+            .iter()
+            .chain(item_param_decls(source_def.items()))
+        {
+            if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                for a in assignments {
+                    elab.declared_parameters
+                        .insert(format!("{}{}", prefix, a.name.name));
+                }
+            }
+        }
+        return Ok(());
     }
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
