@@ -246,7 +246,12 @@ pub use value::Value;
 ///         nettype input ports kept apart from non-nettype actuals (§23.3.3).
 /// \x4b = \x4a + unsized signed decimal numbers sized by their magnitude and a sign bit in
 ///         parameters, constant expressions and cached literals (§5.7.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4b";
+/// \x4c = \x4b + package parameters qualified in the data types of package subroutines and
+///         classes (§26.3), an instance's `[N]` sized by its module's uncontested import
+///         (§7.4.2), nested classes named through a specialized host by their renamed spelling
+///         (§8.23), class-local typedef property widths (§6.18) and package sequences and
+///         properties under `pkg::name` keys (§16.8, §26.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4c";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
