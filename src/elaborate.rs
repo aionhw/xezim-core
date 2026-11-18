@@ -51993,8 +51993,516 @@ fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule) {
     }
 }
 
-/// §10.11: the canonical net of the alias group a name belongs to, or the
-/// name itself when it belongs to no group.
+/// §14.5 (issue #1241): an input/inout clockvar bound to an EXPRESSION (`input
+/// e = a + 1;` / `input e = {a, b};` / `input e = s ? x : y;`) samples through
+/// a private net that an ordinary continuous assignment drives with the
+/// expression's value. The clocking sampling/skew/history/preponed machinery
+/// in the simulator keys on the signal name alone, so pointing `bound_to` at
+/// the private net makes those paths — including `#1step` (default), `#0` and
+/// `#N` skews — sample the expression exactly like a named signal.
+///
+/// Left alone (the pre-existing behavior is kept):
+///
+///  - a plain name (`input a;`), a whole-array or single-dimensional-array
+///    element binding, and a PART-SELECT binding (`input a = bus[3:0]`), all of
+///    which the simulator reads directly;
+///  - a clocking block whose input carries an explicit EDGE skew
+///    (`input negedge e = ...`), which the sampler does not implement — a
+///    private net would wrongly sample on the block's own clock edge;
+///  - a binding in a GENERATE context (a block or referencing signals expanded
+///    from a generate loop / conditional), where one registration serves every
+///    copy and a single private net could not represent each copy's distinct
+///    expression.
+///
+/// The private net is a fresh top-level signal whose natural (self-determined)
+/// width and signedness come from the expression, so a negative or wide result
+/// reads back correctly and a `#N` skew history of the right shape is kept.
+///
+/// Runs after instance inlining and after the nettype / shared-output staging:
+/// `stage_shared_clocking_outputs` above creates the `<net>$clk<k>` output
+/// stages, and the private nets added here participate in the same
+/// single-driver continuous-assign flow below. It must run BEFORE the
+/// "physical net before driver widening" bookkeeping so the net's width/sign
+/// are recorded before any lowering compares them.
+fn create_clocking_input_expr_nets(elab: &mut ElaboratedModule) {
+    if elab.clocking_blocks.is_empty() {
+        return;
+    }
+    // A clocking input expression is a self-determined value; its sampled
+    // width is the natural width of the (informal) expression, exactly as
+    // `$bits(expr)` reports it (§20.6.2).
+    // §6.6.4 / §5.7.1: the self-determined (natural) WIDTH of an untyped
+    // expression, resolved structurally from the elaborated signal table (an
+    // operator, conditional or call operand has its self-determined width;
+    // §11.6.1). Defined below so it can recurse on `elab`.
+    let expr_width = |e: &Expression| expr_width_fn(elab, e);
+    // §5.7.1 / §11.6: the self-determined signedness of an untyped
+    // expression. Leaf signals resolve from the elaborated signal table so a
+    // signed leaf propagates signedness to its result (`input e = a - 3`
+    // samples signed when `a` is a signed `int`).
+    fn expr_signed(elab: &ElaboratedModule, e: &Expression) -> bool {
+        use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+        let s = |x: &Expression| expr_signed(elab, x);
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer { signed, .. }) => *signed,
+            ExprKind::Number(NumberLiteral::Real(_)) => true,
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => false,
+            ExprKind::Paren(i) => s(i),
+            ExprKind::StringLiteral(_)
+            | ExprKind::Concatenation(_)
+            | ExprKind::Replication { .. }
+            | ExprKind::RangeSelect { .. } => false,
+            ExprKind::Ident(h) => {
+                if !h.path.iter().all(|p| p.selects.is_empty()) {
+                    return true;
+                }
+                let raw = h.path.last().map(|p| p.name.name.as_str()).unwrap_or("");
+                elab
+                    .signals
+                    .get(raw)
+                    .map(|sg| sg.is_signed)
+                    .or_else(|| {
+                        elab
+                            .parameters
+                            .get(raw)
+                            .filter(|v| !v.is_real)
+                            .map(|v| v.is_signed)
+                    })
+                    .unwrap_or(false)
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => elab
+                    .signals
+                    .get(&format!("{}.{}", h.path[0].name.name, member.name))
+                    .map(|sg| sg.is_signed)
+                    .unwrap_or(false),
+                _ => false,
+            },
+            ExprKind::Unary { op, operand } => match op {
+                U::Plus | U::Minus | U::BitNot => s(operand),
+                U::LogNot
+                | U::BitAnd
+                | U::BitNand
+                | U::BitOr
+                | U::BitNor
+                | U::BitXor
+                | U::BitXnor => false,
+                _ => false,
+            },
+            ExprKind::Binary { op, left, right } => match op {
+                B::Add | B::Sub | B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr
+                | B::BitXor | B::BitXnor => s(left) && s(right),
+                _ => false,
+            },
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => s(then_expr) && s(else_expr),
+            _ => false,
+        }
+    }
+    // §6.6.4: when any operand is `real`, the self-determined result is real
+    // (§11.6.1).
+    fn expr_real(elab: &ElaboratedModule, e: &Expression) -> bool {
+        use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+        let r = |x: &Expression| expr_real(elab, x);
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Real(_)) => true,
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) => false,
+            ExprKind::Paren(i) => r(i),
+            ExprKind::Ident(h) => {
+                let raw = h.path.last().map(|p| p.name.name.as_str()).unwrap_or("");
+                elab
+                    .signals
+                    .get(raw)
+                    .map(|sg| sg.is_real)
+                    .or_else(|| {
+                        elab
+                            .parameters
+                            .get(raw)
+                            .map(|v| v.is_real)
+                    })
+                    .unwrap_or(false)
+            }
+            ExprKind::MemberAccess { expr, member } => elab
+                .signals
+                .get(&format!("{}.{}", expr_flat(expr), member.name))
+                .map(|sg| sg.is_real)
+                .unwrap_or(false),
+            ExprKind::Unary { op, operand } => match op {
+                U::Plus | U::Minus | U::BitNot => r(operand),
+                _ => false,
+            },
+            ExprKind::Binary { op, left, right } => match op {
+                B::Add | B::Sub | B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr
+                | B::BitXor | B::BitXnor => r(left) || r(right),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    // Phase 1 (read-only): decide which expression-bound input/inout clockvars
+    // need a private net, and compute each net's width/sign/realness.
+    let mut k: HashMap<String, usize> = HashMap::default();
+    // New signals, continuous-assign RHS, in lockstep: (net, signal, rhs).
+    let mut new_sigs: Vec<(String, Signal, Expression)> = Vec::new();
+    let mut rewrites: Vec<(String, String, String)> = Vec::new();
+    for cd in elab.clocking_blocks.values() {
+        for s in &cd.signals {
+            // Only inputs/inouts are sampled; `#1241` is about input
+            // expressions. Outputs are already handled by
+            // `stage_shared_clocking_outputs`.
+            if s.direction == crate::ast::types::PortDirection::Output {
+                continue;
+            }
+            let Some(expr) = &s.bound_to else {
+                continue;
+            };
+            // Explicit input edge skew (guard §1 of the issue) — the sampler
+            // does not implement input edge skews, so keep the old path.
+            if s.skew_edge.is_some() {
+                continue;
+            }
+            // The already-working forms need no private net.
+            if ident_flat_name(expr).is_some() {
+                continue;
+            }
+            if is_select_chain(expr) {
+                continue;
+            }
+            // Generate-context guard (#1241): a clocking block inside a
+            // generate loop / conditional is registered under ONE name whose
+            // copies share it — the survived copy has its genvar-sumstituted
+            // leaves baked in (`src[2] + 2`), so a single private net could
+            // not represent the per-copy expressions. Such substituted leaves
+            // carry a zero span; skip those blocks (keep the pre-existing
+            // path).
+            if expr_has_synthetic_leaf(expr) {
+                continue;
+            }
+            // Resolve the binding's width and signedness from the expression.
+            let is_real = expr_real(elab, expr);
+            let width = if is_real {
+                64
+            } else {
+                match expr_width(expr) {
+                    Some(w) => w,
+                    None => continue,
+                }
+            };
+            let is_signed = !is_real && expr_signed(elab, expr);
+            // A pure-constant binding (an arithmetic expression over literals /
+            // parameters — including one a port connection folded to its
+            // constant value) is materialised into the net's INITIAL value so
+            // the #1step / preponed snapshot sees it even when the continuous
+            // assign's settle happens after the first preponed snapshot (issue
+            // #1241 guard #3). A runtime-signal binding stays settled by its
+            // continuous assign, which the simulator tracks.
+            let value: Value = if is_real {
+                Value::from_f64(0.0)
+            } else if expr_is_constant_root(expr) {
+                eval_const_expr_val(expr, &elab.parameters)
+            } else {
+                Value::all_x(width)
+            };
+            let n = k.entry(cd.name.name.clone()).or_insert(0);
+            let net = format!("{}${}$cbexpr{}", cd.name.name, s.name.name, n);
+            *n += 1;
+            let sig = Signal {
+                name: net.clone().into(),
+                width,
+                is_signed,
+                is_real,
+                is_const: false,
+                direction: None,
+                value,
+                type_name: None,
+            };
+            new_sigs.push((net.clone(), sig, expr.clone()));
+            rewrites.push((cd.name.name.clone(), s.name.name.clone(), net));
+        }
+    }
+    if new_sigs.is_empty() {
+        return;
+    }
+
+    // Phase 2: apply the new signals and continuous assignments, then retarget
+    // the clocking inputs' `bound_to` at their private nets. A PURE-CONSTANT
+    // binding needs no continuous assign — its value was materialised into the
+    // signal already (#1241 guard §3), and emitting one can drive the net to X
+    // before the #1step preponed snapshot when the block sits across a module
+    // boundary from the only consumer.
+    for (net, sig, rhs) in new_sigs {
+        if !elab.signals.contains_key(&net) {
+            let is_const = expr_is_constant_root(&rhs);
+            elab.signals.insert(net.clone(), sig);
+            if !is_const {
+                elab.continuous_assigns.push(ContinuousAssignment {
+                    gate_delay_fall: None,
+                    delay_select: None,
+                    origin: None,
+                    lhs: make_ident_expr(&net),
+                    rhs,
+                    delay: 0,
+                    rhs_parent_scoped: false,
+                    delay_fall: None,
+                    delay_off: None,
+                });
+            }
+        }
+    }
+    for (cb, signame, net) in rewrites {
+        if let Some(cd) = elab.clocking_blocks.get_mut(&cb) {
+            for cs in &mut cd.signals {
+                if cs.name.name == signame {
+                    cs.bound_to = Some(make_ident_expr(&net));
+                    break;
+                }
+            }
+        }
+    }
+    fn collect_flat(e: &Expression, out: &mut String) {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|p| p.selects.is_empty()) => {
+                out.push_str(
+                    &h.path
+                        .iter()
+                        .map(|p| p.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                collect_flat(expr, out);
+                out.push('.');
+                out.push_str(&member.name);
+            }
+            _ => {}
+        }
+    }
+    fn expr_flat(e: &Expression) -> String {
+        let mut o = String::new();
+        collect_flat(e, &mut o);
+        o
+    }
+}
+
+/// §14.3: True for a part-select / index / array-element binding
+/// (`input a = bus[3:0]` / `input a = m[i]`), including a chained one, that
+/// the simulator already samples directly via `select_chain_base`. Mirrors the
+/// simulator's shape, so the nets get created only for genuine expressions.
+fn is_select_chain(expr: &Expression) -> bool {
+    match &expr.kind {
+        ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+            is_select_chain(base) || ident_flat_name(base).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` is a pure constant expression — only literals, parameters and
+/// operators over them, with no runtime signal / array / member / index leaf.
+/// Used to materialise pure-constant clocking-input bindings into the private
+/// net's initial value (issue #1241 guard #3, where a port connection folds an
+/// operand to its constant before clocking binding).
+fn expr_is_constant_root(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Paren(i) => expr_is_constant_root(i),
+        ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+        ExprKind::Unary { operand, .. } => expr_is_constant_root(operand),
+        ExprKind::Binary { left, right, .. } => {
+            expr_is_constant_root(left) && expr_is_constant_root(right)
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_is_constant_root(condition)
+                && expr_is_constant_root(then_expr)
+                && expr_is_constant_root(else_expr)
+        }
+        ExprKind::Replication { count, exprs } => {
+            expr_is_constant_root(count) && exprs.iter().all(expr_is_constant_root)
+        }
+        ExprKind::Concatenation(parts) => parts.iter().all(expr_is_constant_root),
+        // A parameter reference (resolved by name) is constant; a signal is
+        // not. The create call passes `&elab.parameters` so only params — not
+        // signals — const-evaluate.
+        ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+        | ExprKind::RangeSelect { .. } | ExprKind::Call { .. } | ExprKind::SystemCall { .. } => {
+            false
+        }
+        _ => false,
+    }
+}
+
+/// §6.6.4 / §5.7.1: the SELF-DETERMINED (natural) width of an untyped clocking
+/// input expression, resolved structurally from the elaborated module. An
+/// operator, conditional or call operand has its self-determined width, so a
+/// binary arithmetic result is the max of its two operands, a comparison /
+/// logical result is 1 bit, a concatenation / replication sums its parts, and
+/// a leaf resolves by its declared type (`port_conn_width`). Unsized literals
+/// are handled by their §5.7.1 rules (an unsized decimal is 32-bit; an unsized
+/// based literal is context-determined). Returns None when the width cannot be
+/// determined — the caller keeps the pre-existing path for such a signal.
+fn expr_width_fn(elab: &ElaboratedModule, e: &Expression) -> Option<u32> {
+    use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+    let w = |x: &Expression| expr_width_fn(elab, x);
+    match &e.kind {
+        ExprKind::Paren(i) => w(i),
+        ExprKind::Unary { op, operand } => match op {
+            U::LogNot | U::BitAnd | U::BitNand | U::BitOr | U::BitNor | U::BitXor
+            | U::BitXnor => Some(1),
+            U::Plus | U::Minus | U::BitNot => w(operand),
+            _ => None,
+        },
+        ExprKind::Binary { op, left, right } => match op {
+            B::Eq
+            | B::Neq
+            | B::CaseEq
+            | B::CaseNeq
+            | B::WildcardEq
+            | B::WildcardNeq
+            | B::LogAnd
+            | B::LogOr
+            | B::LogImplies
+            | B::LogEquiv
+            | B::Lt
+            | B::Leq
+            | B::Gt
+            | B::Geq => Some(1),
+            B::ShiftLeft | B::ShiftRight | B::ArithShiftLeft | B::ArithShiftRight => w(left),
+            B::Power => w(left),
+            B::Add
+            | B::Sub
+            | B::Mul
+            | B::Div
+            | B::Mod
+            | B::BitAnd
+            | B::BitOr
+            | B::BitXor
+            | B::BitXnor => Some(w(left)?.max(w(right)?)),
+            _ => None,
+        },
+        ExprKind::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => Some(w(then_expr)?.max(w(else_expr)?)),
+        ExprKind::Replication { count, exprs } => {
+            let n = u32::try_from(const_eval_i64_with_params(count, Some(&elab.parameters))?).ok()?;
+            let mut total = 0u32;
+            for x in exprs {
+                total = total.checked_add(w(x)?)?;
+            }
+            Some(total.checked_mul(n)?)
+        }
+        // §11.7: $signed/$unsigned keep the operand width.
+        ExprKind::SystemCall { name, args } if name == "$signed" || name == "$unsigned" => {
+            args.first().and_then(w)
+        }
+        ExprKind::SystemCall { name, args } if is_cast_call(name) => args
+            .first()
+            .and_then(w)
+            .or_else(|| args.get(1).and_then(w)),
+        // §5.7.1: an unsized decimal literal is 32-bit (an `int`); an unsized
+        // based literal is context-determined, so adopt the other/no width.
+        ExprKind::Number(number) => match number {
+            NumberLiteral::Integer { size: Some(sz), .. } => Some(*sz),
+            NumberLiteral::Integer {
+                size: None,
+                signed,
+                base,
+                value,
+                ..
+            } => {
+                let digits = value.replace('_', "");
+                if *signed {
+                    // Unsized decimal signed literal: 32 bits.
+                    Some(32)
+                } else if digits.chars().all(|c| c == '0') {
+                    // `'0` — one bit, context-extends, but self-determined as 1.
+                    Some(1)
+                } else {
+                    // §5.7.1: an unsized based literal takes as many bits as
+                    // the value needs (binary = digit count, octal = ×3,
+                    // hex = ×4, decimal = minimal bits for the value).
+                    let per_digit = match base {
+                        NumberBase::Binary => 1u32,
+                        NumberBase::Octal => 3,
+                        NumberBase::Hex => 4,
+                        NumberBase::Decimal => {
+                            // Bits needed to represent the decimal value.
+                            // x/z digits force the max digit count * 3.3…;
+                            // for pure decimal digits compute via log2.
+                            if digits.chars().any(|c| c == 'x' || c == 'z') {
+                                return None;
+                            }
+                            let v = digits.parse::<u64>().ok()?;
+                            let m =
+                                (64 - v.leading_zeros()).max(if v == 0 { 1 } else { 1 }) as u32;
+                            return Some(m);
+                        }
+                    };
+                    Some(digits.len() as u32 * per_digit)
+                }
+            }
+            NumberLiteral::UnbasedUnsized(_) => Some(1),
+            NumberLiteral::Real(_) => Some(64),
+            _ => None,
+        },
+        ExprKind::StringLiteral(s) => Some(8 * s.len().max(1) as u32),
+        // Leaf / base forms (ident, member, select, concatenation over
+        // leaves): reuse the port-connection width rule.
+        _ => port_conn_width(e, elab),
+    }
+}
+
+/// Whether `e` (an expression taken from a clocking input binding) contains a
+/// leaf a generate-iteration substitution synthesized out of whole cloth — a
+/// leaf whose source span is empty (start == end == 0). A clocking block in a
+/// generate loop is registered under a single name whose survived copy has its
+/// genvar-substituted leaves baked in; a private net built for it could not
+/// represent the per-copy expressions, so such blocks keep the pre-existing
+/// path. Empty spans otherwise arise only from synthesised nodes, never from
+/// source, so this is a safe detection.
+fn expr_has_synthetic_leaf(e: &Expression) -> bool {
+    if e.span.start == 0 && e.span.end == 0 {
+        return true;
+    }
+    match &e.kind {
+        ExprKind::Paren(i) => expr_has_synthetic_leaf(i),
+        ExprKind::Unary { operand, .. } => expr_has_synthetic_leaf(operand),
+        ExprKind::Binary { left, right, .. } => {
+            expr_has_synthetic_leaf(left) || expr_has_synthetic_leaf(right)
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_synthetic_leaf(condition)
+                || expr_has_synthetic_leaf(then_expr)
+                || expr_has_synthetic_leaf(else_expr)
+        }
+        ExprKind::Replication { count, exprs } => {
+            expr_has_synthetic_leaf(count) || exprs.iter().any(expr_has_synthetic_leaf)
+        }
+        ExprKind::Concatenation(parts) => parts.iter().any(expr_has_synthetic_leaf),
+        ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+            expr_has_synthetic_leaf(expr)
+        }
+        ExprKind::MemberAccess { expr, .. } => expr_has_synthetic_leaf(expr),
+        ExprKind::Call { func, args, .. } => {
+            expr_has_synthetic_leaf(func) || args.iter().any(expr_has_synthetic_leaf)
+        }
+        ExprKind::SystemCall { args, .. } => args.iter().any(expr_has_synthetic_leaf),
+        _ => false,
+    }
+}
+
 fn alias_canonical(alias_canon: &HashMap<String, String>, name: String) -> String {
     alias_canon.get(name.as_str()).cloned().unwrap_or(name)
 }
@@ -52264,6 +52772,13 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // the net's resolution. It drives a stage of its own when the net has
     // another driver.
     stage_shared_clocking_outputs(elab);
+    // §14.5/#1241: an input (or inout) clockvar bound to an arithmetic /
+    // concatenation / conditional EXPRESSION (`input e = a + 1`) is sampled
+    // through a private net driven by an ordinary continuous assignment, so
+    // the existing clocking skew / preponed / history machinery works
+    // unchanged. A plain name, a reordered-name binding and a select binding
+    // already work and are left alone.
+    create_clocking_input_expr_nets(elab);
     // §28.12 / §21.2.1.5: a net with ONE driver that carries a strength or
     // is a tristate primitive keeps that driver for `%v`; a net several
     // drivers resolve replaces it below.
