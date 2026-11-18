@@ -3551,7 +3551,7 @@ endmodule
                     StatementKind::SeqBlock { stmts, .. } => stmts,
                     _ => panic!("expected a block"),
                 },
-                ModuleItem::FunctionDeclaration(f) => f.items.into_vec(),
+                ModuleItem::FunctionDeclaration(f) => f.items,
                 _ => continue,
             };
             assert_eq!(declared_type(&stmts[0]), "copper::word_t");

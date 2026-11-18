@@ -1,4 +1,4 @@
-//! Copy-on-write storage for immutable subroutine bodies (§13.3, §13.4).
+//! Copy-on-write storage for immutable statement lists (§9.3, §13.3, §13.4).
 //!
 //! A declaration's signature belongs to its scope, while clones may share
 //! its unchanged body. Rewriters obtain exclusive storage before mutation.
@@ -9,9 +9,15 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct SharedVec<T>(Arc<Vec<T>>);
 
-impl<T> Clone for SharedVec<T> {
+impl<T: Clone> Clone for SharedVec<T> {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+        if super::cache::scope_clone_needs_private_body() {
+            // An explicitly private callable/process copy must reset or
+            // disable caches inside every nested block as well (§23.6).
+            Self(Arc::new((*self.0).clone()))
+        } else {
+            Self(Arc::clone(&self.0))
+        }
     }
 }
 
