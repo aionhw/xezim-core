@@ -1449,8 +1449,8 @@ impl Parser {
                         is_default: false,
                         stmt,
                         span: self.span_from(istart),
-                        pattern: Some(pattern),
-                        guard,
+                        pattern: Some(Box::new(pattern)),
+                        guard: guard.map(Box::new),
                     });
                 }
                 if self.pos == before {

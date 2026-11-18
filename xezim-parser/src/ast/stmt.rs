@@ -292,10 +292,10 @@ pub struct CaseItem {
     /// §12.6: the item's pattern in a `case (…) matches` statement. `None` for
     /// an ordinary case item (which uses `patterns` instead).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub pattern: Option<Pattern>,
+    pub pattern: Option<Box<Pattern>>,
     /// §12.6: the item's optional `&&& <guard>` expression.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub guard: Option<Expression>,
+    pub guard: Option<Box<Expression>>,
 }
 
 #[derive(Debug, Clone)]
