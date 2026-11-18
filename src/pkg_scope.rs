@@ -93,6 +93,11 @@ struct Info {
     /// Value names (subroutines, parameters, variables, `let`s) declared by
     /// more than one package, or by a package and `$unit`.
     colliding_values: HashSet<String>,
+    /// Value parameter names any package declares. The elaborator binds a
+    /// package's bare parameter names only while it registers that package
+    /// (§26.3), so references from data types in its subroutines and
+    /// classes, sized later, are spelled `pkg::name` (see `resolve_value`).
+    pkg_params: HashSet<String>,
     /// Package VARIABLE names that two or more packages declare. Every
     /// package's variables share one design-wide bare namespace at run
     /// time, so each such variable is renamed to `pkg::name` and every
@@ -1002,6 +1007,10 @@ fn collect(descs: &[Description]) -> Option<Info> {
     let colliding = clash(|pi| &pi.types, &other);
     let colliding_members = clash(|pi| &pi.members, &other_members);
     let colliding_values = clash(|pi| &pi.values, &other_values);
+    let pkg_params: HashSet<String> = pkgs
+        .values()
+        .flat_map(|pi| pi.params.iter().cloned())
+        .collect();
     // A name some `import Q::n;` / `export Q::n;` spells out keeps its
     // declared name: the import and export checks look it up by that name.
     let mut explicit_named: HashSet<String> = HashSet::default();
@@ -1124,6 +1133,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
     if colliding.is_empty()
         && colliding_members.is_empty()
         && colliding_values.is_empty()
+        && pkg_params.is_empty()
         && class_colliding.is_empty()
         && hiding.is_empty()
         && classes.values().all(|ci| ci.inline.is_empty())
@@ -1135,6 +1145,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
         colliding,
         colliding_members,
         colliding_values,
+        pkg_params,
         mangled_vars,
         class_colliding,
         hiding,
@@ -1507,10 +1518,11 @@ impl Rw<'_> {
     /// bare name, where the last package registered wins, so the reference
     /// is spelled `pkg::n`, the qualified lookup.
     fn resolve_value(&self, n: &str) -> Option<String> {
-        if !self.info.colliding_values.contains(n) {
+        let colliding = self.info.colliding_values.contains(n);
+        if !colliding && (self.in_const == 0 || !self.info.pkg_params.contains(n)) {
             return None;
         }
-        for f in self.frames.iter().rev() {
+        for (depth, f) in self.frames.iter().rev().enumerate() {
             if let Some(p) = &f.pkg {
                 if self
                     .info
@@ -1519,9 +1531,11 @@ impl Rw<'_> {
                     .is_some_and(|pi| pi.values.contains(n))
                 {
                     // §26.3: parameter references in package functions and
-                    // classes keep the package's value when a module owns
-                    // the same bare name in the flattened design.
-                    return self.info.pkgs[p].params.contains(n).then(|| p.clone());
+                    // classes keep the package's value, which is bound by
+                    // its bare name only while the package registers, and
+                    // which a module may shadow in the flattened design.
+                    return (self.info.pkgs[p].params.contains(n) && (colliding || depth > 0))
+                        .then(|| p.clone());
                 }
             }
             let inherited = f.inherits
@@ -1534,6 +1548,9 @@ impl Rw<'_> {
                     }));
             if f.values.contains(n) || inherited {
                 return None;
+            }
+            if !colliding && (f.pkg.is_none() || depth == 0) {
+                continue;
             }
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.value_owner(q, n, 0);
@@ -2038,7 +2055,6 @@ impl Rw<'_> {
         // A type of that name in scope keeps the associative reading.
         if !matches!(self.resolve(n), Res::Keep)
             || self.frames.iter().any(|f| f.types.contains(n))
-            || !self.info.colliding_values.contains(n)
         {
             return None;
         }
@@ -2182,7 +2198,9 @@ impl Rw<'_> {
                         if let Res::To(m) = self.resolve(n) {
                             h.path[0].name.name = m;
                         }
-                    } else if self.info.colliding_values.contains(n) {
+                    } else if self.info.colliding_values.contains(n)
+                        || (self.in_const > 0 && self.info.pkg_params.contains(n))
+                    {
                         if let Some(p) = self.resolve_value(n) {
                             let span = e.span;
                             let member = h.path[0].name.clone();
@@ -2779,22 +2797,30 @@ impl Rw<'_> {
     fn function(&mut self, f: &mut FunctionDeclaration) {
         let method = !f.name.scopes.is_empty();
         self.subroutine_name(&mut f.name);
+        // The return type and formals are sized after the package pass, so
+        // they need a frame nested in the package's for `resolve_value` to
+        // qualify a package parameter in them (its `depth > 0` check).
+        self.frames.push(Frame::default());
         self.dtype(&mut f.return_type);
         let pushed = self.push_method_class(&f.name);
         self.subroutine_body(&mut f.ports, &mut f.items, method);
         if pushed {
             self.frames.pop();
         }
+        self.frames.pop();
     }
 
     fn task(&mut self, t: &mut TaskDeclaration) {
         let method = !t.name.scopes.is_empty();
         self.subroutine_name(&mut t.name);
+        // A nested frame for the formals, as in `function`.
+        self.frames.push(Frame::default());
         let pushed = self.push_method_class(&t.name);
         self.subroutine_body(&mut t.ports, &mut t.items, method);
         if pushed {
             self.frames.pop();
         }
+        self.frames.pop();
     }
 
     /// §8.24: the formals and body of an out-of-block method `C::f` are in

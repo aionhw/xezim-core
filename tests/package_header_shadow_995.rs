@@ -51,3 +51,25 @@ fn explicit_import_cannot_replace_a_header_parameter() {
         "{error}"
     );
 }
+
+#[test]
+fn package_function_formals_without_an_import_keep_package_widths() {
+    let src = r#"
+package cfg;
+ parameter int W=8;
+ function automatic logic [W-1:0] mask(input logic [W-1:0] v); return v; endfunction
+endpackage
+module top;
+ localparam int MASK=cfg::mask(8'hf3);
+endmodule
+"#;
+    let (_, d) = xezim_core::parse_and_elaborate_multi(
+        &[src.into()],
+        Some("top"),
+        &[],
+        &["top.sv".into()],
+        &[],
+    )
+    .expect("elaborate");
+    assert_eq!(d.parameters["MASK"].to_i64(), Some(0xf3));
+}
