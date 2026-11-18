@@ -69,3 +69,17 @@ fn forced_part_activity_is_diagnosed_after_driver_discovery() {
             .any(|e| e.contains("forced or converted signal part"))
     );
 }
+
+#[test]
+fn whole_signal_activity_timestamp_exists_only_for_observed_signals() {
+    let sv = lower(
+        "signal q : bit; signal initialized : boolean := q'last_active > 0 ns;",
+        "process begin q <= '0'; wait for 1 ns; assert initialized; wait; end process;",
+    )
+    .unwrap();
+    assert!(sv.contains("longint vh_s0_lact;"));
+    let init = sv.find("vh_s0_lact = vh_s0_lev;").unwrap();
+    let read = sv.find("vh_now - vh_s0_lact").unwrap();
+    assert!(init < read);
+    assert!(!sv.contains("vh_s1_lact"));
+}
