@@ -1365,9 +1365,43 @@ impl<'a> Lw<'a> {
         })
     }
 
+    /// Check intermediate names before target_path flattens slices. For
+    /// example, q(0 to 0)(1) is outside the slice even if q(1) exists (§8.4).
+    fn activity_name_in_bounds(&mut self, x: &HExpr) -> bool {
+        match &x.kind {
+            HExprKind::Obj(_) => true,
+            HExprKind::Field(b, _) => self.activity_name_in_bounds(b),
+            HExprKind::Index(b, indices) => {
+                if !self.activity_name_in_bounds(b) { return false; }
+                for (k, index) in indices.iter().enumerate() {
+                    let Some(value) = self.d.eval(index).and_then(|v| v.as_i64()) else { return false };
+                    let bounds = if k == 0 {
+                        self.shape(b)
+                    } else {
+                        self.static_dim(b.ty, k).and_then(|r| Some((r.left.as_i64()?, r.dir, r.right.as_i64()?)))
+                    };
+                    let Some((left, dir, right)) = bounds else { return false };
+                    let inside = if dir == Dir::To { left <= value && value <= right } else { right <= value && value <= left };
+                    if !inside { return false; }
+                }
+                true
+            }
+            HExprKind::Slice(b, range) => {
+                if !self.activity_name_in_bounds(b) { return false; }
+                let Some(selected) = self.range_bounds(range) else { return false };
+                if super::packed::bounds_len(selected) == 0 { return true; }
+                let Some((left, dir, right)) = self.shape(b) else { return false };
+                let (lo, hi) = if dir == Dir::To { (left, right) } else { (right, left) };
+                selected.1 == dir && lo <= selected.0 && selected.0 <= hi && lo <= selected.2 && selected.2 <= hi
+            }
+            _ => false,
+        }
+    }
+
     /// §16.2.4: a composite part is active iff one of its scalar
     /// subelements has a transaction in this cycle, including equal values.
     fn part_activity_attr(&mut self, x: &HExpr, name: &str) -> String {
+        let mut invalid_bounds = false;
         let selected = self.target_path(x).and_then(|(s, path)| {
             let static_path = path.iter().all(|p| matches!(p,
                 DSel::Field(_) | DSel::Elem(_, Some(_)) | DSel::Slice(_, _, Some(_))));
@@ -1377,6 +1411,12 @@ impl<'a> Lw<'a> {
                 self.d.types[self.base(c.scalar)].kind,
                 TypeKind::Array { .. } | TypeKind::Record(_)));
             if !static_path || !scalar_leaves || self.has_boundary() {
+                return None;
+            }
+            if !self.activity_name_in_bounds(x)
+                || !self.activity_path_in_bounds(self.sigs[s].ty, &path)
+            {
+                invalid_bounds = true;
                 return None;
             }
             match self.path_cov(self.sigs[s].ty, &path) {
@@ -1389,7 +1429,11 @@ impl<'a> Lw<'a> {
             }
         });
         let Some((s, leaves)) = selected else {
-            self.err(&x.loc, "activity of this signal part requires static scalar selections");
+            self.err(&x.loc, if invalid_bounds {
+                "signal part activity selection is out of bounds"
+            } else {
+                "activity of this signal part requires static scalar selections"
+            });
             return "0".into();
         };
         if leaves.is_empty() {

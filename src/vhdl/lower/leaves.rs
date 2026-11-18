@@ -369,6 +369,33 @@ impl<'a> Lw<'a> {
         runs
     }
 
+    /// Check static selections against each traversed array dimension.
+    /// Null slices select no scalars and need no endpoint bound checks (§8.5).
+    pub(super) fn activity_path_in_bounds(&self, t: TypeId, path: &[DSel]) -> bool {
+        let Some(classes) = self.leaf_classes(t) else { return false };
+        let mut matched = false;
+        for class in &classes {
+            let mut steps = class.steps.iter();
+            let mut compatible = true;
+            for sel in path {
+                match (sel, steps.next()) {
+                    (DSel::Field(i), Some(Step::Field(j))) if i == j => {}
+                    (DSel::Elem(_, Some(k)), Some(Step::Dim(n) | Step::PDim(n, _))) => {
+                        if *k < 0 || *k >= *n { return false; }
+                    }
+                    (DSel::Slice(_, _, Some((off, len))), Some(Step::Dim(n) | Step::PDim(n, _))) => {
+                        if *len < 0 || (*len > 0 && (*off < 0 || *off > *n || *len > *n - *off)) {
+                            return false;
+                        }
+                    }
+                    _ => { compatible = false; break; }
+                }
+            }
+            matched |= compatible;
+        }
+        matched
+    }
+
     /// Whether a static selection covers every scalar leaf, without the
     /// conservative size limit of driver coverage (§14.7.2).
     pub(super) fn path_covers_all_leaves(&self, t: TypeId, path: &[DSel]) -> bool {
