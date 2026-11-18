@@ -167,14 +167,25 @@ impl<'a> Lexer<'a> {
     pub fn tokenize(mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
         loop {
+            let token = self.next_token();
+            let end = token.kind == TokenKind::Eof;
+            tokens.push(token);
+            if end {
+                break;
+            }
+        }
+        tokens.shrink_to_fit();
+        tokens
+    }
+
+    /// Read one token without retaining the preceding token stream.
+    /// Keyword regions and byte spans follow the same scanner state as
+    /// `tokenize` (IEEE 1800-2023 §5, §22.14).
+    pub fn next_token(&mut self) -> Token {
+        loop {
             self.skip_whitespace();
             if self.pos >= self.input.len() {
-                tokens.push(Token::new(
-                    TokenKind::Eof,
-                    String::new(),
-                    Span::new(self.pos, self.pos),
-                ));
-                break;
+                return Token::new(TokenKind::Eof, String::new(), Span::new(self.pos, self.pos));
             }
             // Skip comments
             if self.pos + 1 < self.input.len() && self.input[self.pos] == b'/' {
@@ -199,10 +210,8 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
             }
-            tokens.push(self.scan_token());
+            return self.scan_token();
         }
-        tokens.shrink_to_fit();
-        tokens
     }
 
     fn peek(&self) -> Option<u8> {

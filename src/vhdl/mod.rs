@@ -408,8 +408,17 @@ fn lower_ident(s: &str) -> String {
 /// file's, so span-keyed simulator caches never collide with them.
 const GENERATED_SPAN_BASE: usize = 1 << 41;
 
+mod generated_parse;
+
 /// Parse the lowered design's SystemVerilog text.
 fn parse_generated(text: &str) -> Result<Vec<Description>, String> {
+    if let Some(descriptions) = generated_parse::parse(text, 65_536) {
+        return Ok(descriptions);
+    }
+    parse_generated_whole(text)
+}
+
+fn parse_generated_whole(text: &str) -> Result<Vec<Description>, String> {
     let mut tokens = crate::sv_parser::lexer::Lexer::new(text).tokenize();
     crate::oom_trace::checkpoint(
         "vhdl.generated_tokens",
@@ -419,12 +428,20 @@ fn parse_generated(text: &str) -> Result<Vec<Description>, String> {
         t.span.start += GENERATED_SPAN_BASE;
         t.span.end += GENERATED_SPAN_BASE;
     }
-    let mut parser = crate::sv_parser::parse::Parser::new(tokens);
-    let source = parser.parse_source_text();
+    let descriptions = parse_generated_tokens(tokens, text)?;
     crate::oom_trace::checkpoint(
         "vhdl.generated_ast",
-        &[("descriptions", source.descriptions.len())],
+        &[("descriptions", descriptions.len())],
     );
+    Ok(descriptions)
+}
+
+fn parse_generated_tokens(
+    tokens: Vec<crate::sv_parser::lexer::Token>,
+    text: &str,
+) -> Result<Vec<Description>, String> {
+    let mut parser = crate::sv_parser::parse::Parser::new(tokens);
+    let source = parser.parse_source_text();
     let errors: Vec<String> = parser
         .diagnostics()
         .iter()
