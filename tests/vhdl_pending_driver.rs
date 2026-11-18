@@ -83,8 +83,8 @@ fn procedure_force_is_discovered_before_driver_selection() {
 }
 
 #[test]
-fn partial_driver_keeps_pending_leaf_state_without_future_queues() {
-    let source = b"entity t is end; architecture a of t is signal q : bit_vector(1 downto 0); begin process begin q(0) <= '1'; wait; end process; end;";
+fn multi_leaf_driver_keeps_pending_leaf_state_without_future_queues() {
+    let source = b"entity t is end; architecture a of t is signal q : bit_vector(1 downto 0); begin process begin q(0) <= '1'; q(1) <= '0'; wait; end process; end;";
     let sv = vhdl::lower_design(&[("work", "partial.vhd", source)])
         .unwrap_or_else(|errors| panic!("{}", errors.join("\n")));
     for state in ["vh_pf0_0_c0", "vh_pm0_0_c0", "vh_pl0_0_c0", "vh_pn0_0_c0"] {

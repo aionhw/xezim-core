@@ -12,7 +12,7 @@ fn lower(decls: &str, body: &str) -> Result<String, Vec<String>> {
 fn pending_leaf_activity_is_selected_by_scalar_key() {
     let sv = lower(
         "signal q : bit_vector(2 downto 0);",
-        "process begin q(0) <= '0'; wait for 0 ns; assert q(2)'quiet(1 ns); wait; end process;",
+        "process begin q(0) <= '0'; q(1) <= '0'; wait for 0 ns; assert q(2)'quiet(1 ns); wait; end process;",
     )
     .unwrap();
     assert!(sv.contains("bit vh_pa0; longint vh_pa0_last;"));
