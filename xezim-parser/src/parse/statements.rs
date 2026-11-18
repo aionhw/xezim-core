@@ -60,7 +60,7 @@ impl Parser {
                 return Statement::new(
                     StatementKind::SeqBlock {
                         name: Some(label),
-                        stmts: vec![inner],
+                        stmts: vec![inner].into(),
                     },
                     span,
                 );
@@ -690,7 +690,7 @@ impl Parser {
                 Statement::new(
                     StatementKind::SeqBlock {
                         name: None,
-                        stmts: vec![wait_stmt, stmt],
+                        stmts: vec![wait_stmt, stmt].into(),
                     },
                     self.span_from(start),
                 )
@@ -1248,7 +1248,7 @@ impl Parser {
             }
         }
         Statement::new(
-            StatementKind::SeqBlock { name, stmts },
+            StatementKind::SeqBlock { name, stmts: stmts.into() },
             self.span_from(start),
         )
     }
@@ -1305,7 +1305,7 @@ impl Parser {
             StatementKind::ParBlock {
                 name,
                 join_type,
-                stmts,
+                stmts: stmts.into(),
             },
             self.span_from(start),
         )
@@ -2224,13 +2224,13 @@ impl Parser {
                 });
                 inner = stmt(StatementKind::SeqBlock {
                     name: None,
-                    stmts: vec![cycles, inner],
+                    stmts: vec![cycles, inner].into(),
                 });
             }
         }
         Some(stmt(StatementKind::SeqBlock {
             name: None,
-            stmts: vec![wait, inner],
+            stmts: vec![wait, inner].into(),
         }))
     }
 
@@ -2529,7 +2529,7 @@ impl Parser {
                     rs_rewrite_return_as_rsreturn(s);
                 }
                 let span = self.span_from(start);
-                let inner = Statement::new(StatementKind::SeqBlock { name: None, stmts }, span);
+                let inner = Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span);
                 RsProd::Block(Statement::new(
                     StatementKind::RsAction {
                         body: Box::new(inner),
@@ -2756,7 +2756,7 @@ fn expand_seq(prods: &ProdMap, seq: &RsSeq, depth: &mut u32, span: crate::ast::S
         .iter()
         .map(|p| expand_prod(prods, p, depth, span))
         .collect();
-    Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
+    Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span)
 }
 
 fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::Span) -> Statement {
@@ -2795,7 +2795,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                 ));
             }
             stmts.push(body);
-            Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
+            Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span)
         }
         RsProd::If(cond, then_a, else_a) => {
             *depth += 1;
@@ -2866,7 +2866,7 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                 .iter()
                 .map(|p| expand_prod(prods, p, depth, span))
                 .collect();
-            Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
+            Statement::new(StatementKind::SeqBlock { name: None, stmts: stmts.into() }, span)
         }
         RsProd::Break => Statement::new(StatementKind::Break, span),
         RsProd::Return => Statement::new(StatementKind::Return(None), span),

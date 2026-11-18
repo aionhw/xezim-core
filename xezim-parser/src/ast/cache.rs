@@ -45,6 +45,12 @@ fn scope_cache_mode() -> ScopeCacheMode {
     SCOPE_CACHE_MODE.with(|flag| flag.get())
 }
 
+/// Explicit private/reset clones must visit nested shared block bodies so
+/// their contextual caches are reset or disabled as requested.
+pub(crate) fn scope_clone_needs_private_body() -> bool {
+    scope_cache_mode() != ScopeCacheMode::Preserve
+}
+
 fn scope_caches_disabled() -> bool {
     scope_cache_mode() == ScopeCacheMode::Disabled
 }

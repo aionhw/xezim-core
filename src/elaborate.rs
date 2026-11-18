@@ -10185,7 +10185,9 @@ pub fn elaborate_module_with_defs(
     // §20.6.2/§20.7: the module's declarations answer `$bits` and the array
     // queries in its constant expressions for the whole elaboration.
     DECL_SHAPES_CACHE.with(|c| c.borrow_mut().clear());
+    crate::oom_trace::checkpoint("elaborate.decl_shapes.begin", &[("module_items", module.items().len())]);
     let _decl_shapes = install_decl_shapes(module);
+    crate::oom_trace::checkpoint("elaborate.decl_shapes.ready", &[]);
 
     // §24.3: a program block shall not contain module declarations —
     // reject before elaboration runs the nested module's items (ivtest
@@ -10424,6 +10426,8 @@ pub fn elaborate_module_with_defs(
         hoist_package_struct_params(defs, &mut elab);
     }
 
+    crate::oom_trace::checkpoint("elaborate.global_definitions.ready", &[("functions", elab.functions.len())]);
+
     // Process top-level imports
     for imp in top_level_imports {
         if let Some(defs) = all_defs {
@@ -10485,7 +10489,9 @@ pub fn elaborate_module_with_defs(
                 .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
         }
     }
+    crate::oom_trace::checkpoint("elaborate.functions.registered", &[("functions", elab.functions.len())]);
     set_funcs_tls(&elab.functions);
+    crate::oom_trace::checkpoint("elaborate.functions.published", &[("functions", elab.functions.len())]);
     // §23.2.2 / A.1.2: module-HEADER imports (`module m import P::*;
     // #(parameter X = FOO) (...)`) precede the parameter list in the grammar
     // and are usable in it. The items walk processes imports in source order
@@ -10899,6 +10905,8 @@ pub fn elaborate_module_with_defs(
         }
         PortList::Empty => {}
     }
+
+    crate::oom_trace::checkpoint("elaborate.header.ready", &[("signals", elab.signals.len())]);
 
     // Process items
     if let Definition::Package(p) = module {
@@ -11410,7 +11418,24 @@ pub fn elaborate_module_with_defs(
     // `extends` when their constraints are validated.
     let local_defs = defs_with_local_classes(module.items(), all_defs);
     let cls_defs = local_defs.as_ref().or(all_defs);
-    for item in module.items() {
+    for (item_index, item) in module.items().iter().enumerate() {
+        if item_index + 4096 >= module.items().len() && crate::oom_trace::enabled() {
+            crate::oom_trace::checkpoint("elaborate.last_item", &[
+                ("item_index", item_index), ("signals", elab.signals.len()),
+                ("var_decl_types", elab.var_decl_types.len()),
+                ("initial", matches!(item, ModuleItem::InitialConstruct(_)) as usize),
+                ("always", matches!(item, ModuleItem::AlwaysConstruct(_)) as usize),
+                ("signal_inline_bytes", std::mem::size_of::<Signal>()),
+                ("type_inline_bytes", std::mem::size_of::<DataType>()),
+            ]);
+        }
+        if item_index % 4096 == 0 && crate::oom_trace::enabled() {
+            crate::oom_trace::checkpoint("elaborate.items", &[
+                ("item_index", item_index), ("module_items", module.items().len()),
+                ("signals", elab.signals.len()), ("var_decl_types", elab.var_decl_types.len()),
+                ("functions", elab.functions.len()),
+            ]);
+        }
         match item {
             ModuleItem::PortDeclaration(pd) => {
                 let port_modport_view = match &pd.data_type {
@@ -13087,7 +13112,7 @@ pub fn elaborate_module_with_defs(
                                 }
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
-                                        StatementKind::SeqBlock { name: None, stmts },
+                                        StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                         Span::dummy(),
                                     ),
                                     scope: String::new(),
@@ -13856,7 +13881,7 @@ pub fn elaborate_module_with_defs(
                                 if !stmts.is_empty() {
                                     elab.initial_blocks.push(InitialBlock {
                                         stmt: Statement::new(
-                                            StatementKind::SeqBlock { name: None, stmts },
+                                            StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                             Span::dummy(),
                                         ),
                                         scope: String::new(),
@@ -14938,6 +14963,13 @@ pub fn elaborate_module_with_defs(
             }
         }
     }
+    crate::oom_trace::checkpoint("elaborate.items.ready", &[
+        ("signals", elab.signals.len()), ("signals_capacity", elab.signals.capacity()),
+        ("var_decl_types", elab.var_decl_types.len()), ("var_types_capacity", elab.var_decl_types.as_map().capacity()),
+        ("signal_inline_bytes", std::mem::size_of::<Signal>()),
+        ("type_inline_bytes", std::mem::size_of::<DataType>()),
+        ("shape_inline_bytes", std::mem::size_of::<DeclShape>()),
+    ]);
     expand_whole_struct_continuous_assigns(&mut elab);
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
@@ -14960,10 +14992,9 @@ pub fn elaborate_module_with_defs(
     // regions, so one call over the module's items covers every depth —
     // per-arm registration in the item loop would miss the ones that
     // `elaborate_items` handles on its own recursion.
-    {
-        let items: Vec<ModuleItem> = module.items().to_vec();
-        register_generate_labels(&items, &mut elab);
-    }
+    crate::oom_trace::checkpoint("elaborate.labels.begin", &[("signals", elab.signals.len())]);
+    register_generate_labels(module.items(), &mut elab);
+    crate::oom_trace::checkpoint("elaborate.labels.ready", &[("signals", elab.signals.len())]);
     // §23.9: a NAMED block's locals are reachable hierarchically
     // (`nb.q` from a sibling process), so every block label in the module is
     // a legal reference root — collect them all before validating.
@@ -15025,6 +15056,8 @@ pub fn elaborate_module_with_defs(
         validate_expr_idents(&ca.lhs, &elab, &HashSet::default())?;
         validate_expr_idents(&ca.rhs, &elab, &HashSet::default())?;
     }
+
+    crate::oom_trace::checkpoint("elaborate.identifiers.ready", &[("signals", elab.signals.len())]);
 
     // IEEE 1800-2017 §6.20.6: a `const` variable may be assigned only once, in
     // its declaration. The `validate_stmt_idents` check above exempts a const
@@ -20158,7 +20191,7 @@ fn elaborate_items(
                                 }
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(
-                                        StatementKind::SeqBlock { name: None, stmts },
+                                        StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                         Span::dummy(),
                                     ),
                                     scope: String::new(),
@@ -36746,7 +36779,7 @@ fn inline_instantiations_inner(
                                     }
                                     elab.static_init_blocks.push(InitialBlock {
                                         stmt: Statement::new(
-                                            StatementKind::SeqBlock { name: None, stmts },
+                                            StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                                             Span::dummy(),
                                         ),
                                         scope: String::new(),
@@ -47459,7 +47492,7 @@ fn inline_module_items(
                     // by the hierarchy group's percent_m_module_init_scope self-test.
                     elab.static_init_blocks.push(InitialBlock {
                         stmt: Statement::new(
-                            StatementKind::SeqBlock { name: None, stmts },
+                            StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                             Span::dummy(),
                         ),
                         scope: inst_prefix.trim_end_matches('.').to_string(),
@@ -58048,7 +58081,7 @@ fn rewrite_stmt(
         },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name: name.clone(),
-            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map).into(),
         },
         StatementKind::EventTrigger {
             nonblocking,
@@ -58092,7 +58125,7 @@ fn rewrite_stmt(
             join_type,
         } => StatementKind::ParBlock {
             name: name.clone(),
-            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map),
+            stmts: rewrite_stmt_list_scoped(stmts, prefix, port_map, local_names, interface_map).into(),
             join_type: *join_type,
         },
 
@@ -58267,6 +58300,13 @@ fn compute_foreign_package_names(
     // Unlike the wildcard case there is no §26.3 ordering rule to honour —
     // the name was never in scope, so a local declaration wins wherever it
     // appears.
+    // No unimported package can collide with a local declaration. Avoid
+    // copying the whole module's names for an empty intersection (§26.3).
+    if !defs.iter().any(|(name, def)| {
+        matches!(def, Definition::Package(_)) && !imported.contains(name.as_str())
+    }) {
+        return std::collections::HashSet::default();
+    }
     let local = collect_local_scope_names(items);
     let mut out = std::collections::HashSet::default();
     for (pkg_name, def) in defs {
@@ -58378,6 +58418,13 @@ fn compute_wildcard_shadowed(
     params: &[ParameterDeclaration],
     defs: &HashMap<String, Definition>,
 ) -> std::collections::HashSet<String> {
+    // With no wildcard import, there is no imported name to shadow. In
+    // particular, explicit imports follow a different conflict rule (§26.3).
+    if !items.iter().any(|item| matches!(item,
+        ModuleItem::ImportDeclaration(imp) if imp.items.iter().any(|ii| ii.item.is_none())))
+    {
+        return std::collections::HashSet::default();
+    }
     // §26.3 ordering rule: a local declaration only legally SHADOWS a
     // wildcard-imported name if it precedes any use of that name. A name that a
     // procedural/continuous-assign block references BEFORE its local
@@ -60227,7 +60274,9 @@ mod prepared_process_ownership_tests {
         let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
             panic!("module expected");
         };
-        let original = format!("{:?}", module.items);
+        // Compare source syntax, not immutable literal memoization that
+        // shared bodies may populate during preparation.
+        let original = bincode::serde::encode_to_vec(&module.items, crate::xez_bincode_config()).unwrap();
         let definitions = HashMap::from_iter([("leaf".to_string(), Definition::Module(module))]);
         let params = HashMap::default();
         let scope = param_scope::ParamScope::new(
@@ -60317,7 +60366,7 @@ mod prepared_process_ownership_tests {
             }
         }
         assert_eq!(
-            format!("{:?}", module.items),
+            bincode::serde::encode_to_vec(&module.items, crate::xez_bincode_config()).unwrap(),
             original,
             "preparing an instance must not consume or mutate its source definition"
         );
