@@ -56421,7 +56421,7 @@ fn rewrite_stmt(
             lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
             delay: delay
                 .as_ref()
-                .map(|d| rewrite_expr(d, prefix, port_map, local_names, interface_map)),
+                .map(|d| Box::new(rewrite_expr(d, prefix, port_map, local_names, interface_map))),
             rvalue: rewrite_expr(rvalue, prefix, port_map, local_names, interface_map),
         },
         StatementKind::Expr(expr) => StatementKind::Expr(rewrite_expr(
@@ -56792,14 +56792,15 @@ fn rewrite_stmt(
                 inferred_clock: a
                     .inferred_clock
                     .as_ref()
-                    .map(|ev| crate::ast::stmt::EventExpr {
-                        edge: ev.edge,
-                        expr: rewrite_expr(&ev.expr, prefix, port_map, local_names, interface_map),
-                        iff: ev
-                            .iff
-                            .as_ref()
-                            .map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
-                        span: ev.span,
+                    .map(|ev| {
+                        Box::new(crate::ast::stmt::EventExpr {
+                            edge: ev.edge,
+                            expr: rewrite_expr(&ev.expr, prefix, port_map, local_names, interface_map),
+                            iff: ev.iff.as_ref().map(|g| {
+                                rewrite_expr(g, prefix, port_map, local_names, interface_map)
+                            }),
+                            span: ev.span,
+                        })
                     }),
                 span: a.span,
             })

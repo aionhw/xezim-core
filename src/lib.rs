@@ -232,7 +232,8 @@ pub use value::Value;
 ///         alias/port resolution and separate zero-rise gate/net delays.
 /// \x46 = \x45 + parameter declaration ownership for waveform scopes (§26.3, §21.7.2.3).
 /// \x47 = \x46 + shared sequential and parallel statement block bodies (§9.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x47";
+/// \x48 = \x47 + boxed optional assignment delays and inferred assertion clocks.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x48";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

@@ -419,7 +419,7 @@ impl Parser {
         match &mut stmt.kind {
             K::Assertion(a) => {
                 if a.is_property && a.procedural {
-                    a.inferred_clock = Some(clock.clone());
+                    a.inferred_clock = Some(Box::new(clock.clone()));
                 }
             }
             K::If {

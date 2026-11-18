@@ -54,7 +54,8 @@ pub enum StatementKind {
     },
     NonblockingAssign {
         lvalue: Expression,
-        delay: Option<Expression>,
+        // Keep absent timing from reserving an expression in every statement.
+        delay: Option<Box<Expression>>,
         rvalue: Expression,
     },
     If {
@@ -390,9 +391,10 @@ pub struct AssertionStatement {
     pub procedural: bool,
     /// §16.14.6: the clock a procedural concurrent assertion infers from
     /// its `always` procedure's event control, used when the property has
-    /// no clock of its own.
+    /// no clock of its own. Box this rare payload so an absent clock does
+    /// not enlarge every statement in a procedural body.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub inferred_clock: Option<EventExpr>,
+    pub inferred_clock: Option<Box<EventExpr>>,
     pub span: Span,
 }
 
