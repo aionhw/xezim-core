@@ -1,6 +1,6 @@
 //! Declaration parsing (IEEE 1800-2017 §A.2)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::Identifier;
 use crate::ast::decl::*;
 use crate::ast::stmt::VarDeclarator;
@@ -489,8 +489,7 @@ impl Parser {
                 break;
             }
         }
-        decls.shrink_to_fit();
-        decls
+        compact_syntax_list(decls)
     }
 
     pub(super) fn parse_function_declaration(&mut self) -> FunctionDeclaration {
@@ -551,7 +550,7 @@ impl Parser {
                 ports[ansi_ports].span,
             ));
         }
-        items.shrink_to_fit();
+        let items = compact_syntax_list(items);
         FunctionDeclaration {
             lifetime,
             specifier,
@@ -697,7 +696,7 @@ impl Parser {
         let endlabel = self.parse_end_label();
         self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
-        items.shrink_to_fit();
+        let items = compact_syntax_list(items);
         TaskDeclaration {
             lifetime,
             specifier,

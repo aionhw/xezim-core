@@ -14,6 +14,17 @@ use crate::diagnostics::Diagnostic;
 use crate::lexer::token::{Token, TokenKind};
 use items::ConstraintPos;
 
+/// Finish an owned syntax list before its AST is published. A fresh buffer
+/// releases spare storage even when the allocator would keep a shrunk one.
+fn compact_syntax_list<T>(mut items: Vec<T>) -> Vec<T> {
+    if items.len() == items.capacity() || std::mem::size_of::<T>() == 0 {
+        return items;
+    }
+    let mut compact = Vec::with_capacity(items.len());
+    compact.append(&mut items);
+    compact
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
