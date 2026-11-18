@@ -46254,6 +46254,31 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // §23.3.3: "If only one of the two connections is of a
+                    // user-defined nettype then ... the connection shall be
+                    // treated as a continuous assignment from source to
+                    // sink"; only connections of the same nettype merge into
+                    // one simulated net. An input formal of a user-defined
+                    // nettype therefore keeps its own net, driven by the
+                    // connection assign and resolved by the nettype's
+                    // resolution function (§6.6.7), unless the actual is a
+                    // whole net of that nettype. Substituting a variable, a
+                    // literal or a member select renames the formal onto it,
+                    // and every read of the formal then skips the resolution
+                    // function. Checked before the signal lookup below: a
+                    // nettype over an unpacked struct has no signal of its
+                    // own, only member leaves.
+                    if matches!(
+                        prepared_sub.port_directions.get(pname.as_str()),
+                        Some(PortDirection::Input)
+                    ) && let Some(formal_nettype) =
+                        user_nettype_of(elab, &cat2(&inst_prefix, pname))
+                        && whole_net_ident_name_scoped(actual, elab)
+                            .and_then(|n| user_nettype_of(elab, &n))
+                            .is_none_or(|t| t != formal_nettype)
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     let Some(formal) = elab
                         .signals
                         .get(&cat2(&inst_prefix, &pname))
@@ -54305,6 +54330,18 @@ fn is_net_name(elab: &ElaboratedModule, name: &str) -> bool {
             .as_deref()
             .is_some_and(|t| elab.nettype_resolvers.contains_key(t))
     })
+}
+
+/// The user-defined nettype (§6.6.7) `name` is declared with, if any: its
+/// signal's type name, or the declared type of a nettype net over an
+/// unpacked struct, which is stored as member leaves with no signal of its
+/// own.
+fn user_nettype_of(elab: &ElaboratedModule, name: &str) -> Option<String> {
+    let tn = match elab.signals.get(name) {
+        Some(s) => s.type_name.clone(),
+        None => elab.var_decl_types.get(name).and_then(get_type_name),
+    }?;
+    elab.nettype_resolvers.contains_key(&tn).then_some(tn)
 }
 
 /// The head name of a hierarchical path expression — `g[1].w` names the
