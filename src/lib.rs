@@ -240,7 +240,11 @@ pub use value::Value;
 /// \x49 = \x48 + package members left unrooted in continuous assignments that write another
 ///         scope (§26.3), member signals for each element of a multi-dimensional unpacked-struct
 ///         array (§7.4.2), and `binsof()` of a hierarchical cross item (§19.6.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x49";
+/// \x4a = \x49 + fill operands of real operators folded at one bit (§5.7.1), stream operands
+///         keeping their `with [ array_range ]` (§11.4.14.4), per-driver delay stages and
+///         declaration-initializer drivers of user-defined nettype nets (§10.3.3, §6.6.7), and
+///         nettype input ports kept apart from non-nettype actuals (§23.3.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4a";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
