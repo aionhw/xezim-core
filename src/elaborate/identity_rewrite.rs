@@ -6,7 +6,7 @@ use super::{
     TYPE_BIND_WIDTHS_TLS,
 };
 use crate::ast::expr::{ExprKind, Expression};
-use crate::ast::stmt::{EventControl, Statement, StatementKind, TimingControl};
+use crate::ast::stmt::{EventControl, ForInit, Statement, StatementKind, TimingControl};
 use crate::ast::Span;
 
 /// Whether the final root rewrite is an identity for this narrow syntax set.
@@ -128,6 +128,25 @@ fn stmt_rejection(stmt: &Statement) -> Option<RootRejection> {
                 })
             })
         }
+        StatementKind::For {
+            init,
+            condition,
+            step,
+            body,
+        } => {
+            init.iter().enumerate()
+                .find_map(|(index, entry)| match entry {
+                    ForInit::Assign { lvalue, rvalue } => {
+                        expr_rejection(lvalue).or_else(|| expr_rejection(rvalue))
+                    }
+                    ForInit::VarDecl { name, .. } => {
+                        Some(rejection("identity.reject.stmt.for_decl", name.span, index))
+                    }
+                })
+                .or_else(|| condition.as_ref().and_then(expr_rejection))
+                .or_else(|| step.iter().find_map(expr_rejection))
+                .or_else(|| stmt_rejection(body))
+        }
         StatementKind::While { condition, body } => {
             expr_rejection(condition).or_else(|| stmt_rejection(body))
         }
@@ -161,7 +180,6 @@ fn stmt_rejection(stmt: &Statement) -> Option<RootRejection> {
                 StatementKind::ScopePop => "identity.reject.stmt.scope_pop",
                 StatementKind::LoopStep => "identity.reject.stmt.loop_step",
                 StatementKind::DisableFork => "identity.reject.stmt.disable_fork",
-                StatementKind::For { .. } => "identity.reject.stmt.for",
                 StatementKind::Foreach { .. } => "identity.reject.stmt.foreach",
                 StatementKind::ForeachTail { .. } => "identity.reject.stmt.foreach_tail",
                 StatementKind::DoWhile { .. } => "identity.reject.stmt.do_while",
@@ -230,6 +248,9 @@ fn expr_rejection(expr: &Expression) -> Option<RootRejection> {
         ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
             expr_rejection(left).or_else(|| expr_rejection(right))
         }
+        ExprKind::AssignExpr { lvalue, rvalue } => {
+            expr_rejection(lvalue).or_else(|| expr_rejection(rvalue))
+        }
         ExprKind::Conditional {
             condition,
             then_expr,
@@ -286,7 +307,6 @@ fn expr_rejection(expr: &Expression) -> Option<RootRejection> {
                 ExprKind::Empty => "identity.reject.expr.empty",
                 ExprKind::WithClause { .. } => "identity.reject.expr.with_clause",
                 ExprKind::RandomizeWith { .. } => "identity.reject.expr.randomize_with",
-                ExprKind::AssignExpr { .. } => "identity.reject.expr.assign_expr",
                 ExprKind::StreamOp { .. } => "identity.reject.expr.stream_op",
                 ExprKind::Tagged { .. } => "identity.reject.expr.tagged",
                 ExprKind::SvaClocked { .. } => "identity.reject.expr.sva_clocked",
@@ -335,6 +355,23 @@ fn identity_stmt(stmt: &Statement) -> bool {
                         && item.guard.as_deref().is_none_or(identity_expr)
                         && identity_stmt(&item.stmt)
                 })
+        }
+        StatementKind::For {
+            init,
+            condition,
+            step,
+            body,
+        } => {
+            // Assignment-only headers introduce no loop-local names, so
+            // the ordinary shadowing path has no bindings to remove.
+            init.iter().all(|entry| match entry {
+                ForInit::Assign { lvalue, rvalue } => {
+                    identity_expr(lvalue) && identity_expr(rvalue)
+                }
+                ForInit::VarDecl { .. } => false,
+            }) && condition.as_ref().is_none_or(identity_expr)
+                && step.iter().all(identity_expr)
+                && identity_stmt(body)
         }
         StatementKind::While { condition, body } => identity_expr(condition) && identity_stmt(body),
         StatementKind::Repeat { count, body } => identity_expr(count) && identity_stmt(body),
@@ -397,6 +434,9 @@ fn identity_expr(expr: &Expression) -> bool {
         ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => identity_expr(operand),
         ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
             identity_expr(left) && identity_expr(right)
+        }
+        ExprKind::AssignExpr { lvalue, rvalue } => {
+            identity_expr(lvalue) && identity_expr(rvalue)
         }
         ExprKind::Conditional {
             condition,
@@ -520,6 +560,9 @@ mod tests {
             "begin if (a) begin b = c + 1; end else fork b = 0; c = 1; join end",
             "begin a = a ? {b, c} : {2{b}}; end",
             "begin a = f(b + 1); end",
+            "begin a = (b = c); end",
+            "begin for (a=0; a<3; a=a+1) begin b[a]=c; end end",
+            "begin for (; a;) begin b=c; end end",
             "begin a = b[0]; b[c] = a; end",
             "begin a = b[3:0]; b[c +: 2] = a; b[c -: 2] = a; end",
             "begin case (a) 0: b = c; 1, 2: begin b = 1; end default: b = 0; endcase end",
@@ -557,6 +600,9 @@ mod tests {
             "begin case (a) 0: b = child.value; endcase end",
             "begin while (child.value) b = c; end",
             "begin wait (child.ready) b = c; end",
+            "begin for (int a=0; a<3; a=a+1) b=c; end",
+            "begin for (a=child.value; a<3; a=a+1) b=c; end",
+            "begin for (a=0; a<3; a=a+1) b=child.value; end",
             "begin repeat (a) b = child.value; end",
             "begin int local_value; a = local_value; end",
             "begin while (a) begin int local_value; b = local_value; end end",
@@ -564,6 +610,59 @@ mod tests {
         ] {
             assert!(!can_preserve_root_stmt(&initial(source)), "{source}");
         }
+    }
+
+    /// §12.7/§23.6: assignment-only loops retain all contextual-cache
+    /// checks, including caches on assignment expressions in the step.
+    #[test]
+    fn assignment_loop_operands_keep_cache_and_rejection_checks() {
+        for operand in 0..4 {
+            let source = initial("for (a=0; a<3; a=a+1) b=c;");
+            assert!(can_preserve_root_stmt(&source));
+            let StatementKind::For {
+                init,
+                condition,
+                step,
+                ..
+            } = &source.kind
+            else {
+                panic!("for loop expected");
+            };
+            match operand {
+                0 => {
+                    let ForInit::Assign { rvalue, .. } = &init[0] else {
+                        panic!("assignment initializer expected");
+                    };
+                    rvalue.cached_width.set(Some(32));
+                }
+                1 => condition.as_ref().unwrap().cached_width.set(Some(1)),
+                2 => step[0].cached_width.set(Some(32)),
+                _ => {
+                    let ExprKind::AssignExpr { lvalue, .. } = &step[0].kind else {
+                        panic!("assignment step expected");
+                    };
+                    let ExprKind::Ident(name) = &lvalue.kind else {
+                        panic!("step target expected");
+                    };
+                    name.cached_resolved_name.set("old.a".to_string()).unwrap();
+                }
+            }
+            assert!(!can_preserve_root_stmt(&source));
+            assert_eq!(
+                stmt_rejection(&source).unwrap().phase,
+                if operand == 3 {
+                    "identity.reject.cache.name"
+                } else {
+                    "identity.reject.cache.width"
+                }
+            );
+        }
+        let source = initial("for (int a=0; a<3; a=a+1) b=c;");
+        assert!(!can_preserve_root_stmt(&source));
+        assert_eq!(
+            stmt_rejection(&source).unwrap().phase,
+            "identity.reject.stmt.for_decl"
+        );
     }
 
     /// §11.5.1/§25.5.4: an index retains neither stale contextual state

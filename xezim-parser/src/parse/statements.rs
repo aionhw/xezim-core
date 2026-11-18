@@ -1247,6 +1247,9 @@ impl Parser {
                 }
             }
         }
+        // Freeze only the used statement slots. Growth capacity is useful
+        // while parsing, but otherwise stays resident in every shared block.
+        stmts.shrink_to_fit();
         Statement::new(
             StatementKind::SeqBlock { name, stmts: stmts.into() },
             self.span_from(start),
@@ -1301,6 +1304,7 @@ impl Parser {
                 }
             }
         }
+        stmts.shrink_to_fit();
         Statement::new(
             StatementKind::ParBlock {
                 name,
