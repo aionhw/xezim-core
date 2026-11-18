@@ -3312,7 +3312,7 @@ fn elaborate_class_in_scope(
                     // Remember scalar initializers so instantiation can re-eval
                     // them with the live parameter table (e.g. `= NUM_HARTS`).
                     if let Some(init) = &decl.init {
-                        property_inits.insert(decl.name.name.clone(), init.clone());
+                        property_inits.insert(decl.name.name.clone(), init.as_ref().clone());
                     }
                     let mut v = if let Some(init) = &decl.init {
                         let mut val =
@@ -10069,7 +10069,14 @@ pub fn elaborate_module_with_defs(
     // §20.6.2/§20.7: the module's declarations answer `$bits` and the array
     // queries in its constant expressions for the whole elaboration.
     DECL_SHAPES_CACHE.with(|c| c.borrow_mut().clear());
-    crate::oom_trace::checkpoint("elaborate.decl_shapes.begin", &[("module_items", module.items().len())]);
+    crate::oom_trace::checkpoint(
+        "elaborate.decl_shapes.begin",
+        &[
+            ("module_items", module.items().len()),
+            ("shape_inline_bytes", std::mem::size_of::<StoredDeclShape>()),
+            ("shape_query_inline_bytes", std::mem::size_of::<DeclShape>()),
+        ],
+    );
     let _decl_shapes = install_decl_shapes(module);
     crate::oom_trace::checkpoint("elaborate.decl_shapes.ready", &[]);
 
@@ -12699,7 +12706,7 @@ pub fn elaborate_module_with_defs(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -12772,7 +12779,7 @@ pub fn elaborate_module_with_defs(
                                 stmt: Statement::new(
                                     StatementKind::BlockingAssign {
                                         lvalue: make_ident_expr(&decl.name.name),
-                                        rvalue: init_expr.clone(),
+                                        rvalue: init_expr.as_ref().clone(),
                                     },
                                     Span::dummy(),
                                 ),
@@ -12932,7 +12939,7 @@ pub fn elaborate_module_with_defs(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -12999,7 +13006,7 @@ pub fn elaborate_module_with_defs(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -13069,7 +13076,7 @@ pub fn elaborate_module_with_defs(
                                         w,
                                         &elab.typedef_types,
                                     ),
-                                    Some(init_expr.clone()),
+                                    Some(init_expr.as_ref().clone()),
                                 )
                             }
                         } else {
@@ -14812,13 +14819,18 @@ pub fn elaborate_module_with_defs(
             }
         }
     }
-    crate::oom_trace::checkpoint("elaborate.items.ready", &[
-        ("signals", elab.signals.len()), ("signals_capacity", elab.signals.capacity()),
-        ("var_decl_types", elab.var_decl_types.len()), ("var_types_capacity", elab.var_decl_types.capacity()),
-        ("signal_inline_bytes", std::mem::size_of::<Signal>()),
-        ("type_inline_bytes", std::mem::size_of::<DataType>()),
-        ("shape_inline_bytes", std::mem::size_of::<DeclShape>()),
-    ]);
+    crate::oom_trace::checkpoint(
+        "elaborate.items.ready",
+        &[
+            ("signals", elab.signals.len()),
+            ("signals_capacity", elab.signals.capacity()),
+            ("var_decl_types", elab.var_decl_types.len()),
+            ("var_types_capacity", elab.var_decl_types.capacity()),
+            ("signal_inline_bytes", std::mem::size_of::<Signal>()),
+            ("type_inline_bytes", std::mem::size_of::<DataType>()),
+            ("shape_inline_bytes", std::mem::size_of::<StoredDeclShape>()),
+        ],
+    );
     expand_whole_struct_continuous_assigns(&mut elab);
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
@@ -19825,7 +19837,7 @@ fn elaborate_items(
                                 stmt: Statement::new(
                                     StatementKind::BlockingAssign {
                                         lvalue: make_ident_expr(&decl.name.name),
-                                        rvalue: init_expr.clone(),
+                                        rvalue: init_expr.as_ref().clone(),
                                     },
                                     Span::dummy(),
                                 ),
@@ -19912,7 +19924,7 @@ fn elaborate_items(
                                     stmt: Statement::new(
                                         StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
-                                            rvalue: init_expr.clone(),
+                                            rvalue: init_expr.as_ref().clone(),
                                         },
                                         Span::dummy(),
                                     ),
@@ -19979,10 +19991,10 @@ fn elaborate_items(
                     } else {
                         let procedural_init = decl
                             .init
-                            .as_ref()
+                            .as_deref()
                             .filter(|init| !is_const_expr(init, &elab.parameters));
                         let init_val = if let Some(init_expr) =
-                            decl.init.as_ref().filter(|_| procedural_init.is_none())
+                            decl.init.as_deref().filter(|_| procedural_init.is_none())
                         {
                             let mut rv =
                                 eval_init_for_target(init_expr, &elab.parameters, width, is_real);
@@ -22452,11 +22464,11 @@ fn net_decl_assign_delay(
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,
 ) -> (u64, Option<u64>, Option<u64>) {
-    let ev = |d: &Option<Expression>| d.as_ref().map(|d| eval_const_expr(d, params));
+    let ev = |d: Option<&Expression>| d.map(|d| eval_const_expr(d, params));
     (
-        ev(&nd.delay).unwrap_or(0),
-        ev(&nd.delay_fall),
-        ev(&nd.delay_off),
+        ev(nd.delay.as_deref()).unwrap_or(0),
+        ev(nd.delay_fall.as_deref()),
+        ev(nd.delay_off.as_deref()),
     )
 }
 
@@ -26230,12 +26242,230 @@ pub struct DeclShape {
     pub param: bool,
 }
 
+/// The common declaration types do not need the space of a named type in
+/// every shape-table bucket. Keep their fields verbatim, including spans;
+/// rich types retain the complete AST in the fallback.
+#[derive(Debug, Clone)]
+enum DeclShapeDataType {
+    IntegerVector {
+        kind: IntegerVectorType,
+        signing: Option<Signing>,
+        dimensions: Vec<PackedDimension>,
+        span: Span,
+    },
+    IntegerAtom {
+        kind: IntegerAtomType,
+        signing: Option<Signing>,
+        span: Span,
+    },
+    Real {
+        kind: RealType,
+        span: Span,
+    },
+    Implicit {
+        signing: Option<Signing>,
+        dimensions: Vec<PackedDimension>,
+        span: Span,
+    },
+    Other(Box<DataType>),
+}
+
+impl DeclShapeDataType {
+    fn new(dt: &DataType) -> Self {
+        match dt {
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => Self::IntegerVector {
+                kind: *kind,
+                signing: *signing,
+                dimensions: dimensions.clone(),
+                span: *span,
+            },
+            DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => Self::IntegerAtom {
+                kind: *kind,
+                signing: *signing,
+                span: *span,
+            },
+            DataType::Real { kind, span } => Self::Real {
+                kind: *kind,
+                span: *span,
+            },
+            DataType::Implicit {
+                signing,
+                dimensions,
+                span,
+            } => Self::Implicit {
+                signing: *signing,
+                dimensions: dimensions.clone(),
+                span: *span,
+            },
+            _ => Self::Other(Box::new(dt.clone())),
+        }
+    }
+
+    fn into_data_type(self) -> DataType {
+        match self {
+            Self::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            },
+            Self::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            },
+            Self::Real { kind, span } => DataType::Real { kind, span },
+            Self::Implicit {
+                signing,
+                dimensions,
+                span,
+            } => DataType::Implicit {
+                signing,
+                dimensions,
+                span,
+            },
+            Self::Other(dt) => *dt,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredDeclShape {
+    data_type: DeclShapeDataType,
+    unpacked: Vec<UnpackedDimension>,
+    by_type_param: bool,
+    param: bool,
+}
+
+impl StoredDeclShape {
+    fn new(
+        dt: &DataType,
+        unpacked: &[UnpackedDimension],
+        by_type_param: bool,
+        param: bool,
+    ) -> Self {
+        Self {
+            data_type: DeclShapeDataType::new(dt),
+            unpacked: unpacked.to_vec(),
+            by_type_param,
+            param,
+        }
+    }
+
+    fn into_decl_shape(self) -> DeclShape {
+        DeclShape {
+            data_type: self.data_type.into_data_type(),
+            unpacked: self.unpacked,
+            by_type_param: self.by_type_param,
+            param: self.param,
+        }
+    }
+}
+
+#[cfg(test)]
+mod decl_shape_storage_tests {
+    use super::*;
+
+    #[test]
+    fn compact_shape_types_preserve_their_ast_fields() {
+        let parsed = crate::parse(
+            "module shapes; logic signed [3:1] v [2:5]; int unsigned a; realtime r; \
+             wire signed [7:0] imp; typedef logic [6:0] word_t; word_t named [1:3]; \
+             struct packed { logic [1:0] x; bit y; } aggregate; \
+             enum logic [2:0] { A, B } enumeration; endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("expected module");
+        };
+        let (shapes, _) = collect_decl_shapes(
+            &module.ports,
+            &module.items,
+            &module.params,
+            &HashSet::default(),
+        );
+        for item in &module.items {
+            let (dt, name, dims) = match item {
+                ModuleItem::DataDeclaration(d) => (
+                    &d.data_type,
+                    &d.declarators[0].name,
+                    &d.declarators[0].dimensions,
+                ),
+                ModuleItem::NetDeclaration(d) => (
+                    &d.data_type,
+                    &d.declarators[0].name,
+                    &d.declarators[0].dimensions,
+                ),
+                _ => continue,
+            };
+            let stored = shapes.get(&name.name).expect("fixed declaration shape");
+            let shape = stored.clone().into_decl_shape();
+            assert_eq!(
+                serde_json::to_value(&shape.data_type).unwrap(),
+                serde_json::to_value(dt).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&shape.unpacked).unwrap(),
+                serde_json::to_value(dims).unwrap()
+            );
+            assert!(!shape.by_type_param);
+            assert!(!shape.param);
+        }
+        assert!(std::mem::size_of::<StoredDeclShape>() < std::mem::size_of::<DeclShape>());
+    }
+
+    #[test]
+    fn streamed_scope_items_keep_declaration_order_and_generate_boundaries() {
+        let parsed = crate::parse(
+            "module shapes #(parameter type T=logic [5:0]); \
+             generate logic [3:0] first; T typed; endgenerate \
+             logic [9:0] first; \
+             if (1) begin : child logic hidden; end \
+             localparam logic [4:0] P=0; endmodule",
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("expected module");
+        };
+        let (shapes, type_params) = collect_decl_shapes(
+            &module.ports,
+            &module.items,
+            &module.params,
+            &HashSet::default(),
+        );
+        assert!(type_params.contains("T"));
+        assert!(shapes["typed"].by_type_param);
+        assert!(shapes["P"].param);
+        assert!(!shapes.contains_key("hidden"));
+        let first = shapes["first"].clone().into_decl_shape();
+        assert_eq!(resolve_type_width(&first.data_type, None, None), 4);
+    }
+}
+
 thread_local! {
     /// Declared shapes of the module (or instance) whose body is being
     /// elaborated, keyed by bare name. Installed by `DeclShapesGuard` for that
     /// scope only and restored afterwards, so a name never answers from
     /// another module's declarations, and nothing is installed at run time.
-    static DECL_SHAPES_TLS: std::cell::RefCell<Option<std::rc::Rc<HashMap<String, DeclShape>>>>
+    static DECL_SHAPES_TLS: std::cell::RefCell<Option<std::rc::Rc<HashMap<String, StoredDeclShape>>>>
         = const { std::cell::RefCell::new(None) };
     /// Built declared-shape tables, keyed by definition (name and source
     /// identity) — see `install_decl_shapes`.
@@ -26388,28 +26618,28 @@ fn tls_restore_typedef_shape(name: &str, saved: TypedefShapeSave) {
 #[derive(Default)]
 struct DeclShapeLayers {
     type_params: std::rc::Rc<HashSet<String>>,
-    blocks: Vec<std::rc::Rc<HashMap<String, DeclShape>>>,
+    blocks: Vec<std::rc::Rc<HashMap<String, StoredDeclShape>>>,
     /// The shapes of the blocks already elaborated in this scope, under
     /// their block keys (`g[0].arr`), for a query from outside (§23.6).
-    left: HashMap<String, DeclShape>,
+    left: HashMap<String, StoredDeclShape>,
     /// Every generate block's declared shapes as written, under the block
     /// path without loop indices (`g.arr`), for a query from outside a block
     /// not yet elaborated. A shape that reads a genvar does not evaluate.
-    by_path: std::rc::Rc<HashMap<String, DeclShape>>,
+    by_path: std::rc::Rc<HashMap<String, StoredDeclShape>>,
 }
 
 /// A definition's declared shapes, the names of its type parameters, and
 /// its generate blocks' shapes by block path.
 type DeclShapeTable = (
-    std::rc::Rc<HashMap<String, DeclShape>>,
+    std::rc::Rc<HashMap<String, StoredDeclShape>>,
     std::rc::Rc<HashSet<String>>,
-    std::rc::Rc<HashMap<String, DeclShape>>,
+    std::rc::Rc<HashMap<String, StoredDeclShape>>,
 );
 
 /// Restores the previously installed declared-shape table, and the block
 /// layers over it, on drop.
 pub struct DeclShapesGuard(
-    Option<std::rc::Rc<HashMap<String, DeclShape>>>,
+    Option<std::rc::Rc<HashMap<String, StoredDeclShape>>>,
     DeclShapeLayers,
 );
 
@@ -26445,6 +26675,7 @@ fn decl_shape_of(name: &str) -> Option<DeclShape> {
                 })
             })
         })
+        .map(StoredDeclShape::into_decl_shape)
 }
 
 /// `g[0].n.arr` without its loop indices (`g.n.arr`); None for a simple name.
@@ -26472,12 +26703,12 @@ fn collect_block_shapes(
     items: &[ModuleItem],
     prefix: &str,
     type_params: &HashSet<String>,
-    out: &mut HashMap<String, DeclShape>,
+    out: &mut HashMap<String, StoredDeclShape>,
     clash: &mut HashSet<String>,
 ) {
     let block = |name: &str,
                  block_items: &[ModuleItem],
-                 out: &mut HashMap<String, DeclShape>,
+                 out: &mut HashMap<String, StoredDeclShape>,
                  clash: &mut HashSet<String>| {
         let p = format!("{prefix}{name}.");
         let (shapes, _) = collect_decl_shapes(&PortList::Empty, block_items, &[], type_params);
@@ -26696,15 +26927,30 @@ pub fn install_decl_shapes(def: Definition) -> DeclShapesGuard {
 
 /// The items of a scope, with those of its `generate` regions in place: a
 /// region is not a scope (§27.3).
-fn scope_items(items: &[ModuleItem]) -> Vec<&ModuleItem> {
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        match it {
-            ModuleItem::GenerateRegion(gr) => out.extend(scope_items(&gr.items)),
-            _ => out.push(it),
+fn scope_items(items: &[ModuleItem]) -> ScopeItems<'_> {
+    ScopeItems {
+        pending: vec![items.iter()],
+    }
+}
+
+struct ScopeItems<'a> {
+    pending: Vec<std::slice::Iter<'a, ModuleItem>>,
+}
+
+impl<'a> Iterator for ScopeItems<'a> {
+    type Item = &'a ModuleItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.pending.last_mut()?.next() {
+                Some(ModuleItem::GenerateRegion(gr)) => self.pending.push(gr.items.iter()),
+                Some(item) => return Some(item),
+                None => {
+                    self.pending.pop();
+                }
+            }
         }
     }
-    out
 }
 
 /// The declared shapes of a scope's ports and declarations, and the type
@@ -26715,13 +26961,12 @@ fn collect_decl_shapes(
     items: &[ModuleItem],
     header_params: &[ParameterDeclaration],
     outer_type_params: &HashSet<String>,
-) -> (HashMap<String, DeclShape>, HashSet<String>) {
-    let items = scope_items(items);
+) -> (HashMap<String, StoredDeclShape>, HashSet<String>) {
     // A variable typed by one of the module's own TYPE parameters takes the
     // instance's binding; it is sized from that width alone, never from a
     // same-named typedef elsewhere.
     let mut type_params: HashSet<String> = outer_type_params.clone();
-    let body_params = items.iter().filter_map(|it| match it {
+    let body_params = scope_items(items).filter_map(|it| match it {
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
         _ => None,
     });
@@ -26734,64 +26979,50 @@ fn collect_decl_shapes(
         matches!(dt, DataType::TypeReference { name, .. }
             if name.scopes.is_empty() && type_params.contains(name.name.name.as_str()))
     };
-    let mut m: HashMap<String, DeclShape> = HashMap::default();
+    let mut m: HashMap<String, StoredDeclShape> = HashMap::default();
     if let PortList::Ansi(ps) = ports {
         for p in ps {
             if let Some(dt) = &p.data_type
                 && decl_shape_is_fixed(dt, &p.dimensions)
             {
-                m.entry(p.name.name.clone()).or_insert_with(|| DeclShape {
-                    data_type: dt.clone(),
-                    unpacked: p.dimensions.clone(),
-                    by_type_param: by_type_param(dt),
-                    param: false,
+                m.entry(p.name.name.clone()).or_insert_with(|| {
+                    StoredDeclShape::new(dt, &p.dimensions, by_type_param(dt), false)
                 });
             }
         }
     }
-    for &item in &items {
-        let (dt, decls): (&DataType, Vec<(&Identifier, &Vec<UnpackedDimension>)>) = match item {
-            ModuleItem::DataDeclaration(dd) => (
-                &dd.data_type,
-                dd.declarators
-                    .iter()
-                    .map(|d| (&d.name, &d.dimensions))
-                    .collect(),
-            ),
-            ModuleItem::NetDeclaration(nd) => (
-                &nd.data_type,
-                nd.declarators
-                    .iter()
-                    .map(|d| (&d.name, &d.dimensions))
-                    .collect(),
-            ),
-            ModuleItem::PortDeclaration(pd) => (
-                &pd.data_type,
-                pd.declarators
-                    .iter()
-                    .map(|d| (&d.name, &d.dimensions))
-                    .collect(),
-            ),
-            _ => continue,
-        };
-        for (name, dims) in decls {
-            // A non-ANSI port is declared twice (direction, then type); the
-            // first spelling that carries the shape wins.
-            if !decl_shape_is_fixed(dt, dims) {
-                continue;
+    // A non-ANSI port is declared twice (direction, then type); the first
+    // spelling that carries the shape wins.
+    let mut add_decl = |dt: &DataType, name: &Identifier, dims: &[UnpackedDimension]| {
+        if decl_shape_is_fixed(dt, dims) {
+            m.entry(name.name.clone())
+                .or_insert_with(|| StoredDeclShape::new(dt, dims, by_type_param(dt), false));
+        }
+    };
+    for item in scope_items(items) {
+        match item {
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    add_decl(&dd.data_type, &d.name, &d.dimensions);
+                }
             }
-            m.entry(name.name.clone()).or_insert_with(|| DeclShape {
-                data_type: dt.clone(),
-                unpacked: dims.clone(),
-                by_type_param: by_type_param(dt),
-                param: false,
-            });
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators {
+                    add_decl(&nd.data_type, &d.name, &d.dimensions);
+                }
+            }
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators {
+                    add_decl(&pd.data_type, &d.name, &d.dimensions);
+                }
+            }
+            _ => {}
         }
     }
     // §20.7, §6.20.2: a value parameter with a declared type or range has
     // that shape (`$size(V)` of `localparam logic [7:0] V` is 8); an untyped
     // one takes its value's, which the parameter table answers.
-    let body_params = items.iter().filter_map(|it| match it {
+    let body_params = scope_items(items).filter_map(|it| match it {
         ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
         _ => None,
     });
@@ -26808,11 +27039,8 @@ fn collect_decl_shapes(
         }
         for a in assignments {
             if decl_shape_is_fixed(data_type, &a.dimensions) {
-                m.entry(a.name.name.clone()).or_insert_with(|| DeclShape {
-                    data_type: data_type.clone(),
-                    unpacked: a.dimensions.clone(),
-                    by_type_param: by_type_param(data_type),
-                    param: true,
+                m.entry(a.name.name.clone()).or_insert_with(|| {
+                    StoredDeclShape::new(data_type, &a.dimensions, by_type_param(data_type), true)
                 });
             }
         }
@@ -35568,7 +35796,7 @@ fn inline_instantiations_inner(
                                             stmt: Statement::new(
                                                 StatementKind::BlockingAssign {
                                                     lvalue: make_ident_expr(&decl.name.name),
-                                                    rvalue: init_expr.clone(),
+                                                    rvalue: init_expr.as_ref().clone(),
                                                 },
                                                 Span::dummy(),
                                             ),
@@ -35633,7 +35861,7 @@ fn inline_instantiations_inner(
                                                 stmt: Statement::new(
                                                     StatementKind::BlockingAssign {
                                                         lvalue: make_ident_expr(&name),
-                                                        rvalue: init_expr.clone(),
+                                                        rvalue: init_expr.as_ref().clone(),
                                                     },
                                                     Span::dummy(),
                                                 ),
@@ -35773,7 +36001,7 @@ fn inline_instantiations_inner(
                                                 stmt: Statement::new(
                                                     StatementKind::BlockingAssign {
                                                         lvalue: make_ident_expr(&decl.name.name),
-                                                        rvalue: init_expr.clone(),
+                                                        rvalue: init_expr.as_ref().clone(),
                                                     },
                                                     Span::dummy(),
                                                 ),
@@ -35936,7 +36164,7 @@ fn inline_instantiations_inner(
                                         stmt: Statement::new(
                                             StatementKind::BlockingAssign {
                                                 lvalue: make_ident_expr(&decl.name.name),
-                                                rvalue: init_expr.clone(),
+                                                rvalue: init_expr.as_ref().clone(),
                                             },
                                             Span::dummy(),
                                         ),
@@ -35991,7 +36219,7 @@ fn inline_instantiations_inner(
                                         stmt: Statement::new(
                                             StatementKind::BlockingAssign {
                                                 lvalue: make_ident_expr(&decl.name.name),
-                                                rvalue: init_expr.clone(),
+                                                rvalue: init_expr.as_ref().clone(),
                                             },
                                             Span::dummy(),
                                         ),
@@ -36533,7 +36761,7 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             for d in &mut new_dd.declarators {
                 gen_rename(d.decl, &mut d.name.name);
                 d.dimensions = gen_dims(&d.dimensions);
-                d.init = d.init.as_ref().map(gen_expr);
+                d.init = d.init.as_deref().map(|e| Box::new(gen_expr(e)));
             }
             ModuleItem::DataDeclaration(new_dd)
         }
@@ -36548,12 +36776,12 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             .into_iter()
             .flatten()
             {
-                *d = gen_expr(d);
+                **d = gen_expr(d);
             }
             for d in &mut new_nd.declarators {
                 gen_rename(d.decl, &mut d.name.name);
                 d.dimensions = gen_dims(&d.dimensions);
-                d.init = d.init.as_ref().map(gen_expr);
+                d.init = d.init.as_deref().map(|e| Box::new(gen_expr(e)));
             }
             ModuleItem::NetDeclaration(new_nd)
         }
@@ -36815,7 +37043,7 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
                 .into_iter()
                 .flatten()
             {
-                *d = gen_expr(d);
+                **d = gen_expr(d);
             }
             for s in &mut c.signals {
                 for e in [&mut s.skew, &mut s.bound_to].into_iter().flatten() {
@@ -36897,7 +37125,7 @@ fn rename_class_refs(c: &mut ClassDeclaration) {
                 p.data_type = gen_type(&p.data_type);
                 for d in &mut p.declarators {
                     d.dimensions = gen_dims(&d.dimensions);
-                    d.init = d.init.as_ref().map(gen_expr);
+                    d.init = d.init.as_deref().map(|e| Box::new(gen_expr(e)));
                 }
             }
             ClassItem::Method(m) => match &mut m.kind {
@@ -39337,7 +39565,7 @@ fn prepare_module_items(
                     nd.declarators
                         .iter()
                         .filter_map(|d| {
-                            d.init.as_ref().map(|init| {
+                            d.init.as_deref().map(|init| {
                                 (
                                     std::rc::Rc::new(make_ident_expr(&d.name.name)),
                                     std::rc::Rc::new(init.clone()),
@@ -45229,8 +45457,10 @@ fn inline_module_items(
                                         // other instance declaration's (one whole-pattern
                                         // assignment, rewritten into the instance scope).
                                         if let Some(init_expr) = &decl.init {
-                                            deferred_decl_inits
-                                                .push((sig_name.clone(), init_expr.clone()));
+                                            deferred_decl_inits.push((
+                                                sig_name.clone(),
+                                                init_expr.as_ref().clone(),
+                                            ));
                                         }
                                         continue;
                                     }
@@ -45276,7 +45506,7 @@ fn inline_module_items(
                                     // instance scope); it used to be dropped here.
                                     if let Some(init_expr) = &decl.init {
                                         deferred_decl_inits
-                                            .push((sig_name.clone(), init_expr.clone()));
+                                            .push((sig_name.clone(), init_expr.as_ref().clone()));
                                     }
                                     // The ELEMENT type of a child array — the
                                     // top-level path records one and every
@@ -45350,8 +45580,10 @@ fn inline_module_items(
                                         // initial-block assignment exactly as the
                                         // top-level declaration path does.
                                         if !is_const_expr(init_expr, &sub_merged_params) {
-                                            deferred_decl_inits
-                                                .push((sig_name.clone(), init_expr.clone()));
+                                            deferred_decl_inits.push((
+                                                sig_name.clone(),
+                                                init_expr.as_ref().clone(),
+                                            ));
                                             default_value_for_type_resolved(
                                                 &dd.data_type,
                                                 width,
@@ -46952,14 +47184,17 @@ fn inline_module_items(
                     }
                     if let ModuleItem::ContinuousAssign(ca_item) = sub_item {
                         // #7: Rc-share source ASTs across sibling instances.
-                        let delay_rc = ca_item.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                        let delay_rc = ca_item
+                            .delay
+                            .as_deref()
+                            .map(|d| std::rc::Rc::new(d.clone()));
                         let delay_fall_rc = ca_item
                             .delay_fall
-                            .as_ref()
+                            .as_deref()
                             .map(|d| std::rc::Rc::new(d.clone()));
                         let delay_off_rc = ca_item
                             .delay_off
-                            .as_ref()
+                            .as_deref()
                             .map(|d| std::rc::Rc::new(d.clone()));
                         if let BodySource::ContAssign(pairs) = body_src {
                             for (lhs_rc, rhs_rc) in pairs {
@@ -47033,11 +47268,13 @@ fn inline_module_items(
                             // the `assign #d` form above. With an assignment
                             // the delay is the ASSIGNMENT's (§10.3.3), not a
                             // net delay; see `net_delay_of`.
-                            let rc = |d: &Option<Expression>| {
-                                d.as_ref().map(|d| std::rc::Rc::new(d.clone()))
-                            };
-                            let (delay_rc, delay_fall_rc, delay_off_rc) =
-                                (rc(&nd.delay), rc(&nd.delay_fall), rc(&nd.delay_off));
+                            let rc =
+                                |d: Option<&Expression>| d.map(|d| std::rc::Rc::new(d.clone()));
+                            let (delay_rc, delay_fall_rc, delay_off_rc) = (
+                                rc(nd.delay.as_deref()),
+                                rc(nd.delay_fall.as_deref()),
+                                rc(nd.delay_off.as_deref()),
+                            );
                             for (lhs_rc, rhs_rc) in inits {
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
@@ -56390,10 +56627,15 @@ fn rewrite_decl_list(
                 true => with_gen_part(local_type_takes, || gen_dims(&d.dimensions)),
                 false => d.dimensions.clone(),
             },
-            init: d
-                .init
-                .as_ref()
-                .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+            init: d.init.as_deref().map(|e| {
+                Box::new(rewrite_expr(
+                    e,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                ))
+            }),
             span: d.span,
         })
         .collect()

@@ -78,7 +78,7 @@ pub enum ModuleItem {
     GenerateRegion(GenerateRegion),
     /// Generate-if: condition + then-items, and a chain of (condition, items) for else-if/else
     GenerateIf(GenerateIf),
-    GenerateFor(GenerateFor),
+    GenerateFor(Box<GenerateFor>),
     /// Generate-case: case (constant_expr) values: items ... endcase
     /// Each arm matches one or more case values; an arm with empty `values`
     /// is the `default` arm. Used to pick between alternative module
@@ -100,8 +100,8 @@ pub enum ModuleItem {
     LetDeclaration(LetDeclaration),
     NettypeDeclaration(NettypeDeclaration),
     SpecifyBlock(SpecifyBlock),
-    DPIImport(DPIImport),
-    DPIExport(DPIExport),
+    DPIImport(Box<DPIImport>),
+    DPIExport(Box<DPIExport>),
     /// Out-of-class constraint definition: `constraint ClassName::cname { ... }`.
     /// Only the qualified name is tracked; body is not modeled.
     /// §18.5.1 `constraint Class::name { ... }` — the BODY is carried so the
@@ -585,10 +585,10 @@ pub struct ClockingDeclaration {
     pub clock_edge: Option<super::stmt::Edge>,
     /// §14.4 `default input #d` skew expression, if declared.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub default_input_skew: Option<super::expr::Expression>,
+    pub default_input_skew: Option<Box<super::expr::Expression>>,
     /// §14.4 `default output #d` skew expression, if declared.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub default_output_skew: Option<super::expr::Expression>,
+    pub default_output_skew: Option<Box<super::expr::Expression>>,
     /// §14.3 edge of a `default output negedge` skew, if declared.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_output_edge: Option<super::stmt::Edge>,
@@ -1047,13 +1047,13 @@ pub struct NetDeclaration {
     pub strength: Option<String>,
     pub data_type: DataType,
     /// §6.7.1 net delay: `#d` / first of `#(rise, fall[, turnoff])`.
-    pub delay: Option<Expression>,
+    pub delay: Option<Box<Expression>>,
     /// Second delay of the pair/triple form: applied to a transition to 0.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub delay_fall: Option<Expression>,
+    pub delay_fall: Option<Box<Expression>>,
     /// Third delay: applied to a transition to z.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub delay_off: Option<Expression>,
+    pub delay_off: Option<Box<Expression>>,
     pub declarators: Vec<NetDeclarator>,
     pub span: Span,
 }
@@ -1063,7 +1063,7 @@ pub struct NetDeclaration {
 pub struct NetDeclarator {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
-    pub init: Option<Expression>,
+    pub init: Option<Box<Expression>>,
     /// The declaration's own id in its definition's tree (`Bound::decl`);
     /// `UNSET` when not bound. Written by the lexical binder (§23.9).
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -1196,13 +1196,13 @@ pub struct FinalConstruct {
 pub struct ContinuousAssign {
     pub strength: Option<String>,
     /// `#d` / first of `#(rise, fall[, turnoff])` (§10.3.3).
-    pub delay: Option<Expression>,
+    pub delay: Option<Box<Expression>>,
     /// Second delay of the pair/triple form: applied to a transition to 0.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub delay_fall: Option<Expression>,
+    pub delay_fall: Option<Box<Expression>>,
     /// Third delay: applied to a transition to z.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub delay_off: Option<Expression>,
+    pub delay_off: Option<Box<Expression>>,
     pub assignments: Vec<(Expression, Expression)>,
     pub span: Span,
 }

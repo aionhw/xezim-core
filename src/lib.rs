@@ -233,7 +233,8 @@ pub use value::Value;
 /// \x46 = \x45 + parameter declaration ownership for waveform scopes (§26.3, §21.7.2.3).
 /// \x47 = \x46 + shared sequential and parallel statement block bodies (§9.3).
 /// \x48 = \x47 + boxed optional assignment delays and inferred assertion clocks.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x48";
+/// \x49 = \x48 + compact optional declaration payloads and cold module constructs.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x49";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -2848,11 +2849,11 @@ fn parse_and_elaborate(
                         })
                     });
                     if !own {
-                        items.insert(0, ast::decl::ModuleItem::DPIImport(di.clone()));
+                        items.insert(0, ast::decl::ModuleItem::DPIImport(Box::new(di.clone())));
                     }
                 }
                 for e in top_level_dpi_exports.iter() {
-                    items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
+                    items.push(ast::decl::ModuleItem::DPIExport(Box::new(e.clone())));
                 }
                 // A module's own property or sequence of the same name
                 // shadows the $unit one.
@@ -2996,14 +2997,14 @@ fn parse_and_elaborate(
                         }
                         if let Some(init) = &mut decl.init {
                             let stmt = ast::stmt::Statement::new(
-                                ast::stmt::StatementKind::Expr(init.clone()),
+                                ast::stmt::StatementKind::Expr(init.as_ref().clone()),
                                 init.span,
                             );
                             if let ast::stmt::StatementKind::Expr(expr) =
                                 elaborate::substitute_bare_idents_stmt(&stmt, &shadowed_unit_vars)
                                     .kind
                             {
-                                *init = expr;
+                                **init = expr;
                             }
                         }
                     }
