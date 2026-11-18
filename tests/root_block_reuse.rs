@@ -1,0 +1,169 @@
+//! IEEE 1800-2023 §9.3/§23.10: an unchanged root process retains its
+//! shared syntax; a required hierarchical-name conversion still runs.
+
+use std::sync::Arc;
+use xezim_core::SourceDefinition;
+use xezim_core::ast::decl::ModuleItem;
+use xezim_core::ast::expr::ExprKind;
+use xezim_core::ast::shared_vec::SharedVec;
+use xezim_core::ast::stmt::{Statement, StatementKind};
+use xezim_core::elaborate::{Definition, elaborate_module_with_defs, inline_instantiations};
+use xezim_core::hasher::HashMap;
+
+fn body(stmt: &Statement) -> &SharedVec<Statement> {
+    match &stmt.kind {
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => stmts,
+        StatementKind::TimingControl { stmt, .. } => body(stmt),
+        _ => panic!("process block expected"),
+    }
+}
+
+#[test]
+fn full_elaboration_retains_unchanged_root_bodies() {
+    for processes in [
+        "initial begin a=0; b=1; end always @(trigger) begin a=trigger; b=~trigger; end",
+        "initial fork begin a=0; end begin b=1; end join always @(posedge trigger iff b) begin if (b) a=trigger; else a=~trigger; end",
+    ] {
+        let source = format!("module top; bit trigger, a, b; {processes} endmodule");
+        let (definitions, model) = xezim_core::parse_and_elaborate_multi(
+            &[source],
+            Some("top"),
+            &[],
+            &["root-sharing.sv".into()],
+            &[],
+        )
+        .expect("root processes elaborate");
+        let SourceDefinition::Module(module) = &definitions["top"] else {
+            panic!("module expected");
+        };
+        let initial = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ModuleItem::InitialConstruct(p) => Some(&p.stmt),
+                _ => None,
+            })
+            .unwrap();
+        let always = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ModuleItem::AlwaysConstruct(p) => Some(&p.stmt),
+                _ => None,
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            body(initial).as_arc(),
+            body(&model.initial_blocks[0].stmt).as_arc()
+        ));
+        assert!(Arc::ptr_eq(
+            body(always).as_arc(),
+            body(&model.always_blocks[0].stmt).as_arc()
+        ));
+    }
+}
+
+#[test]
+fn root_member_access_still_converts_to_a_hierarchical_name() {
+    let source = "module child; logic q; endmodule module top; logic a; child u(); initial begin a=u.q; end endmodule";
+    let (definitions, model) = xezim_core::parse_and_elaborate_multi(
+        &[source.into()],
+        Some("top"),
+        &[],
+        &["root-member.sv".into()],
+        &[],
+    )
+    .expect("hierarchical reference elaborates");
+    let SourceDefinition::Module(module) = &definitions["top"] else {
+        panic!("module expected");
+    };
+    let initial = module
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ModuleItem::InitialConstruct(p) => Some(&p.stmt),
+            _ => None,
+        })
+        .unwrap();
+    let rewritten = &model.initial_blocks[0].stmt;
+    assert!(!Arc::ptr_eq(
+        body(initial).as_arc(),
+        body(rewritten).as_arc()
+    ));
+    let StatementKind::BlockingAssign { rvalue, .. } = &body(rewritten)[0].kind else {
+        panic!("assignment expected");
+    };
+    let ExprKind::Ident(target) = &rvalue.kind else {
+        panic!("hierarchical identifier expected: {:?}", rvalue.kind);
+    };
+    assert_eq!(
+        target
+            .path
+            .iter()
+            .map(|part| part.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        "u.q"
+    );
+}
+
+/// §23.6: the integrated identity path honors explicit cache ownership,
+/// including refreshing a body whose source caches were disabled.
+#[test]
+fn root_reuse_honors_explicit_cache_clone_modes() {
+    use xezim_core::ast::cache::{with_fresh_scope_caches, without_scope_caches};
+    for source_disabled in [false, true] {
+        let source = "module top; logic trigger, a, b; always @(trigger) begin a=b; end endmodule";
+        let parsed = if source_disabled {
+            without_scope_caches(|| xezim_core::parse(source))
+        } else {
+            xezim_core::parse(source)
+        };
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let xezim_core::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected");
+        };
+        let definitions = HashMap::from_iter([("top".to_string(), Definition::Module(module))]);
+        let mut model = elaborate_module_with_defs(
+            Definition::Module(module),
+            &HashMap::default(),
+            Some(&definitions),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let rewrite = || inline_instantiations(&mut model, &definitions);
+        if source_disabled {
+            with_fresh_scope_caches(rewrite).unwrap();
+        } else {
+            without_scope_caches(rewrite).unwrap();
+        }
+        let StatementKind::BlockingAssign { lvalue, .. } =
+            &body(&model.always_blocks[0].stmt)[0].kind
+        else {
+            panic!("assignment expected");
+        };
+        lvalue.cached_width.set(Some(8));
+        assert_eq!(lvalue.cached_width.get(), source_disabled.then_some(8));
+        let ModuleItem::AlwaysConstruct(original) = &module.items[1] else {
+            panic!("source always expected");
+        };
+        let StatementKind::BlockingAssign {
+            lvalue: source_name,
+            ..
+        } = &body(&original.stmt)[0].kind
+        else {
+            panic!("source assignment expected");
+        };
+        assert!(!Arc::ptr_eq(
+            body(&original.stmt).as_arc(),
+            body(&model.always_blocks[0].stmt).as_arc()
+        ));
+        source_name.cached_width.set(Some(16));
+        assert_eq!(
+            source_name.cached_width.get(),
+            (!source_disabled).then_some(16)
+        );
+    }
+}
