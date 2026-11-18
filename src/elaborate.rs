@@ -36371,10 +36371,15 @@ fn inline_instantiations_inner(
             rewrite_stmt(stmt, prefix, &port_map, &local_names, &interface_map)
         }
     };
-    for block in &mut elab.always_blocks {
+    for (index, block) in elab.always_blocks.iter_mut().enumerate() {
+        if index % 64 == 0 {
+            crate::oom_trace::checkpoint("inline.root_always", &[("block_index", index)]);
+        }
         block.stmt = rewrite_root(&block.stmt);
     }
-    for block in &mut elab.initial_blocks {
+    crate::oom_trace::checkpoint("inline.root_always.ready", &[]);
+    for (index, block) in elab.initial_blocks.iter_mut().enumerate() {
+        crate::oom_trace::checkpoint("inline.root_initial", &[("block_index", index)]);
         block.stmt = rewrite_root(&block.stmt);
     }
     for assign in &mut elab.continuous_assigns {
