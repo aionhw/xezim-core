@@ -25,8 +25,12 @@ fn out_of_range_static_vector_activity_is_diagnosed() {
 }
 
 #[test]
-fn out_of_range_nested_array_alias_activity_is_diagnosed() {
-    let errors = lower("type words is array (0 to 1) of bit_vector(1 downto 0); signal q : words; alias bad : bit_vector(1 downto 0) is q(2);", "assert not bad(0)'active;").unwrap_err();
+fn out_of_range_nested_index_cannot_alias_a_valid_leaf() {
+    let errors = lower(
+        "type words is array (0 to 1) of bit_vector(1 downto 0); signal q : words;",
+        "assert not q(0)(-1)'active;",
+    )
+    .unwrap_err();
     assert!(
         errors
             .iter()
