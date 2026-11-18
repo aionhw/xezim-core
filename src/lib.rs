@@ -244,7 +244,9 @@ pub use value::Value;
 ///         keeping their `with [ array_range ]` (§11.4.14.4), per-driver delay stages and
 ///         declaration-initializer drivers of user-defined nettype nets (§10.3.3, §6.6.7), and
 ///         nettype input ports kept apart from non-nettype actuals (§23.3.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4a";
+/// \x4b = \x4a + unsized signed decimal numbers sized by their magnitude and a sign bit in
+///         parameters, constant expressions and cached literals (§5.7.1).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4b";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
