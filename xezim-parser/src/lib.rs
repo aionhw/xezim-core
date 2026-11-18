@@ -397,11 +397,13 @@ pub static RELAX_NUL_BYTES: RelaxFlag = RelaxFlag::new(
     "XEZIM_RELAX_NUL_BYTES",
     "read a NUL byte in the source as white space (§5.3)",
 );
-/// §19.6: a hierarchical cross item gets an implicit coverpoint.
+/// §19.6: a hierarchical cross item gets an implicit coverpoint, and a
+/// `binsof` of the cross's bin selects may name it (§19.6.1).
 pub static RELAX_CROSS_HIER_ITEM: RelaxFlag = RelaxFlag::new(
     "cross-hier-item",
     "XEZIM_RELAX_CROSS_HIER_ITEM",
-    "accept a hierarchical reference as a cross item, with an implicit coverpoint (§19.6)",
+    "accept a hierarchical reference as a cross item, with an implicit coverpoint, and in \
+     binsof() (§19.6, §19.6.1)",
 );
 
 /// §6.5: a module net or variable used ahead of its declaration (checked
