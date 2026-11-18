@@ -3,7 +3,8 @@
 //!
 //! The design is flattened into one module named after the top entity:
 //! signals (effective value, event/active flags, last value and last event
-//! time), one transaction queue per driver (signal × process), processes as
+//! time), pending values or transaction queues per driver (signal × process),
+//! processes as
 //! `initial` blocks, subprograms as automatic functions/tasks, and a
 //! generated kernel `initial` block implementing the VHDL simulation cycle
 //! (IEEE 1076-2008 §14.7.5): it updates signals from due transactions,
@@ -143,6 +144,13 @@ struct Lw<'a> {
     procs: Vec<(usize, usize, usize)>,
     /// Drivers by (signal, process).
     drivers: BTreeMap<(usize, usize), Driver>,
+    /// Drivers with a waveform that needs the general transaction machinery.
+    queued_drivers: BTreeSet<(usize, usize)>,
+    /// Processes using signal procedures keep the general driver form.
+    signal_procs: BTreeSet<usize>,
+    /// Frozen after driver discovery: whole scalar drivers whose every
+    /// assignment is one implicit-zero, non-null inertial transaction.
+    pending_drivers: BTreeSet<(usize, usize)>,
     /// Port associations through conversions or partial formals.
     links: Vec<elab::Link>,
     /// Per process: its wait sites.
@@ -330,6 +338,9 @@ impl<'a> Lw<'a> {
             inst: 0,
             procs: Vec::new(),
             drivers: BTreeMap::new(),
+            queued_drivers: BTreeSet::new(),
+            signal_procs: BTreeSet::new(),
+            pending_drivers: BTreeSet::new(),
             links: Vec::new(),
             sites: Vec::new(),
             pkg_objs: BTreeSet::new(),
