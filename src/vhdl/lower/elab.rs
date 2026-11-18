@@ -2286,13 +2286,14 @@ impl<'a> Lw<'a> {
         }
         // Signals.
         let sigs = self.sigs.clone();
+        let mut activity_init_offsets = Vec::with_capacity(sigs.len());
         for (si, s) in sigs.iter().enumerate() {
             let info = d.objects[s.obj].clone();
             self.inst = if s.inst == GLOBAL { 0 } else { s.inst };
             let r = self.repr(s.ty, &info.loc);
             let _ = writeln!(
                 decls,
-                "  {t} vh_s{s};\n  bit vh_s{s}_ev, vh_s{s}_act; {t} vh_s{s}_last; longint vh_s{s}_lev, vh_s{s}_lact;",
+                "  {t} vh_s{s};\n  bit vh_s{s}_ev, vh_s{s}_act; {t} vh_s{s}_last; longint vh_s{s}_lev;",
                 s = si,
                 t = r.sv()
             );
@@ -2318,10 +2319,11 @@ impl<'a> Lw<'a> {
             elab.push_str(&flushed);
             let _ = writeln!(
                 elab,
-                "    vh_s{s} = {v};\n    vh_s{s}_last = vh_s{s}; vh_s{s}_lev = -64'sd9223372036854775807; vh_s{s}_lact = vh_s{s}_lev;",
+                "    vh_s{s} = {v};\n    vh_s{s}_last = vh_s{s}; vh_s{s}_lev = -64'sd9223372036854775807;",
                 s = si,
                 v = v
             );
+            activity_init_offsets.push(elab.len());
         }
         // Temporaries of the initial values, declared in vh_elab.
         let mut elab_temps = String::new();
@@ -2603,6 +2605,9 @@ impl<'a> Lw<'a> {
         m.push_str(&self.sv_wires);
         m.push_str(&bnd);
         m.push_str(&self.sv_items);
+        for &sig in self.need_lact.range(..activity_init_offsets.len()) {
+            let _ = writeln!(m, "  longint vh_s{sig}_lact;");
+        }
         m.push_str(&decls);
         m.push_str(&self.lit_items);
         let tio = self.textio_sv();
@@ -2614,9 +2619,21 @@ impl<'a> Lw<'a> {
         m.push_str(&imp_fns);
         let _ = write!(
             m,
-            "  function automatic void vh_elab();\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n{}  endfunction\n",
-            elab_temps, np, elab
+            "  function automatic void vh_elab();\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n",
+            elab_temps, np
         );
+        // Reads of 'last_active can be discovered in later process bodies.
+        // Insert each observed signal's initializer at its original position
+        // so subsequent declaration initializers see the initialized timestamp.
+        let mut start = 0;
+        for &sig in self.need_lact.range(..activity_init_offsets.len()) {
+            let end = activity_init_offsets[sig];
+            m.push_str(&elab[start..end]);
+            let _ = writeln!(m, "    vh_s{sig}_lact = vh_s{sig}_lev;");
+            start = end;
+        }
+        m.push_str(&elab[start..]);
+        m.push_str("  endfunction\n");
         // Clocked processes assign vh_clkd from functions emitted above the
         // kernel, so the flag has to be declared first.
         if self.has_boundary() {
