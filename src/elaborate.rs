@@ -36121,11 +36121,22 @@ fn inline_instantiations_inner(
     }
     let prefix = "";
 
+    // §9.3/§23.6: an identity rewrite may retain shared root syntax.
+    // Instances, interfaces, specialization and populated contextual
+    // caches still take the complete rewrite and invalidation path.
+    let root_identity = prefix.is_empty() && port_map.is_empty() && interface_map.is_empty();
+    let rewrite_root = |stmt: &Statement| {
+        if root_identity && identity_rewrite::can_preserve_root_stmt(stmt) {
+            stmt.clone()
+        } else {
+            rewrite_stmt(stmt, prefix, &port_map, &local_names, &interface_map)
+        }
+    };
     for block in &mut elab.always_blocks {
-        block.stmt = rewrite_stmt(&block.stmt, prefix, &port_map, &local_names, &interface_map);
+        block.stmt = rewrite_root(&block.stmt);
     }
     for block in &mut elab.initial_blocks {
-        block.stmt = rewrite_stmt(&block.stmt, prefix, &port_map, &local_names, &interface_map);
+        block.stmt = rewrite_root(&block.stmt);
     }
     for assign in &mut elab.continuous_assigns {
         assign.lhs = rewrite_expr(&assign.lhs, prefix, &port_map, &local_names, &interface_map);
@@ -56387,6 +56398,8 @@ fn rewrite_decl_list(
         })
         .collect()
 }
+
+mod identity_rewrite;
 
 fn rewrite_stmt(
     stmt: &Statement,
