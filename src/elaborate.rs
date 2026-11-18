@@ -2822,8 +2822,13 @@ fn elaborate_class_in_scope(
                 // `resolve_type_width`'s TypeReference branch, which returns a
                 // flat 32 when it has no table — so every such property was
                 // recorded 32 bits wide however narrow its type.
-                let width =
-                    typedefs_snapshot(|td| resolve_type_width(&p.data_type, class_params, td));
+                // §6.18, §8.25: a type the class itself declares is sized by
+                // its declaration in the class's constant scope. The bare
+                // typedef table was sized in the enclosing scope, which has
+                // no class `localparam`, so `typedef logic [W-1:0] t;` read
+                // one bit there.
+                let width_dt = class_local_typedef_target(c, &p.data_type, u8::MAX);
+                let width = typedefs_snapshot(|td| resolve_type_width(width_dt, class_params, td));
                 // §6.20.3 / §6.18: a body type alias retains its signedness.
                 let is_signed = TYPEDEF_SHAPES_TLS
                     .with(|types| is_type_signed_resolved(&p.data_type, &types.borrow().0));
