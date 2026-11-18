@@ -8037,6 +8037,23 @@ fn check_implicit_static_inits(
     ))
 }
 
+/// Declaration-order snapshots are immutable inside procedural scopes.
+/// Sharing them avoids copying every module declaration for each function,
+/// block and condition; module/generate declarations retain copy-on-write
+/// isolation (§6.5, §6.21).
+#[derive(Clone, Default)]
+struct DeclaredModuleNames(Rc<HashSet<String>>);
+
+impl DeclaredModuleNames {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+
+    fn insert(&mut self, name: String) -> bool {
+        Rc::make_mut(&mut self.0).insert(name)
+    }
+}
+
 /// IEEE 1800-2017 §6.5: data shall be declared before use, except implicit
 /// nets (§6.10). Only names actually declared as module data are checked;
 /// unresolved names remain the responsibility of implicit-net/name resolution.
@@ -8050,7 +8067,7 @@ fn check_module_use_before_decl(
 ) -> Vec<String> {
     #[derive(Clone, Default)]
     struct Scope {
-        declared: HashSet<String>,
+        declared: DeclaredModuleNames,
         locals: HashSet<String>,
         objects: HashMap<String, String>,
         constraint_caller: Option<HashSet<String>>,
