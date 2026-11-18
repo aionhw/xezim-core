@@ -237,7 +237,10 @@ pub use value::Value;
 ///         root, and declared types shared per declaration.
 /// \x48 = \x47 + a formal written with neither a data type nor a direction takes the previous
 ///         formal's type (§13.5).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x48";
+/// \x49 = \x48 + package members left unrooted in continuous assignments that write another
+///         scope (§26.3), member signals for each element of a multi-dimensional unpacked-struct
+///         array (§7.4.2), and `binsof()` of a hierarchical cross item (§19.6.1).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x49";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
