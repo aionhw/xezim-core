@@ -2,7 +2,7 @@
 //! root process's storage without skipping scope or reference rewrites.
 
 use super::{
-    GEN_RENAME_TLS, PKG_FLATTEN_ONLY, TYPE_BIND_QUERIES_TLS, TYPE_BIND_TYPES_TLS,
+    GEN_RENAME_TLS, MODPORT_SUBST_FLAG, PKG_FLATTEN_ONLY, TYPE_BIND_QUERIES_TLS, TYPE_BIND_TYPES_TLS,
     TYPE_BIND_WIDTHS_TLS,
 };
 use crate::ast::expr::{ExprKind, Expression};
@@ -24,7 +24,10 @@ pub(super) fn can_preserve_root_stmt(stmt: &Statement) -> bool {
         && TYPE_BIND_WIDTHS_TLS.with(|bindings| bindings.borrow().is_none())
         && TYPE_BIND_QUERIES_TLS.with(|bindings| bindings.borrow().is_none())
         && TYPE_BIND_TYPES_TLS.with(|bindings| bindings.borrow().is_none())
-        && PKG_FLATTEN_ONLY.with(|packages| packages.borrow().is_none());
+        && PKG_FLATTEN_ONLY.with(|packages| packages.borrow().is_none())
+        // An ordinary index rewrite consumes this transient flag. Starting
+        // clear also preserves that state when retaining the expression.
+        && MODPORT_SUBST_FLAG.with(|flag| !flag.get());
     root_context && identity_stmt(stmt)
 }
 
@@ -135,6 +138,25 @@ fn identity_expr(expr: &Expression) -> bool {
         ExprKind::Replication { count, exprs } => {
             identity_expr(count) && exprs.iter().all(identity_expr)
         }
+        ExprKind::Index { expr: base, index } => {
+            // Empty root maps cannot select an interface array. Accepted
+            // operands cannot substitute a modport expression either, so
+            // the normal index arm only reconstructs these operands.
+            identity_expr(base) && identity_expr(index)
+        }
+        ExprKind::RangeSelect {
+            expr: base,
+            left,
+            right,
+            ..
+        } => {
+            // An identical range over another range can collapse. Keep
+            // every direct nested range on the complete rewrite path.
+            !matches!(base.kind, ExprKind::RangeSelect { .. })
+                && identity_expr(base)
+                && identity_expr(left)
+                && identity_expr(right)
+        }
         ExprKind::Call { func, args } => {
             // In particular, a member/scoped/upward callee is excluded by
             // the operand predicate; no call is evaluated by this rewrite.
@@ -156,8 +178,8 @@ fn identity_expr(expr: &Expression) -> bool {
                     | "$unpacked_dimensions"
             ) && args.iter().all(identity_expr)
         }
-        // Selects can collapse after rewriting; member paths can become
-        // hierarchical references. Type queries still take the full path.
+        // Member paths can become hierarchical references; type queries
+        // and all other unknown forms still take the complete rewrite.
         // Keep every such form on the complete rewrite path for now.
         _ => false,
     }
@@ -229,6 +251,8 @@ mod tests {
             "begin if (a) begin b = c + 1; end else fork b = 0; c = 1; join end",
             "begin a = a ? {b, c} : {2{b}}; end",
             "begin a = f(b + 1); end",
+            "begin a = b[0]; b[c] = a; end",
+            "begin a = b[3:0]; b[c +: 2] = a; b[c -: 2] = a; end",
             "begin case (a) 0: b = c; 1, 2: begin b = 1; end default: b = 0; endcase end",
             "begin case (a) inside [0:3]: b = c; default: b = 0; endcase end",
             "begin while (a) begin b = c; end repeat (2) begin c = b; end end",
@@ -254,8 +278,10 @@ mod tests {
             "@(posedge child.clk) begin a = b; end",
             "@(posedge clk iff child.enable) begin a = b; end",
             "#(child.delay_value) begin a = b; end",
-            "begin a = b[0]; end",
             "begin a = b[3:0][3:0]; end",
+            "begin a = b[child.value]; end",
+            "begin a = child.value[0]; end",
+            "begin a = b[child.left:0]; end",
             "begin a = int'(b); end",
             "begin $display(child.value); end",
             "begin case (a) 0: b = child.value; endcase end",
@@ -267,6 +293,58 @@ mod tests {
         ] {
             assert!(!can_preserve_root_stmt(&initial(source)), "{source}");
         }
+    }
+
+    /// §11.5.1/§25.5.4: an index retains neither stale contextual state
+    /// nor a modport-substitution marker from another rewrite.
+    #[test]
+    fn select_operands_and_modport_state_require_the_full_rewrite() {
+        let source = initial("a = b[0];");
+        let StatementKind::BlockingAssign { rvalue, .. } = &source.kind else {
+            panic!("assignment expected");
+        };
+        rvalue.cached_width.set(Some(1));
+        assert!(!can_preserve_root_stmt(&source));
+
+        let source = initial("a = b[c];");
+        let StatementKind::BlockingAssign { rvalue, .. } = &source.kind else {
+            panic!("assignment expected");
+        };
+        let ExprKind::Index { index, .. } = &rvalue.kind else {
+            panic!("index expected");
+        };
+        index.cached_width.set(Some(32));
+        assert!(!can_preserve_root_stmt(&source));
+
+        let source = initial("a = b[0];");
+        let StatementKind::BlockingAssign { rvalue, .. } = &source.kind else {
+            panic!("assignment expected");
+        };
+        let ExprKind::Index { expr: base, .. } = &rvalue.kind else {
+            panic!("index expected");
+        };
+        let ExprKind::Ident(name) = &base.kind else {
+            panic!("identifier expected");
+        };
+        name.cached_signal_id.set(Some(7));
+        assert!(!can_preserve_root_stmt(&source));
+
+        let source = initial("a = b[3:0];");
+        let StatementKind::BlockingAssign { rvalue, .. } = &source.kind else {
+            panic!("assignment expected");
+        };
+        let ExprKind::RangeSelect { right, .. } = &rvalue.kind else {
+            panic!("range expected");
+        };
+        right.cached_width.set(Some(32));
+        assert!(!can_preserve_root_stmt(&source));
+
+        let source = initial("a = b[0];");
+        let saved = MODPORT_SUBST_FLAG.with(|flag| flag.replace(true));
+        let _restore = super::super::scopeguard_lite(|| {
+            MODPORT_SUBST_FLAG.with(|flag| flag.set(saved));
+        });
+        assert!(!can_preserve_root_stmt(&source));
     }
 
     #[test]
