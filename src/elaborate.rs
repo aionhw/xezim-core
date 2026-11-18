@@ -35312,33 +35312,15 @@ fn is_implicit_block_name(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
 }
 
-/// An identifier or call in an inlined sub-instance body that NOTHING in the
-/// design declares is an error — the reference tooling rejects it at
-/// elaboration. The per-module validator only ever saw the TOP module's
-/// blocks; sub-instance bodies are inlined afterwards and were never checked,
-/// so `chk_always(...)` in an RTL module bound to a stale header that lacked
-/// it simply never ran (assertions silently vanished), and a typo'd signal in
-/// a child read x for the whole run.
-///
-/// §23.9, §23.8.1: the binding of a head decides (`head_verdict`). A head the
-/// binder did not walk, or an upward path head, keeps the "declared nowhere"
-/// bar: a bare name is accepted if the instance's own module declares it
-/// (`local_names`, ports, interfaces), the body declares it, any elaborated
-/// table knows it under any scope, or any definition in the design declares it.
-fn validate_inlined_bodies(
-    elab: &ElaboratedModule,
-    definitions: &HashMap<String, Definition>,
-) -> Result<(), String> {
-    let mut known = collect_design_declared_names(definitions, true);
-    // §23.11: instances that compilation-unit binds add.
-    UNIT_BIND_INSTANCES.with(|s| known.extend(s.borrow().names.iter().cloned()));
-    let mut outside_classes = collect_design_declared_names(definitions, false);
+/// Add flattened declaration aliases without retaining a second owned set.
+fn extend_elaborated_decl_leaves(elab: &ElaboratedModule, names: &mut HashSet<String>) {
     // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
-    let mut leaves: HashSet<String> = HashSet::default();
     let mut add_key = |k: &str| {
         let leaf = k.rsplit('.').next().unwrap_or(k);
         let base = leaf.split('[').next().unwrap_or(leaf);
-        leaves.insert(base.to_string());
+        if !names.contains(base) {
+            names.insert(base.to_string());
+        }
     };
     for k in elab.signals.keys() {
         add_key(k);
@@ -35401,9 +35383,29 @@ fn validate_inlined_bodies(
             add_key(n);
         }
     }
-    known.extend(leaves.iter().cloned());
-    outside_classes.extend(leaves);
-    let known = known;
+}
+
+/// An identifier or call in an inlined sub-instance body that NOTHING in the
+/// design declares is an error — the reference tooling rejects it at
+/// elaboration. The per-module validator only ever saw the TOP module's
+/// blocks; sub-instance bodies are inlined afterwards and were never checked,
+/// so `chk_always(...)` in an RTL module bound to a stale header that lacked
+/// it simply never ran (assertions silently vanished), and a typo'd signal in
+/// a child read x for the whole run.
+///
+/// §23.9, §23.8.1: the binding of a head decides (`head_verdict`). A head the
+/// binder did not walk, or an upward path head, keeps the "declared nowhere"
+/// bar: a bare name is accepted if the instance's own module declares it
+/// (`local_names`, ports, interfaces), the body declares it, any elaborated
+/// table knows it under any scope, or any definition in the design declares it.
+fn validate_inlined_bodies(
+    elab: &ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+) -> Result<(), String> {
+    let mut known = collect_design_declared_names(definitions, true);
+    // §23.11: instances that compilation-unit binds add.
+    UNIT_BIND_INSTANCES.with(|s| known.extend(s.borrow().names.iter().cloned()));
+    extend_elaborated_decl_leaves(elab, &mut known);
 
     // §23.6: a named block of any process is a scope the module's other
     // processes may name (`blk.v`).
@@ -35536,7 +35538,7 @@ fn validate_inlined_bodies(
             .unwrap_or_default();
         return Err(format!("Undeclared identifier '{}'{}", name, loc));
     }
-    validate_subroutine_bodies(elab, definitions, &known, &outside_classes)
+    validate_subroutine_bodies(elab, definitions, &known)
 }
 
 /// Names a statement's constructs bind themselves, for the undeclared-name
@@ -35650,7 +35652,6 @@ fn validate_subroutine_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
     known: &HashSet<String>,
-    outside_classes: &HashSet<String>,
 ) -> Result<(), String> {
     use crate::ast::decl::{ClassItem, ClassMethodKind, PackageItem};
 
@@ -35821,6 +35822,9 @@ fn validate_subroutine_bodies(
         out
     };
     let mut scopes: HashMap<&str, HashSet<String>> = HashMap::default();
+    // Only class methods need the stricter namespace. Most generated designs
+    // have no class methods, so keep their large global-name table singular.
+    let mut outside_classes = None;
     for body in &bodies {
         // Qualified and bare aliases point to one elaborated class, whose
         // declared name indexes the AST's lexical scope maps. Resolve the
@@ -35841,7 +35845,12 @@ fn validate_subroutine_bodies(
             first_undeclared_in_subroutine(body, known, None, &upward)
         } else {
             let scope = scopes.entry(class).or_insert_with(|| class_scope(class));
-            first_undeclared_in_subroutine(body, outside_classes, Some(scope), &upward)
+            let outside = outside_classes.get_or_insert_with(|| {
+                let mut names = collect_design_declared_names(definitions, false);
+                extend_elaborated_decl_leaves(elab, &mut names);
+                names
+            });
+            first_undeclared_in_subroutine(body, outside, Some(scope), &upward)
         };
         if let Some((name, span)) = found {
             return Err(span_error_of(

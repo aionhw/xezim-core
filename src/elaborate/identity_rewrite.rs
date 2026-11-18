@@ -1,5 +1,5 @@
-//! IEEE 1800-2023 §9.2, §9.3, §23.6: retain an unchanged root process's
-//! statement storage without skipping required scope or reference rewrites.
+//! IEEE 1800-2023 §9.2, §9.3, §12.5, §12.7, §23.6: retain an unchanged
+//! root process's storage without skipping scope or reference rewrites.
 
 use super::{
     GEN_RENAME_TLS, PKG_FLATTEN_ONLY, TYPE_BIND_QUERIES_TLS, TYPE_BIND_TYPES_TLS,
@@ -54,6 +54,19 @@ fn identity_stmt(stmt: &Statement) -> bool {
                 && identity_stmt(then_stmt)
                 && else_stmt.as_deref().is_none_or(identity_stmt)
         }
+        StatementKind::Case { expr, items, .. } => {
+            identity_expr(expr)
+                && items.iter().all(|item| {
+                    // Pattern bindings introduce names of their own. Keep
+                    // them on the complete scope rewrite path.
+                    item.pattern.is_none()
+                        && item.patterns.iter().all(identity_expr)
+                        && item.guard.as_ref().is_none_or(identity_expr)
+                        && identity_stmt(&item.stmt)
+                })
+        }
+        StatementKind::While { condition, body } => identity_expr(condition) && identity_stmt(body),
+        StatementKind::Repeat { count, body } => identity_expr(count) && identity_stmt(body),
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             // No accepted child introduces a declaration. The scoped list
             // walk therefore has no local-name shadowing to apply (§6.21).
@@ -66,8 +79,8 @@ fn identity_stmt(stmt: &Statement) -> bool {
             };
             identity_control && identity_stmt(stmt)
         }
-        // Declarations, loops, assertions, event triggers, disables and all
-        // other forms keep their existing rewrite and scope handling.
+        // Declarations, binding loops, assertions, event triggers, disables
+        // and all other forms keep their existing scope handling.
         _ => false,
     }
 }
@@ -127,8 +140,24 @@ fn identity_expr(expr: &Expression) -> bool {
             // the operand predicate; no call is evaluated by this rewrite.
             identity_expr(func) && args.iter().all(identity_expr)
         }
+        ExprKind::SystemCall { name, args } => {
+            // These queries can replace a call by a literal in a type
+            // binding context. Other system calls only rewrite operands.
+            !matches!(
+                name.as_str(),
+                "$bits"
+                    | "$left"
+                    | "$right"
+                    | "$high"
+                    | "$low"
+                    | "$size"
+                    | "$increment"
+                    | "$dimensions"
+                    | "$unpacked_dimensions"
+            ) && args.iter().all(identity_expr)
+        }
         // Selects can collapse after rewriting; member paths can become
-        // hierarchical references. System calls may fold type queries.
+        // hierarchical references. Type queries still take the full path.
         // Keep every such form on the complete rewrite path for now.
         _ => false,
     }
@@ -200,6 +229,10 @@ mod tests {
             "begin if (a) begin b = c + 1; end else fork b = 0; c = 1; join end",
             "begin a = a ? {b, c} : {2{b}}; end",
             "begin a = f(b + 1); end",
+            "begin case (a) 0: b = c; 1, 2: begin b = 1; end default: b = 0; endcase end",
+            "begin case (a) inside [0:3]: b = c; default: b = 0; endcase end",
+            "begin while (a) begin b = c; end repeat (2) begin c = b; end end",
+            "begin $display(\"value=%0d\", a); b = $clog2(8); $finish; end",
             "@(posedge clk iff enable) begin a <= b; end",
             "@(posedge clk or negedge enable) begin a <= b; end",
             "@* begin a = b; end",
@@ -224,13 +257,69 @@ mod tests {
             "begin a = b[0]; end",
             "begin a = b[3:0][3:0]; end",
             "begin a = int'(b); end",
-            "begin $display(a); end",
+            "begin $display(child.value); end",
+            "begin case (a) 0: b = child.value; endcase end",
+            "begin while (child.value) b = c; end",
+            "begin repeat (a) b = child.value; end",
             "begin int local_value; a = local_value; end",
-            "begin while (a) b = c; end",
+            "begin while (a) begin int local_value; b = local_value; end end",
             "begin -> a; end",
         ] {
             assert!(!can_preserve_root_stmt(&initial(source)), "{source}");
         }
+    }
+
+    #[test]
+    fn type_queries_and_case_binding_patterns_require_the_full_rewrite() {
+        for name in [
+            "$bits",
+            "$left",
+            "$right",
+            "$high",
+            "$low",
+            "$size",
+            "$increment",
+            "$dimensions",
+            "$unpacked_dimensions",
+        ] {
+            assert!(!can_preserve_root_stmt(&initial(&format!("a = {name}(b);"))));
+        }
+        let mut source = initial("case (a) 0: b = c; endcase");
+        let StatementKind::Case { items, .. } = &mut source.kind else {
+            panic!("case expected");
+        };
+        items[0].pattern = Some(crate::ast::stmt::Pattern::Binding(crate::ast::Identifier {
+            name: "captured".to_string(),
+            span: crate::ast::Span::dummy(),
+        }));
+        assert!(!can_preserve_root_stmt(&source));
+    }
+
+    #[test]
+    fn case_loop_and_system_call_operand_caches_require_invalidation() {
+        let source = initial("case (a) 0: b = c; endcase");
+        let StatementKind::Case { items, .. } = &source.kind else {
+            panic!("case expected");
+        };
+        items[0].patterns[0].cached_width.set(Some(32));
+        assert!(!can_preserve_root_stmt(&source));
+
+        let source = initial("while (a) b = c;");
+        let StatementKind::While { condition, .. } = &source.kind else {
+            panic!("while expected");
+        };
+        condition.cached_width.set(Some(1));
+        assert!(!can_preserve_root_stmt(&source));
+
+        let source = initial("$display(a);");
+        let StatementKind::Expr(expr) = &source.kind else {
+            panic!("expression expected");
+        };
+        let ExprKind::SystemCall { args, .. } = &expr.kind else {
+            panic!("system call expected");
+        };
+        args[0].cached_width.set(Some(1));
+        assert!(!can_preserve_root_stmt(&source));
     }
 
     #[test]

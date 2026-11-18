@@ -3756,6 +3756,12 @@ fn parse_and_elaborate(
         elab.timeprecision_exp = p;
     }
 
+    // The top's temporary declaration and constant-evaluation indexes are
+    // no longer live. Release their pages before root rewriting and its
+    // validation tables allocate another view of a large flat design.
+    release_free_memory();
+    oom_trace::checkpoint("elaborate.memory_released", &[]);
+
     // §23.11: bind selection uses the finished hierarchy and declaration
     // scope. Re-elaborate only designs with newly resolved bindings; ordinary
     // designs retain their single elaboration pass. This also permits binds
