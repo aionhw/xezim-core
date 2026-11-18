@@ -21,6 +21,8 @@ fn implicit_zero_driver_has_no_projected_waveform_queue() {
     assert!(sv.contains("bit vh_pend0_0;"));
     assert!(sv.contains("vh_pv0_0 = 1; vh_pend0_0 = 1;"));
     assert!(sv.contains("vh_pv0_0 = 0; vh_pend0_0 = 1;"));
+    assert!(sv.contains("vh_pend0_0 = 1; vh_delta_pending = 1;"));
+    assert!(!sv.contains("if (vh_pend0_0) vh_n = vh_now;"));
     assert!(!has_queue(&sv, 0, 0));
     assert!(!sv.contains("vh_qn0_0"));
     assert!(!sv.contains("vh_drv_0_0"));
@@ -214,4 +216,15 @@ fn guarded_driver_keeps_null_transaction_support() {
     assert!(sv.contains("bit vh_don0_0;"));
     assert!(has_queue(&sv, 0, 0));
     assert!(sv.contains("bit vh_dn0_0[$];"));
+}
+
+#[test]
+fn timeout_scan_spans_processes_that_can_suspend() {
+    let sv = lowered(
+        "",
+        "process(q) begin null; end process; process begin wait for 1 ns; end process; process(q) begin null; end process; process begin wait for 2 ns; end process; process(q) begin null; end process;",
+    );
+    assert!(sv.contains("for (int p = 1; p <= 3; p++) if (vh_tmo[p] >= 0"));
+    let sv = lowered("", "process(q) begin null; end process;");
+    assert!(!sv.contains("p++) if (vh_tmo[p] >= 0"));
 }

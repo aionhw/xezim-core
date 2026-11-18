@@ -36,7 +36,8 @@ fn repeated_scalar_part_writes_keep_value_and_flag_only() {
     assert!(sv.contains("vh_lk = 24;"));
     assert!(sv.contains("vh_spv0_0 = vh_tv"));
     assert!(sv.contains("vh_spend0_0 = 1;"));
-    assert!(sv.contains("if (vh_spend0_0) vh_n = vh_now;"));
+    assert!(sv.contains("vh_spend0_0 = 1; vh_delta_pending = 1;"));
+    assert!(!sv.contains("if (vh_spend0_0) vh_n = vh_now;"));
     assert!(sv.contains("vh_spend0_0 = 0; vh_s0_act = 1;"));
 }
 
