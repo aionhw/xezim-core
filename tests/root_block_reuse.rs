@@ -24,6 +24,7 @@ fn full_elaboration_retains_unchanged_root_bodies() {
         "initial begin a=0; b=1; end always @(trigger) begin a=trigger; b=~trigger; end",
         "initial fork begin a=0; end begin b=1; end join always @(posedge trigger iff b) begin if (b) a=trigger; else a=~trigger; end",
         "initial begin case (trigger) 0: a=b; default: b=a; endcase while (a) begin b=a; end repeat (2) begin a=b; end $display(\"%0d\", a); end always @(trigger) begin case (a) 0: b=trigger; default: b=a; endcase end",
+        "initial begin a=b[0]; b[0]=a; end always @(trigger) begin a=b[0:0]; b[trigger +: 1]=a; end",
     ] {
         let source = format!("module top; bit trigger, a, b; {processes} endmodule");
         let (definitions, model) = xezim_core::parse_and_elaborate_multi(
@@ -106,6 +107,32 @@ fn root_member_access_still_converts_to_a_hierarchical_name() {
             .join("."),
         "u.q"
     );
+}
+
+/// §11.5.1: equal nested part-selects still need the ordinary collapse.
+#[test]
+fn root_same_range_select_still_collapses() {
+    let source = "module top; bit [3:0] a, b; initial begin a=b[3:0][3:0]; end endmodule";
+    let (_, model) = xezim_core::parse_and_elaborate_multi(
+        &[source.into()],
+        Some("top"),
+        &[],
+        &["root-select.sv".into()],
+        &[],
+    )
+    .expect("nested ranges elaborate");
+    let StatementKind::BlockingAssign { rvalue, .. } =
+        &body(&model.initial_blocks[0].stmt)[0].kind
+    else {
+        panic!("assignment expected");
+    };
+    let ExprKind::RangeSelect { expr: base, .. } = &rvalue.kind else {
+        panic!("part-select expected");
+    };
+    let ExprKind::Ident(name) = &base.kind else {
+        panic!("the repeated part-select must collapse");
+    };
+    assert_eq!(name.path[0].name.name, "b");
 }
 
 /// §23.6: the integrated identity path honors explicit cache ownership,
