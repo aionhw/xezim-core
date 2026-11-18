@@ -2500,7 +2500,9 @@ impl Rw<'_> {
                 rvalue,
             } => {
                 self.expr(lvalue);
-                self.opt(delay);
+                if let Some(delay) = delay {
+                    self.expr(delay);
+                }
                 self.expr(rvalue);
             }
             StatementKind::If {

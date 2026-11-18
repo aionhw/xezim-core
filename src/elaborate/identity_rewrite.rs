@@ -40,7 +40,7 @@ fn identity_stmt(stmt: &Statement) -> bool {
             rvalue,
         } => {
             identity_expr(lvalue)
-                && delay.as_ref().is_none_or(identity_expr)
+                && delay.as_deref().is_none_or(identity_expr)
                 && identity_expr(rvalue)
         }
         StatementKind::Expr(expr) => identity_expr(expr),
