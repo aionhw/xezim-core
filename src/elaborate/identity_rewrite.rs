@@ -7,6 +7,7 @@ use super::{
 };
 use crate::ast::expr::{ExprKind, Expression};
 use crate::ast::stmt::{EventControl, Statement, StatementKind, TimingControl};
+use crate::ast::Span;
 
 /// Whether the final root rewrite is an identity for this narrow syntax set.
 ///
@@ -29,6 +30,273 @@ pub(super) fn can_preserve_root_stmt(stmt: &Statement) -> bool {
         // clear also preserves that state when retaining the expression.
         && MODPORT_SUBST_FLAG.with(|flag| !flag.get());
     root_context && identity_stmt(stmt)
+}
+
+/// Report the first failed identity gate, in predicate order, without
+/// retaining or printing syntax. The caller uses the same empty root maps
+/// as `can_preserve_root_stmt` and calls this only on a rejected body.
+pub(super) fn trace_root_rejection(stmt: &Statement) {
+    if !crate::oom_trace::enabled() {
+        return;
+    }
+    let rejection = context_rejection(stmt.span)
+        .or_else(|| stmt_rejection(stmt))
+        .unwrap_or_else(|| rejection("identity.reject.not_reproduced", stmt.span, 0));
+    crate::oom_trace::checkpoint(
+        rejection.phase,
+        &[
+            ("root_span_start", stmt.span.start),
+            ("root_span_end", stmt.span.end),
+            ("span_start", rejection.span.start),
+            ("span_end", rejection.span.end),
+            ("detail", rejection.detail),
+        ],
+    );
+}
+
+struct RootRejection {
+    phase: &'static str,
+    span: Span,
+    detail: usize,
+}
+
+fn rejection(phase: &'static str, span: Span, detail: usize) -> RootRejection {
+    RootRejection { phase, span, detail }
+}
+
+fn context_rejection(span: Span) -> Option<RootRejection> {
+    let frames = GEN_RENAME_TLS.with(|frames| frames.borrow().len());
+    if frames != 0 {
+        return Some(rejection("identity.reject.context.gen_rename", span, frames));
+    }
+    if let Some(count) =
+        TYPE_BIND_WIDTHS_TLS.with(|bindings| bindings.borrow().as_ref().map(|map| map.len()))
+    {
+        return Some(rejection("identity.reject.context.type_widths", span, count));
+    }
+    if let Some(count) =
+        TYPE_BIND_QUERIES_TLS.with(|bindings| bindings.borrow().as_ref().map(|map| map.len()))
+    {
+        return Some(rejection("identity.reject.context.type_queries", span, count));
+    }
+    if let Some(count) =
+        TYPE_BIND_TYPES_TLS.with(|bindings| bindings.borrow().as_ref().map(|map| map.len()))
+    {
+        return Some(rejection("identity.reject.context.type_bindings", span, count));
+    }
+    if let Some(count) =
+        PKG_FLATTEN_ONLY.with(|packages| packages.borrow().as_ref().map(|set| set.len()))
+    {
+        return Some(rejection("identity.reject.context.package_flatten", span, count));
+    }
+    MODPORT_SUBST_FLAG
+        .with(|flag| flag.get())
+        .then(|| rejection("identity.reject.context.modport_flag", span, 1))
+}
+
+fn stmt_rejection(stmt: &Statement) -> Option<RootRejection> {
+    match &stmt.kind {
+        StatementKind::Null => None,
+        StatementKind::BlockingAssign { lvalue, rvalue } => {
+            expr_rejection(lvalue).or_else(|| expr_rejection(rvalue))
+        }
+        StatementKind::NonblockingAssign {
+            lvalue,
+            delay,
+            rvalue,
+        } => expr_rejection(lvalue)
+            .or_else(|| delay.as_deref().and_then(expr_rejection))
+            .or_else(|| expr_rejection(rvalue)),
+        StatementKind::Expr(expr) => expr_rejection(expr),
+        StatementKind::If {
+            condition,
+            then_stmt,
+            else_stmt,
+            ..
+        } => expr_rejection(condition)
+            .or_else(|| stmt_rejection(then_stmt))
+            .or_else(|| else_stmt.as_deref().and_then(stmt_rejection)),
+        StatementKind::Case { expr, items, .. } => {
+            expr_rejection(expr).or_else(|| {
+                items.iter().find_map(|item| {
+                    if item.pattern.is_some() {
+                        return Some(rejection("identity.reject.case_pattern", item.span, 1));
+                    }
+                    item.patterns.iter().find_map(expr_rejection)
+                        .or_else(|| item.guard.as_deref().and_then(expr_rejection))
+                        .or_else(|| stmt_rejection(&item.stmt))
+                })
+            })
+        }
+        StatementKind::While { condition, body } => {
+            expr_rejection(condition).or_else(|| stmt_rejection(body))
+        }
+        StatementKind::Repeat { count, body } => {
+            expr_rejection(count).or_else(|| stmt_rejection(body))
+        }
+        StatementKind::Wait { condition, stmt } => {
+            expr_rejection(condition).or_else(|| stmt_rejection(stmt))
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().find_map(stmt_rejection)
+        }
+        StatementKind::TimingControl { control, stmt } => {
+            let rejected = match control {
+                TimingControl::Delay(expr) => expr_rejection(expr),
+                TimingControl::Event(event) => match event {
+                    EventControl::Star | EventControl::ParenStar | EventControl::Identifier(_) => {
+                        None
+                    }
+                    EventControl::HierIdentifier(expr) => expr_rejection(expr),
+                    EventControl::EventExpr(events) => events.iter().find_map(|event| {
+                        expr_rejection(&event.expr)
+                            .or_else(|| event.iff.as_ref().and_then(expr_rejection))
+                    }),
+                },
+            };
+            rejected.or_else(|| stmt_rejection(stmt))
+        }
+        other => {
+            let phase = match other {
+                StatementKind::ScopePop => "identity.reject.stmt.scope_pop",
+                StatementKind::LoopStep => "identity.reject.stmt.loop_step",
+                StatementKind::DisableFork => "identity.reject.stmt.disable_fork",
+                StatementKind::For { .. } => "identity.reject.stmt.for",
+                StatementKind::Foreach { .. } => "identity.reject.stmt.foreach",
+                StatementKind::ForeachTail { .. } => "identity.reject.stmt.foreach_tail",
+                StatementKind::DoWhile { .. } => "identity.reject.stmt.do_while",
+                StatementKind::Forever { .. } => "identity.reject.stmt.forever",
+                StatementKind::ForeverTail { .. } => "identity.reject.stmt.forever_tail",
+                StatementKind::EventTrigger { .. } => "identity.reject.stmt.event_trigger",
+                StatementKind::WaitFork => "identity.reject.stmt.wait_fork",
+                StatementKind::Disable(_) => "identity.reject.stmt.disable",
+                StatementKind::Return(_) => "identity.reject.stmt.return",
+                StatementKind::Break => "identity.reject.stmt.break",
+                StatementKind::Continue => "identity.reject.stmt.continue",
+                StatementKind::Assertion(_) => "identity.reject.stmt.assertion",
+                StatementKind::ProceduralContinuous(_) => {
+                    "identity.reject.stmt.procedural_continuous"
+                }
+                StatementKind::VarDecl { .. } => "identity.reject.stmt.var_decl",
+                StatementKind::ParamDecl { .. } => "identity.reject.stmt.param_decl",
+                StatementKind::RandCase { .. } => "identity.reject.stmt.randcase",
+                StatementKind::Typedef(_) => "identity.reject.stmt.typedef",
+                StatementKind::Coverpoint { .. } => "identity.reject.stmt.coverpoint",
+                StatementKind::Cross { .. } => "identity.reject.stmt.cross",
+                StatementKind::RsAction { .. } => "identity.reject.stmt.rs_action",
+                StatementKind::RsReturn => "identity.reject.stmt.rs_return",
+                StatementKind::WaitOrder { .. } => "identity.reject.stmt.wait_order",
+                _ => "identity.reject.stmt.other",
+            };
+            Some(rejection(phase, stmt.span, 0))
+        }
+    }
+}
+
+fn expr_rejection(expr: &Expression) -> Option<RootRejection> {
+    if let Some(width) = expr.cached_width.get() {
+        return Some(rejection(
+            "identity.reject.cache.width",
+            expr.span,
+            width as usize,
+        ));
+    }
+    match &expr.kind {
+        ExprKind::Number(_) | ExprKind::StringLiteral(_) => None,
+        ExprKind::Ident(name) => {
+            let (phase, detail) = if name.root.is_some() {
+                ("identity.reject.ident.rooted", name.path.len())
+            } else if name.bound.is_upward() {
+                ("identity.reject.ident.upward", name.path.len())
+            } else if let Some(signal) = name.cached_signal_id.get() {
+                ("identity.reject.cache.signal", signal as usize)
+            } else if let Some(cached) = name.cached_resolved_name.get() {
+                ("identity.reject.cache.name", cached.len())
+            } else {
+                match name.path.as_slice() {
+                    [segment] if !segment.selects.is_empty() => {
+                        ("identity.reject.ident.selects", segment.selects.len())
+                    }
+                    [segment] if segment.name.name.contains(['.', ':', '$']) => {
+                        ("identity.reject.ident.qualified", segment.name.name.len())
+                    }
+                    [_] => return None,
+                    _ => ("identity.reject.ident.path", name.path.len()),
+                }
+            };
+            Some(rejection(phase, expr.span, detail))
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => expr_rejection(operand),
+        ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
+            expr_rejection(left).or_else(|| expr_rejection(right))
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => expr_rejection(condition)
+            .or_else(|| expr_rejection(then_expr))
+            .or_else(|| expr_rejection(else_expr)),
+        ExprKind::Concatenation(parts) => parts.iter().find_map(expr_rejection),
+        ExprKind::Replication { count, exprs } => {
+            expr_rejection(count).or_else(|| exprs.iter().find_map(expr_rejection))
+        }
+        ExprKind::Index { expr: base, index } => {
+            expr_rejection(base).or_else(|| expr_rejection(index))
+        }
+        ExprKind::RangeSelect {
+            expr: base,
+            left,
+            right,
+            ..
+        } => {
+            if matches!(base.kind, ExprKind::RangeSelect { .. }) {
+                return Some(rejection("identity.reject.nested_range", expr.span, 0));
+            }
+            expr_rejection(base)
+                .or_else(|| expr_rejection(left))
+                .or_else(|| expr_rejection(right))
+        }
+        ExprKind::Call { func, args } => {
+            expr_rejection(func).or_else(|| args.iter().find_map(expr_rejection))
+        }
+        ExprKind::SystemCall { name, args } => {
+            if matches!(
+                name.as_str(),
+                "$bits" | "$left" | "$right" | "$high" | "$low" | "$size" | "$increment"
+                    | "$dimensions" | "$unpacked_dimensions"
+            ) {
+                Some(rejection("identity.reject.type_query", expr.span, args.len()))
+            } else {
+                args.iter().find_map(expr_rejection)
+            }
+        }
+        other => {
+            let phase = match other {
+                ExprKind::TypeLiteral(_) => "identity.reject.expr.type_literal",
+                ExprKind::AssignmentPattern(_) => "identity.reject.expr.assignment_pattern",
+                ExprKind::NamedArg { .. } => "identity.reject.expr.named_arg",
+                ExprKind::Inside { .. } => "identity.reject.expr.inside",
+                ExprKind::Matches { .. } => "identity.reject.expr.matches",
+                ExprKind::MemberAccess { .. } => "identity.reject.expr.member_access",
+                ExprKind::Specialization { .. } => "identity.reject.expr.specialization",
+                ExprKind::Dollar => "identity.reject.expr.dollar",
+                ExprKind::Null => "identity.reject.expr.null",
+                ExprKind::This => "identity.reject.expr.this",
+                ExprKind::Empty => "identity.reject.expr.empty",
+                ExprKind::WithClause { .. } => "identity.reject.expr.with_clause",
+                ExprKind::RandomizeWith { .. } => "identity.reject.expr.randomize_with",
+                ExprKind::AssignExpr { .. } => "identity.reject.expr.assign_expr",
+                ExprKind::StreamOp { .. } => "identity.reject.expr.stream_op",
+                ExprKind::Tagged { .. } => "identity.reject.expr.tagged",
+                ExprKind::SvaClocked { .. } => "identity.reject.expr.sva_clocked",
+                ExprKind::ShallowCopy { .. } => "identity.reject.expr.shallow_copy",
+                ExprKind::TypedPattern { .. } => "identity.reject.expr.typed_pattern",
+                _ => "identity.reject.expr.other",
+            };
+            Some(rejection(phase, expr.span, 0))
+        }
+    }
 }
 
 fn identity_stmt(stmt: &Statement) -> bool {

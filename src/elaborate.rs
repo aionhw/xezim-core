@@ -37167,6 +37167,9 @@ fn inline_instantiations_inner(
         if root_identity && identity_rewrite::can_preserve_root_stmt(stmt) {
             stmt.clone()
         } else {
+            if root_identity && crate::oom_trace::enabled() {
+                identity_rewrite::trace_root_rejection(stmt);
+            }
             rewrite_stmt(stmt, prefix, &port_map, &local_names, &interface_map)
         }
     };
