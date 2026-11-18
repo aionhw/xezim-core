@@ -211,3 +211,63 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
     );
     Some(result)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_batches_preserve_syntax_and_spans() {
+        let text = r#"module one(input wire logic clk, output logic [7:0] q);
+          timeunit 1fs; timeprecision 1fs;
+          typedef struct { int n; byte d[]; } row;
+          row a;
+          function automatic int f(input int x);
+            case (x) 0: return 1; default: return x + 2; endcase
+          endfunction
+          always @(clk) begin if (clk) q = f(3); else q = 0; end
+          initial begin : start
+            for (int i=0; i<3; i++) begin q = i; #1; end
+          end
+          assign q = clk ? 8'h3b : 0;
+        endmodule
+        module two; string s = "endfunction; endmodule"; endmodule"#;
+        let whole = super::super::parse_generated_whole(text).unwrap();
+        for target in [1, 8, 64, 65_536] {
+            let batched = parse(text, target).unwrap();
+            assert_eq!(format!("{whole:?}"), format!("{batched:?}"));
+        }
+    }
+
+    #[test]
+    fn persistent_scope_constructs_keep_the_whole_parser() {
+        assert!(parse("module m; let f(x)=x+1; int q=f(2); endmodule", 8).is_none());
+        assert!(parse("module m(a); input a; endmodule", 8).is_none());
+        assert!(parse("module m; initial fork begin end join endmodule", 8).is_none());
+        assert!(parse("module m; int q endmodule", 8).is_none());
+    }
+
+    #[test]
+    fn lowered_runtime_and_record_design_have_identical_ast() {
+        let source = br#"
+library ieee; use ieee.std_logic_1164.all;
+entity t is end;
+architecture a of t is
+  type row is record value : std_logic_vector(7 downto 0); count : integer; end record;
+  type rows is array (0 to 1) of row;
+  signal r : rows;
+begin
+  process begin
+    r(0).value <= x"a5";
+    r(0).count <= 7 after 1 ns;
+    wait for 2 ns;
+    report "item; endfunction";
+    std.env.finish;
+  end process;
+end;
+"#;
+        let text = super::super::lower_design(&[("work", "records.vhd", source)]).unwrap();
+        let whole = super::super::parse_generated_whole(&text).unwrap();
+        let batched = parse(&text, 64).expect("generated items must use bounded token groups");
+        assert_eq!(format!("{whole:?}"), format!("{batched:?}"));
+    }
+}
