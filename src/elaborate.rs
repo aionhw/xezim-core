@@ -59483,12 +59483,15 @@ mod prepared_process_ownership_tests {
             sources.push(Rc::clone(source));
         }
         assert_eq!(sources.len(), 2);
-        // §5.7.1: cache ordinary literals in the retained source, but leave
-        // warning-producing unsized decimal literals for their evaluator.
+        // §5.7.1: cache literals in the retained source at their full width,
+        // including the sign bit of an unsized decimal magnitude.
         let StatementKind::SeqBlock { stmts, .. } = &sources[0].kind else {
             unreachable!();
         };
-        for (stmt, expected) in stmts.iter().zip([Some((42, 0, 8)), None]) {
+        for (stmt, expected) in stmts
+            .iter()
+            .zip([Some((42, 0, 8)), Some((3_000_000_000, 0, 33))])
+        {
             let StatementKind::BlockingAssign { rvalue, .. } = &stmt.kind else {
                 panic!("assignment expected");
             };

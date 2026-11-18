@@ -4663,13 +4663,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unsized_decimal_literal_wrap_is_reported_at_the_2_31_boundary() {
-        // §5.7.1 sizes an unsized decimal literal signed and exactly 32 bits,
-        // so from 2^31 up it reads back negative. That matches the reference
-        // simulator and stays; this helper is what lets elaboration SAY so
-        // instead of wrapping silently (issue #31: a fitted RNM pole above
-        // 2^31 rad/s written without a decimal point got its sign flipped,
-        // turning a stable state into positive feedback).
+    fn signed_decimal_width_preserves_magnitude() {
+        for (text, width) in [
+            ("0", 32),
+            ("2147483647", 32),
+            ("2147483648", 33),
+            ("2000000000000", 42),
+            ("2_000_000_000_000", 42),
+            ("18446744073709551616", 66),
+        ] {
+            assert_eq!(Value::unsized_integer_width(text, 10, true), width);
+        }
+        assert_eq!(Value::unsized_integer_width("ffffffff", 16, true), 32);
+        assert_eq!(Value::unsized_integer_width("4294967295", 10, false), 32);
+    }
+
+    #[test]
+    fn legacy_decimal_truncation_is_reported_at_the_2_31_boundary() {
+        // Read at exactly 32 signed bits, an unsized decimal from 2^31 up
+        // reads back negative (literals are not sized that way any more, see
+        // `signed_decimal_width_preserves_magnitude`).
         assert_eq!(
             Value::unsized_decimal_wrap(None, 10, "3000000000"),
             Some(-1294967296)
