@@ -3627,6 +3627,7 @@ impl Parser {
                 break;
             }
         }
+        decls.shrink_to_fit();
         decls
     }
 

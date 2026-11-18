@@ -489,6 +489,7 @@ impl Parser {
                 break;
             }
         }
+        decls.shrink_to_fit();
         decls
     }
 
@@ -550,6 +551,7 @@ impl Parser {
                 ports[ansi_ports].span,
             ));
         }
+        items.shrink_to_fit();
         FunctionDeclaration {
             lifetime,
             specifier,
@@ -695,6 +697,7 @@ impl Parser {
         let endlabel = self.parse_end_label();
         self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
+        items.shrink_to_fit();
         TaskDeclaration {
             lifetime,
             specifier,

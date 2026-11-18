@@ -192,6 +192,27 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
                 let end = stream.take();
                 let mut module = assembled?;
                 module.span = Span::new(header[0].span.start, end.span.end);
+                let capacity_before = module.items.capacity();
+                if capacity_before > module.items.len() {
+                    // Drop the large batch-growth allocation before building
+                    // elaboration tables. Move values without cloning their
+                    // contextual caches; the completed AST is not yet indexed.
+                    let mut compact = Vec::with_capacity(module.items.len());
+                    compact.append(&mut module.items);
+                    module.items = compact;
+                }
+                crate::oom_trace::checkpoint(
+                    "vhdl.generated_item_capacity",
+                    &[
+                        ("items", module.items.len()),
+                        ("capacity_before", capacity_before),
+                        ("capacity_after", module.items.capacity()),
+                        (
+                            "item_bytes",
+                            std::mem::size_of::<crate::ast::decl::ModuleItem>(),
+                        ),
+                    ],
+                );
                 result.push(Description::Module(module));
                 // End labels are not emitted; leave them to the whole parser.
                 if stream.next.kind == K::Colon {
