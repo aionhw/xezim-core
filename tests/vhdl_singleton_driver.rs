@@ -47,7 +47,7 @@ fn record_field_uses_its_scalar_type_and_static_destination() {
         "process begin q.b <= 7; wait; end process;",
     );
     scalar_state_only(&sv, 0, 0);
-    assert!(sv.contains("longint vh_spv0_0;"));
+    assert!(sv.contains("int vh_spv0_0;"));
     assert!(sv.contains("vh_dv0_0.f1 = vh_spv0_0;"));
 }
 
