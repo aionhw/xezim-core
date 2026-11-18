@@ -1889,6 +1889,34 @@ impl<'a> Lw<'a> {
         Some(Target::Path(sig, path, cov))
     }
 
+    /// A coverage naming exactly one genuine scalar, not a collapsed
+    /// packed composite leaf (§14.7.2).
+    fn single_scalar_leaf(&self, s: usize, cov: &Cov) -> Option<super::leaves::PendingLeaf> {
+        let Cov::Set(leaves) = cov else { return None };
+        if leaves.len() != 1 { return None; }
+        let global = *leaves.first()?;
+        self.leaf_classes(self.sigs[s].ty)?.iter().enumerate().find_map(|(class, c)| {
+            (global >= c.base && global < c.base + c.count && self.d.is_scalar(c.scalar))
+                .then_some(super::leaves::PendingLeaf { class, local: global - c.base, global })
+        })
+    }
+
+    /// Static target proof, separate from conservative driver coverage:
+    /// a dynamic index in a one-element dimension also has singleton coverage.
+    fn static_single_scalar_target(&mut self, s: usize, path: &[DSel], target: &HExpr) -> bool {
+        // Require the emitted offset itself to be constant, not just its
+        // conservative static coverage (which may ignore a runtime binding).
+        path.iter().all(|sel| match sel {
+            DSel::Field(_) => true,
+            DSel::Elem(off, Some(k)) => off.parse::<i64>().ok() == Some(*k),
+            DSel::Slice(off, _, Some((k, n))) => *n > 0 && off.parse::<i64>().ok() == Some(*k),
+            _ => false,
+        })
+            && self.activity_name_in_bounds(target)
+            && self.activity_path_in_bounds(self.sigs[s].ty, path)
+            && self.single_scalar_leaf(s, &self.path_cov(self.sigs[s].ty, path)).is_some()
+    }
+
     /// projected waveform of this process's driver of s.
     pub(super) fn signal_assign(
         &mut self,
@@ -1923,6 +1951,12 @@ impl<'a> Lw<'a> {
                 (s, Some(path))
             }
         };
+        if let Some(path) = &path
+            && !self.non_singleton_slots.contains(&(sig, p))
+            && !self.static_single_scalar_target(sig, path, target)
+        {
+            self.non_singleton_slots.insert((sig, p));
+        }
         // §10.5.2: only a single default-inertial transaction with no written
         // delay can be represented by one pending value for every activation.
         // A later delayed, transport, null or multi-element waveform makes
@@ -2353,6 +2387,11 @@ impl<'a> Lw<'a> {
                 .then_some((s, p))
             })
             .collect();
+        self.singleton_slot_drivers = self.pending_slot_drivers.iter().filter_map(|&(s, p)| {
+            if self.non_singleton_slots.contains(&(s, p)) { return None; }
+            let single = self.single_scalar_leaf(s, &self.drivers.get(&(s, p))?.cov)?;
+            Some(((s, p), single))
+        }).collect();
         for (gp, (inst, ai, pi)) in self.procs.clone().into_iter().enumerate() {
             let p = d.archs[ai].processes[pi].clone();
             self.inst = inst;
@@ -2604,6 +2643,7 @@ impl<'a> Lw<'a> {
                 ("drivers", self.drivers.len()),
                 ("pending_drivers", self.pending_drivers.len()),
                 ("pending_slot_drivers", self.pending_slot_drivers.len()),
+                ("singleton_slot_drivers", self.singleton_slot_drivers.len()),
                 ("links", self.links.len()),
                 ("subprogram_bytes", self.sub_items.len()),
             ]);

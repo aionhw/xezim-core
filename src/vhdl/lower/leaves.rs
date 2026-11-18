@@ -58,6 +58,14 @@ pub(super) struct LeafClass {
     pub base: i64,
 }
 
+/// A valid scalar subelement selected by every write of one driver.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingLeaf {
+    pub class: usize,
+    pub local: i64,
+    pub global: i64,
+}
+
 impl LeafClass {
     fn dims(&self) -> Vec<i64> {
         self.steps
@@ -568,6 +576,11 @@ impl<'a> Lw<'a> {
         let classes = self.leaf_classes(ty)?;
         let mut out = String::new();
         let _ = writeln!(out, "  {} vh_dv{}_{};", t, s, p);
+        if let Some(single) = self.singleton_slot_drivers.get(&(s, p)).copied() {
+            let et = self.repr(classes[single.class].scalar, loc).sv();
+            let _ = writeln!(out, "  {et} vh_spv{s}_{p};\n  bit vh_spend{s}_{p};");
+            return Some(out);
+        }
         let used = self.driver_classes(s, p);
         let pending_only = self.pending_slot_drivers.contains(&(s, p));
         for (ci, c) in classes.iter().enumerate() {
@@ -700,6 +713,7 @@ impl<'a> Lw<'a> {
     ) {
         let pad = " ".repeat(ind);
         let pending_only = self.pending_slot_drivers.contains(&(s, p));
+        let singleton = self.singleton_slot_drivers.contains_key(&(s, p));
         // A whole packed record array is one pending vector. Parts are
         // overlaid by `drive_path` before this is reached.
         if path.is_empty()
@@ -751,7 +765,8 @@ impl<'a> Lw<'a> {
                 // The whole of a packed vector, with no queued transaction:
                 // one pending value, which replaces those pending by leaf.
                 let mut whole = false;
-                if let Some((_, n)) = pk
+                if !singleton
+                    && let Some((_, n)) = pk
                     && ndim == 1
                     && slice_start.is_none()
                     && slice_len.is_none()
@@ -789,7 +804,8 @@ impl<'a> Lw<'a> {
                 // and the due phase applies nibbles after words so the bit
                 // wins.
                 let mut word = false;
-                if !whole
+                if !singleton
+                    && !whole
                     && let Some((_, n)) = pk
                     && ndim == 1
                     && slice_start.is_none()
@@ -887,6 +903,12 @@ impl<'a> Lw<'a> {
                     };
                 }
                 if self.leaf_zero && self.sig_kind(s).is_none() {
+                    if singleton {
+                        // §10.5.2, §14.7.2: only one scalar can be pending.
+                        // Keep selector evaluation, including its bound checks.
+                        let _ = writeln!(out, "{pad}vh_lk = {key};\n{pad}vh_spv{s}_{p} = {val}; vh_spend{s}_{p} = 1;");
+                        return;
+                    }
                     if pending_only {
                         let _ = writeln!(
                             out,
@@ -925,6 +947,13 @@ impl<'a> Lw<'a> {
         let Some(classes) = self.leaf_classes(self.sigs[s].ty) else {
             return out;
         };
+        if let Some(single) = self.singleton_slot_drivers.get(&(s, p)).copied() {
+            let leaf = Self::leaf_sv(&classes[single.class], &single.local.to_string());
+            let key = single.global.to_string();
+            let activity = self.part_activity_mark(s, Some((&key, &key)));
+            let _ = writeln!(out, "{ind}if (vh_spend{s}_{p}) begin vh_dv{s}_{p}{leaf} = vh_spv{s}_{p}; vh_spend{s}_{p} = 0; vh_s{s}_act = 1;{activity} end");
+            return out;
+        }
         for c in self.driver_classes(s, p) {
             let leaf = Self::leaf_sv(&classes[c], "vh_lk");
             let base = classes[c].base;
@@ -963,6 +992,9 @@ impl<'a> Lw<'a> {
 
     /// The next transaction time of driver (s, p) by parts.
     pub(super) fn slot_driver_next(&self, s: usize, p: usize) -> String {
+        if self.singleton_slot_drivers.contains_key(&(s, p)) {
+            return format!("    if (vh_spend{s}_{p}) n = vh_now;\n");
+        }
         let mut out = String::new();
         let pending_only = self.pending_slot_drivers.contains(&(s, p));
         let classes = self.leaf_classes(self.sigs[s].ty).unwrap_or_default();

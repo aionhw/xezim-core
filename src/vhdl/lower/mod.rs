@@ -154,6 +154,10 @@ struct Lw<'a> {
     /// The same zero-delay proof for per-leaf drivers: keep their pending
     /// masks, lists and words, but no future transaction queues.
     pending_slot_drivers: BTreeSet<(usize, usize)>,
+    /// Part drivers with any target not proved to be one valid static scalar.
+    non_singleton_slots: BTreeSet<(usize, usize)>,
+    /// Frozen subset of pending slots: every write selects the same scalar.
+    singleton_slot_drivers: BTreeMap<(usize, usize), leaves::PendingLeaf>,
     /// Port associations through conversions or partial formals.
     links: Vec<elab::Link>,
     /// Per process: its wait sites.
@@ -349,6 +353,8 @@ impl<'a> Lw<'a> {
             signal_procs: BTreeSet::new(),
             pending_drivers: BTreeSet::new(),
             pending_slot_drivers: BTreeSet::new(),
+            non_singleton_slots: BTreeSet::new(),
+            singleton_slot_drivers: BTreeMap::new(),
             links: Vec::new(),
             sites: Vec::new(),
             pkg_objs: BTreeSet::new(),
