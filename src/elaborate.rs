@@ -36372,9 +36372,7 @@ fn inline_instantiations_inner(
         }
     };
     for (index, block) in elab.always_blocks.iter_mut().enumerate() {
-        if index % 64 == 0 {
-            crate::oom_trace::checkpoint("inline.root_always", &[("block_index", index)]);
-        }
+        crate::oom_trace::checkpoint("inline.root_always", &[("block_index", index)]);
         block.stmt = rewrite_root(&block.stmt);
     }
     crate::oom_trace::checkpoint("inline.root_always.ready", &[]);
@@ -56702,6 +56700,19 @@ fn rewrite_stmt(
     local_names: &std::collections::HashSet<String>,
     interface_map: &HashMap<String, String>,
 ) -> Statement {
+    // A changed enclosing block may still contain unchanged block lists.
+    // Reuse only proven root identities; clone keeps explicit Fresh and
+    // Disabled cache ownership in force for every nested statement.
+    if matches!(
+        stmt.kind,
+        StatementKind::SeqBlock { .. } | StatementKind::ParBlock { .. }
+    ) && prefix.is_empty()
+        && port_map.is_empty()
+        && interface_map.is_empty()
+        && identity_rewrite::can_preserve_root_stmt(stmt)
+    {
+        return stmt.clone();
+    }
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
             lvalue: rewrite_expr(lvalue, prefix, port_map, local_names, interface_map),
