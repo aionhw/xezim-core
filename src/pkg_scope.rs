@@ -1872,7 +1872,7 @@ impl Rw<'_> {
         }
     }
 
-    fn type_name(&mut self, tn: &mut TypeName) {
+    fn type_name(&mut self, tn: &mut TypeName, own_args: bool) {
         for s in &mut tn.scopes {
             for a in &mut s.type_args {
                 self.expr(a);
@@ -1883,13 +1883,27 @@ impl Rw<'_> {
             return;
         }
         // `C::t` (`Outer::Inner::t`, `pkg::C::t`) naming a renamed class-scoped type.
+        let segs: Vec<String> = tn.scopes.iter().map(|s| s.name.name.clone()).collect();
         if tn.scopes.iter().all(|s| s.type_args.is_empty()) {
-            let segs: Vec<String> = tn.scopes.iter().map(|s| s.name.name.clone()).collect();
             if let Some(m) = self.class_scoped_type(&segs, &tn.name.name) {
                 tn.scopes.clear();
                 tn.name.name = m;
                 return;
             }
+        } else if !own_args
+            && !self.is_package(&segs[0])
+            && let Some(m) = self.class_scoped_type(&segs, &tn.name.name)
+            && self.info.classes.contains_key(&m)
+        {
+            // §8.23, §8.25: `C#(..)::Inner` naming a nested class this pass
+            // renamed (another class nests one of the same name): the
+            // nested class goes by its renamed spelling, and the scopes keep
+            // the specialization its enclosing parameters take. The bare
+            // name named whichever class kept it, or none (#1273). A
+            // `pkg::C#(..)::Inner` reference, or one with arguments of its
+            // own, is resolved through its qualified spelling at run time.
+            tn.name.name = m;
+            return;
         }
         let first = tn.scopes[0].name.name.clone();
         if self.is_package(&first) {
@@ -1940,7 +1954,7 @@ impl Rw<'_> {
                 type_args,
                 ..
             } => {
-                self.type_name(name);
+                self.type_name(name, !type_args.is_empty());
                 self.packed(dimensions);
                 type_args.iter_mut().for_each(|a| self.expr(a));
             }
