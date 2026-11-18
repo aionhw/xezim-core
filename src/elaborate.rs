@@ -6262,32 +6262,28 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
     // §26.2: hoist package-scope named properties/sequences into the same
     // maps a module-level declaration populates, so an importing module's
     // `assert property (p(...))` resolves them.
+    // §26.3: each is also registered as `pkg::name`, the spelling
+    // `pkg_scope` gives a reference when two packages declare the name.
     for p in &pkgs {
         for item in &p.items {
-            match item {
-                crate::ast::decl::PackageItem::Property(pd) => {
-                    elab.sequences.insert(pd.name.name.clone());
-                    if let Some(body) = &pd.body {
-                        elab.property_decls
-                            .entry(pd.name.name.clone())
-                            .or_insert_with(|| body.clone());
-                        elab.property_params
-                            .entry(pd.name.name.clone())
-                            .or_insert_with(|| pd.ports.iter().map(|p| p.name.clone()).collect());
-                    }
-                }
-                crate::ast::decl::PackageItem::Sequence(sd) => {
-                    elab.sequences.insert(sd.name.name.clone());
-                    if let Some(body) = &sd.body {
-                        elab.property_decls
-                            .entry(sd.name.name.clone())
-                            .or_insert_with(|| body.clone());
-                        elab.property_params
-                            .entry(sd.name.name.clone())
-                            .or_insert_with(|| sd.ports.iter().map(|p| p.name.clone()).collect());
-                    }
-                }
-                _ => {}
+            let (name, body, ports) = match item {
+                crate::ast::decl::PackageItem::Property(pd) => (&pd.name.name, &pd.body, &pd.ports),
+                crate::ast::decl::PackageItem::Sequence(sd) => (&sd.name.name, &sd.body, &sd.ports),
+                _ => continue,
+            };
+            let qualified = format!("{}::{}", p.name.name, name);
+            elab.sequences.insert(name.clone());
+            elab.sequences.insert(qualified.clone());
+            if let Some(body) = body {
+                let params: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+                elab.property_decls
+                    .entry(name.clone())
+                    .or_insert_with(|| body.clone());
+                elab.property_params
+                    .entry(name.clone())
+                    .or_insert_with(|| params.clone());
+                elab.property_decls.insert(qualified.clone(), body.clone());
+                elab.property_params.insert(qualified, params);
             }
         }
     }
@@ -58162,6 +58158,25 @@ fn process_import(
                         // `import P::my_let;` names it.
                         PackageItem::Let(l) if &l.name.name == sym_name => {
                             elab.lets.insert(l.name.name.clone(), l.clone());
+                            found = true;
+                        }
+                        // §16.8, §16.12, §26.3: so are a named sequence and
+                        // property; the import binds the bare name to this
+                        // package's declaration.
+                        PackageItem::Property(PropertyDeclaration {
+                            name, ports, body, ..
+                        })
+                        | PackageItem::Sequence(SequenceDeclaration {
+                            name, ports, body, ..
+                        }) if &name.name == sym_name => {
+                            elab.sequences.insert(name.name.clone());
+                            if let Some(body) = body {
+                                elab.property_decls.insert(name.name.clone(), body.clone());
+                                elab.property_params.insert(
+                                    name.name.clone(),
+                                    ports.iter().map(|p| p.name.clone()).collect(),
+                                );
+                            }
                             found = true;
                         }
                         PackageItem::Class(c) if &c.name.name == sym_name => {

@@ -1321,6 +1321,14 @@ fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
         PackageItem::Let(l) => {
             out.insert(l.name.name.clone());
         }
+        // §16.8, §16.12, §26.3: a named sequence or property is a package
+        // value too: two packages declaring one name share one bare key.
+        PackageItem::Property(p) => {
+            out.insert(p.name.name.clone());
+        }
+        PackageItem::Sequence(s) => {
+            out.insert(s.name.name.clone());
+        }
         _ => {}
     }
 }
@@ -3521,6 +3529,12 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             }
             ModuleItem::LetDeclaration(l) => {
                 f.values.insert(l.name.name.clone());
+            }
+            ModuleItem::PropertyDeclaration(p) => {
+                f.values.insert(p.name.name.clone());
+            }
+            ModuleItem::SequenceDeclaration(s) => {
+                f.values.insert(s.name.name.clone());
             }
             ModuleItem::ImportDeclaration(imp) => f.add_imports(imp),
             ModuleItem::GenerateRegion(g) => module_item_names(&g.items, f),
