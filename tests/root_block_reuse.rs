@@ -25,6 +25,7 @@ fn full_elaboration_retains_unchanged_root_bodies() {
         "initial fork begin a=0; end begin b=1; end join always @(posedge trigger iff b) begin if (b) a=trigger; else a=~trigger; end",
         "initial begin case (trigger) 0: a=b; default: b=a; endcase while (a) begin b=a; end repeat (2) begin a=b; end $display(\"%0d\", a); end always @(trigger) begin case (a) 0: b=trigger; default: b=a; endcase end",
         "initial begin a=b[0]; b[0]=a; end always @(trigger) begin a=b[0:0]; b[trigger +: 1]=a; end",
+        "initial begin for(a=0;a<1;a=a+1) begin b[a]=trigger; end end always @(trigger) begin for(a=0;a<1;a=a+1) b=trigger; end",
     ] {
         let source = format!("module top; bit trigger, a, b; {processes} endmodule");
         let (definitions, model) = xezim_core::parse_and_elaborate_multi(
