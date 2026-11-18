@@ -1,6 +1,6 @@
 //! Module-level item parsing (IEEE 1800-2017 §A.1)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::Identifier;
 use crate::ast::decl::*;
 use crate::ast::expr::*;
@@ -3627,8 +3627,7 @@ impl Parser {
                 break;
             }
         }
-        decls.shrink_to_fit();
-        decls
+        compact_syntax_list(decls)
     }
 
     fn parse_gate_instantiation(&mut self) -> GateInstantiation {

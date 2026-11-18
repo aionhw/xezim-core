@@ -1,6 +1,6 @@
 //! Statement parsing (IEEE 1800-2017 §A.6)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral};
 use crate::ast::stmt::*;
 use crate::ast::types::{DataType, Lifetime, SimpleType};
@@ -1249,7 +1249,7 @@ impl Parser {
         }
         // Freeze only the used statement slots. Growth capacity is useful
         // while parsing, but otherwise stays resident in every shared block.
-        stmts.shrink_to_fit();
+        let stmts = compact_syntax_list(stmts);
         Statement::new(
             StatementKind::SeqBlock { name, stmts: stmts.into() },
             self.span_from(start),
@@ -1304,7 +1304,7 @@ impl Parser {
                 }
             }
         }
-        stmts.shrink_to_fit();
+        let stmts = compact_syntax_list(stmts);
         Statement::new(
             StatementKind::ParBlock {
                 name,
