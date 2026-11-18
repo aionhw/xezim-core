@@ -235,7 +235,9 @@ pub use value::Value;
 /// \x47 = \x46 + compilation-unit DPI imports and constants only in the definitions that name them
 ///         (§3.12.1, §35.5.4), each compilation-unit variable and net declared once in the hierarchy
 ///         root, and declared types shared per declaration.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x47";
+/// \x48 = \x47 + a formal written with neither a data type nor a direction takes the previous
+///         formal's type (§13.5).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x48";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
