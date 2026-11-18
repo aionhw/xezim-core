@@ -39,8 +39,15 @@ fn wide_std_logic_vector_is_packed() {
         "2048-element std_logic_vector was not packed"
     );
     assert!(
-        sv.contains("vh_txw_pk4_2048"),
-        "driver queue is not the packed form"
+        sv.contains("bit [8191:0] vh_pv"),
+        "the implicit-zero driver's pending value is not packed"
+    );
+    // The queue-form requirement still applies to timed writes; pending
+    // storage is covered by the immediate case and vhdl_pending_driver.
+    let timed = lowered(&slv(2047).replace("q <= not q;", "q <= not q after 1 ns;"));
+    assert!(
+        timed.contains("vh_txw_pk4_2048"),
+        "the timed driver's queue is not packed"
     );
 }
 
