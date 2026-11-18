@@ -3626,7 +3626,10 @@ impl<'a> Lw<'a> {
         let _ = writeln!(k, "    bit vh_any;");
         let _ = writeln!(k, "    vh_elab();\n    vh_now = $time;");
         k.push_str(&self.boundary_sample_init());
-        // Initial effective values (§14.7.5.2), in update order.
+        // Initial effective values (§14.7.5.2), in update order. This
+        // declaration-free block can retain its shared syntax when the
+        // enclosing kernel's local declaration requires scope rewriting.
+        let _ = writeln!(k, "    begin");
         for &step in &order {
             let s = match step {
                 UpdStep::In(n) => {
@@ -3657,6 +3660,7 @@ impl<'a> Lw<'a> {
         for &n in &imp_order {
             let _ = writeln!(k, "    vh_imp{}(1);", n);
         }
+        let _ = writeln!(k, "    end");
         k.push_str(&self.boundary_write(true, "    "));
         let _ = writeln!(
             k,
@@ -3665,16 +3669,32 @@ impl<'a> Lw<'a> {
         for p in &post {
             let _ = writeln!(k, "    vh_post[{}] = 1;", p);
         }
+        // Keep large startup lists in bounded, declaration-free blocks.
+        // Sequential blocks introduce no scheduler yield; normal processes
+        // still suspend before postponed processes start (§14.7.5.2).
+        const INITIALIZATION_BATCH: usize = 1024;
         for pass in [false, true] {
+            let mut in_batch = 0;
             for p in 0..nprocs {
                 if post.contains(&p) != pass {
                     continue;
+                }
+                if in_batch == 0 {
+                    let _ = writeln!(k, "    begin");
                 }
                 if fp.contains(&p) {
                     let _ = writeln!(k, "    vh_run{}();", p);
                 } else {
                     let _ = writeln!(k, "    vh_go[{p}] = 1; wait (vh_go[{p}] == 0);", p = p);
                 }
+                in_batch += 1;
+                if in_batch == INITIALIZATION_BATCH {
+                    let _ = writeln!(k, "    end");
+                    in_batch = 0;
+                }
+            }
+            if in_batch != 0 {
+                let _ = writeln!(k, "    end");
             }
         }
         let _ = writeln!(k, "    vh_nxt = vh_next();");

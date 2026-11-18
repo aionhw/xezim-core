@@ -234,7 +234,8 @@ pub use value::Value;
 /// \x47 = \x46 + shared sequential and parallel statement block bodies (§9.3).
 /// \x48 = \x47 + boxed optional assignment delays and inferred assertion clocks.
 /// \x49 = \x48 + compact optional declaration payloads and cold module constructs.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x49";
+/// \x4a = \x49 + boxed optional case matching patterns and guards (§12.6).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4a";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

@@ -2490,7 +2490,7 @@ impl Rw<'_> {
                     if let Some(p) = &mut it.pattern {
                         self.pattern(p);
                     }
-                    self.opt(&mut it.guard);
+                    self.opt_box(&mut it.guard);
                     self.stmt(&mut it.stmt);
                 }
             }

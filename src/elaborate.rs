@@ -56783,14 +56783,24 @@ fn rewrite_stmt(
                     span: item.span,
                     // §12.6: rewrite constant-expression sub-patterns and the
                     // `&&&` guard; tags and `.v` binding names are not signals.
-                    pattern: item
-                        .pattern
-                        .as_ref()
-                        .map(|p| rewrite_pattern(p, prefix, port_map, local_names, interface_map)),
-                    guard: item
-                        .guard
-                        .as_ref()
-                        .map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
+                    pattern: item.pattern.as_deref().map(|p| {
+                        Box::new(rewrite_pattern(
+                            p,
+                            prefix,
+                            port_map,
+                            local_names,
+                            interface_map,
+                        ))
+                    }),
+                    guard: item.guard.as_deref().map(|g| {
+                        Box::new(rewrite_expr(
+                            g,
+                            prefix,
+                            port_map,
+                            local_names,
+                            interface_map,
+                        ))
+                    }),
                 })
                 .collect(),
         },

@@ -64,12 +64,13 @@ fn identity_stmt(stmt: &Statement) -> bool {
                     // them on the complete scope rewrite path.
                     item.pattern.is_none()
                         && item.patterns.iter().all(identity_expr)
-                        && item.guard.as_ref().is_none_or(identity_expr)
+                        && item.guard.as_deref().is_none_or(identity_expr)
                         && identity_stmt(&item.stmt)
                 })
         }
         StatementKind::While { condition, body } => identity_expr(condition) && identity_stmt(body),
         StatementKind::Repeat { count, body } => identity_expr(count) && identity_stmt(body),
+        StatementKind::Wait { condition, stmt } => identity_expr(condition) && identity_stmt(stmt),
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             // No accepted child introduces a declaration. The scoped list
             // walk therefore has no local-name shadowing to apply (§6.21).
@@ -256,6 +257,7 @@ mod tests {
             "begin case (a) 0: b = c; 1, 2: begin b = 1; end default: b = 0; endcase end",
             "begin case (a) inside [0:3]: b = c; default: b = 0; endcase end",
             "begin while (a) begin b = c; end repeat (2) begin c = b; end end",
+            "begin wait (a) begin b = c; end end",
             "begin $display(\"value=%0d\", a); b = $clog2(8); $finish; end",
             "@(posedge clk iff enable) begin a <= b; end",
             "@(posedge clk or negedge enable) begin a <= b; end",
@@ -286,6 +288,7 @@ mod tests {
             "begin $display(child.value); end",
             "begin case (a) 0: b = child.value; endcase end",
             "begin while (child.value) b = c; end",
+            "begin wait (child.ready) b = c; end",
             "begin repeat (a) b = child.value; end",
             "begin int local_value; a = local_value; end",
             "begin while (a) begin int local_value; b = local_value; end end",
@@ -366,10 +369,12 @@ mod tests {
         let StatementKind::Case { items, .. } = &mut source.kind else {
             panic!("case expected");
         };
-        items[0].pattern = Some(crate::ast::stmt::Pattern::Binding(crate::ast::Identifier {
-            name: "captured".to_string(),
-            span: crate::ast::Span::dummy(),
-        }));
+        items[0].pattern = Some(Box::new(crate::ast::stmt::Pattern::Binding(
+            crate::ast::Identifier {
+                name: "captured".to_string(),
+                span: crate::ast::Span::dummy(),
+            },
+        )));
         assert!(!can_preserve_root_stmt(&source));
     }
 
@@ -385,6 +390,13 @@ mod tests {
         let source = initial("while (a) b = c;");
         let StatementKind::While { condition, .. } = &source.kind else {
             panic!("while expected");
+        };
+        condition.cached_width.set(Some(1));
+        assert!(!can_preserve_root_stmt(&source));
+
+        let source = initial("wait (a) b = c;");
+        let StatementKind::Wait { condition, .. } = &source.kind else {
+            panic!("wait expected");
         };
         condition.cached_width.set(Some(1));
         assert!(!can_preserve_root_stmt(&source));
