@@ -151,6 +151,9 @@ struct Lw<'a> {
     /// Frozen after driver discovery: whole scalar drivers whose every
     /// assignment is one implicit-zero, non-null inertial transaction.
     pending_drivers: BTreeSet<(usize, usize)>,
+    /// The same zero-delay proof for per-leaf drivers: keep their pending
+    /// masks, lists and words, but no future transaction queues.
+    pending_slot_drivers: BTreeSet<(usize, usize)>,
     /// Port associations through conversions or partial formals.
     links: Vec<elab::Link>,
     /// Per process: its wait sites.
@@ -182,6 +185,10 @@ struct Lw<'a> {
     imp_refs: Vec<usize>,
     /// Signals whose time of last activity is kept (`'last_active`).
     need_lact: BTreeSet<usize>,
+    /// Activity of statically selected scalar subelements (§16.2.4).
+    part_activity: Vec<elab::PartActivity>,
+    /// Signal formals whose activity is observed, including through calls.
+    signal_activity_params: Option<BTreeSet<ObjId>>,
     /// `'driving`/`'driving_value` uses: signal, process, location (the
     /// process must have a driver of the signal).
     drv_checks: Vec<(usize, usize, Loc)>,
@@ -230,8 +237,8 @@ struct Lw<'a> {
     /// Processes with a sensitivity list, run by the kernel's cycle block
     /// (and lowered as functions in a mixed design, for the eager path).
     fprocs: BTreeSet<usize>,
-    /// Their bodies: process, temporaries, statements.
-    fproc_bodies: Vec<(usize, String, String)>,
+    /// Process id, inline line estimate, and reusable body call.
+    fproc_bodies: Vec<(usize, usize, String)>,
     /// The process being lowered assigns a record or struct-array
     /// variable: it runs as a called function (the simulator's compiled
     /// `always` blocks do not copy structs between module variables).
@@ -341,6 +348,7 @@ impl<'a> Lw<'a> {
             queued_drivers: BTreeSet::new(),
             signal_procs: BTreeSet::new(),
             pending_drivers: BTreeSet::new(),
+            pending_slot_drivers: BTreeSet::new(),
             links: Vec::new(),
             sites: Vec::new(),
             pkg_objs: BTreeSet::new(),
@@ -356,6 +364,8 @@ impl<'a> Lw<'a> {
             standalone_fns: HashMap::new(),
             imp_refs: Vec::new(),
             need_lact: BTreeSet::new(),
+            part_activity: Vec::new(),
+            signal_activity_params: None,
             drv_checks: Vec::new(),
             read_drv: None,
             forced: BTreeSet::new(),

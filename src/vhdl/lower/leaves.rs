@@ -369,6 +369,21 @@ impl<'a> Lw<'a> {
         runs
     }
 
+    /// Whether a static selection covers every scalar leaf, without the
+    /// conservative size limit of driver coverage (§14.7.2).
+    pub(super) fn path_covers_all_leaves(&self, t: TypeId, path: &[DSel]) -> bool {
+        let Some(classes) = self.leaf_classes(t) else { return false };
+        !classes.is_empty() && classes.iter().all(|c| {
+            let mut steps = c.steps.iter();
+            path.iter().all(|sel| match (sel, steps.next()) {
+                (DSel::Field(i), Some(Step::Field(j))) => i == j,
+                (DSel::Elem(_, Some(0)), Some(Step::Dim(1) | Step::PDim(1, _))) => true,
+                (DSel::Slice(_, _, Some((0, len))), Some(Step::Dim(n) | Step::PDim(n, _))) => len == n,
+                _ => false,
+            })
+        })
+    }
+
     /// The global numbers of the leaves under a path; a step with an
     /// offset computed at run time covers every offset of its dimension.
     pub(super) fn path_cov(&self, t: TypeId, path: &[DSel]) -> Cov {
@@ -509,8 +524,9 @@ impl<'a> Lw<'a> {
             .collect()
     }
 
-    /// Driver (s, p) of a signal assigned by parts: per leaf class, queues
-    /// of transaction times, leaves and values, the function adding a
+    /// Driver (s, p) of a signal assigned by parts: per leaf class, pending
+    /// values and, when needed, queues of transaction times, leaves and
+    /// values, the function adding a
     /// transaction (§10.5.2.2) and the one applying those due; and
     /// `vh_drv_{s}_{p}` driving every leaf from a whole value.
     pub(super) fn slot_driver_sv(
@@ -526,13 +542,18 @@ impl<'a> Lw<'a> {
         let mut out = String::new();
         let _ = writeln!(out, "  {} vh_dv{}_{};", t, s, p);
         let used = self.driver_classes(s, p);
+        let pending_only = self.pending_slot_drivers.contains(&(s, p));
         for (ci, c) in classes.iter().enumerate() {
             if !used.contains(&ci) {
                 continue;
             }
             let r = self.repr(c.scalar, loc);
             let et = r.sv();
-            let tx = self.slot_tx(&r);
+            let tx = if pending_only {
+                String::new()
+            } else {
+                self.slot_tx(&r)
+            };
             let cap = c.count.max(1);
             // A zero-delay assignment of the whole vector is one pending
             // value (`emit_leaves`); a queued transaction first queues it.
@@ -549,17 +570,19 @@ impl<'a> Lw<'a> {
                     p = p,
                     ci = ci
                 );
-                let _ = write!(
-                    wflush,
-                    "    if (vh_pwwn{s}_{p}_c{ci} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{ci}; vh_pi = vh_pi + 1) begin vh_lkk = vh_pwwi{s}_{p}_c{ci}[vh_pi]; if (vh_pwwm{s}_{p}_c{ci}[vh_lkk]) begin for (vh_pj = 0; vh_pj < {n}; vh_pj = vh_pj + 1) {tx}(vh_dt{s}_{p}_c{ci}, vh_dk{s}_{p}_c{ci}, vh_dq{s}_{p}_c{ci}, vh_lkk * {n} + vh_pj, vh_pww{s}_{p}_c{ci}[vh_lkk][{w} * ({n1} - vh_pj) +: {w}], 64'sd0, 64'sd0, 0); vh_pwwm{s}_{p}_c{ci}[vh_lkk] = 0; end end vh_pwwn{s}_{p}_c{ci} = 0; end\n",
-                    n1 = n - 1,
-                    s = s,
-                    p = p,
-                    ci = ci,
-                    tx = tx,
-                    n = n,
-                    w = w
-                );
+                if !pending_only {
+                    let _ = write!(
+                        wflush,
+                        "    if (vh_pwwn{s}_{p}_c{ci} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{ci}; vh_pi = vh_pi + 1) begin vh_lkk = vh_pwwi{s}_{p}_c{ci}[vh_pi]; if (vh_pwwm{s}_{p}_c{ci}[vh_lkk]) begin for (vh_pj = 0; vh_pj < {n}; vh_pj = vh_pj + 1) {tx}(vh_dt{s}_{p}_c{ci}, vh_dk{s}_{p}_c{ci}, vh_dq{s}_{p}_c{ci}, vh_lkk * {n} + vh_pj, vh_pww{s}_{p}_c{ci}[vh_lkk][{w} * ({n1} - vh_pj) +: {w}], 64'sd0, 64'sd0, 0); vh_pwwm{s}_{p}_c{ci}[vh_lkk] = 0; end end vh_pwwn{s}_{p}_c{ci} = 0; end\n",
+                        n1 = n - 1,
+                        s = s,
+                        p = p,
+                        ci = ci,
+                        tx = tx,
+                        n = n,
+                        w = w
+                    );
+                }
             }
             if let Some((_, w, n)) = Self::whole_class(c) {
                 let _ = writeln!(
@@ -567,18 +590,36 @@ impl<'a> Lw<'a> {
                     "  bit [{hi}:0] vh_pw{s}_{p}_c{ci};\n  bit vh_pwf{s}_{p}_c{ci};",
                     hi = w as i64 * n - 1
                 );
-                let _ = write!(
-                    flush,
-                    "    if (vh_pwf{s}_{p}_c{ci}) begin\n      vh_pwf{s}_{p}_c{ci} = 0;\n      for (vh_pj = 0; vh_pj < {n}; vh_pj = vh_pj + 1) {tx}(vh_dt{s}_{p}_c{ci}, vh_dk{s}_{p}_c{ci}, vh_dq{s}_{p}_c{ci}, vh_pj, vh_pw{s}_{p}_c{ci}[{w} * ({n1} - vh_pj) +: {w}], 64'sd0, 64'sd0, 0);\n    end\n",
-                    n1 = n - 1
-                );
+                if !pending_only {
+                    let _ = write!(
+                        flush,
+                        "    if (vh_pwf{s}_{p}_c{ci}) begin\n      vh_pwf{s}_{p}_c{ci} = 0;\n      for (vh_pj = 0; vh_pj < {n}; vh_pj = vh_pj + 1) {tx}(vh_dt{s}_{p}_c{ci}, vh_dk{s}_{p}_c{ci}, vh_dq{s}_{p}_c{ci}, vh_pj, vh_pw{s}_{p}_c{ci}[{w} * ({n1} - vh_pj) +: {w}], 64'sd0, 64'sd0, 0);\n    end\n",
+                        n1 = n - 1
+                    );
+                }
             }
+            if pending_only {
+                // §10.5.2, §14.7.2: every write is a pending next-delta
+                // value. Equal-value writes still enter the activity list.
+                let _ = write!(
+                    out,
+                    "  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n",
+                    s = s,
+                    p = p,
+                    c = ci,
+                    et = et,
+                    cnt1 = c.count.max(1) - 1,
+                    cap1 = cap - 1
+                );
+                continue;
+            }
+            let activity = self.part_activity_mark(s, Some((&format!("{} + k", c.base), &format!("{} + k", c.base))));
             // Pending zero-delay values by leaf, the leaves pending (each
             // once), and their number (the fast path of `emit_leaves`); a
             // queued transaction first moves the pending ones into the queue.
             let _ = write!(
                 out,
-                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  int vh_sqn{s}_{p}_c{c};\n  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n{wflush}{flush}    for (vh_pj = 0; vh_pj < vh_pn{s}_{p}_c{c}; vh_pj = vh_pj + 1) begin\n      vh_lkk = vh_pl{s}_{p}_c{c}[vh_pj];\n      if (vh_pm{s}_{p}_c{c}[vh_lkk]) begin {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, vh_lkk, vh_pf{s}_{p}_c{c}[vh_lkk], 64'sd0, 64'sd0, 0); vh_pm{s}_{p}_c{c}[vh_lkk] = 0; end\n    end\n    vh_pn{s}_{p}_c{c} = 0;\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= vh_now) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;\n    end\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n",
+                "  longint vh_dt{s}_{p}_c{c}[$];\n  longint vh_dk{s}_{p}_c{c}[$];\n  {et} vh_dq{s}_{p}_c{c}[$];\n  int vh_sqn{s}_{p}_c{c};\n  {et} vh_pf{s}_{p}_c{c} [0:{cnt1}];\n  bit vh_pm{s}_{p}_c{c} [0:{cnt1}];\n  longint vh_pl{s}_{p}_c{c} [0:{cap1}];\n  int vh_pn{s}_{p}_c{c};\n  function automatic void vh_drs_{s}_{p}_c{c}(longint k, {et} v, longint after, longint rej, int mode);\n{wflush}{flush}    for (vh_pj = 0; vh_pj < vh_pn{s}_{p}_c{c}; vh_pj = vh_pj + 1) begin\n      vh_lkk = vh_pl{s}_{p}_c{c}[vh_pj];\n      if (vh_pm{s}_{p}_c{c}[vh_lkk]) begin {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, vh_lkk, vh_pf{s}_{p}_c{c}[vh_lkk], 64'sd0, 64'sd0, 0); vh_pm{s}_{p}_c{c}[vh_lkk] = 0; end\n    end\n    vh_pn{s}_{p}_c{c} = 0;\n    {tx}(vh_dt{s}_{p}_c{c}, vh_dk{s}_{p}_c{c}, vh_dq{s}_{p}_c{c}, k, v, after, rej, mode);\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n  function automatic void vh_drd_{s}_{p}_c{c}();\n    longint k;\n    while (vh_dt{s}_{p}_c{c}.size() > 0 && vh_dt{s}_{p}_c{c}[0] <= vh_now) begin\n      void'(vh_dt{s}_{p}_c{c}.pop_front());\n      k = vh_dk{s}_{p}_c{c}.pop_front();\n      vh_dv{s}_{p}{leaf} = vh_dq{s}_{p}_c{c}.pop_front();\n      vh_s{s}_act = 1;{activity}\n    end\n    vh_sqn{s}_{p}_c{c} = vh_dt{s}_{p}_c{c}.size();\n  endfunction\n",
                 s = s,
                 p = p,
                 c = ci,
@@ -592,7 +633,7 @@ impl<'a> Lw<'a> {
             );
         }
         // Whole assignments: only by a driver covering every leaf.
-        if used.len() != classes.len() {
+        if pending_only || used.len() != classes.len() {
             return Some(out);
         }
         let mut body = String::new();
@@ -631,6 +672,7 @@ impl<'a> Lw<'a> {
         depth: usize,
     ) {
         let pad = " ".repeat(ind);
+        let pending_only = self.pending_slot_drivers.contains(&(s, p));
         // A whole packed record array is one pending vector. Parts are
         // overlaid by `drive_path` before this is reached.
         if path.is_empty()
@@ -638,6 +680,13 @@ impl<'a> Lw<'a> {
             && self.record_array_pack(t).is_some()
             && let Some(ci) = self.packed_record_class(s)
         {
+            if pending_only {
+                let _ = writeln!(
+                    out,
+                    "{pad}vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1;"
+                );
+                return;
+            }
             let _ = writeln!(
                 out,
                 "{pad}if (vh_sqn{s}_{p}_c{ci} == 0) begin vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1; end else vh_drs_{s}_{p}_c{ci}(0, {val}, after, rej, mode);",
@@ -691,6 +740,13 @@ impl<'a> Lw<'a> {
                         .position(|c| Self::whole_class(c).is_some_and(|(q, _, m)| q == pre && m == n))
                         && self.driver_classes(s, p).contains(&ci)
                     {
+                        if pending_only {
+                            let _ = writeln!(
+                                out,
+                                "{pad}if (vh_pn{s}_{p}_c{ci} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{ci}; vh_pi = vh_pi + 1) vh_pm{s}_{p}_c{ci}[vh_pl{s}_{p}_c{ci}[vh_pi]] = 0; vh_pn{s}_{p}_c{ci} = 0; end\n{pad}vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1;"
+                            );
+                            return;
+                        }
                         whole = true;
                         let _ = writeln!(
                             out,
@@ -722,9 +778,14 @@ impl<'a> Lw<'a> {
                     && let Some(key) = Self::word_key(c, path)
                 {
                     word = true;
+                    let guard = if pending_only {
+                        format!("vh_pn{s}_{p}_c{ci} == 0")
+                    } else {
+                        format!("vh_sqn{s}_{p}_c{ci} == 0 && vh_pn{s}_{p}_c{ci} == 0")
+                    };
                     let _ = writeln!(
                         out,
-                        "{pad}if (vh_sqn{s}_{p}_c{c} == 0 && vh_pn{s}_{p}_c{c} == 0) begin\n{pad}  vh_lk = {key};\n{pad}  vh_pww{s}_{p}_c{c}[vh_lk] = {val}; if (!vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_pwwm{s}_{p}_c{c}[vh_lk] = 1; vh_pwwi{s}_{p}_c{c}[vh_pwwn{s}_{p}_c{c}] = vh_lk; vh_pwwn{s}_{p}_c{c} = vh_pwwn{s}_{p}_c{c} + 1; end\n{pad}end else begin",
+                        "{pad}if ({guard}) begin\n{pad}  vh_lk = {key};\n{pad}  vh_pww{s}_{p}_c{c}[vh_lk] = {val}; if (!vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_pwwm{s}_{p}_c{c}[vh_lk] = 1; vh_pwwi{s}_{p}_c{c}[vh_pwwn{s}_{p}_c{c}] = vh_lk; vh_pwwn{s}_{p}_c{c} = vh_pwwn{s}_{p}_c{c} + 1; end\n{pad}end else begin",
                         pad = pad,
                         key = key,
                         c = ci,
@@ -799,6 +860,13 @@ impl<'a> Lw<'a> {
                     };
                 }
                 if self.leaf_zero && self.sig_kind(s).is_none() {
+                    if pending_only {
+                        let _ = writeln!(
+                            out,
+                            "{pad}vh_lk = {key};\n{pad}vh_pf{s}_{p}_c{ci}[vh_lk] = {val}; if (!vh_pm{s}_{p}_c{ci}[vh_lk]) begin vh_pm{s}_{p}_c{ci}[vh_lk] = 1; vh_pl{s}_{p}_c{ci}[vh_pn{s}_{p}_c{ci}] = vh_lk; vh_pn{s}_{p}_c{ci} = vh_pn{s}_{p}_c{ci} + 1; end"
+                        );
+                        return;
+                    }
                     // A zero-delay assignment to a leaf without queued
                     // transactions: a pending value (compiled code), applied
                     // by the update phase; else the queue (`vh_drs`).
@@ -826,35 +894,42 @@ impl<'a> Lw<'a> {
     /// Kernel: apply the due transactions of driver (s, p) by parts.
     pub(super) fn slot_driver_due(&self, s: usize, p: usize, ind: &str) -> String {
         let mut out = String::new();
+        let pending_only = self.pending_slot_drivers.contains(&(s, p));
         let Some(classes) = self.leaf_classes(self.sigs[s].ty) else {
             return out;
         };
         for c in self.driver_classes(s, p) {
             let leaf = Self::leaf_sv(&classes[c], "vh_lk");
+            let base = classes[c].base;
+            let leaf_activity = self.part_activity_mark(s, Some((&format!("{base} + vh_lk"), &format!("{base} + vh_lk"))));
             if let Some((pre, ..)) = Self::whole_class(&classes[c]) {
+                let activity = self.part_activity_mark(s, Some((&base.to_string(), &(base + classes[c].count - 1).to_string())));
                 let _ = writeln!(
                     out,
-                    "{ind}if (vh_pwf{s}_{p}_c{c}) begin vh_dv{s}_{p}{pre} = vh_pw{s}_{p}_c{c}; vh_pwf{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end"
+                    "{ind}if (vh_pwf{s}_{p}_c{c}) begin vh_dv{s}_{p}{pre} = vh_pw{s}_{p}_c{c}; vh_pwf{s}_{p}_c{c} = 0; vh_s{s}_act = 1;{activity} end"
                 );
             }
-            if Self::word_pending(&classes[c]).is_some()
+            if let Some((_, _, n)) = Self::word_pending(&classes[c])
                 && let Some(pre) = Self::packed_word_sv(&classes[c], "vh_lk")
             {
+                let activity = self.part_activity_mark(s, Some((&format!("{base} + vh_lk * {n}"), &format!("{base} + (vh_lk + 1) * {n} - 1"))));
                 let _ = writeln!(
                     out,
-                    "{ind}if (vh_pwwn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pwwi{s}_{p}_c{c}[vh_pi]; if (vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{pre} = vh_pww{s}_{p}_c{c}[vh_lk]; vh_pwwm{s}_{p}_c{c}[vh_lk] = 0; end end vh_pwwn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end"
+                    "{ind}if (vh_pwwn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pwwi{s}_{p}_c{c}[vh_pi]; if (vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{pre} = vh_pww{s}_{p}_c{c}[vh_lk]; vh_pwwm{s}_{p}_c{c}[vh_lk] = 0;{activity} end end vh_pwwn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end"
                 );
             }
             let _ = writeln!(
                 out,
-                "{ind}if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pl{s}_{p}_c{c}[vh_pi]; if (vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{leaf} = vh_pf{s}_{p}_c{c}[vh_lk]; vh_pm{s}_{p}_c{c}[vh_lk] = 0; end end vh_pn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end",
+                "{ind}if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pl{s}_{p}_c{c}[vh_pi]; if (vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{leaf} = vh_pf{s}_{p}_c{c}[vh_lk]; vh_pm{s}_{p}_c{c}[vh_lk] = 0;{leaf_activity} end end vh_pn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end",
                 ind = ind,
                 s = s,
                 p = p,
                 c = c,
                 leaf = leaf
             );
-            let _ = writeln!(out, "{ind}if (vh_sqn{s}_{p}_c{c} > 0) vh_drd_{s}_{p}_c{c}();", ind = ind, s = s, p = p, c = c);
+            if !pending_only {
+                let _ = writeln!(out, "{ind}if (vh_sqn{s}_{p}_c{c} > 0) vh_drd_{s}_{p}_c{c}();", ind = ind, s = s, p = p, c = c);
+            }
         }
         out
     }
@@ -862,6 +937,7 @@ impl<'a> Lw<'a> {
     /// The next transaction time of driver (s, p) by parts.
     pub(super) fn slot_driver_next(&self, s: usize, p: usize) -> String {
         let mut out = String::new();
+        let pending_only = self.pending_slot_drivers.contains(&(s, p));
         let classes = self.leaf_classes(self.sigs[s].ty).unwrap_or_default();
         for c in self.driver_classes(s, p) {
             if classes.get(c).is_some_and(|c| Self::whole_class(c).is_some()) {
@@ -870,13 +946,17 @@ impl<'a> Lw<'a> {
             if classes.get(c).is_some_and(|c| Self::word_pending(c).is_some()) {
                 let _ = writeln!(out, "    if (vh_pwwn{s}_{p}_c{c} > 0) n = vh_now;");
             }
-            let _ = writeln!(
-                out,
-                "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now; else if (vh_sqn{s}_{p}_c{c} > 0 && (n < 0 || vh_dt{s}_{p}_c{c}[0] < n)) n = vh_dt{s}_{p}_c{c}[0];",
-                s = s,
-                p = p,
-                c = c
-            );
+            if pending_only {
+                let _ = writeln!(out, "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now;");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now; else if (vh_sqn{s}_{p}_c{c} > 0 && (n < 0 || vh_dt{s}_{p}_c{c}[0] < n)) n = vh_dt{s}_{p}_c{c}[0];",
+                    s = s,
+                    p = p,
+                    c = c
+                );
+            }
         }
         out
     }
@@ -1317,7 +1397,13 @@ impl<'a> Lw<'a> {
         let (after, rej, mode) = timing;
         let pad = " ".repeat(ind);
         let zero = after == "64'sd0" && rej == "64'sd0" && mode == 1;
-        let inner = if zero {
+        let pending_only = zero && self.pending_slot_drivers.contains(&(s, p));
+        let inner = if pending_only {
+            format!(
+                "{pad}  if (!vh_pwf{s}_{p}_c{ci}) begin vh_pw{s}_{p}_c{ci} = vh_dv{s}_{p}; vh_pwf{s}_{p}_c{ci} = 1; end\n\
+                 {pad}  vh_pw{s}_{p}_c{ci}[({lo}) +: {width}] = {val};\n"
+            )
+        } else if zero {
             format!(
                 "{pad}  if (vh_sqn{s}_{p}_c{ci} == 0) begin\n\
                  {pad}    if (!vh_pwf{s}_{p}_c{ci}) begin vh_pw{s}_{p}_c{ci} = vh_dv{s}_{p}; vh_pwf{s}_{p}_c{ci} = 1; end\n\
@@ -1349,6 +1435,9 @@ impl<'a> Lw<'a> {
                 ci = ci
             )
         };
+        if pending_only {
+            return Some(format!("{pad}begin\n{inner}{pad}end\n"));
+        }
         Some(format!(
             "{pad}begin\n{pad}  longint after, rej;\n{pad}  int mode;\n{pad}  after = {after}; rej = {rej}; mode = {mode};\n{inner}{pad}end\n",
             pad = pad,
@@ -1393,6 +1482,11 @@ impl<'a> Lw<'a> {
         let saved = std::mem::replace(&mut self.leaf_zero, after == "64'sd0" && rej == "64'sd0" && mode == 1);
         self.emit_leaves(s, p, t, val, &mut prefix, slice_start, slice_len, &mut body, ind + 2, 0);
         self.leaf_zero = saved;
+        if self.pending_slot_drivers.contains(&(s, p)) {
+            // The timing values are compile-time zero and none of the
+            // retained pending paths references transaction parameters.
+            return format!("{pad}begin\n{body}{pad}end\n");
+        }
         format!(
             "{pad}begin\n{pad}  longint after, rej;\n{pad}  int mode;\n{pad}  after = {after}; rej = {rej}; mode = {mode};\n{body}{pad}end\n",
             pad = pad,

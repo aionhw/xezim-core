@@ -92,6 +92,14 @@ pub(super) struct SigRef {
     pub part: Part,
 }
 
+/// An observed static part, updated from transactions rather than value changes.
+#[derive(Clone, Debug)]
+pub(super) struct PartActivity {
+    pub sig: usize,
+    pub leaves: Vec<i64>,
+    pub loc: Loc,
+}
+
 /// The elements a driver covers.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Cov {
@@ -1325,7 +1333,10 @@ impl<'a> Lw<'a> {
             let r = self.erepr(x);
             return Some(match name {
                 "event" => format!("({}_ev && !{})", p, self.eq_expr(&r, &cur, &last)),
-                "active" => format!("{}_act", p),
+                "active" => {
+                    self.err(&x.loc, "activity of a signal parameter part is not supported yet");
+                    "0".into()
+                }
                 "last_value" => last,
                 "last_active" => {
                     self.err(
@@ -1341,6 +1352,9 @@ impl<'a> Lw<'a> {
         if self.whole_sig(x).is_some() {
             return Some(self.whole_attr(s, name));
         }
+        if matches!(name, "active" | "last_active") {
+            return Some(self.part_activity_attr(x, name));
+        }
         let cur = self.ex(x);
         let last = self.ex_last(x);
         let r = self.erepr(x);
@@ -1349,6 +1363,74 @@ impl<'a> Lw<'a> {
             "last_value" => last,
             _ => self.whole_attr(s, name),
         })
+    }
+
+    /// §16.2.4: a composite part is active iff one of its scalar
+    /// subelements has a transaction in this cycle, including equal values.
+    fn part_activity_attr(&mut self, x: &HExpr, name: &str) -> String {
+        let selected = self.target_path(x).and_then(|(s, path)| {
+            let static_path = path.iter().all(|p| matches!(p,
+                DSel::Field(_) | DSel::Elem(_, Some(_)) | DSel::Slice(_, _, Some(_))));
+            let classes = self.leaf_classes(self.sigs[s].ty)?;
+            // Packed record arrays collapse several scalars into one leaf.
+            let scalar_leaves = classes.iter().all(|c| !matches!(
+                self.d.types[self.base(c.scalar)].kind,
+                TypeKind::Array { .. } | TypeKind::Record(_)));
+            if !static_path || !scalar_leaves || self.has_boundary() {
+                return None;
+            }
+            match self.path_cov(self.sigs[s].ty, &path) {
+                Cov::Set(set) => Some((s, set.into_iter().collect::<Vec<_>>())),
+                Cov::All if self.path_covers_all_leaves(self.sigs[s].ty, &path) => {
+                    let count = classes.last().map_or(0, |c| c.base + c.count);
+                    Some((s, (0..count).collect()))
+                }
+                Cov::All => None,
+            }
+        });
+        let Some((s, leaves)) = selected else {
+            self.err(&x.loc, "activity of this signal part requires static scalar selections");
+            return "0".into();
+        };
+        if leaves.is_empty() {
+            return if name == "active" { "0".into() } else { "64'sd9223372036854775807".into() };
+        }
+        let n = match self.part_activity.iter().position(|a| a.sig == s && a.leaves == leaves) {
+            Some(n) => n,
+            None => {
+                let n = self.part_activity.len();
+                self.part_activity.push(PartActivity { sig: s, leaves, loc: x.loc.clone() });
+                n
+            }
+        };
+        if name == "active" {
+            format!("vh_pa{n}")
+        } else {
+            // No transaction means TIME'HIGH, independent of the current time.
+            format!("(vh_pa{n}_last < 0 ? 64'sd9223372036854775807 : (vh_now - vh_pa{n}_last))")
+        }
+    }
+
+    /// Mark the observed parts intersecting an applied scalar range. The
+    /// marks are ORed across all drivers, before resolution (§14.7.3).
+    pub(super) fn part_activity_mark(&self, s: usize, range: Option<(&str, &str)>) -> String {
+        let mut out = String::new();
+        for (n, a) in self.part_activity.iter().enumerate().filter(|(_, a)| a.sig == s) {
+            if let Some((lo, hi)) = range {
+                let mut runs: Vec<(i64, i64)> = Vec::new();
+                for &k in &a.leaves {
+                    match runs.last_mut() {
+                        Some((_, end)) if *end + 1 == k => *end = k,
+                        _ => runs.push((k, k)),
+                    }
+                }
+                let tests = runs.iter().map(|(start, end)| format!("(({lo}) <= {end} && ({hi}) >= {start})")).collect::<Vec<_>>().join(" || ");
+                let _ = write!(out, " if ({tests}) vh_pa{n} = 1;");
+            } else {
+                let _ = write!(out, " vh_pa{n} = 1;");
+            }
+        }
+        out
     }
 
     /// A signal attribute of a whole signal.
@@ -1800,9 +1882,8 @@ impl<'a> Lw<'a> {
         // §10.5.2: only a single default-inertial transaction with no written
         // delay can be represented by one pending value for every activation.
         // A later delayed, transport, null or multi-element waveform makes
-        // this process's whole driver use projected transaction queues.
-        if path.is_some()
-            || !matches!(delay, None | Some(HDelay::Inertial(None)))
+        // this process's driver use projected transaction queues.
+        if !matches!(delay, None | Some(HDelay::Inertial(None)))
             || !matches!(waves, [HWave { value: Some(_), after: None }])
         {
             self.queued_drivers.insert((sig, p));
@@ -2214,6 +2295,20 @@ impl<'a> Lw<'a> {
                 .then_some((s, p))
             })
             .collect();
+        self.pending_slot_drivers = self
+            .drivers
+            .iter()
+            .filter_map(|(&(s, p), driver)| {
+                (p < PSEUDO
+                    && driver.slots
+                    && self.leaf_classes(self.sigs[s].ty).is_some()
+                    && self.sig_kind(s).is_none()
+                    && !self.queued_drivers.contains(&(s, p))
+                    && !self.signal_procs.contains(&p)
+                    && !self.forced.contains(&s))
+                .then_some((s, p))
+            })
+            .collect();
         for (gp, (inst, ai, pi)) in self.procs.clone().into_iter().enumerate() {
             let p = d.archs[ai].processes[pi].clone();
             self.inst = inst;
@@ -2265,12 +2360,13 @@ impl<'a> Lw<'a> {
                         body = body
                     );
                 }
-                if slow {
-                    self.fproc_bodies
-                        .push((gp, String::new(), format!("    vh_run{}();\n", gp)));
-                } else {
-                    self.fproc_bodies.push((gp, temps, body));
-                }
+                // §11.3, §14.7.5: the helper already owns this process's
+                // body and temporaries. Reuse it for the cycle scan as for
+                // initialization, retaining the old inline size estimate
+                // so a short call does not create an oversized VM block.
+                let inline_lines = if slow { 1 } else { body.lines().count() };
+                self.fproc_bodies
+                    .push((gp, inline_lines, format!("    vh_run{}();\n", gp)));
                 continue;
             }
             let _ = write!(
@@ -2304,6 +2400,7 @@ impl<'a> Lw<'a> {
         // lowered with the subprograms).
         self.temps.clear();
         self.trace_lowering("vhdl.lower.drivers");
+        let part_activity_count = self.part_activity.len();
         let drv = self.drivers_sv(&mut elab);
         // Temporaries of drivers' initial values (port defaults).
         for (n, t) in std::mem::take(&mut self.temps) {
@@ -2339,6 +2436,18 @@ impl<'a> Lw<'a> {
                 s = s,
                 t = t
             );
+        }
+        for (n, a) in self.part_activity.clone().into_iter().enumerate() {
+            // Driver helpers already contain their activity marks. A late
+            // dependency must not silently read a flag they never update.
+            if n >= part_activity_count {
+                self.err(&a.loc, "activity of this signal part was discovered after driver emission");
+            }
+            if self.forced.contains(&a.sig) || self.links.iter().any(|l| l.target.sig == a.sig) {
+                self.err(&a.loc, "activity of a forced or converted signal part is not supported yet");
+            }
+            let _ = writeln!(decls, "  bit vh_pa{n}; longint vh_pa{n}_last;");
+            let _ = writeln!(elab, "    vh_pa{n} = 0; vh_pa{n}_last = -64'sd9223372036854775807;");
         }
         self.trace_lowering("vhdl.lower.kernel");
         let k = self.kernel(&upd_sigs);
@@ -2450,6 +2559,7 @@ impl<'a> Lw<'a> {
                 ("processes", self.procs.len()),
                 ("drivers", self.drivers.len()),
                 ("pending_drivers", self.pending_drivers.len()),
+                ("pending_slot_drivers", self.pending_slot_drivers.len()),
                 ("links", self.links.len()),
                 ("subprogram_bytes", self.sub_items.len()),
             ]);
@@ -3019,13 +3129,17 @@ impl<'a> Lw<'a> {
         for s in 0..self.sigs.len() {
             let _ = writeln!(ub, "    vh_s{s}_ev = 0; vh_s{s}_act = 0;", s = s);
         }
+        for n in 0..self.part_activity.len() {
+            let _ = writeln!(ub, "    vh_pa{n} = 0;");
+        }
         let _ = writeln!(ub, "    vh_fpend = 0;");
         ub.push_str(&self.boundary_sample("    "));
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
+            let part_act = self.part_activity_mark(*s, None);
             if self.pending_drivers.contains(&(*s, *p)) {
                 let _ = writeln!(
                     ub,
-                    "    if (vh_pend{s}_{p}) begin vh_dv{s}_{p} = vh_pv{s}_{p}; vh_pend{s}_{p} = 0; vh_s{s}_act = 1; end",
+                    "    if (vh_pend{s}_{p}) begin vh_dv{s}_{p} = vh_pv{s}_{p}; vh_pend{s}_{p} = 0; vh_s{s}_act = 1;{part_act} end",
                     s = s,
                     p = p
                 );
@@ -3034,7 +3148,7 @@ impl<'a> Lw<'a> {
             } else if self.fast_driver(*s, *p) {
                 let _ = writeln!(
                     ub,
-                    "    if (vh_pend{s}_{p}) begin vh_dv{s}_{p} = vh_pv{s}_{p}; vh_pend{s}_{p} = 0; vh_s{s}_act = 1; end else if (vh_qn{s}_{p} > 0 && vh_dt{s}_{p}[0] <= vh_now) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1; end",
+                    "    if (vh_pend{s}_{p}) begin vh_dv{s}_{p} = vh_pv{s}_{p}; vh_pend{s}_{p} = 0; vh_s{s}_act = 1;{part_act} end else if (vh_qn{s}_{p} > 0 && vh_dt{s}_{p}[0] <= vh_now) begin void'(vh_dt{s}_{p}.pop_front()); vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1;{part_act} end",
                     s = s,
                     p = p
                 );
@@ -3045,7 +3159,7 @@ impl<'a> Lw<'a> {
                     String::new()
                 };
                 let pop = format!(
-                    "void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1;",
+                    "void'(vh_dt{s}_{p}.pop_front());{on} vh_dv{s}_{p} = vh_dq{s}_{p}.pop_front(); vh_qn{s}_{p}--; vh_s{s}_act = 1;{part_act}",
                     s = s,
                     p = p,
                     on = on
@@ -3187,6 +3301,9 @@ impl<'a> Lw<'a> {
                 set = set
             );
         }
+        for n in 0..self.part_activity.len() {
+            let _ = writeln!(ub, "    if (vh_pa{n}) vh_pa{n}_last = vh_now;");
+        }
         // Implicit signals (§14.7.5.3 c).
         for &n in &imp_order {
             let _ = writeln!(ub, "    vh_imp{}(0);", n);
@@ -3274,24 +3391,18 @@ impl<'a> Lw<'a> {
             Scan,
             Next,
         }
-        let mut segs: Vec<(Seg, String)> = Vec::new();
+        let mut segs: Vec<(Seg, String, usize)> = Vec::new();
         for line in ub.lines() {
-            segs.push((Seg::Update, format!("  {}\n", line)));
+            segs.push((Seg::Update, format!("  {}\n", line), 1));
         }
-        let bodies: std::collections::BTreeMap<usize, (String, String)> = self
+        let bodies: std::collections::BTreeMap<usize, (usize, String)> = self
             .fproc_bodies
             .iter()
-            .map(|(gp, t, b)| (*gp, (t.clone(), b.clone())))
+            .map(|(gp, cost, b)| (*gp, (*cost, b.clone())))
             .collect();
-        // The blocks' variables at module scope: a block-local declaration
-        // keeps the simulator from compiling the block.
+        // Process temporaries stay in their automatic helper's frame.
         let mut cyc = String::new();
         let _ = writeln!(cyc, "  longint vh_cyc_n;");
-        for (temps, _) in bodies.values() {
-            for line in temps.lines() {
-                let _ = writeln!(cyc, "  {}", line.trim_start());
-            }
-        }
         for (pi, c) in conds.iter().enumerate() {
             let Some(c) = c.clone() else { continue };
             let mut t = String::new();
@@ -3322,9 +3433,14 @@ impl<'a> Lw<'a> {
                     c = c
                 );
             }
-            segs.push((Seg::Scan, t));
+            let cost = if fp.contains(&pi) && !post.contains(&pi) {
+                bodies.get(&pi).map_or(0, |body| body.0) + 2
+            } else {
+                t.lines().count()
+            };
+            segs.push((Seg::Scan, t, cost));
         }
-        segs.push((Seg::Next, "      vh_cyc_n = -64'sd1;\n".into()));
+        segs.push((Seg::Next, "      vh_cyc_n = -64'sd1;\n".into(), 1));
         for line in nx.lines() {
             // `vh_n` only (not `vh_now`).
             segs.push((
@@ -3333,20 +3449,20 @@ impl<'a> Lw<'a> {
                     "  {}\n",
                     line.replace("vh_now", "\u{1}").replace("vh_n", "vh_cyc_n").replace('\u{1}', "vh_now")
                 ),
+                1,
             ));
         }
-        segs.push((Seg::Next, "      vh_nxt = vh_cyc_n;\n".into()));
+        segs.push((Seg::Next, "      vh_nxt = vh_cyc_n;\n".into(), 1));
         // Pack the segments into blocks.
         let mut blocks: Vec<Vec<(Seg, String)>> = vec![Vec::new()];
         let mut lines = 0usize;
-        for seg in segs {
-            let n = seg.1.lines().count();
+        for (kind, text, n) in segs {
             if lines + n > MAX_LINES && !blocks.last().unwrap().is_empty() {
                 blocks.push(Vec::new());
                 lines = 0;
             }
             lines += n;
-            blocks.last_mut().unwrap().push(seg);
+            blocks.last_mut().unwrap().push((kind, text));
         }
         let nb = blocks.len();
         let mut trig = String::new();
@@ -3613,6 +3729,10 @@ impl<'a> Lw<'a> {
         let mut out = vec![v];
         let bsv = self.shape(a).map(|b| self.bounds_sv(b));
         for n in ["event", "active", "last_value", "last_event"] {
+            if n == "active" && !self.needs_signal_activity(p) {
+                out.push("0".into());
+                continue;
+            }
             match self.sig_attr(a, n) {
                 Some(x) => out.push(if n == "last_event" {
                     // The parameter carries the time of the last event.

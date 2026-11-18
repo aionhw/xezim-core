@@ -20,9 +20,35 @@ use crate::vhdl::sema::hir::*;
 struct Uses {
     objs: BTreeSet<ObjId>,
     subs: BTreeSet<SubId>,
+    track_activity: bool,
+    activity: BTreeSet<ObjId>,
+    signal_calls: Vec<(SubId, Vec<Option<ObjId>>)>,
 }
 
 impl Uses {
+    fn signal_root(h: &HExpr) -> Option<ObjId> {
+        match &h.kind {
+            HExprKind::Obj(o) => Some(*o),
+            HExprKind::Index(b, _)
+            | HExprKind::Slice(b, _)
+            | HExprKind::Field(b, _)
+            | HExprKind::Qualified(b)
+            | HExprKind::Convert(b) => Self::signal_root(b),
+            _ => None,
+        }
+    }
+
+    fn call(&mut self, s: SubId, args: &[HExpr]) {
+        self.subs.insert(s);
+        if self.track_activity {
+            self.signal_calls
+                .push((s, args.iter().map(Self::signal_root).collect()));
+        }
+        for a in args {
+            self.expr(a);
+        }
+    }
+
     fn expr(&mut self, h: &HExpr) {
         match &h.kind {
             HExprKind::Obj(o) => {
@@ -30,10 +56,7 @@ impl Uses {
             }
             HExprKind::Lit(_) | HExprKind::NewOf(_) => {}
             HExprKind::Call(s, args) => {
-                self.subs.insert(*s);
-                for a in args {
-                    self.expr(a);
-                }
+                self.call(*s, args);
             }
             HExprKind::RecordAgg(args) => {
                 for a in args {
@@ -72,8 +95,17 @@ impl Uses {
                     self.expr(v);
                 }
             }
-            HExprKind::Attr(_, p, prm) => {
+            HExprKind::Attr(name, p, prm) => {
                 if let AttrPrefix::Expr(x) = p.as_ref() {
+                    if self.track_activity
+                        && matches!(
+                            name.as_str(),
+                            "active" | "last_active" | "quiet" | "transaction"
+                        )
+                        && let Some(o) = Self::signal_root(x)
+                    {
+                        self.activity.insert(o);
+                    }
                     self.expr(x);
                 }
                 if let Some(x) = prm {
@@ -148,12 +180,7 @@ impl Uses {
                     self.expr(target);
                     self.opt(value);
                 }
-                HStmtKind::Call(c, args) => {
-                    self.subs.insert(*c);
-                    for a in args {
-                        self.expr(a);
-                    }
-                }
+                HStmtKind::Call(c, args) => self.call(*c, args),
                 HStmtKind::If(arms, last) => {
                     for (c, b) in arms {
                         self.expr(c);
@@ -178,9 +205,7 @@ impl Uses {
                     }
                     self.stmts(body);
                 }
-                HStmtKind::Next(_, c) | HStmtKind::Exit(_, c) | HStmtKind::Return(c) => {
-                    self.opt(c)
-                }
+                HStmtKind::Next(_, c) | HStmtKind::Exit(_, c) | HStmtKind::Return(c) => self.opt(c),
                 HStmtKind::Null | HStmtKind::InitObj(_) => {}
             }
         }
@@ -188,6 +213,70 @@ impl Uses {
 }
 
 impl<'a> Lw<'a> {
+    /// §4.2.2.3: forward activity only to formals that observe it. Value
+    /// and event-only calls need no scalar activity of their actual parts.
+    pub(super) fn needs_signal_activity(&mut self, p: ObjId) -> bool {
+        if self.signal_activity_params.is_none() {
+            let mut needed = BTreeSet::new();
+            let mut edges = Vec::new();
+            for info in &self.d.subprograms {
+                let Some(body) = &info.body else {
+                    if info.builtin.is_some() {
+                        continue;
+                    }
+                    needed.extend(info.params.iter().copied().filter(|p| {
+                        matches!(
+                            self.d.objects[*p].kind,
+                            ObjKind::Param(ObjClass::Signal, Mode::In)
+                        )
+                    }));
+                    continue;
+                };
+                let mut uses = Uses {
+                    track_activity: true,
+                    ..Uses::default()
+                };
+                uses.stmts(&body.stmts);
+                for l in &body.locals {
+                    uses.opt(&self.d.objects[*l].init);
+                    let mut bounds = Vec::new();
+                    super::spec::bound_exprs(self, self.d.objects[*l].ty, &mut bounds);
+                    for b in &bounds {
+                        uses.expr(b);
+                    }
+                }
+                needed.extend(uses.activity);
+                for (sub, args) in uses.signal_calls {
+                    for (formal, actual) in self.d.subprograms[sub].params.iter().zip(args) {
+                        if let Some(actual) = actual
+                            && matches!(
+                                self.d.objects[*formal].kind,
+                                ObjKind::Param(ObjClass::Signal, Mode::In)
+                            )
+                        {
+                            edges.push((*formal, actual));
+                        }
+                    }
+                }
+            }
+            loop {
+                let mut changed = false;
+                for &(formal, actual) in &edges {
+                    if needed.contains(&formal) {
+                        changed |= needed.insert(actual);
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            self.signal_activity_params = Some(needed);
+        }
+        self.signal_activity_params
+            .as_ref()
+            .is_some_and(|needed| needed.contains(&p))
+    }
+
     /// The objects of enclosing subprograms each subprogram takes as extra
     /// formals, by subprogram; only those that take any.
     fn capture_table(&self) -> BTreeMap<SubId, Vec<ObjId>> {
