@@ -891,6 +891,12 @@ pub fn qualify_colliding_package_types(descs: &mut [Description]) -> Result<(), 
 /// Gather every package's type names and imports; `None` when no type name
 /// is declared by a package and anywhere else (nothing to do).
 fn collect(descs: &[Description]) -> Option<Info> {
+    let all_classes = design_classes(descs);
+    // Classes also need qualification without packages. Otherwise a design
+    // with no packages cannot contribute any colliding names to this pass.
+    if all_classes.is_empty() && !descs.iter().any(|d| matches!(d, Description::Package(_))) {
+        return None;
+    }
     let mut pkgs: HashMap<String, PkgInfo> = HashMap::default();
     let mut other: HashSet<String> = HashSet::default();
     let mut other_members: HashSet<String> = HashSet::default();
@@ -1060,7 +1066,6 @@ fn collect(descs: &[Description]) -> Option<Info> {
     };
     // §8.3: a class is a scope of its own; a type name a class declares
     // collides when it is declared anywhere else as well.
-    let all_classes = design_classes(descs);
     let mut lexical_counts: HashMap<&str, usize> = HashMap::default();
     for (scope, c) in &all_classes {
         if !matches!(scope, ClassScope::Package(_)) {
