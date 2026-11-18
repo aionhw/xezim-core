@@ -425,18 +425,19 @@ impl Value {
 }
 
 impl Value {
-    /// The value an UNSIZED DECIMAL literal actually takes once §5.7.1's
-    /// signed, exactly-32-bit sizing is applied: `Some(wrapped)` when that
-    /// changes it, `None` when the literal is unaffected.
+    /// The value an UNSIZED DECIMAL literal would read as if it were sized at
+    /// exactly 32 signed bits: `Some(wrapped)` when that changes it, `None`
+    /// when the literal is unaffected.
     ///
     /// `3000000000` comes back as `Some(-1294967296)`; `4294967297` as
     /// `Some(1)`. Anything below 2^31 fits and returns `None`, as does a sized
     /// literal (`64'd3000000000`) or a based one (`'hffffffff`), which §5.7.1
     /// makes unsigned.
     ///
-    /// This reports the wrap rather than avoiding it — see
-    /// `warn_unsized_decimal_wrap` in `elaborate.rs` for why the wrap itself
-    /// is deliberate.
+    /// Literals are not evaluated that way: §5.7.1 gives an unsized number
+    /// that needs more than 32 bits the width it needs, sign bit included
+    /// (`unsized_integer_width`). This only tells what a 32-bit reading
+    /// would have lost.
     pub fn unsized_decimal_wrap(size: Option<u32>, radix: u32, value: &str) -> Option<i32> {
         if size.is_some() || radix != 10 {
             return None;
@@ -462,6 +463,18 @@ impl Value {
     /// width is under 32), so this only ever widens a constant that would have lost
     /// data.
     pub fn unsized_literal_width(value: &str, radix: u32) -> u32 {
+        Self::unsized_integer_width(value, radix, false)
+    }
+
+    /// IEEE 1800-2023 §5.7.1: "An unsized number that requires more than 32
+    /// bits shall have at least the minimum width needed to properly
+    /// represent the value, including a sign bit if the number is signed."
+    /// A signed decimal (`2000000000000`, `'sd3000000000`) is its magnitude's
+    /// bits plus a sign bit, at least 32: `2147483647` is 32 bits,
+    /// `2147483648` 33 and `2000000000000` 42. An unsigned decimal (`'d…`)
+    /// and a based number keep the width of their digits, as
+    /// `unsized_literal_width` describes.
+    pub fn unsized_integer_width(value: &str, radix: u32, signed: bool) -> u32 {
         // ONE byte pass where `chars().filter(..).count()` decoded UTF-8. A
         // UTF-8 continuation byte (`0b10xxxxxx`) is never the start of a
         // character and `_` is ASCII, so counting non-continuation bytes that
@@ -476,6 +489,9 @@ impl Value {
             2 => digits,
             8 => digits.saturating_mul(3),
             16 => digits.saturating_mul(4),
+            // Nine decimal digits stay below 2^31: 32 bits, sign bit and all,
+            // without parsing (this runs per literal operand evaluation).
+            _ if digits <= 9 => 32,
             // Decimal: use the magnitude when it fits, else a safe upper bound
             // (log2(10) < 3.33, so 4 bits per digit never under-counts).
             _ => {
@@ -489,7 +505,7 @@ impl Value {
                     cleaned.parse::<u128>()
                 };
                 match parsed {
-                    Ok(v) => (128 - v.leading_zeros()).max(1),
+                    Ok(v) => (128 - v.leading_zeros()).max(1) + u32::from(signed),
                     Err(_) => digits.saturating_mul(4),
                 }
             }

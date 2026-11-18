@@ -70,8 +70,23 @@ pub(super) fn infer<P: ParamLookup>(expr: &Expression, params: &P, types: &mut T
     }
     let mut cached = None;
     let ty = match &expr.kind {
-        ExprKind::Number(NumberLiteral::Integer { size, signed, .. }) => {
-            Type::integer(size.unwrap_or(32), *signed)
+        ExprKind::Number(NumberLiteral::Integer {
+            size,
+            signed,
+            base,
+            value,
+            ..
+        }) => {
+            let radix = match base {
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Hex => 16,
+                NumberBase::Decimal => 10,
+            };
+            Type::integer(
+                size.unwrap_or_else(|| Value::unsized_integer_width(value, radix, *signed)),
+                *signed,
+            )
         }
         ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Type::integer(1, false),
         ExprKind::Number(NumberLiteral::Real(_)) => Type {

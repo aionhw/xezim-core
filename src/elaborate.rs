@@ -24266,8 +24266,8 @@ fn const_eval_typed_pattern_index_env<P: ParamLookup>(
                     .or_else(|_| i64::from_str_radix(&digits, radix).map(|v| v as u64))
                     .ok()?;
                 let width = size.unwrap_or(32);
-                // Keep the scalar path for large unsized decimal integers;
-                // their minimum width is a separate §5.7.1 limitation.
+                // Keep large unsized values on the general evaluator so
+                // this scalar folding path cannot truncate their magnitude.
                 let unsized_max = if *signed && matches!(base, NumberBase::Decimal) {
                     i32::MAX as u64
                 } else {
@@ -24893,7 +24893,9 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                     ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => {
                         Some(*s as i64)
                     }
-                    ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+                    ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                        Some(i64::from(number_literal_width(n)))
+                    }
                     ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
                     ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => params
                         .and_then(|p| const_cast_bits(inner, p))
@@ -24921,8 +24923,8 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                                 ExprKind::Number(NumberLiteral::Integer {
                                     size: Some(s), ..
                                 }) => Some(*s as i64),
-                                ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => {
-                                    Some(32)
+                                ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                                    Some(number_literal_width(n) as i64)
                                 }
                                 ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
                                 ExprKind::Paren(i) => expr_bits(i, params),
@@ -27628,7 +27630,9 @@ fn const_self_width<P: ParamLookup>(e: &Expression, params: &P) -> Option<u32> {
     };
     match &e.kind {
         ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s),
-        ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+        ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+            Some(number_literal_width(n))
+        }
         ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
         ExprKind::Number(NumberLiteral::Real(_)) => Some(64),
         ExprKind::StringLiteral(t) => Some(8 * t.len().max(1) as u32),
@@ -28312,7 +28316,7 @@ fn string_literal_width(init: &Expression) -> Option<u32> {
 
 /// §6.20.2: a parameter with no type and no range takes the type of its
 /// final value — the SELF-DETERMINED width (§11.6.1, Table 11-21) of its
-/// initializer. Known for literals (sized, unsized 32, string 8 per
+/// initializer. Known for literals (sized, unsized at least 32, string 8 per
 /// character), other parameters in `params`, and the operators whose result
 /// width follows from their operands'. `None` when an operand's width is not
 /// known here (a function call, an element select, a cast), which keeps the
@@ -28321,7 +28325,21 @@ fn string_literal_width(init: &Expression) -> Option<u32> {
 pub fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
     let w = |x: &Expression| untyped_param_width(x, params);
     match &e.kind {
-        ExprKind::Number(NumberLiteral::Integer { size, .. }) => Some(size.unwrap_or(32)),
+        ExprKind::Number(NumberLiteral::Integer {
+            size,
+            signed,
+            base,
+            value,
+            ..
+        }) => {
+            let radix = match base {
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Hex => 16,
+                NumberBase::Decimal => 10,
+            };
+            Some(size.unwrap_or_else(|| Value::unsized_integer_width(value, radix, *signed)))
+        }
         ExprKind::StringLiteral(t) if !t.is_empty() && !t.contains('\\') => {
             Some(8 * t.len() as u32)
         }
@@ -31180,50 +31198,27 @@ fn package_var_init_value(
     v
 }
 
-
-/// §5.7.1 makes an unsized decimal literal SIGNED, and it is exactly 32 bits
-/// wide, so a value from 2^31 up reads back negative: `localparam real P =
-/// 3000000000` evaluates to -1294967296, and 4294967297 collapses to 1.
-///
-/// That wrap is deliberate and stays. §5.7's "at least 32 bits" leaves the
-/// >= 2^31 decimal case tool-defined, and the reference simulator sizes it 32
-/// signed and wraps exactly as we do (`$bits(3000000000)` is 32 there, and
-/// there too the literal reads -1294967296). Widening to fit would be a
-/// visible divergence -- `$bits` would answer 33, and every expression-width
-/// rule keyed on a literal's self-determined width would shift with it.
-///
-/// What the reference ALSO does, and what xezim was missing, is SAY so. The
-/// wrap is otherwise completely silent, and it is not a corner case for
-/// analog modelling: a fitted pole above 2^31 rad/s (about 342 MHz) that
-/// happens to come out integral gets written without a decimal point, and the
-/// sign flip turns `dx/dt = -WP*x` into positive feedback. A real-number model
-/// built that way elaborates, runs, and produces a plausible waveform for
-/// thousands of steps before it runs away to inf.
-pub fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &str) {
-    let radix = match base {
-        NumberBase::Decimal => 10,
-        _ => return,
-    };
-    let Some(wrapped) = Value::unsized_decimal_wrap(size, radix, value) else {
-        return;
-    };
-    use std::sync::{Mutex, OnceLock};
-    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    if !seen
-        .lock()
-        .map(|mut g| g.insert(value.to_string()))
-        .unwrap_or(false)
-    {
-        return;
+/// §5.7.1: self-determined literal width, shared by elaboration queries.
+pub fn number_literal_width(num: &NumberLiteral) -> u32 {
+    match num {
+        NumberLiteral::Integer {
+            size,
+            signed,
+            base,
+            value,
+            ..
+        } => {
+            let radix = match base {
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Hex => 16,
+                NumberBase::Decimal => 10,
+            };
+            size.unwrap_or_else(|| Value::unsized_integer_width(value, radix, *signed))
+        }
+        NumberLiteral::UnbasedUnsized(_) => 1,
+        _ => 64,
     }
-    crate::elab_diag(format!(
-        "[xezim][warning] unsized decimal literal '{}' is treated as a 32-bit \
-         signed integer and wraps to {} (IEEE 1800-2017 \u{00a7}5.7); \
-         write it as '{}.0' for a real constant, or size it explicitly \
-         (e.g. 64'd{})",
-        value, wrapped, value, value
-    ));
 }
 
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
@@ -31348,13 +31343,13 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     value,
                     ..
                 } => {
-                    let w = size.unwrap_or(32);
                     let r = match base {
                         NumberBase::Binary => 2,
                         NumberBase::Octal => 8,
                         NumberBase::Hex => 16,
                         NumberBase::Decimal => 10,
                     };
+                    let w = size.unwrap_or_else(|| Value::unsized_integer_width(value, r, *signed));
                     // A NEGATIVE genvar substituted into a generate body
                     // (`genvar_const_expr`, §27.4) spells its value `-2`; the
                     // radix parse has no sign and read it as x.
@@ -31365,7 +31360,6 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                         _ => Value::from_str_radix(&value.replace('_', ""), r, w),
                     };
                     v.is_signed = *signed;
-                    warn_unsized_decimal_wrap(*size, base, value);
                     v
                 }
                 NumberLiteral::Real(f) => Value::from_f64(*f),
@@ -31694,7 +31688,9 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                         .unwrap_or(0)
                 }
                 ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
-                ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
+                ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                    number_literal_width(n)
+                }
                 ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
                 ExprKind::SystemCall { name: cn, .. } if is_cast_call(cn) => {
                     const_cast_bits(inner, params).unwrap_or(0)
@@ -37907,7 +37903,9 @@ fn ai_conn_expr_width(
             }
             Some(sum)
         }
-        EK::Number(crate::ast::expr::NumberLiteral::Integer { size: None, .. }) => Some(32),
+        EK::Number(n @ crate::ast::expr::NumberLiteral::Integer { size: None, .. }) => {
+            Some(number_literal_width(n))
+        }
         EK::Unary { op, operand } => {
             use crate::ast::expr::UnaryOp as U;
             match op {
@@ -39662,6 +39660,7 @@ fn prefill_literal_caches(items: &[ModuleItem]) {
     fn fill(n: &NumberLiteral) {
         let NumberLiteral::Integer {
             size,
+            signed,
             base,
             value,
             cached_val,
@@ -39679,12 +39678,9 @@ fn prefill_literal_caches(items: &[ModuleItem]) {
             NumberBase::Hex => 16,
             NumberBase::Decimal => 10,
         };
-        if Value::unsized_decimal_wrap(*size, radix, value).is_some() {
-            return;
-        }
         let w = match size {
             Some(sz) => *sz,
-            None => Value::unsized_literal_width(value, radix),
+            None => Value::unsized_integer_width(value, radix, *signed),
         };
         if w > 64 {
             return;
