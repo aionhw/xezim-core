@@ -1835,6 +1835,10 @@ fn parse_and_elaborate(
     String,
 > {
     let _oom_prepare = oom_trace::scope("prepare definitions", "", "", "");
+    // Generated text and token batches have been dropped at this boundary.
+    // Return their unused pages before allocating the definition indexes.
+    release_free_memory();
+    oom_trace::checkpoint("prepare.memory_released", &[]);
     let _name_registry = shared_names::registry_scope();
     let _declaration_order_scope = elaborate::declaration_order_scope();
     // Every elaboration starts from the same state, whatever the thread
@@ -1856,10 +1860,15 @@ fn parse_and_elaborate(
     // §26.3: a type name declared by two packages (or a package and $unit / a
     // module) gets its package-qualified spelling before anything keys the
     // flat per-design type tables by it (#300).
+    oom_trace::checkpoint("prepare.body_types.begin", &[]);
     body_type_params::normalize(&mut all_descriptions);
+    oom_trace::checkpoint("prepare.body_types.ready", &[]);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
+    oom_trace::checkpoint("prepare.package_types.ready", &[]);
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
+    oom_trace::checkpoint("prepare.automatic.ready", &[]);
     scope_tree::build_design(&mut all_descriptions);
+    oom_trace::checkpoint("prepare.scope_tree.ready", &[]);
     let cli = module_timescale_cli();
     // Deterministic: `module_timescale_exp` is filled by walking this map,
     // and its serialized order follows the order entries are inserted in.
@@ -2131,6 +2140,14 @@ fn parse_and_elaborate(
                     m: &mut ast::module::ModuleDeclaration,
                     out: &mut Vec<ast::module::ModuleDeclaration>,
                 ) {
+                    // Flat generated modules need no replacement item buffer.
+                    if !m
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, ast::decl::ModuleItem::NestedModule(_)))
+                    {
+                        return;
+                    }
                     let mut kept = Vec::with_capacity(m.items.len());
                     for item in m.items.drain(..) {
                         if let ast::decl::ModuleItem::NestedModule(inner) = item {
