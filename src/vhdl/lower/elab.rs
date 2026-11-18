@@ -2011,7 +2011,7 @@ impl<'a> Lw<'a> {
                 None if self.pending_drivers.contains(&(sig, p)) => {
                     let _ = writeln!(
                         out,
-                        "{pad}vh_pv{s}_{p} = {v}; vh_pend{s}_{p} = 1;",
+                        "{pad}vh_pv{s}_{p} = {v}; vh_pend{s}_{p} = 1; vh_delta_pending = 1;",
                         pad = pad,
                         s = sig,
                         p = p,
@@ -2101,14 +2101,14 @@ impl<'a> Lw<'a> {
             Some(v) => {
                 let x = self.store_value(target, v);
                 format!(
-                    "{pad}vh_s{s}_fnv = {x}; vh_s{s}_freq = 1; vh_s{s}_rreq = 0; vh_fpend = 1;\n",
+                    "{pad}vh_s{s}_fnv = {x}; vh_s{s}_freq = 1; vh_s{s}_rreq = 0; vh_delta_pending = 1;\n",
                     pad = pad,
                     s = s,
                     x = x
                 )
             }
             None => format!(
-                "{pad}vh_s{s}_rreq = 1; vh_s{s}_freq = 0; vh_fpend = 1;\n",
+                "{pad}vh_s{s}_rreq = 1; vh_s{s}_freq = 0; vh_delta_pending = 1;\n",
                 pad = pad,
                 s = s
             ),
@@ -2591,7 +2591,7 @@ impl<'a> Lw<'a> {
         );
         let _ = writeln!(
             m,
-            "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop, vh_fpend;",
+            "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop, vh_delta_pending;",
             n = np
         );
         m.push_str(&self.tx_defs);
@@ -3153,7 +3153,7 @@ impl<'a> Lw<'a> {
         let mut nx = String::new();
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
             if self.pending_drivers.contains(&(*s, *p)) {
-                let _ = writeln!(nx, "    if (vh_pend{s}_{p}) vh_n = vh_now;", s = s, p = p);
+                // These drivers mark the shared delta request on every write.
                 continue;
             }
             if dr.slots {
@@ -3176,11 +3176,16 @@ impl<'a> Lw<'a> {
                 );
             }
         }
-        let _ = writeln!(
-            nx,
-            "    for (int p = 0; p < {}; p++) if (vh_tmo[p] >= 0 && (vh_n < 0 || vh_tmo[p] < vh_n)) vh_n = vh_tmo[p];",
-            nprocs
-        );
+        // Only processes that can suspend can schedule a timeout (§10.2).
+        // Keep a single loop, trimming sensitivity-only processes at either end.
+        let mut waiters = (0..nprocs).filter(|p| !fp.contains(p));
+        if let Some(first) = waiters.next() {
+            let last = waiters.next_back().unwrap_or(first);
+            let _ = writeln!(
+                nx,
+                "    for (int p = {first}; p <= {last}; p++) if (vh_tmo[p] >= 0 && (vh_n < 0 || vh_tmo[p] < vh_n)) vh_n = vh_tmo[p];",
+            );
+        }
         for im in &self.imps {
             match im.kind {
                 ImpKind::Stable | ImpKind::Quiet => {
@@ -3200,8 +3205,9 @@ impl<'a> Lw<'a> {
                 _ => {}
             }
         }
-        // Force and release requests take effect in the next cycle.
-        let _ = writeln!(nx, "    if (vh_fpend && (vh_n < 0 || vh_now < vh_n)) vh_n = vh_now;");
+        // Compact zero-delay drivers and force/release requests all take effect
+        // in the next update. None can cancel the need for that cycle.
+        let _ = writeln!(nx, "    if (vh_delta_pending && (vh_n < 0 || vh_now < vh_n)) vh_n = vh_now;");
         let _ = write!(
             k,
             "  function automatic longint vh_next();\n    longint vh_n;\n    vh_n = -64'sd1;\n{}    return vh_n;\n  endfunction\n",
@@ -3216,7 +3222,7 @@ impl<'a> Lw<'a> {
         for n in 0..self.part_activity.len() {
             let _ = writeln!(ub, "    vh_pa{n} = 0;");
         }
-        let _ = writeln!(ub, "    vh_fpend = 0;");
+        let _ = writeln!(ub, "    vh_delta_pending = 0;");
         ub.push_str(&self.boundary_sample("    "));
         for ((s, p), dr) in drivers.iter().filter(|((_, p), _)| *p < PSEUDO) {
             let part_act = self.part_activity_mark(*s, None);

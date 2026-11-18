@@ -906,7 +906,7 @@ impl<'a> Lw<'a> {
                     if singleton {
                         // §10.5.2, §14.7.2: only one scalar can be pending.
                         // Keep selector evaluation, including its bound checks.
-                        let _ = writeln!(out, "{pad}vh_lk = {key};\n{pad}vh_spv{s}_{p} = {val}; vh_spend{s}_{p} = 1;");
+                        let _ = writeln!(out, "{pad}vh_lk = {key};\n{pad}vh_spv{s}_{p} = {val}; vh_spend{s}_{p} = 1; vh_delta_pending = 1;");
                         return;
                     }
                     if pending_only {
@@ -993,7 +993,7 @@ impl<'a> Lw<'a> {
     /// The next transaction time of driver (s, p) by parts.
     pub(super) fn slot_driver_next(&self, s: usize, p: usize) -> String {
         if self.singleton_slot_drivers.contains_key(&(s, p)) {
-            return format!("    if (vh_spend{s}_{p}) n = vh_now;\n");
+            return String::new();
         }
         let mut out = String::new();
         let pending_only = self.pending_slot_drivers.contains(&(s, p));
