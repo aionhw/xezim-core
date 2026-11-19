@@ -256,7 +256,8 @@ pub use value::Value;
 ///         precision and tick by exact powers of ten (§5.8, §3.14.1).
 /// \x4d = \x4c + assignment pattern type keys bound at every array dimension in
 ///         continuous assignments, nettype drivers and parameter values (§10.9.1, §10.9.2).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4e";
+/// \x4f = \x4e + substituted input literals converted to the formal's type (§23.3.3.8).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4f";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
