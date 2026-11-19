@@ -356,4 +356,153 @@ module top;
         m.parameters.remove("c.W");
         assert_eq!(lookup(&mut m, "c."), scan(&m, "c."));
     }
+
+    /// The entries and stored text of the index: what its memory is
+    /// proportional to.
+    fn held(m: &ElaboratedModule) -> (usize, usize) {
+        let keys = m.param_index.keys.as_ref().expect("index built");
+        let bytes = keys
+            .paths
+            .iter()
+            .map(|(key, leaves)| {
+                key.len()
+                    + leaves
+                        .iter()
+                        .flat_map(|l| l.iter())
+                        .map(|l| l.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + keys.odd.iter().map(|key| key.len()).sum::<usize>();
+        (keys.paths.len() + keys.odd.len(), bytes)
+    }
+
+    /// aionhw/xezim#721: the parameters of one instance hold its path once.
+    /// A path with a single parameter costs the key and nothing more.
+    #[test]
+    fn the_keys_of_one_path_hold_the_path_once() {
+        let path = |i: usize| format!("top.block_{i}.{}", "p".repeat(200));
+        let mut dense = ElaboratedModule::new("top".into());
+        let mut sparse = ElaboratedModule::new("top".into());
+        let mut text = 0;
+        for i in 0..40 {
+            for p in 0..25 {
+                let key = format!("{}.P{p}", path(i));
+                text += key.len();
+                dense.set_param(line!(), key, Value::from_u64(p, 32));
+            }
+            sparse.set_param(line!(), format!("{}.P0", path(i)), Value::from_u64(0, 32));
+        }
+        assert_eq!(lookup(&mut dense, &format!("{}.", path(7))).len(), 25);
+        assert_eq!(lookup(&mut sparse, &format!("{}.", path(7))).len(), 1);
+        let (entries, bytes) = held(&dense);
+        assert_eq!(entries, 40);
+        // 40 paths and 1000 short names, where the keys themselves are 40
+        // paths 25 times over.
+        assert!(bytes < text / 15, "{bytes} of {text}");
+        let (entries, bytes) = held(&sparse);
+        assert_eq!(entries, 40);
+        assert_eq!(bytes, (0..40).map(|i| path(i).len() + 3).sum::<usize>());
+        let keys = sparse.param_index.keys.as_ref().unwrap();
+        assert!(keys.paths.values().all(|leaves| leaves.is_none()));
+    }
+
+    /// A path moves between its two forms as keys come and go, and the
+    /// lookup answers the same in both.
+    #[test]
+    fn a_path_gains_and_loses_keys() {
+        let mut m = ElaboratedModule::new("top".into());
+        m.set_param(line!(), "u.c.W".into(), Value::from_u64(1, 32));
+        // Built here, with one key under the path.
+        assert_eq!(lookup(&mut m, "u.c."), [("W".to_string(), 1)]);
+        assert_eq!(held(&m), (1, 5));
+        m.set_param(line!(), "u.c.A".into(), Value::from_u64(2, 32));
+        m.set_param(line!(), "u.c.Z".into(), Value::from_u64(3, 32));
+        // Written again: the table has it already.
+        m.set_param(line!(), "u.c.A".into(), Value::from_u64(4, 32));
+        assert_eq!(held(&m), (1, 4 + 3));
+        assert_eq!(
+            lookup(&mut m, "u.c."),
+            [
+                ("A".to_string(), 4),
+                ("W".to_string(), 1),
+                ("Z".to_string(), 3)
+            ]
+        );
+        m.remove_param("u.c.W");
+        m.remove_param("u.c.A");
+        assert_eq!(held(&m), (1, 5));
+        assert_eq!(lookup(&mut m, "u.c."), [("Z".to_string(), 3)]);
+        m.set_param(line!(), "u.c.B".into(), Value::from_u64(5, 32));
+        assert_eq!(
+            lookup(&mut m, "u."),
+            [("c.B".to_string(), 5), ("c.Z".to_string(), 3)]
+        );
+        m.remove_param("u.c.B");
+        m.remove_param("u.c.Z");
+        assert_eq!(held(&m), (0, 0));
+        assert_eq!(lookup(&mut m, "u."), []);
+        assert_eq!(m.param_index.builds, 1);
+    }
+
+    /// The keys under a prefix come in key order whatever paths hold them:
+    /// a deeper path sorts between the keys of a shallower one, and a path
+    /// that only begins like the prefix is not under it.
+    #[test]
+    fn keys_of_nested_paths_come_in_key_order() {
+        let mut m = ElaboratedModule::new("top".into());
+        let keys = [
+            "a.b.Z",
+            "a.b.d",
+            "a.b.c.W",
+            "a.b.c.V",
+            "a.b.e.k.V",
+            "a.b.a",
+            "a.b[1].W",
+            "a.bc.W",
+            "a.b.",
+            "a.W",
+            "b.W",
+            "top_level",
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            m.set_param(line!(), key.to_string(), Value::from_u64(i as u64, 32));
+            if i == 3 {
+                // Built part way, so both the build and the tracked writes
+                // are exercised.
+                assert_eq!(lookup(&mut m, "a.b.").len(), 4);
+            }
+        }
+        let mut order = Vec::new();
+        m.for_each_parameter_with_prefix("a.b.", |rest, _| order.push(rest.to_string()));
+        assert_eq!(order, ["", "Z", "a", "c.V", "c.W", "d", "e.k.V"]);
+        order.clear();
+        m.for_each_parameter_with_prefix("a.", |rest, _| order.push(rest.to_string()));
+        assert_eq!(
+            order,
+            [
+                "W", "b.", "b.Z", "b.a", "b.c.V", "b.c.W", "b.d", "b.e.k.V", "b[1].W", "bc.W"
+            ]
+        );
+        for prefix in [
+            "a.b.c.", "a.b[1].", "a.bc.", "b.", "c.", "a.b.e.", "a.b.e.k.",
+        ] {
+            assert_eq!(lookup(&mut m, prefix), scan(&m, prefix), "{prefix}");
+        }
+        // A key that holds the index's own separator is kept as it is.
+        m.set_param(line!(), "a.b.\u{1}x.W".into(), Value::from_u64(90, 32));
+        m.set_param(line!(), "a.b.y\u{1}".into(), Value::from_u64(91, 32));
+        for prefix in ["a.b.", "a.", "a.b.\u{1}x.", "a.b.c."] {
+            assert_eq!(lookup(&mut m, prefix), scan(&m, prefix), "{prefix:?}");
+        }
+        m.remove_param("a.b.\u{1}x.W");
+        m.remove_param("a.b.y\u{1}");
+        assert_eq!(lookup(&mut m, "a.b."), scan(&m, "a.b."));
+        // A prefix that is no path is answered from the table.
+        order.clear();
+        m.for_each_parameter_with_prefix("a.b", |rest, _| order.push(rest.to_string()));
+        assert_eq!(order.len(), 9);
+        assert_eq!(order[0], ".");
+        assert_eq!(m.param_index.builds, 1);
+    }
 }
