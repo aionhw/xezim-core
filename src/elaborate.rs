@@ -982,6 +982,82 @@ pub struct RewriteCtx {
     pub upward: Rc<std::cell::RefCell<UpwardScopes>>,
 }
 
+/// Per-instance context needed to materialize a deferred instance-scoped
+/// function or task body (#193). Sibling callables of one instance share one `Rc`.
+#[derive(Debug, Clone)]
+pub struct CallableRewriteCtx {
+    pub ctx: Rc<RewriteCtx>,
+    /// Unpacked-array typedef names declared locally in this instance that
+    /// must be instance-prefixed in local declaration types (§6.18/§23.9).
+    pub local_array_typedefs: Option<Rc<std::collections::HashSet<String>>>,
+}
+
+impl CallableRewriteCtx {
+    /// Rewrite `source_items` into this instance's lexical scope, applying
+    /// formal/local shadowing, port/interface substitution, local unpacked-
+    /// array typedef scoping, and type-parameter substitution. Respects the
+    /// caller's `ast::cache` scope-cache mode (`without_scope_caches` or
+    /// `with_fresh_scope_caches`).
+    pub fn materialize_body(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        source_items: &[Statement],
+    ) -> Vec<Statement> {
+        let mut fn_locals = (*self.ctx.local_names).clone();
+        for p in ports {
+            fn_locals.remove(&p.name.name);
+        }
+        for n in stmt_list_declared_names(source_items) {
+            fn_locals.remove(n);
+        }
+        let formal_names: Vec<&str> = ports.iter().map(|p| p.name.name.as_str()).collect();
+        let mut items = with_type_bind_tls(&self.ctx, || {
+            with_shadowed(
+                &formal_names,
+                &self.ctx.port_map,
+                &fn_locals,
+                |ports, locals| {
+                    rewrite_stmt_list_scoped(
+                        source_items,
+                        &self.ctx.prefix,
+                        ports,
+                        locals,
+                        &self.ctx.interface_map,
+                    )
+                },
+            )
+        });
+        if let Some(lat) = &self.local_array_typedefs {
+            let prefix = &self.ctx.prefix;
+            let scope_array_typedef = |dt: &DataType| -> Option<DataType> {
+                match dt {
+                    DataType::TypeReference {
+                        name,
+                        dimensions,
+                        type_args,
+                        span,
+                    } if name.scopes.is_empty()
+                        && dimensions.is_empty()
+                        && lat.contains(&name.name.name) =>
+                    {
+                        let mut nn = name.clone();
+                        nn.name.name = cat2(prefix, &name.name.name);
+                        Some(DataType::TypeReference {
+                            name: nn,
+                            dimensions: dimensions.clone(),
+                            type_args: type_args.clone(),
+                            span: *span,
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            scope_local_decl_types(&mut items, &scope_array_typedef);
+        }
+        substitute_type_params_stmts(items, &self.ctx.type_binds, &self.ctx.prefix)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingAlways {
     pub kind: AlwaysKind,
@@ -4515,6 +4591,16 @@ pub struct ElaboratedModule {
     pub pending_initial: Vec<PendingInitial>,
     #[serde(skip)]
     pub pending_cont_assign: Vec<PendingContAssign>,
+    /// Instance-scoped function bodies retained in shared definition syntax
+    /// (keyed by `functions` key). Materialized on demand or by
+    /// `materialize_pending`. Not serialized: artifact writers call
+    /// `materialize_pending()` first.
+    #[serde(skip)]
+    pub deferred_function_bodies: HashMap<String, Rc<CallableRewriteCtx>>,
+    /// Instance-scoped task bodies retained in shared definition syntax
+    /// (keyed by `tasks` key).
+    #[serde(skip)]
+    pub deferred_task_bodies: HashMap<String, Rc<CallableRewriteCtx>>,
     /// §6.7.1 / §28.16 net delays, keyed by flat net name, as (rise, fall,
     /// turn-off) in ticks. A net delay belongs to the NET: it delays every
     /// driver of it, not only a declaration assignment. Recorded where each
@@ -4939,6 +5025,8 @@ impl ElaboratedModule {
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
+            deferred_function_bodies: HashMap::default(),
+            deferred_task_bodies: HashMap::default(),
             tri_select_pulls: HashSet::default(),
             net_delays: HashMap::default(),
             const_decl_inits: HashSet::default(),
@@ -4963,12 +5051,126 @@ impl ElaboratedModule {
         }
     }
 
+    /// Materialize a deferred function body into a private `SharedVec` using
+    /// the caller's current scope-cache mode, or `None` when not deferred.
+    pub fn materialize_function_body(
+        &self,
+        key: &str,
+        fd: &FunctionDeclaration,
+    ) -> Option<crate::ast::shared_vec::SharedVec<Statement>> {
+        self.deferred_function_bodies
+            .get(key)
+            .map(|ctx| ctx.materialize_body(&fd.ports, &fd.items).into())
+    }
+
+    /// Materialize a deferred task body into a private `SharedVec` using
+    /// the caller's current scope-cache mode, or `None` when not deferred.
+    pub fn materialize_task_body(
+        &self,
+        key: &str,
+        td: &TaskDeclaration,
+    ) -> Option<crate::ast::shared_vec::SharedVec<Statement>> {
+        self.deferred_task_bodies
+            .get(key)
+            .map(|ctx| ctx.materialize_body(&td.ports, &td.items).into())
+    }
+
+    /// Borrow or materialize a function's instance-rewritten statements for a
+    /// read-only pass (keeping scope caches disabled if materialized).
+    pub fn resolved_function_items<'a>(
+        &self,
+        key: &str,
+        fd: &'a FunctionDeclaration,
+    ) -> std::borrow::Cow<'a, [Statement]> {
+        match self.deferred_function_bodies.get(key) {
+            Some(ctx) => std::borrow::Cow::Owned(crate::ast::cache::without_scope_caches(|| {
+                ctx.materialize_body(&fd.ports, &fd.items)
+            })),
+            None => std::borrow::Cow::Borrowed(&fd.items),
+        }
+    }
+
+    /// Borrow or materialize a task's instance-rewritten statements for a
+    /// read-only pass (keeping scope caches disabled if materialized).
+    pub fn resolved_task_items<'a>(
+        &self,
+        key: &str,
+        td: &'a TaskDeclaration,
+    ) -> std::borrow::Cow<'a, [Statement]> {
+        match self.deferred_task_bodies.get(key) {
+            Some(ctx) => std::borrow::Cow::Owned(crate::ast::cache::without_scope_caches(|| {
+                ctx.materialize_body(&td.ports, &td.items)
+            })),
+            None => std::borrow::Cow::Borrowed(&td.items),
+        }
+    }
+
+    /// Materialize one deferred function body in place inside `self.functions`.
+    /// Returns `true` if `key` was deferred and materialized.
+    pub fn materialize_function(&mut self, key: &str) -> bool {
+        let Some(ctx) = self.deferred_function_bodies.remove(key) else {
+            return false;
+        };
+        let Some(mut fd) = self.functions.get(key).cloned() else {
+            return false;
+        };
+        fd.items =
+            crate::ast::cache::without_scope_caches(|| ctx.materialize_body(&fd.ports, &fd.items))
+                .into();
+        self.functions.insert(key.to_string(), fd);
+        true
+    }
+
+    /// Materialize one deferred task body in place inside `self.tasks`.
+    /// Returns `true` if `key` was deferred and materialized.
+    pub fn materialize_task(&mut self, key: &str) -> bool {
+        let Some(ctx) = self.deferred_task_bodies.remove(key) else {
+            return false;
+        };
+        let Some(td) = self.tasks.get_mut(key) else {
+            return false;
+        };
+        td.items =
+            crate::ast::cache::without_scope_caches(|| ctx.materialize_body(&td.ports, &td.items))
+                .into();
+        true
+    }
+
+    /// Materialize every deferred instance-scoped function and task body in
+    /// place (`self.functions` / `self.tasks`) with scope caches disabled.
+    pub fn materialize_pending_callables(&mut self) {
+        let deferred_fns = std::mem::take(&mut self.deferred_function_bodies);
+        if !deferred_fns.is_empty() {
+            let mut functions = std::mem::take(&mut self.functions).into_map();
+            for (key, ctx) in deferred_fns {
+                if let Some(fd) = functions.get_mut(&key) {
+                    fd.items = crate::ast::cache::without_scope_caches(|| {
+                        ctx.materialize_body(&fd.ports, &fd.items)
+                    })
+                    .into();
+                }
+            }
+            self.functions = FuncTable::from_map(functions);
+        }
+        let deferred_tasks = std::mem::take(&mut self.deferred_task_bodies);
+        for (key, ctx) in deferred_tasks {
+            if let Some(td) = self.tasks.get_mut(&key) {
+                td.items = crate::ast::cache::without_scope_caches(|| {
+                    ctx.materialize_body(&td.ports, &td.items)
+                })
+                .into();
+            }
+        }
+    }
+
     /// Eager (non-streaming) drain of pending procedural blocks. Materializes
     /// every Pending* into the corresponding always_blocks/initial_blocks/
-    /// continuous_assigns vec. Keeps semantics identical to pre-#7 elaborate
-    /// at the cost of high peak memory — use streaming drains in performance-
-    /// sensitive paths (see drain_pending_*_for_each).
+    /// continuous_assigns vec, and materializes deferred callable bodies. Keeps
+    /// semantics identical to pre-#7 elaborate at the cost of high peak memory
+    /// — use streaming drains in performance-sensitive paths (see
+    /// drain_pending_*_for_each).
     pub fn materialize_pending(&mut self) {
+        self.materialize_pending_callables();
         let pending_always = std::mem::take(&mut self.pending_always);
         for p in pending_always {
             self.always_blocks.push(p.materialize());
@@ -35085,15 +35287,77 @@ fn collect_write_targets(
     for b in elab.initial_blocks.iter().chain(elab.final_blocks.iter()) {
         walk(&b.stmt, &mut out);
     }
-    for t in elab.tasks.values() {
-        for s in &t.items {
-            walk(s, &mut out);
-        }
+    struct RoutineRaw {
+        sets: Sets,
+        local_decls: Vec<String>,
     }
-    for f in elab.functions.values() {
-        for s in &f.items {
-            walk(s, &mut out);
+    let mut routine_memo: HashMap<usize, RoutineRaw> = HashMap::default();
+    let mut visit_routine = |items: &crate::ast::shared_vec::SharedVec<Statement>,
+                             ports: &[crate::ast::decl::FunctionPort],
+                             deferred: Option<&Rc<CallableRewriteCtx>>| {
+        let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+        let raw = routine_memo.entry(ptr).or_insert_with(|| {
+            let mut sets = Sets {
+                overrides: crate::hasher::HashSet::default(),
+                writes: crate::hasher::HashSet::default(),
+            };
+            for s in items.iter() {
+                walk(s, &mut sets);
+            }
+            let local_decls = stmt_list_declared_names(items)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            RoutineRaw { sets, local_decls }
+        });
+        let Some(dctx) = deferred else {
+            out.overrides.extend(raw.sets.overrides.iter().cloned());
+            out.writes.extend(raw.sets.writes.iter().cloned());
+            return;
+        };
+        let is_shadowed = |head: &str| {
+            ports.iter().any(|p| p.name.name == head)
+                || raw.local_decls.iter().any(|l| l == head)
+        };
+        for o in &raw.sets.overrides {
+            if !is_shadowed(o)
+                && let Some(actual) = dctx.ctx.port_map.get(o)
+            {
+                leaf(actual, &mut out.overrides);
+            } else {
+                out.overrides.insert(o.clone());
+            }
         }
+        for w in &raw.sets.writes {
+            let head = w.split('.').next().unwrap_or(w);
+            if !is_shadowed(head) {
+                if dctx.ctx.local_names.contains(head) {
+                    out.writes.insert(cat2(&dctx.ctx.prefix, w));
+                    continue;
+                }
+                if let Some(actual) = dctx.ctx.port_map.get(head) {
+                    let rest = &w[head.len()..];
+                    let mut mapped = crate::hasher::HashSet::default();
+                    flat(actual, &mut mapped);
+                    for m in mapped {
+                        out.writes.insert(format!("{}{}", m, rest));
+                    }
+                    continue;
+                }
+                if let Some(iface) = dctx.ctx.interface_map.get(head) {
+                    let rest = &w[head.len()..];
+                    out.writes.insert(format!("{}{}", iface, rest));
+                    continue;
+                }
+            }
+            out.writes.insert(w.clone());
+        }
+    };
+    for (k, t) in &elab.tasks {
+        visit_routine(&t.items, &t.ports, elab.deferred_task_bodies.get(k));
+    }
+    for (k, f) in elab.functions.iter() {
+        visit_routine(&f.items, &f.ports, elab.deferred_function_bodies.get(k));
     }
     for c in elab.classes.values() {
         for m in c.methods.values() {
@@ -41118,6 +41382,15 @@ struct InlineCache {
     equal_prepared: HashMap<(String, usize), EqualPrepared>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
+    /// Cache-disabled shared source bodies keyed by original `Arc` pointer,
+    /// avoiding repeated cloning/interning across sibling instances (#193).
+    shared_callable_sources: HashMap<
+        usize,
+        (
+            std::sync::Arc<Vec<Statement>>,
+            crate::ast::shared_vec::SharedVec<Statement>,
+        ),
+    >,
     /// §6.20.3 / §20.7: equal type bindings and their independent width/query
     /// snapshots are immutable. Keep one copy through deferred rewriting.
     type_binds: context_maps::MapInterner<DataType>,
@@ -41153,6 +41426,25 @@ pub type HiddenBareType = (
 impl InlineCache {
     #[cfg(test)]
     fn len(&self) -> usize { self.prepared.len() }
+
+    fn share_callable_source(
+        &mut self,
+        source: &crate::ast::shared_vec::SharedVec<Statement>,
+    ) -> crate::ast::shared_vec::SharedVec<Statement> {
+        let ptr = std::sync::Arc::as_ptr(source.as_arc()) as usize;
+        if let Some((orig, shared)) = self.shared_callable_sources.get(&ptr)
+            && std::sync::Arc::ptr_eq(orig, source.as_arc())
+        {
+            return shared.clone();
+        }
+        let disabled = crate::ast::cache::without_scope_caches(|| source.clone());
+        let interned = self.callable_bodies.intern(disabled);
+        self.shared_callable_sources.insert(
+            ptr,
+            (std::sync::Arc::clone(source.as_arc()), interned.clone()),
+        );
+        interned
+    }
 
     /// §26.3: the typedefs the imports of `def` bind, in binding order. An
     /// import of a package the design does not declare is an error, at that
@@ -50037,25 +50329,23 @@ fn inline_instantiation_items(
                 // instance's own unpacked-array typedef (`u8a_t r;` with
                 // `typedef u8_t u8a_t [0:7]`) names the instance-scoped key,
                 // as the signature does; the bare key is not this instance's.
-                let local_array_typedefs: std::collections::HashSet<&String> = sub_typedef_names
-                    .iter()
-                    .filter(|n| {
-                        elab.typedef_unpacked_dims
-                            .contains_key(&cat2(&inst_prefix, n))
-                    })
-                    .collect();
-                let scope_array_typedef = |dt: &DataType| -> Option<DataType> {
-                    match dt {
-                        DataType::TypeReference {
-                            name, dimensions, ..
-                        } if name.scopes.is_empty()
-                            && dimensions.is_empty()
-                            && local_array_typedefs.contains(&name.name.name) =>
-                        {
-                            Some(scope_local_typeref(dt))
-                        }
-                        _ => None,
-                    }
+                // Capture the set once per instance in `callable_ctx` so deferred
+                // function/task bodies apply it on demand (#193).
+                let callable_ctx: Option<Rc<CallableRewriteCtx>> = if prepared_sub.has_subroutines {
+                    let lat: std::collections::HashSet<String> = sub_typedef_names
+                        .iter()
+                        .filter(|n| {
+                            elab.typedef_unpacked_dims
+                                .contains_key(&cat2(&inst_prefix, n))
+                        })
+                        .cloned()
+                        .collect();
+                    Some(Rc::new(CallableRewriteCtx {
+                        ctx: Rc::clone(&pend_ctx),
+                        local_array_typedefs: (!lat.is_empty()).then(|| Rc::new(lat)),
+                    }))
+                } else {
+                    None
                 };
                 let bake_formal_type = |p: &mut FunctionPort| {
                     p.data_type = scope_local_typeref(&rewrite_data_type_genvar(
@@ -50076,9 +50366,9 @@ fn inline_instantiation_items(
                 // Inline the sub-module's continuous assigns
                 iprof_since("ck6_before_fntask", __th);
                 let __td = iprof_now();
-                // Function/task bodies are copied PER INSTANCE below through
-                // `rewrite_stmt`, so this instance's type-parameter widths
-                // must be live for `$bits(T)` to fold inside them too.
+                // Function/task bodies retain their shared definition syntax
+                // and materialize on demand via `callable_ctx`; keep this
+                // instance's type-parameter TLS active for eager items in the loop.
                 set_type_bind_tls(&pend_ctx);
                 let body_classes: Vec<&ClassDeclaration> = prepared_sub
                     .effective_items
@@ -50108,63 +50398,37 @@ fn inline_instantiation_items(
                             &inst_prefix,
                             &class_bindings,
                         );
-                        // A FORMAL shadows any same-named module-scope object
-                        // inside the body (§13.4): `local_names` is the set of
-                        // module-scope names that GET the instance prefix, so
-                        // the formals must be REMOVED from it — otherwise
-                        // `function z(input x, input y)` in a module that ALSO
-                        // has a function `y` rewrote the formal reference to
-                        // "<inst>.y", a nonexistent signal that read x
-                        // (br_gh277b).
-                        let mut fn_locals = (*prepared_sub.local_names).clone();
-                        for p in &fd.ports {
-                            fn_locals.remove(&p.name.name);
-                        }
-                        for n in stmt_list_declared_names(&fd.items) {
-                            fn_locals.remove(n);
-                        }
                         for p in &mut new_fd.ports {
                             bake_formal_type(p);
-                            if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(
-                                    def,
-                                    &inst_prefix,
-                                    &rewrite_port_map,
-                                    &fn_locals,
-                                    &sub_interface_map,
-                                ));
+                        }
+                        if new_fd.ports.iter().any(|p| p.default.is_some()) {
+                            // A formal or top-level local shadows any same-named
+                            // module-scope object inside default expressions (§13.4).
+                            let mut fn_locals = (*prepared_sub.local_names).clone();
+                            for p in &fd.ports {
+                                fn_locals.remove(&p.name.name);
+                            }
+                            for n in stmt_list_declared_names(&fd.items) {
+                                fn_locals.remove(n);
+                            }
+                            for p in &mut new_fd.ports {
+                                if let Some(def) = &p.default {
+                                    p.default = Some(rewrite_expr(
+                                        def,
+                                        &inst_prefix,
+                                        &rewrite_port_map,
+                                        &fn_locals,
+                                        &sub_interface_map,
+                                    ));
+                                }
                             }
                         }
-                        let formal_names: Vec<&str> =
-                            fd.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        let mut items = crate::ast::cache::without_scope_caches(|| {
-                            with_shadowed(
-                                &formal_names,
-                                &rewrite_port_map,
-                                &fn_locals,
-                                |ports, locals| {
-                                    rewrite_stmt_list_scoped(
-                                        &fd.items,
-                                        &inst_prefix,
-                                        ports,
-                                        locals,
-                                        &sub_interface_map,
-                                    )
-                                },
-                            )
-                        });
-                        scope_local_decl_types(&mut items, &scope_array_typedef);
-                        // §6.20.3: a local declared with one of this instance's
-                        // type parameters (`T loc;`) has the type bound here, as
-                        // in its initial and always blocks; the bare name has
-                        // no binding once the instance is inlined.
-                        let items = substitute_type_params_stmts(
-                            items,
-                            &pend_ctx.type_binds,
-                            &pend_ctx.prefix,
-                        );
-                        new_fd.items = cache.callable_bodies.intern(items.into());
-                        elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
+                        let key = new_fd.name.name.name.clone();
+                        new_fd.items = cache.share_callable_source(&fd.items);
+                        elab.functions.insert(key.clone(), new_fd);
+                        if let Some(cctx) = &callable_ctx {
+                            elab.deferred_function_bodies.insert(key, Rc::clone(cctx));
+                        }
                     }
                     // §16.6/§16.8: a named property or sequence of an INLINED
                     // instance was never registered, so `assert property
@@ -50248,53 +50512,36 @@ fn inline_instantiation_items(
                     if let ModuleItem::TaskDeclaration(td) = sub_item {
                         let mut new_td = td.clone();
                         new_td.name.name.name = cat2(&inst_prefix, &td.name.name.name);
-                        // Same formal-shadowing rule as functions above.
-                        let mut task_locals = (*prepared_sub.local_names).clone();
-                        for p in &td.ports {
-                            task_locals.remove(&p.name.name);
-                        }
-                        for n in stmt_list_declared_names(&td.items) {
-                            task_locals.remove(n);
-                        }
                         for p in &mut new_td.ports {
                             bake_formal_type(p);
-                            if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(
-                                    def,
-                                    &inst_prefix,
-                                    &rewrite_port_map,
-                                    &task_locals,
-                                    &sub_interface_map,
-                                ));
+                        }
+                        if new_td.ports.iter().any(|p| p.default.is_some()) {
+                            // Same formal-shadowing rule as functions above.
+                            let mut task_locals = (*prepared_sub.local_names).clone();
+                            for p in &td.ports {
+                                task_locals.remove(&p.name.name);
+                            }
+                            for n in stmt_list_declared_names(&td.items) {
+                                task_locals.remove(n);
+                            }
+                            for p in &mut new_td.ports {
+                                if let Some(def) = &p.default {
+                                    p.default = Some(rewrite_expr(
+                                        def,
+                                        &inst_prefix,
+                                        &rewrite_port_map,
+                                        &task_locals,
+                                        &sub_interface_map,
+                                    ));
+                                }
                             }
                         }
-                        let formal_names: Vec<&str> =
-                            td.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        let mut items = crate::ast::cache::without_scope_caches(|| {
-                            with_shadowed(
-                                &formal_names,
-                                &rewrite_port_map,
-                                &task_locals,
-                                |ports, locals| {
-                                    rewrite_stmt_list_scoped(
-                                        &td.items,
-                                        &inst_prefix,
-                                        ports,
-                                        locals,
-                                        &sub_interface_map,
-                                    )
-                                },
-                            )
-                        });
-                        scope_local_decl_types(&mut items, &scope_array_typedef);
-                        // §6.20.3: as for a function above.
-                        let items = substitute_type_params_stmts(
-                            items,
-                            &pend_ctx.type_binds,
-                            &pend_ctx.prefix,
-                        );
-                        new_td.items = cache.callable_bodies.intern(items.into());
-                        elab.tasks.insert(new_td.name.name.name.clone(), new_td);
+                        let key = new_td.name.name.name.clone();
+                        new_td.items = cache.share_callable_source(&td.items);
+                        elab.tasks.insert(key.clone(), new_td);
+                        if let Some(cctx) = &callable_ctx {
+                            elab.deferred_task_bodies.insert(key, Rc::clone(cctx));
+                        }
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
                         validate_class_constraints_in_body(
@@ -53014,16 +53261,26 @@ fn substitute_const_fn_calls<P: ParamLookup>(
                     return None;
                 }
             };
-            let fd = match scoped_key
+            let (resolved_key, fd_ref) = match scoped_key
                 .as_deref()
-                .and_then(|k| elab.functions.get(k))
-                .or_else(|| elab.functions.get(&fname))
+                .and_then(|k| elab.functions.get_key_value(k))
+                .or_else(|| elab.functions.get_key_value(&fname))
             {
-                Some(fd) => fd.clone(),
+                Some((k, fd)) => (k.as_str(), fd),
                 None => {
                     param_trace("const-fn:MISS", &fname, "no function registration");
                     return None;
                 }
+            };
+            let mut owned_fd;
+            let fd = if let Some(items) = crate::ast::cache::without_scope_caches(|| {
+                elab.materialize_function_body(resolved_key, fd_ref)
+            }) {
+                owned_fd = fd_ref.clone();
+                owned_fd.items = items;
+                &owned_fd
+            } else {
+                fd_ref
             };
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
@@ -60021,6 +60278,31 @@ fn clear_type_bind_tls() {
     TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
     TYPE_BIND_QUERIES_TLS.with(|c| *c.borrow_mut() = None);
     TYPE_BIND_TYPES_TLS.with(|c| *c.borrow_mut() = None);
+}
+
+fn with_type_bind_tls<R>(ctx: &RewriteCtx, f: impl FnOnce() -> R) -> R {
+    struct Restore {
+        upward: Option<Rc<std::cell::RefCell<UpwardScopes>>>,
+        widths: Option<Rc<HashMap<String, u32>>>,
+        queries: Option<Rc<HashMap<String, TypeQueryDims>>>,
+        types: Option<Rc<HashMap<String, DataType>>>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UPWARD_SCOPES_TLS.with(|c| *c.borrow_mut() = self.upward.take());
+            TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = self.widths.take());
+            TYPE_BIND_QUERIES_TLS.with(|c| *c.borrow_mut() = self.queries.take());
+            TYPE_BIND_TYPES_TLS.with(|c| *c.borrow_mut() = self.types.take());
+        }
+    }
+    let _restore = Restore {
+        upward: UPWARD_SCOPES_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+        widths: TYPE_BIND_WIDTHS_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+        queries: TYPE_BIND_QUERIES_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+        types: TYPE_BIND_TYPES_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+    };
+    set_type_bind_tls(ctx);
+    f()
 }
 
 /// §10.9: the type of a typed pattern `T'{...}` in the instance being
