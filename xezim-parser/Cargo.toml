@@ -9,7 +9,7 @@ keywords = ["systemverilog", "parser", "hdl", "verilog", "eda"]
 categories = ["parser-implementations", "development-tools"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive", "rc"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]

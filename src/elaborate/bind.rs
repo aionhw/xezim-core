@@ -1129,6 +1129,7 @@ impl<'a> Binder<'a> {
                     ClassMethodKind::Task(t) => self.task(t),
                 },
                 ClassItem::Constraint(k) => {
+                    let k = std::sync::Arc::make_mut(k);
                     self.with_pos("constraint", |b| b.constraints(&mut k.items))
                 }
                 ClassItem::Typedef(t) => {

@@ -1248,8 +1248,12 @@ pub struct ElaboratedClass {
     /// Properties marked specifically as 'randc' (cyclic random).
     #[serde(default)]
     pub randc_properties: HashSet<String>,
-    /// Constraints: name -> constraint declaration.
-    pub constraints: HashMap<String, ClassConstraint>,
+    /// Constraints: name -> constraint declaration. Shared with the class
+    /// declaration and with every other elaborated copy of the class that
+    /// did not rewrite the block (aionhw/xezim#721): a reader that changes
+    /// one, or that keys state by where its items are stored, takes its own
+    /// copy first.
+    pub constraints: HashMap<String, std::sync::Arc<ClassConstraint>>,
     /// Class parameters with default values, in declaration order.
     /// `(name, default_value_expr)`.
     pub param_defaults: Vec<(String, Option<crate::ast::expr::Expression>)>,
@@ -1549,6 +1553,7 @@ fn install_ooc_constraint_body(
         .map(std::sync::Arc::make_mut)
     {
         if let Some(existing) = cd.constraints.get_mut(constraint_name) {
+            let existing = std::sync::Arc::make_mut(existing);
             existing.items = items.to_vec();
             existing.has_body = true;
         }
@@ -37966,6 +37971,7 @@ fn rename_class_refs(c: &mut ClassDeclaration) {
                 }
             },
             ClassItem::Constraint(k) => {
+                let k = std::sync::Arc::make_mut(k);
                 k.items = with_gen_part(constraint_takes, || {
                     k.items.iter().map(gen_constraint).collect()
                 });

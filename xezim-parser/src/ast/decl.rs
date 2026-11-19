@@ -1515,8 +1515,10 @@ pub enum ClassItem {
     Property(ClassProperty),
     /// Method: function or task
     Method(ClassMethod),
-    /// Constraint declaration
-    Constraint(ClassConstraint),
+    /// Constraint declaration. Shared: a copy of the class (one per instance
+    /// of the module declaring it, §8.3; one per specialization, §8.25)
+    /// holds the same block until a rewriter takes it with `Arc::make_mut`.
+    Constraint(std::sync::Arc<ClassConstraint>),
     /// Typedef inside class
     Typedef(TypedefDeclaration),
     /// Parameter/localparam inside class

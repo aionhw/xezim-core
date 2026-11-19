@@ -1181,7 +1181,7 @@ impl Parser {
                     crate::ast::decl::ClassItem::Constraint(k)
                         if k.name.name == name.name.name && !k.has_body =>
                     {
-                        Some(k)
+                        Some(std::sync::Arc::make_mut(k))
                     }
                     _ => None,
                 })
@@ -5479,14 +5479,14 @@ impl Parser {
                     self.expect(TokenKind::Semicolon);
                     (Vec::new(), false)
                 };
-                ClassItem::Constraint(ClassConstraint {
+                ClassItem::Constraint(std::sync::Arc::new(ClassConstraint {
                     is_static: qualifiers.contains(&ClassQualifier::Static),
                     is_extern: qualifiers.contains(&ClassQualifier::Extern),
                     has_body,
                     name: cname,
                     items,
                     span: self.span_from(start),
-                })
+                }))
             }
             TokenKind::KwTypedef => ClassItem::Typedef(self.parse_typedef_declaration()),
             TokenKind::KwParameter | TokenKind::KwLocalparam => {

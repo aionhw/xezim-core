@@ -3019,7 +3019,10 @@ impl Rw<'_> {
                     | ClassMethodKind::Extern(fd) => self.function(fd),
                     ClassMethodKind::Task(td) => self.task(td),
                 },
-                ClassItem::Constraint(cc) => cc.items.iter_mut().for_each(|i| self.constraint(i)),
+                ClassItem::Constraint(cc) => std::sync::Arc::make_mut(cc)
+                    .items
+                    .iter_mut()
+                    .for_each(|i| self.constraint(i)),
                 ClassItem::Typedef(td) => {
                     // §8.3/§6.18: a class typedef whose name is declared
                     // elsewhere too is renamed to its class-qualified spelling.
