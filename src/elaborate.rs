@@ -21952,6 +21952,23 @@ pub fn scope_time_decl_inits(items: &mut [ModuleItem], unit_exp: i32, prec_exp: 
             // parameters from the instantiation saw the default scaled and
             // the override not.
             ModuleItem::ModuleInstantiation(inst) => {
+                for conn in inst.instances.iter_mut().flat_map(|i| &mut i.connections) {
+                    let actual = match conn {
+                        PortConnection::Ordered(expr) | PortConnection::Named { expr, .. } => expr,
+                        PortConnection::Wildcard => continue,
+                    };
+                    if let Some(actual) = actual {
+                        let mut literal = &*actual;
+                        while let ExprKind::Paren(inner) = &literal.kind {
+                            literal = inner;
+                        }
+                        // §5.8: scale a time literal in the connecting scope
+                        // before a port substitutes it into another scope.
+                        if matches!(literal.kind, ExprKind::Number(NumberLiteral::Time(_))) {
+                            scope_time_expr(actual, unit_exp, prec_exp);
+                        }
+                    }
+                }
                 if let Some(params) = inst.params.as_mut() {
                     for pc in params.iter_mut() {
                         let value = match pc {
@@ -40815,6 +40832,134 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
     }
 }
 
+/// §23.3.3.8, §10.7: an inlined literal must read like the result of
+/// assigning it to the input. Resize with the actual's sign, then give
+/// the resulting bits the formal's sign.
+fn port_literal_for_formal(
+    actual: &Expression,
+    prefix: &str,
+    port: &str,
+    elab: &ElaboratedModule,
+    resolved_two_state_ports: &HashSet<&str>,
+) -> Option<Expression> {
+    let mut literal = actual;
+    while let ExprKind::Paren(inner) = &literal.kind {
+        literal = inner;
+    }
+    if !matches!(
+        literal.kind,
+        ExprKind::Number(NumberLiteral::Integer { .. } | NumberLiteral::Real(_))
+            | ExprKind::StringLiteral(_)
+    ) {
+        return None;
+    }
+    let formal_name = cat2(prefix, port);
+    let formal = elab.signals.get(&formal_name)?;
+    if formal.width == 0 || elab.string_signals.contains(&formal_name) {
+        return None;
+    }
+    let is_two_state = || {
+        resolved_two_state_ports.contains(port)
+            || elab.two_state_signals.contains(&formal_name)
+            || (!is_net_name(elab, &formal_name) && !formal.value.has_xz())
+    };
+    let mut value = match &literal.kind {
+        ExprKind::Number(NumberLiteral::Integer {
+            size: Some(size),
+            signed,
+            base,
+            value,
+            cached_val,
+        }) if *size == formal.width
+            && !formal.is_real
+            && !(value.contains(['x', 'X', 'z', 'Z', '?']) && is_two_state()) =>
+        {
+            if *signed == formal.is_signed {
+                return Some(literal.clone());
+            }
+            // At equal width the cached bits are independent of the sign.
+            return Some(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(*size),
+                    signed: formal.is_signed,
+                    base: *base,
+                    value: value.clone(),
+                    cached_val: cached_val.clone(),
+                }),
+                literal.span,
+            ));
+        }
+        // An unsized nonnegative decimal has enough bits for its magnitude.
+        // Sizing its digits directly is equivalent to extending or truncating
+        // that value. This also covers the common .en(1) and .rst(0) tie-offs.
+        ExprKind::Number(NumberLiteral::Integer {
+            size: None,
+            base: NumberBase::Decimal,
+            value,
+            ..
+        }) if !formal.is_real && value.starts_with(|c: char| c.is_ascii_digit()) => {
+            return Some(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(formal.width),
+                    signed: formal.is_signed,
+                    base: NumberBase::Decimal,
+                    value: value.clone(),
+                    cached_val: Default::default(),
+                }),
+                actual.span,
+            ));
+        }
+        ExprKind::Number(
+            num @ NumberLiteral::Integer { size, signed, base, value, .. },
+        ) => {
+            let width = number_literal_width(num);
+            let radix = match base {
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Decimal => 10,
+                NumberBase::Hex => 16,
+            };
+            // §5.7.1: a leading X/Z in an unsized unsigned literal pads
+            // to the expression width, even beyond its intrinsic width.
+            let width = if size.is_none() && !signed && !formal.is_real {
+                width.max(formal.width)
+            } else {
+                width
+            };
+            let mut v = Value::from_literal_text(value, radix, width);
+            v.is_signed = *signed;
+            v
+        }
+        ExprKind::Number(NumberLiteral::Real(value)) if !formal.is_real => {
+            Value::from_real_wrapped(*value, formal.width)
+        }
+        ExprKind::StringLiteral(value) => Value::from_string(value),
+        _ => return None,
+    };
+    if formal.is_real {
+        value = Value::from_f64(value.to_two_state().to_f64());
+    } else {
+        value = value.resize_for_assign(formal.width);
+        value.is_signed = formal.is_signed;
+        if value.has_xz() && is_two_state() {
+            value = value.to_two_state();
+        }
+    }
+    if value.is_real || value.has_xz() {
+        return const_value_literal(&value, actual.span);
+    }
+    Some(Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: Some(value.width),
+            signed: value.is_signed,
+            base: NumberBase::Hex,
+            value: value.to_hex(),
+            cached_val: Default::default(),
+        }),
+        actual.span,
+    ))
+}
+
 /// Warn once per (module, port) about a width-mismatched connection. §23.3.3
 /// makes the mismatch legal (implicit truncation/extension applies), but it
 /// is the classic wiring bug, and commercial tools flag it.
@@ -44657,6 +44802,10 @@ fn inline_module_items(
                         }
                     }
                 }
+                // String ports keep their dynamic type when their literal is
+                // substituted. Their storage allocation is not a packed width.
+                let mut string_ports = HashSet::default();
+                let mut resolved_two_state_ports = HashSet::default();
                 match sub_mod.ports() {
                     PortList::Ansi(ports) => {
                         for port in ports {
@@ -44815,6 +44964,17 @@ fn inline_module_items(
                                 // which is what made this look type-specific.
                                 let resolved_dt =
                                     resolve_typedef_chain(dt, &elab.typedef_types).clone();
+                                if matches!(
+                                    resolved_dt,
+                                    DataType::Simple { kind: SimpleType::String, .. }
+                                ) {
+                                    string_ports.insert(port.name.name.as_str());
+                                }
+                                if matches!(dt, DataType::TypeReference { .. })
+                                    && is_type_two_state_resolved(&resolved_dt, &elab.typedef_types)
+                                {
+                                    resolved_two_state_ports.insert(port.name.name.as_str());
+                                }
                                 if let Some(ew) =
                                     packed_inner_elem_width(dt, &sub_merged_params, &elab.typedefs)
                                         .or_else(|| {
@@ -45304,6 +45464,21 @@ fn inline_module_items(
                         if let ModuleItem::PortDeclaration(pd) = sub_item {
                             if is_interface_type(&pd.data_type, definitions) {
                                 continue;
+                            }
+                            if matches!(
+                                resolve_typedef_chain(&pd.data_type, &elab.typedef_types),
+                                DataType::Simple { kind: SimpleType::String, .. }
+                            ) {
+                                string_ports.extend(
+                                    pd.declarators.iter().map(|d| d.name.name.as_str()),
+                                );
+                            }
+                            if matches!(pd.data_type, DataType::TypeReference { .. })
+                                && is_type_two_state_resolved(&pd.data_type, &elab.typedef_types)
+                            {
+                                resolved_two_state_ports.extend(
+                                    pd.declarators.iter().map(|d| d.name.name.as_str()),
+                                );
                             }
                             let width = resolve_type_width(
                                 &pd.data_type,
@@ -47488,6 +47663,20 @@ fn inline_module_items(
                     {
                         no_subst_ports.insert(pname.clone());
                     }
+                    // §6.6.5: a high-impedance driver lets the pull value win.
+                    if is_input
+                        && matches!(
+                            &fill_actual.kind,
+                            ExprKind::Number(NumberLiteral::Integer { value, .. })
+                                if value.contains(['z', 'Z', '?'])
+                        )
+                        && matches!(
+                            elab.resolved_net_kinds.get(&array_formal),
+                            Some(ResolvedNetKind::Tri0 | ResolvedNetKind::Tri1)
+                        )
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     // §7.2.1/§23.3.3: a PACKED-STRUCT formal read member-wise
                     // (`din.f0`) needs its own member layout. Substituting a
                     // FLAT actual (a plain vector net, a concat, a select)
@@ -47572,7 +47761,25 @@ fn inline_module_items(
                             Some(PortDirection::Output)
                         ) && !no_subst_ports.contains(name.as_str())
                     })
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(name, actual)| {
+                        let converted = if matches!(
+                            prepared_sub.port_directions.get(name.as_str()),
+                            Some(PortDirection::Input)
+                        ) && !prepared_sub.body_driven_ports.contains(name.as_str())
+                            && !string_ports.contains(name.as_str())
+                        {
+                            port_literal_for_formal(
+                                actual,
+                                &inst_prefix,
+                                name,
+                                elab,
+                                &resolved_two_state_ports,
+                            )
+                        } else {
+                            None
+                        };
+                        (name.clone(), converted.unwrap_or_else(|| actual.clone()))
+                    })
                     .collect();
                 // §8.3 / §23.6: a module-instance class cannot replace a
                 // same-named compilation-unit or sibling-instance class.
