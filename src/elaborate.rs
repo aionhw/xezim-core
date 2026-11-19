@@ -36056,27 +36056,64 @@ fn is_builtin_bare_name(name: &str) -> bool {
     )
 }
 
+type BindResolveStep<'a> = dyn FnMut(
+    &mut ElaboratedModule,
+) -> Result<Vec<(String, Vec<crate::ast::decl::BindDirective>)>, String>
+    + 'a;
+
+struct PortElisionGuard;
+impl Drop for PortElisionGuard {
+    fn drop(&mut self) {
+        PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
+    }
+}
+
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    inline_instantiations_core(elab, definitions, None).map(|_| ())
+}
+
+/// Inline the hierarchy rooted at `elab.name` and resolve any nested `bind`
+/// fixed-point incrementally on newly introduced targets. Returns `Ok(true)` if
+/// a rare cross-pass edge case requires a full root rebuild from the populated
+/// `elab.resolved_binds`.
+pub(crate) fn inline_instantiations_with_binds(
+    elab: &mut ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+    unit_binds: &[crate::ast::decl::BindDirective],
+    resolve_step: &mut BindResolveStep<'_>,
+) -> Result<bool, String> {
+    inline_instantiations_core(elab, definitions, Some((unit_binds, resolve_step)))
+}
+
+fn inline_instantiations_core(
+    elab: &mut ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+    bind_driver: Option<(&[crate::ast::decl::BindDirective], &mut BindResolveStep<'_>)>,
+) -> Result<bool, String> {
     let _oom_trace = crate::oom_trace::session();
     let _oom_inline = crate::oom_trace::scope("inline hierarchy", "", &elab.name, &elab.name);
     port_elision_setup();
-    let result = inline_instantiations_inner(elab, definitions);
-    PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
+    let _port_elision_guard = PortElisionGuard;
+    let needs_rebuild = inline_instantiations_inner(elab, definitions, bind_driver)?;
+    if needs_rebuild {
+        return Ok(true);
+    }
     elab.elided_port_hashes.sort_unstable();
     elab.elided_port_hashes.dedup();
     // The instances' and interfaces' own arrays, as the top's.
     register_nd_struct_array_members(elab);
-    result
+    Ok(false)
 }
 
 fn inline_instantiations_inner(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
-) -> Result<(), String> {
+    bind_driver: Option<(&[crate::ast::decl::BindDirective], &mut BindResolveStep<'_>)>,
+) -> Result<bool, String> {
     let header_values: Vec<_> = definitions
         .get(&elab.name)
         .into_iter()
@@ -37169,8 +37206,21 @@ fn inline_instantiations_inner(
     // the entries its definition can name (#740).
     let param_scope =
         param_scope::ParamScope::new(&top_params, definitions, &elab.resolved_binds, &elab.lets);
-    let top_scope = param_scope.top_scope(top_def, definitions);
-    inline_module_items(
+    let mut top_scope = param_scope.top_scope(top_def, definitions);
+    let mut bind_state = bind_driver.as_ref().and_then(|(unit_binds, _)| {
+        BindTargetFilter::collect(
+            top_def.name(),
+            unit_binds,
+            definitions,
+            &elab.checker_decls,
+        )
+        .map(|filter| BindWorklistState {
+            filter,
+            scopes: HashMap::default(),
+            needs_full_rebuild: false,
+        })
+    });
+    let top_meta = inline_module_items(
         elab,
         top_def,
         "",
@@ -37181,7 +37231,58 @@ fn inline_instantiations_inner(
         &HashMap::default(),
         &root_defparams,
         &param_scope,
+        bind_state.as_mut(),
     )?;
+    if let Some(bs) = bind_state.as_mut()
+        && bs.filter.can_target_top
+    {
+        let top_defparams = if !top_meta.was_flat_leaf {
+            top_meta.defparams
+        } else {
+            root_defparams
+        };
+        bs.scopes.insert(
+            String::new(),
+            TargetScope {
+                def_name: module_name.clone(),
+                local_names: top_meta.local_names,
+                local_typedefs: top_meta.local_typedefs,
+                interface_map: HashMap::default(),
+                port_map: Rc::new(HashMap::default()),
+                local_params: std::mem::take(&mut top_scope),
+                defparams: top_defparams,
+                type_overlay: None,
+                items_end: top_meta.items_end,
+                was_flat_leaf: top_meta.was_flat_leaf,
+            },
+        );
+    }
+    if let (Some((_, resolve_step)), Some(mut bs)) = (bind_driver, bind_state) {
+        for pass in 0..64 {
+            let new_binds = resolve_step(elab)?;
+            if new_binds.is_empty() {
+                break;
+            }
+            if pass == 63 {
+                return Err("bind hierarchy does not converge (§23.11)".into());
+            }
+            for (target_path, directives) in new_binds {
+                inline_bound_items(
+                    elab,
+                    &target_path,
+                    &directives,
+                    definitions,
+                    &mut cache,
+                    &param_scope,
+                    &mut bs,
+                )?;
+                if bs.needs_full_rebuild {
+                    return Ok(true);
+                }
+            }
+        }
+        drop(bs);
+    }
     crate::oom_trace::model("inline.top.ready", elab, Some(cache.prepared.len()));
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
@@ -37200,7 +37301,7 @@ fn inline_instantiations_inner(
     // implicit 1-bit wires for any prefixed names that don't yet exist.
     create_implicit_nets_for_pending(elab);
 
-    // Identify interface instances at top level
+    // Identify interface instances at top level (declared or bound directly to top)
     let mut top_interface_names = HashSet::default();
     for item in top_def.items() {
         if let ModuleItem::ModuleInstantiation(inst) = item {
@@ -37209,6 +37310,18 @@ fn inline_instantiations_inner(
                 .is_some_and(|d| matches!(d, Definition::Interface(_)))
             {
                 for hi in &inst.instances {
+                    top_interface_names.insert(hi.name.name.clone());
+                }
+            }
+        }
+    }
+    if let Some(top_binds) = elab.resolved_binds.get("") {
+        for b in top_binds {
+            if definitions
+                .get(&b.instantiation.module_name.name)
+                .is_some_and(|d| matches!(d, Definition::Interface(_)))
+            {
+                for hi in &b.instantiation.instances {
                     top_interface_names.insert(hi.name.name.clone());
                 }
             }
@@ -37285,7 +37398,7 @@ fn inline_instantiations_inner(
     // member` at elaboration). Only accesses proven illegal are rejected.
     validate_member_visibility(elab)?;
 
-    Ok(())
+    Ok(false)
 }
 
 /// Construct an unsized integer-literal `Expression` for a genvar value.
@@ -41674,6 +41787,655 @@ fn bind_inlined_import_params(
     Ok(())
 }
 
+/// Static filter indexing every target that any `bind` directive in the
+/// design could ever match. When empty (`collect` returns `None`),
+/// non-bind designs retain zero `TargetScope` state.
+struct BindTargetFilter {
+    target_defs: HashSet<String>,
+    target_leaf_names: HashSet<String>,
+    can_target_top: bool,
+    has_non_plain_bind: bool,
+}
+
+impl BindTargetFilter {
+    fn collect(
+        top_def_name: &str,
+        unit_binds: &[BindDirective],
+        definitions: &HashMap<String, Definition>,
+        checker_decls: &HashMap<String, crate::ast::decl::CheckerDeclaration>,
+    ) -> Option<Self> {
+        let mut filter = Self {
+            target_defs: HashSet::default(),
+            target_leaf_names: HashSet::default(),
+            can_target_top: false,
+            has_non_plain_bind: false,
+        };
+        let mut any = false;
+        let mut note_bind = |b: &BindDirective| {
+            any = true;
+            if b.target_path.is_empty() {
+                filter.target_defs.insert(b.target_module.name.clone());
+                filter
+                    .target_leaf_names
+                    .insert(b.target_module.name.clone());
+                if b.target_module.name == top_def_name {
+                    filter.can_target_top = true;
+                }
+            } else {
+                for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
+                    if let Some(last) = path.last() {
+                        filter.target_leaf_names.insert(last.name.name.clone());
+                        if (path.len() == 1 && last.name.name == top_def_name)
+                            || (path.len() == 2
+                                && path[0].name.name == "$root"
+                                && last.name.name == top_def_name)
+                        {
+                            filter.can_target_top = true;
+                        }
+                    }
+                }
+            }
+            let bound_name = &b.instantiation.module_name.name;
+            let plain = matches!(
+                definitions.get(bound_name),
+                Some(Definition::Module(_) | Definition::Interface(_) | Definition::Program(_))
+            ) && !checker_decls.contains_key(bound_name);
+            if !plain {
+                filter.has_non_plain_bind = true;
+            }
+        };
+        for b in unit_binds {
+            note_bind(b);
+        }
+        fn walk_items(items: &[ModuleItem], note_bind: &mut impl FnMut(&BindDirective)) {
+            for item in items {
+                match item {
+                    ModuleItem::Bind(b) => note_bind(b),
+                    ModuleItem::GenerateRegion(gr) => walk_items(&gr.items, note_bind),
+                    ModuleItem::GenerateFor(gf) => walk_items(&gf.items, note_bind),
+                    ModuleItem::GenerateIf(gi) => {
+                        for (_, branch) in &gi.branches {
+                            walk_items(branch, note_bind);
+                        }
+                    }
+                    ModuleItem::GenerateCase(gc) => {
+                        for arm in &gc.arms {
+                            walk_items(&arm.items, note_bind);
+                        }
+                    }
+                    ModuleItem::NestedModule(nm) => walk_items(&nm.items, note_bind),
+                    _ => {}
+                }
+            }
+        }
+        for def in definitions.values() {
+            match def {
+                Definition::Module(m) => walk_items(&m.items, &mut note_bind),
+                Definition::Interface(i) => walk_items(&i.items, &mut note_bind),
+                Definition::Program(p) => walk_items(&p.items, &mut note_bind),
+                _ => {}
+            }
+        }
+        any.then_some(filter)
+    }
+
+    fn matches(&self, inst_path: &str, def_name: &str) -> bool {
+        if inst_path.is_empty() {
+            return self.can_target_top;
+        }
+        if self.target_defs.contains(def_name) {
+            return true;
+        }
+        let leaf = inst_path.rsplit('.').next().unwrap_or(inst_path);
+        let base = if leaf.ends_with(']') {
+            leaf.split('[').next().unwrap_or(leaf)
+        } else {
+            leaf
+        };
+        self.target_leaf_names.contains(base)
+    }
+}
+
+/// Active typedef / type-parameter overrides of an elaborated instance while
+/// its body was inlined, captured for later incremental `bind` passes.
+struct TargetTypeOverlay {
+    typedef_binds: Vec<(String, Option<u32>, Option<DataType>)>,
+    type_shapes: Vec<(String, TypedefShapeSave)>,
+    unpacked_dims: Vec<(String, Option<Vec<UnpackedDimension>>)>,
+}
+
+type AppliedTypeOverlay = TargetTypeOverlay;
+
+/// Elaboration environment captured for a scope that may receive bound
+/// instances on a later `bind` fixed-point pass.
+struct TargetScope {
+    def_name: String,
+    local_names: Option<Rc<std::collections::HashSet<String>>>,
+    local_typedefs: Option<Box<std::collections::HashSet<String>>>,
+    interface_map: HashMap<String, String>,
+    port_map: Rc<HashMap<String, Expression>>,
+    local_params: HashMap<String, Value>,
+    defparams: Vec<PendingDefparam>,
+    type_overlay: Option<Box<TargetTypeOverlay>>,
+    items_end: usize,
+    was_flat_leaf: bool,
+}
+
+struct BindWorklistState {
+    filter: BindTargetFilter,
+    scopes: HashMap<String, TargetScope>,
+    needs_full_rebuild: bool,
+}
+
+struct ModuleInlineMeta {
+    items_end: usize,
+    was_flat_leaf: bool,
+    local_names: Option<Rc<std::collections::HashSet<String>>>,
+    local_typedefs: Option<Box<std::collections::HashSet<String>>>,
+    defparams: Vec<PendingDefparam>,
+}
+
+fn capture_type_overlay(
+    elab: &ElaboratedModule,
+    saved_type_binds: &[(String, Option<u32>, Option<DataType>)],
+    saved_type_shapes: &[(String, TypedefShapeSave)],
+    saved_unpacked_dims: &[(String, Option<Vec<UnpackedDimension>>)],
+) -> Option<Box<TargetTypeOverlay>> {
+    if saved_type_binds.is_empty()
+        && saved_type_shapes.is_empty()
+        && saved_unpacked_dims.is_empty()
+    {
+        return None;
+    }
+    let mut seen = HashSet::default();
+    let mut typedef_binds = Vec::with_capacity(saved_type_binds.len());
+    for (name, _, _) in saved_type_binds {
+        if seen.insert(name.as_str()) {
+            typedef_binds.push((
+                name.clone(),
+                elab.typedefs.get(name).copied(),
+                elab.typedef_types.get(name).cloned(),
+            ));
+        }
+    }
+    seen.clear();
+    let mut type_shapes = Vec::with_capacity(saved_type_shapes.len());
+    for (name, _) in saved_type_shapes {
+        if seen.insert(name.as_str()) {
+            type_shapes.push((name.clone(), tls_typedef_shape(name)));
+        }
+    }
+    seen.clear();
+    let mut unpacked_dims = Vec::with_capacity(saved_unpacked_dims.len());
+    for (name, _) in saved_unpacked_dims {
+        if seen.insert(name.as_str()) {
+            unpacked_dims.push((name.clone(), elab.typedef_unpacked_dims.get(name).cloned()));
+        }
+    }
+    Some(Box::new(TargetTypeOverlay {
+        typedef_binds,
+        type_shapes,
+        unpacked_dims,
+    }))
+}
+
+fn apply_type_overlay(
+    elab: &mut ElaboratedModule,
+    overlay: &TargetTypeOverlay,
+) -> AppliedTypeOverlay {
+    let mut prev_binds = Vec::with_capacity(overlay.typedef_binds.len());
+    for (name, w, dt) in &overlay.typedef_binds {
+        prev_binds.push((
+            name.clone(),
+            elab.typedefs.get(name).copied(),
+            elab.typedef_types.get(name).cloned(),
+        ));
+        match w {
+            Some(width) => {
+                elab.typedefs.insert_if_changed(name.clone(), *width);
+            }
+            None => {
+                elab.typedefs.remove(name);
+            }
+        }
+        match dt {
+            Some(t) => {
+                elab.typedef_types.insert(name.clone(), t.clone());
+            }
+            None => {
+                elab.typedef_types.remove(name);
+            }
+        }
+    }
+    let mut prev_shapes = Vec::with_capacity(overlay.type_shapes.len());
+    for (name, shape) in &overlay.type_shapes {
+        prev_shapes.push((name.clone(), tls_typedef_shape(name)));
+        tls_restore_typedef_shape(name, shape.clone());
+    }
+    let mut prev_dims = Vec::with_capacity(overlay.unpacked_dims.len());
+    for (name, dims) in &overlay.unpacked_dims {
+        prev_dims.push((name.clone(), elab.typedef_unpacked_dims.get(name).cloned()));
+        match dims {
+            Some(d) => {
+                elab.typedef_unpacked_dims.insert(name.clone(), d.clone());
+            }
+            None => {
+                elab.typedef_unpacked_dims.remove(name);
+            }
+        }
+    }
+    AppliedTypeOverlay {
+        typedef_binds: prev_binds,
+        type_shapes: prev_shapes,
+        unpacked_dims: prev_dims,
+    }
+}
+
+fn restore_type_overlay(elab: &mut ElaboratedModule, prev: AppliedTypeOverlay) {
+    for (name, shape) in prev.type_shapes.into_iter().rev() {
+        tls_restore_typedef_shape(&name, shape);
+    }
+    for (name, dims) in prev.unpacked_dims.into_iter().rev() {
+        match dims {
+            Some(d) => {
+                elab.typedef_unpacked_dims.insert(name, d);
+            }
+            None => {
+                elab.typedef_unpacked_dims.remove(&name);
+            }
+        }
+    }
+    for (name, w, dt) in prev.typedef_binds.into_iter().rev() {
+        match w {
+            Some(width) => {
+                elab.typedefs.insert_if_changed(name.clone(), width);
+            }
+            None => {
+                elab.typedefs.remove(&name);
+            }
+        }
+        match dt {
+            Some(t) => {
+                elab.typedef_types.insert(name, t);
+            }
+            None => {
+                elab.typedef_types.remove(&name);
+            }
+        }
+    }
+    sync_typedefs_tls(&elab.typedefs);
+}
+
+fn create_target_implicit_nets(
+    elab: &mut ElaboratedModule,
+    target_def: Definition,
+    inst_prefix: &str,
+    mut cands: Vec<String>,
+) {
+    if cands.is_empty() {
+        return;
+    }
+    let __ta = iprof_now();
+    let target_port_names: std::collections::HashSet<String> = match target_def.ports() {
+        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
+        PortList::NonAnsi(ps) => ps.iter().map(|p| p.name.clone()).collect(),
+        _ => std::collections::HashSet::default(),
+    };
+    let target_declares: std::collections::HashSet<String> = {
+        let mut v = Vec::new();
+        visit_renamed_decls(target_def.items(), &mut |n, _, kind| {
+            if kind != DeclKind::Label {
+                v.push(n.to_string())
+            }
+        });
+        // §6.20: a HEADER parameter (`#(parameter ...)`) is a
+        // constant, not a net: `leaf u (.a(VREF));` binds its
+        // value. The body items above cover body parameters
+        // and localparams but not the header, so such an
+        // actual was taken for an undeclared identifier.
+        for pd in target_def.params() {
+            match &pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+                ParameterKind::Type { assignments } => {
+                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+            }
+        }
+        v.into_iter().collect()
+    };
+    cands.sort();
+    cands.dedup();
+    for name in cands {
+        // A formal port of the sub-module is bound to the
+        // parent's expression, not declared here.
+        if target_port_names.contains(&name) {
+            continue;
+        }
+        let scoped = cat2(inst_prefix, &name);
+        // §6.10: the implicit net belongs to THIS instance, so
+        // the existence test must be SCOPED. A bare
+        // `signals.contains_key(name)` skipped creation
+        // whenever anything ANYWHERE shared the bare spelling —
+        // including an INSTANCE-NAME placeholder, since
+        // instantiating `foo c (...)` registers a signal named
+        // `c`. A gate library hits this constantly: a cell's
+        // `buf IC (clk, dCK);` wants its own implicit `clk`,
+        // every design has some other `clk`, and the cell's
+        // flops were then never clocked and read x.
+        if elab.signals.contains_key(&scoped)
+            || elab.parameters.contains_key(&name)
+            || elab.parameters.contains_key(&scoped)
+            || elab.nets.contains(&scoped)
+            || elab.arrays.contains_key(&scoped)
+            || elab.arrays_2d.contains_key(&scoped)
+            || elab.arrays_nd.contains_key(&scoped)
+            || elab.interfaces.contains(&scoped)
+        {
+            continue;
+        }
+        // Declared inside the sub-module itself (a net/var
+        // declaration or one of its own ports) — the regular
+        // inline paths create those.
+        if target_declares.contains(&name) {
+            continue;
+        }
+        if crate::implicit_net_warn() {
+            crate::elab_diag(format!(
+                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                 (IEEE 1800-2017 §6.10, instance port connection). Add an explicit declaration to silence.",
+                scoped
+            ));
+        }
+        signals_insert_traced(
+            &mut elab.signals,
+            line!(),
+            scoped.clone(),
+            Signal {
+                is_const: false,
+                name: scoped.clone().into(),
+                width: 1,
+                is_signed: false,
+                direction: None,
+                value: Value::new(1),
+                is_real: false,
+                type_name: None,
+            },
+        );
+        elab.implicit_nets.insert(scoped.clone());
+        elab.nets.insert(scoped);
+    }
+    iprof_since("implicit_net_scan", __ta);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_bound_items(
+    elab: &mut ElaboratedModule,
+    target_path: &str,
+    directives: &[BindDirective],
+    definitions: &HashMap<String, Definition>,
+    cache: &mut InlineCache,
+    param_scope: &param_scope::ParamScope,
+    bind_state: &mut BindWorklistState,
+) -> Result<(), String> {
+    let mut scope = bind_state
+        .scopes
+        .remove(target_path)
+        .ok_or_else(|| format!("missing bind target scope '{}'", target_path))?;
+    let source_def = *definitions
+        .get(&scope.def_name)
+        .ok_or_else(|| format!("Bind target definition '{}' not found", scope.def_name))?;
+    let prefix = if target_path.is_empty() {
+        String::new()
+    } else {
+        format!("{target_path}.")
+    };
+    for b in directives {
+        if let Some(def) = definitions.get(&b.instantiation.module_name.name) {
+            crate::param_override_lists::check_bound_instance(
+                &b.instantiation,
+                *def,
+                source_def.name(),
+            )?;
+        }
+    }
+    let chain = {
+        let scopes = elab.upward_scopes.borrow();
+        let mut rev_chain: Vec<(String, String)> = Vec::new();
+        let mut cur = target_path;
+        loop {
+            let def_name = scopes
+                .defs
+                .get(cur)
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| {
+                    if cur == target_path {
+                        scope.def_name.clone()
+                    } else {
+                        String::new()
+                    }
+                });
+            let pfx = if cur.is_empty() {
+                String::new()
+            } else {
+                format!("{cur}.")
+            };
+            rev_chain.push((pfx, def_name));
+            if cur.is_empty() {
+                break;
+            }
+            if let Some(parent) = scopes.parents.get(cur) {
+                // `parent.path` lives behind `Ref` to `UpwardScopes`; walk via
+                // string slice lifetime tied to `scopes`.
+                let mut p: &str = &*parent.path;
+                while !p.is_empty() && !scopes.defs.contains_key(p) {
+                    p = p.rsplit_once('.').map(|(head, _)| head).unwrap_or("");
+                }
+                cur = p;
+            } else {
+                let mut p = cur.rsplit_once('.').map(|(head, _)| head).unwrap_or("");
+                while !p.is_empty() && !scopes.defs.contains_key(p) {
+                    p = p.rsplit_once('.').map(|(head, _)| head).unwrap_or("");
+                }
+                cur = p;
+            }
+        }
+        rev_chain.reverse();
+        rev_chain
+    };
+    let prev_chain = INLINE_CHAIN_TLS.with(|c| c.replace(chain));
+    struct ChainRestore(Vec<(String, String)>);
+    impl Drop for ChainRestore {
+        fn drop(&mut self) {
+            let prev = std::mem::take(&mut self.0);
+            INLINE_CHAIN_TLS.with(|c| {
+                *c.borrow_mut() = prev;
+            });
+        }
+    }
+    let _chain_restore = ChainRestore(prev_chain);
+
+    install_upward_scopes(&elab.upward_scopes);
+    let _decl_shapes = install_decl_shapes(source_def);
+
+    let imports = cache.imported_typedefs(elab, source_def, definitions)?;
+    rebind_imported_typedefs(elab, &imports);
+    if !cache.param_imports_done.contains(source_def.name()) {
+        cache
+            .param_imports_done
+            .insert(source_def.name().to_string());
+        bind_inlined_import_params(elab, source_def, definitions)?;
+    }
+
+    let applied_overlay = scope
+        .type_overlay
+        .as_deref()
+        .map(|o| apply_type_overlay(elab, o));
+    sync_typedefs_tls(&elab.typedefs);
+
+    param_scope.extend_scope_for_binds(directives, definitions, &mut scope.local_params);
+
+    if scope.was_flat_leaf {
+        for item in source_def.items() {
+            scope.items_end = scope.items_end.max(match item {
+                ModuleItem::InitialConstruct(ic) => ic.span.end,
+                ModuleItem::AlwaysConstruct(ac) => ac.span.end,
+                ModuleItem::AssertionItem(a) => a.span.end,
+                ModuleItem::ModuleInstantiation(mi) => mi.span.end,
+                _ => 0,
+            });
+            if let ModuleItem::Defparam(assigns) = item {
+                for (lhs, rhs) in assigns {
+                    if let Some(path) = defparam_path_segments(lhs) {
+                        scope.defparams.push(PendingDefparam {
+                            path,
+                            value: eval_const_expr_val(rhs, &scope.local_params),
+                            span: lhs.span,
+                            owner: source_def.name().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        scope.was_flat_leaf = false;
+    }
+
+    let mut bound: Vec<ModuleItem> = directives
+        .iter()
+        .rev()
+        .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
+        .collect();
+    let has_arrays = has_instance_arrays(&bound);
+    if has_arrays || scope.local_names.is_none() {
+        cache.prepared.enter_instance(&prefix);
+        let prepared = prepare_module_items(
+            source_def,
+            definitions,
+            &scope.local_params,
+            &elab.typedefs,
+            cache,
+            param_scope,
+        );
+        if scope.local_names.is_none() {
+            scope.local_names = Some(Rc::clone(&prepared.local_names));
+            if !prepared.local_typedefs.is_empty() {
+                scope.local_typedefs = Some(Box::new(prepared.local_typedefs.clone()));
+            }
+        }
+        if has_arrays {
+            let shapes = ai_scope_shapes(
+                &prepared.effective_items,
+                source_def,
+                &scope.local_params,
+                &elab.typedefs,
+            );
+            ai_expand_instance_arrays(
+                &mut bound,
+                &shapes,
+                definitions,
+                &scope.local_params,
+                &elab.typedefs,
+            );
+        }
+    }
+
+    let mut cands = Vec::new();
+    collect_port_connection_net_candidates(&bound, &mut cands);
+    if !cands.is_empty() {
+        let local_names = scope
+            .local_names
+            .get_or_insert_with(|| Rc::new(std::collections::HashSet::default()));
+        if cands.iter().any(|n| !local_names.contains(n)) {
+            Rc::make_mut(local_names).extend(cands.iter().cloned());
+        }
+        create_target_implicit_nets(elab, source_def, &prefix, cands);
+    }
+
+    register_modport_expressions(&bound, &prefix, definitions);
+    let mut sibling_inst_names: std::collections::HashSet<String> = {
+        let scopes = elab.upward_scopes.borrow();
+        scopes
+            .children
+            .get(target_path)
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|p| UpwardScopes::child_leaf(target_path, p).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for item in &bound {
+        if let ModuleItem::ModuleInstantiation(mi) = item {
+            for hi in &mi.instances {
+                sibling_inst_names.insert(hi.name.name.clone());
+            }
+        }
+    }
+
+    if !prefix.is_empty() {
+        for item in &bound {
+            if let ModuleItem::ModuleInstantiation(mi) = item
+                && definitions
+                    .get(&mi.module_name.name)
+                    .is_some_and(|d| matches!(d, Definition::Interface(_)))
+            {
+                for hi in &mi.instances {
+                    if elab.interface_port_aliases.iter().any(|(k, v)| {
+                        k.starts_with(&prefix)
+                            && v.split(|c| c == '.' || c == '[').next()
+                                == Some(hi.name.name.as_str())
+                    }) {
+                        bind_state.needs_full_rebuild = true;
+                        break;
+                    }
+                }
+            }
+            if bind_state.needs_full_rebuild {
+                break;
+            }
+        }
+    }
+
+    let res = if bind_state.needs_full_rebuild {
+        Ok(())
+    } else {
+        let empty_names = std::collections::HashSet::default();
+        let parent_local_names: &std::collections::HashSet<String> =
+            scope.local_names.as_deref().unwrap_or(&empty_names);
+        let parent_local_typedefs: &std::collections::HashSet<String> =
+            scope.local_typedefs.as_deref().unwrap_or(&empty_names);
+        inline_instantiation_items(
+            elab,
+            source_def,
+            &prefix,
+            definitions,
+            &mut scope.interface_map,
+            &scope.local_params,
+            cache,
+            &scope.port_map,
+            &scope.defparams,
+            param_scope,
+            parent_local_names,
+            parent_local_typedefs,
+            &sibling_inst_names,
+            &mut scope.items_end,
+            &bound,
+            Some(bind_state),
+        )
+    };
+
+    if let Some(prev) = applied_overlay {
+        restore_type_overlay(elab, prev);
+    } else {
+        sync_typedefs_tls(&elab.typedefs);
+    }
+    bind_state.scopes.insert(target_path.to_string(), scope);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -41698,7 +42460,8 @@ fn inline_module_items(
     // §23.10/§26.3: the package, `$unit` and top parameters, from which a
     // child's scope takes the entries its definition can name.
     param_scope: &param_scope::ParamScope,
-) -> Result<(), String> {
+    mut bind_state: Option<&mut BindWorklistState>,
+) -> Result<ModuleInlineMeta, String> {
     // Bind this module's imported type names BEFORE its body is prepared or
     // resolved. The top-module path re-runs its imports
     // (`elaborate_module_with_defs`); the inlined-instance path never processed
@@ -41776,7 +42539,13 @@ fn inline_module_items(
                 }
             }
         }
-        return Ok(());
+        return Ok(ModuleInlineMeta {
+            items_end: 0,
+            was_flat_leaf: true,
+            local_names: None,
+            local_typedefs: None,
+            defparams: Vec::new(),
+        });
     }
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
@@ -41896,9 +42665,69 @@ fn inline_module_items(
     // End offset of the process/instance items seen so far (see
     // `ElabInstance::src_pos`).
     let mut items_end = 0usize;
-    for item in &prepared_source.effective_items {
-        let item_floor = items_end;
-        items_end = items_end.max(match item {
+    inline_instantiation_items(
+        elab,
+        source_def,
+        prefix,
+        definitions,
+        interface_map,
+        local_params,
+        cache,
+        parent_port_map,
+        &defparams,
+        param_scope,
+        &prepared_source.local_names,
+        &prepared_source.local_typedefs,
+        &sibling_inst_names,
+        &mut items_end,
+        &prepared_source.effective_items,
+        bind_state.as_deref_mut(),
+    )?;
+    if bind_state
+        .as_ref()
+        .is_some_and(|bs| bs.filter.matches(prefix.trim_end_matches('.'), source_def.name()))
+    {
+        Ok(ModuleInlineMeta {
+            items_end,
+            was_flat_leaf: false,
+            local_names: Some(Rc::clone(&prepared_source.local_names)),
+            local_typedefs: (!prepared_source.local_typedefs.is_empty())
+                .then(|| Box::new(prepared_source.local_typedefs.clone())),
+            defparams,
+        })
+    } else {
+        Ok(ModuleInlineMeta {
+            items_end,
+            was_flat_leaf: false,
+            local_names: None,
+            local_typedefs: None,
+            defparams: Vec::new(),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_instantiation_items(
+    elab: &mut ElaboratedModule,
+    source_def: Definition,
+    prefix: &str,
+    definitions: &HashMap<String, Definition>,
+    interface_map: &mut HashMap<String, String>,
+    local_params: &HashMap<String, Value>,
+    cache: &mut InlineCache,
+    parent_port_map: &HashMap<String, Expression>,
+    defparams: &[PendingDefparam],
+    param_scope: &param_scope::ParamScope,
+    parent_local_names: &std::collections::HashSet<String>,
+    parent_local_typedefs: &std::collections::HashSet<String>,
+    sibling_inst_names: &std::collections::HashSet<String>,
+    items_end: &mut usize,
+    items: &[ModuleItem],
+    mut bind_state: Option<&mut BindWorklistState>,
+) -> Result<(), String> {
+    for item in items {
+        let item_floor = *items_end;
+        *items_end = (*items_end).max(match item {
             ModuleItem::InitialConstruct(ic) => ic.span.end,
             ModuleItem::AlwaysConstruct(ac) => ac.span.end,
             ModuleItem::AssertionItem(a) => a.span.end,
@@ -41931,7 +42760,7 @@ fn inline_module_items(
                     udp,
                     inst,
                     prefix,
-                    &prepared_source.local_names,
+                    parent_local_names,
                     interface_map,
                 );
                 continue;
@@ -41953,7 +42782,7 @@ fn inline_module_items(
                 None => {
                     // Check if it's a typedef-based variable declaration (happens if parser was unsure)
                     if elab.typedefs.contains_key(sub_mod_name)
-                        || prepared_source.local_typedefs.contains(sub_mod_name)
+                        || parent_local_typedefs.contains(sub_mod_name)
                     {
                         let width = elab.typedefs.get(sub_mod_name).copied().unwrap_or(32);
                         let is_real = sub_mod_name == "real";
@@ -42143,37 +42972,6 @@ fn inline_module_items(
                 // dropping most transitions on a fast clock. Register it here,
                 // under this instance's prefix, exactly as a declared net.
                 {
-                    let __ta = iprof_now();
-                    let sub_mod_port_names: std::collections::HashSet<String> =
-                        match sub_mod.ports() {
-                            PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
-                            PortList::NonAnsi(ps) => ps.iter().map(|p| p.name.clone()).collect(),
-                            _ => std::collections::HashSet::default(),
-                        };
-                    let sub_mod_declares: std::collections::HashSet<String> = {
-                        let mut v = Vec::new();
-                        visit_renamed_decls(sub_mod.items(), &mut |n, _, kind| {
-                            if kind != DeclKind::Label {
-                                v.push(n.to_string())
-                            }
-                        });
-                        // §6.20: a HEADER parameter (`#(parameter ...)`) is a
-                        // constant, not a net: `leaf u (.a(VREF));` binds its
-                        // value. The body items above cover body parameters
-                        // and localparams but not the header, so such an
-                        // actual was taken for an undeclared identifier.
-                        for pd in sub_mod.params() {
-                            match &pd.kind {
-                                ParameterKind::Data { assignments, .. } => {
-                                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
-                                }
-                                ParameterKind::Type { assignments } => {
-                                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
-                                }
-                            }
-                        }
-                        v.into_iter().collect()
-                    };
                     let mut cands: Vec<String> = Vec::new();
                     collect_port_connection_net_candidates(sub_mod.items(), &mut cands);
                     // §23.11: a bound instance is as if present at the end of
@@ -42185,68 +42983,7 @@ fn inline_module_items(
                             .collect();
                         collect_port_connection_net_candidates(&bound, &mut cands);
                     }
-                    cands.sort();
-                    cands.dedup();
-                    for name in cands {
-                        // A formal port of the sub-module is bound to the
-                        // parent's expression, not declared here.
-                        if sub_mod_port_names.contains(&name) {
-                            continue;
-                        }
-                        let scoped = cat2(&inst_prefix, &name);
-                        // §6.10: the implicit net belongs to THIS instance, so
-                        // the existence test must be SCOPED. A bare
-                        // `signals.contains_key(name)` skipped creation
-                        // whenever anything ANYWHERE shared the bare spelling —
-                        // including an INSTANCE-NAME placeholder, since
-                        // instantiating `foo c (...)` registers a signal named
-                        // `c`. A gate library hits this constantly: a cell's
-                        // `buf IC (clk, dCK);` wants its own implicit `clk`,
-                        // every design has some other `clk`, and the cell's
-                        // flops were then never clocked and read x.
-                        if elab.signals.contains_key(&scoped)
-                            || elab.parameters.contains_key(&name)
-                            || elab.parameters.contains_key(&scoped)
-                            || elab.nets.contains(&scoped)
-                            || elab.arrays.contains_key(&scoped)
-                            || elab.arrays_2d.contains_key(&scoped)
-                            || elab.arrays_nd.contains_key(&scoped)
-                            || elab.interfaces.contains(&scoped)
-                        {
-                            continue;
-                        }
-                        // Declared inside the sub-module itself (a net/var
-                        // declaration or one of its own ports) — the regular
-                        // inline paths create those.
-                        if sub_mod_declares.contains(&name) {
-                            continue;
-                        }
-                        if crate::implicit_net_warn() {
-                            crate::elab_diag(format!(
-                                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-                                 (IEEE 1800-2017 §6.10, instance port connection). Add an explicit declaration to silence.",
-                                scoped
-                            ));
-                        }
-                        signals_insert_traced(
-                            &mut elab.signals,
-                            line!(),
-                            scoped.clone(),
-                            Signal {
-                                is_const: false,
-                                name: scoped.clone().into(),
-                                width: 1,
-                                is_signed: false,
-                                direction: None,
-                                value: Value::new(1),
-                                is_real: false,
-                                type_name: None,
-                            },
-                        );
-                        elab.implicit_nets.insert(scoped.clone());
-                        elab.nets.insert(scoped);
-                    }
-                    iprof_since("implicit_net_scan", __ta);
+                    create_target_implicit_nets(elab, sub_mod, &inst_prefix, cands);
                 }
 
                 iprof_since("ck1_after_implnet", __th);
@@ -42254,22 +42991,13 @@ fn inline_module_items(
                 let mut port_map = HashMap::default();
                 let mut sub_interface_map = HashMap::default();
 
-                // Local names of the CURRENT (parent) module — bare names of
-                // signals declared in this scope. Used when rewriting port
-                // connection parent expressions so bare identifiers get
-                // prefixed with the current scope. Without this, a port
-                // connection like `.mrd(mrd)` inside wrapper would be stored
-                // in port_map as a bare `mrd`, and later substitutions into
-                // the sub-module would insert a bare (unresolvable) name.
-                let parent_local_names = &*prepared_source.local_names;
-
                 // Interface ports of the SUB-module being instantiated. The
                 // connection code below must route interface actuals through
                 // `sub_interface_map` (not `port_map`) so `<port>.<member>`
                 // resolves to the bound instance's members and inlined
-                // interface tasks dispatch. `prepared_source` is the PARENT
-                // (whose interface_ports is empty for a top instantiation), so
-                // it can't answer this — compute it from `sub_mod` directly.
+                // interface tasks dispatch. `parent_local_names` belongs to
+                // the PARENT (whose interface_ports may differ), so compute
+                // it from `sub_mod` directly.
                 let sub_iface_ports: std::collections::HashSet<String> = {
                     let mut s = std::collections::HashSet::default();
                     if let PortList::Ansi(ports) = sub_mod.ports() {
@@ -43025,7 +43753,7 @@ fn inline_module_items(
                 let inst_segs: Vec<&str> = hi.name.name.split('.').collect();
                 let n_inst = inst_segs.len();
                 let mut sub_defparams: Vec<PendingDefparam> = Vec::new();
-                for dp in &defparams {
+                for dp in defparams {
                     let path = &dp.path;
                     if path.len() <= n_inst
                         || !path[..n_inst].iter().zip(&inst_segs).all(|(a, b)| a == b)
@@ -47636,10 +48364,18 @@ fn inline_module_items(
                                 )
                             ) && !elab.checker_decls.contains_key(name)
                         };
-                        if !port_elision_blocked_by_items(
-                            &prepared_sub.effective_items,
-                            &plain_inst,
-                        ) {
+                        let bind_blocks_elision = bind_state.as_ref().is_some_and(|bs| {
+                            bs.filter.has_non_plain_bind
+                                && bs
+                                    .filter
+                                    .matches(inst_prefix.trim_end_matches('.'), sub_mod_name)
+                        });
+                        if !bind_blocks_elision
+                            && !port_elision_blocked_by_items(
+                                &prepared_sub.effective_items,
+                                &plain_inst,
+                            )
+                        {
                             let mut drop_idx: Vec<usize> = Vec::new();
                             for (pname, idx) in &input_connects {
                                 let formal = cat2(&inst_prefix, pname);
@@ -48658,7 +49394,7 @@ fn inline_module_items(
                 );
                 // Keep later items strictly after this one: bound
                 // instantiations carry spans from elsewhere.
-                items_end = items_end.max(hi.span.start.max(item_floor) + 1);
+                *items_end = (*items_end).max(hi.span.start.max(item_floor) + 1);
 
                 // Recurse into sub-module instantiations
                 iprof_since("subitem_loop", __td);
@@ -48704,7 +49440,7 @@ fn inline_module_items(
                         ));
                     }
                 }
-                inline_module_items(
+                let child_meta = inline_module_items(
                     elab,
                     sub_mod,
                     &inst_prefix,
@@ -48715,9 +49451,51 @@ fn inline_module_items(
                     &rewrite_port_map,
                     &sub_defparams,
                     param_scope,
+                    bind_state.as_deref_mut(),
                 )?;
                 crate::oom_trace::model("instance complete", elab, Some(cache.prepared.len()));
                 iprof_since("recursion", __te);
+
+                if let Some(bs) = bind_state.as_deref_mut() {
+                    let inst_path = inst_prefix.trim_end_matches('.');
+                    if bs.filter.matches(inst_path, sub_mod_name) {
+                        let type_overlay = capture_type_overlay(
+                            elab,
+                            &saved_type_binds,
+                            &saved_type_shapes,
+                            &saved_unpacked_dims,
+                        );
+                        let local_names = Some(
+                            child_meta
+                                .local_names
+                                .unwrap_or_else(|| Rc::clone(&prepared_sub.local_names)),
+                        );
+                        let local_typedefs = child_meta.local_typedefs.or_else(|| {
+                            (!prepared_sub.local_typedefs.is_empty())
+                                .then(|| Box::new(prepared_sub.local_typedefs.clone()))
+                        });
+                        let saved_defparams = if !child_meta.was_flat_leaf {
+                            child_meta.defparams
+                        } else {
+                            std::mem::take(&mut sub_defparams)
+                        };
+                        bs.scopes.insert(
+                            inst_path.to_string(),
+                            TargetScope {
+                                def_name: sub_mod_name.clone(),
+                                local_names,
+                                local_typedefs,
+                                interface_map: std::mem::take(&mut sub_interface_map),
+                                port_map: Rc::clone(&rewrite_port_map),
+                                local_params: std::mem::take(&mut sub_merged_params),
+                                defparams: saved_defparams,
+                                type_overlay,
+                                items_end: child_meta.items_end,
+                                was_flat_leaf: child_meta.was_flat_leaf,
+                            },
+                        );
+                    }
+                }
 
                 for (tp_name, saved) in saved_type_shapes.into_iter().rev() {
                     tls_restore_typedef_shape(&tp_name, saved);

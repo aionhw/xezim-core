@@ -328,6 +328,54 @@ impl ParamScope {
         }
     }
 
+    /// Add to `scope` (a bind target's parameter environment) the entries from
+    /// the design-wide parameter table spelled by `binds` and the definitions
+    /// they instantiate (§23.11, §26.3), without overwriting entries `scope`
+    /// already carries.
+    pub(super) fn extend_scope_for_binds(
+        &self,
+        binds: &[crate::ast::decl::BindDirective],
+        definitions: &HashMap<String, Definition>,
+        scope: &mut HashMap<String, Value>,
+    ) {
+        let mut found = HashSet::default();
+        let mut named = HashSet::default();
+        let mut all = false;
+        for b in binds {
+            all |= !self.scan(&b.instantiation, &mut found, &mut named);
+            if self.instantiable.contains(&b.instantiation.module_name.name) {
+                named.insert(b.instantiation.module_name.name.clone());
+            }
+        }
+        if !all {
+            let bound: Vec<String> = named.drain().collect();
+            for name in bound {
+                if let Some(def) = definitions.get(&name)
+                    && let Some(spelled) = &*self.spelled_by(def)
+                {
+                    found.extend(spelled.0.iter().copied());
+                } else if definitions.contains_key(&name) {
+                    all = true;
+                    break;
+                }
+            }
+        }
+        if all {
+            for (k, v) in &self.entries {
+                if !scope.contains_key(k) {
+                    scope.insert(k.clone(), v.clone());
+                }
+            }
+        } else {
+            for i in found {
+                let (k, v) = &self.entries[i as usize];
+                if !scope.contains_key(k) {
+                    scope.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
     fn selection(&self, def: Definition, definitions: &HashMap<String, Definition>) -> Rc<[u32]> {
         let key = def_key(&def);
         if let Some(s) = self.selected.borrow().get(&key) {

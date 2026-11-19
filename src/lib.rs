@@ -3764,37 +3764,44 @@ fn parse_and_elaborate(
     release_free_memory();
     oom_trace::checkpoint("elaborate.memory_released", &[]);
 
-    // §23.11: bind selection uses the finished hierarchy and declaration
-    // scope. Re-elaborate only designs with newly resolved bindings; ordinary
-    // designs retain their single elaboration pass. This also permits binds
-    // into hierarchy introduced by an earlier bind.
-    for pass in 0..64 {
-        elaborate::inline_instantiations(&mut elab, &def_refs)?;
-        if !resolve_instance_binds(&mut elab, &top_level_binds, &unit_bind_params)? {
-            break;
+    // §23.11: resolve bind targets incrementally on newly introduced scopes so
+    // unaffected hierarchy is elaborated once; fall back to full rebuild only
+    // when a rare cross-pass reference forces re-elaboration of existing scopes.
+    let mut bind_resolver = IncrementalBindResolver::new(&top_level_binds, &unit_bind_params);
+    if elaborate::inline_instantiations_with_binds(
+        &mut elab,
+        &def_refs,
+        &top_level_binds,
+        &mut |elab| bind_resolver.resolve_step(elab),
+    )? {
+        for pass in 0..64 {
+            let binds = std::mem::take(&mut elab.resolved_binds);
+            let timescales = std::mem::take(&mut elab.module_timescale_exp);
+            let without_timescale = std::mem::take(&mut elab.modules_without_timescale);
+            let unit = elab.timeunit_exp;
+            let precision = elab.timeprecision_exp;
+            elab = elaborate::elaborate_module_with_defs(
+                elab_def,
+                &params,
+                Some(&def_refs),
+                &top_level_imports,
+                &top_level_lets,
+                &top_level_ooc_constraints,
+            )?;
+            elab.resolved_binds = binds;
+            elab.tick_s = tick_s;
+            elab.module_timescale_exp = timescales;
+            elab.modules_without_timescale = without_timescale;
+            elab.timeunit_exp = unit;
+            elab.timeprecision_exp = precision;
+            elaborate::inline_instantiations(&mut elab, &def_refs)?;
+            if !resolve_instance_binds(&mut elab, &top_level_binds, &unit_bind_params)? {
+                break;
+            }
+            if pass == 63 {
+                return Err("bind hierarchy does not converge (§23.11)".into());
+            }
         }
-        if pass == 63 {
-            return Err("bind hierarchy does not converge (§23.11)".into());
-        }
-        let binds = std::mem::take(&mut elab.resolved_binds);
-        let timescales = std::mem::take(&mut elab.module_timescale_exp);
-        let without_timescale = std::mem::take(&mut elab.modules_without_timescale);
-        let unit = elab.timeunit_exp;
-        let precision = elab.timeprecision_exp;
-        elab = elaborate::elaborate_module_with_defs(
-            elab_def,
-            &params,
-            Some(&def_refs),
-            &top_level_imports,
-            &top_level_lets,
-            &top_level_ooc_constraints,
-        )?;
-        elab.resolved_binds = binds;
-        elab.tick_s = tick_s;
-        elab.module_timescale_exp = timescales;
-        elab.modules_without_timescale = without_timescale;
-        elab.timeunit_exp = unit;
-        elab.timeprecision_exp = precision;
     }
     elab_phase("inline instantiations", &mut phase_t);
     // Re-register any compilation-unit-scope CLASS whose name a module
@@ -4069,6 +4076,330 @@ impl<'a> BindConstants<'a> {
     }
 }
 
+fn bind_directive_matches(
+    previous: &ast::decl::BindDirective,
+    b: &ast::decl::BindDirective,
+) -> bool {
+    previous.span == b.span
+        && previous.instantiation.module_name.name == b.instantiation.module_name.name
+        && previous.gen_scope == b.gen_scope
+        && previous
+            .instantiation
+            .instances
+            .iter()
+            .map(|i| &i.name.name)
+            .eq(b.instantiation.instances.iter().map(|i| &i.name.name))
+}
+
+fn collect_bind_ancestors<'a>(scope: &'a str) -> Vec<&'a str> {
+    let mut ancestors = vec![scope];
+    let mut ancestor = scope;
+    while let Some((parent, _)) = ancestor.rsplit_once('.') {
+        ancestors.push(parent);
+        ancestor = parent;
+    }
+    ancestors
+}
+
+fn find_lexical_bind_target(
+    ancestors: &[&str],
+    target_module: &str,
+    host_paths: &crate::hasher::HashSet<String>,
+) -> Option<String> {
+    ancestors
+        .iter()
+        .filter(|parent| !parent.is_empty())
+        .map(|parent| format!("{parent}.{target_module}"))
+        .chain(std::iter::once(target_module.to_string()))
+        .find(|candidate| host_paths.contains(candidate.as_str()))
+}
+
+fn eval_bind_path_target(
+    path: &[ast::expr::HierPathSegment],
+    target_module_name: &str,
+    top_name: &str,
+    unit_scope: bool,
+    ancestors: &[&str],
+    host_paths: &crate::hasher::HashSet<String>,
+    constants: &mut BindConstants<'_>,
+) -> Result<Option<String>, String> {
+    let mut joined = String::new();
+    for segment in path {
+        if !joined.is_empty() {
+            joined.push('.');
+        }
+        joined.push_str(&segment.name.name);
+        for select in &segment.selects {
+            let constants = constants.scope(unit_scope, ancestors);
+            let value = elaborate::const_eval_i64_with_params(select, Some(constants))
+                .ok_or_else(|| {
+                    format!(
+                        "nonconstant bind target index in '{}' (§23.11)",
+                        target_module_name
+                    )
+                })?;
+            use std::fmt::Write as _;
+            let _ = write!(joined, "[{value}]");
+        }
+    }
+    let absolute = joined.strip_prefix("$root.").unwrap_or(&joined);
+    let rooted = absolute.strip_prefix(&format!("{}.", top_name));
+    let mut candidates = Vec::new();
+    if absolute == top_name {
+        candidates.push(String::new());
+    }
+    if let Some(p) = rooted {
+        candidates.push(p.to_string());
+    }
+    if joined.starts_with("$root.") {
+        candidates.push(absolute.to_string());
+    } else {
+        for parent in ancestors {
+            if !parent.is_empty() {
+                candidates.push(format!("{parent}.{joined}"));
+            }
+        }
+        candidates.push(joined);
+    }
+    Ok(candidates
+        .into_iter()
+        .find(|p| host_paths.contains(p.as_str())))
+}
+
+/// Incremental §23.11 target resolver: indexes only newly instantiated
+/// hierarchy per round and returns newly matched `(target_path, directives)`
+/// pairs as a worklist.
+struct IncrementalBindResolver<'a> {
+    unit_binds: &'a [ast::decl::BindDirective],
+    unit_params: &'a crate::hasher::HashMap<String, Value>,
+    host_paths: crate::hasher::HashSet<String>,
+    hosts_of: crate::hasher::HashMap<String, Vec<String>>,
+    indexed_instances: usize,
+    top_indexed: bool,
+    scanned_bind_sites: usize,
+    scanned_unit_binds: bool,
+    path_site_resolved: crate::hasher::HashSet<usize>,
+    path_site_complete: crate::hasher::HashSet<usize>,
+}
+
+impl<'a> IncrementalBindResolver<'a> {
+    fn new(
+        unit_binds: &'a [ast::decl::BindDirective],
+        unit_params: &'a crate::hasher::HashMap<String, Value>,
+    ) -> Self {
+        Self {
+            unit_binds,
+            unit_params,
+            host_paths: crate::hasher::HashSet::default(),
+            hosts_of: crate::hasher::HashMap::default(),
+            indexed_instances: 0,
+            top_indexed: false,
+            scanned_bind_sites: 0,
+            scanned_unit_binds: false,
+            path_site_resolved: crate::hasher::HashSet::default(),
+            path_site_complete: crate::hasher::HashSet::default(),
+        }
+    }
+
+    fn resolve_step(
+        &mut self,
+        elab: &mut elaborate::ElaboratedModule,
+    ) -> Result<Vec<(String, Vec<ast::decl::BindDirective>)>, String> {
+        let mut new_hosts_start: crate::hasher::HashMap<&str, usize> =
+            crate::hasher::HashMap::default();
+        if !self.top_indexed {
+            self.top_indexed = true;
+            self.host_paths.insert(String::new());
+            let list = self.hosts_of.entry(elab.name.clone()).or_default();
+            new_hosts_start
+                .entry(elab.name.as_str())
+                .or_insert(list.len());
+            list.push(String::new());
+        }
+        for inst in &elab.instances[self.indexed_instances..] {
+            self.host_paths.insert(inst.path.clone());
+            let list = self.hosts_of.entry(inst.def_name.clone()).or_default();
+            new_hosts_start
+                .entry(inst.def_name.as_str())
+                .or_insert(list.len());
+            list.push(inst.path.clone());
+        }
+        self.indexed_instances = elab.instances.len();
+
+        if elab.bind_sites.is_empty() && self.unit_binds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut additions: Vec<(String, bool, usize)> = Vec::new();
+        {
+            let mut constants = BindConstants {
+                parameters: &elab.parameters,
+                top: &elab.name,
+                unit_params: self.unit_params,
+                dotted: None,
+                module: None,
+                unit: None,
+                entered: None,
+                undo: Vec::new(),
+            };
+
+            let mod_site_count = elab.bind_sites.len();
+            let unit_count = self.unit_binds.len();
+            for idx in 0..(mod_site_count + unit_count) {
+                let (scope, b, unit_scope, site_id, local_idx, is_new) = if idx < mod_site_count {
+                    let (ref sc, ref bd) = elab.bind_sites[idx];
+                    (
+                        sc.as_str(),
+                        bd,
+                        false,
+                        unit_count + idx,
+                        idx,
+                        idx >= self.scanned_bind_sites,
+                    )
+                } else {
+                    let u_idx = idx - mod_site_count;
+                    (
+                        "",
+                        &self.unit_binds[u_idx],
+                        true,
+                        u_idx,
+                        u_idx,
+                        !self.scanned_unit_binds,
+                    )
+                };
+
+                if !is_new && new_hosts_start.is_empty() {
+                    continue;
+                }
+                if !b.target_path.is_empty() && self.path_site_complete.contains(&site_id) {
+                    continue;
+                }
+
+                let ancestors = collect_bind_ancestors(scope);
+                let mut targets = Vec::new();
+                if b.target_path.is_empty() {
+                    if let Some(instance) = find_lexical_bind_target(
+                        &ancestors,
+                        &b.target_module.name,
+                        &self.host_paths,
+                    ) {
+                        targets.push(instance);
+                    } else if let Some(all_hosts) = self.hosts_of.get(b.target_module.name.as_str())
+                    {
+                        let start = if is_new {
+                            0
+                        } else if let Some(&s) = new_hosts_start.get(b.target_module.name.as_str())
+                        {
+                            s
+                        } else {
+                            all_hosts.len()
+                        };
+                        targets.extend(all_hosts[start..].iter().cloned());
+                    }
+                } else {
+                    let mut total_paths = 0usize;
+                    let mut matched_paths = 0usize;
+                    for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
+                        total_paths += 1;
+                        if let Some(target) = eval_bind_path_target(
+                            path,
+                            &b.target_module.name,
+                            &elab.name,
+                            unit_scope,
+                            &ancestors,
+                            &self.host_paths,
+                            &mut constants,
+                        )? {
+                            matched_paths += 1;
+                            targets.push(target);
+                        }
+                    }
+                    constants.leave();
+                    if matched_paths > 0 {
+                        self.path_site_resolved.insert(site_id);
+                    }
+                    if matched_paths == total_paths {
+                        self.path_site_complete.insert(site_id);
+                    }
+                }
+                targets.sort();
+                targets.dedup();
+                for target in targets {
+                    additions.push((target, unit_scope, local_idx));
+                }
+            }
+        }
+
+        self.scanned_bind_sites = elab.bind_sites.len();
+        self.scanned_unit_binds = true;
+
+        let mut order: Vec<String> = Vec::new();
+        let mut by_target: crate::hasher::HashMap<String, Vec<ast::decl::BindDirective>> =
+            crate::hasher::HashMap::default();
+        for (target, unit_scope, local_idx) in additions {
+            let b = if unit_scope {
+                &self.unit_binds[local_idx]
+            } else {
+                &elab.bind_sites[local_idx].1
+            };
+            let bound = elab.resolved_binds.entry(target.clone()).or_default();
+            if !bound.iter().any(|prev| bind_directive_matches(prev, b)) {
+                bound.push(b.clone());
+                let entry = by_target.entry(target.clone()).or_insert_with(|| {
+                    order.push(target);
+                    Vec::new()
+                });
+                entry.push(b.clone());
+            }
+        }
+
+        if order.is_empty() {
+            let mut unresolved = Vec::new();
+            let unit_count = self.unit_binds.len();
+            for (idx, (_, b)) in elab.bind_sites.iter().enumerate() {
+                let site_id = unit_count + idx;
+                if !b.target_path.is_empty() && !self.path_site_resolved.contains(&site_id) {
+                    unresolved.push(
+                        b.target_path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
+            }
+            for (idx, b) in self.unit_binds.iter().enumerate() {
+                if !b.target_path.is_empty() && !self.path_site_resolved.contains(&idx) {
+                    unresolved.push(
+                        b.target_path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
+            }
+            unresolved.sort();
+            unresolved.dedup();
+            for target in unresolved {
+                log_eprintln(&format!(
+                    "[elab] no bind target instance '{}'; bind ignored",
+                    target
+                ));
+            }
+            return Ok(Vec::new());
+        }
+
+        Ok(order
+            .into_iter()
+            .map(|t| {
+                let list = by_target.remove(&t).expect("target in by_target");
+                (t, list)
+            })
+            .collect())
+    }
+}
+
 /// §23.11: select targets using effective hierarchy and lexical constants.
 fn resolve_instance_binds(
     elab: &mut elaborate::ElaboratedModule,
@@ -4089,10 +4420,10 @@ fn resolve_instance_binds(
     // once, so selecting a target is a lookup rather than a scan.
     let mut host_paths = crate::hasher::HashSet::default();
     let mut hosts_of = crate::hasher::HashMap::<&str, Vec<&str>>::default();
-    host_paths.insert("");
+    host_paths.insert(String::new());
     hosts_of.entry(elab.name.as_str()).or_default().push("");
     for i in &elab.instances {
-        host_paths.insert(i.path.as_str());
+        host_paths.insert(i.path.clone());
         hosts_of
             .entry(i.def_name.as_str())
             .or_default()
@@ -4111,24 +4442,15 @@ fn resolve_instance_binds(
     let mut changed = false;
     let mut unresolved = Vec::new();
     for (scope, b, unit_scope) in sites {
-        let mut ancestors = vec![scope.as_str()];
-        let mut ancestor = scope.as_str();
-        while let Some((parent, _)) = ancestor.rsplit_once('.') {
-            ancestors.push(parent);
-            ancestor = parent;
-        }
+        let ancestors = collect_bind_ancestors(&scope);
         let mut targets = Vec::new();
         if b.target_path.is_empty() {
             // §23.11: a single identifier can name an instance as well as a
             // module/interface type. Lexical instance lookup takes priority,
             // including when an unrelated type has the same spelling.
-            let instance = ancestors
-                .iter()
-                .filter(|parent| !parent.is_empty())
-                .map(|parent| format!("{parent}.{}", b.target_module.name))
-                .chain(std::iter::once(b.target_module.name.clone()))
-                .find(|candidate| host_paths.contains(candidate.as_str()));
-            if let Some(instance) = instance {
+            if let Some(instance) =
+                find_lexical_bind_target(&ancestors, &b.target_module.name, &host_paths)
+            {
                 targets.push(instance);
             } else {
                 targets.extend(
@@ -4141,48 +4463,15 @@ fn resolve_instance_binds(
             }
         } else {
             for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
-                let mut joined = String::new();
-                for segment in path {
-                    if !joined.is_empty() {
-                        joined.push('.');
-                    }
-                    joined.push_str(&segment.name.name);
-                    for select in &segment.selects {
-                        let constants = constants.scope(unit_scope, &ancestors);
-                        let value = elaborate::const_eval_i64_with_params(select, Some(constants))
-                            .ok_or_else(|| {
-                                format!(
-                                    "nonconstant bind target index in '{}' (§23.11)",
-                                    b.target_module.name
-                                )
-                            })?;
-                        use std::fmt::Write as _;
-                        let _ = write!(joined, "[{value}]");
-                    }
-                }
-                let absolute = joined.strip_prefix("$root.").unwrap_or(&joined);
-                let rooted = absolute.strip_prefix(&format!("{}.", elab.name));
-                let mut candidates = Vec::new();
-                if absolute == elab.name {
-                    candidates.push(String::new());
-                }
-                if let Some(p) = rooted {
-                    candidates.push(p.to_string());
-                }
-                if joined.starts_with("$root.") {
-                    candidates.push(absolute.to_string());
-                } else {
-                    for parent in &ancestors {
-                        if !parent.is_empty() {
-                            candidates.push(format!("{parent}.{joined}"));
-                        }
-                    }
-                    candidates.push(joined.clone());
-                }
-                if let Some(target) = candidates
-                    .into_iter()
-                    .find(|p| host_paths.contains(p.as_str()))
-                {
+                if let Some(target) = eval_bind_path_target(
+                    path,
+                    &b.target_module.name,
+                    &elab.name,
+                    unit_scope,
+                    &ancestors,
+                    &host_paths,
+                    &mut constants,
+                )? {
                     targets.push(target);
                 }
             }
@@ -4201,17 +4490,7 @@ fn resolve_instance_binds(
         targets.dedup();
         for target in targets {
             let bound = elab.resolved_binds.entry(target).or_default();
-            if !bound.iter().any(|previous| {
-                previous.span == b.span
-                    && previous.instantiation.module_name.name == b.instantiation.module_name.name
-                    && previous.gen_scope == b.gen_scope
-                    && previous
-                        .instantiation
-                        .instances
-                        .iter()
-                        .map(|i| &i.name.name)
-                        .eq(b.instantiation.instances.iter().map(|i| &i.name.name))
-            }) {
+            if !bound.iter().any(|previous| bind_directive_matches(previous, &b)) {
                 bound.push(b.clone());
                 changed = true;
             }
