@@ -28744,13 +28744,10 @@ fn struct_typedef_self_reference(
 /// Flatten a (possibly nested) packed struct/union `DataType` into
 /// `(field_path, lsb_offset, width)` tuples for `packed_struct_fields`.
 /// First-declared member is the MSB (IEEE 1800-2017 §7.2.1), so offsets are
-/// Pack an assignment-pattern literal for a PACKED ARRAY OF STRUCTS parameter
-/// (`T [N-1:0] p = '{ '{...}, '{...}, ... }`, e.g. black-parrot's
-/// `bp_proc_param_s [max_cfgs-1:0] all_cfgs_gp`) into one packed Value. Each
-/// pattern element is packed as the element struct type and the elements are
-/// concatenated MSB-first (first pattern item = highest index, IEEE 1800-2017
-/// §10.9.2 / §7.4.2). Returns None unless `dt` is a packed array of a struct
-/// typedef and `expr` is an assignment pattern, so callers fall back cleanly.
+/// Packed dimensions of `dt`, outermost first, and the width of one leaf
+/// element. A `logic` vector's leaf is 1 bit (the ranges ARE the bits). An
+/// enum's leaf is the enum base width (`unit_type_t` is 2 bits), and every
+/// `typedef T [L:R]` along the chain contributes its range outside that.
 fn packed_pattern_shape(
     dt: &DataType,
     params: &dyn ParamLookup,
@@ -28784,6 +28781,9 @@ fn packed_pattern_shape(
     None
 }
 
+/// The outermost packed dimension of `dt` (left and right bound) and the
+/// type of one element below it, through typedefs. None when `dt` has no
+/// packed dimension with constant bounds.
 fn peel_packed_dim_const(
     dt: &DataType,
     params: &dyn ParamLookup,
@@ -28876,6 +28876,7 @@ fn peel_packed_dim_const(
     None
 }
 
+/// The number of elements `dims` span, when every bound is constant.
 fn packed_dims_product_const(dims: &[PackedDimension], params: &dyn ParamLookup) -> Option<u32> {
     let mut total: u32 = 1;
     for d in dims {
@@ -28889,6 +28890,7 @@ fn packed_dims_product_const(dims: &[PackedDimension], params: &dyn ParamLookup)
     Some(total)
 }
 
+/// The packed width of `dt` with constant bounds; 0 when it cannot be sized.
 fn packed_type_width_const(
     dt: &DataType,
     params: &dyn ParamLookup,
@@ -28961,6 +28963,13 @@ fn packed_type_width_const(
     0
 }
 
+/// Pack an assignment-pattern literal for a PACKED ARRAY OF STRUCTS parameter
+/// (`T [N-1:0] p = '{ '{...}, '{...}, ... }`, e.g. black-parrot's
+/// `bp_proc_param_s [max_cfgs-1:0] all_cfgs_gp`) into one packed Value. Each
+/// pattern element is packed as the element struct type and the elements are
+/// concatenated MSB-first (first pattern item = highest index, IEEE 1800-2017
+/// §10.9.2 / §7.4.2). Returns None unless `dt` is a packed array of a struct
+/// typedef and `expr` is an assignment pattern, so callers fall back cleanly.
 fn pack_packed_array_const_value(
     dt: &DataType,
     expr: &Expression,
@@ -28983,6 +28992,17 @@ fn pack_packed_array_const_value(
 
 /// §10.9 / §6.20.2: pack an assignment-pattern value against a MULTI-DIM
 /// packed VECTOR type (`parameter bit [1:0][7:0] M = '{8'hAA, 8'hBB}`).
+///
+/// The generic const-eval cannot pack a pattern — it has no type to take
+/// element widths from — so such a parameter silently evaluated to 0, both as
+/// a declared default and as an instance `#(.M('{...}))` override, in module,
+/// package and interface scope alike.
+///
+/// The pattern's first element corresponds to the leftmost index of the outer
+/// dimension, which is the MS end of packed storage for descending and
+/// ascending ranges alike, so filled slots concatenate in slot order. Returns
+/// `None` — callers fall back to the previous behavior — for anything not a
+/// packed type with a dimension or any pattern shape not understood.
 pub(crate) fn pack_packed_vector_pattern(
     dt: &DataType,
     expr: &Expression,
@@ -29018,6 +29038,10 @@ fn pack_typed_pattern(
         .or_else(|| pack_packed_vector_pattern_env(ty, pattern, params, typedef_types))
 }
 
+/// §10.9.1: the constant value of the pattern `expr` for the packed type
+/// `dt`, one outermost dimension at a time: index and positional items first,
+/// then the last type key that matches the element type (`outer_types` are
+/// the keys of enclosing levels), then `default:`.
 fn pack_packed_dt_pattern(
     dt: &DataType,
     expr: &Expression,
