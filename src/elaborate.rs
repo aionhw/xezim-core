@@ -16686,6 +16686,65 @@ pub fn exp_to_secs(e: i32) -> f64 {
     10f64.powi(e)
 }
 
+/// The powers of ten that are exact in an f64 (10^0 to 10^22).
+const POW10_EXACT: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// §5.8, §3.14.1: `x * 10^e`, correctly rounded. A time value changes units
+/// by a power of ten; 10^n is exact in an f64 up to 10^22, so the product
+/// (or, for a negative `e`, the quotient) is the nearest f64 to the exact
+/// result. `x / 10f64.powi(-15)` is not: 1e-15 is not 10^-15, and
+/// `9200.0 / 1e-15` is 9199999999999998000, so `9200s` under `1ns/1fs` was
+/// 2048 fs short of 9200 s and never equal to the integer 9200000000000.
+#[inline]
+pub fn scale_pow10(x: f64, e: i32) -> f64 {
+    match e {
+        0 => x,
+        1..=22 => x * POW10_EXACT[e as usize],
+        -22..=-1 => x / POW10_EXACT[e.unsigned_abs() as usize],
+        _ => x * 10f64.powi(e),
+    }
+}
+
+/// §3.14.1, §6.12.1: round a time value counted in units of a precision to
+/// the nearest whole unit, ties away from zero. A decimal half reaches here
+/// a few ulps off after a change of unit (`2.5ps` as 2.4999999999999996
+/// ps), so a value within four ulps below a half is taken as the half. The
+/// slack applies below 2^30 only, where four ulps are under 2^-20; a larger
+/// count is rounded as it is (every f64 of 2^52 or more is an integer
+/// already). The relative nudge used before, `x * (1 + 1e-12)`, moved such
+/// a count: 9.2e15 by 9200.
+#[inline]
+pub fn round_time_units(x: f64) -> f64 {
+    let a = x.abs();
+    if !(a < 1_073_741_824.0) {
+        return x.round();
+    }
+    let f = a.floor();
+    let r = if a - f >= 0.5 - 4.0 * f64::EPSILON * a.max(1.0) {
+        f + 1.0
+    } else {
+        f
+    };
+    r.copysign(x)
+}
+
+/// §5.8: the value of a time literal of `secs` seconds in a scope whose time
+/// unit is 10^`unit_exp` s and whose precision is 10^`prec_exp` s: rounded
+/// to the precision (§3.14.1), then expressed in the unit. Both changes of
+/// unit are by an exact power of ten (`scale_pow10`), so a literal that is a
+/// whole number of precision ticks gives exactly that count whenever an f64
+/// holds it (`9200s` under `1ns/1fs` is 9200000000000.0).
+#[inline]
+pub fn time_literal_in_units(secs: f64, unit_exp: i32, prec_exp: i32) -> f64 {
+    scale_pow10(
+        round_time_units(scale_pow10(secs, -prec_exp)),
+        prec_exp - unit_exp,
+    )
+}
+
 pub fn time_literal_to_exp(s: &str) -> i32 {
     let s = s.trim();
     let split = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
@@ -21625,10 +21684,7 @@ fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
         // VALUE-position time literal: absolute seconds, scaled to the
         // scope's unit rounded at its precision (§5.8).
         ExprKind::Number(NumberLiteral::Time(secs)) => {
-            let prec_s = 10f64.powi(p);
-            let ratio = 10f64.powi(u - p);
-            let v = (*secs / prec_s).round() / ratio;
-            e.kind = ExprKind::Number(NumberLiteral::Real(v));
+            e.kind = ExprKind::Number(NumberLiteral::Real(time_literal_in_units(*secs, u, p)));
         }
         ExprKind::SystemCall { name, args } => {
             if args.is_empty() && matches!(name.as_str(), "$time" | "$stime" | "$realtime") {
@@ -22458,15 +22514,16 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
     // 1ns/1ns BFM kept a real 2 ps duration when called hierarchically
     // from a 1 ps-precision testbench, phase-shifting delay-paced loops
     // off the clock grid for the rest of the run).
-    let q = prec_s / tick_s;
-    let quant = |ticks: f64| -> f64 {
-        if q > 1.0 + f64::EPSILON {
-            let x = (ticks / q) * (1.0 + 1e-12);
-            (x.round() * q).round()
-        } else {
-            ticks
-        }
-    };
+    // Every change of unit is by an exact power of ten (`scale_pow10`): the
+    // quotients of the unit, precision and tick in seconds are not exact
+    // (`1e-6 / 1e-15` is 999999999.9999999), and neither was `9200s / 1e-15`.
+    let (u, p, t) = (
+        secs_to_exp(unit_s),
+        secs_to_exp(prec_s),
+        secs_to_exp(tick_s),
+    );
+    // A count of precision units, rounded to a whole one, in global ticks.
+    let quant = |prec_units: f64| -> f64 { scale_pow10(round_time_units(prec_units), p - t) };
     match &d.kind {
         // §3.14.3 / A.2.2.3: `1step` is the global time precision, one tick,
         // whatever the scope's own unit and precision (#615).
@@ -22486,7 +22543,7 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
         }
         ExprKind::Number(NumberLiteral::Time(s)) => {
             // Absolute time literal → ticks, on the precision grid.
-            let ticks = quant(*s / tick_s);
+            let ticks = quant(scale_pow10(*s, -p));
             *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
         }
         // A FRACTIONAL bare delay is the only bare form the precision grid
@@ -22494,12 +22551,12 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
         // and quantize now. Integer and non-constant delays keep the
         // multiply-by-scale form (+ runtime quantization).
         ExprKind::Number(NumberLiteral::Real(r)) => {
-            let ticks = quant(*r * (unit_s / tick_s));
+            let ticks = quant(scale_pow10(*r, u - p));
             *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
         }
         _ => {
             // Bare delay (count of the module timeunit) → ticks.
-            let scale = unit_s / tick_s;
+            let scale = scale_pow10(1.0, u - t);
             if (scale - 1.0).abs() > f64::EPSILON {
                 let span = d.span;
                 let inner = std::mem::replace(d, Expression::new(ExprKind::Null, span));
