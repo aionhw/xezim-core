@@ -4881,6 +4881,10 @@ impl ElaboratedModule {
             self.initial_blocks.push(p.materialize());
         }
         let pending_ca = std::mem::take(&mut self.pending_cont_assign);
+        // One allocation for the lot: growing the table a push at a time
+        // copies it at every doubling, old and new buffer held together,
+        // and leaves up to half of the last one unused (aionhw/xezim#721).
+        self.continuous_assigns.reserve_exact(pending_ca.len());
         for p in pending_ca {
             let ca = p.materialize(&self.parameters);
             // A sub-module's `assign dst = src;` between unpacked arrays
