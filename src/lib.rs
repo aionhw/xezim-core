@@ -254,7 +254,9 @@ pub use value::Value;
 /// \x4d = \x4c + real initializers of 64-bit integral variables and typed package parameters
 ///         held as integers (§6.12.1), and time literals and delays scaled to the unit,
 ///         precision and tick by exact powers of ten (§5.8, §3.14.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4d";
+/// \x4d = \x4c + assignment pattern type keys bound at every array dimension in
+///         continuous assignments, nettype drivers and parameter values (§10.9.1, §10.9.2).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4e";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
