@@ -22333,25 +22333,6 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
     }
 }
 
-/// §6.20.2/§23.10: fold this instance's parameters into the dimensions of
-/// declarations that live INSIDE a statement — task and function locals, named
-/// blocks, fork branches.
-///
-/// Such a declaration is sized long after elaboration, from the flat
-/// design-wide parameter map — where a submodule's parameters live under their
-/// INSTANCE-QUALIFIED keys (`u_fifo.DW`). The bare `DW` the declaration spells
-/// missed that map, `const_eval_i64_with_params` returned None, and
-/// `resolve_type_width` then silently SKIPPED the dimension, leaving the local
-/// ONE BIT wide: every value stored in it was truncated to its LSB. A
-/// module-level declaration escapes this only because elaboration sizes it
-/// while the instance's parameters are still bound to their bare names.
-///
-/// Running the fold here fixes both consumers at once — the bytecode compiler
-/// and the AST interpreter read the same declaration, and after this pass its
-/// range is a literal. `prepare_module_items` caches per (module,
-/// parameter-set), so two instances with different parameters get different
-/// constants.
-///
 /// Whether `items` (generate constructs included) hold an instance with
 /// delays of a definition `is_udp` names.
 pub fn instantiates_udp(items: &[ModuleItem], is_udp: &dyn Fn(&str) -> bool) -> bool {
@@ -22416,6 +22397,25 @@ pub fn rewrite_udp_instance_delays(
     }
 }
 
+/// §6.20.2/§23.10: fold this instance's parameters into the dimensions of
+/// declarations that live INSIDE a statement — task and function locals, named
+/// blocks, fork branches.
+///
+/// Such a declaration is sized long after elaboration, from the flat
+/// design-wide parameter map — where a submodule's parameters live under their
+/// INSTANCE-QUALIFIED keys (`u_fifo.DW`). The bare `DW` the declaration spells
+/// missed that map, `const_eval_i64_with_params` returned None, and
+/// `resolve_type_width` then silently SKIPPED the dimension, leaving the local
+/// ONE BIT wide: every value stored in it was truncated to its LSB. A
+/// module-level declaration escapes this only because elaboration sizes it
+/// while the instance's parameters are still bound to their bare names.
+///
+/// Running the fold here fixes both consumers at once — the bytecode compiler
+/// and the AST interpreter read the same declaration, and after this pass its
+/// range is a literal. `prepare_module_items` caches per (module,
+/// parameter-set), so two instances with different parameters get different
+/// constants.
+///
 /// A name the body declares itself is left alone: it shadows the parameter.
 fn literalize_stmt_decl_dims(items: &mut [ModuleItem], params: &HashMap<String, Value>) {
     // The module's own typedefs, with this instance's parameters already
@@ -25820,6 +25820,15 @@ thread_local! {
     /// map alone numbers index 0 from the LSB, which is `[N-1:0]`.
     static PACKED_ELEM_MSB0_TLS: std::cell::RefCell<HashSet<String>>
         = std::cell::RefCell::new(HashSet::default());
+    /// The lowest index of a packed array's outermost range when it is not
+    /// 0 (`s_t [1:3]`, `s_t [3:1]`): an index counts from it (§7.4.1).
+    static PACKED_ELEM_LOW_TLS: std::cell::RefCell<HashMap<String, i64>>
+        = std::cell::RefCell::new(HashMap::default());
+    /// The packed dimensions below the outermost one of a multi-dimensional
+    /// packed parameter, outermost first: (element width, ascending, lowest
+    /// index) of each, for the second and later selects of `M[i][j]`.
+    static PACKED_ELEM_INNER_TLS: std::cell::RefCell<HashMap<String, Vec<(u32, bool, i64)>>>
+        = std::cell::RefCell::new(HashMap::default());
     /// Names of STRING-typed parameters, so const-eval knows a concatenation
     /// involving them is TEXT concatenation (§6.16) rather than a bit-vector
     /// concatenation — `localparam string CAT = {PFX, NAME}` produced only the
@@ -26009,6 +26018,82 @@ fn tls_register_elem_msb0(name: &str) {
     });
 }
 
+/// Record (or, for 0, forget) the lowest index of `name`'s outermost packed
+/// range; returns the previous entry.
+fn tls_register_elem_low(name: &str, low: i64) -> Option<i64> {
+    PACKED_ELEM_LOW_TLS.with(|c| {
+        let mut map = c.borrow_mut();
+        if low != 0 {
+            map.insert(name.to_string(), low)
+        } else {
+            map.remove(name)
+        }
+    })
+}
+
+/// Record the packed dimensions of `dt` below its outermost one for `name`
+/// (see `PACKED_ELEM_INNER_TLS`); a type with one packed dimension clears it.
+fn tls_register_elem_inner(
+    name: &str,
+    dt: &DataType,
+    params: &dyn ParamLookup,
+    typedef_types: &HashMap<String, DataType>,
+) {
+    let shape = packed_struct_array_info_env(dt, params, typedef_types)
+        .and_then(|(dims, elem)| {
+            let leaf = typedefs_snapshot(|td| resolve_type_width_env(&elem, Some(&params), td));
+            (leaf > 0).then_some((dims, leaf))
+        })
+        .or_else(|| {
+            let (dims, leaf) = packed_pattern_shape(dt, params, typedef_types)?;
+            let mut out = Vec::with_capacity(dims.len());
+            for d in &dims {
+                let PackedDimension::Range { left, right, .. } = d else {
+                    return None;
+                };
+                out.push((
+                    const_eval_i64_with_params_env(left, Some(&params))?,
+                    const_eval_i64_with_params_env(right, Some(&params))?,
+                ));
+            }
+            Some((out, leaf.max(1)))
+        });
+    let mut inner = Vec::new();
+    if let Some((dims, leaf)) = shape {
+        let mut ew = leaf;
+        for (l, r) in dims.iter().skip(1).rev() {
+            inner.push((ew, l < r, *l.min(r)));
+            ew = ew.saturating_mul(((l - r).unsigned_abs() + 1) as u32);
+        }
+        inner.reverse();
+    }
+    PACKED_ELEM_INNER_TLS.with(|c| {
+        let mut map = c.borrow_mut();
+        if inner.is_empty() {
+            map.remove(name);
+        } else {
+            map.insert(name.to_string(), inner);
+        }
+    });
+}
+
+/// Bit offset of element `idx` in a `width`-bit packed array whose elements
+/// are `ew` bits: the left bound of the range is the most significant
+/// element (§7.4.1), and `low` is the range's lowest index. `None` when the
+/// index is outside the range.
+fn packed_elem_slot_lo(width: u32, ew: u32, msb0: bool, low: i64, idx: i64) -> Option<u32> {
+    if ew == 0 || width < ew {
+        return None;
+    }
+    let n = (width / ew) as i64;
+    let rel = idx.checked_sub(low)?;
+    if rel < 0 || rel >= n {
+        return None;
+    }
+    let slot = if msb0 { n - 1 - rel } else { rel };
+    Some(slot as u32 * ew)
+}
+
 /// Outermost element of a packed array: its width, and whether index 0 sits
 /// in the MS bits (`[0:N]`, not `[N:0]`). A plain bit vector (element width
 /// 1) is left to the bit-select path.
@@ -26016,7 +26101,20 @@ fn packed_outer_elem(
     dt: &DataType,
     params: &dyn ParamLookup,
     typedef_types: &HashMap<String, DataType>,
-) -> Option<(u32, bool)> {
+) -> Option<(u32, bool, i64)> {
+    // §7.4.1: a packed array of packed structures or unions; its element is
+    // the whole structure.
+    if let Some((dims, elem)) = packed_struct_array_info_env(dt, params, typedef_types) {
+        let mut ew = typedefs_snapshot(|td| resolve_type_width_env(&elem, Some(&params), td));
+        if ew == 0 {
+            return None;
+        }
+        for (l, r) in dims.iter().skip(1) {
+            ew = ew.checked_mul(((l - r).unsigned_abs() + 1) as u32)?;
+        }
+        let (l, r) = *dims.first()?;
+        return Some((ew, l < r, l.min(r)));
+    }
     let (dims, leaf) = packed_pattern_shape(dt, params, typedef_types)?;
     let outer = dims.first()?;
     let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
@@ -26039,11 +26137,11 @@ fn packed_outer_elem(
         // from the LSB. `[0:N]` numbers bit 0 from the MSB — fpnew's format
         // masks are declared that way, and reading bit 0 turned FP32 off.
         if l < r {
-            return Some((1, true));
+            return Some((1, true, l));
         }
         return None;
     }
-    Some((ew, l < r))
+    Some((ew, l < r, l.min(r)))
 }
 
 /// `P.Field[i]` on a packed-array member. The field select yields the array
@@ -26060,12 +26158,15 @@ fn register_struct_member_elem_widths(
         return;
     };
     for member in &su.members {
-        let Some((ew, msb0)) = packed_outer_elem(&member.data_type, params, typedef_types) else {
+        let Some((ew, msb0, low)) = packed_outer_elem(&member.data_type, params, typedef_types)
+        else {
             continue;
         };
         for decl in &member.declarators {
             let key = format!("{param}.{}", decl.name.name);
             tls_register_elem_w(&key, ew);
+            tls_register_elem_low(&key, low);
+            tls_register_elem_inner(&key, &member.data_type, params, typedef_types);
             if msb0 {
                 tls_register_elem_msb0(&key);
             }
@@ -26079,37 +26180,61 @@ fn register_struct_member_elem_widths(
 fn const_packed_array_elem<P: ParamLookup>(
     base: &Expression,
     base_val: &Value,
-    idx: u64,
+    idx: i64,
     params: &P,
 ) -> Option<Value> {
+    // §7.4.1: `M[i][j]` — `base` is itself an element select of a
+    // multi-dimensional packed parameter; this select takes one element of
+    // the next dimension out of the value the selects before it produced.
+    let mut root = base;
+    let mut depth = 0usize;
+    loop {
+        match &root.kind {
+            ExprKind::Paren(inner) => root = inner,
+            ExprKind::Index { expr, .. } => {
+                depth += 1;
+                root = expr;
+            }
+            _ => break,
+        }
+    }
+    if depth > 0 {
+        let mut keys = Vec::new();
+        if let Some(path) = const_parameter_path(root, Some(params)) {
+            keys.push(path);
+        }
+        const_index_base_keys(root, Some(params), &mut keys);
+        let level = PACKED_ELEM_INNER_TLS.with(|c| {
+            let map = c.borrow();
+            keys.iter()
+                .find_map(|k| map.get(k))
+                .and_then(|levels| levels.get(depth - 1).copied())
+        });
+        if let Some((ew, msb0, low)) = level {
+            let lo = packed_elem_slot_lo(base_val.width, ew, msb0, low, idx)?;
+            return Some(base_val.range_select((lo + ew - 1) as usize, lo as usize));
+        }
+    }
     let mut keys = Vec::new();
     if let Some(path) = const_parameter_path(base, Some(params)) {
         keys.push(path);
     }
     const_index_base_keys(base, Some(params), &mut keys);
-    let (ew, msb0) = PACKED_ELEM_W_TLS.with(|widths| {
+    let (ew, msb0, low) = PACKED_ELEM_W_TLS.with(|widths| {
         let widths = widths.borrow();
         PACKED_ELEM_MSB0_TLS.with(|msb| {
             let msb = msb.borrow();
             keys.into_iter().find_map(|k| {
                 let ew = *widths.get(&k)?;
-                Some((ew, msb.contains(&k)))
+                let low = PACKED_ELEM_LOW_TLS.with(|c| c.borrow().get(&k).copied());
+                Some((ew, msb.contains(&k), low.unwrap_or(0)))
             })
         })
     })?;
     if ew == 0 || base_val.width < ew {
         return None;
     }
-    let n = base_val.width / ew;
-    let slot = if msb0 {
-        n.saturating_sub(1).saturating_sub(idx as u32)
-    } else {
-        idx as u32
-    };
-    let lo = slot.saturating_mul(ew);
-    if lo + ew > base_val.width {
-        return None;
-    }
+    let lo = packed_elem_slot_lo(base_val.width, ew, msb0, low, idx)?;
     Some(base_val.range_select((lo + ew - 1) as usize, lo as usize))
 }
 
@@ -26129,7 +26254,7 @@ fn register_packed_param_index(
         let params = params.unwrap_or(&elab.parameters);
         packed_inner_elem_width(data_type, params, &elab.typedefs).or_else(|| {
             packed_outer_elem(data_type, params, &elab.typedef_types)
-                .map(|(ew, _)| ew)
+                .map(|(ew, _, _)| ew)
                 .filter(|ew| *ew > 1)
         })
     };
@@ -26208,9 +26333,11 @@ fn register_packed_array_elem_w(
             if let Some(PackedDimension::Range { left, right, .. }) = dimensions.first()
                 && let Some(l) = const_eval_i64_with_params(left, Some(params))
                 && let Some(r) = const_eval_i64_with_params(right, Some(params))
-                && l < r
             {
-                tls_register_elem_msb0(name);
+                tls_register_elem_low(name, l.min(r));
+                if l < r {
+                    tls_register_elem_msb0(name);
+                }
             }
         }
     }
@@ -29157,12 +29284,14 @@ fn register_pkg_param_elem(
     if !pkg.is_empty() {
         keys.push(format!("{pkg}.{name}"));
     }
-    let msb0 = packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types)
-        .is_some_and(|(_, msb0)| msb0);
+    let outer = packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types);
+    let msb0 = outer.is_some_and(|(_, msb0, _)| msb0);
     for key in keys {
         register_packed_param_index(elab, &key, data_type, None);
         if let Some(&ew) = elab.packed_signal_elem_widths.get(&key) {
             tls_register_elem_w(&key, ew);
+            tls_register_elem_low(&key, outer.map_or(0, |(_, _, low)| low));
+            tls_register_elem_inner(&key, data_type, &elab.parameters, &elab.typedef_types);
             // §7.4.5: the left bound of an ascending packed range is the
             // most significant element, in constant expressions as at runtime.
             PACKED_ELEM_MSB0_TLS.with(|c| {
@@ -30542,8 +30671,12 @@ fn register_packed_param_shape(elab: &mut ElaboratedModule, name: &str, data_typ
         // The runtime map is `register_packed_param_index`.
         tls_register_elem_w(name, elem_w);
     }
-    if let Some((ew, msb0)) = packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types) {
+    if let Some((ew, msb0, low)) =
+        packed_outer_elem(data_type, &elab.parameters, &elab.typedef_types)
+    {
         tls_register_elem_w(name, ew);
+        tls_register_elem_low(name, low);
+        tls_register_elem_inner(name, data_type, &elab.parameters, &elab.typedef_types);
         if msb0 {
             tls_register_elem_msb0(name);
         }
@@ -33612,7 +33745,12 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     return ev.clone();
                 }
             }
-            if let Some(elem) = const_packed_array_elem(base, &base_val, idx, params) {
+            if let Some(elem) = const_packed_array_elem(
+                base,
+                &base_val,
+                signed_index.unwrap_or(idx as i64),
+                params,
+            ) {
                 return elem;
             }
             let i = idx as usize;
@@ -41726,6 +41864,33 @@ fn scope_local_decl_types_in(s: &mut Statement, rename: &dyn Fn(&DataType) -> Op
     }
 }
 
+/// §7.4.1: whether `dt` names (through plain aliases) a packed array of a
+/// named type (`lane_t [0:1]`, or `typedef lane_t [0:1] arr_t;`) or a packed
+/// structure or union. A port of such a type keeps its declaration, as a
+/// variable of it does: an element of a named signed type is signed, and so
+/// is one of a packed-array member of the structure.
+fn names_packed_array_or_struct(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> bool {
+    let mut cur = dt;
+    for _ in 0..64 {
+        match cur {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
+                if !dimensions.is_empty() {
+                    return true;
+                }
+                match lookup_scoped_type(name, typedef_types) {
+                    Some(next) => cur = next,
+                    None => return false,
+                }
+            }
+            DataType::Struct(su) => return su.packed,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// One typedef step of a BARE reference with no dimensions of its own:
 /// `w_t` gives `b_t [0:3]` for `typedef b_t [0:3] w_t;`. A reference that
 /// carries dims keeps them for the chained walk instead.
@@ -41864,33 +42029,6 @@ fn interface_signal_names(
             for p in ps {
                 out.insert(p.name.name.clone());
             }
-/// §7.4.1: whether `dt` names (through plain aliases) a packed array of a
-/// named type (`lane_t [0:1]`, or `typedef lane_t [0:1] arr_t;`) or a packed
-/// structure or union. A port of such a type keeps its declaration, as a
-/// variable of it does: an element of a named signed type is signed, and so
-/// is one of a packed-array member of the structure.
-fn names_packed_array_or_struct(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> bool {
-    let mut cur = dt;
-    for _ in 0..64 {
-        match cur {
-            DataType::TypeReference {
-                name, dimensions, ..
-            } => {
-                if !dimensions.is_empty() {
-                    return true;
-                }
-                match lookup_scoped_type(name, typedef_types) {
-                    Some(next) => cur = next,
-                    None => return false,
-                }
-            }
-            DataType::Struct(su) => return su.packed,
-            _ => return false,
-        }
-    }
-    false
-}
-
         }
         PortList::NonAnsi(ids) => {
             for id in ids {
@@ -43750,12 +43888,13 @@ fn inline_module_items(
                                                     // `ACTIVE_FORMATS[FP32]` reads
                                                     // the low bit and the FP32
                                                     // result pack is never built.
-                                                    if let Some((ew, msb0)) = packed_outer_elem(
+                                                    if let Some((ew, msb0, low)) = packed_outer_elem(
                                                         data_type,
                                                         local_map,
                                                         &elab_ro.typedef_types,
                                                     ) {
                                                         tls_register_elem_w(&assign.name.name, ew);
+                                                        tls_register_elem_low(&assign.name.name, low);
                                                         if msb0 {
                                                             tls_register_elem_msb0(
                                                                 &assign.name.name,
@@ -43994,12 +44133,13 @@ fn inline_module_items(
                             // `fmt_logic_t` is `logic [0:N]`. The typedef carries
                             // the range, so `FpFmtMask[fmt]` keeps index 0 in
                             // the high bit.
-                            if let Some((ew, msb0)) = packed_outer_elem(
+                            if let Some((ew, msb0, low)) = packed_outer_elem(
                                 data_type,
                                 &sub_local_params,
                                 &elab.typedef_types,
                             ) {
                                 tls_register_elem_w(&assign.name.name, ew);
+                                tls_register_elem_low(&assign.name.name, low);
                                 if msb0 {
                                     tls_register_elem_msb0(&assign.name.name);
                                 }
@@ -45134,6 +45274,17 @@ fn inline_module_items(
                                 if let Some(ew) =
                                     packed_inner_elem_width(dt, &sub_merged_params, &elab.typedefs)
                                         .or_else(|| {
+                                            // §7.4.1: dimensions carried by a
+                                            // typedef of a named element type
+                                            // (`typedef lane_t [0:1] arr_t;`).
+                                            let one = bare_typedef_step(dt, &elab.typedef_types)?;
+                                            packed_inner_elem_width(
+                                                &one,
+                                                &sub_merged_params,
+                                                &elab.typedefs,
+                                            )
+                                        })
+                                        .or_else(|| {
                                             packed_inner_elem_width(
                                                 &resolved_dt,
                                                 &sub_merged_params,
@@ -45272,17 +45423,6 @@ fn inline_module_items(
                                             default_port_value(
                                                 port.direction,
                                                 port.data_type.as_ref(),
-                                        .or_else(|| {
-                                            // §7.4.1: dimensions carried by a
-                                            // typedef of a named element type
-                                            // (`typedef lane_t [0:1] arr_t;`).
-                                            let one = bare_typedef_step(dt, &elab.typedef_types)?;
-                                            packed_inner_elem_width(
-                                                &one,
-                                                &sub_merged_params,
-                                                &elab.typedefs,
-                                            )
-                                        })
                                                 width,
                                                 is_real,
                                                 ansi_port_net_type(port),
@@ -45687,6 +45827,25 @@ fn inline_module_items(
                                             sub_mod.name(),
                                         ),
                                     );
+                                } else if names_packed_array_or_struct(
+                                    &pd.data_type,
+                                    &elab.typedef_types,
+                                ) && !elab.var_decl_types.contains_key(&sig_name)
+                                {
+                                    // §7.4.1: a port of a named type keeps
+                                    // its declaration, so an element of
+                                    // `input lane_t [0:1] p;` has the signing
+                                    // of `lane_t`.
+                                    elab.var_decl_types.insert_shared(
+                                        sig_name.clone(),
+                                        instance_decl_type(
+                                            &mut cache.decl_types,
+                                            &pd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                            sub_mod.name(),
+                                        ),
+                                    );
                                 }
                                 // §7.4.1: a non-ANSI PORT of a packed
                                 // multi-D / packed-struct type needs the
@@ -45827,25 +45986,6 @@ fn inline_module_items(
                                     elab.net_delays.insert(sig_name.clone(), d);
                                 }
                                 let effective_dims = normalize_unpacked_dims(
-                                } else if names_packed_array_or_struct(
-                                    &pd.data_type,
-                                    &elab.typedef_types,
-                                ) && !elab.var_decl_types.contains_key(&sig_name)
-                                {
-                                    // §7.4.1: a port of a named type keeps
-                                    // its declaration, so an element of
-                                    // `input lane_t [0:1] p;` has the signing
-                                    // of `lane_t`.
-                                    elab.var_decl_types.insert_shared(
-                                        sig_name.clone(),
-                                        instance_decl_type(
-                                            &mut cache.decl_types,
-                                            &pd.data_type,
-                                            &sub_typedef_names_all,
-                                            &inst_prefix,
-                                            sub_mod.name(),
-                                        ),
-                                    );
                                     &decl.dimensions,
                                     &sub_merged_params,
                                     &elab.typedef_types,
@@ -49828,6 +49968,7 @@ impl Drop for ConstFnStructLayouts {
 struct ConstFnPackedElems {
     saved_w: Vec<(String, Option<u32>)>,
     saved_msb: Vec<(String, bool)>,
+    saved_low: Vec<(String, Option<i64>)>,
 }
 
 impl ConstFnPackedElems {
@@ -49842,9 +49983,11 @@ impl ConstFnPackedElems {
         let dt = inlined.as_ref().unwrap_or(dt);
         let qualified = qualify_const_fn_typedef(dt, elab);
         let dt = qualified.as_ref().unwrap_or(dt);
-        let Some((ew, msb0)) = packed_outer_elem(dt, params, &elab.typedef_types) else {
+        let Some((ew, msb0, low)) = packed_outer_elem(dt, params, &elab.typedef_types) else {
             return;
         };
+        self.saved_low
+            .push((name.to_string(), tls_register_elem_low(name, low)));
         let prev_w = PACKED_ELEM_W_TLS.with(|c| {
             let mut map = c.borrow_mut();
             let prev = map.get(name).copied();
@@ -49889,6 +50032,9 @@ impl Drop for ConstFnPackedElems {
                 }
             }
         });
+        for (name, prev) in self.saved_low.drain(..).rev() {
+            tls_register_elem_low(&name, prev.unwrap_or(0));
+        }
     }
 }
 
@@ -49915,19 +50061,8 @@ fn const_fn_packed_slot(name: &str, width: u32, idx: u64) -> Option<(u32, u32)> 
         let msb0 = PACKED_ELEM_MSB0_TLS.with(|msb| msb.borrow().contains(name));
         Some((ew, msb0))
     })?;
-    if ew == 0 || width < ew {
-        return None;
-    }
-    let n = width / ew;
-    let slot = if msb0 {
-        n.saturating_sub(1).saturating_sub(idx as u32)
-    } else {
-        idx as u32
-    };
-    let lo = slot.saturating_mul(ew);
-    if lo + ew > width {
-        return None;
-    }
+    let low = PACKED_ELEM_LOW_TLS.with(|c| c.borrow().get(name).copied().unwrap_or(0));
+    let lo = packed_elem_slot_lo(width, ew, msb0, low, idx as i64)?;
     Some((lo, ew))
 }
 
