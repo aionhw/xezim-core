@@ -1,22 +1,182 @@
 //! §25.10, §23.3.3: an instance with an interface port sees the parameters
 //! of the interface instance bound to it through the port formal, and finds
 //! them under the bound instance's path in the design-wide parameter table.
-//! A sorted set of the table's dotted keys answers that lookup with a range
-//! scan instead of a pass over every entry. It is built on the first lookup
-//! (a design without interface ports never builds it) and kept exact by
-//! `set_param`/`remove_param`, through which elaboration makes every write to
-//! the table; a table whose size no longer matches the tracked changes is
+//! An ordered index of the table's dotted keys answers that lookup with a
+//! range scan instead of a pass over every entry. It is built on the first
+//! lookup (a design without interface ports never builds it) and kept exact
+//! by `set_param`/`remove_param`, through which elaboration makes every write
+//! to the table; a table whose size no longer matches the tracked changes is
 //! re-indexed before the next lookup.
+//!
+//! The parameters of one instance differ in their last component only, so
+//! the index holds the path of an instance once (aionhw/xezim#721). A key is
+//! stored with its last `.` written as a separator no name contains, which
+//! puts the keys of one path next to each other in plain byte order. A path
+//! with one key holds that key whole, which costs what a plain set of the
+//! keys costs; a path with more holds the path and the sorted last
+//! components.
 
 use super::{ElaboratedModule, params_insert_traced};
 use crate::value::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
+
+/// Stands for the last `.` of a stored key.
+const SEP: char = '\u{1}';
+
+/// The sorted last components of the keys of one path.
+type Leaves = Box<Vec<Box<str>>>;
+
+/// `key` as its stored path (through the separator) and last component.
+fn stored(key: &str) -> (String, &str) {
+    let dot = key.rfind('.').unwrap_or(0);
+    let mut path = String::with_capacity(key.len());
+    path.push_str(&key[..dot]);
+    path.push(SEP);
+    (path, &key[dot + 1..])
+}
+
+/// The dotted keys of the table.
+#[derive(Debug, Default)]
+struct Keys {
+    /// `None` beside a whole stored key, the last components beside a stored
+    /// path. A path has either one whole key or one entry of two or more
+    /// components (of any number when one is empty, which a whole key cannot
+    /// express). No other stored key begins with a stored path.
+    paths: BTreeMap<Box<str>, Option<Leaves>>,
+    /// Keys that contain the separator themselves, as they are.
+    odd: BTreeSet<Box<str>>,
+}
+
+impl Keys {
+    /// Add `key`, which contains a `.`.
+    fn insert(&mut self, key: &str) {
+        if key.contains(SEP) {
+            self.odd.insert(key.into());
+            return;
+        }
+        let (mut path, leaf) = stored(key);
+        // The path's own entry, else the one whole key of this path, is the
+        // first entry from the path on.
+        let mut alone = None;
+        if let Some((have, leaves)) = self
+            .paths
+            .range_mut::<str, _>((Bound::Included(path.as_str()), Bound::Unbounded))
+            .next()
+            && have.starts_with(path.as_str())
+        {
+            match leaves {
+                Some(leaves) => {
+                    if let Err(at) = leaves.binary_search_by(|have| (**have).cmp(leaf)) {
+                        leaves.insert(at, leaf.into());
+                    }
+                    return;
+                }
+                None => alone = Some(have.clone()),
+            }
+        }
+        match alone {
+            Some(alone) if &alone[path.len()..] != leaf => {
+                self.paths.remove(&alone);
+                let mut leaves: Vec<Box<str>> = vec![alone[path.len()..].into(), leaf.into()];
+                leaves.sort_unstable();
+                self.paths.insert(path.into(), Some(Box::new(leaves)));
+            }
+            Some(_) => {}
+            None if leaf.is_empty() => {
+                self.paths
+                    .insert(path.into(), Some(Box::new(vec![leaf.into()])));
+            }
+            None => {
+                path.push_str(leaf);
+                self.paths.insert(path.into(), None);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if key.contains(SEP) {
+            self.odd.remove(key);
+            return;
+        }
+        let (mut path, leaf) = stored(key);
+        let Some(Some(leaves)) = self.paths.get_mut(path.as_str()) else {
+            path.push_str(leaf);
+            self.paths.remove(path.as_str());
+            return;
+        };
+        if let Ok(at) = leaves.binary_search_by(|have| (**have).cmp(leaf)) {
+            leaves.remove(at);
+        }
+        match leaves.as_slice() {
+            [] => {
+                self.paths.remove(path.as_str());
+            }
+            [last] if !last.is_empty() => {
+                let whole = format!("{path}{last}");
+                self.paths.remove(path.as_str());
+                self.paths.insert(whole.into(), None);
+            }
+            _ => {}
+        }
+    }
+
+    /// Every key that starts with `prefix` (a path and its `.`), in key
+    /// order.
+    fn with_prefix(&self, prefix: &str, mut f: impl FnMut(&str)) {
+        let under = |from: &str| {
+            let from = from.to_string();
+            self.paths
+                .range::<str, _>((Bound::Included(from.as_str()), Bound::Unbounded))
+                .take_while(move |(have, _)| have.starts_with(from.as_str()))
+        };
+        // The keys of the path itself: one entry, in order as it is.
+        let (own, _) = stored(prefix);
+        let mut key = String::from(prefix);
+        let mut own_keys = |f: &mut dyn FnMut(&str)| {
+            for (have, leaves) in under(&own) {
+                let mut each = |leaf: &str| {
+                    key.truncate(prefix.len());
+                    key.push_str(leaf);
+                    f(&key);
+                };
+                match leaves {
+                    None => each(&have[own.len()..]),
+                    Some(leaves) => leaves.iter().for_each(|leaf| each(leaf)),
+                }
+            }
+        };
+        // The keys of the paths below it, and those held as they are.
+        let mut deeper = under(prefix).peekable();
+        let mut odd = self
+            .odd
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(|have| have.starts_with(prefix))
+            .peekable();
+        if deeper.peek().is_none() && odd.peek().is_none() {
+            return own_keys(&mut f);
+        }
+        // A deeper path can sort between the keys of a shallower one
+        // (`a.b.c.W` before `a.b.d`).
+        let mut keys = Vec::new();
+        own_keys(&mut |key| keys.push(key.to_string()));
+        for (have, leaves) in deeper {
+            let (path, last) = have.split_once(SEP).unwrap_or((have, ""));
+            match leaves {
+                None => keys.push(format!("{path}.{last}")),
+                Some(leaves) => keys.extend(leaves.iter().map(|leaf| format!("{path}.{leaf}"))),
+            }
+        }
+        keys.extend(odd.map(|key| key.to_string()));
+        keys.sort_unstable();
+        keys.iter().for_each(|key| f(key));
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct ParamPrefixIndex {
     /// The keys of `parameters` that contain a `.`, once built.
-    keys: Option<BTreeSet<String>>,
+    keys: Option<Keys>,
     /// The size of `parameters` that the tracked changes imply.
     len: usize,
     /// How many times the index was built.
@@ -28,15 +188,15 @@ impl ElaboratedModule {
     /// Insert into `parameters`, keeping the prefix index exact.
     pub(crate) fn set_param(&mut self, site: u32, key: String, value: Value) -> Option<Value> {
         let index = &mut self.param_index;
-        let new_key =
-            index.keys.is_some() && key.contains('.') && !self.parameters.contains_key(&key);
-        let indexed = new_key.then(|| key.clone());
+        if let Some(keys) = index.keys.as_mut()
+            && key.contains('.')
+            && !self.parameters.contains_key(&key)
+        {
+            keys.insert(&key);
+        }
         let previous = params_insert_traced(&mut self.parameters, site, key, value);
         if previous.is_none() {
             index.len += 1;
-        }
-        if let (Some(keys), Some(key)) = (index.keys.as_mut(), indexed) {
-            keys.insert(key);
         }
         previous
     }
@@ -47,7 +207,9 @@ impl ElaboratedModule {
         if previous.is_some() {
             let index = &mut self.param_index;
             index.len = index.len.saturating_sub(1);
-            if let Some(keys) = index.keys.as_mut() {
+            if let Some(keys) = index.keys.as_mut()
+                && key.contains('.')
+            {
                 keys.remove(key);
             }
         }
@@ -55,22 +217,32 @@ impl ElaboratedModule {
     }
 
     /// Call `f` with the rest of each key of `parameters` that starts with
-    /// `prefix` (which must contain a `.`) and its value, in key order.
+    /// `prefix` (a path and its `.`) and its value, in key order.
     pub(crate) fn for_each_parameter_with_prefix(
         &mut self,
         prefix: &str,
         mut f: impl FnMut(&str, &Value),
     ) {
-        debug_assert!(prefix.contains('.'));
+        if !prefix.ends_with('.') {
+            // Not a path: the index cannot answer; read the table.
+            let mut found: Vec<_> = self
+                .parameters
+                .iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .collect();
+            found.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in found {
+                f(&key[prefix.len()..], value);
+            }
+            return;
+        }
         let index = &mut self.param_index;
         if index.keys.is_none() || index.len != self.parameters.len() {
-            index.keys = Some(
-                self.parameters
-                    .keys()
-                    .filter(|key| key.contains('.'))
-                    .cloned()
-                    .collect(),
-            );
+            let mut keys = Keys::default();
+            for key in self.parameters.keys().filter(|key| key.contains('.')) {
+                keys.insert(key);
+            }
+            index.keys = Some(keys);
             index.len = self.parameters.len();
             #[cfg(test)]
             {
@@ -78,12 +250,9 @@ impl ElaboratedModule {
             }
         }
         let keys = index.keys.as_ref().expect("index built above");
-        for key in keys
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .take_while(|key| key.starts_with(prefix))
-        {
+        keys.with_prefix(prefix, |key| {
             f(&key[prefix.len()..], &self.parameters[key]);
-        }
+        });
     }
 }
 
