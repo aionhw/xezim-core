@@ -1666,11 +1666,12 @@ fn design_package(name: &str) -> bool {
 /// is materialized, by which time the tree is complete.
 #[derive(Debug, Default)]
 pub struct UpwardScopes {
-    /// Parent scope path (`""` = the top module) → its child instances as
-    /// `(instance name, definition name)`, bound instances included.
-    children: HashMap<String, Vec<(String, String)>>,
+    /// Parent scope path (`""` = the top module) → the paths of its child
+    /// instances, bound instances included. A child's instance name is its
+    /// path below the parent's (`child_leaf`).
+    children: HashMap<Rc<str>, Vec<Rc<str>>>,
     /// Instance path (`""` = the top module) → definition name.
-    defs: HashMap<String, String>,
+    defs: HashMap<Rc<str>, Rc<str>>,
     /// Definition name → the scope names its source declares anywhere in
     /// its body (instances of every generate branch, generate and block
     /// labels, subroutines): a reference headed by one of them is a
@@ -1680,33 +1681,88 @@ pub struct UpwardScopes {
     /// package constant, never a scope path.
     packages: HashSet<String>,
     /// §23.8.1: instance path → where its instantiation sits in its parent.
-    parents: HashMap<String, InstanceParent>,
+    parents: HashMap<Rc<str>, InstanceParent>,
+    /// The definition names in `defs` and `parents`, one string per
+    /// definition. An instance path is likewise one string, shared by the
+    /// tables that name it (aionhw/xezim#721).
+    def_names: HashSet<Rc<str>>,
+    /// The scope the last instance was recorded in; the children of one
+    /// scope arrive together, so most lookups of a parent end here.
+    last_parent: Option<Rc<str>>,
 }
 
 /// The scope of the parent definition holding an instantiation.
 #[derive(Debug)]
 struct InstanceParent {
     /// The instance's own definition.
-    def: String,
-    path: String,
+    def: Rc<str>,
+    path: Rc<str>,
     tree: Rc<crate::scope_tree::ScopeTree>,
     scope: crate::ast::binding::ScopeId,
     indices: Vec<i64>,
 }
 
 impl UpwardScopes {
-    fn add_instance(&mut self, parent: &str, path: &str, def: &str) {
-        let leaf = match parent.is_empty() {
+    /// The one string of the scope path `parent`, an instance recorded
+    /// earlier (or the top): the key a table already holds it under.
+    fn shared_parent(&mut self, parent: &str) -> Rc<str> {
+        if let Some(held) = self.last_parent.as_ref().filter(|p| &***p == parent) {
+            return Rc::clone(held);
+        }
+        let held = self.defs.get_key_value(parent).map(|(k, _)| k);
+        let held = held.or_else(|| self.parents.get_key_value(parent).map(|(k, _)| k));
+        let held = held.or_else(|| self.children.get_key_value(parent).map(|(k, _)| k));
+        let held = held.cloned().unwrap_or_else(|| Rc::from(parent));
+        self.last_parent = Some(Rc::clone(&held));
+        held
+    }
+
+    /// The one string of definition name `def`.
+    fn shared_def(&mut self, def: &str) -> Rc<str> {
+        if let Some(held) = self.def_names.get(def) {
+            return Rc::clone(held);
+        }
+        let name: Rc<str> = Rc::from(def);
+        self.def_names.insert(Rc::clone(&name));
+        name
+    }
+
+    /// The instance name of the child at `path` in the scope `parent`.
+    fn child_leaf<'a>(parent: &str, path: &'a str) -> &'a str {
+        match parent.is_empty() {
             true => path,
             false => path
                 .strip_prefix(parent)
                 .map_or(path, |p| p.trim_start_matches('.')),
-        };
+        }
+    }
+
+    /// The child instance of scope `parent` named `name`, by that name.
+    fn child_named(&self, parent: &str, name: &str) -> Option<&str> {
         self.children
-            .entry(parent.to_string())
+            .get(parent)?
+            .iter()
+            .map(|path| Self::child_leaf(parent, path))
+            .find(|leaf| *leaf == name)
+    }
+
+    /// The top module is an instance of `def` at the empty path.
+    fn set_top(&mut self, def: &str) {
+        let (path, def) = (self.shared_parent(""), self.shared_def(def));
+        self.defs.insert(path, def);
+    }
+
+    fn add_instance(&mut self, parent: &str, path: &str, def: &str) {
+        let parent = self.shared_parent(parent);
+        // `add_parent` recorded the instantiation first, under this path.
+        let held = self.parents.get_key_value(path).map(|(k, _)| Rc::clone(k));
+        let path = held.unwrap_or_else(|| Rc::from(path));
+        let def = self.shared_def(def);
+        self.children
+            .entry(parent)
             .or_default()
-            .push((leaf.to_string(), def.to_string()));
-        self.defs.insert(path.to_string(), def.to_string());
+            .push(Rc::clone(&path));
+        self.defs.insert(path, def);
     }
 
     /// Record where instance `path` is declared in its parent `parent`, an
@@ -1727,11 +1783,14 @@ impl UpwardScopes {
         if scope.0 as usize >= tree.scopes.len() {
             return;
         }
+        let parent = self.shared_parent(parent);
+        let def = self.shared_def(&inst.module_name.name);
+        // The first record of this instance: its path string starts here.
         self.parents.insert(
-            path.to_string(),
+            Rc::from(path),
             InstanceParent {
-                def: inst.module_name.name.clone(),
-                path: parent.to_string(),
+                def,
+                path: parent,
                 tree,
                 scope,
                 indices: hi.gen_indices.clone(),
@@ -1778,7 +1837,7 @@ impl UpwardScopes {
                 }
                 scope = sc.parent;
             }
-            at = &up.path;
+            at = &*up.path;
         }
         None
     }
@@ -1786,7 +1845,7 @@ impl UpwardScopes {
     /// §23.8.1: a bare call of `name` in a body of definition `def` finds a
     /// subroutine upward from every instance of `def`. The top finds none.
     fn every_instance_finds(&self, def: &str, name: &str) -> bool {
-        let mut insts = self.defs.iter().filter(|(_, d)| *d == def).peekable();
+        let mut insts = self.defs.iter().filter(|(_, d)| &***d == def).peekable();
         insts.peek().is_some() && insts.all(|(p, _)| self.find_subroutine(p, name).is_some())
     }
 
@@ -41680,9 +41739,7 @@ fn inline_module_items(
         let mut scopes = elab.upward_scopes.borrow_mut();
         scopes.declare(&source_def);
         if prefix.is_empty() {
-            scopes
-                .defs
-                .insert(String::new(), source_def.name().to_string());
+            scopes.set_top(source_def.name());
             scopes.packages.extend(elab.packages.iter().cloned());
         }
     }
@@ -55761,16 +55818,10 @@ fn upward_scope_rewrite(hier: &HierarchicalIdentifier, prefix: &str) -> Option<E
         scopes
             .defs
             .get(p)
-            .and_then(|d| scopes.declared.get(d))
+            .and_then(|d| scopes.declared.get(&**d))
             .is_some_and(|names| names.contains(head))
     };
-    let kids_of = |p: &str| scopes.children.get(p).map(Vec::as_slice).unwrap_or(&[]);
-    let child_named = |p: &str| {
-        kids_of(p)
-            .iter()
-            .find(|(l, _)| l == head)
-            .map(|(l, _)| l.as_str())
-    };
+    let child_named = |p: &str| scopes.child_named(p, head);
     let cur = prefix.trim_end_matches('.');
     // Step a: the current design element's own scopes are downward.
     if declares(cur) || child_named(cur).is_some() {
@@ -55780,7 +55831,7 @@ fn upward_scope_rewrite(hier: &HierarchicalIdentifier, prefix: &str) -> Option<E
     // The matched scope and what replaces the head below it: nothing when
     // the head named `p`'s module, the child's name, or the label itself.
     let hit: Option<(&str, Option<&str>)> = loop {
-        if !p.is_empty() && scopes.defs.get(p).is_some_and(|d| d == head) {
+        if !p.is_empty() && scopes.defs.get(p).is_some_and(|d| &**d == head) {
             break Some((p, None));
         }
         if p != cur {
@@ -55833,7 +55884,7 @@ fn upward_subroutine_key(hier: &HierarchicalIdentifier, prefix: &str) -> Option<
     let inst = prefix.trim_end_matches('.');
     let key = scopes.subroutine_key(inst, name)?;
     if bind::audit_enabled() {
-        let def = scopes.parents.get(inst).map_or("", |up| up.def.as_str());
+        let def = scopes.parents.get(inst).map_or("", |up| &*up.def);
         eprintln!(
             "[bind-audit] upward {} {name} in {inst} -> {key}",
             audit_location(def, hier.span)
