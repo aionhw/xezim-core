@@ -2,19 +2,59 @@
 
 use crate::ast::Span;
 
-#[derive(Debug, Clone)]
+/// Compact source-backed token (8 bytes, `Copy`).
+///
+/// Byte offsets and lengths index into the enclosing [`TokenStream`](super::TokenStream)
+/// source buffer; tokens of 65,535 bytes or longer store `LONG_LEN` and keep
+/// their exact end offset in the stream's overflow table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
+    pub kind: TokenKind,
+    start: u32,
+    len: u16,
+}
+
+/// Standalone owned token returned by convenience helpers (`tokenize`,
+/// `tokenize_file`) that drop their temporary preprocessed source buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedToken {
     pub kind: TokenKind,
     pub text: String,
     pub span: Span,
 }
 
+const _: () = assert!(std::mem::size_of::<TokenKind>() == 2);
+const _: () = assert!(std::mem::size_of::<Token>() == 8);
+
 impl Token {
-    pub fn new(kind: TokenKind, text: String, span: Span) -> Self {
-        Self { kind, text, span }
+    pub(crate) const LONG_LEN: u16 = u16::MAX;
+
+    #[inline]
+    pub(crate) const fn from_raw(kind: TokenKind, start: u32, len: u16) -> Self {
+        Self { kind, start, len }
+    }
+
+    #[inline]
+    pub const fn start(&self) -> usize {
+        self.start as usize
+    }
+
+    #[inline]
+    pub(crate) const fn raw_len(&self) -> u16 {
+        self.len
+    }
+
+    #[inline]
+    pub(crate) const fn inline_end(&self) -> Option<usize> {
+        if self.len < Self::LONG_LEN {
+            Some(self.start as usize + self.len as usize)
+        } else {
+            None
+        }
     }
 }
 
+#[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum TokenKind {

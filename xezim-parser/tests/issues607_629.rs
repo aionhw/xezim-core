@@ -353,7 +353,10 @@ fn keyword_set_frees_later_words() {
     let reserved = |version: &str, word: &str| {
         let src = format!("`begin_keywords \"{version}\"\n{word}\n`end_keywords\n");
         let tokens = Lexer::new(&src).tokenize();
-        let tok = tokens.iter().find(|t| t.text == word).expect("word token");
+        let tok = tokens
+            .iter()
+            .find(|&t| tokens.text(t) == word)
+            .expect("word token");
         tok.kind != TokenKind::Identifier
     };
     for (version, names, keywords) in [
