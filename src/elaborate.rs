@@ -5833,38 +5833,58 @@ pub fn specialized_class_scope_width(
     elab: &ElaboratedModule,
 ) -> Option<u32> {
     // The scope link carrying `#(...)` args names the specialized class;
-    // without one, the last link may be a typedef naming a specialization.
-    let (cls_name, type_args): (&str, &[Expression]) =
-        match name.scopes.iter().rev().find(|s| !s.type_args.is_empty()) {
-            Some(link) => (&link.name.name, &link.type_args),
-            None => typedef_specialization(&name.scopes.last()?.name.name, elab)?,
+    // without one, a link may be a typedef naming a specialization. The
+    // links after it (and the classes the typedef nests into) name classes
+    // nested in that specialization (§8.23).
+    let (cls_name, type_args, nested): (&str, &[Expression], Vec<&str>) =
+        match name.scopes.iter().rposition(|s| !s.type_args.is_empty()) {
+            Some(i) => (
+                &name.scopes[i].name.name,
+                &name.scopes[i].type_args,
+                name.scopes[i + 1..]
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect(),
+            ),
+            None => name.scopes.iter().enumerate().rev().find_map(|(i, s)| {
+                let (c, a, mut n) = typedef_specialization(&s.name.name, elab)?;
+                n.extend(name.scopes[i + 1..].iter().map(|s| s.name.name.as_str()));
+                Some((c, a, n))
+            })?,
         };
     let cls = elab.classes.get(cls_name)?;
-    // Bind the class's value parameters: defaults first, then the
-    // positional `#(...)` args in `param_order` (type and value params
-    // interleaved, §6.20.2).
-    let mut params: HashMap<String, Value> = HashMap::default();
-    for (pn, init) in &cls.param_defaults {
-        if let Some(init) = init {
-            let v = eval_const_expr_val(init, &params);
-            params.insert(pn.clone(), v);
-        }
-    }
+    // Bind the `#(...)` args: positional ones in `param_order` (type and
+    // value params interleaved, §6.20.2), named ones by name (§8.25).
+    let defaults = class_default_values(cls, &HashMap::default());
+    let mut overrides: HashMap<String, Value> = HashMap::default();
     for (i, arg) in type_args.iter().enumerate() {
-        if let Some(pn) = cls.param_order.get(i) {
-            let v = eval_const_expr_val(arg, &params);
-            params.insert(pn.clone(), v);
+        match &arg.kind {
+            ExprKind::NamedArg { name: pn, expr } => {
+                if let Some(e) = expr
+                    && !cls.type_param_names.iter().any(|t| t == &pn.name)
+                {
+                    overrides.insert(pn.name.clone(), eval_const_expr_val(e, &defaults));
+                }
+            }
+            _ => {
+                if let Some(pn) = cls.param_order.get(i)
+                    && !cls.type_param_names.iter().any(|t| t == pn)
+                {
+                    overrides.insert(pn.clone(), eval_const_expr_val(arg, &defaults));
+                }
+            }
         }
     }
-    let target = cls.typedef_targets.get(&name.name.name)?;
     // §8.25: a typedef of one of the class's TYPE parameters
     // (`typedef T elem_t;`) takes the type that argument binds.
-    if let DataType::TypeReference {
-        name: tn,
-        dimensions,
-        type_args: targs,
-        ..
-    } = target
+    if nested.is_empty()
+        && let Some(target) = cls.typedef_targets.get(&name.name.name)
+        && let DataType::TypeReference {
+            name: tn,
+            dimensions,
+            type_args: targs,
+            ..
+        } = target
         && tn.scopes.is_empty()
         && dimensions.is_empty()
         && targs.is_empty()
@@ -5875,6 +5895,7 @@ pub fn specialized_class_scope_width(
             .position(|p| p == &tn.name.name)
             .and_then(|i| type_args.get(i))
     {
+        let params = class_default_values(cls, &overrides);
         let w = match &arg.kind {
             ExprKind::TypeLiteral(dt) => {
                 Some(resolve_type_width(dt, Some(&params), Some(&elab.typedefs)))
@@ -5889,17 +5910,85 @@ pub fn specialized_class_scope_width(
             return Some(w);
         }
     }
+    class_scope_typedef_width(cls_name, &overrides, &nested, &name.name.name, elab)
+}
+
+/// The value parameters and body constants of `cls` in declaration order:
+/// an entry of `bound` as given, any other from its default evaluated
+/// under the ones before it (so a body `localparam N = W * 2` follows a
+/// bound `W`).
+fn class_default_values(
+    cls: &ElaboratedClass,
+    bound: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    let mut params: HashMap<String, Value> = bound.clone();
+    for (pn, init) in &cls.param_defaults {
+        if bound.contains_key(pn) {
+            continue;
+        }
+        if let Some(init) = init {
+            let v = eval_const_expr_val(init, &params);
+            params.insert(pn.clone(), v);
+        }
+    }
+    params
+}
+
+/// §8.23, §8.25.1: the width of typedef `leaf` of class `cls_name` — or of
+/// the class reached from it through the nested-class names `nested`
+/// (`Outer#(6)::Inner::td`) — with the value parameters in `bound` taking
+/// the place of their defaults. A nested class sees its enclosing classes'
+/// parameters. None when a link names no such class or typedef.
+pub fn class_scope_typedef_width(
+    cls_name: &str,
+    bound: &HashMap<String, Value>,
+    nested: &[&str],
+    leaf: &str,
+    elab: &ElaboratedModule,
+) -> Option<u32> {
+    let mut cls = elab.classes.get(cls_name)?;
+    let mut cur = cls_name.to_string();
+    let mut params = class_default_values(cls, bound);
+    for n in nested {
+        // A nested class another class also nests goes by its qualified
+        // spelling; a reference may already carry it.
+        let qualified = format!("{cur}::{n}");
+        let (key, sub) = [qualified.as_str(), n]
+            .into_iter()
+            .find_map(|k| {
+                let c = elab.classes.get(k)?;
+                // `enclosing` is linked late in elaboration; before that a
+                // class of this name with no enclosing class recorded is it.
+                (k.contains("::") || c.enclosing.as_deref().is_none_or(|e| e == cur))
+                    .then_some((k.to_string(), c))
+            })?;
+        params = class_default_values(sub, &params);
+        cls = sub;
+        cur = key;
+    }
+    // A typedef name several classes declare goes by its class-qualified
+    // spelling (`Inner::td`), as a nested class name does.
+    let target = cls.typedef_targets.get(leaf).or_else(|| {
+        let mut qualified = cls
+            .typedef_targets
+            .iter()
+            .filter(|(k, _)| k.rsplit_once("::").is_some_and(|(_, l)| l == leaf));
+        let first = qualified.next()?;
+        qualified.next().is_none().then_some(first.1)
+    })?;
     let w = resolve_type_width(target, Some(&params), Some(&elab.typedefs));
     Some(w.max(1))
 }
 
 /// §6.18/§8.25.1: the class and `#(...)` args a typedef names when it
 /// aliases a class specialization (`typedef holder #(byte, 6) h_t;`),
-/// following plain alias hops; None for any other typedef.
+/// following plain alias hops, and the classes nested in that
+/// specialization the alias goes on to name (`typedef box #(6)::pay
+/// p_t;`, §8.23); None for any other typedef.
 fn typedef_specialization<'a>(
     name: &str,
     elab: &'a ElaboratedModule,
-) -> Option<(&'a str, &'a [Expression])> {
+) -> Option<(&'a str, &'a [Expression], Vec<&'a str>)> {
     let mut cur = elab.typedef_types.get(name)?;
     for _ in 0..16 {
         let DataType::TypeReference {
@@ -5911,14 +6000,31 @@ fn typedef_specialization<'a>(
         else {
             return None;
         };
-        if !dimensions.is_empty() || !tn.scopes.is_empty() {
+        if !dimensions.is_empty() {
             return None;
+        }
+        if !tn.scopes.is_empty() {
+            // `C#(args)::Inner`: the link with the args names the class.
+            if !type_args.is_empty() {
+                return None;
+            }
+            let i = tn.scopes.iter().rposition(|s| !s.type_args.is_empty())?;
+            let link = &tn.scopes[i];
+            if !elab.classes.contains_key(&link.name.name) {
+                return None;
+            }
+            let mut nested: Vec<&str> = tn.scopes[i + 1..]
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect();
+            nested.push(tn.name.name.as_str());
+            return Some((link.name.name.as_str(), link.type_args.as_slice(), nested));
         }
         if !type_args.is_empty() {
             return elab
                 .classes
                 .contains_key(&tn.name.name)
-                .then_some((tn.name.name.as_str(), type_args.as_slice()));
+                .then_some((tn.name.name.as_str(), type_args.as_slice(), Vec::new()));
         }
         cur = elab.typedef_types.get(&tn.name.name)?;
     }
