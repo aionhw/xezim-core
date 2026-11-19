@@ -126,6 +126,8 @@ pub struct StdTypes {
 pub struct Design {
     /// The revision of the language the design is analysed as.
     pub revision: super::VhdlStd,
+    /// A resolved signal attribute observes the time of its last event.
+    pub(super) uses_last_event: bool,
     pub files: Vec<SourceFile>,
     asts: Vec<Option<ast::DesignFile>>,
     pub types: Vec<TypeInfo>,
@@ -281,6 +283,7 @@ impl Design {
     fn new() -> Self {
         Design {
             revision: super::VhdlStd::V2008,
+            uses_last_event: false,
             files: Vec::new(),
             asts: Vec::new(),
             types: Vec::new(),

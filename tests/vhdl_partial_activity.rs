@@ -78,7 +78,7 @@ fn whole_signal_activity_timestamp_exists_only_for_observed_signals() {
     )
     .unwrap();
     assert!(sv.contains("longint vh_s0_lact;"));
-    let init = sv.find("vh_s0_lact = vh_s0_lev;").unwrap();
+    let init = sv.find("vh_s0_lact = -64'sd9223372036854775807;").unwrap();
     let read = sv.find("vh_now - vh_s0_lact").unwrap();
     assert!(init < read);
     assert!(!sv.contains("vh_s1_lact"));

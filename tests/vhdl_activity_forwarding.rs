@@ -17,6 +17,7 @@ fn value_only_dynamic_signal_actual_needs_no_activity() {
         "process variable i : integer := 0; begin assert f(q(i)) = '0'; wait; end process;",
     )
     .unwrap();
+    assert!(!sv.contains("_lev"));
     assert!(!sv.contains("bit vh_pa"));
 }
 
@@ -95,4 +96,15 @@ fn large_static_subset_is_not_mistaken_for_whole_activity() {
             .iter()
             .any(|e| e.contains("requires static scalar selections"))
     );
+}
+
+#[test]
+fn event_time_observed_through_a_signal_formal_is_forwarded() {
+    let sv = lower(
+        "function age(signal x : bit) return time is begin return x'last_event; end;",
+        "process begin q(0) <= '1'; wait for 1 ns; assert age(q(0)) = 1 ns; wait; end process;",
+    )
+    .unwrap();
+    assert!(sv.contains("vh_s0_lev ="));
+    assert!(sv.contains("64'sd9223372036854775807 : (vh_now - "));
 }

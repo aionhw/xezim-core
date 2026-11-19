@@ -2520,6 +2520,10 @@ impl<'a> Lw<'a> {
                         self.sig_attr(x, name)
                     }
                 {
+                    // §16.2.4: before the first event the result stays TIME'HIGH.
+                    if name == "last_event" {
+                        return format!("(({v} < 0) ? 64'sd9223372036854775807 : (vh_now - {v}))");
+                    }
                     return v;
                 }
                 if elab::is_implicit(name) && self.d.is_signal_expr(x) {

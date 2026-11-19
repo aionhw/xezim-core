@@ -1057,7 +1057,8 @@ impl<'a> Lw<'a> {
         if l.inn {
             let eq = self.eq_expr(&r, "nv", &format!("vh_s{}", s));
             format!(
-                "  function automatic void vh_lnk{n}(bit init);\n    {t} nv;\n{temps}    nv = vh_s{s};\n{pre}{assign}    if (init) begin vh_s{s} = nv; vh_s{s}_last = nv; end\n    else begin\n      vh_s{s}_act = 1;\n      if (!{eq}) begin if (!vh_s{s}_ev) vh_s{s}_last = vh_s{s}; vh_s{s} = nv; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end\n    end\n  endfunction\n",
+                "  function automatic void vh_lnk{n}(bit init);\n    {t} nv;\n{temps}    nv = vh_s{s};\n{pre}{assign}    if (init) begin vh_s{s} = nv; vh_s{s}_last = nv; end\n    else begin\n      vh_s{s}_act = 1;\n      if (!{eq}) begin if (!vh_s{s}_ev) vh_s{s}_last = vh_s{s}; vh_s{s} = nv; vh_s{s}_ev = 1;{event_time} end\n    end\n  endfunction\n",
+                event_time = self.write_event_time(s, "$time"),
                 n = n,
                 t = t,
                 temps = temps,
@@ -1290,6 +1291,8 @@ impl<'a> Lw<'a> {
         }
     }
 
+    /// For `last_event` return the stored timestamp so calls can forward it
+    /// through signal formals. The attribute expression computes the elapsed time.
     pub(super) fn sig_attr(&mut self, x: &HExpr, name: &str) -> Option<String> {
         // An implicit signal.
         if let HExprKind::Attr(an, p, prm) = &x.kind
@@ -1317,7 +1320,7 @@ impl<'a> Lw<'a> {
                     );
                     "0".into()
                 }
-                _ => format!("(vh_now - {}_lev)", p),
+                _ => format!("{}_lev", p),
             });
         }
         if let HExprKind::Index(b, _) | HExprKind::Slice(b, _) | HExprKind::Field(b, _) = &x.kind
@@ -1345,7 +1348,7 @@ impl<'a> Lw<'a> {
                     );
                     "0".into()
                 }
-                _ => format!("(vh_now - {}_lev)", p),
+                _ => format!("{}_lev", p),
             });
         }
         let s = self.sig_of(x)?;
@@ -1477,6 +1480,16 @@ impl<'a> Lw<'a> {
         out
     }
 
+    // Event flags are needed for scheduling even when no VHDL expression
+    // observes the timestamp. Keep writes at their original update sites.
+    fn write_event_time(&self, sig: usize, time: &str) -> String {
+        if self.d.uses_last_event {
+            format!(" vh_s{sig}_lev = {time};")
+        } else {
+            String::new()
+        }
+    }
+
     /// A signal attribute of a whole signal.
     fn whole_attr(&mut self, s: usize, name: &str) -> String {
         match name {
@@ -1487,7 +1500,7 @@ impl<'a> Lw<'a> {
                 self.need_lact.insert(s);
                 format!("(vh_now - vh_s{}_lact)", s)
             }
-            _ => format!("(vh_now - vh_s{}_lev)", s),
+            _ => format!("vh_s{}_lev", s),
         }
     }
 
@@ -2319,9 +2332,10 @@ impl<'a> Lw<'a> {
             elab.push_str(&flushed);
             let _ = writeln!(
                 elab,
-                "    vh_s{s} = {v};\n    vh_s{s}_last = vh_s{s}; vh_s{s}_lev = -64'sd9223372036854775807;",
+                "    vh_s{s} = {v};\n    vh_s{s}_last = vh_s{s};{event_time}",
                 s = si,
-                v = v
+                v = v,
+                event_time = self.write_event_time(si, "-64'sd9223372036854775807")
             );
             activity_init_offsets.push(elab.len());
         }
@@ -2333,9 +2347,11 @@ impl<'a> Lw<'a> {
             for s in first + 1..end {
                 let _ = write!(decls, ", vh_s{s}_ev, vh_s{s}_act");
             }
-            let _ = write!(decls, ";\n  longint vh_s{first}_lev");
-            for s in first + 1..end {
-                let _ = write!(decls, ", vh_s{s}_lev");
+            if self.d.uses_last_event {
+                let _ = write!(decls, ";\n  longint vh_s{first}_lev");
+                for s in first + 1..end {
+                    let _ = write!(decls, ", vh_s{s}_lev");
+                }
             }
             decls.push_str(";\n");
         }
@@ -2653,7 +2669,7 @@ impl<'a> Lw<'a> {
         for &sig in self.need_lact.range(..activity_init_offsets.len()) {
             let end = activity_init_offsets[sig];
             m.push_str(&elab[start..end]);
-            let _ = writeln!(m, "    vh_s{sig}_lact = vh_s{sig}_lev;");
+            let _ = writeln!(m, "    vh_s{sig}_lact = -64'sd9223372036854775807;");
             start = end;
         }
         m.push_str(&elab[start..]);
@@ -2732,12 +2748,13 @@ impl<'a> Lw<'a> {
         self.cur_proc = saved_proc;
         let t = self.repr(e.ty, &e.loc).sv();
         format!(
-            "  function automatic void vh_imp{n}(bit init);\n    {t} nv;\n{temps}{pre}    nv = {v};\n    if (init) begin vh_s{r} = nv; vh_s{r}_last = nv; end\n    else if (nv != vh_s{r}) begin vh_s{r}_last = vh_s{r}; vh_s{r} = nv; vh_s{r}_ev = 1; vh_s{r}_act = 1; vh_s{r}_lev = $time; end\n  endfunction\n",
+            "  function automatic void vh_imp{n}(bit init);\n    {t} nv;\n{temps}{pre}    nv = {v};\n    if (init) begin vh_s{r} = nv; vh_s{r}_last = nv; end\n    else if (nv != vh_s{r}) begin vh_s{r}_last = vh_s{r}; vh_s{r} = nv; vh_s{r}_ev = 1; vh_s{r}_act = 1;{event_time} end\n  endfunction\n",
             n = n,
             t = t,
             temps = temps,
             pre = pre,
             v = v,
+            event_time = self.write_event_time(r, "$time"),
             r = r
         )
     }
@@ -2756,17 +2773,22 @@ impl<'a> Lw<'a> {
         let t = rp.sv();
         let _ = writeln!(
             decls,
-            "  {t} vh_s{r};\n  bit vh_s{r}_ev, vh_s{r}_act; {t} vh_s{r}_last; longint vh_s{r}_lev, vh_s{r}_lact;",
+            "  {t} vh_s{r};\n  bit vh_s{r}_ev, vh_s{r}_act; {t} vh_s{r}_last; longint vh_s{r}_lact;",
             t = t,
             r = r
         );
+        if self.d.uses_last_event {
+            let _ = writeln!(decls, "  longint vh_s{r}_lev;");
+        }
         let init_common = format!(
-            "vh_s{r}_last = vh_s{r}; vh_s{r}_lev = -64'sd9223372036854775807; vh_s{r}_lact = vh_s{r}_lev;",
+            "vh_s{r}_last = vh_s{r}; vh_s{r}_lact = -64'sd9223372036854775807;{event_time}",
+            event_time = self.write_event_time(r, "-64'sd9223372036854775807"),
             r = r
         );
         let ev = format!(
-            "    if (!{}) begin vh_s{r}_last = o; vh_s{r}_ev = 1; vh_s{r}_lev = $time; end\n",
+            "    if (!{}) begin vh_s{r}_last = o; vh_s{r}_ev = 1;{event_time} end\n",
             self.eq_expr(&rp, &format!("vh_s{}", r), "o"),
+            event_time = self.write_event_time(r, "$time"),
             r = r
         );
         match im.kind {
@@ -2803,8 +2825,9 @@ impl<'a> Lw<'a> {
                 )
             }
             ImpKind::Transaction => format!(
-                "  function automatic void vh_imp{n}(bit init);\n    if (init) begin vh_s{r} = 1; {ic} return; end\n    if ({trig}) begin vh_s{r}_last = vh_s{r}; vh_s{r} = 1 - vh_s{r}; vh_s{r}_ev = 1; vh_s{r}_act = 1; vh_s{r}_lev = $time; end\n  endfunction\n",
+                "  function automatic void vh_imp{n}(bit init);\n    if (init) begin vh_s{r} = 1; {ic} return; end\n    if ({trig}) begin vh_s{r}_last = vh_s{r}; vh_s{r} = 1 - vh_s{r}; vh_s{r}_ev = 1; vh_s{r}_act = 1;{event_time} end\n  endfunction\n",
                 n = n,
+                event_time = self.write_event_time(r, "$time"),
                 r = r,
                 ic = init_common,
                 trig = im.trig
@@ -3146,7 +3169,8 @@ impl<'a> Lw<'a> {
             let eq = self.eq_expr(&r, "nv", &format!("vh_s{}", s));
             let _ = write!(
                 out,
-                "  function automatic void vh_upd{s}(bit init);\n{body}    if (init) begin vh_s{s} = nv; vh_s{s}_last = nv; end\n    else if (!{eq}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = nv; vh_s{s}_ev = 1; vh_s{s}_lev = $time; end\n  endfunction\n",
+                "  function automatic void vh_upd{s}(bit init);\n{body}    if (init) begin vh_s{s} = nv; vh_s{s}_last = nv; end\n    else if (!{eq}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = nv; vh_s{s}_ev = 1;{event_time} end\n  endfunction\n",
+                event_time = self.write_event_time(s, "$time"),
                 s = s,
                 body = body,
                 eq = eq
@@ -3351,7 +3375,8 @@ impl<'a> Lw<'a> {
                 let r = self.repr(sig.ty, &loc);
                 let eq = self.eq_expr(&r, &format!("vh_s{}_fnv", s), &format!("vh_s{}", s));
                 let set = format!(
-                    "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1; vh_s{s}_lev = vh_now;",
+                    "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_s{s}_fnv; vh_s{s}_ev = 1;{event_time}",
+                    event_time = self.write_event_time(s, "vh_now"),
                     s = s
                 );
                 let set = if self.sig_scalar(s) {
@@ -3400,7 +3425,8 @@ impl<'a> Lw<'a> {
                 )
             );
             let set = format!(
-                "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1; vh_s{s}_lev = vh_now;",
+                "vh_s{s}_last = vh_s{s}; vh_s{s} = vh_dv{s}_{p}; vh_s{s}_ev = 1;{event_time}",
+                event_time = self.write_event_time(s, "vh_now"),
                 s = s,
                 p = ds[0].0
             );
@@ -3809,13 +3835,18 @@ impl<'a> Lw<'a> {
         let r = self.obj_repr(p, loc);
         let name = self.obj_name(p);
         match o.kind {
-            ObjKind::Param(ObjClass::Signal, Mode::In) => vec![
-                format!("input {} {}", r.sv(), name),
-                format!("input bit {}_ev", name),
-                format!("input bit {}_act", name),
-                format!("input {} {}_last", r.sv(), name),
-                format!("input longint {}_lev", name),
-            ],
+            ObjKind::Param(ObjClass::Signal, Mode::In) => {
+                let mut params = vec![
+                    format!("input {} {}", r.sv(), name),
+                    format!("input bit {}_ev", name),
+                    format!("input bit {}_act", name),
+                    format!("input {} {}_last", r.sv(), name),
+                ];
+                if self.d.uses_last_event {
+                    params.push(format!("input longint {}_lev", name));
+                }
+                params
+            }
             ObjKind::Param(ObjClass::Signal, _) => {
                 self.err(
                     loc,
@@ -3875,15 +3906,15 @@ impl<'a> Lw<'a> {
         let mut out = vec![v];
         let bsv = self.shape(a).map(|b| self.bounds_sv(b));
         for n in ["event", "active", "last_value", "last_event"] {
+            if n == "last_event" && !self.d.uses_last_event {
+                continue;
+            }
             if n == "active" && !self.needs_signal_activity(p) {
                 out.push("0".into());
                 continue;
             }
             match self.sig_attr(a, n) {
-                Some(x) => out.push(if n == "last_event" {
-                    // The parameter carries the time of the last event.
-                    format!("(vh_now - {})", x)
-                } else if n == "last_value" {
+                Some(x) => out.push(if n == "last_value" {
                     self.coerce(x, &ar, &pr, bsv.clone(), &a.loc)
                 } else {
                     x

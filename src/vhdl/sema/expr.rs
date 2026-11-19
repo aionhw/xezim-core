@@ -2043,7 +2043,11 @@ impl Design {
                 Some(mk(self, boolean, pe, px))
             }
             "last_value" | "driving_value" if is_signal => Some(mk(self, pt, None, px)),
-            "last_event" | "last_active" if is_signal => Some(mk(self, time, None, px)),
+            "last_event" if is_signal => {
+                self.uses_last_event = true;
+                Some(mk(self, time, None, px))
+            }
+            "last_active" if is_signal => Some(mk(self, time, None, px)),
             "delayed" if is_signal => {
                 let pe = match param {
                     Some(e) => Some(self.expr(r, e, Some(time))?),
