@@ -4345,6 +4345,13 @@ pub struct ElaboratedModule {
     /// §16.6: formal port NAMES of each named property/sequence, keyed like
     /// `property_decls`. Empty vec for portless declarations.
     pub property_params: HashMap<String, Vec<String>>,
+    /// §16.8, §16.12: the default actual argument of each formal, keyed like
+    /// `property_decls` and parallel to `property_params`; absent when no
+    /// formal of the declaration has one. A declaration of an inlined
+    /// instance has its defaults rewritten into the instance's scope, as its
+    /// body is.
+    #[serde(default)]
+    pub property_param_defaults: HashMap<String, Vec<Option<crate::ast::expr::Expression>>>,
     /// LRM §8.4: for an array-of-class-handles (`T arr[N]`,
     /// `T arr[];`), record the element's class name so runtime
     /// `arr[i] = new(...)` can construct an instance of that class.
@@ -4875,6 +4882,7 @@ impl ElaboratedModule {
             checker_decls: HashMap::default(),
             property_decls: HashMap::default(),
             property_params: HashMap::default(),
+            property_param_defaults: HashMap::default(),
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
             coll_shapes: HashMap::default(),
@@ -6352,9 +6360,13 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
     // `pkg_scope` gives a reference when two packages declare the name.
     for p in &pkgs {
         for item in &p.items {
-            let (name, body, ports) = match item {
-                crate::ast::decl::PackageItem::Property(pd) => (&pd.name.name, &pd.body, &pd.ports),
-                crate::ast::decl::PackageItem::Sequence(sd) => (&sd.name.name, &sd.body, &sd.ports),
+            let (name, body, ports, defaults) = match item {
+                crate::ast::decl::PackageItem::Property(pd) => {
+                    (&pd.name.name, &pd.body, &pd.ports, &pd.port_defaults)
+                }
+                crate::ast::decl::PackageItem::Sequence(sd) => {
+                    (&sd.name.name, &sd.body, &sd.ports, &sd.port_defaults)
+                }
                 _ => continue,
             };
             let qualified = format!("{}::{}", p.name.name, name);
@@ -6369,6 +6381,13 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     .entry(name.clone())
                     .or_insert_with(|| params.clone());
                 elab.property_decls.insert(qualified.clone(), body.clone());
+                if defaults.iter().any(|d| d.is_some()) {
+                    elab.property_param_defaults
+                        .entry(name.clone())
+                        .or_insert_with(|| defaults.clone());
+                    elab.property_param_defaults
+                        .insert(qualified.clone(), defaults.clone());
+                }
                 elab.property_params.insert(qualified, params);
             }
         }
@@ -14839,6 +14858,7 @@ pub fn elaborate_module_with_defs(
                         sd.name.name.clone(),
                         sd.ports.iter().map(|p| p.name.clone()).collect(),
                     );
+                    register_sva_port_defaults(&mut elab, &sd.name.name, &sd.port_defaults);
                 }
             }
             ModuleItem::PropertyDeclaration(pd) => {
@@ -14850,6 +14870,7 @@ pub fn elaborate_module_with_defs(
                         pd.name.name.clone(),
                         pd.ports.iter().map(|p| p.name.clone()).collect(),
                     );
+                    register_sva_port_defaults(&mut elab, &pd.name.name, &pd.port_defaults);
                 }
             }
             // LRM §17.2 — register the checker name and store its
@@ -20843,6 +20864,7 @@ fn elaborate_items(
                         sd.name.name.clone(),
                         sd.ports.iter().map(|p| p.name.clone()).collect(),
                     );
+                    register_sva_port_defaults(elab, &sd.name.name, &sd.port_defaults);
                 }
             }
             ModuleItem::PropertyDeclaration(pd) => {
@@ -20854,6 +20876,7 @@ fn elaborate_items(
                         pd.name.name.clone(),
                         pd.ports.iter().map(|p| p.name.clone()).collect(),
                     );
+                    register_sva_port_defaults(elab, &pd.name.name, &pd.port_defaults);
                 }
             }
             // LRM §17 — register the checker name AND inline its body
@@ -33797,6 +33820,22 @@ fn with_enclosing_params(
     params.append(&mut out.params);
     out.params = params;
     out
+}
+
+/// §16.8, §16.12: record the default actual arguments of the named sequence
+/// or property registered as `key`. A redeclaration without any drops the
+/// ones an earlier declaration of the name left.
+fn register_sva_port_defaults(
+    elab: &mut ElaboratedModule,
+    key: &str,
+    defaults: &[Option<Expression>],
+) {
+    if defaults.iter().any(|d| d.is_some()) {
+        elab.property_param_defaults
+            .insert(key.to_string(), defaults.to_vec());
+    } else {
+        elab.property_param_defaults.remove(key);
+    }
 }
 
 /// Visit every expression reachable from a statement, in evaluation-agnostic
@@ -48167,14 +48206,14 @@ fn inline_module_items(
                     // locals and stay bare for the call-site substitution).
                     let named_sva = match sub_item {
                         ModuleItem::PropertyDeclaration(pd) => {
-                            Some((&pd.name.name, &pd.ports, &pd.body))
+                            Some((&pd.name.name, &pd.ports, &pd.body, &pd.port_defaults))
                         }
                         ModuleItem::SequenceDeclaration(sd) => {
-                            Some((&sd.name.name, &sd.ports, &sd.body))
+                            Some((&sd.name.name, &sd.ports, &sd.body, &sd.port_defaults))
                         }
                         _ => None,
                     };
-                    if let Some((name, ports, body)) = named_sva {
+                    if let Some((name, ports, body, defaults)) = named_sva {
                         let key = cat2(&inst_prefix, &name);
                         elab.sequences.insert(key.clone());
                         if let Some(body) = body {
@@ -48192,6 +48231,25 @@ fn inline_module_items(
                                 &sub_interface_map,
                             );
                             elab.property_decls.insert(key.clone(), body);
+                            // §16.8: a default actual argument is resolved in
+                            // the scope of the declaration, as the body is.
+                            if defaults.iter().any(|d| d.is_some()) {
+                                let defaults = defaults
+                                    .iter()
+                                    .map(|d| {
+                                        d.as_ref().map(|d| {
+                                            rewrite_expr(
+                                                d,
+                                                &inst_prefix,
+                                                &sva_ports,
+                                                &sva_locals,
+                                                &sub_interface_map,
+                                            )
+                                        })
+                                    })
+                                    .collect();
+                                elab.property_param_defaults.insert(key.clone(), defaults);
+                            }
                             elab.property_params
                                 .insert(key, ports.iter().map(|p| p.name.clone()).collect());
                         }
@@ -59760,10 +59818,18 @@ fn process_import(
                         // property; the import binds the bare name to this
                         // package's declaration.
                         PackageItem::Property(PropertyDeclaration {
-                            name, ports, body, ..
+                            name,
+                            ports,
+                            port_defaults,
+                            body,
+                            ..
                         })
                         | PackageItem::Sequence(SequenceDeclaration {
-                            name, ports, body, ..
+                            name,
+                            ports,
+                            port_defaults,
+                            body,
+                            ..
                         }) if &name.name == sym_name => {
                             elab.sequences.insert(name.name.clone());
                             if let Some(body) = body {
@@ -59772,6 +59838,7 @@ fn process_import(
                                     name.name.clone(),
                                     ports.iter().map(|p| p.name.clone()).collect(),
                                 );
+                                register_sva_port_defaults(elab, &name.name, port_defaults);
                             }
                             found = true;
                         }

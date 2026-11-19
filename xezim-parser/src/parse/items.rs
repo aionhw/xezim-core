@@ -1014,11 +1014,24 @@ impl Parser {
     /// segment may carry `local`/direction keywords, a type, and a default
     /// (`= expr`); the port name is the last identifier before the default
     /// (or before the segment end). Called with the cursor ON the `(`.
-    /// The formal port names of a property or sequence declaration, and its
-    /// §16.8.2 `local [input]` formals with their types.
-    fn parse_sva_port_names(&mut self) -> (Vec<Identifier>, Vec<(Identifier, DataType)>) {
+    /// The formal port names of a property or sequence declaration, its
+    /// §16.8.2 `local [input]` formals with their types, and the §16.8
+    /// default actual argument of each formal (parallel to the names).
+    #[allow(clippy::type_complexity)]
+    fn parse_sva_port_names(
+        &mut self,
+    ) -> (
+        Vec<Identifier>,
+        Vec<(Identifier, DataType)>,
+        Vec<Option<Expression>>,
+    ) {
         let mut ports: Vec<Identifier> = Vec::new();
         let mut local_ports: Vec<(Identifier, DataType)> = Vec::new();
+        let mut defaults: Vec<Option<Expression>> = Vec::new();
+        // The default of the formal being read.
+        let mut default: Option<Expression> = None;
+        // Whether the formal being read is declared with a type.
+        let mut typed = false;
         self.bump(); // (
         let mut depth: i32 = 1;
         let mut last_ident: Option<Identifier> = None;
@@ -1028,13 +1041,17 @@ impl Parser {
         let mut local_type: Option<DataType> = None;
         let finish = |last: &mut Option<Identifier>,
                       local: &mut Option<DataType>,
+                      default: &mut Option<Expression>,
                       ports: &mut Vec<Identifier>,
-                      local_ports: &mut Vec<(Identifier, DataType)>| {
+                      local_ports: &mut Vec<(Identifier, DataType)>,
+                      defaults: &mut Vec<Option<Expression>>| {
+            let default = default.take();
             if let Some(id) = last.take() {
                 if let Some(dt) = local.take() {
                     local_ports.push((id.clone(), dt));
                 }
                 ports.push(id);
+                defaults.push(default);
             }
             *local = None;
         };
@@ -1071,11 +1088,13 @@ impl Parser {
                 };
                 // `local output` / `local inout` formals stay plain
                 // substitutions (not modelled as locals).
+                typed = !matches!(dt, DataType::Implicit { .. });
                 local_type = input.then_some(dt);
             }
             port_start = false;
             match self.current_kind() {
                 TokenKind::LParen | TokenKind::LBracket => {
+                    typed |= !in_default;
                     depth += 1;
                     self.bump();
                 }
@@ -1085,8 +1104,10 @@ impl Parser {
                         finish(
                             &mut last_ident,
                             &mut local_type,
+                            &mut default,
                             &mut ports,
                             &mut local_ports,
+                            &mut defaults,
                         );
                     }
                     self.bump();
@@ -1095,10 +1116,13 @@ impl Parser {
                     finish(
                         &mut last_ident,
                         &mut local_type,
+                        &mut default,
                         &mut ports,
                         &mut local_ports,
+                        &mut defaults,
                     );
                     in_default = false;
+                    typed = false;
                     port_start = true;
                     self.bump();
                 }
@@ -1107,20 +1131,99 @@ impl Parser {
                     // idents inside the default must not overwrite it.
                     in_default = true;
                     self.bump();
+                    // §16.8: keep the default actual argument when it parses
+                    // as one expression up to the end of the formal; any
+                    // other shape (an edge event) is skipped token by token
+                    // below, as before.
+                    let save_pos = self.pos;
+                    let save_diag = self.diagnostics.len();
+                    let save_seq = self.in_sva_seq;
+                    self.in_sva_seq = true;
+                    let e = self.parse_expression();
+                    self.in_sva_seq = save_seq;
+                    if self.diagnostics.len() == save_diag
+                        && matches!(self.current_kind(), TokenKind::Comma | TokenKind::RParen)
+                    {
+                        default = Some(if typed {
+                            e
+                        } else {
+                            Self::sva_self_determined(e)
+                        });
+                    } else {
+                        self.diagnostics.truncate(save_diag);
+                        self.pos = save_pos;
+                    }
                 }
                 TokenKind::Identifier | TokenKind::EscapedIdentifier => {
                     if !in_default {
+                        // `my_t x`: a name after a name is typed by the first.
+                        typed |= last_ident.is_some();
                         last_ident = Some(self.parse_identifier());
                     } else {
                         self.bump();
                     }
                 }
-                _ => {
+                kind => {
+                    typed |= !in_default && kind != TokenKind::KwUntyped;
                     self.bump();
                 }
             }
         }
-        (ports, local_ports)
+        (ports, local_ports, defaults)
+    }
+
+    /// §16.8: the actual argument of an untyped formal is cast to its
+    /// self-determined type before it is substituted, so an operator
+    /// expression does not take the width of the place the formal is used
+    /// in (`x == 8'hff` with `~v` for `x`). A size cast to the operand's own
+    /// width evaluates it that way and keeps its signedness (§6.24.1).
+    /// Operands that are sized by themselves, and sequence or property
+    /// expressions, are left as written.
+    fn sva_self_determined(e: Expression) -> Expression {
+        use crate::ast::expr::NumberLiteral;
+        let context_sized = match &e.kind {
+            ExprKind::Unary { op, .. } => {
+                matches!(op, UnaryOp::BitNot | UnaryOp::Minus | UnaryOp::Plus)
+            }
+            ExprKind::Binary { op, .. } => matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::Power
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::BitXnor
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+                    | BinaryOp::ArithShiftLeft
+                    | BinaryOp::ArithShiftRight
+            ),
+            ExprKind::Conditional { .. } => true,
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => true,
+            _ => false,
+        };
+        if !context_sized {
+            return e;
+        }
+        let span = e.span;
+        let bits = Expression::new(
+            ExprKind::SystemCall {
+                name: "$bits".to_string(),
+                args: vec![e.clone()],
+            },
+            span,
+        );
+        Expression::new(
+            ExprKind::SystemCall {
+                name: "$__xz_size_cast".to_string(),
+                args: vec![bits, e],
+            },
+            span,
+        )
     }
 
     /// Whether the bracket groups starting `n` tokens ahead are followed by
@@ -2847,10 +2950,10 @@ impl Parser {
                 let start = self.current().span.start;
                 self.bump();
                 let name = self.parse_identifier();
-                let (ports, local_ports) = if self.at(TokenKind::LParen) {
+                let (ports, local_ports, port_defaults) = if self.at(TokenKind::LParen) {
                     self.parse_sva_port_names()
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new())
                 };
                 self.expect(TokenKind::Semicolon);
                 // §16.10: assertion-local variable declarations.
@@ -2940,6 +3043,7 @@ impl Parser {
                 Some(ModuleItem::PropertyDeclaration(PropertyDeclaration {
                     name,
                     ports,
+                    port_defaults,
                     items,
                     body: body_expr,
                     endlabel,
@@ -2951,10 +3055,10 @@ impl Parser {
                 let start = self.current().span.start;
                 self.bump();
                 let name = self.parse_identifier();
-                let (ports, local_ports) = if self.at(TokenKind::LParen) {
+                let (ports, local_ports, port_defaults) = if self.at(TokenKind::LParen) {
                     self.parse_sva_port_names()
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new())
                 };
                 self.expect(TokenKind::Semicolon);
                 // §16.10: assertion-local variable declarations.
@@ -3016,6 +3120,7 @@ impl Parser {
                 Some(ModuleItem::SequenceDeclaration(SequenceDeclaration {
                     name,
                     ports,
+                    port_defaults,
                     items,
                     body: body_expr,
                     endlabel,
