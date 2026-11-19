@@ -6,7 +6,8 @@ use crate::ast::decl::*;
 use crate::ast::expr::*;
 use crate::ast::module::*;
 use crate::ast::types::*;
-use crate::lexer::token::TokenKind;
+use crate::lexer::stream::TokenStream;
+use crate::lexer::token::{Token, TokenKind};
 
 /// Which constraint production the caller is inside, which is what decides
 /// whether a leading `{` can open a nested block at all (IEEE 1800-2023
@@ -28,7 +29,7 @@ pub(crate) enum ConstraintPos {
     ConstraintSet,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// The `edge_identifier` that may open a §14.3 `clocking_skew`.
     fn parse_clocking_skew_edge(&mut self) -> Option<crate::ast::stmt::Edge> {
         let edge = match self.current_kind() {
@@ -48,12 +49,12 @@ impl Parser {
     /// and the rest of the `default` item (`output #2`) was skipped.
     fn parse_clocking_skew_value(&mut self) -> Option<crate::ast::expr::Expression> {
         if self.at(TokenKind::IntegerLiteral)
-            && self.current().text == "1"
+            && self.current_text() == "1"
             && self.peek_kind() == TokenKind::Identifier
         {
-            let one = self.current().span;
-            let step = self.tokens[self.pos + 1].span;
-            if self.tokens[self.pos + 1].text == "step" && step.start == one.end {
+            let one = self.current_span();
+            let step = self.tokens.span_at(self.pos + 1);
+            if self.tokens.text_at(self.pos + 1) == "step" && step.start == one.end {
                 self.bump();
                 self.bump();
                 let sp = crate::ast::Span {
@@ -134,7 +135,7 @@ impl Parser {
                     self.peek_kind(),
                     TokenKind::Semicolon | TokenKind::Assign | TokenKind::Comma
                 );
-            let tstart = self.current().span.start;
+            let tstart = self.current_span().start;
             let data_type = if implicit {
                 DataType::Implicit {
                     signing: None,
@@ -867,7 +868,7 @@ impl Parser {
     }
 
     pub(super) fn parse_module_declaration(&mut self) -> ModuleDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let outer_loops = std::mem::take(&mut self.plain_loop_vars);
         let kind = if self.eat(TokenKind::KwMacromodule).is_some() {
             ModuleKind::Macromodule
@@ -916,7 +917,7 @@ impl Parser {
     }
 
     pub(super) fn parse_interface_declaration(&mut self) -> InterfaceDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let outer_loops = std::mem::take(&mut self.plain_loop_vars);
         self.expect(TokenKind::KwInterface);
         let lifetime = self.parse_optional_lifetime();
@@ -958,7 +959,7 @@ impl Parser {
     }
 
     pub(super) fn parse_program_declaration(&mut self) -> ProgramDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let outer_loops = std::mem::take(&mut self.plain_loop_vars);
         self.expect(TokenKind::KwProgram);
         let lifetime = self.parse_optional_lifetime();
@@ -1052,7 +1053,7 @@ impl Parser {
                     }
                     _ => true,
                 };
-                let tstart = self.current().span.start;
+                let tstart = self.current_span().start;
                 let named_now = matches!(
                     self.current_kind(),
                     TokenKind::Identifier | TokenKind::EscapedIdentifier
@@ -1155,7 +1156,7 @@ impl Parser {
     /// body of the `extern constraint name;` its class `C` of the same package
     /// declares; the body is put on that prototype (#654).
     fn parse_package_ooc_constraint(&mut self, items: &mut [PackageItem]) {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwConstraint);
         let hid = self.parse_hierarchical_identifier();
         let mut body = Vec::new();
@@ -1205,7 +1206,7 @@ impl Parser {
     }
 
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwPackage);
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
@@ -1216,6 +1217,7 @@ impl Parser {
         while !self.at(TokenKind::KwEndpackage) && !self.at(TokenKind::Eof) {
             if self.at(TokenKind::KwConstraint) {
                 self.parse_package_ooc_constraint(&mut items);
+                self.release_consumed_tokens();
                 continue;
             }
             if let Some(item) = self.parse_package_item() {
@@ -1223,6 +1225,7 @@ impl Parser {
             } else {
                 self.bump();
             }
+            self.release_consumed_tokens();
         }
         self.pop_let_scope();
         if lifetime == Some(Lifetime::Automatic) {
@@ -1397,7 +1400,7 @@ impl Parser {
                 // this slot is dropped, matching the LRM's "connection to a
                 // null port is ignored".
                 if self.at(TokenKind::Comma) {
-                    let sp = self.current().span;
+                    let sp = self.current_span();
                     names.push(null_port(&names, sp));
                     self.bump(); // consume the comma standing in for the port
                     if self.at(TokenKind::RParen) {
@@ -1438,7 +1441,7 @@ impl Parser {
                 }
                 // A trailing `, )` leaves one more null port.
                 if self.at(TokenKind::RParen) {
-                    let sp = self.current().span;
+                    let sp = self.current_span();
                     names.push(null_port(&names, sp));
                 }
             }
@@ -1778,7 +1781,7 @@ impl Parser {
     }
 
     fn parse_ansi_port(&mut self) -> AnsiPort {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let direction = self.parse_optional_direction();
         let net_type = self.parse_optional_net_type();
         let var_kw = self.eat(TokenKind::KwVar).is_some();
@@ -1943,8 +1946,9 @@ impl Parser {
                 // without bump). A None that DID advance is a deliberate
                 // parse-accept/skip (specparam, interconnect, …) and is not
                 // flagged, since pos moved on.
-                self.error(format!("unexpected: {:?}", self.current().text));
+                self.error(format!("unexpected: {:?}", self.current_text()));
                 self.bump();
+                self.release_consumed_tokens();
                 continue;
             }
             if let Some(item) = item {
@@ -1952,12 +1956,13 @@ impl Parser {
                 items.push(item);
                 items.append(&mut self.pending_module_items);
             }
+            self.release_consumed_tokens();
         }
         items
     }
 
     pub(super) fn parse_module_item(&mut self) -> Option<ModuleItem> {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut is_extern = false;
         let mut is_virtual = false;
         let mut _is_static = false;
@@ -2290,7 +2295,7 @@ impl Parser {
                     while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                         let t = self.bump();
                         if t.kind != TokenKind::Comma {
-                            parts.push(t.text.clone());
+                            parts.push(self.token_text(t).into_owned());
                         }
                     }
                     self.expect(TokenKind::RParen);
@@ -2480,11 +2485,11 @@ impl Parser {
                 }
             }
             TokenKind::KwModport => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let mut items = Vec::new();
                 loop {
-                    let istart = self.current().span.start;
+                    let istart = self.current_span().start;
                     let name = self.parse_identifier();
                     self.expect(TokenKind::LParen);
                     let mut ports = Vec::new();
@@ -2500,7 +2505,7 @@ impl Parser {
                         if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                             break;
                         }
-                        let pstart = self.current().span.start;
+                        let pstart = self.current_span().start;
                         // IEEE 1800-2023 §25.5: `modport <name> ( clocking <cb> )`
                         // — a modport_clocking_declaration. We record it as a
                         // synthetic Input port whose name is the clocking
@@ -2660,7 +2665,7 @@ impl Parser {
             // statements beyond `<dir> [type] <name> (, <name>)*` are
             // skipped (default skew, etc. — rich grammar not modelled).
             TokenKind::KwClocking => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let cb_name =
                     if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
@@ -2754,7 +2759,7 @@ impl Parser {
                         | TokenKind::KwOutput
                         | TokenKind::KwInout
                         | TokenKind::KwRef => {
-                            let sstart = self.current().span.start;
+                            let sstart = self.current_span().start;
                             let direction = self
                                 .parse_optional_direction()
                                 .unwrap_or(PortDirection::Input);
@@ -2844,7 +2849,7 @@ impl Parser {
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement()))
             }
             TokenKind::KwProperty => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let name = self.parse_identifier();
                 let (ports, local_ports) = if self.at(TokenKind::LParen) {
@@ -2861,7 +2866,7 @@ impl Parser {
                 // (an `SvaClocked { events, body }` wrapper). Properties not
                 // matching this shape fall back to the legacy token-skip
                 // path so the parser stays resilient.
-                let bstart = self.current().span.start;
+                let bstart = self.current_span().start;
                 let save_pos = self.pos;
                 let save_diag = self.diagnostics.len();
                 let clocked = self.at(TokenKind::At);
@@ -2948,7 +2953,7 @@ impl Parser {
                 }))
             }
             TokenKind::KwSequence => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let name = self.parse_identifier();
                 let (ports, local_ports) = if self.at(TokenKind::LParen) {
@@ -2964,7 +2969,7 @@ impl Parser {
                 // property-decl path. Other shapes (raw `##N` chains)
                 // fall back to the token-skip path.
                 let body_expr = if self.at(TokenKind::At) {
-                    let bstart = self.current().span.start;
+                    let bstart = self.current_span().start;
                     self.bump();
                     let events = self.parse_sva_clock_event();
                     self.in_sva_seq = true;
@@ -3104,15 +3109,15 @@ impl Parser {
                 }
             }
             TokenKind::KwIf => {
-                let s = self.current().span.start;
+                let s = self.current_span().start;
                 Some(self.parse_generate_if(s))
             }
             TokenKind::KwCase => {
-                let s = self.current().span.start;
+                let s = self.current_span().start;
                 Some(self.parse_generate_case(s))
             }
             TokenKind::KwChecker => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let name = self.parse_identifier();
                 let ports = self.parse_port_list();
@@ -3132,7 +3137,7 @@ impl Parser {
             }
             TokenKind::KwLet => Some(ModuleItem::LetDeclaration(self.parse_let_declaration())),
             TokenKind::KwNettype => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let data_type = self.parse_data_type();
                 let name = self.parse_identifier();
@@ -3150,15 +3155,15 @@ impl Parser {
                 }))
             }
             TokenKind::KwFor => {
-                let s = self.current().span.start;
+                let s = self.current_span().start;
                 self.bump();
                 self.expect(TokenKind::LParen);
                 // Parse init: genvar i = 0 or i = 0
                 let has_genvar = self.eat(TokenKind::KwGenvar).is_some();
                 let var_name = if self.at(TokenKind::Identifier) {
-                    let n = self.current().text.clone();
+                    let n = self.current_text().into_owned();
                     if !has_genvar {
-                        let span = self.current().span;
+                        let span = self.current_span();
                         self.plain_loop_vars.push(Identifier {
                             name: n.clone(),
                             span,
@@ -3208,7 +3213,7 @@ impl Parser {
                             TokenKind::ArithShiftRightAssign,
                         ])
                     {
-                        let op_kind = self.current().kind.clone();
+                        let op_kind = self.current_kind().clone();
                         self.bump();
                         let rhs = self.parse_expression();
                         let span = self.span_from(s);
@@ -3401,14 +3406,14 @@ impl Parser {
                         }
                     }
                     if self.at(TokenKind::SystemIdentifier)
-                        && Self::is_timing_check_task(self.current().text.as_str())
+                        && Self::is_timing_check_task(&self.current_text())
                     {
                         let check_pos = self.pos;
                         let check = self.parse_timing_check();
                         // §15.6 negative-timing-check tasks carry `delayed_reference`
                         // / `delayed_data` OUTPUT nets that the cell's functional
                         // path uses — extract those so the elaborator can drive them.
-                        if Self::is_timing_check_name(self.tokens[check_pos].text.as_str()) {
+                        if Self::is_timing_check_name(&self.tokens.text_at(check_pos)) {
                             let end_pos = self.pos;
                             self.pos = check_pos;
                             self.parse_timing_check_delayed_nets(&mut delayed_nets);
@@ -3456,7 +3461,7 @@ impl Parser {
                 self.parse_module_item()
             }
             TokenKind::KwBegin => {
-                let s = self.current().span.start;
+                let s = self.current_span().start;
                 let items = self.parse_generate_branch_items();
                 Some(ModuleItem::GenerateRegion(GenerateRegion {
                     items,
@@ -3468,7 +3473,7 @@ impl Parser {
     }
 
     pub(super) fn parse_net_declaration(&mut self) -> NetDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let net_type = self.parse_optional_net_type().unwrap_or(NetType::Wire);
         // §10.3.1: declaration assignments retain the same strength pair as
         // explicit continuous assignments, for resolution and `%v` reporting.
@@ -3479,7 +3484,7 @@ impl Parser {
             while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                 let token = self.bump();
                 if token.kind != TokenKind::Comma {
-                    parts.push(token.text.clone());
+                    parts.push(self.token_text(token).into_owned());
                 }
             }
             self.expect(TokenKind::RParen);
@@ -3608,7 +3613,7 @@ impl Parser {
     fn parse_net_declarator_list(&mut self) -> Vec<NetDeclarator> {
         let mut decls = Vec::new();
         loop {
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let init = if self.eat(TokenKind::Assign).is_some() {
@@ -3631,7 +3636,7 @@ impl Parser {
     }
 
     fn parse_gate_instantiation(&mut self) -> GateInstantiation {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let gate_type = match self.current_kind() {
             TokenKind::KwAnd => GateType::And,
             TokenKind::KwNand => GateType::Nand,
@@ -3709,7 +3714,7 @@ impl Parser {
         }
         let mut instances = Vec::new();
         loop {
-            let istart = self.current().span.start;
+            let istart = self.current_span().start;
             let name = if self.at(TokenKind::Identifier) {
                 Some(self.parse_identifier())
             } else {
@@ -3866,8 +3871,9 @@ impl Parser {
     /// an argument that does not parse becomes `None`, like an omitted one.
     /// Returns None (after skipping the item) when the list is malformed.
     fn parse_timing_check(&mut self) -> Option<TimingCheck> {
-        let start = self.current().span.start;
-        let name = self.bump().text;
+        let start = self.current_span().start;
+        let name_tok = self.bump();
+        let name = self.token_text(name_tok).into_owned();
         if !self.at(TokenKind::LParen) {
             self.skip_to_semi();
             return None;
@@ -3904,7 +3910,10 @@ impl Parser {
         let span = self.span_from(start);
         let args = ranges
             .into_iter()
-            .map(|(a, b)| Self::parse_timing_check_arg(&self.tokens[a..b]))
+            .map(|(a, b)| {
+                let arg_toks: Vec<Token> = (a..b).map(|i| self.tokens[i]).collect();
+                Self::parse_timing_check_arg(&self.tokens, &arg_toks)
+            })
             .collect();
         Some(TimingCheck { name, args, span })
     }
@@ -3913,11 +3922,14 @@ impl Parser {
     /// expression): `[posedge | negedge | edge [descriptors]] terminal
     /// [&&& condition]`. `&&&` lexes as `&&` followed by `&`. A limit may be a
     /// `min:typ:max` triplet, resolved by `+mindelays/+typdelays/+maxdelays`.
-    fn parse_timing_check_arg(toks: &[crate::lexer::token::Token]) -> Option<TimingCheckArg> {
+    fn parse_timing_check_arg(
+        stream: &TokenStream<'a>,
+        toks: &[Token],
+    ) -> Option<TimingCheckArg> {
         if toks.is_empty() {
             return None;
         }
-        let text = Self::tokens_source_text(toks);
+        let text = Self::tokens_source_text(stream, toks);
         let mut i = 0usize;
         let mut edges = None;
         match toks[0].kind {
@@ -3935,7 +3947,10 @@ impl Parser {
                     let close = toks.iter().position(|t| t.kind == TokenKind::RBracket)?;
                     let mut mask = 0u16;
                     for desc in toks[2..close].split(|t| t.kind == TokenKind::Comma) {
-                        let d: String = desc.iter().map(|t| t.text.to_ascii_lowercase()).collect();
+                        let d: String = desc
+                            .iter()
+                            .map(|&t| stream.text(t).to_ascii_lowercase())
+                            .collect();
                         let level = |c: char| match c {
                             '0' => Some(0u8),
                             '1' => Some(1u8),
@@ -3979,10 +3994,13 @@ impl Parser {
             }
         }
         let (expr_toks, cond) = match split {
-            Some(k) => (&toks[i..k], Some(Self::parse_token_expr(&toks[k + 2..])?)),
+            Some(k) => (
+                &toks[i..k],
+                Some(Self::parse_token_expr(stream, &toks[k + 2..])?),
+            ),
             None => (&toks[i..], None),
         };
-        let expr = Self::parse_token_expr(Self::select_mintypmax(expr_toks))?;
+        let expr = Self::parse_token_expr(stream, Self::select_mintypmax(expr_toks))?;
         Some(TimingCheckArg {
             edges,
             expr,
@@ -3993,7 +4011,7 @@ impl Parser {
 
     /// Pick the `+mindelays/+typdelays/+maxdelays` element of a `min:typ:max`
     /// token run (optionally parenthesized); any other run is returned whole.
-    fn select_mintypmax(toks: &[crate::lexer::token::Token]) -> &[crate::lexer::token::Token] {
+    fn select_mintypmax(toks: &[Token]) -> &[Token] {
         let inner = if toks.len() >= 2
             && toks[0].kind == TokenKind::LParen
             && toks[toks.len() - 1].kind == TokenKind::RParen
@@ -4025,30 +4043,25 @@ impl Parser {
 
     /// Parse a complete expression from a token run with a private parser, so
     /// a run that is not one expression is rejected without diagnostics.
-    fn parse_token_expr(toks: &[crate::lexer::token::Token]) -> Option<Expression> {
+    fn parse_token_expr(stream: &TokenStream<'a>, toks: &[Token]) -> Option<Expression> {
         if toks.is_empty() {
             return None;
         }
-        let end = toks[toks.len() - 1].span.end;
-        let mut run = toks.to_vec();
-        run.push(crate::lexer::token::Token::new(
-            TokenKind::Eof,
-            String::new(),
-            crate::ast::Span::new(end, end),
-        ));
-        let mut p = super::Parser::new(run);
+        let end = stream.span(toks[toks.len() - 1]).end;
+        let sub = stream.sub_stream_with_eof(toks, end);
+        let mut p = super::Parser::new_sub(sub);
         let e = p.parse_expression();
         (p.at(TokenKind::Eof) && !p.has_errors()).then_some(e)
     }
 
     /// Token texts joined with a single space wherever the source had one.
-    fn tokens_source_text(toks: &[crate::lexer::token::Token]) -> String {
+    fn tokens_source_text(stream: &TokenStream<'a>, toks: &[Token]) -> String {
         let mut s = String::new();
-        for (k, t) in toks.iter().enumerate() {
-            if k > 0 && toks[k - 1].span.end < t.span.start {
+        for (k, &t) in toks.iter().enumerate() {
+            if k > 0 && stream.span(toks[k - 1]).end < stream.span(t).start {
                 s.push(' ');
             }
-            s.push_str(&t.text);
+            s.push_str(&stream.text(t));
         }
         s
     }
@@ -4063,7 +4076,7 @@ impl Parser {
     /// Everything is then consumed to the terminating `;`.
     fn parse_timing_check_delayed_nets(&mut self, out: &mut Vec<(String, String)>) {
         let is_recrem_or_setuphold =
-            matches!(self.current().text.as_str(), "$setuphold" | "$recrem");
+            matches!(self.current_text().as_ref(), "$setuphold" | "$recrem");
         self.bump(); // the $name
         if !self.at(TokenKind::LParen) {
             self.skip_to_semi();
@@ -4076,10 +4089,11 @@ impl Parser {
         let mut cur: Vec<String> = Vec::new();
         let mut depth = 0i32;
         while !self.at(TokenKind::Eof) {
-            match self.current().kind {
+            match self.current_kind() {
                 TokenKind::LParen => {
                     depth += 1;
-                    cur.push(self.bump().text.clone());
+                    let tok = self.bump();
+                    cur.push(self.token_text(tok).into_owned());
                 }
                 TokenKind::RParen => {
                     if depth == 0 {
@@ -4087,13 +4101,17 @@ impl Parser {
                         break;
                     }
                     depth -= 1;
-                    cur.push(self.bump().text.clone());
+                    let tok = self.bump();
+                    cur.push(self.token_text(tok).into_owned());
                 }
                 TokenKind::Comma if depth == 0 => {
                     self.bump();
                     args.push(std::mem::take(&mut cur));
                 }
-                _ => cur.push(self.bump().text.clone()),
+                _ => {
+                    let tok = self.bump();
+                    cur.push(self.token_text(tok).into_owned());
+                }
             }
         }
         args.push(cur);
@@ -4172,7 +4190,7 @@ impl Parser {
     fn try_parse_specify_path(&mut self) -> Option<SpecifyPath> {
         let start_pos = self.pos;
         let diag_len = self.diagnostics.len();
-        let sp_start = self.current().span.start;
+        let sp_start = self.current_span().start;
         let p = self.parse_specify_path_inner(sp_start);
         if p.is_none() || self.diagnostics.len() != diag_len {
             self.diagnostics.truncate(diag_len);
@@ -4214,7 +4232,7 @@ impl Parser {
             if matches!(self.current_kind(), TokenKind::Plus | TokenKind::Minus) {
                 self.bump();
             }
-            if self.at(TokenKind::FatArrow) && self.current().text == "=>" {
+            if self.at(TokenKind::FatArrow) && self.current_text() == "=>" {
                 self.bump();
             } else if self.at(TokenKind::Star) && self.peek_kind() == TokenKind::Gt {
                 self.bump();
@@ -4464,12 +4482,13 @@ impl Parser {
                 // default specialization, so its type-parameter property was
                 // no virtual interface.
                 DataType::Interface { span, .. } => {
-                    let toks: Vec<String> = self
-                        .tokens
+                    let slice = self.tokens.source().get(span.start..span.end).unwrap_or("");
+                    let sub = crate::lexer::Lexer::new(slice).tokenize();
+                    let toks: Vec<String> = sub
                         .iter()
-                        .filter(|t| t.span.start >= span.start && t.span.end <= span.end)
+                        .take_while(|t| t.kind != TokenKind::Eof)
                         .skip_while(|t| t.kind == TokenKind::KwVirtual)
-                        .map(|t| t.text.clone())
+                        .map(|t| sub.text(t).into_owned())
                         .collect();
                     (Self::virtual_type_arg_text(&toks), *span)
                 }
@@ -4574,7 +4593,7 @@ impl Parser {
     }
 
     fn parse_identifier_starting_item(&mut self) -> ModuleItem {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let first_name = self.parse_identifier();
         if self.at(TokenKind::DoubleColon) {
             // `::`-chained scoped type: `pkg::T`, `pkg::cls::T`,
@@ -4796,7 +4815,7 @@ impl Parser {
         if self.at(TokenKind::LParen) {
             let mut instances = Vec::new();
             loop {
-                let inst_start = self.current().span.start;
+                let inst_start = self.current_span().start;
                 let name = if self.at(TokenKind::Identifier) {
                     self.parse_identifier()
                 } else {
@@ -4834,7 +4853,7 @@ impl Parser {
             let mut instances = Vec::new();
             loop {
                 let inst_save_pos = self.pos;
-                let inst_start = self.current().span.start;
+                let inst_start = self.current_span().start;
                 let _iname = self.parse_identifier();
                 let _dims = self.parse_unpacked_dimensions();
                 if self.at(TokenKind::Assign)
@@ -4933,13 +4952,13 @@ impl Parser {
     /// `$__posedge(e)` / `$__negedge(e)` / `$__edge(e)` call and folded
     /// into the clocking event when the checker body is instantiated.
     fn parse_port_actual(&mut self) -> Expression {
-        let name = match self.current().kind {
+        let name = match self.current_kind() {
             TokenKind::KwPosedge => "$__posedge",
             TokenKind::KwNegedge => "$__negedge",
             TokenKind::KwEdge => "$__edge",
             _ => return self.parse_expression(),
         };
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.bump();
         let e = self.parse_expression();
         Expression::new(
@@ -5033,7 +5052,7 @@ impl Parser {
                 // nothing would loop forever, so force progress here too (this
                 // is the loop behind generate-block bodies, so it shares the
                 // virtual-interface hazard).
-                self.error(format!("unexpected: {:?}", self.current().text));
+                self.error(format!("unexpected: {:?}", self.current_text()));
                 self.bump();
                 continue;
             }
@@ -5049,23 +5068,23 @@ impl Parser {
     /// The tokens of a parameter value list parsed from `start` on, as text,
     /// to tell specializations apart (empty without a list).
     fn param_args_text(&self, start: usize) -> String {
-        let toks = &self.tokens[start..self.pos];
-        let inner = match toks {
+        let toks: Vec<Token> = (start..self.pos).map(|i| self.tokens[i]).collect();
+        let inner = match toks.as_slice() {
             [h, l, rest @ .., _] if h.kind == TokenKind::Hash && l.kind == TokenKind::LParen => {
                 rest
             }
             [l, rest @ .., _] if l.kind == TokenKind::LParen => rest,
-            _ => toks,
+            _ => toks.as_slice(),
         };
         inner
             .iter()
-            .map(|t| t.text.as_str())
+            .map(|&t| self.token_text(t))
             .collect::<Vec<_>>()
             .join(" ")
     }
 
     pub(super) fn parse_class_declaration(&mut self) -> ClassDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         // A module item arrives here with `virtual` / `interface` already
         // consumed; the caller sets the flags, but the class checks below
         // need them too.
@@ -5097,7 +5116,7 @@ impl Parser {
         let mut bases = Vec::new();
         let mut unscoped_bases: Vec<Identifier> = Vec::new();
         let extends = if self.eat(TokenKind::KwExtends).is_some() {
-            let ext_start = self.current().span.start;
+            let ext_start = self.current_span().start;
             // §8.13: the base class may be package/class-scoped —
             // `extends pkg::Base` or `extends A::B::C`. Keep the final
             // segment as the base-class name; the scope prefix is kept in
@@ -5226,6 +5245,7 @@ impl Parser {
             let it = self.parse_class_item();
             self.hide_let_names_of_class_item(&it);
             items.push(it);
+            self.release_consumed_tokens();
         }
         self.pop_let_scope();
         let pure_constraints = std::mem::replace(&mut self.pure_constraints, outer_pure);
@@ -5352,7 +5372,7 @@ impl Parser {
     }
 
     fn parse_class_item(&mut self) -> ClassItem {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         if self.eat(TokenKind::Semicolon).is_some() {
             return ClassItem::Empty;
         }
@@ -5530,7 +5550,7 @@ impl Parser {
             _ => {
                 self.error(format!(
                     "unexpected token in class: {:?}",
-                    self.current().text
+                    self.current_text()
                 ));
                 self.bump();
                 ClassItem::Empty
@@ -5804,13 +5824,13 @@ impl Parser {
         }
         self.error(format!(
             "expected a cross bin select expression, found '{}'",
-            self.current().text
+            self.current_text()
         ));
         CrossSelect::All
     }
 
     pub(super) fn parse_covergroup_declaration(&mut self) -> CovergroupDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.bump();
         let name = self.parse_identifier();
         // §19.3 constructor formal list (`covergroup cg (int lo, int hi)`),
@@ -5881,7 +5901,7 @@ impl Parser {
     }
 
     fn parse_covergroup_item(&mut self) -> CovergroupItem {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut name = None;
         if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Colon {
             name = Some(self.parse_identifier());
@@ -5927,7 +5947,7 @@ impl Parser {
                     self.bump();
                     // Parse a sequence of bin declarations until matching `}`.
                     while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                        let bin_start = self.current().span.start;
+                        let bin_start = self.current_span().start;
                         // Optional `wildcard` modifier (LRM §19.5) — applies
                         // to the next `bins`/`ignore_bins`/`illegal_bins`.
                         let is_wildcard = self.eat(TokenKind::KwWildcard).is_some();
@@ -5941,7 +5961,7 @@ impl Parser {
                                 Some(crate::ast::decl::CoverBinKind::Illegal)
                             }
                             // Identifier text fallback for tokenizer variants.
-                            TokenKind::Identifier => match self.current().text.as_str() {
+                            TokenKind::Identifier => match self.current_text().as_ref() {
                                 "bins" => Some(crate::ast::decl::CoverBinKind::Bins),
                                 "ignore_bins" => Some(crate::ast::decl::CoverBinKind::Ignore),
                                 "illegal_bins" => Some(crate::ast::decl::CoverBinKind::Illegal),
@@ -5958,7 +5978,7 @@ impl Parser {
                                 // reserved word (`small`, `large`) is not one.
                                 self.error(format!(
                                     "expected a bin name, found '{}'",
-                                    self.current().text
+                                    self.current_text()
                                 ));
                                 self.skip_bin_body_to_semicolon();
                                 if self.at(TokenKind::Semicolon) {
@@ -6059,8 +6079,8 @@ impl Parser {
                                 self.bump();
                             }
                         } else if self.at(TokenKind::Identifier)
-                            && (self.current().text == "option"
-                                || self.current().text == "type_option")
+                            && (self.current_text() == "option"
+                                || self.current_text() == "type_option")
                         {
                             // §19.7 coverpoint-level `option.NAME = expr;`.
                             self.bump(); // option / type_option
@@ -6172,7 +6192,7 @@ impl Parser {
                             if !self.at(TokenKind::Identifier) {
                                 self.error(format!(
                                     "expected a bin name, found '{}'",
-                                    self.current().text
+                                    self.current_text()
                                 ));
                                 self.skip_bin_body_to_semicolon();
                                 let _ = self.eat(TokenKind::Semicolon);
@@ -6206,8 +6226,8 @@ impl Parser {
                             continue;
                         }
                         if self.at(TokenKind::Identifier)
-                            && (self.current().text == "option"
-                                || self.current().text == "type_option")
+                            && (self.current_text() == "option"
+                                || self.current_text() == "type_option")
                             && self.peek_kind() == TokenKind::Dot
                         {
                             self.bump();
@@ -6248,7 +6268,7 @@ impl Parser {
                 })
             }
             TokenKind::Identifier
-                if self.current().text == "option" || self.current().text == "type_option" =>
+                if self.current_text() == "option" || self.current_text() == "type_option" =>
             {
                 let id = self.parse_identifier();
                 let is_type = id.name == "type_option";
@@ -6272,7 +6292,7 @@ impl Parser {
             _ => {
                 self.error(format!(
                     "unexpected token in covergroup: {:?}",
-                    self.current().text
+                    self.current_text()
                 ));
                 self.bump();
                 CovergroupItem::Option {
@@ -6290,7 +6310,7 @@ impl Parser {
     /// checks consult, and the whole operand as an identifier path (an
     /// index select held on its segment), which the solver orders by.
     fn parse_solve_term(&mut self) -> (Identifier, Expression) {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let root = self.parse_identifier();
         let mut path = vec![crate::ast::expr::HierPathSegment {
             name: root.clone(),
@@ -6437,7 +6457,7 @@ impl Parser {
     }
 
     pub(crate) fn parse_constraint_item(&mut self, pos: ConstraintPos) -> ConstraintItem {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         match self.current_kind() {
             TokenKind::KwSolve => {
                 self.bump();
@@ -6777,7 +6797,7 @@ impl Parser {
     }
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// A `wreal` net or port carries a real value and names no data type of
     /// its own -- `wreal n;` is a net type and nothing else. Substituting
     /// `real` here means every downstream question ("how wide is it", "is it

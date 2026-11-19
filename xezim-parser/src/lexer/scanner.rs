@@ -1,18 +1,12 @@
 //! Lexer/Scanner for SystemVerilog (IEEE 1800-2017 §5)
 
-use super::token::{Token, TokenKind, keyword};
-use crate::ast::Span;
+use std::borrow::Cow;
 
-/// `String::from_utf8_lossy(b).to_string()`, validating with the fast
-/// `str::from_utf8` first (token text is almost always valid).
-fn lossy_string(b: &[u8]) -> String {
-    match std::str::from_utf8(b) {
-        Ok(s) => s.to_owned(),
-        Err(_) => String::from_utf8_lossy(b).into_owned(),
-    }
-}
+use super::stream::TokenStream;
+use super::token::{TokenKind, keyword};
 
 pub struct Lexer<'a> {
+    source: &'a str,
     input: &'a [u8],
     pos: usize,
     /// IEEE 1800-2023 §22.14: stack of active `begin_keywords` regions. The
@@ -156,7 +150,12 @@ pub fn default_keywords_key() -> u8 {
 
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
+        assert!(
+            source.len() <= u32::MAX as usize,
+            "SystemVerilog source exceeds 4 GiB byte-offset limit"
+        );
         Self {
+            source,
             input: source.as_bytes(),
             pos: 0,
             kw_stack: Vec::new(),
@@ -164,16 +163,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn tokenize(mut self) -> Vec<Token> {
-        let mut tokens = Vec::new();
+    pub fn tokenize(mut self) -> TokenStream<'a> {
+        let mut tokens = TokenStream::new(self.source);
         loop {
             self.skip_whitespace();
             if self.pos >= self.input.len() {
-                tokens.push(Token::new(
-                    TokenKind::Eof,
-                    String::new(),
-                    Span::new(self.pos, self.pos),
-                ));
+                tokens.push_token(TokenKind::Eof, self.pos, self.pos);
                 break;
             }
             // Skip comments
@@ -199,9 +194,11 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
             }
-            tokens.push(self.scan_token());
+            let start = self.pos;
+            let kind = self.scan_token(start);
+            tokens.push_token(kind, start, self.pos);
         }
-        tokens.shrink_to_fit();
+        tokens.finish();
         tokens
     }
 
@@ -237,18 +234,16 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn make_token(&mut self, start: usize, kind: TokenKind) -> Token {
+    fn make_token(&mut self, kind: TokenKind) -> TokenKind {
         self.pos += 1;
-        let text = lossy_string(&self.input[start..self.pos]);
-        Token::new(kind, text, Span::new(start, self.pos))
+        kind
     }
 
-    fn scan_token(&mut self) -> Token {
-        let start = self.pos;
+    fn scan_token(&mut self, start: usize) -> TokenKind {
         let ch = self.input[self.pos];
         match ch {
             // String literal
-            b'"' => self.scan_string(start),
+            b'"' => self.scan_string(),
             // Compiler directive
             b'`' => self.scan_directive(start),
             // System identifier
@@ -257,68 +252,59 @@ impl<'a> Lexer<'a> {
                     .peek()
                     .map_or(false, |c| c.is_ascii_alphabetic() || c == b'_')
                 {
-                    self.scan_system_id(start)
+                    self.scan_system_id()
                 } else {
-                    self.make_token(start, TokenKind::Dollar)
+                    self.make_token(TokenKind::Dollar)
                 }
             }
             // Escaped identifier
-            b'\\' => self.scan_escaped_id(start),
+            b'\\' => self.scan_escaped_id(),
             // Number starting with apostrophe: 'b, 'h, 'o, 'd, 's, '0, '1, 'x, 'z
             b'\'' => {
                 if self.peek().map_or(false, |c| matches!(c, b'{')) {
                     self.pos += 2;
-                    Token::new(
-                        TokenKind::ApostropheLBrace,
-                        "'{".into(),
-                        Span::new(start, self.pos),
-                    )
+                    TokenKind::ApostropheLBrace
                 } else if self.peek().map_or(false, |c| {
                     matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z')
                 }) {
                     self.pos += 2;
-                    let text = lossy_string(&self.input[start..self.pos]);
-                    Token::new(
-                        TokenKind::UnbasedUnsizedLiteral,
-                        text,
-                        Span::new(start, self.pos),
-                    )
+                    TokenKind::UnbasedUnsizedLiteral
                 } else {
-                    self.scan_based_number(start)
+                    self.scan_based_number()
                 }
             }
             // Numbers
-            b'0'..=b'9' => self.scan_number(start),
+            b'0'..=b'9' => self.scan_number(),
             // Identifiers / keywords
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.scan_identifier(start),
             // Operators and punctuation
-            b'(' => self.make_token(start, TokenKind::LParen),
-            b')' => self.make_token(start, TokenKind::RParen),
-            b'[' => self.make_token(start, TokenKind::LBracket),
-            b']' => self.make_token(start, TokenKind::RBracket),
-            b'{' => self.make_token(start, TokenKind::LBrace),
-            b'}' => self.make_token(start, TokenKind::RBrace),
-            b';' => self.make_token(start, TokenKind::Semicolon),
-            b',' => self.make_token(start, TokenKind::Comma),
-            b'.' => self.make_token(start, TokenKind::Dot),
-            b'@' => self.make_token(start, TokenKind::At),
-            b'?' => self.make_token(start, TokenKind::Question),
+            b'(' => self.make_token(TokenKind::LParen),
+            b')' => self.make_token(TokenKind::RParen),
+            b'[' => self.make_token(TokenKind::LBracket),
+            b']' => self.make_token(TokenKind::RBracket),
+            b'{' => self.make_token(TokenKind::LBrace),
+            b'}' => self.make_token(TokenKind::RBrace),
+            b';' => self.make_token(TokenKind::Semicolon),
+            b',' => self.make_token(TokenKind::Comma),
+            b'.' => self.make_token(TokenKind::Dot),
+            b'@' => self.make_token(TokenKind::At),
+            b'?' => self.make_token(TokenKind::Question),
             b'~' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
                     Some(b'&') => {
                         self.pos += 1;
-                        Token::new(TokenKind::BitNand, "~&".into(), Span::new(start, self.pos))
+                        TokenKind::BitNand
                     }
                     Some(b'|') => {
                         self.pos += 1;
-                        Token::new(TokenKind::BitNor, "~|".into(), Span::new(start, self.pos))
+                        TokenKind::BitNor
                     }
                     Some(b'^') => {
                         self.pos += 1;
-                        Token::new(TokenKind::BitXnor, "~^".into(), Span::new(start, self.pos))
+                        TokenKind::BitXnor
                     }
-                    _ => Token::new(TokenKind::BitNot, "~".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::BitNot,
                 }
             }
             b'+' => {
@@ -326,29 +312,17 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'+') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::Increment,
-                            "++".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::Increment
                     }
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::PlusAssign,
-                            "+=".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::PlusAssign
                     }
                     Some(b':') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::PlusColon,
-                            "+:".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::PlusColon
                     }
-                    _ => Token::new(TokenKind::Plus, "+".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Plus,
                 }
             }
             b'-' => {
@@ -356,42 +330,26 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'-') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::Decrement,
-                            "--".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::Decrement
                     }
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::MinusAssign,
-                            "-=".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::MinusAssign
                     }
                     Some(b'>') => {
                         self.pos += 1;
                         if self.input.get(self.pos) == Some(&b'>') {
                             self.pos += 1;
-                            Token::new(
-                                TokenKind::DoubleArrow,
-                                "->>".into(),
-                                Span::new(start, self.pos),
-                            )
+                            TokenKind::DoubleArrow
                         } else {
-                            Token::new(TokenKind::Arrow, "->".into(), Span::new(start, self.pos))
+                            TokenKind::Arrow
                         }
                     }
                     Some(b':') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::MinusColon,
-                            "-:".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::MinusColon
                     }
-                    _ => Token::new(TokenKind::Minus, "-".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Minus,
                 }
             }
             b'*' => {
@@ -399,21 +357,13 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'*') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::DoubleStar,
-                            "**".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::DoubleStar
                     }
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::StarAssign,
-                            "*=".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::StarAssign
                     }
-                    _ => Token::new(TokenKind::Star, "*".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Star,
                 }
             }
             b'/' => {
@@ -421,26 +371,18 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::SlashAssign,
-                            "/=".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::SlashAssign
                     }
-                    _ => Token::new(TokenKind::Slash, "/".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Slash,
                 }
             }
             b'%' => {
                 self.pos += 1;
                 if self.input.get(self.pos) == Some(&b'=') {
                     self.pos += 1;
-                    Token::new(
-                        TokenKind::PercentAssign,
-                        "%=".into(),
-                        Span::new(start, self.pos),
-                    )
+                    TokenKind::PercentAssign
                 } else {
-                    Token::new(TokenKind::Percent, "%".into(), Span::new(start, self.pos))
+                    TokenKind::Percent
                 }
             }
             b'!' => {
@@ -451,26 +393,16 @@ impl<'a> Lexer<'a> {
                         match self.input.get(self.pos) {
                             Some(b'=') => {
                                 self.pos += 1;
-                                Token::new(
-                                    TokenKind::CaseNeq,
-                                    "!==".into(),
-                                    Span::new(start, self.pos),
-                                )
+                                TokenKind::CaseNeq
                             }
                             Some(b'?') => {
                                 self.pos += 1;
-                                Token::new(
-                                    TokenKind::WildcardNeq,
-                                    "!=?".into(),
-                                    Span::new(start, self.pos),
-                                )
+                                TokenKind::WildcardNeq
                             }
-                            _ => {
-                                Token::new(TokenKind::Neq, "!=".into(), Span::new(start, self.pos))
-                            }
+                            _ => TokenKind::Neq,
                         }
                     }
-                    _ => Token::new(TokenKind::LogNot, "!".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::LogNot,
                 }
             }
             b'=' => {
@@ -481,28 +413,20 @@ impl<'a> Lexer<'a> {
                         match self.input.get(self.pos) {
                             Some(b'=') => {
                                 self.pos += 1;
-                                Token::new(
-                                    TokenKind::CaseEq,
-                                    "===".into(),
-                                    Span::new(start, self.pos),
-                                )
+                                TokenKind::CaseEq
                             }
                             Some(b'?') => {
                                 self.pos += 1;
-                                Token::new(
-                                    TokenKind::WildcardEq,
-                                    "==?".into(),
-                                    Span::new(start, self.pos),
-                                )
+                                TokenKind::WildcardEq
                             }
-                            _ => Token::new(TokenKind::Eq, "==".into(), Span::new(start, self.pos)),
+                            _ => TokenKind::Eq,
                         }
                     }
                     Some(b'>') => {
                         self.pos += 1;
-                        Token::new(TokenKind::FatArrow, "=>".into(), Span::new(start, self.pos))
+                        TokenKind::FatArrow
                     }
-                    _ => Token::new(TokenKind::Assign, "=".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Assign,
                 }
             }
             b'<' => {
@@ -510,7 +434,7 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(TokenKind::Leq, "<=".into(), Span::new(start, self.pos))
+                        TokenKind::Leq
                     }
                     Some(b'<') => {
                         self.pos += 1;
@@ -519,49 +443,29 @@ impl<'a> Lexer<'a> {
                                 self.pos += 1;
                                 if self.input.get(self.pos) == Some(&b'=') {
                                     self.pos += 1;
-                                    Token::new(
-                                        TokenKind::ArithShiftLeftAssign,
-                                        "<<<=".into(),
-                                        Span::new(start, self.pos),
-                                    )
+                                    TokenKind::ArithShiftLeftAssign
                                 } else {
-                                    Token::new(
-                                        TokenKind::ArithShiftLeft,
-                                        "<<<".into(),
-                                        Span::new(start, self.pos),
-                                    )
+                                    TokenKind::ArithShiftLeft
                                 }
                             }
                             Some(b'=') => {
                                 self.pos += 1;
-                                Token::new(
-                                    TokenKind::ShiftLeftAssign,
-                                    "<<=".into(),
-                                    Span::new(start, self.pos),
-                                )
+                                TokenKind::ShiftLeftAssign
                             }
-                            _ => Token::new(
-                                TokenKind::ShiftLeft,
-                                "<<".into(),
-                                Span::new(start, self.pos),
-                            ),
+                            _ => TokenKind::ShiftLeft,
                         }
                     }
                     Some(b'-') => {
                         self.pos += 1;
                         if self.input.get(self.pos) == Some(&b'>') {
                             self.pos += 1;
-                            Token::new(
-                                TokenKind::LogEquiv,
-                                "<->".into(),
-                                Span::new(start, self.pos),
-                            )
+                            TokenKind::LogEquiv
                         } else {
                             self.pos -= 1;
-                            Token::new(TokenKind::Lt, "<".into(), Span::new(start, self.pos))
+                            TokenKind::Lt
                         }
                     }
-                    _ => Token::new(TokenKind::Lt, "<".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Lt,
                 }
             }
             b'>' => {
@@ -569,7 +473,7 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(TokenKind::Geq, ">=".into(), Span::new(start, self.pos))
+                        TokenKind::Geq
                     }
                     Some(b'>') => {
                         self.pos += 1;
@@ -578,35 +482,19 @@ impl<'a> Lexer<'a> {
                                 self.pos += 1;
                                 if self.input.get(self.pos) == Some(&b'=') {
                                     self.pos += 1;
-                                    Token::new(
-                                        TokenKind::ArithShiftRightAssign,
-                                        ">>>=".into(),
-                                        Span::new(start, self.pos),
-                                    )
+                                    TokenKind::ArithShiftRightAssign
                                 } else {
-                                    Token::new(
-                                        TokenKind::ArithShiftRight,
-                                        ">>>".into(),
-                                        Span::new(start, self.pos),
-                                    )
+                                    TokenKind::ArithShiftRight
                                 }
                             }
                             Some(b'=') => {
                                 self.pos += 1;
-                                Token::new(
-                                    TokenKind::ShiftRightAssign,
-                                    ">>=".into(),
-                                    Span::new(start, self.pos),
-                                )
+                                TokenKind::ShiftRightAssign
                             }
-                            _ => Token::new(
-                                TokenKind::ShiftRight,
-                                ">>".into(),
-                                Span::new(start, self.pos),
-                            ),
+                            _ => TokenKind::ShiftRight,
                         }
                     }
-                    _ => Token::new(TokenKind::Gt, ">".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Gt,
                 }
             }
             b'&' => {
@@ -614,17 +502,13 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'&') => {
                         self.pos += 1;
-                        Token::new(TokenKind::LogAnd, "&&".into(), Span::new(start, self.pos))
+                        TokenKind::LogAnd
                     }
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::AndAssign,
-                            "&=".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::AndAssign
                     }
-                    _ => Token::new(TokenKind::BitAnd, "&".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::BitAnd,
                 }
             }
             b'|' => {
@@ -632,37 +516,29 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'|') => {
                         self.pos += 1;
-                        Token::new(TokenKind::LogOr, "||".into(), Span::new(start, self.pos))
+                        TokenKind::LogOr
                     }
                     Some(b'=') => {
                         self.pos += 1;
                         if self.input.get(self.pos) == Some(&b'>') {
                             self.pos += 1;
-                            Token::new(
-                                TokenKind::OrFatArrow,
-                                "|=>".into(),
-                                Span::new(start, self.pos),
-                            )
+                            TokenKind::OrFatArrow
                         } else {
-                            Token::new(TokenKind::OrAssign, "|=".into(), Span::new(start, self.pos))
+                            TokenKind::OrAssign
                         }
                     }
                     Some(b'-') => {
                         self.pos += 1;
                         if self.input.get(self.pos) == Some(&b'>') {
                             self.pos += 1;
-                            Token::new(
-                                TokenKind::OrMinusArrow,
-                                "|->".into(),
-                                Span::new(start, self.pos),
-                            )
+                            TokenKind::OrMinusArrow
                         } else {
                             // Backtrack or just bitwise or and minus. Since `-` isn't assignment, return `|` and leave `-`
                             self.pos -= 1;
-                            Token::new(TokenKind::BitOr, "|".into(), Span::new(start, self.pos))
+                            TokenKind::BitOr
                         }
                     }
-                    _ => Token::new(TokenKind::BitOr, "|".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::BitOr,
                 }
             }
             b'^' => {
@@ -670,17 +546,13 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b'~') => {
                         self.pos += 1;
-                        Token::new(TokenKind::BitXnor, "^~".into(), Span::new(start, self.pos))
+                        TokenKind::BitXnor
                     }
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::XorAssign,
-                            "^=".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::XorAssign
                     }
-                    _ => Token::new(TokenKind::BitXor, "^".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::BitXor,
                 }
             }
             b'#' => {
@@ -694,17 +566,12 @@ impl<'a> Lexer<'a> {
                         TokenKind::HashEqualHash
                     };
                     self.pos += 2;
-                    let text = if kind == TokenKind::HashMinusHash {
-                        "#-#"
-                    } else {
-                        "#=#"
-                    };
-                    Token::new(kind, text.into(), Span::new(start, self.pos))
+                    kind
                 } else if self.input.get(self.pos) == Some(&b'#') {
                     self.pos += 1;
-                    Token::new(TokenKind::HashHash, "##".into(), Span::new(start, self.pos))
+                    TokenKind::HashHash
                 } else {
-                    Token::new(TokenKind::Hash, "#".into(), Span::new(start, self.pos))
+                    TokenKind::Hash
                 }
             }
             b':' => {
@@ -712,36 +579,24 @@ impl<'a> Lexer<'a> {
                 match self.input.get(self.pos) {
                     Some(b':') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::DoubleColon,
-                            "::".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::DoubleColon
                     }
                     Some(b'/') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::ColonSlash,
-                            ":/".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::ColonSlash
                     }
                     Some(b'=') => {
                         self.pos += 1;
-                        Token::new(
-                            TokenKind::ColonAssign,
-                            ":=".into(),
-                            Span::new(start, self.pos),
-                        )
+                        TokenKind::ColonAssign
                     }
-                    _ => Token::new(TokenKind::Colon, ":".into(), Span::new(start, self.pos)),
+                    _ => TokenKind::Colon,
                 }
             }
-            _ => self.make_token(start, TokenKind::Unknown),
+            _ => self.make_token(TokenKind::Unknown),
         }
     }
 
-    fn scan_string(&mut self, start: usize) -> Token {
+    fn scan_string(&mut self) -> TokenKind {
         // IEEE 1800-2023 §5.9: triple-quoted string literal (""" ... """).
         // Newlines are preserved and a lone `"` (or `""`) inside does not
         // terminate the literal — only `"""` does. Gated on the SV-2023
@@ -765,18 +620,13 @@ impl<'a> Lexer<'a> {
                 }
                 self.pos += 1;
             }
-            let text = lossy_string(&self.input[start..self.pos]);
-            return Token::new(
-                TokenKind::TripleStringLiteral,
-                text,
-                Span::new(start, self.pos),
-            );
+            return TokenKind::TripleStringLiteral;
         }
 
         self.pos += 1; // skip opening "
         while self.pos < self.input.len() {
             if self.input[self.pos] == b'\\' {
-                self.pos += 2;
+                self.pos = (self.pos + 2).min(self.input.len());
                 continue;
             }
             if self.input[self.pos] == b'"' {
@@ -785,18 +635,17 @@ impl<'a> Lexer<'a> {
             }
             self.pos += 1;
         }
-        let text = lossy_string(&self.input[start..self.pos]);
-        Token::new(TokenKind::StringLiteral, text, Span::new(start, self.pos))
+        TokenKind::StringLiteral
     }
 
-    fn scan_directive(&mut self, start: usize) -> Token {
+    fn scan_directive(&mut self, start: usize) -> TokenKind {
         self.pos += 1; // skip `
         while self.pos < self.input.len()
             && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == b'_')
         {
             self.pos += 1;
         }
-        let text = lossy_string(&self.input[start..self.pos]);
+        let text = &self.source[start..self.pos];
         // §22.14: track `begin_keywords "<version>"` / `end_keywords` so the
         // identifier scanner can downgrade SV-only keywords in legacy regions.
         // The version string is consumed here (not emitted as a separate token).
@@ -813,7 +662,10 @@ impl<'a> Lexer<'a> {
                 while self.pos < self.input.len() && self.input[self.pos] != b'"' {
                     self.pos += 1;
                 }
-                let ver = lossy_string(&self.input[vstart..self.pos]);
+                let ver: Cow<'a, str> = match self.source.get(vstart..self.pos) {
+                    Some(s) => Cow::Borrowed(s),
+                    None => String::from_utf8_lossy(&self.input[vstart..self.pos]),
+                };
                 if self.pos < self.input.len() {
                     self.pos += 1;
                 } // closing quote
@@ -831,16 +683,16 @@ impl<'a> Lexer<'a> {
                 self.pos = save;
                 self.kw_stack.push(KwRegion::default());
             }
-            return Token::new(TokenKind::Directive, text, Span::new(start, self.pos));
+            return TokenKind::Directive;
         }
         if text == "`end_keywords" {
             self.kw_stack.pop();
-            return Token::new(TokenKind::Directive, text, Span::new(start, self.pos));
+            return TokenKind::Directive;
         }
-        Token::new(TokenKind::Directive, text, Span::new(start, self.pos))
+        TokenKind::Directive
     }
 
-    fn scan_system_id(&mut self, start: usize) -> Token {
+    fn scan_system_id(&mut self) -> TokenKind {
         self.pos += 1; // skip $
         while self.pos < self.input.len()
             && (self.input[self.pos].is_ascii_alphanumeric()
@@ -849,28 +701,18 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = lossy_string(&self.input[start..self.pos]);
-        Token::new(
-            TokenKind::SystemIdentifier,
-            text,
-            Span::new(start, self.pos),
-        )
+        TokenKind::SystemIdentifier
     }
 
-    fn scan_escaped_id(&mut self, start: usize) -> Token {
+    fn scan_escaped_id(&mut self) -> TokenKind {
         self.pos += 1; // skip backslash
         while self.pos < self.input.len() && !self.input[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
-        let text = lossy_string(&self.input[start..self.pos]);
-        Token::new(
-            TokenKind::EscapedIdentifier,
-            text,
-            Span::new(start, self.pos),
-        )
+        TokenKind::EscapedIdentifier
     }
 
-    fn scan_identifier(&mut self, start: usize) -> Token {
+    fn scan_identifier(&mut self, start: usize) -> TokenKind {
         while self.pos < self.input.len()
             && (self.input[self.pos].is_ascii_alphanumeric()
                 || self.input[self.pos] == b'_'
@@ -878,19 +720,19 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = lossy_string(&self.input[start..self.pos]);
-        let mut kind = keyword(&text).unwrap_or(TokenKind::Identifier);
+        let text = &self.source[start..self.pos];
+        let mut kind = keyword(text).unwrap_or(TokenKind::Identifier);
         // §22.14: inside a `begin_keywords "1364-*"` region, a SystemVerilog-
         // only keyword is a legal identifier (e.g. `reg logic;` declares a reg
         // named `logic` in Verilog-2001).
         let region = self.kw_stack.last().copied().unwrap_or(self.default_kw);
-        if region.frees(&text) {
+        if region.frees(text) {
             kind = TokenKind::Identifier;
         }
-        Token::new(kind, text, Span::new(start, self.pos))
+        kind
     }
 
-    fn scan_number(&mut self, start: usize) -> Token {
+    fn scan_number(&mut self) -> TokenKind {
         // Consume decimal digits (and underscores)
         while self.pos < self.input.len()
             && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_')
@@ -946,8 +788,7 @@ impl<'a> Lexer<'a> {
                 {
                     self.pos += 1;
                 }
-                let text = literal_text(&self.input[start..self.pos]);
-                return Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos));
+                return TokenKind::IntegerLiteral;
             }
         }
         // Check for real literal: digits.digits or digitsEexp
@@ -997,17 +838,11 @@ impl<'a> Lexer<'a> {
                             .map_or(false, |c| c.is_ascii_alphanumeric())
                     {
                         self.pos += suffix.len();
-                        let text = lossy_string(&self.input[start..self.pos]);
-                        return Token::new(
-                            TokenKind::TimeLiteral,
-                            text,
-                            Span::new(start, self.pos),
-                        );
+                        return TokenKind::TimeLiteral;
                     }
                 }
             }
-            let text = lossy_string(&self.input[start..self.pos]);
-            return Token::new(TokenKind::RealLiteral, text, Span::new(start, self.pos));
+            return TokenKind::RealLiteral;
         }
         // Exponent without decimal point
         if self.pos < self.input.len() && matches!(self.input[self.pos], b'e' | b'E') {
@@ -1022,8 +857,7 @@ impl<'a> Lexer<'a> {
                 {
                     self.pos += 1;
                 }
-                let text = lossy_string(&self.input[start..self.pos]);
-                return Token::new(TokenKind::RealLiteral, text, Span::new(start, self.pos));
+                return TokenKind::RealLiteral;
             }
             self.pos = saved;
         }
@@ -1037,16 +871,14 @@ impl<'a> Lexer<'a> {
                         .map_or(false, |c| c.is_ascii_alphanumeric())
                 {
                     self.pos += suffix.len();
-                    let text = lossy_string(&self.input[start..self.pos]);
-                    return Token::new(TokenKind::TimeLiteral, text, Span::new(start, self.pos));
+                    return TokenKind::TimeLiteral;
                 }
             }
         }
-        let text = lossy_string(&self.input[start..self.pos]);
-        Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos))
+        TokenKind::IntegerLiteral
     }
 
-    fn scan_based_number(&mut self, start: usize) -> Token {
+    fn scan_based_number(&mut self) -> TokenKind {
         self.pos += 1; // skip '
         let mut p = self.pos;
         if p < self.input.len() && matches!(self.input[p], b's' | b'S') {
@@ -1064,11 +896,7 @@ impl<'a> Lexer<'a> {
             // cast like `(w) ' (v)` still has `text == "'"` for the parser's
             // cast handler. (Consuming the space here was tokenizing `"' "`,
             // breaking real-world RTL such as basejump's `(nodes_p) ' (0)`.)
-            return Token::new(
-                TokenKind::IntegerLiteral,
-                "'".into(),
-                Span::new(start, self.pos),
-            );
+            return TokenKind::IntegerLiteral;
         }
         self.pos = p + 1; // consume optional sign + base specifier
         // IEEE 1800-2017 §5.7.1: whitespace allowed between base and value
@@ -1086,30 +914,14 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = literal_text(&self.input[start..self.pos]);
-        Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos))
+        TokenKind::IntegerLiteral
     }
 }
 
 /// §5.3: the white space that may separate the size, the base and the value
 /// of a based literal (§5.7.1): blanks, tabs, newlines and form feeds.
-fn is_literal_space(c: u8) -> bool {
+pub(crate) fn is_literal_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
-}
-
-/// A based literal's text without the white space between its tokens, so
-/// `2 'd 1` reads as `2'd1`: the size was parsed from `"2 "` and lost.
-fn literal_text(bytes: &[u8]) -> String {
-    if bytes.iter().any(|&c| is_literal_space(c)) {
-        let kept: Vec<u8> = bytes
-            .iter()
-            .copied()
-            .filter(|&c| !is_literal_space(c))
-            .collect();
-        lossy_string(&kept)
-    } else {
-        lossy_string(bytes)
-    }
 }
 
 /// §22.14: the library-map/configuration keywords, reserved from 1364-2001

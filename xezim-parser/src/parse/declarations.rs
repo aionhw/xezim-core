@@ -7,7 +7,7 @@ use crate::ast::stmt::VarDeclarator;
 use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub(super) fn parse_parameter_port_list(&mut self) -> Vec<ParameterDeclaration> {
         let mut params = Vec::new();
         if self.eat(TokenKind::Hash).is_none() {
@@ -44,7 +44,7 @@ impl Parser {
     }
 
     pub(super) fn parse_parameter_declaration(&mut self) -> ParameterDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let local = match self.current_kind() {
             TokenKind::KwParameter => {
                 self.bump();
@@ -62,7 +62,7 @@ impl Parser {
             // §6.20.3: a single `parameter type` may declare several comma-
             // separated type assignments — `parameter type A = int, B = X;`.
             loop {
-                let astart = self.current().span.start;
+                let astart = self.current_span().start;
                 let name = self.parse_identifier();
                 // IEEE 1800-2023 §6.20.2.1: `type T extends Base` constrains the
                 // type argument to a class derived from `Base`. Gated on
@@ -154,7 +154,7 @@ impl Parser {
         };
         let mut assignments = Vec::new();
         loop {
-            let astart = self.current().span.start;
+            let astart = self.current_span().start;
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let init = if self.eat(TokenKind::Assign).is_some() {
@@ -256,7 +256,7 @@ impl Parser {
     }
 
     pub(super) fn parse_typedef_declaration(&mut self) -> TypedefDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwTypedef);
         if self.eat(TokenKind::KwClass).is_some() {
             let name = self.parse_identifier();
@@ -330,11 +330,11 @@ impl Parser {
     }
 
     pub(super) fn parse_import_declaration(&mut self) -> ImportDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwImport);
         let mut items = Vec::new();
         loop {
-            let item_start = self.current().span.start;
+            let item_start = self.current_span().start;
             let package = self.parse_identifier();
             self.expect(TokenKind::DoubleColon);
             let item = if self.eat(TokenKind::Star).is_some() {
@@ -359,7 +359,7 @@ impl Parser {
     }
 
     pub(super) fn parse_dpi_import(&mut self) -> DPIImport {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwImport);
         self.expect(TokenKind::StringLiteral); // "DPI-C" etc
         let property = match self.current_kind() {
@@ -393,7 +393,7 @@ impl Parser {
     }
 
     pub(super) fn parse_dpi_export(&mut self) -> DPIExport {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwExport);
         self.expect(TokenKind::StringLiteral);
         let mut c_name = None;
@@ -414,16 +414,19 @@ impl Parser {
     }
 
     pub(super) fn parse_timeunits_declaration(&mut self) -> TimeunitsDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut unit = None;
         let mut precision = None;
         if self.eat(TokenKind::KwTimeunit).is_some() {
-            unit = Some(self.bump().text.clone());
+            let tok = self.bump();
+            unit = Some(self.token_text(tok).into_owned());
             if self.eat(TokenKind::Slash).is_some() {
-                precision = Some(self.bump().text.clone());
+                let tok = self.bump();
+                precision = Some(self.token_text(tok).into_owned());
             }
         } else if self.eat(TokenKind::KwTimeprecision).is_some() {
-            precision = Some(self.bump().text.clone());
+            let tok = self.bump();
+            precision = Some(self.token_text(tok).into_owned());
         }
         self.expect(TokenKind::Semicolon);
         TimeunitsDeclaration {
@@ -434,7 +437,7 @@ impl Parser {
     }
 
     pub(super) fn parse_data_declaration(&mut self) -> DataDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let const_kw = self.eat(TokenKind::KwConst).is_some();
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         let lifetime = self.parse_optional_lifetime();
@@ -470,7 +473,7 @@ impl Parser {
     pub(super) fn parse_var_declarator_list(&mut self) -> Vec<VarDeclarator> {
         let mut decls = Vec::new();
         loop {
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let init = if self.eat(TokenKind::Assign).is_some() {
@@ -493,7 +496,7 @@ impl Parser {
     }
 
     pub(super) fn parse_function_declaration(&mut self) -> FunctionDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwFunction);
         let specifier = self.parse_optional_method_specifier();
@@ -597,7 +600,7 @@ impl Parser {
         ports: &mut Vec<FunctionPort>,
         _strict: &mut Vec<Identifier>,
     ) {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let direction = self
             .parse_optional_direction()
             .unwrap_or(PortDirection::Input);
@@ -655,7 +658,7 @@ impl Parser {
     }
 
     pub(super) fn parse_task_declaration(&mut self) -> TaskDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwTask);
         let specifier = self.parse_optional_method_specifier();
@@ -905,12 +908,12 @@ impl Parser {
     }
 
     pub(super) fn parse_method_name(&mut self) -> TypeName {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut name = if self.at(TokenKind::KwNew) {
             let tok = self.bump();
             Identifier {
-                name: tok.text.clone(),
-                span: tok.span,
+                name: self.token_text(tok).into_owned(),
+                span: self.token_span(tok),
             }
         } else {
             self.parse_identifier()
@@ -925,8 +928,8 @@ impl Parser {
             let next = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
                 Identifier {
-                    name: tok.text.clone(),
-                    span: tok.span,
+                    name: self.token_text(tok).into_owned(),
+                    span: self.token_span(tok),
                 }
             } else {
                 self.parse_identifier()
@@ -991,7 +994,7 @@ impl Parser {
     /// Parse a function prototype (no body, no endfunction). Used for pure virtual.
     /// Syntax: `function [lifetime] [type] name(ports);`
     pub(super) fn parse_function_prototype(&mut self) -> FunctionDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwFunction);
         let specifier = self.parse_optional_method_specifier();
@@ -1022,7 +1025,7 @@ impl Parser {
     }
 
     pub(super) fn parse_task_prototype(&mut self) -> TaskDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwTask);
         let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
@@ -1051,9 +1054,7 @@ impl Parser {
             && self
                 .tokens
                 .get(self.pos + 1)
-                .map(|t| t.text.as_str())
-                .unwrap_or("")
-                == "'";
+                .is_some_and(|t| self.token_text(t) == "'");
         if (self.is_data_type_keyword() || self.at(TokenKind::KwVoid)) && !is_type_cast {
             ParamValue::Type(self.parse_data_type())
         } else if self.at(TokenKind::KwVirtual)
@@ -1116,7 +1117,7 @@ impl Parser {
                     // `.NAME()` — empty binding; skip without pushing.
                     self.bump();
                 } else {
-                    let start = self.current().span.start;
+                    let start = self.current_span().start;
                     let value = match self.parse_param_value() {
                         ParamValue::Expr(e) => e,
                         ParamValue::Type(dt) => crate::ast::expr::Expression::new(
@@ -1173,7 +1174,7 @@ impl Parser {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                 break;
             }
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             let mut var_kw = self.eat(TokenKind::KwVar).is_some();
             let _const_kw = self.eat(TokenKind::KwConst).is_some();
             if !var_kw && self.at(TokenKind::KwVar) {
@@ -1396,7 +1397,7 @@ impl Parser {
             {
                 Identifier {
                     name: format!("__arg{}", ports.len()),
-                    span: self.current().span,
+                    span: self.current_span(),
                 }
             } else {
                 self.parse_identifier()
@@ -1453,11 +1454,11 @@ impl Parser {
                     // — modeled so a wildcard import only re-exposes nested
                     // imports the package actually EXPORTS (and, for
                     // wildcards, references). `*::*` records package "*".
-                    let start_sp = self.current().span.start;
+                    let start_sp = self.current_span().start;
                     self.bump(); // export
                     let mut items = Vec::new();
                     loop {
-                        let item_start = self.current().span.start;
+                        let item_start = self.current_span().start;
                         let package = if self.at(TokenKind::Star) {
                             self.bump();
                             Identifier {

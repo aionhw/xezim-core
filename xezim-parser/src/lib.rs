@@ -131,7 +131,7 @@ pub fn census_session() -> CensusSession {
 
 /// Add one token stream to the process-wide [`ReferenceCensus`]. Called for
 /// every stream the parser is built over, so nothing parsed escapes it.
-pub fn record_reference_census(tokens: &[lexer::Token]) {
+pub fn record_reference_census(tokens: &lexer::TokenStream<'_>) {
     use lexer::token::TokenKind as K;
     let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
     let census = guard.get_or_insert_with(ReferenceCensus::default);
@@ -207,7 +207,8 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
                 let unit_level =
                     regions.last() != Some(&Region::Unit) || regions.contains(&Region::Class);
                 if unit_level {
-                    let n = bare(&tok.text);
+                    let text = tokens.text(tok);
+                    let n = bare(&text);
                     if !census.unit_idents.contains(n) {
                         census.unit_idents.insert(n.to_string());
                     }
@@ -223,7 +224,8 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
                 }
                 if let Some(next) = tokens.get(i + 1) {
                     if matches!(next.kind, K::Identifier | K::EscapedIdentifier) {
-                        let n = bare(&next.text);
+                        let text = tokens.text(next);
+                        let n = bare(&text);
                         if !census.dotted.contains(n) {
                             census.dotted.insert(n.to_string());
                         }
@@ -233,19 +235,23 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
             // `\a.b ` is ONE identifier whose name holds a dot; the flat
             // namespace cannot tell it from the path `a.b`, so count every
             // component after a dot as dotted too.
-            K::EscapedIdentifier if tok.text.contains('.') => {
-                for part in bare(&tok.text).split('.').skip(1) {
-                    census.dotted.insert(part.to_string());
+            K::EscapedIdentifier => {
+                let text = tokens.text(tok);
+                if text.contains('.') {
+                    for part in bare(&text).split('.').skip(1) {
+                        census.dotted.insert(part.to_string());
+                    }
                 }
             }
             K::SystemIdentifier => {
-                if !census.system_names.contains(tok.text.as_str()) {
-                    census.system_names.insert(tok.text.clone());
+                let text = tokens.text(tok);
+                if !census.system_names.contains(text.as_ref()) {
+                    census.system_names.insert(text.into_owned());
                 }
             }
             K::KwImport | K::KwExport => {
                 if let Some(next) = tokens.get(i + 1) {
-                    if matches!(next.kind, K::StringLiteral) && next.text.contains("DPI") {
+                    if matches!(next.kind, K::StringLiteral) && tokens.text(next).contains("DPI") {
                         census.dpi = true;
                         return;
                     }
@@ -582,6 +588,7 @@ fn parse_impl(
     let source_text = parser.parse_source_text();
 
     let (errors, warnings) = partition_diagnostics(parser.diagnostics());
+    drop(parser);
 
     ParseResult {
         source_text: processed,
@@ -651,10 +658,10 @@ pub fn parse_multi(sources: &[&str]) -> ParseResult {
 }
 
 /// Tokenize a SystemVerilog source string (lex only, no parsing).
-pub fn tokenize(source: &str) -> Vec<lexer::Token> {
+pub fn tokenize(source: &str) -> Vec<lexer::OwnedToken> {
     let mut pp = preprocessor::Preprocessor::new();
     let processed = pp.preprocess(source);
-    lexer::Lexer::new(&processed).tokenize()
+    lexer::Lexer::new(&processed).tokenize().to_owned_tokens()
 }
 
 /// Preprocess a SystemVerilog source string (macro expansion, include handling).

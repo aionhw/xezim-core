@@ -981,6 +981,82 @@ pub struct RewriteCtx {
     pub upward: Rc<std::cell::RefCell<UpwardScopes>>,
 }
 
+/// Per-instance context needed to materialize a deferred instance-scoped
+/// function or task body (#193). Sibling callables of one instance share one `Rc`.
+#[derive(Debug, Clone)]
+pub struct CallableRewriteCtx {
+    pub ctx: Rc<RewriteCtx>,
+    /// Unpacked-array typedef names declared locally in this instance that
+    /// must be instance-prefixed in local declaration types (§6.18/§23.9).
+    pub local_array_typedefs: Option<Rc<std::collections::HashSet<String>>>,
+}
+
+impl CallableRewriteCtx {
+    /// Rewrite `source_items` into this instance's lexical scope, applying
+    /// formal/local shadowing, port/interface substitution, local unpacked-
+    /// array typedef scoping, and type-parameter substitution. Respects the
+    /// caller's `ast::cache` scope-cache mode (`without_scope_caches` or
+    /// `with_fresh_scope_caches`).
+    pub fn materialize_body(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        source_items: &[Statement],
+    ) -> Vec<Statement> {
+        let mut fn_locals = (*self.ctx.local_names).clone();
+        for p in ports {
+            fn_locals.remove(&p.name.name);
+        }
+        for n in stmt_list_declared_names(source_items) {
+            fn_locals.remove(n);
+        }
+        let formal_names: Vec<&str> = ports.iter().map(|p| p.name.name.as_str()).collect();
+        let mut items = with_type_bind_tls(&self.ctx, || {
+            with_shadowed(
+                &formal_names,
+                &self.ctx.port_map,
+                &fn_locals,
+                |ports, locals| {
+                    rewrite_stmt_list_scoped(
+                        source_items,
+                        &self.ctx.prefix,
+                        ports,
+                        locals,
+                        &self.ctx.interface_map,
+                    )
+                },
+            )
+        });
+        if let Some(lat) = &self.local_array_typedefs {
+            let prefix = &self.ctx.prefix;
+            let scope_array_typedef = |dt: &DataType| -> Option<DataType> {
+                match dt {
+                    DataType::TypeReference {
+                        name,
+                        dimensions,
+                        type_args,
+                        span,
+                    } if name.scopes.is_empty()
+                        && dimensions.is_empty()
+                        && lat.contains(&name.name.name) =>
+                    {
+                        let mut nn = name.clone();
+                        nn.name.name = cat2(prefix, &name.name.name);
+                        Some(DataType::TypeReference {
+                            name: nn,
+                            dimensions: dimensions.clone(),
+                            type_args: type_args.clone(),
+                            span: *span,
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            scope_local_decl_types(&mut items, &scope_array_typedef);
+        }
+        substitute_type_params_stmts(items, &self.ctx.type_binds)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingAlways {
     pub kind: AlwaysKind,
@@ -4486,6 +4562,16 @@ pub struct ElaboratedModule {
     pub pending_initial: Vec<PendingInitial>,
     #[serde(skip)]
     pub pending_cont_assign: Vec<PendingContAssign>,
+    /// Instance-scoped function bodies retained in shared definition syntax
+    /// (keyed by `functions` key). Materialized on demand or by
+    /// `materialize_pending`. Not serialized: artifact writers call
+    /// `materialize_pending()` first.
+    #[serde(skip)]
+    pub deferred_function_bodies: HashMap<String, Rc<CallableRewriteCtx>>,
+    /// Instance-scoped task bodies retained in shared definition syntax
+    /// (keyed by `tasks` key).
+    #[serde(skip)]
+    pub deferred_task_bodies: HashMap<String, Rc<CallableRewriteCtx>>,
     /// §6.7.1 / §28.16 net delays, keyed by flat net name, as (rise, fall,
     /// turn-off) in ticks. A net delay belongs to the NET: it delays every
     /// driver of it, not only a declaration assignment. Recorded where each
@@ -4904,6 +4990,8 @@ impl ElaboratedModule {
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
+            deferred_function_bodies: HashMap::default(),
+            deferred_task_bodies: HashMap::default(),
             tri_select_pulls: HashSet::default(),
             net_delays: HashMap::default(),
             const_decl_inits: HashSet::default(),
@@ -4927,12 +5015,126 @@ impl ElaboratedModule {
         }
     }
 
+    /// Materialize a deferred function body into a private `SharedVec` using
+    /// the caller's current scope-cache mode, or `None` when not deferred.
+    pub fn materialize_function_body(
+        &self,
+        key: &str,
+        fd: &FunctionDeclaration,
+    ) -> Option<crate::ast::shared_vec::SharedVec<Statement>> {
+        self.deferred_function_bodies
+            .get(key)
+            .map(|ctx| ctx.materialize_body(&fd.ports, &fd.items).into())
+    }
+
+    /// Materialize a deferred task body into a private `SharedVec` using
+    /// the caller's current scope-cache mode, or `None` when not deferred.
+    pub fn materialize_task_body(
+        &self,
+        key: &str,
+        td: &TaskDeclaration,
+    ) -> Option<crate::ast::shared_vec::SharedVec<Statement>> {
+        self.deferred_task_bodies
+            .get(key)
+            .map(|ctx| ctx.materialize_body(&td.ports, &td.items).into())
+    }
+
+    /// Borrow or materialize a function's instance-rewritten statements for a
+    /// read-only pass (keeping scope caches disabled if materialized).
+    pub fn resolved_function_items<'a>(
+        &self,
+        key: &str,
+        fd: &'a FunctionDeclaration,
+    ) -> std::borrow::Cow<'a, [Statement]> {
+        match self.deferred_function_bodies.get(key) {
+            Some(ctx) => std::borrow::Cow::Owned(crate::ast::cache::without_scope_caches(|| {
+                ctx.materialize_body(&fd.ports, &fd.items)
+            })),
+            None => std::borrow::Cow::Borrowed(&fd.items),
+        }
+    }
+
+    /// Borrow or materialize a task's instance-rewritten statements for a
+    /// read-only pass (keeping scope caches disabled if materialized).
+    pub fn resolved_task_items<'a>(
+        &self,
+        key: &str,
+        td: &'a TaskDeclaration,
+    ) -> std::borrow::Cow<'a, [Statement]> {
+        match self.deferred_task_bodies.get(key) {
+            Some(ctx) => std::borrow::Cow::Owned(crate::ast::cache::without_scope_caches(|| {
+                ctx.materialize_body(&td.ports, &td.items)
+            })),
+            None => std::borrow::Cow::Borrowed(&td.items),
+        }
+    }
+
+    /// Materialize one deferred function body in place inside `self.functions`.
+    /// Returns `true` if `key` was deferred and materialized.
+    pub fn materialize_function(&mut self, key: &str) -> bool {
+        let Some(ctx) = self.deferred_function_bodies.remove(key) else {
+            return false;
+        };
+        let Some(mut fd) = self.functions.get(key).cloned() else {
+            return false;
+        };
+        fd.items =
+            crate::ast::cache::without_scope_caches(|| ctx.materialize_body(&fd.ports, &fd.items))
+                .into();
+        self.functions.insert(key.to_string(), fd);
+        true
+    }
+
+    /// Materialize one deferred task body in place inside `self.tasks`.
+    /// Returns `true` if `key` was deferred and materialized.
+    pub fn materialize_task(&mut self, key: &str) -> bool {
+        let Some(ctx) = self.deferred_task_bodies.remove(key) else {
+            return false;
+        };
+        let Some(td) = self.tasks.get_mut(key) else {
+            return false;
+        };
+        td.items =
+            crate::ast::cache::without_scope_caches(|| ctx.materialize_body(&td.ports, &td.items))
+                .into();
+        true
+    }
+
+    /// Materialize every deferred instance-scoped function and task body in
+    /// place (`self.functions` / `self.tasks`) with scope caches disabled.
+    pub fn materialize_pending_callables(&mut self) {
+        let deferred_fns = std::mem::take(&mut self.deferred_function_bodies);
+        if !deferred_fns.is_empty() {
+            let mut functions = std::mem::take(&mut self.functions).into_map();
+            for (key, ctx) in deferred_fns {
+                if let Some(fd) = functions.get_mut(&key) {
+                    fd.items = crate::ast::cache::without_scope_caches(|| {
+                        ctx.materialize_body(&fd.ports, &fd.items)
+                    })
+                    .into();
+                }
+            }
+            self.functions = FuncTable::from_map(functions);
+        }
+        let deferred_tasks = std::mem::take(&mut self.deferred_task_bodies);
+        for (key, ctx) in deferred_tasks {
+            if let Some(td) = self.tasks.get_mut(&key) {
+                td.items = crate::ast::cache::without_scope_caches(|| {
+                    ctx.materialize_body(&td.ports, &td.items)
+                })
+                .into();
+            }
+        }
+    }
+
     /// Eager (non-streaming) drain of pending procedural blocks. Materializes
     /// every Pending* into the corresponding always_blocks/initial_blocks/
-    /// continuous_assigns vec. Keeps semantics identical to pre-#7 elaborate
-    /// at the cost of high peak memory — use streaming drains in performance-
-    /// sensitive paths (see drain_pending_*_for_each).
+    /// continuous_assigns vec, and materializes deferred callable bodies. Keeps
+    /// semantics identical to pre-#7 elaborate at the cost of high peak memory
+    /// — use streaming drains in performance-sensitive paths (see
+    /// drain_pending_*_for_each).
     pub fn materialize_pending(&mut self) {
+        self.materialize_pending_callables();
         let pending_always = std::mem::take(&mut self.pending_always);
         for p in pending_always {
             self.always_blocks.push(p.materialize());
@@ -34108,15 +34310,77 @@ fn collect_write_targets(
     for b in elab.initial_blocks.iter().chain(elab.final_blocks.iter()) {
         walk(&b.stmt, &mut out);
     }
-    for t in elab.tasks.values() {
-        for s in &t.items {
-            walk(s, &mut out);
-        }
+    struct RoutineRaw {
+        sets: Sets,
+        local_decls: Vec<String>,
     }
-    for f in elab.functions.values() {
-        for s in &f.items {
-            walk(s, &mut out);
+    let mut routine_memo: HashMap<usize, RoutineRaw> = HashMap::default();
+    let mut visit_routine = |items: &crate::ast::shared_vec::SharedVec<Statement>,
+                             ports: &[crate::ast::decl::FunctionPort],
+                             deferred: Option<&Rc<CallableRewriteCtx>>| {
+        let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+        let raw = routine_memo.entry(ptr).or_insert_with(|| {
+            let mut sets = Sets {
+                overrides: crate::hasher::HashSet::default(),
+                writes: crate::hasher::HashSet::default(),
+            };
+            for s in items.iter() {
+                walk(s, &mut sets);
+            }
+            let local_decls = stmt_list_declared_names(items)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            RoutineRaw { sets, local_decls }
+        });
+        let Some(dctx) = deferred else {
+            out.overrides.extend(raw.sets.overrides.iter().cloned());
+            out.writes.extend(raw.sets.writes.iter().cloned());
+            return;
+        };
+        let is_shadowed = |head: &str| {
+            ports.iter().any(|p| p.name.name == head)
+                || raw.local_decls.iter().any(|l| l == head)
+        };
+        for o in &raw.sets.overrides {
+            if !is_shadowed(o)
+                && let Some(actual) = dctx.ctx.port_map.get(o)
+            {
+                leaf(actual, &mut out.overrides);
+            } else {
+                out.overrides.insert(o.clone());
+            }
         }
+        for w in &raw.sets.writes {
+            let head = w.split('.').next().unwrap_or(w);
+            if !is_shadowed(head) {
+                if dctx.ctx.local_names.contains(head) {
+                    out.writes.insert(cat2(&dctx.ctx.prefix, w));
+                    continue;
+                }
+                if let Some(actual) = dctx.ctx.port_map.get(head) {
+                    let rest = &w[head.len()..];
+                    let mut mapped = crate::hasher::HashSet::default();
+                    flat(actual, &mut mapped);
+                    for m in mapped {
+                        out.writes.insert(format!("{}{}", m, rest));
+                    }
+                    continue;
+                }
+                if let Some(iface) = dctx.ctx.interface_map.get(head) {
+                    let rest = &w[head.len()..];
+                    out.writes.insert(format!("{}{}", iface, rest));
+                    continue;
+                }
+            }
+            out.writes.insert(w.clone());
+        }
+    };
+    for (k, t) in &elab.tasks {
+        visit_routine(&t.items, &t.ports, elab.deferred_task_bodies.get(k));
+    }
+    for (k, f) in elab.functions.iter() {
+        visit_routine(&f.items, &f.ports, elab.deferred_function_bodies.get(k));
     }
     for c in elab.classes.values() {
         for m in c.methods.values() {
@@ -36056,27 +36320,64 @@ fn is_builtin_bare_name(name: &str) -> bool {
     )
 }
 
+type BindResolveStep<'a> = dyn FnMut(
+    &mut ElaboratedModule,
+) -> Result<Vec<(String, Vec<crate::ast::decl::BindDirective>)>, String>
+    + 'a;
+
+struct PortElisionGuard;
+impl Drop for PortElisionGuard {
+    fn drop(&mut self) {
+        PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
+    }
+}
+
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    inline_instantiations_core(elab, definitions, None).map(|_| ())
+}
+
+/// Inline the hierarchy rooted at `elab.name` and resolve any nested `bind`
+/// fixed-point incrementally on newly introduced targets. Returns `Ok(true)` if
+/// a rare cross-pass edge case requires a full root rebuild from the populated
+/// `elab.resolved_binds`.
+pub(crate) fn inline_instantiations_with_binds(
+    elab: &mut ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+    unit_binds: &[crate::ast::decl::BindDirective],
+    resolve_step: &mut BindResolveStep<'_>,
+) -> Result<bool, String> {
+    inline_instantiations_core(elab, definitions, Some((unit_binds, resolve_step)))
+}
+
+fn inline_instantiations_core(
+    elab: &mut ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+    bind_driver: Option<(&[crate::ast::decl::BindDirective], &mut BindResolveStep<'_>)>,
+) -> Result<bool, String> {
     let _oom_trace = crate::oom_trace::session();
     let _oom_inline = crate::oom_trace::scope("inline hierarchy", "", &elab.name, &elab.name);
     port_elision_setup();
-    let result = inline_instantiations_inner(elab, definitions);
-    PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
+    let _port_elision_guard = PortElisionGuard;
+    let needs_rebuild = inline_instantiations_inner(elab, definitions, bind_driver)?;
+    if needs_rebuild {
+        return Ok(true);
+    }
     elab.elided_port_hashes.sort_unstable();
     elab.elided_port_hashes.dedup();
     // The instances' and interfaces' own arrays, as the top's.
     register_nd_struct_array_members(elab);
-    result
+    Ok(false)
 }
 
 fn inline_instantiations_inner(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
-) -> Result<(), String> {
+    bind_driver: Option<(&[crate::ast::decl::BindDirective], &mut BindResolveStep<'_>)>,
+) -> Result<bool, String> {
     let header_values: Vec<_> = definitions
         .get(&elab.name)
         .into_iter()
@@ -37169,8 +37470,21 @@ fn inline_instantiations_inner(
     // the entries its definition can name (#740).
     let param_scope =
         param_scope::ParamScope::new(&top_params, definitions, &elab.resolved_binds, &elab.lets);
-    let top_scope = param_scope.top_scope(top_def, definitions);
-    inline_module_items(
+    let mut top_scope = param_scope.top_scope(top_def, definitions);
+    let mut bind_state = bind_driver.as_ref().and_then(|(unit_binds, _)| {
+        BindTargetFilter::collect(
+            top_def.name(),
+            unit_binds,
+            definitions,
+            &elab.checker_decls,
+        )
+        .map(|filter| BindWorklistState {
+            filter,
+            scopes: HashMap::default(),
+            needs_full_rebuild: false,
+        })
+    });
+    let top_meta = inline_module_items(
         elab,
         top_def,
         "",
@@ -37181,7 +37495,58 @@ fn inline_instantiations_inner(
         &HashMap::default(),
         &root_defparams,
         &param_scope,
+        bind_state.as_mut(),
     )?;
+    if let Some(bs) = bind_state.as_mut()
+        && bs.filter.can_target_top
+    {
+        let top_defparams = if !top_meta.was_flat_leaf {
+            top_meta.defparams
+        } else {
+            root_defparams
+        };
+        bs.scopes.insert(
+            String::new(),
+            TargetScope {
+                def_name: module_name.clone(),
+                local_names: top_meta.local_names,
+                local_typedefs: top_meta.local_typedefs,
+                interface_map: HashMap::default(),
+                port_map: Rc::new(HashMap::default()),
+                local_params: std::mem::take(&mut top_scope),
+                defparams: top_defparams,
+                type_overlay: None,
+                items_end: top_meta.items_end,
+                was_flat_leaf: top_meta.was_flat_leaf,
+            },
+        );
+    }
+    if let (Some((_, resolve_step)), Some(mut bs)) = (bind_driver, bind_state) {
+        for pass in 0..64 {
+            let new_binds = resolve_step(elab)?;
+            if new_binds.is_empty() {
+                break;
+            }
+            if pass == 63 {
+                return Err("bind hierarchy does not converge (§23.11)".into());
+            }
+            for (target_path, directives) in new_binds {
+                inline_bound_items(
+                    elab,
+                    &target_path,
+                    &directives,
+                    definitions,
+                    &mut cache,
+                    &param_scope,
+                    &mut bs,
+                )?;
+                if bs.needs_full_rebuild {
+                    return Ok(true);
+                }
+            }
+        }
+        drop(bs);
+    }
     crate::oom_trace::model("inline.top.ready", elab, Some(cache.prepared.len()));
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
@@ -37200,7 +37565,7 @@ fn inline_instantiations_inner(
     // implicit 1-bit wires for any prefixed names that don't yet exist.
     create_implicit_nets_for_pending(elab);
 
-    // Identify interface instances at top level
+    // Identify interface instances at top level (declared or bound directly to top)
     let mut top_interface_names = HashSet::default();
     for item in top_def.items() {
         if let ModuleItem::ModuleInstantiation(inst) = item {
@@ -37209,6 +37574,18 @@ fn inline_instantiations_inner(
                 .is_some_and(|d| matches!(d, Definition::Interface(_)))
             {
                 for hi in &inst.instances {
+                    top_interface_names.insert(hi.name.name.clone());
+                }
+            }
+        }
+    }
+    if let Some(top_binds) = elab.resolved_binds.get("") {
+        for b in top_binds {
+            if definitions
+                .get(&b.instantiation.module_name.name)
+                .is_some_and(|d| matches!(d, Definition::Interface(_)))
+            {
+                for hi in &b.instantiation.instances {
                     top_interface_names.insert(hi.name.name.clone());
                 }
             }
@@ -37285,7 +37662,7 @@ fn inline_instantiations_inner(
     // member` at elaboration). Only accesses proven illegal are rejected.
     validate_member_visibility(elab)?;
 
-    Ok(())
+    Ok(false)
 }
 
 /// Construct an unsized integer-literal `Expression` for a genvar value.
@@ -39937,6 +40314,15 @@ struct InlineCache {
     equal_prepared: HashMap<(String, usize), EqualPrepared>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
+    /// Cache-disabled shared source bodies keyed by original `Arc` pointer,
+    /// avoiding repeated cloning/interning across sibling instances (#193).
+    shared_callable_sources: HashMap<
+        usize,
+        (
+            std::sync::Arc<Vec<Statement>>,
+            crate::ast::shared_vec::SharedVec<Statement>,
+        ),
+    >,
     /// §6.20.3 / §20.7: equal type bindings and their independent width/query
     /// snapshots are immutable. Keep one copy through deferred rewriting.
     type_binds: context_maps::MapInterner<DataType>,
@@ -39963,6 +40349,25 @@ type ImportedTypedefs = Rc<[(String, String)]>;
 impl InlineCache {
     #[cfg(test)]
     fn len(&self) -> usize { self.prepared.len() }
+
+    fn share_callable_source(
+        &mut self,
+        source: &crate::ast::shared_vec::SharedVec<Statement>,
+    ) -> crate::ast::shared_vec::SharedVec<Statement> {
+        let ptr = std::sync::Arc::as_ptr(source.as_arc()) as usize;
+        if let Some((orig, shared)) = self.shared_callable_sources.get(&ptr)
+            && std::sync::Arc::ptr_eq(orig, source.as_arc())
+        {
+            return shared.clone();
+        }
+        let disabled = crate::ast::cache::without_scope_caches(|| source.clone());
+        let interned = self.callable_bodies.intern(disabled);
+        self.shared_callable_sources.insert(
+            ptr,
+            (std::sync::Arc::clone(source.as_arc()), interned.clone()),
+        );
+        interned
+    }
 
     /// §26.3: the typedefs the imports of `def` bind, in binding order. An
     /// import of a package the design does not declare is an error, at that
@@ -41674,6 +42079,655 @@ fn bind_inlined_import_params(
     Ok(())
 }
 
+/// Static filter indexing every target that any `bind` directive in the
+/// design could ever match. When empty (`collect` returns `None`),
+/// non-bind designs retain zero `TargetScope` state.
+struct BindTargetFilter {
+    target_defs: HashSet<String>,
+    target_leaf_names: HashSet<String>,
+    can_target_top: bool,
+    has_non_plain_bind: bool,
+}
+
+impl BindTargetFilter {
+    fn collect(
+        top_def_name: &str,
+        unit_binds: &[BindDirective],
+        definitions: &HashMap<String, Definition>,
+        checker_decls: &HashMap<String, crate::ast::decl::CheckerDeclaration>,
+    ) -> Option<Self> {
+        let mut filter = Self {
+            target_defs: HashSet::default(),
+            target_leaf_names: HashSet::default(),
+            can_target_top: false,
+            has_non_plain_bind: false,
+        };
+        let mut any = false;
+        let mut note_bind = |b: &BindDirective| {
+            any = true;
+            if b.target_path.is_empty() {
+                filter.target_defs.insert(b.target_module.name.clone());
+                filter
+                    .target_leaf_names
+                    .insert(b.target_module.name.clone());
+                if b.target_module.name == top_def_name {
+                    filter.can_target_top = true;
+                }
+            } else {
+                for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
+                    if let Some(last) = path.last() {
+                        filter.target_leaf_names.insert(last.name.name.clone());
+                        if (path.len() == 1 && last.name.name == top_def_name)
+                            || (path.len() == 2
+                                && path[0].name.name == "$root"
+                                && last.name.name == top_def_name)
+                        {
+                            filter.can_target_top = true;
+                        }
+                    }
+                }
+            }
+            let bound_name = &b.instantiation.module_name.name;
+            let plain = matches!(
+                definitions.get(bound_name),
+                Some(Definition::Module(_) | Definition::Interface(_) | Definition::Program(_))
+            ) && !checker_decls.contains_key(bound_name);
+            if !plain {
+                filter.has_non_plain_bind = true;
+            }
+        };
+        for b in unit_binds {
+            note_bind(b);
+        }
+        fn walk_items(items: &[ModuleItem], note_bind: &mut impl FnMut(&BindDirective)) {
+            for item in items {
+                match item {
+                    ModuleItem::Bind(b) => note_bind(b),
+                    ModuleItem::GenerateRegion(gr) => walk_items(&gr.items, note_bind),
+                    ModuleItem::GenerateFor(gf) => walk_items(&gf.items, note_bind),
+                    ModuleItem::GenerateIf(gi) => {
+                        for (_, branch) in &gi.branches {
+                            walk_items(branch, note_bind);
+                        }
+                    }
+                    ModuleItem::GenerateCase(gc) => {
+                        for arm in &gc.arms {
+                            walk_items(&arm.items, note_bind);
+                        }
+                    }
+                    ModuleItem::NestedModule(nm) => walk_items(&nm.items, note_bind),
+                    _ => {}
+                }
+            }
+        }
+        for def in definitions.values() {
+            match def {
+                Definition::Module(m) => walk_items(&m.items, &mut note_bind),
+                Definition::Interface(i) => walk_items(&i.items, &mut note_bind),
+                Definition::Program(p) => walk_items(&p.items, &mut note_bind),
+                _ => {}
+            }
+        }
+        any.then_some(filter)
+    }
+
+    fn matches(&self, inst_path: &str, def_name: &str) -> bool {
+        if inst_path.is_empty() {
+            return self.can_target_top;
+        }
+        if self.target_defs.contains(def_name) {
+            return true;
+        }
+        let leaf = inst_path.rsplit('.').next().unwrap_or(inst_path);
+        let base = if leaf.ends_with(']') {
+            leaf.split('[').next().unwrap_or(leaf)
+        } else {
+            leaf
+        };
+        self.target_leaf_names.contains(base)
+    }
+}
+
+/// Active typedef / type-parameter overrides of an elaborated instance while
+/// its body was inlined, captured for later incremental `bind` passes.
+struct TargetTypeOverlay {
+    typedef_binds: Vec<(String, Option<u32>, Option<DataType>)>,
+    type_shapes: Vec<(String, TypedefShapeSave)>,
+    unpacked_dims: Vec<(String, Option<Vec<UnpackedDimension>>)>,
+}
+
+type AppliedTypeOverlay = TargetTypeOverlay;
+
+/// Elaboration environment captured for a scope that may receive bound
+/// instances on a later `bind` fixed-point pass.
+struct TargetScope {
+    def_name: String,
+    local_names: Option<Rc<std::collections::HashSet<String>>>,
+    local_typedefs: Option<Box<std::collections::HashSet<String>>>,
+    interface_map: HashMap<String, String>,
+    port_map: Rc<HashMap<String, Expression>>,
+    local_params: HashMap<String, Value>,
+    defparams: Vec<PendingDefparam>,
+    type_overlay: Option<Box<TargetTypeOverlay>>,
+    items_end: usize,
+    was_flat_leaf: bool,
+}
+
+struct BindWorklistState {
+    filter: BindTargetFilter,
+    scopes: HashMap<String, TargetScope>,
+    needs_full_rebuild: bool,
+}
+
+struct ModuleInlineMeta {
+    items_end: usize,
+    was_flat_leaf: bool,
+    local_names: Option<Rc<std::collections::HashSet<String>>>,
+    local_typedefs: Option<Box<std::collections::HashSet<String>>>,
+    defparams: Vec<PendingDefparam>,
+}
+
+fn capture_type_overlay(
+    elab: &ElaboratedModule,
+    saved_type_binds: &[(String, Option<u32>, Option<DataType>)],
+    saved_type_shapes: &[(String, TypedefShapeSave)],
+    saved_unpacked_dims: &[(String, Option<Vec<UnpackedDimension>>)],
+) -> Option<Box<TargetTypeOverlay>> {
+    if saved_type_binds.is_empty()
+        && saved_type_shapes.is_empty()
+        && saved_unpacked_dims.is_empty()
+    {
+        return None;
+    }
+    let mut seen = HashSet::default();
+    let mut typedef_binds = Vec::with_capacity(saved_type_binds.len());
+    for (name, _, _) in saved_type_binds {
+        if seen.insert(name.as_str()) {
+            typedef_binds.push((
+                name.clone(),
+                elab.typedefs.get(name).copied(),
+                elab.typedef_types.get(name).cloned(),
+            ));
+        }
+    }
+    seen.clear();
+    let mut type_shapes = Vec::with_capacity(saved_type_shapes.len());
+    for (name, _) in saved_type_shapes {
+        if seen.insert(name.as_str()) {
+            type_shapes.push((name.clone(), tls_typedef_shape(name)));
+        }
+    }
+    seen.clear();
+    let mut unpacked_dims = Vec::with_capacity(saved_unpacked_dims.len());
+    for (name, _) in saved_unpacked_dims {
+        if seen.insert(name.as_str()) {
+            unpacked_dims.push((name.clone(), elab.typedef_unpacked_dims.get(name).cloned()));
+        }
+    }
+    Some(Box::new(TargetTypeOverlay {
+        typedef_binds,
+        type_shapes,
+        unpacked_dims,
+    }))
+}
+
+fn apply_type_overlay(
+    elab: &mut ElaboratedModule,
+    overlay: &TargetTypeOverlay,
+) -> AppliedTypeOverlay {
+    let mut prev_binds = Vec::with_capacity(overlay.typedef_binds.len());
+    for (name, w, dt) in &overlay.typedef_binds {
+        prev_binds.push((
+            name.clone(),
+            elab.typedefs.get(name).copied(),
+            elab.typedef_types.get(name).cloned(),
+        ));
+        match w {
+            Some(width) => {
+                elab.typedefs.insert_if_changed(name.clone(), *width);
+            }
+            None => {
+                elab.typedefs.remove(name);
+            }
+        }
+        match dt {
+            Some(t) => {
+                elab.typedef_types.insert(name.clone(), t.clone());
+            }
+            None => {
+                elab.typedef_types.remove(name);
+            }
+        }
+    }
+    let mut prev_shapes = Vec::with_capacity(overlay.type_shapes.len());
+    for (name, shape) in &overlay.type_shapes {
+        prev_shapes.push((name.clone(), tls_typedef_shape(name)));
+        tls_restore_typedef_shape(name, shape.clone());
+    }
+    let mut prev_dims = Vec::with_capacity(overlay.unpacked_dims.len());
+    for (name, dims) in &overlay.unpacked_dims {
+        prev_dims.push((name.clone(), elab.typedef_unpacked_dims.get(name).cloned()));
+        match dims {
+            Some(d) => {
+                elab.typedef_unpacked_dims.insert(name.clone(), d.clone());
+            }
+            None => {
+                elab.typedef_unpacked_dims.remove(name);
+            }
+        }
+    }
+    AppliedTypeOverlay {
+        typedef_binds: prev_binds,
+        type_shapes: prev_shapes,
+        unpacked_dims: prev_dims,
+    }
+}
+
+fn restore_type_overlay(elab: &mut ElaboratedModule, prev: AppliedTypeOverlay) {
+    for (name, shape) in prev.type_shapes.into_iter().rev() {
+        tls_restore_typedef_shape(&name, shape);
+    }
+    for (name, dims) in prev.unpacked_dims.into_iter().rev() {
+        match dims {
+            Some(d) => {
+                elab.typedef_unpacked_dims.insert(name, d);
+            }
+            None => {
+                elab.typedef_unpacked_dims.remove(&name);
+            }
+        }
+    }
+    for (name, w, dt) in prev.typedef_binds.into_iter().rev() {
+        match w {
+            Some(width) => {
+                elab.typedefs.insert_if_changed(name.clone(), width);
+            }
+            None => {
+                elab.typedefs.remove(&name);
+            }
+        }
+        match dt {
+            Some(t) => {
+                elab.typedef_types.insert(name, t);
+            }
+            None => {
+                elab.typedef_types.remove(&name);
+            }
+        }
+    }
+    sync_typedefs_tls(&elab.typedefs);
+}
+
+fn create_target_implicit_nets(
+    elab: &mut ElaboratedModule,
+    target_def: Definition,
+    inst_prefix: &str,
+    mut cands: Vec<String>,
+) {
+    if cands.is_empty() {
+        return;
+    }
+    let __ta = iprof_now();
+    let target_port_names: std::collections::HashSet<String> = match target_def.ports() {
+        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
+        PortList::NonAnsi(ps) => ps.iter().map(|p| p.name.clone()).collect(),
+        _ => std::collections::HashSet::default(),
+    };
+    let target_declares: std::collections::HashSet<String> = {
+        let mut v = Vec::new();
+        visit_renamed_decls(target_def.items(), &mut |n, _, kind| {
+            if kind != DeclKind::Label {
+                v.push(n.to_string())
+            }
+        });
+        // §6.20: a HEADER parameter (`#(parameter ...)`) is a
+        // constant, not a net: `leaf u (.a(VREF));` binds its
+        // value. The body items above cover body parameters
+        // and localparams but not the header, so such an
+        // actual was taken for an undeclared identifier.
+        for pd in target_def.params() {
+            match &pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+                ParameterKind::Type { assignments } => {
+                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+            }
+        }
+        v.into_iter().collect()
+    };
+    cands.sort();
+    cands.dedup();
+    for name in cands {
+        // A formal port of the sub-module is bound to the
+        // parent's expression, not declared here.
+        if target_port_names.contains(&name) {
+            continue;
+        }
+        let scoped = cat2(inst_prefix, &name);
+        // §6.10: the implicit net belongs to THIS instance, so
+        // the existence test must be SCOPED. A bare
+        // `signals.contains_key(name)` skipped creation
+        // whenever anything ANYWHERE shared the bare spelling —
+        // including an INSTANCE-NAME placeholder, since
+        // instantiating `foo c (...)` registers a signal named
+        // `c`. A gate library hits this constantly: a cell's
+        // `buf IC (clk, dCK);` wants its own implicit `clk`,
+        // every design has some other `clk`, and the cell's
+        // flops were then never clocked and read x.
+        if elab.signals.contains_key(&scoped)
+            || elab.parameters.contains_key(&name)
+            || elab.parameters.contains_key(&scoped)
+            || elab.nets.contains(&scoped)
+            || elab.arrays.contains_key(&scoped)
+            || elab.arrays_2d.contains_key(&scoped)
+            || elab.arrays_nd.contains_key(&scoped)
+            || elab.interfaces.contains(&scoped)
+        {
+            continue;
+        }
+        // Declared inside the sub-module itself (a net/var
+        // declaration or one of its own ports) — the regular
+        // inline paths create those.
+        if target_declares.contains(&name) {
+            continue;
+        }
+        if crate::implicit_net_warn() {
+            crate::elab_diag(format!(
+                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                 (IEEE 1800-2017 §6.10, instance port connection). Add an explicit declaration to silence.",
+                scoped
+            ));
+        }
+        signals_insert_traced(
+            &mut elab.signals,
+            line!(),
+            scoped.clone(),
+            Signal {
+                is_const: false,
+                name: scoped.clone().into(),
+                width: 1,
+                is_signed: false,
+                direction: None,
+                value: Value::new(1),
+                is_real: false,
+                type_name: None,
+            },
+        );
+        elab.implicit_nets.insert(scoped.clone());
+        elab.nets.insert(scoped);
+    }
+    iprof_since("implicit_net_scan", __ta);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_bound_items(
+    elab: &mut ElaboratedModule,
+    target_path: &str,
+    directives: &[BindDirective],
+    definitions: &HashMap<String, Definition>,
+    cache: &mut InlineCache,
+    param_scope: &param_scope::ParamScope,
+    bind_state: &mut BindWorklistState,
+) -> Result<(), String> {
+    let mut scope = bind_state
+        .scopes
+        .remove(target_path)
+        .ok_or_else(|| format!("missing bind target scope '{}'", target_path))?;
+    let source_def = *definitions
+        .get(&scope.def_name)
+        .ok_or_else(|| format!("Bind target definition '{}' not found", scope.def_name))?;
+    let prefix = if target_path.is_empty() {
+        String::new()
+    } else {
+        format!("{target_path}.")
+    };
+    for b in directives {
+        if let Some(def) = definitions.get(&b.instantiation.module_name.name) {
+            crate::param_override_lists::check_bound_instance(
+                &b.instantiation,
+                *def,
+                source_def.name(),
+            )?;
+        }
+    }
+    let chain = {
+        let scopes = elab.upward_scopes.borrow();
+        let mut rev_chain: Vec<(String, String)> = Vec::new();
+        let mut cur = target_path;
+        loop {
+            let def_name = scopes
+                .defs
+                .get(cur)
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| {
+                    if cur == target_path {
+                        scope.def_name.clone()
+                    } else {
+                        String::new()
+                    }
+                });
+            let pfx = if cur.is_empty() {
+                String::new()
+            } else {
+                format!("{cur}.")
+            };
+            rev_chain.push((pfx, def_name));
+            if cur.is_empty() {
+                break;
+            }
+            if let Some(parent) = scopes.parents.get(cur) {
+                // `parent.path` lives behind `Ref` to `UpwardScopes`; walk via
+                // string slice lifetime tied to `scopes`.
+                let mut p: &str = &*parent.path;
+                while !p.is_empty() && !scopes.defs.contains_key(p) {
+                    p = p.rsplit_once('.').map(|(head, _)| head).unwrap_or("");
+                }
+                cur = p;
+            } else {
+                let mut p = cur.rsplit_once('.').map(|(head, _)| head).unwrap_or("");
+                while !p.is_empty() && !scopes.defs.contains_key(p) {
+                    p = p.rsplit_once('.').map(|(head, _)| head).unwrap_or("");
+                }
+                cur = p;
+            }
+        }
+        rev_chain.reverse();
+        rev_chain
+    };
+    let prev_chain = INLINE_CHAIN_TLS.with(|c| c.replace(chain));
+    struct ChainRestore(Vec<(String, String)>);
+    impl Drop for ChainRestore {
+        fn drop(&mut self) {
+            let prev = std::mem::take(&mut self.0);
+            INLINE_CHAIN_TLS.with(|c| {
+                *c.borrow_mut() = prev;
+            });
+        }
+    }
+    let _chain_restore = ChainRestore(prev_chain);
+
+    install_upward_scopes(&elab.upward_scopes);
+    let _decl_shapes = install_decl_shapes(source_def);
+
+    let imports = cache.imported_typedefs(elab, source_def, definitions)?;
+    rebind_imported_typedefs(elab, &imports);
+    if !cache.param_imports_done.contains(source_def.name()) {
+        cache
+            .param_imports_done
+            .insert(source_def.name().to_string());
+        bind_inlined_import_params(elab, source_def, definitions)?;
+    }
+
+    let applied_overlay = scope
+        .type_overlay
+        .as_deref()
+        .map(|o| apply_type_overlay(elab, o));
+    sync_typedefs_tls(&elab.typedefs);
+
+    param_scope.extend_scope_for_binds(directives, definitions, &mut scope.local_params);
+
+    if scope.was_flat_leaf {
+        for item in source_def.items() {
+            scope.items_end = scope.items_end.max(match item {
+                ModuleItem::InitialConstruct(ic) => ic.span.end,
+                ModuleItem::AlwaysConstruct(ac) => ac.span.end,
+                ModuleItem::AssertionItem(a) => a.span.end,
+                ModuleItem::ModuleInstantiation(mi) => mi.span.end,
+                _ => 0,
+            });
+            if let ModuleItem::Defparam(assigns) = item {
+                for (lhs, rhs) in assigns {
+                    if let Some(path) = defparam_path_segments(lhs) {
+                        scope.defparams.push(PendingDefparam {
+                            path,
+                            value: eval_const_expr_val(rhs, &scope.local_params),
+                            span: lhs.span,
+                            owner: source_def.name().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        scope.was_flat_leaf = false;
+    }
+
+    let mut bound: Vec<ModuleItem> = directives
+        .iter()
+        .rev()
+        .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
+        .collect();
+    let has_arrays = has_instance_arrays(&bound);
+    if has_arrays || scope.local_names.is_none() {
+        cache.prepared.enter_instance(&prefix);
+        let prepared = prepare_module_items(
+            source_def,
+            definitions,
+            &scope.local_params,
+            &elab.typedefs,
+            cache,
+            param_scope,
+        );
+        if scope.local_names.is_none() {
+            scope.local_names = Some(Rc::clone(&prepared.local_names));
+            if !prepared.local_typedefs.is_empty() {
+                scope.local_typedefs = Some(Box::new(prepared.local_typedefs.clone()));
+            }
+        }
+        if has_arrays {
+            let shapes = ai_scope_shapes(
+                &prepared.effective_items,
+                source_def,
+                &scope.local_params,
+                &elab.typedefs,
+            );
+            ai_expand_instance_arrays(
+                &mut bound,
+                &shapes,
+                definitions,
+                &scope.local_params,
+                &elab.typedefs,
+            );
+        }
+    }
+
+    let mut cands = Vec::new();
+    collect_port_connection_net_candidates(&bound, &mut cands);
+    if !cands.is_empty() {
+        let local_names = scope
+            .local_names
+            .get_or_insert_with(|| Rc::new(std::collections::HashSet::default()));
+        if cands.iter().any(|n| !local_names.contains(n)) {
+            Rc::make_mut(local_names).extend(cands.iter().cloned());
+        }
+        create_target_implicit_nets(elab, source_def, &prefix, cands);
+    }
+
+    register_modport_expressions(&bound, &prefix, definitions);
+    let mut sibling_inst_names: std::collections::HashSet<String> = {
+        let scopes = elab.upward_scopes.borrow();
+        scopes
+            .children
+            .get(target_path)
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|p| UpwardScopes::child_leaf(target_path, p).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for item in &bound {
+        if let ModuleItem::ModuleInstantiation(mi) = item {
+            for hi in &mi.instances {
+                sibling_inst_names.insert(hi.name.name.clone());
+            }
+        }
+    }
+
+    if !prefix.is_empty() {
+        for item in &bound {
+            if let ModuleItem::ModuleInstantiation(mi) = item
+                && definitions
+                    .get(&mi.module_name.name)
+                    .is_some_and(|d| matches!(d, Definition::Interface(_)))
+            {
+                for hi in &mi.instances {
+                    if elab.interface_port_aliases.iter().any(|(k, v)| {
+                        k.starts_with(&prefix)
+                            && v.split(|c| c == '.' || c == '[').next()
+                                == Some(hi.name.name.as_str())
+                    }) {
+                        bind_state.needs_full_rebuild = true;
+                        break;
+                    }
+                }
+            }
+            if bind_state.needs_full_rebuild {
+                break;
+            }
+        }
+    }
+
+    let res = if bind_state.needs_full_rebuild {
+        Ok(())
+    } else {
+        let empty_names = std::collections::HashSet::default();
+        let parent_local_names: &std::collections::HashSet<String> =
+            scope.local_names.as_deref().unwrap_or(&empty_names);
+        let parent_local_typedefs: &std::collections::HashSet<String> =
+            scope.local_typedefs.as_deref().unwrap_or(&empty_names);
+        inline_instantiation_items(
+            elab,
+            source_def,
+            &prefix,
+            definitions,
+            &mut scope.interface_map,
+            &scope.local_params,
+            cache,
+            &scope.port_map,
+            &scope.defparams,
+            param_scope,
+            parent_local_names,
+            parent_local_typedefs,
+            &sibling_inst_names,
+            &mut scope.items_end,
+            &bound,
+            Some(bind_state),
+        )
+    };
+
+    if let Some(prev) = applied_overlay {
+        restore_type_overlay(elab, prev);
+    } else {
+        sync_typedefs_tls(&elab.typedefs);
+    }
+    bind_state.scopes.insert(target_path.to_string(), scope);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -41698,7 +42752,8 @@ fn inline_module_items(
     // §23.10/§26.3: the package, `$unit` and top parameters, from which a
     // child's scope takes the entries its definition can name.
     param_scope: &param_scope::ParamScope,
-) -> Result<(), String> {
+    mut bind_state: Option<&mut BindWorklistState>,
+) -> Result<ModuleInlineMeta, String> {
     // Bind this module's imported type names BEFORE its body is prepared or
     // resolved. The top-module path re-runs its imports
     // (`elaborate_module_with_defs`); the inlined-instance path never processed
@@ -41776,7 +42831,13 @@ fn inline_module_items(
                 }
             }
         }
-        return Ok(());
+        return Ok(ModuleInlineMeta {
+            items_end: 0,
+            was_flat_leaf: true,
+            local_names: None,
+            local_typedefs: None,
+            defparams: Vec::new(),
+        });
     }
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
@@ -41896,9 +42957,69 @@ fn inline_module_items(
     // End offset of the process/instance items seen so far (see
     // `ElabInstance::src_pos`).
     let mut items_end = 0usize;
-    for item in &prepared_source.effective_items {
-        let item_floor = items_end;
-        items_end = items_end.max(match item {
+    inline_instantiation_items(
+        elab,
+        source_def,
+        prefix,
+        definitions,
+        interface_map,
+        local_params,
+        cache,
+        parent_port_map,
+        &defparams,
+        param_scope,
+        &prepared_source.local_names,
+        &prepared_source.local_typedefs,
+        &sibling_inst_names,
+        &mut items_end,
+        &prepared_source.effective_items,
+        bind_state.as_deref_mut(),
+    )?;
+    if bind_state
+        .as_ref()
+        .is_some_and(|bs| bs.filter.matches(prefix.trim_end_matches('.'), source_def.name()))
+    {
+        Ok(ModuleInlineMeta {
+            items_end,
+            was_flat_leaf: false,
+            local_names: Some(Rc::clone(&prepared_source.local_names)),
+            local_typedefs: (!prepared_source.local_typedefs.is_empty())
+                .then(|| Box::new(prepared_source.local_typedefs.clone())),
+            defparams,
+        })
+    } else {
+        Ok(ModuleInlineMeta {
+            items_end,
+            was_flat_leaf: false,
+            local_names: None,
+            local_typedefs: None,
+            defparams: Vec::new(),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_instantiation_items(
+    elab: &mut ElaboratedModule,
+    source_def: Definition,
+    prefix: &str,
+    definitions: &HashMap<String, Definition>,
+    interface_map: &mut HashMap<String, String>,
+    local_params: &HashMap<String, Value>,
+    cache: &mut InlineCache,
+    parent_port_map: &HashMap<String, Expression>,
+    defparams: &[PendingDefparam],
+    param_scope: &param_scope::ParamScope,
+    parent_local_names: &std::collections::HashSet<String>,
+    parent_local_typedefs: &std::collections::HashSet<String>,
+    sibling_inst_names: &std::collections::HashSet<String>,
+    items_end: &mut usize,
+    items: &[ModuleItem],
+    mut bind_state: Option<&mut BindWorklistState>,
+) -> Result<(), String> {
+    for item in items {
+        let item_floor = *items_end;
+        *items_end = (*items_end).max(match item {
             ModuleItem::InitialConstruct(ic) => ic.span.end,
             ModuleItem::AlwaysConstruct(ac) => ac.span.end,
             ModuleItem::AssertionItem(a) => a.span.end,
@@ -41931,7 +43052,7 @@ fn inline_module_items(
                     udp,
                     inst,
                     prefix,
-                    &prepared_source.local_names,
+                    parent_local_names,
                     interface_map,
                 );
                 continue;
@@ -41953,7 +43074,7 @@ fn inline_module_items(
                 None => {
                     // Check if it's a typedef-based variable declaration (happens if parser was unsure)
                     if elab.typedefs.contains_key(sub_mod_name)
-                        || prepared_source.local_typedefs.contains(sub_mod_name)
+                        || parent_local_typedefs.contains(sub_mod_name)
                     {
                         let width = elab.typedefs.get(sub_mod_name).copied().unwrap_or(32);
                         let is_real = sub_mod_name == "real";
@@ -42143,37 +43264,6 @@ fn inline_module_items(
                 // dropping most transitions on a fast clock. Register it here,
                 // under this instance's prefix, exactly as a declared net.
                 {
-                    let __ta = iprof_now();
-                    let sub_mod_port_names: std::collections::HashSet<String> =
-                        match sub_mod.ports() {
-                            PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
-                            PortList::NonAnsi(ps) => ps.iter().map(|p| p.name.clone()).collect(),
-                            _ => std::collections::HashSet::default(),
-                        };
-                    let sub_mod_declares: std::collections::HashSet<String> = {
-                        let mut v = Vec::new();
-                        visit_renamed_decls(sub_mod.items(), &mut |n, _, kind| {
-                            if kind != DeclKind::Label {
-                                v.push(n.to_string())
-                            }
-                        });
-                        // §6.20: a HEADER parameter (`#(parameter ...)`) is a
-                        // constant, not a net: `leaf u (.a(VREF));` binds its
-                        // value. The body items above cover body parameters
-                        // and localparams but not the header, so such an
-                        // actual was taken for an undeclared identifier.
-                        for pd in sub_mod.params() {
-                            match &pd.kind {
-                                ParameterKind::Data { assignments, .. } => {
-                                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
-                                }
-                                ParameterKind::Type { assignments } => {
-                                    v.extend(assignments.iter().map(|a| a.name.name.clone()))
-                                }
-                            }
-                        }
-                        v.into_iter().collect()
-                    };
                     let mut cands: Vec<String> = Vec::new();
                     collect_port_connection_net_candidates(sub_mod.items(), &mut cands);
                     // §23.11: a bound instance is as if present at the end of
@@ -42185,68 +43275,7 @@ fn inline_module_items(
                             .collect();
                         collect_port_connection_net_candidates(&bound, &mut cands);
                     }
-                    cands.sort();
-                    cands.dedup();
-                    for name in cands {
-                        // A formal port of the sub-module is bound to the
-                        // parent's expression, not declared here.
-                        if sub_mod_port_names.contains(&name) {
-                            continue;
-                        }
-                        let scoped = cat2(&inst_prefix, &name);
-                        // §6.10: the implicit net belongs to THIS instance, so
-                        // the existence test must be SCOPED. A bare
-                        // `signals.contains_key(name)` skipped creation
-                        // whenever anything ANYWHERE shared the bare spelling —
-                        // including an INSTANCE-NAME placeholder, since
-                        // instantiating `foo c (...)` registers a signal named
-                        // `c`. A gate library hits this constantly: a cell's
-                        // `buf IC (clk, dCK);` wants its own implicit `clk`,
-                        // every design has some other `clk`, and the cell's
-                        // flops were then never clocked and read x.
-                        if elab.signals.contains_key(&scoped)
-                            || elab.parameters.contains_key(&name)
-                            || elab.parameters.contains_key(&scoped)
-                            || elab.nets.contains(&scoped)
-                            || elab.arrays.contains_key(&scoped)
-                            || elab.arrays_2d.contains_key(&scoped)
-                            || elab.arrays_nd.contains_key(&scoped)
-                            || elab.interfaces.contains(&scoped)
-                        {
-                            continue;
-                        }
-                        // Declared inside the sub-module itself (a net/var
-                        // declaration or one of its own ports) — the regular
-                        // inline paths create those.
-                        if sub_mod_declares.contains(&name) {
-                            continue;
-                        }
-                        if crate::implicit_net_warn() {
-                            crate::elab_diag(format!(
-                                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-                                 (IEEE 1800-2017 §6.10, instance port connection). Add an explicit declaration to silence.",
-                                scoped
-                            ));
-                        }
-                        signals_insert_traced(
-                            &mut elab.signals,
-                            line!(),
-                            scoped.clone(),
-                            Signal {
-                                is_const: false,
-                                name: scoped.clone().into(),
-                                width: 1,
-                                is_signed: false,
-                                direction: None,
-                                value: Value::new(1),
-                                is_real: false,
-                                type_name: None,
-                            },
-                        );
-                        elab.implicit_nets.insert(scoped.clone());
-                        elab.nets.insert(scoped);
-                    }
-                    iprof_since("implicit_net_scan", __ta);
+                    create_target_implicit_nets(elab, sub_mod, &inst_prefix, cands);
                 }
 
                 iprof_since("ck1_after_implnet", __th);
@@ -42254,22 +43283,13 @@ fn inline_module_items(
                 let mut port_map = HashMap::default();
                 let mut sub_interface_map = HashMap::default();
 
-                // Local names of the CURRENT (parent) module — bare names of
-                // signals declared in this scope. Used when rewriting port
-                // connection parent expressions so bare identifiers get
-                // prefixed with the current scope. Without this, a port
-                // connection like `.mrd(mrd)` inside wrapper would be stored
-                // in port_map as a bare `mrd`, and later substitutions into
-                // the sub-module would insert a bare (unresolvable) name.
-                let parent_local_names = &*prepared_source.local_names;
-
                 // Interface ports of the SUB-module being instantiated. The
                 // connection code below must route interface actuals through
                 // `sub_interface_map` (not `port_map`) so `<port>.<member>`
                 // resolves to the bound instance's members and inlined
-                // interface tasks dispatch. `prepared_source` is the PARENT
-                // (whose interface_ports is empty for a top instantiation), so
-                // it can't answer this — compute it from `sub_mod` directly.
+                // interface tasks dispatch. `parent_local_names` belongs to
+                // the PARENT (whose interface_ports may differ), so compute
+                // it from `sub_mod` directly.
                 let sub_iface_ports: std::collections::HashSet<String> = {
                     let mut s = std::collections::HashSet::default();
                     if let PortList::Ansi(ports) = sub_mod.ports() {
@@ -43025,7 +44045,7 @@ fn inline_module_items(
                 let inst_segs: Vec<&str> = hi.name.name.split('.').collect();
                 let n_inst = inst_segs.len();
                 let mut sub_defparams: Vec<PendingDefparam> = Vec::new();
-                for dp in &defparams {
+                for dp in defparams {
                     let path = &dp.path;
                     if path.len() <= n_inst
                         || !path[..n_inst].iter().zip(&inst_segs).all(|(a, b)| a == b)
@@ -47636,10 +48656,18 @@ fn inline_module_items(
                                 )
                             ) && !elab.checker_decls.contains_key(name)
                         };
-                        if !port_elision_blocked_by_items(
-                            &prepared_sub.effective_items,
-                            &plain_inst,
-                        ) {
+                        let bind_blocks_elision = bind_state.as_ref().is_some_and(|bs| {
+                            bs.filter.has_non_plain_bind
+                                && bs
+                                    .filter
+                                    .matches(inst_prefix.trim_end_matches('.'), sub_mod_name)
+                        });
+                        if !bind_blocks_elision
+                            && !port_elision_blocked_by_items(
+                                &prepared_sub.effective_items,
+                                &plain_inst,
+                            )
+                        {
                             let mut drop_idx: Vec<usize> = Vec::new();
                             for (pname, idx) in &input_connects {
                                 let formal = cat2(&inst_prefix, pname);
@@ -47987,25 +49015,23 @@ fn inline_module_items(
                 // instance's own unpacked-array typedef (`u8a_t r;` with
                 // `typedef u8_t u8a_t [0:7]`) names the instance-scoped key,
                 // as the signature does; the bare key is not this instance's.
-                let local_array_typedefs: std::collections::HashSet<&String> = sub_typedef_names
-                    .iter()
-                    .filter(|n| {
-                        elab.typedef_unpacked_dims
-                            .contains_key(&cat2(&inst_prefix, n))
-                    })
-                    .collect();
-                let scope_array_typedef = |dt: &DataType| -> Option<DataType> {
-                    match dt {
-                        DataType::TypeReference {
-                            name, dimensions, ..
-                        } if name.scopes.is_empty()
-                            && dimensions.is_empty()
-                            && local_array_typedefs.contains(&name.name.name) =>
-                        {
-                            Some(scope_local_typeref(dt))
-                        }
-                        _ => None,
-                    }
+                // Capture the set once per instance in `callable_ctx` so deferred
+                // function/task bodies apply it on demand (#193).
+                let callable_ctx: Option<Rc<CallableRewriteCtx>> = if prepared_sub.has_subroutines {
+                    let lat: std::collections::HashSet<String> = sub_typedef_names
+                        .iter()
+                        .filter(|n| {
+                            elab.typedef_unpacked_dims
+                                .contains_key(&cat2(&inst_prefix, n))
+                        })
+                        .cloned()
+                        .collect();
+                    Some(Rc::new(CallableRewriteCtx {
+                        ctx: Rc::clone(&pend_ctx),
+                        local_array_typedefs: (!lat.is_empty()).then(|| Rc::new(lat)),
+                    }))
+                } else {
+                    None
                 };
                 let bake_formal_type = |p: &mut FunctionPort| {
                     p.data_type = scope_local_typeref(&rewrite_data_type_genvar(
@@ -48026,9 +49052,9 @@ fn inline_module_items(
                 // Inline the sub-module's continuous assigns
                 iprof_since("ck6_before_fntask", __th);
                 let __td = iprof_now();
-                // Function/task bodies are copied PER INSTANCE below through
-                // `rewrite_stmt`, so this instance's type-parameter widths
-                // must be live for `$bits(T)` to fold inside them too.
+                // Function/task bodies retain their shared definition syntax
+                // and materialize on demand via `callable_ctx`; keep this
+                // instance's type-parameter TLS active for eager items in the loop.
                 set_type_bind_tls(&pend_ctx);
                 let body_classes: Vec<&ClassDeclaration> = prepared_sub
                     .effective_items
@@ -48058,59 +49084,37 @@ fn inline_module_items(
                             &inst_prefix,
                             &class_bindings,
                         );
-                        // A FORMAL shadows any same-named module-scope object
-                        // inside the body (§13.4): `local_names` is the set of
-                        // module-scope names that GET the instance prefix, so
-                        // the formals must be REMOVED from it — otherwise
-                        // `function z(input x, input y)` in a module that ALSO
-                        // has a function `y` rewrote the formal reference to
-                        // "<inst>.y", a nonexistent signal that read x
-                        // (br_gh277b).
-                        let mut fn_locals = (*prepared_sub.local_names).clone();
-                        for p in &fd.ports {
-                            fn_locals.remove(&p.name.name);
-                        }
-                        for n in stmt_list_declared_names(&fd.items) {
-                            fn_locals.remove(n);
-                        }
                         for p in &mut new_fd.ports {
                             bake_formal_type(p);
-                            if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(
-                                    def,
-                                    &inst_prefix,
-                                    &rewrite_port_map,
-                                    &fn_locals,
-                                    &sub_interface_map,
-                                ));
+                        }
+                        if new_fd.ports.iter().any(|p| p.default.is_some()) {
+                            // A formal or top-level local shadows any same-named
+                            // module-scope object inside default expressions (§13.4).
+                            let mut fn_locals = (*prepared_sub.local_names).clone();
+                            for p in &fd.ports {
+                                fn_locals.remove(&p.name.name);
+                            }
+                            for n in stmt_list_declared_names(&fd.items) {
+                                fn_locals.remove(n);
+                            }
+                            for p in &mut new_fd.ports {
+                                if let Some(def) = &p.default {
+                                    p.default = Some(rewrite_expr(
+                                        def,
+                                        &inst_prefix,
+                                        &rewrite_port_map,
+                                        &fn_locals,
+                                        &sub_interface_map,
+                                    ));
+                                }
                             }
                         }
-                        let formal_names: Vec<&str> =
-                            fd.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        let mut items = crate::ast::cache::without_scope_caches(|| {
-                            with_shadowed(
-                                &formal_names,
-                                &rewrite_port_map,
-                                &fn_locals,
-                                |ports, locals| {
-                                    rewrite_stmt_list_scoped(
-                                        &fd.items,
-                                        &inst_prefix,
-                                        ports,
-                                        locals,
-                                        &sub_interface_map,
-                                    )
-                                },
-                            )
-                        });
-                        scope_local_decl_types(&mut items, &scope_array_typedef);
-                        // §6.20.3: a local declared with one of this instance's
-                        // type parameters (`T loc;`) has the type bound here, as
-                        // in its initial and always blocks; the bare name has
-                        // no binding once the instance is inlined.
-                        let items = substitute_type_params_stmts(items, &pend_ctx.type_binds);
-                        new_fd.items = cache.callable_bodies.intern(items.into());
-                        elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
+                        let key = new_fd.name.name.name.clone();
+                        new_fd.items = cache.share_callable_source(&fd.items);
+                        elab.functions.insert(key.clone(), new_fd);
+                        if let Some(cctx) = &callable_ctx {
+                            elab.deferred_function_bodies.insert(key, Rc::clone(cctx));
+                        }
                     }
                     // §16.6/§16.8: a named property or sequence of an INLINED
                     // instance was never registered, so `assert property
@@ -48175,49 +49179,36 @@ fn inline_module_items(
                     if let ModuleItem::TaskDeclaration(td) = sub_item {
                         let mut new_td = td.clone();
                         new_td.name.name.name = cat2(&inst_prefix, &td.name.name.name);
-                        // Same formal-shadowing rule as functions above.
-                        let mut task_locals = (*prepared_sub.local_names).clone();
-                        for p in &td.ports {
-                            task_locals.remove(&p.name.name);
-                        }
-                        for n in stmt_list_declared_names(&td.items) {
-                            task_locals.remove(n);
-                        }
                         for p in &mut new_td.ports {
                             bake_formal_type(p);
-                            if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(
-                                    def,
-                                    &inst_prefix,
-                                    &rewrite_port_map,
-                                    &task_locals,
-                                    &sub_interface_map,
-                                ));
+                        }
+                        if new_td.ports.iter().any(|p| p.default.is_some()) {
+                            // Same formal-shadowing rule as functions above.
+                            let mut task_locals = (*prepared_sub.local_names).clone();
+                            for p in &td.ports {
+                                task_locals.remove(&p.name.name);
+                            }
+                            for n in stmt_list_declared_names(&td.items) {
+                                task_locals.remove(n);
+                            }
+                            for p in &mut new_td.ports {
+                                if let Some(def) = &p.default {
+                                    p.default = Some(rewrite_expr(
+                                        def,
+                                        &inst_prefix,
+                                        &rewrite_port_map,
+                                        &task_locals,
+                                        &sub_interface_map,
+                                    ));
+                                }
                             }
                         }
-                        let formal_names: Vec<&str> =
-                            td.ports.iter().map(|p| p.name.name.as_str()).collect();
-                        let mut items = crate::ast::cache::without_scope_caches(|| {
-                            with_shadowed(
-                                &formal_names,
-                                &rewrite_port_map,
-                                &task_locals,
-                                |ports, locals| {
-                                    rewrite_stmt_list_scoped(
-                                        &td.items,
-                                        &inst_prefix,
-                                        ports,
-                                        locals,
-                                        &sub_interface_map,
-                                    )
-                                },
-                            )
-                        });
-                        scope_local_decl_types(&mut items, &scope_array_typedef);
-                        // §6.20.3: as for a function above.
-                        let items = substitute_type_params_stmts(items, &pend_ctx.type_binds);
-                        new_td.items = cache.callable_bodies.intern(items.into());
-                        elab.tasks.insert(new_td.name.name.name.clone(), new_td);
+                        let key = new_td.name.name.name.clone();
+                        new_td.items = cache.share_callable_source(&td.items);
+                        elab.tasks.insert(key.clone(), new_td);
+                        if let Some(cctx) = &callable_ctx {
+                            elab.deferred_task_bodies.insert(key, Rc::clone(cctx));
+                        }
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
                         validate_class_constraints_in_body(
@@ -48658,7 +49649,7 @@ fn inline_module_items(
                 );
                 // Keep later items strictly after this one: bound
                 // instantiations carry spans from elsewhere.
-                items_end = items_end.max(hi.span.start.max(item_floor) + 1);
+                *items_end = (*items_end).max(hi.span.start.max(item_floor) + 1);
 
                 // Recurse into sub-module instantiations
                 iprof_since("subitem_loop", __td);
@@ -48704,7 +49695,7 @@ fn inline_module_items(
                         ));
                     }
                 }
-                inline_module_items(
+                let child_meta = inline_module_items(
                     elab,
                     sub_mod,
                     &inst_prefix,
@@ -48715,9 +49706,51 @@ fn inline_module_items(
                     &rewrite_port_map,
                     &sub_defparams,
                     param_scope,
+                    bind_state.as_deref_mut(),
                 )?;
                 crate::oom_trace::model("instance complete", elab, Some(cache.prepared.len()));
                 iprof_since("recursion", __te);
+
+                if let Some(bs) = bind_state.as_deref_mut() {
+                    let inst_path = inst_prefix.trim_end_matches('.');
+                    if bs.filter.matches(inst_path, sub_mod_name) {
+                        let type_overlay = capture_type_overlay(
+                            elab,
+                            &saved_type_binds,
+                            &saved_type_shapes,
+                            &saved_unpacked_dims,
+                        );
+                        let local_names = Some(
+                            child_meta
+                                .local_names
+                                .unwrap_or_else(|| Rc::clone(&prepared_sub.local_names)),
+                        );
+                        let local_typedefs = child_meta.local_typedefs.or_else(|| {
+                            (!prepared_sub.local_typedefs.is_empty())
+                                .then(|| Box::new(prepared_sub.local_typedefs.clone()))
+                        });
+                        let saved_defparams = if !child_meta.was_flat_leaf {
+                            child_meta.defparams
+                        } else {
+                            std::mem::take(&mut sub_defparams)
+                        };
+                        bs.scopes.insert(
+                            inst_path.to_string(),
+                            TargetScope {
+                                def_name: sub_mod_name.clone(),
+                                local_names,
+                                local_typedefs,
+                                interface_map: std::mem::take(&mut sub_interface_map),
+                                port_map: Rc::clone(&rewrite_port_map),
+                                local_params: std::mem::take(&mut sub_merged_params),
+                                defparams: saved_defparams,
+                                type_overlay,
+                                items_end: child_meta.items_end,
+                                was_flat_leaf: child_meta.was_flat_leaf,
+                            },
+                        );
+                    }
+                }
 
                 for (tp_name, saved) in saved_type_shapes.into_iter().rev() {
                     tls_restore_typedef_shape(&tp_name, saved);
@@ -50900,16 +51933,26 @@ fn substitute_const_fn_calls<P: ParamLookup>(
                     return None;
                 }
             };
-            let fd = match scoped_key
+            let (resolved_key, fd_ref) = match scoped_key
                 .as_deref()
-                .and_then(|k| elab.functions.get(k))
-                .or_else(|| elab.functions.get(&fname))
+                .and_then(|k| elab.functions.get_key_value(k))
+                .or_else(|| elab.functions.get_key_value(&fname))
             {
-                Some(fd) => fd.clone(),
+                Some((k, fd)) => (k.as_str(), fd),
                 None => {
                     param_trace("const-fn:MISS", &fname, "no function registration");
                     return None;
                 }
+            };
+            let mut owned_fd;
+            let fd = if let Some(items) = crate::ast::cache::without_scope_caches(|| {
+                elab.materialize_function_body(resolved_key, fd_ref)
+            }) {
+                owned_fd = fd_ref.clone();
+                owned_fd.items = items;
+                &owned_fd
+            } else {
+                fd_ref
             };
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
@@ -57339,6 +58382,31 @@ fn clear_type_bind_tls() {
     TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
     TYPE_BIND_QUERIES_TLS.with(|c| *c.borrow_mut() = None);
     TYPE_BIND_TYPES_TLS.with(|c| *c.borrow_mut() = None);
+}
+
+fn with_type_bind_tls<R>(ctx: &RewriteCtx, f: impl FnOnce() -> R) -> R {
+    struct Restore {
+        upward: Option<Rc<std::cell::RefCell<UpwardScopes>>>,
+        widths: Option<Rc<HashMap<String, u32>>>,
+        queries: Option<Rc<HashMap<String, TypeQueryDims>>>,
+        types: Option<Rc<HashMap<String, DataType>>>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UPWARD_SCOPES_TLS.with(|c| *c.borrow_mut() = self.upward.take());
+            TYPE_BIND_WIDTHS_TLS.with(|c| *c.borrow_mut() = self.widths.take());
+            TYPE_BIND_QUERIES_TLS.with(|c| *c.borrow_mut() = self.queries.take());
+            TYPE_BIND_TYPES_TLS.with(|c| *c.borrow_mut() = self.types.take());
+        }
+    }
+    let _restore = Restore {
+        upward: UPWARD_SCOPES_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+        widths: TYPE_BIND_WIDTHS_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+        queries: TYPE_BIND_QUERIES_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+        types: TYPE_BIND_TYPES_TLS.with(|c| c.borrow().as_ref().map(Rc::clone)),
+    };
+    set_type_bind_tls(ctx);
+    f()
 }
 
 /// §10.9: the type of a typed pattern `T'{...}` in the instance being
