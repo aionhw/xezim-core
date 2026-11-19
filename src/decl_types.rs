@@ -386,4 +386,43 @@ mod tests {
         map.retain(|name, _| name != "u2.d");
         assert_eq!(map.len(), 1);
     }
+
+    /// §7.2: the members beneath one name are read in key order, follow
+    /// later inserts, removals and bulk edits, and the map keeps its plain
+    /// serialized form.
+    #[test]
+    fn member_lookup_tracks_key_changes_and_loads_plain_maps() {
+        let ty = vector("7", 40);
+        let mut original: HashMap<String, DataType> = HashMap::default();
+        for key in ["s", "s.a", "s.a.b", "ss.a"] {
+            original.insert(key.to_string(), ty.clone());
+        }
+        let cfg = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&original, cfg).unwrap();
+        let (mut types, _): (DeclTypeMap, _) =
+            bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        let members = |types: &DeclTypeMap| {
+            types
+                .with_prefix("s.")
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(members(&types), ["s.a", "s.a.b"]);
+        types.remove("s.a");
+        types.insert("s.c".into(), ty.clone());
+        assert_eq!(members(&types), ["s.a.b", "s.c"]);
+        // Bulk mutable access may replace keys without changing the length.
+        let raw = types.as_map_mut();
+        raw.remove("s.a.b");
+        raw.insert("s.d".into(), Rc::new(ty.clone()));
+        assert_eq!(members(&types), ["s.c", "s.d"]);
+        types.entry("s.e".into()).or_insert(ty.clone());
+        types.retain(|name, _| name != "s.c");
+        assert_eq!(members(&types), ["s.d", "s.e"]);
+        assert_eq!(types.clone().with_prefix("ss.").count(), 1);
+        assert_eq!(
+            bincode::serde::encode_to_vec(&types, cfg).unwrap(),
+            bincode::serde::encode_to_vec(types.as_map(), cfg).unwrap()
+        );
+    }
 }
