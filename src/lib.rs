@@ -251,7 +251,10 @@ pub use value::Value;
 ///         (§7.4.2), nested classes named through a specialized host by their renamed spelling
 ///         (§8.23), class-local typedef property widths (§6.18) and package sequences and
 ///         properties under `pkg::name` keys (§16.8, §26.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4c";
+/// \x4d = \x4c + real initializers of 64-bit integral variables and typed package parameters
+///         held as integers (§6.12.1), and time literals and delays scaled to the unit,
+///         precision and tick by exact powers of ten (§5.8, §3.14.1).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4d";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
