@@ -224,7 +224,10 @@ fn timeout_scan_spans_processes_that_can_suspend() {
         "",
         "process(q) begin null; end process; process begin wait for 1 ns; end process; process(q) begin null; end process; process begin wait for 2 ns; end process; process(q) begin null; end process;",
     );
+    assert!(sv.contains("bit vh_go [1:3];"));
+    assert!(sv.contains("int vh_site [1:3];"));
     assert!(sv.contains("for (int p = 1; p <= 3; p++) if (vh_tmo[p] >= 0"));
     let sv = lowered("", "process(q) begin null; end process;");
+    assert!(sv.contains("bit vh_go [0:0];"));
     assert!(!sv.contains("p++) if (vh_tmo[p] >= 0"));
 }

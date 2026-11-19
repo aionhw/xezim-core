@@ -250,6 +250,8 @@ pub fn cache_digest() -> Option<u64> {
     use std::hash::{BuildHasher, Hash, Hasher};
     let cfg = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     let mut h = crate::hasher::DeterministicState::default().build_hasher();
+    // Generated scheduler arrays retain only the range of suspendable processes.
+    "waiter-bounds-v1".hash(&mut h);
     for f in &cfg.files {
         f.hash(&mut h);
         std::fs::read(&f.path).ok().hash(&mut h);

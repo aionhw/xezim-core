@@ -154,6 +154,7 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
         }
         let mut assembled = None;
         let mut item_batches = Vec::new();
+        let mut capacity_before = 0;
         loop {
             let mut tokens = header.clone();
             while stream.next.kind != K::KwEndmodule
@@ -175,7 +176,10 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
             // Keep each parser batch in its own buffer until the total item
             // count is known. Growing a single Vec here copies the preceding
             // batches and can reserve millions of unused ModuleItem slots.
-            item_batches.push(std::mem::take(&mut module.items));
+            // Parsing is finished for this batch. Release its spare slots now,
+            // while later batches and their token buffers are still unallocated.
+            capacity_before += module.items.capacity();
+            item_batches.push(std::mem::take(&mut module.items).into_boxed_slice());
             if assembled.is_none() {
                 assembled = Some(module);
             }
@@ -194,16 +198,13 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
                 let end = stream.take();
                 let mut module = assembled?;
                 module.span = Span::new(header[0].span.start, end.span.end);
-                let capacity_before = item_batches.iter().map(Vec::capacity).sum();
                 module.items = if item_batches.len() == 1 {
-                    let mut items = item_batches.pop()?;
-                    items.shrink_to_fit();
-                    items
+                    item_batches.pop()?.into_vec()
                 } else {
-                    let len = item_batches.iter().map(Vec::len).sum();
+                    let len = item_batches.iter().map(|batch| batch.len()).sum();
                     let mut items = Vec::with_capacity(len);
                     for batch in item_batches {
-                        items.extend(batch);
+                        items.extend(batch.into_vec());
                     }
                     items
                 };

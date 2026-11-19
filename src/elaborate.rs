@@ -17,6 +17,8 @@ use std::rc::Rc;
 pub(crate) mod array_params;
 pub mod bind;
 mod canonical;
+mod declared_types;
+pub use declared_types::DeclaredTypes;
 mod const_context;
 mod const_function_scope;
 #[cfg(test)]
@@ -4066,7 +4068,7 @@ pub struct ElaboratedModule {
     /// `associative_arrays`. Drives the type-directed `%p` renderer
     /// (LRM §21.2.1.7), which must walk nested structs/arrays/enums.
     #[serde(default)]
-    pub var_decl_types: HashMap<String, DataType>,
+    pub var_decl_types: DeclaredTypes,
     /// Value parameter -> its declared type, for an explicitly typed one
     /// (`localparam e_t RST`), keyed as in `parameters`. The self-determined
     /// type of a parameter (§6.20.2), e.g. for a `default:` key (§10.9.1).
@@ -4658,7 +4660,7 @@ impl ElaboratedModule {
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             struct_field_range_idents: HashMap::default(),
-            var_decl_types: HashMap::default(),
+            var_decl_types: DeclaredTypes::default(),
             param_decl_types: SharedNameMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),

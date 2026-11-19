@@ -2213,7 +2213,6 @@ impl<'a> Lw<'a> {
             }
         }
         let nprocs = self.procs.len();
-        let np = nprocs.max(1);
         self.sites = (0..nprocs).map(|_| Vec::new()).collect();
         let mut elab = String::new();
         let mut decls = String::new();
@@ -2565,7 +2564,13 @@ impl<'a> Lw<'a> {
             let _ = writeln!(elab, "    vh_pa{n} = 0; vh_pa{n}_last = -64'sd9223372036854775807;");
         }
         self.trace_lowering("vhdl.lower.kernel");
-        let (kernel, init_offset) = self.kernel(&upd_sigs);
+        // Sensitivity-list functions never suspend and need no scheduler slots.
+        // Keep absolute process IDs so dispatch and source order stay identical.
+        let mut waiters = (0..nprocs).filter(|p| !self.fprocs.contains(p));
+        let waiter_bounds = waiters
+            .next()
+            .map(|first| (first, waiters.next_back().unwrap_or(first)));
+        let (kernel, init_offset) = self.kernel(&upd_sigs, waiter_bounds);
 
         // Assemble.
         let mut logic_defs = String::new();
@@ -2621,10 +2626,11 @@ impl<'a> Lw<'a> {
         m.push_str(
             "  function automatic vh_a_u8 vh_str(string s);\n    byte unsigned t[];\n    t = new[s.len()];\n    for (int i = 0; i < s.len(); i++) t[i] = s.getc(i);\n    return vh_a_u8_from(1, 0, t);\n  endfunction\n  function automatic string vh_sv(vh_a_u8 a);\n    string s;\n    s = \"\";\n    for (int i = 0; i < a.d.size(); i++) s = {s, string'(a.d[i])};\n    return s;\n  endfunction\n  // A BIT_VECTOR in digits of w bits (§5.3.2.4), padded with zeros on the left.\n  function automatic vh_a_u8 vh_bvstr(vh_a_u8 v, int w);\n    byte unsigned t[];\n    longint n, nd, x, k;\n    n = v.d.size();\n    nd = (n + w - 1) / w;\n    t = new[nd];\n    for (longint i = 0; i < nd; i++) begin\n      x = 0;\n      for (int j = 0; j < w; j++) begin\n        k = i * w + j - (nd * w - n);\n        x = x * 2 + (k >= 0 ? v.d[k] : 0);\n      end\n      t[i] = x < 10 ? 48 + x : 55 + x;\n    end\n    return vh_a_u8_from(1, 0, t);\n  endfunction\n  function automatic longint vh_deadline(longint t);\n    if (t < 0) return -64'sd1;\n    if (t > 64'sd9223372036854775807 - longint'($time)) return -64'sd1;\n    return longint'($time) + t;\n  endfunction\n",
         );
+        // Keep one legal dummy element when no process can enter a wait.
+        let (first, last) = waiter_bounds.unwrap_or((0, 0));
         let _ = writeln!(
             m,
-            "  bit vh_go [0:{n}];\n  bit vh_pres [0:{n}];\n  bit vh_post [0:{n}];\n  bit vh_tmoh [0:{n}];\n  longint vh_tmo [0:{n}];\n  longint vh_dl [0:{n}];\n  int vh_site [0:{n}];\n  bit vh_stop, vh_delta_pending;",
-            n = np
+            "  bit vh_go [{first}:{last}];\n  bit vh_pres [{first}:{last}];\n  bit vh_post [{first}:{last}];\n  bit vh_tmoh [{first}:{last}];\n  longint vh_tmo [{first}:{last}];\n  longint vh_dl [{first}:{last}];\n  int vh_site [{first}:{last}];\n  bit vh_stop, vh_delta_pending;"
         );
         m.push_str(&self.tx_defs);
         let files = self.files_sv();
@@ -2659,8 +2665,8 @@ impl<'a> Lw<'a> {
         m.push_str(before_init);
         let _ = write!(
             m,
-            "    begin\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n",
-            elab_temps, np
+            "    begin\n{}    for (int p = {first}; p <= {last}; p++) vh_tmo[p] = -64'sd1;\n",
+            elab_temps
         );
         // Reads of 'last_active can be discovered in later process bodies.
         // Insert each observed signal's initializer at its original position
@@ -3187,7 +3193,11 @@ impl<'a> Lw<'a> {
     /// triggers it, hands control to processes that wait, and advances
     /// time. A mixed design's eager evaluation calls the same phases as
     /// functions.
-    fn kernel(&mut self, upd_sigs: &[usize]) -> (String, usize) {
+    fn kernel(
+        &mut self,
+        upd_sigs: &[usize],
+        waiter_bounds: Option<(usize, usize)>,
+    ) -> (String, usize) {
         let nprocs = self.procs.len();
         let drivers: Vec<((usize, usize), Driver)> =
             self.drivers.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -3237,9 +3247,7 @@ impl<'a> Lw<'a> {
         }
         // Only processes that can suspend can schedule a timeout (§10.2).
         // Keep a single loop, trimming sensitivity-only processes at either end.
-        let mut waiters = (0..nprocs).filter(|p| !fp.contains(p));
-        if let Some(first) = waiters.next() {
-            let last = waiters.next_back().unwrap_or(first);
+        if let Some((first, last)) = waiter_bounds {
             let _ = writeln!(
                 nx,
                 "    for (int p = {first}; p <= {last}; p++) if (vh_tmo[p] >= 0 && (vh_n < 0 || vh_tmo[p] < vh_n)) vh_n = vh_tmo[p];",
@@ -3796,13 +3804,12 @@ impl<'a> Lw<'a> {
             // A change on the SV side: a cycle now.
             let _ = writeln!(k, "      if (vh_extn != vh_exts) vh_nxt = $time;");
         }
-        if !post.is_empty() {
+        if let (Some(first), Some(last)) = (post.first(), post.last()) {
             // §14.7.5.3 h: at the last cycle of a time step the resumed
             // postponed processes run; they must not cause a delta cycle.
             let _ = writeln!(
                 k,
-                "      if (vh_nxt != $time) begin\n        vh_any = 0;\n        for (int p = 0; p < {n}; p++) if (vh_pres[p]) begin vh_pres[p] = 0; vh_go[p] = 1; wait (vh_go[p] == 0); vh_any = 1; end\n        if (vh_any) begin\n          vh_nxt = vh_next();\n          if (vh_nxt == $time) begin vh_fatal(\"postponed process causes a delta cycle\"); break; end\n        end\n      end",
-                n = nprocs
+                "      if (vh_nxt != $time) begin\n        vh_any = 0;\n        for (int p = {first}; p <= {last}; p++) if (vh_pres[p]) begin vh_pres[p] = 0; vh_go[p] = 1; wait (vh_go[p] == 0); vh_any = 1; end\n        if (vh_any) begin\n          vh_nxt = vh_next();\n          if (vh_nxt == $time) begin vh_fatal(\"postponed process causes a delta cycle\"); break; end\n        end\n      end"
             );
         }
         if boundary {
