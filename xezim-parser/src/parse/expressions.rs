@@ -2387,7 +2387,7 @@ impl Parser {
                 let name = self.parse_identifier();
                 self.expect(TokenKind::Colon);
                 let expr = self.parse_expression();
-                items.push(AssignmentPatternItem::Named(name, expr));
+                items.push(AssignmentPatternItem::Named(name.into(), expr));
             } else if self.at(TokenKind::StringLiteral) && self.peek_kind() == TokenKind::Colon {
                 // IEEE 1800-2023 §10.10: associative-array literal
                 // with a string key — `'{"key": value, ...}`.
