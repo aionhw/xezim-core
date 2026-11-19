@@ -34,6 +34,8 @@ mod prepared_bodies;
 #[cfg(test)]
 mod prepared_bodies_tests;
 pub(crate) mod unit_storage;
+#[cfg(test)]
+mod upward_scopes_tests;
 pub(crate) mod relaxed_static;
 
 struct ScopeGuardLite<F: FnMut()>(F);
