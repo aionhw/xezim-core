@@ -234,6 +234,37 @@ fn elements_with_outer(
             }
         } else {
             let item = item?;
+            // §10.9.1: a type key of an enclosing level sets every element
+            // of its type that no index key above set, so it also takes
+            // precedence over the items of a `default:` row pattern.
+            let elem_sig =
+                super::pattern_type_signature(data_type, &elab.typedef_types, init_params);
+            let item = elem_outer
+                .iter()
+                .rev()
+                .find_map(|(kt, v)| {
+                    let ks = super::pattern_type_signature(kt, &elab.typedef_types, init_params)?;
+                    (Some(&ks) == elem_sig.as_ref()).then_some(v)
+                })
+                .unwrap_or(item);
+            // §10.9.2: a `default:` value that reaches a structure element
+            // together with type keys is the default of that element's own
+            // members; the type keys still set the members they match.
+            let spread;
+            let item = if struct_elem
+                && !elem_outer.is_empty()
+                && !matches!(
+                    super::peel_unpacked_typed_pattern(item).kind,
+                    ExprKind::AssignmentPattern(_)
+                ) {
+                spread = Expression::new(
+                    ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(item.clone())]),
+                    item.span,
+                );
+                &spread
+            } else {
+                item
+            };
             super::pack_struct_const_value_with_outer(
                 data_type,
                 item,
@@ -375,9 +406,12 @@ fn pattern_items(
         ExprKind::AssignmentPattern(items) => items,
         _ => return None,
     };
-    if items
-        .iter()
-        .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
+    // An empty pattern stands for a row that only the type keys of an
+    // enclosing level reach; it has no positional items.
+    if !items.is_empty()
+        && items
+            .iter()
+            .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
     {
         if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
             && let ExprKind::Replication { count, exprs } = &only.kind
