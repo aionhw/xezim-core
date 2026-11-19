@@ -11036,6 +11036,15 @@ pub fn elaborate_module_with_defs(
                         elab.descending_arrays.insert(port.name.name.clone());
                     }
                 }
+                // §7.4.1: a port that is a packed array of a named type, or a
+                // packed structure, keeps its declared type like a variable.
+                if let Some(dt) = &port.data_type
+                    && names_packed_array_or_struct(dt, &elab.typedef_types)
+                    && !elab.var_decl_types.contains_key(&port.name.name)
+                {
+                    elab.var_decl_types
+                        .insert(port.name.name.clone(), dt.clone());
+                }
                 // §23.2.2.4: a port default must be a CONSTANT expression —
                 // a reference to a runtime variable is rejected (ivtest
                 // sv_default_port_value3; the reference errors identically).
@@ -11817,6 +11826,16 @@ pub fn elaborate_module_with_defs(
                                     .or_insert_with(|| pd.data_type.clone());
                             }
                         }
+                    }
+                    // §7.4.1, §23.2.2.1: a non-ANSI port of a named type keeps
+                    // its declaration like an ANSI port or a variable of the
+                    // type: an element of `input lane_t [0:1] p;` has the
+                    // signing of `lane_t`, and so does a packed-array member
+                    // of a structure port.
+                    if names_packed_array_or_struct(&pd.data_type, &elab.typedef_types) {
+                        elab.var_decl_types
+                            .entry(decl.name.name.clone())
+                            .or_insert_with(|| pd.data_type.clone());
                     }
                     elab.note_explicit_type(&decl.name.name, &pd.data_type, decl.name.span)?;
                     // §23.2.2.1 non-ANSI ports: the data type and the direction
@@ -41845,6 +41864,33 @@ fn interface_signal_names(
             for p in ps {
                 out.insert(p.name.name.clone());
             }
+/// §7.4.1: whether `dt` names (through plain aliases) a packed array of a
+/// named type (`lane_t [0:1]`, or `typedef lane_t [0:1] arr_t;`) or a packed
+/// structure or union. A port of such a type keeps its declaration, as a
+/// variable of it does: an element of a named signed type is signed, and so
+/// is one of a packed-array member of the structure.
+fn names_packed_array_or_struct(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> bool {
+    let mut cur = dt;
+    for _ in 0..64 {
+        match cur {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
+                if !dimensions.is_empty() {
+                    return true;
+                }
+                match lookup_scoped_type(name, typedef_types) {
+                    Some(next) => cur = next,
+                    None => return false,
+                }
+            }
+            DataType::Struct(su) => return su.packed,
+            _ => return false,
+        }
+    }
+    false
+}
+
         }
         PortList::NonAnsi(ids) => {
             for id in ids {
@@ -45172,8 +45218,7 @@ fn inline_module_items(
                                                 sub_mod.name(),
                                             ),
                                         );
-                                    } else if matches!(dt, DataType::TypeReference { dimensions, .. }
-                                        if !dimensions.is_empty())
+                                    } else if names_packed_array_or_struct(dt, &elab.typedef_types)
                                     {
                                         // §7.4.1: a port that is a packed array
                                         // of a named type (`lane_t [0:8] p`)
@@ -45227,6 +45272,17 @@ fn inline_module_items(
                                             default_port_value(
                                                 port.direction,
                                                 port.data_type.as_ref(),
+                                        .or_else(|| {
+                                            // §7.4.1: dimensions carried by a
+                                            // typedef of a named element type
+                                            // (`typedef lane_t [0:1] arr_t;`).
+                                            let one = bare_typedef_step(dt, &elab.typedef_types)?;
+                                            packed_inner_elem_width(
+                                                &one,
+                                                &sub_merged_params,
+                                                &elab.typedefs,
+                                            )
+                                        })
                                                 width,
                                                 is_real,
                                                 ansi_port_net_type(port),
@@ -45771,6 +45827,25 @@ fn inline_module_items(
                                     elab.net_delays.insert(sig_name.clone(), d);
                                 }
                                 let effective_dims = normalize_unpacked_dims(
+                                } else if names_packed_array_or_struct(
+                                    &pd.data_type,
+                                    &elab.typedef_types,
+                                ) && !elab.var_decl_types.contains_key(&sig_name)
+                                {
+                                    // §7.4.1: a port of a named type keeps
+                                    // its declaration, so an element of
+                                    // `input lane_t [0:1] p;` has the signing
+                                    // of `lane_t`.
+                                    elab.var_decl_types.insert_shared(
+                                        sig_name.clone(),
+                                        instance_decl_type(
+                                            &mut cache.decl_types,
+                                            &pd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                            sub_mod.name(),
+                                        ),
+                                    );
                                     &decl.dimensions,
                                     &sub_merged_params,
                                     &elab.typedef_types,
