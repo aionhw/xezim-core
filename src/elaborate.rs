@@ -28998,16 +28998,21 @@ fn eval_param_init(
     } else {
         eval_const_expr_val(init, params).resize_for_assign(width)
     };
-    // §6.20.2, §6.11.2: the declared type, not the initializer, gives a typed
-    // parameter its signedness, and a 2-state type holds x/z as 0. A type
-    // name this scope cannot resolve keeps the value's own representation.
-    if typed
-        && !v.is_real
+    let resolved_type = typed
         && !matches!(
             resolve_typedef_chain(dt, typedef_types),
             DataType::TypeReference { .. }
-        )
-    {
+        );
+    // §6.12.1: a real value of an integral parameter rounds to an integer;
+    // `resize_for_assign` keeps a real for a 64-bit width (`parameter time
+    // P = 9200s;` in a package held the double).
+    if resolved_type && v.is_real {
+        v = real_to_integral(v.to_f64(), width);
+    }
+    // §6.20.2, §6.11.2: the declared type, not the initializer, gives a typed
+    // parameter its signedness, and a 2-state type holds x/z as 0. A type
+    // name this scope cannot resolve keeps the value's own representation.
+    if resolved_type && !v.is_real {
         v.is_signed = is_type_signed_resolved(dt, typedef_types);
         if is_type_two_state_resolved(dt, typedef_types) {
             v = v.to_two_state();
@@ -31161,7 +31166,17 @@ fn eval_init_for_target(
     if real {
         Value::from_f64(eval_const_expr_val_env(expr, &params).to_f64())
     } else {
-        eval_init_for_width(expr, params, width)
+        // §6.12.1: a real initializer of an integral variable converts to
+        // it, rounded to the nearest integer. `resize_for_assign` leaves a
+        // real as it is for a 64-bit target (a `real` is 64 bits wide too),
+        // so `time t = 9200s;` and `longint l = 3e9;` kept the double and a
+        // shift read its IEEE 754 bits.
+        let v = eval_init_for_width(expr, params, width);
+        if v.is_real {
+            Value::from_real_wrapped(v.to_f64(), width)
+        } else {
+            v
+        }
     }
 }
 
