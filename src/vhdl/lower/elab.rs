@@ -1267,7 +1267,7 @@ impl<'a> Lw<'a> {
     }
 
     /// Whether `h` names a whole signal (not a part of one).
-    fn whole_sig(&self, h: &HExpr) -> Option<usize> {
+    pub(super) fn whole_sig(&self, h: &HExpr) -> Option<usize> {
         match &h.kind {
             HExprKind::Obj(o) => match self.lookup_sig(self.inst, *o) {
                 Some(SigRef {
@@ -1875,6 +1875,41 @@ impl<'a> Lw<'a> {
         Some(format!("{}()", n))
     }
 
+    /// An edge-triggered process whose entire action is guarded by a scalar
+    /// enable does no work while disabled. Keep the ordinary process body for
+    /// initialization and enabled edges. Mixed-language processes also arrange
+    /// an NBA handshake on wakeup, so leave their dispatch alone.
+    fn clock_enable(&mut self, stmts: &[HStmt]) -> Option<String> {
+        fn only_if(stmts: &[HStmt]) -> Option<&(HExpr, Vec<HStmt>)> {
+            let [stmt] = stmts else { return None };
+            let HStmtKind::If(arms, None) = &stmt.kind else { return None };
+            let [arm] = arms.as_slice() else { return None };
+            Some(arm)
+        }
+
+        let (edge, body) = only_if(stmts)?;
+        let HExprKind::Call(id, args) = &edge.kind else { return None };
+        let [clk] = args.as_slice() else { return None };
+        self.whole_sig(clk)?;
+        let sub = &self.d.subprograms[*id];
+        if !matches!(sub.builtin, Some(Builtin::RisingEdge | Builtin::FallingEdge))
+            && !sub.path.eq_ignore_ascii_case("ieee.std_logic_1164.rising_edge")
+            && !sub.path.eq_ignore_ascii_case("ieee.std_logic_1164.falling_edge")
+        {
+            return None;
+        }
+        let (enable, _) = only_if(body)?;
+        let HExprKind::Call(eq, operands) = &enable.kind else { return None };
+        let [signal, literal] = operands.as_slice() else { return None };
+        if !matches!(&self.d.subprograms[*eq].builtin, Some(Builtin::Op(op)) if op == "=")
+            || !matches!(literal.kind, HExprKind::Lit(Value::Enum(_)))
+            || self.whole_sig(signal).is_none()
+        {
+            return None;
+        }
+        Some(self.ex(enable))
+    }
+
     /// The event conditions of a sensitivity list.
     pub(super) fn sensitivity(&mut self, on: &[HExpr]) -> Vec<String> {
         let mut conds = Vec::new();
@@ -2433,7 +2468,12 @@ impl<'a> Lw<'a> {
             let body = self.stmts(&p.stmts, if func { 4 } else { 6 });
             let mut implicit = String::new();
             if let Some(sens) = &p.sens {
-                let conds = self.sensitivity(sens);
+                let mut conds = self.sensitivity(sens);
+                if func && !p.postponed && !self.has_boundary() && !conds.is_empty()
+                    && let Some(enable) = self.clock_enable(&p.stmts)
+                {
+                    conds = vec![format!("({}) && ({enable})", conds.join(" || "))];
+                }
                 let site = self.sites[gp].len();
                 self.sites[gp].push(Site { conds });
                 let _ = writeln!(

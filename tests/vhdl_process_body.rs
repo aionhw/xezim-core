@@ -30,3 +30,19 @@ fn scalar_process_temporaries_stay_local() {
         "process-local temporary became a module signal"
     );
 }
+
+#[test]
+fn disabled_clocked_process_skips_only_an_empty_action() {
+    fn dispatch(action: &str) -> String {
+        let source = format!(
+            "entity t is end; architecture a of t is signal clk, en, q: bit; begin
+             process(clk) begin if rising_edge(clk) then {action} end if; end process; end;"
+        );
+        let sv = vhdl::lower_design(&[("work", "enable.vhd", source.as_bytes())]).unwrap();
+        sv.lines().find(|line| line.contains("vh_from <= 0")).unwrap().to_owned()
+    }
+    let gated = dispatch("if en = '1' then q <= not q; end if;");
+    assert!(gated.contains("vh_s1"), "{gated}");
+    let with_else = dispatch("if en = '1' then q <= not q; else q <= '0'; end if;");
+    assert!(!with_else.contains("vh_s1"), "{with_else}");
+}

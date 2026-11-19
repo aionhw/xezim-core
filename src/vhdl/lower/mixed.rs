@@ -592,8 +592,13 @@ impl<'a> Lw<'a> {
             Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, "vh_v")),
             Bnd::Vec(ul, n) => {
                 if let Repr::Pk(w, _) = r {
+                    let fast = if *ul && *w == 4 && *n >= 8 {
+                        format!("    if (!$isunknown(vh_v)) return {}(vh_v);\n", self.spr_fn(*n))
+                    } else {
+                        String::new()
+                    };
                     return format!(
-                        "    bit [{hi}:0] vh_t;\n    for (int vh_i = 0; vh_i < {n}; vh_i++) vh_t[{w} * ({m} - vh_i) +: {w}] = {b};\n    return vh_t;\n",
+                        "    bit [{hi}:0] vh_t;\n{fast}    for (int vh_i = 0; vh_i < {n}; vh_i++) vh_t[{w} * ({m} - vh_i) +: {w}] = {b};\n    return vh_t;\n",
                         hi = *w as i64 * n - 1,
                         n = n,
                         w = w,
@@ -664,6 +669,9 @@ impl<'a> Lw<'a> {
         match bnd {
             Bnd::Bit(ul) => format!("    return {};\n", bit(*ul, &x)),
             Bnd::Vec(ul, n) => {
+                if *ul && *n >= 8 && pk == Some((4, *n)) && off == 0 {
+                    return format!("    return {}({x});\n", self.to_logic_fn(*n));
+                }
                 let e = match pk {
                     Some((w, pn)) => Lw::pk_sel(&x, w, pn, &format!("{} + vh_i", off)),
                     None => format!("{}.d[{} + vh_i]", x, off),
@@ -742,6 +750,11 @@ impl<'a> Lw<'a> {
                     Repr::Pk(w, pn) => Some((w, pn)),
                     _ => None,
                 };
+                if *ul && *n >= 8 && pk == Some((4, *n)) && first == 0 {
+                    let convert = self.to_logic_fn(*n);
+                    let _ = writeln!(body, "    {dst}[vh_bit -: {n}] = {convert}({src}); vh_bit = vh_bit - {n};");
+                    return;
+                }
                 self.tmp += 1;
                 let iv = format!("vh_p{}", self.tmp);
                 let _ = writeln!(body, "    for (int {iv} = 0; {iv} < {n}; {iv}++) begin");

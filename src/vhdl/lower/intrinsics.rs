@@ -156,6 +156,23 @@ impl<'a> Lw<'a> {
         format!("(({} & {}) == {})", v, nib_pat(n, 'e'), nib_pat(n, '2'))
     }
 
+    /// Convert a packed STD_LOGIC_VECTOR to SV logic at a port boundary.
+    /// Preserve X/Z and weak levels through the scalar conversion when needed.
+    pub(super) fn to_logic_fn(&mut self, n: i64) -> String {
+        let name = format!("vh_to_logic_{n}");
+        if self.pk_fns.insert(name.clone()) {
+            let clean = Self::clean(n, "v");
+            let compress = self.cmp_fn(n);
+            let _ = writeln!(
+                self.type_defs,
+                "  function automatic logic [{last}:0] {name}(bit [{hi}:0] v);\n    logic [{last}:0] result;\n    if ({clean}) return {compress}(v);\n    for (int i = 0; i < {n}; i++) result[i] = vh_u2l(v[4*i +: 4]);\n    return result;\n  endfunction",
+                last = n - 1,
+                hi = 4 * n - 1,
+            );
+        }
+        name
+    }
+
     /// The compression of the value bits of a clean n-element vector into
     /// n bits (and the inverse): log steps of shift-or-mask.
     fn cmp_fn(&mut self, n: i64) -> String {
@@ -187,7 +204,7 @@ impl<'a> Lw<'a> {
         f
     }
 
-    fn spr_fn(&mut self, n: i64) -> String {
+    pub(super) fn spr_fn(&mut self, n: i64) -> String {
         let f = format!("vh_spr4_{}", n);
         if self.pk_fns.insert(f.clone()) {
             let w = 4 * n;
@@ -263,6 +280,16 @@ impl<'a> Lw<'a> {
                     "nor" => format!("vh_ul_not(vh_ul_or({}, {}))", x, y),
                     _ => format!("vh_ul_not(vh_ul_xor({}, {}))", x, y),
                 })
+            }
+            [Cls::Ul] if matches!(name, "rising_edge" | "falling_edge") => {
+                let signal = self.whole_sig(&args[0])?;
+                self.mark_clocked();
+                // TO_X01 maps L/H to 0/1. Clearing the strength bit
+                // pairs precisely encodings 2/6 and 3/7 respectively.
+                let (before, after) = if name == "rising_edge" { (2, 3) } else { (3, 2) };
+                Some(format!(
+                    "(vh_s{signal}_ev && ((vh_s{signal}_last & 8'hfb) == {before}) && ((vh_s{signal} & 8'hfb) == {after}))"
+                ))
             }
             [Cls::Ul] if name == "not" => {
                 let x = self.ex(&args[0]);
