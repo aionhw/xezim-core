@@ -520,9 +520,19 @@ pub struct ContinuousAssignment {
     /// declaration assignment): the span of that statement and the instance
     /// scope it was elaborated in (`""` for the top). `None` for the ones
     /// elaboration synthesizes (port connections, gate primitives, delayed
-    /// nets). Code coverage counts only the former.
+    /// nets). Code coverage counts only the former. The assignments of one
+    /// instance hold one scope string between them (aionhw/xezim#721).
     #[serde(default)]
-    pub origin: Option<(crate::ast::Span, String)>,
+    pub origin: Option<(crate::ast::Span, std::sync::Arc<str>)>,
+}
+
+/// The `ContinuousAssignment::origin` scope of the top module, one string
+/// for all of its assignments.
+fn top_origin_scope() -> std::sync::Arc<str> {
+    thread_local! {
+        static TOP: std::sync::Arc<str> = std::sync::Arc::from("");
+    }
+    TOP.with(std::sync::Arc::clone)
 }
 
 /// IEEE 1800-2017 §29 User-Defined Primitive instance, flattened during
@@ -931,6 +941,9 @@ impl<'de> serde::Deserialize<'de> for InputPortActual {
 #[derive(Debug, Clone)]
 pub struct RewriteCtx {
     pub prefix: String,
+    /// `prefix` without its trailing dot: the scope every continuous
+    /// assignment of the instance records as its origin, held once.
+    pub origin_scope: std::sync::Arc<str>,
     /// Port name → connecting expression in the parent scope. Per-instance
     /// (different connections per instantiation). The one table the
     /// instance's own inlining rewrote with, shared rather than copied; the
@@ -1190,7 +1203,7 @@ impl PendingContAssign {
         let delay_off = eval_delay(&self.delay_off_source);
         let origin = self
             .origin_span
-            .map(|sp| (sp, self.ctx.prefix.trim_end_matches('.').to_string()));
+            .map(|sp| (sp, std::sync::Arc::clone(&self.ctx.origin_scope)));
         ContinuousAssignment {
             gate_delay_fall: None,
             delay_select: None,
@@ -11776,7 +11789,7 @@ pub fn elaborate_module_with_defs(
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     gate_delay_fall: None,
                                     delay_select: None,
-                                    origin: Some((init_expr.span, String::new())),
+                                    origin: Some((init_expr.span, top_origin_scope())),
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: decl_rhs,
                                     delay: decl_dly.0,
@@ -12000,7 +12013,7 @@ pub fn elaborate_module_with_defs(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((init_expr.span, String::new())),
+                            origin: Some((init_expr.span, top_origin_scope())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: decl_rhs,
                             delay: decl_dly.0,
@@ -13265,7 +13278,7 @@ pub fn elaborate_module_with_defs(
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
                                 delay_select: None,
-                                origin: Some((init_expr.span, String::new())),
+                                origin: Some((init_expr.span, top_origin_scope())),
                                 lhs: make_ident_expr(&decl.name.name),
                                 rhs: init_expr.as_ref().clone(),
                                 delay: 0,
@@ -14601,7 +14614,7 @@ pub fn elaborate_module_with_defs(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((ca.span, String::new())),
+                            origin: Some((ca.span, top_origin_scope())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
                             delay,
@@ -19695,7 +19708,7 @@ fn elaborate_items(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((init_expr.span, String::new())),
+                            origin: Some((init_expr.span, top_origin_scope())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: decl_rhs,
                             delay: decl_dly.0,
@@ -20570,7 +20583,7 @@ fn elaborate_items(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
-                            origin: Some((ca.span, String::new())),
+                            origin: Some((ca.span, top_origin_scope())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
                             delay,
@@ -30473,7 +30486,7 @@ fn emit_struct_member_assigns(
                 &flat,
                 typedef_types,
                 params,
-                ca.origin.as_ref().map_or("", |(_, scope)| scope.as_str()),
+                ca.origin.as_ref().map_or("", |(_, scope)| scope),
                 rhs.span,
             ),
             _ => None,
@@ -30591,7 +30604,7 @@ fn emit_member_elem_assigns(
             elem_dt: mdt,
             typedef_types,
             params,
-            scope: ca.origin.as_ref().map_or("", |(_, scope)| scope.as_str()),
+            scope: ca.origin.as_ref().map_or("", |(_, scope)| scope),
         };
         if elem
             .bind(&rhs, &lists, &mut Vec::new(), &mut leaves, outer_types)
@@ -47743,6 +47756,7 @@ fn inline_module_items(
                     });
                 let pend_ctx = std::rc::Rc::new(RewriteCtx {
                     prefix: inst_prefix.clone(),
+                    origin_scope: inst_prefix.trim_end_matches('.').into(),
                     port_map: Rc::clone(&rewrite_port_map),
                     local_names: std::rc::Rc::clone(&prepared_sub.local_names),
                     interface_map: sub_interface_map.clone(),
@@ -51926,7 +51940,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         let scope = ca
             .origin
             .as_ref()
-            .map(|(_, s)| s.clone())
+            .map(|(_, s)| s.to_string())
             .unwrap_or_default();
         real_drivers
             .entry(lhs_name)
