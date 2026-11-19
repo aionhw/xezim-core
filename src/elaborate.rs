@@ -2933,7 +2933,22 @@ fn elaborate_class_in_scope(
                 } else {
                     None
                 };
-                let is_real = is_type_real(&p.data_type);
+                // §6.18: a property of a typedef'd real type is a real, whether
+                // the class or an enclosing scope declares the alias. A name
+                // the class header rebinds (a type parameter, §8.25) is
+                // decided by the specialization at run time.
+                let is_real = match width_dt {
+                    DataType::TypeReference { name, .. } if !name.has_scope() && {
+                        let mut header = HashSet::default();
+                        c.params.iter().for_each(|p| decl_param_names(p, &mut header));
+                        header.contains(&name.name.name)
+                    } =>
+                    {
+                        false
+                    }
+                    _ => TYPEDEF_SHAPES_TLS
+                        .with(|types| is_type_real_resolved(width_dt, &types.borrow().0)),
+                };
                 // Named types (class handles, enums, typedefs) default to
                 // 0 — a class handle's default is `null`.
                 let is_named_type = get_type_name(&p.data_type).is_some();
@@ -6643,6 +6658,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                             continue;
                         }
                     }
+                    let base_is_real = is_type_real_resolved(data_type, &elab.typedef_types);
                     let res = resolve_param_decl_value(
                         &mut *elab,
                         data_type,
@@ -6651,7 +6667,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                         None,
                         base_width,
                         false,
-                        is_type_real(data_type),
+                        base_is_real,
                         ParamDeclPolicy {
                             unresolved_call: UnresolvedCallPolicy::SkipIfUnresolved,
                             promote_implicit_real: false,
@@ -10847,7 +10863,7 @@ pub fn elaborate_module_with_defs(
                 let base_width =
                     resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let base_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
-                let base_is_real = is_type_real(data_type);
+                let base_is_real = is_type_real_resolved(data_type, &elab.typedef_types);
 
                 // IEEE 1800-2017 §6.20: a struct/union-typed parameter whose
                 // value is an assignment pattern (`parameter cfg_t C = '{f:v}`)
@@ -11667,7 +11683,7 @@ pub fn elaborate_module_with_defs(
                 let width =
                     resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
-                let is_real = is_type_real(&pd.data_type);
+                let is_real = is_type_real_resolved(&pd.data_type, &elab.typedef_types);
                 let ranged = matches!(&pd.data_type,
                     DataType::Implicit { dimensions, .. } | DataType::IntegerVector { dimensions, .. }
                         if !dimensions.is_empty());
@@ -11902,7 +11918,7 @@ pub fn elaborate_module_with_defs(
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
-                let is_real = is_type_real(&nd.data_type);
+                let is_real = is_type_real_resolved(&nd.data_type, &elab.typedef_types);
                 for decl in &nd.declarators {
                     // §7.6: net arrays retain left-to-right declaration order too.
                     if let Some(dims) = declared_unpacked_dims(&decl.dimensions, &elab.parameters) {
@@ -14148,7 +14164,7 @@ pub fn elaborate_module_with_defs(
                     // with a typedef'd SIGNED type (`typedef logic signed [1:0]
                     // T; localparam T C = …`) must read the typedef's sign.
                     let mut signed = is_type_signed_resolved(data_type, &elab.typedef_types);
-                    let is_real = is_type_real(data_type);
+                    let is_real = is_type_real_resolved(data_type, &elab.typedef_types);
                     // A `string` parameter renders as text (`%p` quotes it).
                     if matches!(
                         data_type,
@@ -19764,7 +19780,7 @@ fn elaborate_items(
                 let width =
                     resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
-                let is_real = is_type_real(&pd.data_type);
+                let is_real = is_type_real_resolved(&pd.data_type, &elab.typedef_types);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
                         if elab.claim_local_decl_displacement(
@@ -19869,7 +19885,7 @@ fn elaborate_items(
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
-                let is_real = is_type_real(&nd.data_type);
+                let is_real = is_type_real_resolved(&nd.data_type, &elab.typedef_types);
                 for decl in &nd.declarators {
                     // §7.6: net arrays retain left-to-right declaration order too.
                     if let Some(dims) = declared_unpacked_dims(&decl.dimensions, &elab.parameters) {
@@ -20024,7 +20040,7 @@ fn elaborate_items(
                     }
                 }
                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
-                let is_real = is_type_real(&dd.data_type);
+                let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                 for decl in &dd.declarators {
                     // §6.18, §7.4.5: a variable of a dimensioned typedef takes
                     // the typedef's unpacked dimensions after its own, as the
@@ -20577,7 +20593,7 @@ fn elaborate_items(
                     // pre-pass above) — a typedef'd SIGNED declared type must
                     // read the typedef's sign.
                     let base_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
-                    let base_is_real = is_type_real(data_type);
+                    let base_is_real = is_type_real_resolved(data_type, &elab.typedef_types);
                     if matches!(
                         data_type,
                         DataType::Simple {
@@ -39214,7 +39230,7 @@ fn register_fixed_unpacked_array(
 }
 
 fn mark_array_z_init_if_4state(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
-    if !is_type_two_state(data_type) && !is_type_real(data_type) {
+    if !is_type_two_state(data_type) && !is_type_real_resolved(data_type, &elab.typedef_types) {
         elab.z_init_signals.insert(name.to_string());
     }
 }
@@ -43011,7 +43027,7 @@ fn inline_module_items(
                                         {
                                             if assignments.iter().any(|a| a.name.name == name.name)
                                             {
-                                                if is_type_real(data_type) {
+                                                if is_type_real_resolved(data_type, &elab.typedef_types) {
                                                     val = Value::from_f64(val.to_f64());
                                                 } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
                                                     && val.is_real
@@ -43131,7 +43147,7 @@ fn inline_module_items(
                                                 val.to_u64().unwrap_or(0)
                                             );
                                         }
-                                        if is_type_real(data_type) {
+                                        if is_type_real_resolved(data_type, &elab.typedef_types) {
                                             val = Value::from_f64(val.to_f64());
                                         } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
                                             && val.is_real
@@ -43466,7 +43482,7 @@ fn inline_module_items(
                                                         };
                                                     let mut val =
                                                         eval_const_expr_val(init, local_map);
-                                                    if is_type_real(data_type) {
+                                                    if is_type_real_resolved(data_type, &elab_ro.typedef_types) {
                                                         val = Value::from_f64(val.to_f64());
                                                     } else if let DataType::Implicit {
                                                         signing,
@@ -44148,7 +44164,7 @@ fn inline_module_items(
                                         init
                                     };
                                     let mut val = eval_const_expr_val(init_eval, &sub_local_params);
-                                    if is_type_real(data_type) {
+                                    if is_type_real_resolved(data_type, &elab.typedef_types) {
                                         val = Value::from_f64(val.to_f64());
                                     } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
                                         && val.is_real
@@ -59672,7 +59688,7 @@ fn process_import(
                                             &elab.typedef_types,
                                             &elab.parameters,
                                         );
-                                        let is_real = is_type_real(data_type);
+                                        let is_real = is_type_real_resolved(data_type, &elab.typedef_types);
                                         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
                                         {
                                             // Infer width from sized literal
@@ -60153,7 +60169,7 @@ fn process_import(
                                     Some(&elab.parameters),
                                     Some(&elab.typedefs),
                                 );
-                                let is_real = is_type_real(data_type);
+                                let is_real = is_type_real_resolved(data_type, &elab.typedef_types);
                                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                 for assign in assignments {
                                     if elab.local_decl_displaces(&assign.name.name) {
