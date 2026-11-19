@@ -30,6 +30,7 @@ pub mod interface_ports;
 mod module_class_scope;
 mod param_prefix_index;
 mod param_scope;
+mod prepared_bodies;
 pub(crate) mod unit_storage;
 pub(crate) mod relaxed_static;
 
@@ -39837,13 +39838,14 @@ fn collect_body_driven_names(
 #[derive(Default)]
 struct InlineCache {
     /// Prepared bodies (`prepare_module_items`).
-    prepared: HashMap<param_scope::PreparedKey, Rc<PreparedModuleItems>>,
+    prepared: prepared_bodies::PreparedBodies,
     /// Whether preparation leaves value-parameter references symbolic.
     value_independent: HashMap<(String, usize), bool>,
     /// §23.10 / §27 (#721): the distinct prepared bodies of each definition,
     /// by content. Parameter values that change no generate choice, range or
     /// declaration (an index passed down a generate loop) yield equal bodies;
     /// those instances share one instead of each retaining its own copy.
+    /// It owns no body: one that `prepared` released is gone from here too.
     equal_prepared: HashMap<(String, usize), EqualPrepared>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
@@ -40447,13 +40449,17 @@ fn prepare_module_items(
     prepared
 }
 
-/// The distinct prepared bodies of one definition. The first body is kept
-/// unencoded: most definitions are prepared under one parameter environment
-/// only, and comparison is needed only once a second one appears.
+/// The distinct prepared bodies of one definition that are still held. The
+/// first body is kept unencoded: most definitions are prepared under one
+/// parameter environment only, and comparison is needed only once a second
+/// one appears.
 #[derive(Default)]
 struct EqualPrepared {
-    first: Option<Rc<PreparedModuleItems>>,
-    by_content: HashMap<(u64, usize), Vec<Rc<PreparedModuleItems>>>,
+    first: Option<std::rc::Weak<PreparedModuleItems>>,
+    by_content: HashMap<(u64, usize), Vec<std::rc::Weak<PreparedModuleItems>>>,
+    /// The size of `by_content` at which the released bodies are next
+    /// dropped from it.
+    sweep_at: usize,
 }
 
 /// The canonical copy of a freshly prepared body: an equal body of the same
@@ -40476,34 +40482,45 @@ fn share_equal_prepared(
         bincode::serde::encode_to_vec(PreparedView(p), crate::xez_bincode_config()).ok()
     };
     if entry.first.is_none() && entry.by_content.is_empty() {
-        entry.first = Some(Rc::clone(&fresh));
+        entry.first = Some(Rc::downgrade(&fresh));
         return fresh;
     }
-    if let Some(first) = entry.first.take() {
+    if let Some(first) = entry.first.take().and_then(|first| first.upgrade()) {
         let Some(bytes) = encode(&first) else {
-            entry.first = Some(first);
+            entry.first = Some(Rc::downgrade(&first));
             return fresh;
         };
-        entry.by_content.entry(key(&bytes)).or_default().push(first);
+        entry
+            .by_content
+            .entry(key(&bytes))
+            .or_default()
+            .push(Rc::downgrade(&first));
     }
     let Some(bytes) = encode(&fresh) else {
         return fresh;
     };
+    if entry.by_content.len() >= entry.sweep_at {
+        entry.by_content.retain(|_, bucket| {
+            bucket.retain(|body| body.strong_count() > 0);
+            !bucket.is_empty()
+        });
+        entry.sweep_at = (entry.by_content.len() * 2).max(16);
+    }
     let bucket = entry.by_content.entry(key(&bytes)).or_default();
-    for candidate in bucket.iter() {
+    for candidate in bucket.iter().filter_map(|body| body.upgrade()) {
         let mut compare = crate::ast_intern::CompareWriter::new(&bytes);
         if bincode::serde::encode_into_std_write(
-            PreparedView(candidate),
+            PreparedView(&candidate),
             &mut compare,
             crate::xez_bincode_config(),
         )
         .is_ok()
             && compare.matched()
         {
-            return Rc::clone(candidate);
+            return candidate;
         }
     }
-    bucket.push(Rc::clone(&fresh));
+    bucket.push(Rc::downgrade(&fresh));
     fresh
 }
 
@@ -41679,6 +41696,7 @@ fn inline_module_items(
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
     let _decl_shapes = install_decl_shapes(source_def);
+    cache.prepared.enter_instance(prefix);
     let mut prepared_source = prepare_module_items(
         source_def,
         definitions,
@@ -44268,6 +44286,7 @@ fn inline_module_items(
                 }
 
                 let __tp = iprof_now();
+                cache.prepared.enter_instance(&inst_prefix);
                 let prepared_sub = prepare_module_items(
                     sub_mod,
                     definitions,

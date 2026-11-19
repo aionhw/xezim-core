@@ -488,6 +488,11 @@ pub(super) struct PreparedKey {
 pub(super) type TypeBinding = (String, Option<u32>, Box<[u8]>);
 
 impl PreparedKey {
+    /// The definition whose body the key is for.
+    pub(super) fn definition(&self) -> &(String, usize) {
+        &self.definition
+    }
+
     /// A body whose preparation does not inspect value parameters. Type
     /// bindings still distinguish contexts; instance elaboration keeps its
     /// complete parameter scope independently of this syntax cache.
