@@ -4194,7 +4194,7 @@ pub struct ElaboratedModule {
     /// (`localparam e_t RST`), keyed as in `parameters`. The self-determined
     /// type of a parameter (§6.20.2), e.g. for a `default:` key (§10.9.1).
     #[serde(default)]
-    pub param_decl_types: SharedNameMap<DataType>,
+    pub param_decl_types: crate::decl_types::ParamDeclTypeMap,
     /// Struct variable -> its top-level member names in DECLARATION order, for
     /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
     /// offset (i.e. reversed) and unpacked members live in separate signals, so
@@ -4782,7 +4782,7 @@ impl ElaboratedModule {
             packed_struct_fields: HashMap::default(),
             struct_field_range_idents: HashMap::default(),
             var_decl_types: Default::default(),
-            param_decl_types: SharedNameMap::default(),
+            param_decl_types: Default::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
@@ -10522,7 +10522,7 @@ pub fn elaborate_module_with_defs(
             .iter()
             .chain(item_param_decls(module.items())),
         str::to_string,
-        DataType::clone,
+        |dt| Rc::new(dt.clone()),
     );
     if let Some(defs) = all_defs {
         for def in defs.values() {
@@ -10535,7 +10535,7 @@ pub fn elaborate_module_with_defs(
                     &mut elab,
                     pds,
                     |n| format!("{}::{n}", p.name.name),
-                    DataType::clone,
+                    |dt| Rc::new(dt.clone()),
                 );
             }
         }
@@ -26731,12 +26731,13 @@ fn peel_unpacked_typed_pattern(e: &Expression) -> &Expression {
 }
 
 /// §6.20.2: record under `key(name)` the declared type of each explicitly
-/// typed value parameter of `pds`.
+/// typed value parameter of `pds`. The parameters of one declaration hold
+/// one copy of its type.
 fn record_param_decl_types<'a>(
     elab: &mut ElaboratedModule,
     pds: impl Iterator<Item = &'a ParameterDeclaration>,
     key: impl Fn(&str) -> String,
-    ty: impl Fn(&DataType) -> DataType,
+    mut ty: impl FnMut(&DataType) -> Rc<DataType>,
 ) {
     for pd in pds {
         let ParameterKind::Data {
@@ -26752,7 +26753,8 @@ fn record_param_decl_types<'a>(
         }
         let dt = ty(data_type);
         for a in assignments.iter().filter(|a| a.dimensions.is_empty()) {
-            elab.param_decl_types.insert(key(&a.name.name), dt.clone());
+            elab.param_decl_types
+                .insert_shared(key(&a.name.name), Rc::clone(&dt));
         }
     }
 }
@@ -44412,7 +44414,15 @@ fn inline_module_items(
                         .iter()
                         .chain(item_param_decls(&prepared_sub.effective_items)),
                     |n| cat2(&inst_prefix, n),
-                    |dt| scope_local_typerefs(dt, &sub_typedef_names_all, &inst_prefix),
+                    |dt| {
+                        instance_decl_type(
+                            &mut cache.decl_types,
+                            dt,
+                            &sub_typedef_names_all,
+                            &inst_prefix,
+                            sub_mod.name(),
+                        )
+                    },
                 );
                 let mut sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
                     sub_local_params.clone()

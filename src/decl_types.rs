@@ -1,12 +1,13 @@
-//! Declared types of signals (IEEE 1800-2023 §6.8), one shared copy per
-//! declaration (aionhw/xezim#721).
+//! Declared types of signals and value parameters (IEEE 1800-2023 §6.8,
+//! §6.20.2), one shared copy per declaration (aionhw/xezim#721).
 //!
 //! Every signal records the data type it was declared with. The instances of
 //! a definition declare the same types, and so do the declarators of one
 //! declaration; holding a private copy of the type tree in each signal's
 //! entry made it the largest per-signal cost of a design. A [`DeclTypeMap`]
 //! holds each type behind an `Rc`, and a [`DeclTypeInterner`] hands the
-//! signals of one declaration the same one.
+//! signals of one declaration the same one. A [`ParamDeclTypeMap`] does the
+//! same for the explicitly typed value parameters.
 //!
 //! A shared type is immutable. Its contextual evaluator caches (widths,
 //! resolved names) are disabled, so reading it for one instance never leaves
@@ -15,6 +16,7 @@
 
 use crate::ast::types::DataType;
 use crate::hasher::{DeterministicState, HashMap};
+use crate::shared_names::{self, SharedName, SharedNameMap};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, hash_map};
 use std::hash::{BuildHasher, Hasher};
@@ -166,6 +168,71 @@ impl<'a> IntoIterator for &'a DeclTypeMap {
     type IntoIter = Iter<'a>;
     fn into_iter(self) -> Iter<'a> {
         self.iter()
+    }
+}
+
+/// Value parameter name to declared type (§6.20.2), keyed as the parameter
+/// table is. Serde keeps the plain map representation, as [`DeclTypeMap`]
+/// does.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ParamDeclTypeMap(SharedNameMap<Rc<DataType>>);
+
+impl ParamDeclTypeMap {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn get(&self, name: &str) -> Option<&DataType> {
+        self.0.get(name).map(|ty| &**ty)
+    }
+    /// The entry itself, which the parameters of one declaration share.
+    pub fn get_shared(&self, name: &str) -> Option<&Rc<DataType>> {
+        self.0.get(name)
+    }
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+    /// The key of `name`, which the tables keyed by it share.
+    pub fn shared_key(&self, name: &str) -> Option<&SharedName> {
+        self.0.shared_key(name)
+    }
+    /// Record a type that other parameters may hold too. Returns the type
+    /// `name` had.
+    pub fn insert_shared<K: Into<SharedName>>(
+        &mut self,
+        name: K,
+        ty: Rc<DataType>,
+    ) -> Option<Rc<DataType>> {
+        self.0.insert(name, ty)
+    }
+    pub fn keys(&self) -> shared_names::Keys<'_, Rc<DataType>> {
+        self.0.keys()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &DataType)> + Clone {
+        self.0.iter().map(|(name, ty)| (name, &**ty))
+    }
+}
+
+impl<'a> IntoIterator for &'a ParamDeclTypeMap {
+    type Item = (&'a String, &'a DataType);
+    type IntoIter = ParamIter<'a>;
+    fn into_iter(self) -> ParamIter<'a> {
+        ParamIter(self.0.iter())
+    }
+}
+
+pub struct ParamIter<'a>(shared_names::Iter<'a, Rc<DataType>>);
+
+impl<'a> Iterator for ParamIter<'a> {
+    type Item = (&'a String, &'a DataType);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(name, ty)| (name, &**ty))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 
