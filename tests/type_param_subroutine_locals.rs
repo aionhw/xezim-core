@@ -36,7 +36,22 @@ module m #(type MT = s_t, parameter type BT = int) ();
 endmodule
 interface i #(type IT = s_t) (); task automatic t(); IT loc; loc = '0; endtask endinterface
 module top; m u (); m #(.BT(byte)) w (); i k (); endmodule\n";
-    let m = elaborate(src);
+    let mut m = elaborate(src);
+    for task in ["u.t", "k.t"] {
+        let td = m
+            .tasks
+            .get(task)
+            .unwrap_or_else(|| panic!("no task {task}"));
+        let items = m.resolved_task_items(task, td);
+        let dt = first_local_type(&items).expect("a local");
+        assert!(matches!(dt, DataType::Struct(_)), "{task}: {dt:?}");
+    }
+    let f = m.functions.get("w.f").expect("no w.f");
+    let items = m.resolved_function_items("w.f", f);
+    let dt = first_local_type(&items).expect("a local");
+    assert!(!matches!(dt, DataType::TypeReference { .. }), "w.f: {dt:?}");
+
+    m.materialize_pending();
     for task in ["u.t", "k.t"] {
         let td = m
             .tasks
