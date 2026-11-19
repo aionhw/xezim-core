@@ -31,6 +31,8 @@ mod module_class_scope;
 mod param_prefix_index;
 mod param_scope;
 mod prepared_bodies;
+#[cfg(test)]
+mod prepared_bodies_tests;
 pub(crate) mod unit_storage;
 pub(crate) mod relaxed_static;
 
