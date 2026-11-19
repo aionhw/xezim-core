@@ -1832,9 +1832,15 @@ impl<'a> Binder<'a> {
             ExprKind::AssignmentPattern(items) => {
                 for item in items {
                     match item {
-                        AssignmentPatternItem::Ordered(v)
-                        | AssignmentPatternItem::Named(_, v)
-                        | AssignmentPatternItem::Default(v) => self.expr(v),
+                        AssignmentPatternItem::Ordered(v) | AssignmentPatternItem::Default(v) => {
+                            self.expr(v)
+                        }
+                        AssignmentPatternItem::Named(id, v) => {
+                            if id.type_key.is_none() {
+                                id.bound = self.resolve(&id.name).bound();
+                            }
+                            self.expr(v);
+                        }
                         AssignmentPatternItem::Typed(t, v) => {
                             self.data_type(t);
                             self.expr(v);

@@ -171,13 +171,63 @@ pub enum ExprKind {
     },
 }
 
+/// The key of a bare `name: expr` assignment pattern item (§10.9.1, §10.9.2).
+///
+/// `ident` always preserves the original bare spelling for structure member
+/// matching (which takes precedence over type keys in §10.9.2). `type_key`
+/// records a lexically resolved typedef name (such as `"p::PT"` from package
+/// scoping or `"g[1].gw_t"` from generate-block renaming) when the key is used
+/// as a type key instead.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PatternNamedKey {
+    pub ident: Identifier,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub type_key: Option<Box<str>>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
+}
+
+impl PatternNamedKey {
+    pub fn new(ident: Identifier) -> Self {
+        Self {
+            ident,
+            type_key: None,
+            bound: Default::default(),
+        }
+    }
+
+    pub fn type_key_name(&self) -> &str {
+        self.type_key.as_deref().unwrap_or(&self.ident.name)
+    }
+}
+
+impl From<Identifier> for PatternNamedKey {
+    fn from(ident: Identifier) -> Self {
+        Self::new(ident)
+    }
+}
+
+impl std::ops::Deref for PatternNamedKey {
+    type Target = Identifier;
+    fn deref(&self) -> &Self::Target {
+        &self.ident
+    }
+}
+
+impl std::ops::DerefMut for PatternNamedKey {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ident
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AssignmentPatternItem {
     /// Ordered: `'{expr, expr}`
     Ordered(Expression),
     /// Named: `'{name: expr, name: expr}`
-    Named(Identifier, Expression),
+    Named(PatternNamedKey, Expression),
     /// Typed: `'{type: expr}`
     Typed(super::types::DataType, Expression),
     /// Default: `'{default: expr}`

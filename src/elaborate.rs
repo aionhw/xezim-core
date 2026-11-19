@@ -30692,6 +30692,43 @@ fn emit_member_elem_assigns(
     }
 }
 
+/// Like [`member_access_chain_as_scopes`], also stepping through an
+/// `ExprKind::Specialization` (`PC#(integer)::cw_t` or `pkg::PC#(T)::cw_t`).
+fn member_access_chain_as_scopes_or_spec(
+    e: &crate::ast::expr::Expression,
+) -> Option<(Vec<crate::ast::types::TypeScope>, Identifier)> {
+    let mut links: Vec<Identifier> = Vec::new();
+    let mut cur = e;
+    for _ in 0..16 {
+        match &cur.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                links.push(member.clone());
+                cur = expr;
+            }
+            ExprKind::Specialization { base, .. } => {
+                cur = base;
+            }
+            ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) => {
+                for seg in h.path.iter().rev() {
+                    links.push(seg.name.clone());
+                }
+                links.reverse();
+                let leaf = links.pop()?;
+                let scopes = links
+                    .into_iter()
+                    .map(|name| crate::ast::types::TypeScope {
+                        name,
+                        type_args: Vec::new(),
+                    })
+                    .collect();
+                return Some((scopes, leaf));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Whether `expr` is a scoped type reference (`pkg::word_t`, `$unit::word_t`)
 /// in `typedef_types` rather than a value parameter in `params`.
 fn scoped_type_key_of_expr(
@@ -30749,7 +30786,7 @@ fn scoped_type_key_of_expr(
             }
         }
         ExprKind::MemberAccess { .. } => {
-            let (scopes, leaf) = member_access_chain_as_scopes(expr)?;
+            let (scopes, leaf) = member_access_chain_as_scopes_or_spec(expr)?;
             if scopes.is_empty() {
                 return None;
             }
@@ -30831,7 +30868,11 @@ fn pattern_item_type_key<'a>(
             if is_param_in_scope(&k.name, scope, params) {
                 return None;
             }
-            let key = lookup_typedef_key_in_scope(&k.name, scope, typedef_types)?;
+            let key = if let Some(tk) = k.type_key.as_deref() {
+                typedef_types.contains_key(tk).then(|| tk.to_string())?
+            } else {
+                lookup_typedef_key_in_scope(&k.name, scope, typedef_types)?
+            };
             let span = k.span;
             Some((
                 DataType::TypeReference {
@@ -51714,7 +51755,9 @@ fn qualify_nettype_pattern_types(
                         if matches!(item, AssignmentPatternItem::Ordered(_)) {
                             pos += 1;
                         }
-                        if let AssignmentPatternItem::Named(ref k, ref v) = item {
+                        if let AssignmentPatternItem::Named(ref k, ref v) = item
+                            && k.type_key.is_none()
+                        {
                             let is_member = struct_members
                                 .is_some_and(|ms| ms.iter().any(|(m, _, _)| *m == k.name));
                             if !is_member
@@ -56824,7 +56867,27 @@ fn rewrite_expr_impl(
                             }
                             Api::Ordered(rewritten)
                         }
-                        Api::Named(n, e) => Api::Named(n.clone(), rw(e)),
+                        Api::Named(n, e) => {
+                            let mut n = n.clone();
+                            let typedef = |k| k == crate::ast::binding::DeclKind::Typedef;
+                            if let Some(key) = gen_renamed(n.bound, n.type_key_name(), typedef) {
+                                n.type_key = Some(key.into_boxed_str());
+                            }
+                            if !prefix.is_empty() {
+                                let lookup = n.type_key_name();
+                                if !lookup.contains("::")
+                                    && (local_names.contains(lookup)
+                                        || TYPE_BIND_TYPES_TLS.with(|c| {
+                                            c.borrow()
+                                                .as_ref()
+                                                .is_some_and(|m| m.contains_key(lookup))
+                                        }))
+                                {
+                                    n.type_key = Some(format!("{prefix}{lookup}").into_boxed_str());
+                                }
+                            }
+                            Api::Named(n, rw(e))
+                        }
                         Api::Typed(t, e) => Api::Typed(
                             rewrite_typed_pattern_type(
                                 t,
