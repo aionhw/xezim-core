@@ -2293,7 +2293,7 @@ impl<'a> Lw<'a> {
             let r = self.repr(s.ty, &info.loc);
             let _ = writeln!(
                 decls,
-                "  {t} vh_s{s};\n  bit vh_s{s}_ev, vh_s{s}_act; {t} vh_s{s}_last; longint vh_s{s}_lev;",
+                "  {t} vh_s{s}, vh_s{s}_last;",
                 s = si,
                 t = r.sv()
             );
@@ -2324,6 +2324,20 @@ impl<'a> Lw<'a> {
                 v = v
             );
             activity_init_offsets.push(elab.len());
+        }
+        // The flags and timestamps have identical scalar types across signals.
+        // Bound each declaration so even large designs parse in small items.
+        for first in (0..sigs.len()).step_by(128) {
+            let end = (first + 128).min(sigs.len());
+            let _ = write!(decls, "  bit vh_s{first}_ev, vh_s{first}_act");
+            for s in first + 1..end {
+                let _ = write!(decls, ", vh_s{s}_ev, vh_s{s}_act");
+            }
+            let _ = write!(decls, ";\n  longint vh_s{first}_lev");
+            for s in first + 1..end {
+                let _ = write!(decls, ", vh_s{s}_lev");
+            }
+            decls.push_str(";\n");
         }
         // Temporaries scoped to the one-time initialization block.
         let mut elab_temps = String::new();
@@ -2860,7 +2874,7 @@ impl<'a> Lw<'a> {
                 // even when the pending value equals the current value.
                 let _ = write!(
                     drv,
-                    "  {t} vh_dv{s}_{p};\n  bit vh_pend{s}_{p};\n  {t} vh_pv{s}_{p};\n",
+                    "  {t} vh_dv{s}_{p}, vh_pv{s}_{p};\n  bit vh_pend{s}_{p};\n",
                     t = t,
                     s = s,
                     p = p
@@ -2903,7 +2917,7 @@ impl<'a> Lw<'a> {
                     let tx = self.whole_tx(&r);
                     let _ = write!(
                         drv,
-                        "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p};\n  bit vh_pend{s}_{p};\n  {t} vh_pv{s}_{p};\n  int vh_qn{s}_{p};\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    if (vh_pend{s}_{p}) begin {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, vh_pv{s}_{p}, 64'sd0, 64'sd0, 0); vh_pend{s}_{p} = 0; end\n    {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, v, after, rej, mode);\n    vh_qn{s}_{p} = vh_dt{s}_{p}.size();\n  endfunction\n",
+                        "  longint vh_dt{s}_{p}[$];\n  {t} vh_dq{s}_{p}[$];\n  {t} vh_dv{s}_{p}, vh_pv{s}_{p};\n  bit vh_pend{s}_{p};\n  int vh_qn{s}_{p};\n  function automatic void vh_drv_{s}_{p}({t} v, longint after, longint rej, int mode);\n    if (vh_pend{s}_{p}) begin {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, vh_pv{s}_{p}, 64'sd0, 64'sd0, 0); vh_pend{s}_{p} = 0; end\n    {tx}(vh_dt{s}_{p}, vh_dq{s}_{p}, v, after, rej, mode);\n    vh_qn{s}_{p} = vh_dt{s}_{p}.size();\n  endfunction\n",
                         s = s,
                         p = p,
                         t = t,

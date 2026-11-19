@@ -1,6 +1,6 @@
 //! Expression parsing (IEEE 1800-2017 §A.8) with Pratt precedence climbing.
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use super::items::ConstraintPos;
 use crate::ast::Identifier;
 use crate::ast::Span;
@@ -2645,7 +2645,7 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen);
-        args
+        compact_syntax_list(args)
     }
 
     /// Parse a hierarchical identifier (handles pkg::name and obj.member).

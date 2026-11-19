@@ -1,6 +1,6 @@
 //! Data type parsing (IEEE 1800-2017 §A.2.2)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
@@ -705,7 +705,7 @@ impl Parser {
                 }
             }
         }
-        dims
+        compact_syntax_list(dims)
     }
 
     pub(super) fn parse_unpacked_dimensions(&mut self) -> Vec<UnpackedDimension> {
@@ -797,7 +797,7 @@ impl Parser {
                 }
             }
         }
-        dims
+        compact_syntax_list(dims)
     }
 
     fn is_associative_index_type_start(&self) -> bool {

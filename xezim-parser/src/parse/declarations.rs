@@ -1411,7 +1411,7 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen);
-        ports
+        compact_syntax_list(ports)
     }
 
     pub(super) fn parse_package_item(&mut self) -> Option<PackageItem> {

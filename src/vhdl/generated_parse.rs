@@ -153,6 +153,7 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
             return None;
         }
         let mut assembled = None;
+        let mut item_batches = Vec::new();
         loop {
             let mut tokens = header.clone();
             while stream.next.kind != K::KwEndmodule
@@ -171,10 +172,11 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
             if !descriptions.is_empty() || matches!(module.ports, PortList::NonAnsi(_)) {
                 return None;
             }
-            if let Some(previous) = &mut assembled {
-                let previous: &mut crate::ast::module::ModuleDeclaration = previous;
-                previous.items.append(&mut module.items);
-            } else {
+            // Keep each parser batch in its own buffer until the total item
+            // count is known. Growing a single Vec here copies the preceding
+            // batches and can reserve millions of unused ModuleItem slots.
+            item_batches.push(std::mem::take(&mut module.items));
+            if assembled.is_none() {
                 assembled = Some(module);
             }
             batches += 1;
@@ -192,15 +194,19 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
                 let end = stream.take();
                 let mut module = assembled?;
                 module.span = Span::new(header[0].span.start, end.span.end);
-                let capacity_before = module.items.capacity();
-                if capacity_before > module.items.len() {
-                    // Drop the large batch-growth allocation before building
-                    // elaboration tables. Move values without cloning their
-                    // contextual caches; the completed AST is not yet indexed.
-                    let mut compact = Vec::with_capacity(module.items.len());
-                    compact.append(&mut module.items);
-                    module.items = compact;
-                }
+                let capacity_before = item_batches.iter().map(Vec::capacity).sum();
+                module.items = if item_batches.len() == 1 {
+                    let mut items = item_batches.pop()?;
+                    items.shrink_to_fit();
+                    items
+                } else {
+                    let len = item_batches.iter().map(Vec::len).sum();
+                    let mut items = Vec::with_capacity(len);
+                    for batch in item_batches {
+                        items.extend(batch);
+                    }
+                    items
+                };
                 crate::oom_trace::checkpoint(
                     "vhdl.generated_item_capacity",
                     &[
@@ -256,6 +262,39 @@ mod tests {
         for target in [1, 8, 64, 65_536] {
             let batched = parse(text, target).unwrap();
             assert_eq!(format!("{whole:?}"), format!("{batched:?}"));
+        }
+    }
+
+    #[test]
+    fn short_lists_in_generated_helpers_have_no_spare_slots() {
+        use crate::ast::{decl::ModuleItem, expr::ExprKind, stmt::StatementKind, types::DataType};
+
+        let text =
+            "module m; function int f(input logic [7:0] a[2]); return g(a); endfunction endmodule";
+        let descriptions = parse(text, 1).unwrap();
+        let Description::Module(module) = &descriptions[0] else {
+            panic!()
+        };
+        let ModuleItem::FunctionDeclaration(f) = &module.items[0] else {
+            panic!()
+        };
+        let port = &f.ports[0];
+        let DataType::IntegerVector { dimensions, .. } = &port.data_type else {
+            panic!()
+        };
+        let StatementKind::Return(Some(expr)) = &f.items[0].kind else {
+            panic!()
+        };
+        let ExprKind::Call { args, .. } = &expr.kind else {
+            panic!()
+        };
+        for capacity in [
+            f.ports.capacity(),
+            dimensions.capacity(),
+            port.dimensions.capacity(),
+            args.capacity(),
+        ] {
+            assert_eq!(capacity, 1);
         }
     }
 
