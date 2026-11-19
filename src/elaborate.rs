@@ -51786,6 +51786,146 @@ fn is_signal_in_scope(name: &str, scope: &str, elab: &ElaboratedModule) -> bool 
     elab.signals.contains_key(name)
 }
 
+/// Compact index-based Disjoint-Set Union with path halving and union by size.
+struct IndexDsu {
+    parent: Vec<u32>,
+    size: Vec<u32>,
+}
+
+impl IndexDsu {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n as u32).collect(),
+            size: vec![1; n],
+        }
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            let p = self.parent[x as usize];
+            let gp = self.parent[p as usize];
+            self.parent[x as usize] = gp;
+            x = gp;
+        }
+        x
+    }
+
+    fn union(&mut self, a: u32, b: u32) -> u32 {
+        let mut ra = self.find(a);
+        let mut rb = self.find(b);
+        if ra == rb {
+            return ra;
+        }
+        if self.size[ra as usize] < self.size[rb as usize] {
+            std::mem::swap(&mut ra, &mut rb);
+        }
+        self.parent[rb as usize] = ra;
+        self.size[ra as usize] += self.size[rb as usize];
+        ra
+    }
+
+    fn push_singleton(&mut self) -> u32 {
+        let id = self.parent.len() as u32;
+        self.parent.push(id);
+        self.size.push(1);
+        id
+    }
+}
+
+/// Compute `alias` equivalence classes over `alias_groups` + `net_port_merges`
+/// in O((G + M) * α(N)) with zero string allocations during union/find.
+/// Each returned group contains its members in `unify_alias_nets` priority
+/// order (declared alias groups first, then port-merge additions) and the
+/// chosen canonical net name (if any member is a known net/signal).
+fn collect_alias_components<'a>(
+    elab: &'a ElaboratedModule,
+) -> Vec<(Option<String>, Vec<String>)> {
+    if elab.alias_groups.is_empty() {
+        return Vec::new();
+    }
+    let mut id_of: HashMap<&'a str, u32> = HashMap::default();
+    let mut names: Vec<&'a str> = Vec::new();
+    let mut dsu = IndexDsu::new(0);
+    let mut has_alias: Vec<bool> = Vec::new();
+
+    let mut intern = |s: &'a str, dsu: &mut IndexDsu, has_alias: &mut Vec<bool>| -> u32 {
+        if let Some(&id) = id_of.get(s) {
+            return id;
+        }
+        let id = dsu.push_singleton();
+        id_of.insert(s, id);
+        names.push(s);
+        has_alias.push(false);
+        id
+    };
+
+    for group in &elab.alias_groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let first = intern(group[0].as_str(), &mut dsu, &mut has_alias);
+        has_alias[dsu.find(first) as usize] = true;
+        for n in &group[1..] {
+            let id = intern(n.as_str(), &mut dsu, &mut has_alias);
+            let r = dsu.union(first, id);
+            has_alias[r as usize] = true;
+        }
+    }
+    for (formal, actual) in &elab.net_port_merges {
+        let f_id = intern(formal.as_str(), &mut dsu, &mut has_alias);
+        let a_id = intern(actual.as_str(), &mut dsu, &mut has_alias);
+        let fa = has_alias[dsu.find(f_id) as usize] || has_alias[dsu.find(a_id) as usize];
+        let r = dsu.union(f_id, a_id);
+        has_alias[r as usize] |= fa;
+    }
+
+    let mut comp_members: HashMap<u32, Vec<String>> = HashMap::default();
+    let mut comp_order: Vec<u32> = Vec::new();
+    let mut seen: HashSet<&'a str> = HashSet::default();
+    for group in &elab.alias_groups {
+        if group.len() < 2 {
+            continue;
+        }
+        for n in group {
+            if !seen.insert(n.as_str()) {
+                continue;
+            }
+            let root = dsu.find(id_of[n.as_str()]);
+            if !comp_members.contains_key(&root) {
+                comp_order.push(root);
+            }
+            comp_members.entry(root).or_default().push(n.clone());
+        }
+    }
+    for (formal, actual) in &elab.net_port_merges {
+        for n in [formal.as_str(), actual.as_str()] {
+            if !seen.insert(n) {
+                continue;
+            }
+            let root = dsu.find(id_of[n]);
+            if !has_alias[root as usize] {
+                continue;
+            }
+            if !comp_members.contains_key(&root) {
+                comp_order.push(root);
+            }
+            comp_members.entry(root).or_default().push(n.to_string());
+        }
+    }
+
+    comp_order
+        .into_iter()
+        .map(|root| {
+            let members = comp_members.remove(&root).unwrap_or_default();
+            let canon = members
+                .iter()
+                .find(|n| elab.nets.contains(n.as_str()) || elab.signals.contains_key(n.as_str()))
+                .cloned();
+            (canon, members)
+        })
+        .collect()
+}
+
 pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), String> {
     if elab.nettype_resolvers.is_empty() {
         return Ok(());
@@ -51849,14 +51989,18 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     // seed an element key over a declared signal of that spelling: the
     // declared object keeps its own (resolver-less) treatment.
     let mut elem_resolvers: Vec<(String, String)> = Vec::new();
-    for (base, resolver) in &net_resolver {
-        if let Some(&(lo, hi, _)) = elab.arrays.get(base) && resolver.len() != 0 {
-            for i in lo..=hi {
-                let elem = format!("{base}[{i}]");
-                if elab.signals.contains_key(&elem) {
-                    continue;
+    if !elab.arrays.is_empty() {
+        for (base, resolver) in &net_resolver {
+            if let Some(&(lo, hi, _)) = elab.arrays.get(base)
+                && !resolver.is_empty()
+            {
+                for i in lo..=hi {
+                    let elem = format!("{base}[{i}]");
+                    if elab.signals.contains_key(&elem) {
+                        continue;
+                    }
+                    elem_resolvers.push((elem, resolver.clone()));
                 }
-                elem_resolvers.push((elem, resolver.clone()));
             }
         }
     }
@@ -51903,22 +52047,73 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     // So union the nets joined by identity assigns and treat each connected
     // component as the single net it physically is: gather every real driver in
     // the component, resolve once onto a representative, and alias the rest.
-    let mut parent: HashMap<String, String> = HashMap::default();
-    fn find(parent: &mut HashMap<String, String>, x: &str) -> String {
-        let mut cur = x.to_string();
-        while let Some(p) = parent.get(&cur).cloned() {
-            if p == cur {
-                break;
+    // Precompute alias-group canonical map so scalar/vector nettype aliases
+    // pick the same canonical storage name as `unify_alias_nets` and skip
+    // emitting redundant `m = root` copies that `resolve_multi_driver_nets`
+    // would otherwise count as extra drivers on the aliased net.
+    let alias_canon_preview: HashMap<String, String> = if elab.alias_groups.is_empty() {
+        HashMap::default()
+    } else {
+        let mut map = HashMap::default();
+        for (canon_opt, members) in collect_alias_components(elab) {
+            if let Some(canon) = canon_opt {
+                for m in members {
+                    map.insert(m, canon.clone());
+                }
             }
-            cur = p;
         }
-        cur
-    }
-    let touch = |parent: &mut HashMap<String, String>, n: &str| {
-        parent.entry(n.to_string()).or_insert_with(|| n.to_string());
+        map
     };
-    for n in net_resolver.keys() {
-        touch(&mut parent, n);
+
+    // Index-based union-find over `net_resolver` keys (zero string cloning on
+    // find/union, path halving, and lazy member collection for non-singletons).
+    let mut all_nets: Vec<String> = net_resolver.keys().cloned().collect();
+    all_nets.sort();
+    let mut net_id: HashMap<String, u32> = HashMap::with_capacity_and_hasher(
+        all_nets.len(),
+        Default::default(),
+    );
+    for (i, n) in all_nets.iter().enumerate() {
+        net_id.insert(n.clone(), i as u32);
+    }
+    let mut dsu = IndexDsu::new(all_nets.len());
+
+    // §10.11: an `alias` statement declares multiple names for the same physical
+    // net, so their drivers must join one component and resolve together once.
+    for group in &elab.alias_groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let first_id = group.iter().find_map(|n| net_id.get(n.as_str()).copied());
+        if let Some(fid) = first_id {
+            for n in group {
+                if let Some(&id) = net_id.get(n.as_str()) {
+                    dsu.union(fid, id);
+                }
+            }
+        }
+        // Aliased unpacked nettype arrays (`alias a1 = a2;`) share elements pairwise.
+        if !elab.arrays.is_empty()
+            && let Some((base0, &(lo, hi, _))) = group
+                .iter()
+                .find_map(|n| elab.arrays.get(n.as_str()).map(|b| (n.as_str(), b)))
+        {
+            for i in lo..=hi {
+                let elem0 = format!("{base0}[{i}]");
+                let Some(&e0) = net_id.get(&elem0) else {
+                    continue;
+                };
+                for n in group {
+                    if n == base0 {
+                        continue;
+                    }
+                    let elem = format!("{n}[{i}]");
+                    if let Some(&ei) = net_id.get(&elem) {
+                        dsu.union(e0, ei);
+                    }
+                }
+            }
+        }
     }
 
     // net -> its real drivers with their own delays and origin scope (§10.3.3).
@@ -51953,10 +52148,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         && net_resolver[rn].is_empty()
                 });
             if let Some(((ln, _), (rn, _))) = joined {
-                let a = find(&mut parent, &ln);
-                let b = find(&mut parent, &rn);
-                if a != b {
-                    parent.insert(a, b);
+                if let (Some(&a), Some(&b)) = (net_id.get(&ln), net_id.get(&rn)) {
+                    dsu.union(a, b);
                 }
             } else if let Some((net, m)) = ident_flat_name(&ca.lhs)
                 .and_then(|l| net_member(&l))
@@ -51986,10 +52179,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         // read of the element, whose own fold writes the element's storage.
         if let Some(rhs_name) = ca.origin.is_none().then(|| net_base_of(elab, &ca.rhs)).flatten() {
             if net_resolver.contains_key(&rhs_name) && rhs_name != lhs_name {
-                let a = find(&mut parent, &lhs_name);
-                let b = find(&mut parent, &rhs_name);
-                if a != b {
-                    parent.insert(a, b);
+                if let (Some(&a), Some(&b)) = (net_id.get(&lhs_name), net_id.get(&rhs_name)) {
+                    dsu.union(a, b);
                 }
                 continue;
             }
@@ -52011,54 +52202,90 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             .push((ca.rhs, ca.delay, scope));
     }
 
+    // Choose a deterministic representative name for each component:
+    // prefer the `alias` canonical net (if any) or a member registered in
+    // `elab.signals` so staged delay nets and reads align on one slot.
+    let mut dsu_rep: Vec<u32> = (0..all_nets.len() as u32).collect();
+    let rep_rank: Vec<u8> = all_nets
+        .iter()
+        .map(|n| {
+            if alias_canon_preview.get(n).is_some_and(|c| c == n) {
+                2
+            } else if elab.signals.contains_key(n) {
+                1
+            } else {
+                0
+            }
+        })
+        .collect();
+    for (idx, _) in all_nets.iter().enumerate() {
+        let root = dsu.find(idx as u32);
+        let cur_rep = dsu_rep[root as usize];
+        if rep_rank[idx] > rep_rank[cur_rep as usize] {
+            dsu_rep[root as usize] = idx as u32;
+        }
+    }
+
+    // Only non-singleton components need member lists (avoids allocating a
+    // `Vec<String>` for every un-aliased, un-merged net in large designs).
+    let mut comp_members: HashMap<String, Vec<String>> = HashMap::default();
+    for (idx, n) in all_nets.iter().enumerate() {
+        let root = dsu.find(idx as u32);
+        if dsu.size[root as usize] > 1 {
+            let rep = &all_nets[dsu_rep[root as usize] as usize];
+            comp_members
+                .entry(rep.clone())
+                .or_default()
+                .push(n.clone());
+        }
+    }
+
     // Component -> its drivers, in first-seen order (deterministic: the emitted
     // CA order is observable through settle ordering). Each driver keeps its
     // OWN delay (§10.3.3: a delay on one continuous assignment delays that
     // driver's contribution alone, before resolution folds the others in).
     let mut comp_drivers: HashMap<String, Vec<(Expression, u64, String)>> = HashMap::default();
+    let mut comp_first_lhs: HashMap<String, String> = HashMap::default();
     let mut comp_order: Vec<String> = Vec::new();
     let mut comp_delay: HashMap<String, u64> = HashMap::default();
     for n in &order {
-        let root = find(&mut parent, n);
-        if !comp_drivers.contains_key(&root) {
-            comp_order.push(root.clone());
-            comp_delay.insert(root.clone(), *delays.get(n).unwrap_or(&0));
+        let root_id = dsu.find(net_id[n.as_str()]);
+        let rep = all_nets[dsu_rep[root_id as usize] as usize].clone();
+        if !comp_drivers.contains_key(&rep) {
+            comp_order.push(rep.clone());
+            comp_first_lhs.insert(rep.clone(), n.clone());
+            comp_delay.insert(rep.clone(), *delays.get(n).unwrap_or(&0));
         }
         let ds = real_drivers.remove(n).unwrap_or_default();
-        comp_drivers.entry(root).or_default().extend(ds);
-    }
-
-    // Members of each component, so the ones that are not the representative
-    // can be aliased to it and still read correctly.
-    let mut comp_members: HashMap<String, Vec<String>> = HashMap::default();
-    let mut all_nets: Vec<String> = net_resolver.keys().cloned().collect();
-    all_nets.sort();
-    for n in &all_nets {
-        let root = find(&mut parent, n);
-        comp_members.entry(root).or_default().push(n.clone());
+        comp_drivers.entry(rep).or_default().extend(ds);
     }
 
     // §6.6.7: count the drivers of each resolver-less net over its whole
     // component, member-wise ones included (a driver taken apart counts once,
     // as its most-driven member).
-    for n in &all_nets {
-        let root = find(&mut parent, n);
-        if root != *n || !net_resolver[&root].is_empty() {
+    for (idx, n) in all_nets.iter().enumerate() {
+        let root_id = dsu.find(idx as u32);
+        if dsu_rep[root_id as usize] != idx as u32 || !net_resolver[n.as_str()].is_empty() {
             continue;
         }
-        let members = &comp_members[&root];
         let mut per_member: HashMap<&str, usize> = HashMap::default();
-        for net in members {
-            for (m, c) in member_drivers.get(net).into_iter().flatten() {
+        if let Some(members) = comp_members.get(n.as_str()) {
+            for net in members {
+                for (m, c) in member_drivers.get(net).into_iter().flatten() {
+                    *per_member.entry(m.as_str()).or_insert(0) += c;
+                }
+            }
+        } else {
+            for (m, c) in member_drivers.get(n.as_str()).into_iter().flatten() {
                 *per_member.entry(m.as_str()).or_insert(0) += c;
             }
         }
-        let total = comp_drivers.get(&root).map_or(0, |d| d.len())
+        let total = comp_drivers.get(n.as_str()).map_or(0, |d| d.len())
             + per_member.values().copied().max().unwrap_or(0);
         if total > 1 {
             return Err(format!(
                 "net '{}' of an unresolved nettype has {} continuous drivers; a nettype declared without a resolution function permits only one (IEEE 1800-2017 6.6.7)",
-                root, total
+                n, total
             ));
         }
     }
@@ -52216,6 +52443,31 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     drivers.len()
                 ));
             }
+            // For an unresolved unpacked-struct nettype aliased to undriven
+            // siblings (`US usa, usb; alias usa = usb;`), copy member leaves
+            // from the driven member onto its siblings.
+            if members.is_some()
+                && let Some(src) = comp_first_lhs.get(&root)
+                && let Some(ms) = comp_members.get(&root)
+            {
+                for m in ms {
+                    if m == src {
+                        continue;
+                    }
+                    let mm = struct_members(elab, m);
+                    emit(
+                        &mut kept,
+                        m,
+                        make_net_lhs_expr(src),
+                        &mm,
+                        0,
+                        span,
+                        &elab.typedef_types,
+                        &elab.typedef_unpacked_dims,
+                        &elab.parameters,
+                    );
+                }
+            }
             // The original assignments and links were retained above. This
             // also preserves their delay and scope metadata.
             continue;
@@ -52353,16 +52605,26 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         );
 
         // Every other net in the component names the same physical node.
+        // Scalar nets sharing an `alias_canon` group will be storage-aliased
+        // by `unify_alias_nets`, so skip emitting a redundant `m = root` copy
+        // that `resolve_multi_driver_nets` would fold as a second driver.
         if let Some(ms) = comp_members.get(&root) {
+            let root_canon = alias_canon_preview.get(&root);
             for m in ms {
                 if m == &root {
+                    continue;
+                }
+                if members.is_none()
+                    && root_canon.is_some()
+                    && alias_canon_preview.get(m) == root_canon
+                {
                     continue;
                 }
                 let mm = struct_members(elab, m);
                 emit(
                     &mut kept,
                     m,
-                    make_ident_expr(&root),
+                    make_net_lhs_expr(&root),
                     &mm,
                     0,
                     span,
@@ -52370,6 +52632,73 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     &elab.typedef_unpacked_dims,
                     &elab.parameters,
                 );
+            }
+        }
+    }
+
+    // Propagate drivers across aliased/merged members of an unresolved
+    // unpacked-struct nettype whose continuous driver was already expanded
+    // member-wise into `member_drivers` (`US usa, usb; alias usa = usb;
+    // assign usa = '{4.5, 9};`). Components with a whole-net driver in
+    // `comp_first_lhs` were already propagated above.
+    if !member_drivers.is_empty() && !comp_members.is_empty() {
+        let mut kept_lhs: HashSet<String> = HashSet::default();
+        for ca in &kept {
+            if let Some(lhs) = ident_flat_name(&ca.lhs) {
+                if let Some((net, m)) = net_member(&lhs) {
+                    let head = m.split(['.', '[']).next().unwrap_or(&m);
+                    kept_lhs.insert(format!("{net}.{head}"));
+                } else {
+                    kept_lhs.insert(lhs);
+                }
+            }
+        }
+        let mut seen_roots: HashSet<&str> = HashSet::default();
+        for (idx, _) in all_nets.iter().enumerate() {
+            let root_id = dsu.find(idx as u32);
+            let root = all_nets[dsu_rep[root_id as usize] as usize].as_str();
+            if !seen_roots.insert(root)
+                || !net_resolver[root].is_empty()
+                || comp_first_lhs.contains_key(root)
+            {
+                continue;
+            }
+            let Some(ms) = comp_members.get(root) else {
+                continue;
+            };
+            let Some(members) = struct_members(elab, root) else {
+                continue;
+            };
+            for mem_spec in &members {
+                let mname = &mem_spec.0;
+                let Some(src) = ms.iter().find(|s| {
+                    member_drivers.get(s.as_str()).is_some_and(|pm| {
+                        pm.keys().any(|k| {
+                            k == mname
+                                || k.strip_prefix(mname.as_str())
+                                    .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+                        })
+                    })
+                }) else {
+                    continue;
+                };
+                let single_mem = Some(vec![mem_spec.clone()]);
+                for dest in ms {
+                    if dest == src || kept_lhs.contains(&format!("{dest}.{mname}")) {
+                        continue;
+                    }
+                    emit(
+                        &mut kept,
+                        dest,
+                        make_net_lhs_expr(src),
+                        &single_mem,
+                        0,
+                        Span::dummy(),
+                        &elab.typedef_types,
+                        &elab.typedef_unpacked_dims,
+                        &elab.parameters,
+                    );
+                }
             }
         }
     }
@@ -53434,106 +53763,13 @@ pub fn unify_alias_nets(elab: &mut ElaboratedModule) {
     if elab.alias_groups.is_empty() {
         return;
     }
-    // Union-find over the group members: the groups are cumulative, so a net
-    // named by two groups joins them.
-    let mut parent: HashMap<String, String> = HashMap::default();
-    fn find(parent: &mut HashMap<String, String>, x: &str) -> String {
-        let mut cur = x.to_string();
-        while let Some(p) = parent.get(&cur).cloned() {
-            if p == cur {
-                break;
-            }
-            cur = p;
-        }
-        cur
-    }
-    for group in &elab.alias_groups {
-        if group.len() < 2 {
-            continue;
-        }
-        for n in group {
-            parent.entry(n.clone()).or_insert_with(|| n.clone());
-        }
-        let first = group[0].clone();
-        for n in &group[1..] {
-            let a = find(&mut parent, &first);
-            let b = find(&mut parent, n);
-            if a != b {
-                parent.insert(a, b);
-            }
-        }
-    }
-    // §23.3.3.3: an INOUT port and the net it is connected to are ONE
-    // physical net, so a port that reaches an alias group joins that group
-    // (§10.11). The join is transitive: a port whose actual is another
-    // port's formal reaches the whole chain.
-    let mut port_joined: Vec<String> = Vec::new();
-    for _ in 0..=elab.net_port_merges.len() {
-        let mut joined = false;
-        for (formal, actual) in &elab.net_port_merges {
-            let f_in = parent.contains_key(formal);
-            let a_in = parent.contains_key(actual);
-            if !f_in && !a_in {
-                continue;
-            }
-            if f_in && a_in {
-                // Both ends already belong to a group: the port joins the
-                // two groups into one physical net.
-                let a = find(&mut parent, formal);
-                let b = find(&mut parent, actual);
-                if a != b {
-                    parent.insert(a, b);
-                    joined = true;
-                }
-                continue;
-            }
-            let (inside, outside) = if f_in { (formal, actual) } else { (actual, formal) };
-            let root = find(&mut parent, inside);
-            parent.insert(outside.clone(), root);
-            port_joined.push(outside.clone());
-            joined = true;
-        }
-        if !joined {
-            break;
-        }
-    }
-    // The members of each component, in declaration order: the alias
-    // groups' members first, then the port names the merges added.
-    let mut comp_members: HashMap<String, Vec<String>> = HashMap::default();
-    let mut comp_order: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::default();
-    for group in &elab.alias_groups {
-        for n in group {
-            if !seen.insert(n.clone()) {
-                continue;
-            }
-            let root = find(&mut parent, n);
-            if !comp_members.contains_key(&root) {
-                comp_order.push(root.clone());
-            }
-            comp_members.entry(root).or_default().push(n.clone());
-        }
-    }
-    for n in &port_joined {
-        if !seen.insert(n.clone()) {
-            continue;
-        }
-        let root = find(&mut parent, n);
-        if !comp_members.contains_key(&root) {
-            comp_order.push(root.clone());
-        }
-        comp_members.entry(root).or_default().push(n.clone());
-    }
+    let components = collect_alias_components(elab);
     // The canonical name of each component: the first member that names a net
     // the elaborated tables know. A member whose net does not exist (a port
     // already collapsed onto its actual, say) cannot stand for the group.
     elab.alias_pairs.clear();
-    for root in &comp_order {
-        let members = &comp_members[root];
-        let Some(canon) = members
-            .iter()
-            .find(|n| elab.nets.contains(n.as_str()) || elab.signals.contains_key(n.as_str()))
-        else {
+    for (canon_opt, members) in &components {
+        let Some(canon) = canon_opt.as_ref() else {
             continue;
         };
         // §6.6.5, §6.6.6: the members are ONE net, so they share its net
@@ -53593,23 +53829,29 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // to. A name of an alias member names the group's canonical net; a name
     // that reaches the group through a port (`u.p`, `u.h.p`) names it too.
     let alias_lookup_name = |n: &str| -> Option<String> {
+        if alias_canon.is_empty() {
+            return None;
+        }
         if let Some(c) = alias_canon.get(n) {
             return Some(c.clone());
         }
+        if port_aliases.is_empty() {
+            return None;
+        }
         // §23.3.3: a port name reaches the net it is connected to; the
         // chain of collapsed levels is followed to its end.
-        let mut cur = n.to_string();
+        let mut cur = n;
         for _ in 0..64 {
-            let Some(actual) = port_aliases.get(&cur) else {
+            let Some(actual) = port_aliases.get(cur) else {
                 break;
             };
             if let Some(c) = alias_canon.get(actual) {
                 return Some(c.clone());
             }
-            if actual == &cur {
+            if actual == cur {
                 break;
             }
-            cur = actual.clone();
+            cur = actual.as_str();
         }
         None
     };
@@ -53617,6 +53859,9 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // scope may be written with the scope's name (`top.b`) or from the root
     // (`$root.top.b`), and both name the top scope's `b` (§23.6).
     let alias_lookup_lhs = |e: &Expression| -> Option<String> {
+        if alias_canon.is_empty() {
+            return None;
+        }
         let ExprKind::Ident(h) = &e.kind else {
             return None;
         };
@@ -53632,10 +53877,10 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         // A root reference is written `$root.top.b`; elaboration may carry
         // the root as a path segment of its own.
         let (flat, rooted) = match flat.strip_prefix("$root.") {
-            Some(rest) => (rest.to_string(), true),
-            None => (flat, h.root.is_some()),
+            Some(rest) => (rest, true),
+            None => (flat.as_str(), h.root.is_some()),
         };
-        if let Some(c) = alias_lookup_name(&flat) {
+        if let Some(c) = alias_lookup_name(flat) {
             return Some(c);
         }
         // A root reference (`$root.top.b`) names the top scope whatever the
@@ -55308,6 +55553,19 @@ fn expand_whole_array_assign(
 /// A group member that is not a port is the child's own net; the group is
 /// recorded for the unification pass, which merges it with the rest of the
 /// group.
+fn net_port_actual_name(expr: &Expression) -> Option<String> {
+    if let Some(flat) = whole_net_ident_name(expr) {
+        return Some(flat);
+    }
+    if let ExprKind::Index { expr: base, index } = &expr.kind
+        && let Some(bn) = whole_net_ident_name(base)
+        && let Some(idx) = const_eval_i64_with_params(index, None)
+    {
+        return Some(format!("{bn}[{idx}]"));
+    }
+    None
+}
+
 fn apply_child_alias_groups(
     items: &[ModuleItem],
     inst_prefix: &str,
@@ -55331,10 +55589,10 @@ fn apply_child_alias_groups(
         let mut actuals: Vec<String> = Vec::new();
         for n in &names {
             if let Some(a) = port_map.get(n).cloned() {
-                if let Some(flat) = whole_net_ident_name(&a) {
-                    if !actuals.contains(&flat) {
-                        actuals.push(flat);
-                    }
+                if let Some(flat) = net_port_actual_name(&a)
+                    && !actuals.contains(&flat)
+                {
+                    actuals.push(flat);
                 }
                 match &actual {
                     None => actual = Some(a),
@@ -55349,6 +55607,14 @@ fn apply_child_alias_groups(
             } else {
                 group.push(cat2(inst_prefix, n));
             }
+        }
+        // When an alias joins child-local net(s) with port(s), bridge them
+        // to the port's parent actual so they resolve and unify together.
+        if !group.is_empty()
+            && let Some(first_actual) = actuals.first()
+            && !group.contains(first_actual)
+        {
+            group.push(first_actual.clone());
         }
         if group.len() > 1 {
             alias_groups.push(group);
