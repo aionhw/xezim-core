@@ -2325,7 +2325,7 @@ impl<'a> Lw<'a> {
             );
             activity_init_offsets.push(elab.len());
         }
-        // Temporaries of the initial values, declared in vh_elab.
+        // Temporaries scoped to the one-time initialization block.
         let mut elab_temps = String::new();
         for (n, t) in std::mem::take(&mut self.temps) {
             let _ = writeln!(elab_temps, "    {} {};", t, n);
@@ -2535,7 +2535,7 @@ impl<'a> Lw<'a> {
             let _ = writeln!(elab, "    vh_pa{n} = 0; vh_pa{n}_last = -64'sd9223372036854775807;");
         }
         self.trace_lowering("vhdl.lower.kernel");
-        let k = self.kernel(&upd_sigs);
+        let (kernel, init_offset) = self.kernel(&upd_sigs);
 
         // Assemble.
         let mut logic_defs = String::new();
@@ -2617,9 +2617,19 @@ impl<'a> Lw<'a> {
         m.push_str(&self.sub_items);
         m.push_str(&lnk);
         m.push_str(&imp_fns);
+        // Clocked processes assign vh_clkd from functions emitted above the
+        // kernel, so the flag has to be declared first.
+        if self.has_boundary() {
+            m.push_str("  bit vh_clkd;\n");
+        }
+        m.push_str(&procs);
+        // Emit initialization at its only execution site. A separate function
+        // would keep a second, private runtime copy of every initializer.
+        let (before_init, after_init) = kernel.split_at(init_offset);
+        m.push_str(before_init);
         let _ = write!(
             m,
-            "  function automatic void vh_elab();\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n",
+            "    begin\n{}    for (int p = 0; p <= {}; p++) vh_tmo[p] = -64'sd1;\n",
             elab_temps, np
         );
         // Reads of 'last_active can be discovered in later process bodies.
@@ -2633,14 +2643,8 @@ impl<'a> Lw<'a> {
             start = end;
         }
         m.push_str(&elab[start..]);
-        m.push_str("  endfunction\n");
-        // Clocked processes assign vh_clkd from functions emitted above the
-        // kernel, so the flag has to be declared first.
-        if self.has_boundary() {
-            m.push_str("  bit vh_clkd;\n");
-        }
-        m.push_str(&procs);
-        m.push_str(&k);
+        m.push_str("    end\n");
+        m.push_str(after_init);
         m.push_str("endmodule\n");
         crate::oom_trace::checkpoint(
             "vhdl.lower.assembled",
@@ -3145,7 +3149,7 @@ impl<'a> Lw<'a> {
     /// triggers it, hands control to processes that wait, and advances
     /// time. A mixed design's eager evaluation calls the same phases as
     /// functions.
-    fn kernel(&mut self, upd_sigs: &[usize]) -> String {
+    fn kernel(&mut self, upd_sigs: &[usize]) -> (String, usize) {
         let nprocs = self.procs.len();
         let drivers: Vec<((usize, usize), Driver)> =
             self.drivers.iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -3647,7 +3651,8 @@ impl<'a> Lw<'a> {
         };
         let _ = writeln!(k, "  initial begin : vh_kernel");
         let _ = writeln!(k, "    bit vh_any;");
-        let _ = writeln!(k, "    vh_elab();\n    vh_now = $time;");
+        let init_offset = k.len();
+        let _ = writeln!(k, "    vh_now = $time;");
         k.push_str(&self.boundary_sample_init());
         // Initial effective values (§14.7.5.2), in update order. This
         // declaration-free block can retain its shared syntax when the
@@ -3780,7 +3785,7 @@ impl<'a> Lw<'a> {
         let _ = writeln!(k, "    end");
         let _ = writeln!(k, "    $finish;");
         let _ = writeln!(k, "  end");
-        k
+        (k, init_offset)
     }
 
     /// The SV parameters of a subprogram parameter: a signal parameter
