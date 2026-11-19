@@ -3138,6 +3138,45 @@ fn parse_and_elaborate(
         }
     }
 
+    // §29.8, §28.16: the delays of a UDP instance count the time unit of the
+    // definition holding the instance. Only now is every primitive known
+    // (one may be defined after its first instance, or come from a library).
+    {
+        let udps: std::collections::HashSet<String> = definitions
+            .iter()
+            .filter(|(_, d)| matches!(d, SourceDefinition::Udp(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !udps.is_empty() {
+            let is_udp = |n: &str| udps.contains(n);
+            for (name, def) in definitions.iter_mut() {
+                let (unit_s, prec_s) = module_timescale_exp
+                    .get(name)
+                    .map(|&(u, p)| (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)))
+                    .unwrap_or((tick_s, tick_s));
+                match def {
+                    SourceDefinition::Module(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let m = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut m.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    SourceDefinition::Interface(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let i = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut i.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     warn_unapplied_param_overrides(&param_override_hits);
 
     // §6.18 + §3.12.1: a $unit typedef's DIMENSIONS are evaluated in the

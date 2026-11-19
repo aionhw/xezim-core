@@ -22333,6 +22333,70 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
 /// parameter-set), so two instances with different parameters get different
 /// constants.
 ///
+/// Whether `items` (generate constructs included) hold an instance with
+/// delays of a definition `is_udp` names.
+pub fn instantiates_udp(items: &[ModuleItem], is_udp: &dyn Fn(&str) -> bool) -> bool {
+    items.iter().any(|item| match item {
+        ModuleItem::ModuleInstantiation(mi) => mi.params.is_some() && is_udp(&mi.module_name.name),
+        ModuleItem::GenerateFor(gf) => instantiates_udp(&gf.items, is_udp),
+        ModuleItem::GenerateIf(gi) => gi
+            .branches
+            .iter()
+            .any(|(_c, items)| instantiates_udp(items, is_udp)),
+        ModuleItem::GenerateRegion(gr) => instantiates_udp(&gr.items, is_udp),
+        ModuleItem::GenerateCase(gc) => {
+            gc.arms.iter().any(|arm| instantiates_udp(&arm.items, is_udp))
+        }
+        _ => false,
+    })
+}
+
+/// §29.8, §28.16, §3.14.2: the delays of a UDP instance (`udp #(4) u(q, a);`,
+/// `#(rise, fall)`) count the time unit of the module that holds the
+/// instance, like the delays of a gate. A UDP instance is written as a module
+/// instantiation, and which names are primitives is known only once every
+/// definition is in hand, so `rewrite_module_item_delays` cannot take them;
+/// this pass runs afterwards, once per holding definition.
+pub fn rewrite_udp_instance_delays(
+    items: &mut [ModuleItem],
+    is_udp: &dyn Fn(&str) -> bool,
+    unit_s: f64,
+    prec_s: f64,
+    tick_s: f64,
+) {
+    for item in items.iter_mut() {
+        match item {
+            ModuleItem::ModuleInstantiation(mi) if is_udp(&mi.module_name.name) => {
+                for conn in mi.params.iter_mut().flatten() {
+                    if let crate::ast::decl::ParamConnection::Ordered(Some(
+                        crate::ast::decl::ParamValue::Expr(d),
+                    )) = conn
+                    {
+                        rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                    }
+                }
+            }
+            ModuleItem::GenerateFor(gf) => {
+                rewrite_udp_instance_delays(&mut gf.items, is_udp, unit_s, prec_s, tick_s)
+            }
+            ModuleItem::GenerateIf(gi) => {
+                for (_c, items) in gi.branches.iter_mut() {
+                    rewrite_udp_instance_delays(items, is_udp, unit_s, prec_s, tick_s);
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => {
+                rewrite_udp_instance_delays(&mut gr.items, is_udp, unit_s, prec_s, tick_s)
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in gc.arms.iter_mut() {
+                    rewrite_udp_instance_delays(&mut arm.items, is_udp, unit_s, prec_s, tick_s);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A name the body declares itself is left alone: it shadows the parameter.
 fn literalize_stmt_decl_dims(items: &mut [ModuleItem], params: &HashMap<String, Value>) {
     // The module's own typedefs, with this instance's parameters already
@@ -54990,8 +55054,52 @@ fn lower_udp_instances(
             crate::ast::decl::ParamConnection::Ordered(Some(
                 crate::ast::decl::ParamValue::Expr(e),
             )) => {
-                let e = rewrite_expr(e, prefix, &HashMap::default(), local_names, interface_map);
-                const_eval_i64_with_params(&e, Some(&elab.parameters)).map(|d| d.max(0) as u64)
+                // §3.14.2: `rewrite_udp_instance_delays` left the value in
+                // ticks: a literal folded to a real count, any other
+                // expression multiplied by the ticks of one time unit.
+                let (inner, scale) = match &e.kind {
+                    ExprKind::Binary {
+                        op: BinaryOp::Mul,
+                        left,
+                        right,
+                    } => match &right.kind {
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Real(s)) => {
+                            (left.as_ref(), *s)
+                        }
+                        _ => (e, 1.0),
+                    },
+                    _ => (e, 1.0),
+                };
+                let inner =
+                    rewrite_expr(inner, prefix, &HashMap::default(), local_names, interface_map);
+                let ticks = |units: f64| -> u64 {
+                    let t = (units * scale).round();
+                    if t.is_finite() && t > 0.0 { t as u64 } else { 0 }
+                };
+                let v = eval_const_expr_val(&inner, &elab.parameters);
+                if v.is_real {
+                    Some(ticks(v.to_f64()))
+                } else if v.has_xz() {
+                    // An unknown delay value is no delay, as the reference
+                    // simulator takes it.
+                    Some(0)
+                } else {
+                    // A non-constant value stays "not given". The integer
+                    // evaluator has no select of a parameter (`#(V[3:0] + 0)`
+                    // is 0 to it); the value evaluator has.
+                    let by_value = || {
+                        if v.is_signed {
+                            v.to_i64().unwrap_or(0).max(0) as u64
+                        } else {
+                            v.to_u64().unwrap_or(0)
+                        }
+                    };
+                    match const_eval_i64_with_params(&inner, Some(&elab.parameters)) {
+                        Some(0) => Some(ticks(by_value() as f64)),
+                        Some(d) => Some(ticks(d.max(0) as f64)),
+                        None => Some(by_value()).filter(|u| *u > 0).map(|u| ticks(u as f64)),
+                    }
+                }
             }
             _ => None,
         }
