@@ -11,6 +11,7 @@ mod types;
 use crate::ast::decl::{ModuleItem, PackageItem};
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::lexer::stream::TokenStream;
 use crate::lexer::token::{Token, TokenKind};
 use items::ConstraintPos;
 
@@ -25,10 +26,10 @@ fn compact_syntax_list<T>(mut items: Vec<T>) -> Vec<T> {
     compact
 }
 
-pub struct Parser {
+pub struct Parser<'a> {
     // §22.8 directive transitions in source order, consumed outside the grammar.
     default_net_pulls: Vec<(usize, Option<crate::ast::types::NetType>)>,
-    tokens: Vec<Token>,
+    tokens: TokenStream<'a>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
     /// IEEE 1800-2017 §12.6: `.name` pattern bindings collected while parsing a
@@ -90,7 +91,7 @@ pub struct Parser {
     pub(super) rs_values: Vec<String>,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// A.2.2.3 `delay_value ::= ... | 1step`: the lexer reads `1` and an
     /// adjacent `step`. Right after `#` or inside `#( )` they are one delay
     /// value, the global time precision (§3.14.3): rejoin them as the
@@ -99,13 +100,17 @@ impl Parser {
     /// delay, a clocking skew) reads it alike. Anywhere else (`x = 1step;`)
     /// they stay apart, an error. It was a delay of 1 and a stray `step`
     /// (#615).
-    fn join_one_step(tokens: Vec<Token>) -> Vec<Token> {
+    fn join_one_step(mut tokens: TokenStream<'a>) -> TokenStream<'a> {
         let joinable = |i: usize| {
-            tokens[i].kind == TokenKind::IntegerLiteral
-                && tokens[i].text == "1"
-                && tokens[i + 1].kind == TokenKind::Identifier
-                && tokens[i + 1].text == "step"
-                && tokens[i + 1].span.start == tokens[i].span.end
+            let tok = tokens[i];
+            let next = tokens[i + 1];
+            tok.kind == TokenKind::IntegerLiteral
+                && tok.raw_len() == 1
+                && next.kind == TokenKind::Identifier
+                && next.raw_len() == 4
+                && tokens.span(next).start == tokens.span(tok).end
+                && tokens.text(tok) == "1"
+                && tokens.text(next) == "step"
                 && (tokens[i - 1].kind == TokenKind::Hash
                     || (tokens[i - 1].kind == TokenKind::LParen
                         && i >= 2
@@ -115,7 +120,9 @@ impl Parser {
                     // `$__xz_intra_delay(d, b)` before parsing.
                     || (tokens[i - 1].kind == TokenKind::LParen
                         && i >= 2
-                        && tokens[i - 2].text == "$__xz_intra_delay"
+                        && tokens[i - 2].kind == TokenKind::SystemIdentifier
+                        && tokens[i - 2].raw_len() == 17
+                        && tokens.text_at(i - 2) == "$__xz_intra_delay"
                         && tokens.get(i + 2).is_some_and(|t| t.kind == TokenKind::Comma)))
         };
         let joins: Vec<usize> = (1..tokens.len().saturating_sub(1))
@@ -125,44 +132,85 @@ impl Parser {
             return tokens;
         }
         // One pass: removing each `step` in place shifted the whole tail.
-        let mut out = Vec::with_capacity(tokens.len() - joins.len());
-        let mut joins = joins.into_iter().peekable();
-        let mut rest = tokens.into_iter().enumerate();
-        while let Some((i, mut tok)) = rest.next() {
-            if joins.next_if_eq(&i).is_some()
-                && let Some((_, step)) = rest.next()
-            {
-                tok.kind = TokenKind::Identifier;
-                tok.text = crate::ast::decl::CLOCKING_ONE_STEP.to_string();
-                tok.span.end = step.span.end;
+        let long_ends = tokens.take_long_ends();
+        let mut out = TokenStream::with_long_ends(tokens.source(), long_ends);
+        let mut ji = 0usize;
+        let mut i = 0usize;
+        let n = tokens.len();
+        while i < n {
+            tokens.release_before(i);
+            if ji < joins.len() && joins[ji] == i {
+                ji += 1;
+                let tok = tokens[i];
+                // Adjacent `"1"` and `"step"` slice as `"1step"` (CLOCKING_ONE_STEP).
+                out.push_raw(Token::from_raw(
+                    TokenKind::Identifier,
+                    tok.start() as u32,
+                    5,
+                ));
+                i += 2;
+            } else {
+                out.push_raw(tokens[i]);
+                i += 1;
             }
-            out.push(tok);
         }
+        out.finish();
         out
     }
 
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: TokenStream<'a>) -> Self {
         crate::record_reference_census(&tokens);
-        let mut tokens = Self::join_one_step(tokens);
+        let tokens = Self::join_one_step(tokens);
+        let (tokens, default_net_pulls) = Self::take_default_net_pulls(tokens);
+        let mut parser = Self::new_sub(tokens);
+        parser.default_net_pulls = default_net_pulls;
+        parser
+    }
+
+    /// Drop each `` `default_nettype `` directive and its net type token,
+    /// keeping where it stands and whether it names a pull (tri0/tri1).
+    fn take_default_net_pulls(
+        mut tokens: TokenStream<'a>,
+    ) -> (TokenStream<'a>, Vec<(usize, Option<crate::ast::types::NetType>)>) {
+        let is_directive = |tokens: &TokenStream<'a>, tok: Token| {
+            tok.kind == TokenKind::Directive && tokens.text(tok) == "`default_nettype"
+        };
+        if !tokens.iter().any(|tok| is_directive(&tokens, tok)) {
+            return (tokens, Vec::new());
+        }
         let mut default_net_pulls = Vec::new();
+        let long_ends = tokens.take_long_ends();
+        let mut out = TokenStream::with_long_ends(tokens.source(), long_ends);
         let mut after_directive = false;
-        tokens.retain(|token| {
+        for i in 0..tokens.len() {
+            tokens.release_before(i);
+            let tok = tokens[i];
             if after_directive {
                 after_directive = false;
-                let net = match token.kind {
+                let net = match tok.kind {
                     TokenKind::KwTri0 => Some(crate::ast::types::NetType::Tri0),
                     TokenKind::KwTri1 => Some(crate::ast::types::NetType::Tri1),
-                    TokenKind::Eof => return true,
+                    TokenKind::Eof => {
+                        out.push_raw(tok);
+                        continue;
+                    }
                     _ => None,
                 };
-                default_net_pulls.push((token.span.start, net));
-                return false;
+                default_net_pulls.push((tokens.span(tok).start, net));
+                continue;
             }
-            after_directive = token.kind == TokenKind::Directive && token.text == "`default_nettype";
-            !after_directive
-        });
+            after_directive = is_directive(&tokens, tok);
+            if !after_directive {
+                out.push_raw(tok);
+            }
+        }
+        out.finish();
+        (out, default_net_pulls)
+    }
+
+    pub(super) fn new_sub(tokens: TokenStream<'a>) -> Self {
         Self {
-            default_net_pulls,
+            default_net_pulls: Vec::new(),
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
@@ -197,7 +245,7 @@ impl Parser {
 
     /// source_text ::= { description }
     pub fn parse_source_text(&mut self) -> SourceText {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut descriptions = Vec::new();
         while !self.at(TokenKind::Eof) {
             let before = self.pos;
@@ -206,13 +254,16 @@ impl Parser {
                 // No progress — genuinely stuck, whether or not it produced a
                 // Description (a Some(..) from a branch that consumed nothing
                 // would otherwise loop forever). Force progress.
-                self.error(format!("unexpected token: {:?}", self.current().text));
+                let text = self.current_text().into_owned();
+                self.error(format!("unexpected token: {:?}", text));
                 self.bump();
+                self.release_consumed_tokens();
                 continue;
             }
             if let Some(desc) = desc {
                 descriptions.push(desc);
             }
+            self.release_consumed_tokens();
             // A None that advanced (e.g. a stray top-level `;` consumed by the
             // Semicolon arm) is a clean skip, not an error.
         }
@@ -285,7 +336,7 @@ impl Parser {
     /// §23.11: bind targets retain constant selects until elaboration, at
     /// both compilation-unit and module scope.
     pub(super) fn try_bind_directive(&mut self) -> Option<crate::ast::decl::BindDirective> {
-        let start_byte = self.current().span.start;
+        let start_byte = self.current_span().start;
         let restart = self.pos;
         let first = self.parse_bind_path();
         let target = first.first()?.name.clone();
@@ -312,7 +363,7 @@ impl Parser {
         let mut instances = Vec::new();
         let mut complete = false;
         while self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
-            let inst_start = self.current().span.start;
+            let inst_start = self.current_span().start;
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let connections = self.parse_port_connections();
@@ -382,12 +433,12 @@ impl Parser {
             // §23.11/§23.8: an absolute bind path may start at $root.
             let name = if path.is_empty()
                 && self.at(TokenKind::SystemIdentifier)
-                && self.current().text == "$root"
+                && self.current_text() == "$root"
             {
                 let token = self.bump();
                 crate::ast::Identifier {
                     name: "$root".into(),
-                    span: token.span,
+                    span: self.token_span(token),
                 }
             } else {
                 self.parse_identifier()
@@ -434,10 +485,10 @@ impl Parser {
             // aside with a warning; it was a stream of "unexpected token"
             // errors (#603).
             TokenKind::KwConfig => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump(); // config
                 let name = if self.at(TokenKind::Identifier) {
-                    self.current().text.clone()
+                    self.current_text().into_owned()
                 } else {
                     String::new()
                 };
@@ -707,7 +758,7 @@ impl Parser {
     /// malformed table never crashes the parse nor silently mis-simulates.
     fn parse_primitive(&mut self) -> Description {
         use crate::ast::decl::{UdpDecl, UdpOut, UdpSym, UdpTableRow};
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.bump(); // `primitive`
         let name = self.parse_identifier();
 
@@ -746,8 +797,9 @@ impl Parser {
                         self.bump();
                     }
                     _ if depth == 1 && init_val.is_some() => {
+                        let txt = self.current_text();
                         if let Some(v) = init_val.as_mut() {
-                            v.push_str(&self.current().text);
+                            v.push_str(&txt);
                         }
                         self.bump();
                     }
@@ -789,7 +841,7 @@ impl Parser {
                         if k == TokenKind::Assign || k == TokenKind::Eq {
                             seen_eq = true;
                         } else if seen_eq {
-                            val.push_str(&self.current().text);
+                            val.push_str(&self.current_text());
                         }
                         self.bump();
                     }
@@ -814,8 +866,11 @@ impl Parser {
                             TokenKind::KwReg if output => reg = true,
                             TokenKind::Assign | TokenKind::Eq if reg => val = Some(String::new()),
                             _ => {
-                                if let Some(v) = val.as_mut() {
-                                    v.push_str(&self.current().text);
+                                if val.is_some() {
+                                    let txt = self.current_text();
+                                    if let Some(v) = val.as_mut() {
+                                        v.push_str(&txt);
+                                    }
                                 }
                             }
                         }
@@ -838,7 +893,7 @@ impl Parser {
         let mut table_ok = true;
         let mut fail_detail = String::new();
         // Where the warning points: the row that failed, else the table.
-        let mut fail_span = self.current().span;
+        let mut fail_span = self.current_span();
         if self.eat(TokenKind::KwTable).is_some() {
             // Gather raw table tokens up to `endtable`.
             let mut toks: Vec<Token> = Vec::new();
@@ -846,8 +901,7 @@ impl Parser {
                 && !self.at(TokenKind::Eof)
                 && !self.at(TokenKind::KwEndprimitive)
             {
-                toks.push(self.current().clone());
-                self.bump();
+                toks.push(self.bump());
             }
             self.eat(TokenKind::KwEndtable);
             // Split into rows on `;`.
@@ -862,26 +916,30 @@ impl Parser {
                     }
                     if crate::strict_checks()
                         && !ports.is_empty()
-                        && let Some(msg) = Self::udp_row_shape_error(slice, n_inputs)
+                        && let Some(msg) = Self::udp_row_shape_error(&self.tokens, slice, n_inputs)
                     {
-                        let span = Span::new(slice[0].span.start, slice[slice.len() - 1].span.end);
+                        let span = Span::new(
+                            self.tokens.span(slice[0]).start,
+                            self.tokens.span(slice[slice.len() - 1]).end,
+                        );
                         self.diagnostics.push(crate::diagnostics::Diagnostic::error(
                             format!("in primitive '{}': {}", name.name, msg),
                             span,
                         ));
                     }
-                    match Self::parse_udp_row(slice, n_inputs) {
+                    match Self::parse_udp_row(&self.tokens, slice, n_inputs) {
                         Some(r) => rows.push(r),
                         None => {
                             table_ok = false;
                             let txt: String = slice
                                 .iter()
-                                .map(|t| t.text.clone())
+                                .map(|&t| self.tokens.text(t))
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             fail_detail = txt;
-                            if let (Some(f), Some(l)) = (slice.first(), slice.last()) {
-                                fail_span = Span::new(f.span.start, l.span.end);
+                            if let (Some(&f), Some(&l)) = (slice.first(), slice.last()) {
+                                fail_span =
+                                    Span::new(self.tokens.span(f).start, self.tokens.span(l).end);
                             }
                             break;
                         }
@@ -977,10 +1035,14 @@ impl Parser {
     /// state and output symbol. Symbols are counted per character (the lexer
     /// may join adjacent ones into one token) and a parenthesized edge counts
     /// once.
-    fn udp_row_shape_error(slice: &[Token], n_inputs: usize) -> Option<String> {
+    fn udp_row_shape_error(
+        stream: &TokenStream<'a>,
+        slice: &[Token],
+        n_inputs: usize,
+    ) -> Option<String> {
         let mut fields: Vec<usize> = vec![0];
         let mut in_edge = false;
-        for t in slice {
+        for &t in slice {
             match t.kind {
                 TokenKind::Colon if !in_edge => fields.push(0),
                 TokenKind::LParen => {
@@ -988,7 +1050,7 @@ impl Parser {
                     *fields.last_mut().unwrap() += 1;
                 }
                 TokenKind::RParen => in_edge = false,
-                _ if !in_edge => *fields.last_mut().unwrap() += t.text.chars().count(),
+                _ if !in_edge => *fields.last_mut().unwrap() += stream.text(t).chars().count(),
                 _ => {}
             }
         }
@@ -1020,7 +1082,11 @@ impl Parser {
     /// Parse one truth-table row from a raw token slice (columns are
     /// `:`-separated; combinational = 2 fields, sequential = 3). Returns
     /// `None` on any unrecognised symbol or shape so the caller can fall back.
-    fn parse_udp_row(slice: &[Token], n_inputs: usize) -> Option<crate::ast::decl::UdpTableRow> {
+    fn parse_udp_row(
+        stream: &TokenStream<'a>,
+        slice: &[Token],
+        n_inputs: usize,
+    ) -> Option<crate::ast::decl::UdpTableRow> {
         use crate::ast::decl::{UdpOut, UdpTableRow};
         // Split fields on `:`.
         let mut fields: Vec<&[Token]> = Vec::new();
@@ -1036,13 +1102,13 @@ impl Parser {
             3 => (fields[0], Some(fields[1]), fields[2]),
             _ => return None,
         };
-        let inputs = Self::parse_udp_syms(input_f)?;
+        let inputs = Self::parse_udp_syms(stream, input_f)?;
         if inputs.len() != n_inputs {
             return None;
         }
         let state = match state_f {
             Some(f) => {
-                let mut s = Self::parse_udp_syms(f)?;
+                let mut s = Self::parse_udp_syms(stream, f)?;
                 if s.len() != 1 {
                     return None;
                 }
@@ -1054,7 +1120,7 @@ impl Parser {
         if out_f.len() != 1 {
             return None;
         }
-        let output = match out_f[0].text.as_str() {
+        let output = match stream.text(out_f[0]).as_ref() {
             "0" => UdpOut::Level('0'),
             "1" => UdpOut::Level('1'),
             "x" | "X" => UdpOut::Level('x'),
@@ -1063,7 +1129,7 @@ impl Parser {
         };
         let span = slice
             .first()
-            .map(|t| t.span)
+            .map(|&t| stream.span(t))
             .unwrap_or(crate::ast::Span::dummy());
         Some(UdpTableRow {
             inputs,
@@ -1074,19 +1140,22 @@ impl Parser {
     }
 
     /// Parse a sequence of input/state symbols from a token slice.
-    fn parse_udp_syms(field: &[Token]) -> Option<Vec<crate::ast::decl::UdpSym>> {
+    fn parse_udp_syms(
+        stream: &TokenStream<'a>,
+        field: &[Token],
+    ) -> Option<Vec<crate::ast::decl::UdpSym>> {
         use crate::ast::decl::UdpSym;
         let mut out = Vec::new();
         let mut i = 0usize;
         while i < field.len() {
-            let t = &field[i];
+            let t = field[i];
             match t.kind {
                 TokenKind::LParen => {
                     // Edge `(vw)` — concatenate token text until `)`.
                     let mut j = i + 1;
                     let mut txt = String::new();
                     while j < field.len() && field[j].kind != TokenKind::RParen {
-                        txt.push_str(&field[j].text);
+                        txt.push_str(&stream.text(field[j]));
                         j += 1;
                     }
                     if j >= field.len() {
@@ -1105,7 +1174,7 @@ impl Parser {
                 // (`01`, `bB`, `x0`) reach here as one token, so take every
                 // character of the token as its own symbol.
                 _ => {
-                    for c in t.text.chars() {
+                    for c in stream.text(t).chars() {
                         out.push(match c {
                             '0' => UdpSym::Level('0'),
                             '1' => UdpSym::Level('1'),

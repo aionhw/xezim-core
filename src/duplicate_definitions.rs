@@ -168,14 +168,14 @@ fn normalize_typedef(text: &str, span: Span) -> Option<String> {
     let slice = text.get(span.start..span.end)?;
     let tokens = Lexer::new(slice).tokenize();
     let mut out = String::new();
-    for tok in tokens {
+    for tok in &tokens {
         if tok.kind == TokenKind::Eof {
             continue;
         }
         if !out.is_empty() {
             out.push('\0');
         }
-        out.push_str(&tok.text);
+        out.push_str(&tokens.text(tok));
     }
     (!out.is_empty()).then_some(out)
 }

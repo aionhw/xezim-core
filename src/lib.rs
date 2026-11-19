@@ -990,8 +990,8 @@ impl SourceDefinition {
 }
 
 /// Tokenize a source string.
-pub fn tokenize_file(source: &str, _path: Option<&std::path::Path>) -> Vec<lexer::Token> {
-    lexer::Lexer::new(source).tokenize()
+pub fn tokenize_file(source: &str, _path: Option<&std::path::Path>) -> Vec<lexer::OwnedToken> {
+    lexer::Lexer::new(source).tokenize().to_owned_tokens()
 }
 
 /// Parse a source string into an AST.
@@ -1330,6 +1330,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
         let mut parser = sv_parser::parse::Parser::new(tokens);
         let source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
+        drop(parser);
 
         if diags
             .iter()
@@ -1648,11 +1649,12 @@ pub(crate) fn parse_override_value(text: &str) -> Option<ast::expr::Expression> 
     );
     let mut parser = sv_parser::parse::Parser::new(lexer::Lexer::new(&src).tokenize());
     let parsed = parser.parse_source_text();
-    if parser
+    let has_err = parser
         .diagnostics()
         .iter()
-        .any(|d| d.severity == diagnostics::Severity::Error)
-    {
+        .any(|d| d.severity == diagnostics::Severity::Error);
+    drop(parser);
+    if has_err {
         return None;
     }
     let Some(ast::Description::Module(m)) = parsed.descriptions.into_iter().next() else {
