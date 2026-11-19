@@ -3212,6 +3212,12 @@ impl<'a> Lw<'a> {
                     let _ = writeln!(body, "    vh_updo{}();", s);
                 }
             }
+            // A driver can cover multiple leaf classes. Consume its activity
+            // only after all of its independent fields have been copied.
+            for &(_, p) in self.record_update_drivers.range((s, 0)..=(s, usize::MAX)) {
+                let _ = writeln!(out, "  bit vh_changed{s}_{p};");
+                let _ = writeln!(body, "    vh_changed{s}_{p} = 0;");
+            }
             let eq = self.eq_expr(&r, "nv", &format!("vh_s{}", s));
             let _ = write!(
                 out,

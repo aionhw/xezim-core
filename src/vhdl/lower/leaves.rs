@@ -943,6 +943,11 @@ impl<'a> Lw<'a> {
     /// Kernel: apply the due transactions of driver (s, p) by parts.
     pub(super) fn slot_driver_due(&self, s: usize, p: usize, ind: &str) -> String {
         let mut out = String::new();
+        let driver_activity = if self.record_update_drivers.contains(&(s, p)) {
+            format!(" vh_changed{s}_{p} = 1;")
+        } else {
+            String::new()
+        };
         let pending_only = self.pending_slot_drivers.contains(&(s, p));
         let Some(classes) = self.leaf_classes(self.sigs[s].ty) else {
             return out;
@@ -951,7 +956,7 @@ impl<'a> Lw<'a> {
             let leaf = Self::leaf_sv(&classes[single.class], &single.local.to_string());
             let key = single.global.to_string();
             let activity = self.part_activity_mark(s, Some((&key, &key)));
-            let _ = writeln!(out, "{ind}if (vh_spend{s}_{p}) begin vh_dv{s}_{p}{leaf} = vh_spv{s}_{p}; vh_spend{s}_{p} = 0; vh_s{s}_act = 1;{activity} end");
+            let _ = writeln!(out, "{ind}if (vh_spend{s}_{p}) begin vh_dv{s}_{p}{leaf} = vh_spv{s}_{p}; vh_spend{s}_{p} = 0; vh_s{s}_act = 1;{driver_activity}{activity} end");
             return out;
         }
         for c in self.driver_classes(s, p) {
@@ -962,7 +967,7 @@ impl<'a> Lw<'a> {
                 let activity = self.part_activity_mark(s, Some((&base.to_string(), &(base + classes[c].count - 1).to_string())));
                 let _ = writeln!(
                     out,
-                    "{ind}if (vh_pwf{s}_{p}_c{c}) begin vh_dv{s}_{p}{pre} = vh_pw{s}_{p}_c{c}; vh_pwf{s}_{p}_c{c} = 0; vh_s{s}_act = 1;{activity} end"
+                    "{ind}if (vh_pwf{s}_{p}_c{c}) begin vh_dv{s}_{p}{pre} = vh_pw{s}_{p}_c{c}; vh_pwf{s}_{p}_c{c} = 0; vh_s{s}_act = 1;{driver_activity}{activity} end"
                 );
             }
             if let Some((_, _, n)) = Self::word_pending(&classes[c])
@@ -971,12 +976,12 @@ impl<'a> Lw<'a> {
                 let activity = self.part_activity_mark(s, Some((&format!("{base} + vh_lk * {n}"), &format!("{base} + (vh_lk + 1) * {n} - 1"))));
                 let _ = writeln!(
                     out,
-                    "{ind}if (vh_pwwn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pwwi{s}_{p}_c{c}[vh_pi]; if (vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{pre} = vh_pww{s}_{p}_c{c}[vh_lk]; vh_pwwm{s}_{p}_c{c}[vh_lk] = 0;{activity} end end vh_pwwn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end"
+                    "{ind}if (vh_pwwn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pwwn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pwwi{s}_{p}_c{c}[vh_pi]; if (vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{pre} = vh_pww{s}_{p}_c{c}[vh_lk]; vh_pwwm{s}_{p}_c{c}[vh_lk] = 0;{activity} end end vh_pwwn{s}_{p}_c{c} = 0; vh_s{s}_act = 1;{driver_activity} end"
                 );
             }
             let _ = writeln!(
                 out,
-                "{ind}if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pl{s}_{p}_c{c}[vh_pi]; if (vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{leaf} = vh_pf{s}_{p}_c{c}[vh_lk]; vh_pm{s}_{p}_c{c}[vh_lk] = 0;{leaf_activity} end end vh_pn{s}_{p}_c{c} = 0; vh_s{s}_act = 1; end",
+                "{ind}if (vh_pn{s}_{p}_c{c} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{c}; vh_pi = vh_pi + 1) begin vh_lk = vh_pl{s}_{p}_c{c}[vh_pi]; if (vh_pm{s}_{p}_c{c}[vh_lk]) begin vh_dv{s}_{p}{leaf} = vh_pf{s}_{p}_c{c}[vh_lk]; vh_pm{s}_{p}_c{c}[vh_lk] = 0;{leaf_activity} end end vh_pn{s}_{p}_c{c} = 0; vh_s{s}_act = 1;{driver_activity} end",
                 ind = ind,
                 s = s,
                 p = p,
@@ -1047,6 +1052,13 @@ impl<'a> Lw<'a> {
         let _ = writeln!(decls, "    {} nv;\n    int c, cc;\n    longint g, k;", tsv);
         let mut body = String::new();
         let _ = writeln!(body, "    nv = vh_s{};", s);
+        // nv starts from the effective signal value. It can supply an idle
+        // field only when no force or port link can overwrite that value.
+        let record_parts = ds.len() > 1
+            && matches!(self.d.types[self.base(ty)].kind, TypeKind::Record(_))
+            && !self.forced.contains(&s)
+            && self.inout_driver(s).is_none()
+            && !self.links.iter().any(|link| link.target.sig == s);
         for (ci, c) in classes.iter().enumerate() {
             let cov: Vec<&(usize, Driver)> = ds
                 .iter()
@@ -1094,6 +1106,11 @@ impl<'a> Lw<'a> {
             if kind.is_none() && one_source && disjoint {
                 let elem = Self::leaf_elem_sv(c, "k");
                 for (p, d) in &cov {
+                    let tracked = record_parts && self.pending_slot_drivers.contains(&(s, *p));
+                    if tracked {
+                        self.record_update_drivers.insert((s, *p));
+                        let _ = writeln!(body, "    if (init || vh_changed{s}_{p}) begin");
+                    }
                     for (a, b) in Self::cov_runs(&d.cov, c.base, c.count) {
                         let (a, b) = (a - c.base, b - c.base);
                         // A run of whole packed words (every element of each
@@ -1163,6 +1180,9 @@ impl<'a> Lw<'a> {
                                 );
                             }
                         }
+                    }
+                    if tracked {
+                        let _ = writeln!(body, "    end");
                     }
                 }
                 continue;
