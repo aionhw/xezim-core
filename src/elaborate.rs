@@ -46046,6 +46046,13 @@ fn inline_module_items(
                     // an indexed SCOPE (`g[1].w`, §27.6) names a whole net, so
                     // it does get one.
                     if let Some(actual) = whole_net_ident_name_scoped(parent_expr, elab) {
+                        // A generated netlist can connect u.q to the parent's
+                        // escaped wire `\u.q `. Both already use the same
+                        // flattened signal. An implied q = q would introduce
+                        // another driver and feed X back onto the real driver.
+                        if actual == sub_sig_name && is_net_name(elab, &actual) {
+                            continue;
+                        }
                         // §23.3.3.2: only a formal that is a NET is merged with
                         // its actual. A formal that declares a VARIABLE
                         // (`input var`) is connected by an implied continuous
