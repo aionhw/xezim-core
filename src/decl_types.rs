@@ -16,79 +16,125 @@
 use crate::ast::types::DataType;
 use crate::hasher::{DeterministicState, HashMap};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map;
+use std::collections::{BTreeSet, hash_map};
 use std::hash::{BuildHasher, Hasher};
+use std::ops::Bound;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 /// Signal name to declared type, with the borrowed `String`-key API of the
 /// map it replaces. Serde keeps the plain map representation: a shared type
 /// is written once per entry and read back as an entry of its own.
+///
+/// `dotted` orders the keys that hold a `.`, built on the first
+/// [`DeclTypeMap::with_prefix`] and kept current by `insert` and `remove`,
+/// so the members beneath one name are read without visiting every signal.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct DeclTypeMap(HashMap<String, Rc<DataType>>);
+pub struct DeclTypeMap {
+    map: HashMap<String, Rc<DataType>>,
+    #[serde(skip)]
+    dotted: OnceLock<BTreeSet<String>>,
+}
 
 impl DeclTypeMap {
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.map.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.map.is_empty()
     }
     pub fn get(&self, name: &str) -> Option<&DataType> {
-        self.0.get(name).map(|ty| &**ty)
+        self.map.get(name).map(|ty| &**ty)
     }
     /// The entry itself, for a caller that records the same type again.
     pub fn get_shared(&self, name: &str) -> Option<&Rc<DataType>> {
-        self.0.get(name)
+        self.map.get(name)
+    }
+    pub fn get_key_value(&self, name: &str) -> Option<(&String, &Rc<DataType>)> {
+        self.map.get_key_value(name)
     }
     pub fn contains_key(&self, name: &str) -> bool {
-        self.0.contains_key(name)
+        self.map.contains_key(name)
+    }
+    /// The entries whose key starts with `prefix` (a name and its `.`), in
+    /// key order.
+    pub fn with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a Rc<DataType>)> {
+        assert!(prefix.contains('.'));
+        let keys = self.dotted.get_or_init(|| {
+            self.map
+                .keys()
+                .filter(|key| key.contains('.'))
+                .cloned()
+                .collect()
+        });
+        keys.range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(move |key| key.starts_with(prefix))
+            .filter_map(|key| self.map.get_key_value(key.as_str()))
     }
     /// The type of `name`, for changing it. A type other signals hold too is
     /// copied first: they keep the one they had.
     pub fn get_mut(&mut self, name: &str) -> Option<&mut DataType> {
-        self.0.get_mut(name).map(Rc::make_mut)
+        self.map.get_mut(name).map(Rc::make_mut)
     }
     /// Record `ty` for `name` alone. Returns the type `name` had.
     pub fn insert(&mut self, name: String, ty: DataType) -> Option<Rc<DataType>> {
-        self.0.insert(name, Rc::new(ty))
+        self.insert_shared(name, Rc::new(ty))
     }
     /// Record a type that other signals hold too.
     pub fn insert_shared(&mut self, name: String, ty: Rc<DataType>) -> Option<Rc<DataType>> {
-        self.0.insert(name, ty)
+        if let Some(keys) = self.dotted.get_mut()
+            && name.contains('.')
+            && !self.map.contains_key(&name)
+        {
+            keys.insert(name.clone());
+        }
+        self.map.insert(name, ty)
     }
     pub fn remove(&mut self, name: &str) -> Option<Rc<DataType>> {
-        self.0.remove(name)
+        if name.contains('.')
+            && let Some(keys) = self.dotted.get_mut()
+        {
+            keys.remove(name);
+        }
+        self.map.remove(name)
     }
     /// The entry of `name`, to give it a type when it has none.
     pub fn entry(&mut self, name: String) -> Entry<'_> {
-        Entry(self.0.entry(name))
+        self.dotted.take();
+        Entry(self.map.entry(name))
     }
     pub fn retain(&mut self, mut keep: impl FnMut(&String, &DataType) -> bool) {
-        self.0.retain(|name, ty| keep(name, ty));
+        self.dotted.take();
+        self.map.retain(|name, ty| keep(name, ty));
     }
     /// The entries themselves, for code that moves them between tables.
     pub fn as_map(&self) -> &HashMap<String, Rc<DataType>> {
-        &self.0
+        &self.map
     }
     pub fn as_map_mut(&mut self) -> &mut HashMap<String, Rc<DataType>> {
-        &mut self.0
+        // The caller may change any key.
+        self.dotted.take();
+        &mut self.map
     }
     pub fn iter(&self) -> Iter<'_> {
-        Iter(self.0.iter())
+        Iter(self.map.iter())
     }
     pub fn keys(&self) -> hash_map::Keys<'_, String, Rc<DataType>> {
-        self.0.keys()
+        self.map.keys()
     }
     pub fn values(&self) -> impl Iterator<Item = &DataType> {
-        self.0.values().map(|ty| &**ty)
+        self.map.values().map(|ty| &**ty)
     }
 }
 
 impl std::ops::Index<&str> for DeclTypeMap {
     type Output = DataType;
     fn index(&self, name: &str) -> &DataType {
-        &self.0[name]
+        &self.map[name]
     }
 }
 
