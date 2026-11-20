@@ -41947,6 +41947,32 @@ fn scope_local_typerefs(
     }
 }
 
+/// §6.20.3, §23.10: a type parameter override is written in the
+/// instantiating body, so a typedef name in it is that body's. A non-top
+/// body's typedefs outlive its inlining only under their instance-scoped keys
+/// (`m.id_t`), so name the override's local typedefs (`local`, those of the
+/// body at `prefix`) by those keys before resolving it. Left bare, the struct
+/// `s_t { id_t id; ... }` of instance `m`, bound to a child's `T`, kept a
+/// bare `id_t` member that resolved to nothing once `m`'s bare typedefs were
+/// restored (a 32-bit `int`), and a child typedef of the same name captured
+/// it while the child was inlined.
+fn scope_override_typerefs(
+    dt: &DataType,
+    local: &std::collections::HashSet<String>,
+    prefix: &str,
+    typedef_types: &HashMap<String, DataType>,
+) -> DataType {
+    if prefix.is_empty() || local.is_empty() {
+        return dt.clone();
+    }
+    let scoped: std::collections::HashSet<String> = local
+        .iter()
+        .filter(|n| typedef_types.contains_key(&cat2(prefix, n)))
+        .cloned()
+        .collect();
+    scope_local_typerefs(dt, &scoped, prefix)
+}
+
 /// Whether `scope_local_typerefs` would change `dt`: it names a typedef the
 /// instance declares itself, directly or in a member or an enum base.
 fn names_local_typedef(dt: &DataType, local_names: &std::collections::HashSet<String>) -> bool {
@@ -43548,7 +43574,17 @@ fn inline_module_items(
                 // after it.
                 let mut saved_type_shapes: Vec<(String, TypedefShapeSave)> = Vec::new();
                 for (tp_name, tp_dt) in &type_overrides {
-                    let resolved_dt = resolve_typedef_chain(tp_dt, &elab.typedef_types).clone();
+                    // §6.20.3: this body's typedefs by their instance keys,
+                    // so the child's own same-named typedefs, bound below,
+                    // cannot capture them.
+                    let scoped_dt = scope_override_typerefs(
+                        tp_dt,
+                        &prepared_source.local_typedefs,
+                        prefix,
+                        &elab.typedef_types,
+                    );
+                    let resolved_dt =
+                        resolve_typedef_chain(&scoped_dt, &elab.typedef_types).clone();
                     let w = resolve_type_width(
                         &resolved_dt,
                         Some(scoped_eval_params),
@@ -48204,10 +48240,20 @@ fn inline_module_items(
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
+                            // §6.20.3: an override names this body's typedefs
+                            // by their instance keys, which outlive the
+                            // inlining (the default is the child's own).
                             let dt = type_overrides
                                 .iter()
                                 .find(|(n, _)| n == &a.name.name)
-                                .map(|(_, d)| d.clone())
+                                .map(|(_, d)| {
+                                    scope_override_typerefs(
+                                        d,
+                                        &prepared_source.local_typedefs,
+                                        prefix,
+                                        &elab.typedef_types,
+                                    )
+                                })
                                 .or_else(|| a.init.clone());
                             if let Some(dt) = dt {
                                 let mut resolved =
