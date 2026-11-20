@@ -4041,6 +4041,12 @@ pub struct ElaboratedModule {
     /// an explicit packed range (`output [7:0] x;`).
     #[serde(skip)]
     pub ranged_port_widths: HashMap<String, u32>,
+    /// Transient (§26.3): bare type entries `rebind_imported_typedefs` hid
+    /// for the scope being prepared, because an import of that scope binds
+    /// the name as a constant: name, width, type, unpacked dimensions and
+    /// element width. The next scope's rebind puts them back.
+    #[serde(skip)]
+    pub hidden_bare_types: Vec<HiddenBareType>,
     /// §26.3: names that are BOTH brought in by a wildcard package import
     /// (`import pkg::*`) AND re-declared locally in this scope. A local
     /// declaration shadows the imported name — so at such a name the
@@ -4857,6 +4863,7 @@ impl ElaboratedModule {
             dpi_export_c_names: Vec::new(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
+            hidden_bare_types: Vec::new(),
             modport_views: HashMap::default(),
             clocking_signal_dirs: HashMap::default(),
         clocking_output_stages: HashMap::default(),
@@ -40519,8 +40526,17 @@ struct InlineCache {
 }
 
 /// The typedefs an import binds, as (bare name, qualified key) in binding
-/// order.
+/// order. A key `=pkg::name` marks a constant the import binds (§26.3).
 type ImportedTypedefs = Rc<[(String, String)]>;
+
+/// A bare type entry hidden by an imported constant (`hidden_bare_types`).
+pub type HiddenBareType = (
+    String,
+    Option<u32>,
+    Option<DataType>,
+    Option<Vec<UnpackedDimension>>,
+    Option<u32>,
+);
 
 impl InlineCache {
     #[cfg(test)]
@@ -40558,6 +40574,12 @@ impl InlineCache {
                     ));
                 }
                 lists.push(match &ii.item {
+                    Some(sym)
+                        if package_declares_constant(pkg, &sym.name, definitions)
+                            && design_type_names(definitions).contains(sym.name.as_str()) =>
+                    {
+                        Rc::from([(sym.name.clone(), format!("={pkg}::{}", sym.name))])
+                    }
                     Some(sym) => Rc::from([(sym.name.clone(), format!("{pkg}::{}", sym.name))]),
                     None => match self.wildcards.get(pkg) {
                         Some(list) => Rc::clone(list),
@@ -40568,6 +40590,30 @@ impl InlineCache {
                         }
                     },
                 });
+            }
+        }
+        // A name the definition declares itself is its own (§26.3): an
+        // imported constant of that name hides nothing.
+        if lists
+            .iter()
+            .any(|l| l.iter().any(|(_, k)| k.starts_with('=')))
+        {
+            let mut local = collect_local_scope_names(def.items());
+            for pd in def.params() {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    local.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+            }
+            for l in lists.iter_mut() {
+                if l.iter()
+                    .any(|(n, k)| k.starts_with('=') && local.contains(n))
+                {
+                    *l = l
+                        .iter()
+                        .filter(|(n, k)| !(k.starts_with('=') && local.contains(n)))
+                        .cloned()
+                        .collect();
+                }
             }
         }
         let lists: Rc<[ImportedTypedefs]> = lists.into();
@@ -60115,7 +60161,45 @@ fn compute_wildcard_shadowed(
 /// `process_import` has design-wide effects that must not re-run per instance.
 fn rebind_imported_typedefs(elab: &mut ElaboratedModule, imports: &[ImportedTypedefs]) {
     let mut changed = false;
+    // What the previous scope hid is visible again, unless something has
+    // registered the name since.
+    for (name, w, t, dims, ew) in std::mem::take(&mut elab.hidden_bare_types) {
+        if elab.typedefs.contains_key(&name) || elab.typedef_types.contains_key(&name) {
+            continue;
+        }
+        if let Some(w) = w {
+            typedefs_insert_traced(&mut elab.typedefs, "rebind:unhide", name.clone(), w);
+            changed = true;
+        }
+        if let Some(t) = t {
+            elab.typedef_types.insert(name.clone(), t);
+        }
+        if let Some(d) = dims {
+            elab.typedef_unpacked_dims.insert(name.clone(), d);
+        }
+        if let Some(e) = ew {
+            elab.typedef_elem_widths.insert(name, e);
+        }
+    }
     for (name, key) in imports.iter().flat_map(|list| list.iter()) {
+        // §26.3: the import binds `name` as a constant of its package. The
+        // bare type of that name is another package's, hoisted design-wide,
+        // and not visible here: `[N]` with `import p::*` sizes by `p::N`
+        // even when a package this scope does not import declares a type N.
+        if key.starts_with('=') {
+            if elab.typedefs.contains_key(name) || elab.typedef_types.contains_key(name) {
+                let hidden = (
+                    name.clone(),
+                    elab.typedefs.remove(name),
+                    elab.typedef_types.remove(name),
+                    elab.typedef_unpacked_dims.remove(name),
+                    elab.typedef_elem_widths.remove(name),
+                );
+                changed |= hidden.1.is_some();
+                elab.hidden_bare_types.push(hidden);
+            }
+            continue;
+        }
         if let Some(w) = elab.typedefs.get(key).copied()
             && typedefs_insert_traced(&mut elab.typedefs, "rebind:import", name.clone(), w)
                 != Some(w)
@@ -60145,6 +60229,44 @@ fn rebind_imported_typedefs(elab: &mut ElaboratedModule, imports: &[ImportedType
     }
 }
 
+/// Whether package `pkg` declares a parameter or localparam `name`.
+fn package_declares_constant(
+    pkg: &str,
+    name: &str,
+    definitions: &HashMap<String, Definition>,
+) -> bool {
+    let Some(Definition::Package(p)) = definitions.get(pkg) else {
+        return false;
+    };
+    p.items.iter().any(|item| {
+        matches!(item, PackageItem::Parameter(pd)
+            if matches!(&pd.kind, ParameterKind::Data { assignments, .. }
+                if assignments.iter().any(|a| a.name.name == name)))
+    })
+}
+
+/// The types packages and the compilation unit declare: the bare type
+/// entries hoisted design-wide.
+fn design_type_names<'d>(definitions: &'d HashMap<String, Definition>) -> HashSet<&'d str> {
+    let mut out = HashSet::default();
+    for d in definitions.values() {
+        match d {
+            Definition::Typedef(t) => {
+                out.insert(t.name.name.as_str());
+            }
+            Definition::Package(p) => {
+                for i in &p.items {
+                    if let PackageItem::Typedef(t) = i {
+                        out.insert(t.name.name.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Depth of the import chain `wildcard_typedefs` follows.
 const MAX_IMPORT_DEPTH: u32 = 8;
 
@@ -60156,6 +60278,7 @@ fn wildcard_typedefs(pkg: &str, definitions: &HashMap<String, Definition>) -> Im
     fn walk(
         pkg: &str,
         definitions: &HashMap<String, Definition>,
+        types: &HashSet<&str>,
         depth: u32,
         out: &mut Vec<(String, String)>,
     ) {
@@ -60170,17 +60293,30 @@ fn wildcard_typedefs(pkg: &str, definitions: &HashMap<String, Definition>) -> Im
                 PackageItem::Typedef(td) => {
                     out.push((td.name.name.clone(), format!("{pkg}::{}", td.name.name)))
                 }
+                PackageItem::Parameter(pd) => {
+                    if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                        // Only a constant some type shares its name with
+                        // needs to hide anything (§26.3).
+                        for a in assignments
+                            .iter()
+                            .filter(|a| types.contains(a.name.name.as_str()))
+                        {
+                            out.push((a.name.name.clone(), format!("={pkg}::{}", a.name.name)));
+                        }
+                    }
+                }
                 PackageItem::Import(inner) => {
                     for ii in inner.items.iter().filter(|ii| ii.item.is_none()) {
-                        walk(&ii.package.name, definitions, depth + 1, out);
+                        walk(&ii.package.name, definitions, types, depth + 1, out);
                     }
                 }
                 _ => {}
             }
         }
     }
+    let types = design_type_names(definitions);
     let mut all = Vec::new();
-    walk(pkg, definitions, 0, &mut all);
+    walk(pkg, definitions, &types, 0, &mut all);
     // The key names the pair: keep each one's last place.
     let mut seen = HashSet::default();
     let keep: Vec<bool> = all
