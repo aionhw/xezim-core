@@ -40138,6 +40138,7 @@ enum BodySource {
 
 #[derive(Debug, Clone)]
 struct PreparedModuleItems {
+    interface_array_bounds: Vec<(String, (i64, i64))>,
     effective_items: Vec<ModuleItem>,
     body_sources: Vec<BodySource>,
     has_subroutines: bool,
@@ -40633,7 +40634,21 @@ fn prepare_module_items(
 
     // §23.3.2: expand arrays of module instances into individual instances with
     // bit-sliced vector connections, before body_sources/driver derivation.
+    let mut interface_array_bounds = Vec::new();
     if has_instance_arrays(&effective_items) {
+        for item in &effective_items {
+            if let ModuleItem::ModuleInstantiation(inst) = item
+                && matches!(definitions.get(&inst.module_name.name), Some(Definition::Interface(_)))
+            {
+                for element in &inst.instances {
+                    if let Some(bounds) = declared_unpacked_dims(&element.dimensions, local_params)
+                        && let [dim] = bounds.as_slice()
+                    {
+                        interface_array_bounds.push((element.name.name.clone(), *dim));
+                    }
+                }
+            }
+        }
         let shapes = ai_scope_shapes(&effective_items, source_def, local_params, typedef_widths);
         ai_expand_instance_arrays(
             &mut effective_items,
@@ -40947,6 +40962,7 @@ fn prepare_module_items(
         .collect();
 
     let mut prepared = Rc::new(PreparedModuleItems {
+        interface_array_bounds,
         effective_items,
         body_sources,
         has_subroutines,
@@ -41075,7 +41091,8 @@ impl serde::Serialize for PreparedView<'_> {
         let p = self.0;
         let mut directions: Vec<_> = p.port_directions.iter().collect();
         directions.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let mut t = s.serialize_tuple(8)?;
+        let mut t = s.serialize_tuple(9)?;
+        t.serialize_element(&p.interface_array_bounds)?;
         t.serialize_element(&p.effective_items)?;
         t.serialize_element(&Sources(&p.body_sources))?;
         t.serialize_element(&p.has_subroutines)?;
@@ -42249,6 +42266,9 @@ fn inline_module_items(
         cache,
         param_scope,
     );
+    for (name, bounds) in &prepared_source.interface_array_bounds {
+        elab.unpacked_decl_dims.insert(cat2(prefix, name), vec![*bounds]);
+    }
     // Keep declaration ownership after flattening (§26.3, §21.7.2.3).
     // Imported lookup aliases never enter this set.
     for pd in source_def.params().iter().chain(
@@ -44564,6 +44584,7 @@ fn inline_module_items(
                 // child in source order — the overwhelmingly common layout.)
                 interface_arrays::register_views(
                     &mut sub_interface_map,
+                    &elab.unpacked_decl_dims,
                     sub_mod.ports(),
                     &sub_local_params,
                 );
@@ -56809,7 +56830,7 @@ fn rewrite_expr_impl(
                 }
             }
             let name = &hier.path[0].name.name;
-            if let Some(if_prefix) = interface_map.get(name) {
+            if let Some(if_prefix) = interface_map.get(name).filter(|_| hier.bound != Bound::NO_TARGET) {
                 if let Some(view) = interface_arrays::view(interface_map, name) {
                     let mut selected = hier.clone();
                     for segment in &mut selected.path {

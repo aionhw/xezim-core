@@ -13,18 +13,24 @@ fn range_path(path: &str) -> Option<(&str, i64, i64)> {
 /// instance such as `actual[1:2].PARAM`.
 pub(super) fn register_views(
     bindings: &mut HashMap<String, String>,
+    shapes: &HashMap<String, Vec<(i64, i64)>>,
     ports: &PortList,
     params: &HashMap<String, Value>,
 ) {
     let PortList::Ansi(ports) = ports else { return };
     for port in ports {
         let formal = &port.name.name;
-        let Some(bound) = bindings.get(formal) else {
-            continue;
+        let Some(bound) = bindings.get(formal) else { continue };
+        let whole_range;
+        let range = if let Some(shape) = shapes.get(bound)
+            && let [(left, right)] = shape.as_slice()
+        {
+            whole_range = format!("{bound}[{left}:{right}]");
+            &whole_range
+        } else {
+            bound
         };
-        let Some((base, al, ar)) = range_path(bound) else {
-            continue;
-        };
+        let Some((base, al, ar)) = range_path(range) else { continue };
         let Some(dims) = declared_unpacked_dims(&port.dimensions, params) else {
             continue;
         };
@@ -48,6 +54,9 @@ pub(super) fn register_views(
                 )
             })
             .collect();
+        if bound != range {
+            bindings.insert(formal.clone(), range.clone());
+        }
         bindings.extend(entries);
     }
 }
@@ -88,7 +97,7 @@ pub(super) fn view(bindings: &HashMap<String, String>, name: &str) -> Option<Vie
 pub(super) fn bare_view(bindings: &HashMap<String, String>, e: &Expression) -> Option<View> {
     match &e.kind {
         ExprKind::Ident(h)
-            if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            if h.root.is_none() && h.bound != crate::ast::binding::Bound::NO_TARGET && h.path.len() == 1 && h.path[0].selects.is_empty() =>
         {
             view(bindings, &h.path[0].name.name)
         }
@@ -105,7 +114,6 @@ impl View {
     fn base_expr(&self, span: Span) -> Expression {
         let mut e = make_ident_expr(&self.base);
         e.span = span;
-        mark_actual_rooted(&mut e, &|_| false);
         e
     }
 
@@ -203,7 +211,10 @@ impl View {
             e
         } else {
             let mut h = hier.clone();
-            h.root = Some("$root".to_string());
+            // The resolved actual already contains its instance path. Keep the
+            // ordinary interface-member representation used by event controls,
+            // aggregate stores and method dispatch.
+            h.root = None;
             h.path[0].name.name = self.base.clone();
             h.path[0].selects[0] = self.index(h.path[0].selects[0].clone());
             Expression::new(ExprKind::Ident(h), span)
