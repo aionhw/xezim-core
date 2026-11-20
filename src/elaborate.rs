@@ -58233,6 +58233,19 @@ fn rescope_expr(
             ranges: ranges.iter().map(rx).collect(),
         },
         ExprKind::Range(lo, hi) => ExprKind::Range(bx(lo), bx(hi)),
+        // §23.3.3.5: select in the formal's index space before rebuilding
+        // a method receiver. Rewriting the base alone creates a whole-array
+        // slice, then applies the formal label to the actual slice.
+        ExprKind::Index { expr: x, index }
+            if let Some(view) = interface_arrays::bare_view(interface_map, x) =>
+        {
+            return view.element(rx(index), e.span);
+        }
+        ExprKind::RangeSelect { expr: x, kind: RangeKind::Constant, left, right }
+            if let Some(view) = interface_arrays::bare_view(interface_map, x) =>
+        {
+            return view.range(rx(left), rx(right), e.span);
+        }
         ExprKind::Index { expr: x, index } => ExprKind::Index {
             expr: bx(x),
             index: bx(index),
