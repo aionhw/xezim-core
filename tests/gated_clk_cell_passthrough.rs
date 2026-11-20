@@ -93,7 +93,10 @@ endmodule
 fn passthrough_with_a_shaped_clock_net_is_elaborated() {
     let cells = [
         ("net delay", "output clk_out; wire #5 clk_out;"),
-        ("rise and fall delays", "output clk_out; wire #(2, 3) clk_out;"),
+        (
+            "rise and fall delays",
+            "output clk_out; wire #(2, 3) clk_out;",
+        ),
         ("pulled net", "output clk_out; tri1 clk_out;"),
         ("pulled port", "output tri0 clk_out;"),
         ("delayed input", "output clk_out; wire #1 clk_in;"),
@@ -124,4 +127,73 @@ endmodule
             "{what}: the cell is elaborated as written"
         );
     }
+}
+
+/// The pass-through body with a clock port that is not a scalar four-state
+/// value: a `bit` port turns an x or z clock into 0 (§6.11.2), and a vector
+/// or signed port resizes or sign-extends what it passes (§23.3.3). The
+/// direct assignment of the connections would do neither, so these cells are
+/// elaborated as written too. A `logic` or `reg` scalar is still a
+/// pass-through.
+#[test]
+fn passthrough_with_a_non_scalar_four_state_clock_is_elaborated() {
+    let cells = [
+        ("bit input", "input bit clk_in; output clk_out;", true),
+        ("vector output", "input clk_in; output [1:0] clk_out;", true),
+        ("signed input", "input signed clk_in; output clk_out;", true),
+        (
+            "vector input net",
+            "input clk_in; output clk_out; wire [1:0] clk_in;",
+            true,
+        ),
+        (
+            "logic ports",
+            "input logic clk_in; output logic clk_out;",
+            false,
+        ),
+        ("reg output", "input clk_in; output reg clk_out;", false),
+    ];
+    for (what, decl, elaborated) in cells {
+        let m = elaborate(
+            &format!(
+                r#"
+module gated_clk_cell(clk_in, en, clk_out);
+  {decl}
+  input en;
+  wire en_q;
+  assign en_q = en;
+  assign clk_out = clk_in;
+endmodule
+module top;
+  reg clk = 0;
+  wire gclk;
+  gated_clk_cell u (.clk_in(clk), .en(1'b1), .clk_out(gclk));
+endmodule
+"#
+            ),
+            "top",
+        );
+        assert_eq!(
+            m.signals.contains_key("u.en_q"),
+            elaborated,
+            "{what}: elaborated as written = {elaborated}"
+        );
+    }
+    let m = elaborate(
+        r#"
+module gated_clk_cell(input bit en, clk_in, output clk_out);
+  assign clk_out = clk_in;
+endmodule
+module top;
+  reg clk = 0;
+  wire gclk;
+  gated_clk_cell u (.clk_in(clk), .en(1'b1), .clk_out(gclk));
+endmodule
+"#,
+        "top",
+    );
+    assert!(
+        m.signals.contains_key("u.clk_in"),
+        "an ANSI clk_in that inherits `bit` (§23.2.2.3) is elaborated as written"
+    );
 }
