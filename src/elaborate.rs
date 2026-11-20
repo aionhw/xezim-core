@@ -52428,7 +52428,8 @@ thread_local! {
 #[derive(Default)]
 pub struct LibrarySources {
     /// (file label, preprocessed text, line map) per adopted library file.
-    pub files: Vec<(String, String, Option<sv_parser::source_map::LineMap>)>,
+    /// The text is shared with `preprocess_adopted_lib`.
+    pub files: Vec<(String, std::sync::Arc<str>, Option<sv_parser::source_map::LineMap>)>,
     /// Adopted definition name -> index into `files`.
     pub def_file: HashMap<String, u32>,
     /// Package name -> where a library file declared it, as
