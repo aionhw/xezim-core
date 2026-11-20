@@ -22900,49 +22900,44 @@ fn lsdd_may_fold_expr(expr: &Expression) -> bool {
 }
 
 /// Whether a dimension endpoint names a value the fold can bind. §20.8,
-/// §20.9: the argument of a value system function (`$clog2(P)`,
-/// `$signed(P)`, a cast) is such a name too; `[$clog2(P)-1:0]` in an
-/// instance otherwise kept its bare `P`, which the design-wide map holds only
-/// as `u.P`, and the local was one bit wide. §20.6, §20.7: a query of a
-/// declaration (`$bits(v)`, `$size(a)`) is left to the run time, where a
-/// block local shadows the module's names, together with everything inside
-/// it (`$bits($signed(N))`).
+/// §20.9: the argument of a system function (`$clog2(P)`, `$signed(P)`, a
+/// cast, `$bits(P)`) is such a name too; `[$clog2(P)-1:0]` in an instance
+/// otherwise kept its bare `P`, which the design-wide map holds only as
+/// `u.P`, and the local was one bit wide.
 fn lsdd_names_value(expr: &Expression) -> bool {
     let mut names = Vec::new();
-    collect_ident_names(expr, &mut names);
-    if !names.is_empty() {
-        return true;
-    }
-    let has_query = {
-        let mut q = false;
-        for_each_sub_expr(expr, &mut |e| {
-            q |= matches!(&e.kind, ExprKind::SystemCall { name, .. } if lsdd_is_decl_query(name));
-        });
-        q
-    };
-    let pruned;
-    let expr = if has_query {
-        // Pre-order: a query collapses to a literal before its arguments
-        // would be visited.
-        let mut e = expr.clone();
-        for_each_sub_expr_mut(&mut e, &mut |x| {
-            if matches!(&x.kind, ExprKind::SystemCall { name, .. } if lsdd_is_decl_query(name)) {
-                x.kind = ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('0'));
-            }
-        });
-        pruned = e;
-        &pruned
-    } else {
-        expr
-    };
-    let mut found = false;
+    lsdd_all_names(expr, &mut names);
+    !names.is_empty()
+}
+
+/// Every identifier name in `expr`, the arguments of its system calls
+/// included (`collect_ident_names` does not look inside them).
+fn lsdd_all_names(expr: &Expression, names: &mut Vec<String>) {
+    collect_ident_names(expr, names);
     for_each_sub_expr(expr, &mut |e| {
         if let ExprKind::SystemCall { args, .. } = &e.kind {
-            found |= args.iter().any(|a| {
-                let mut names = Vec::new();
-                collect_ident_names(a, &mut names);
-                !names.is_empty()
-            });
+            for a in args {
+                collect_ident_names(a, names);
+            }
+        }
+    });
+}
+
+/// §20.6, §20.7: whether `expr` holds a query of a declaration (`$bits(v)`,
+/// `$size(a)`) whose argument names anything but this scope's parameters
+/// (`env`). Such a name is a variable or a type, which a block local may
+/// shadow; the query is left to the run time.
+fn lsdd_queries_a_declaration(expr: &Expression, env: &HashMap<String, Value>) -> bool {
+    let mut found = false;
+    for_each_sub_expr(expr, &mut |e| {
+        if let ExprKind::SystemCall { name, args } = &e.kind
+            && lsdd_is_decl_query(name)
+        {
+            let mut names = Vec::new();
+            for a in args {
+                lsdd_all_names(a, &mut names);
+            }
+            found |= names.is_empty() || names.iter().any(|n| !env.contains_key(n));
         }
     });
     found
@@ -22980,52 +22975,33 @@ fn lsdd_literal(v: i64) -> ExprKind {
 
 /// Const-evaluate a dimension endpoint in this scope. §11.7: `$signed(x)`
 /// and `$unsigned(x)` reinterpret `x` at its own width (`$signed` of an
-/// 8-bit `8'hff` is -1), while `const_eval_i64_with_params` reads both as
-/// the identity on a 64-bit value. The endpoint is folded only when that
-/// reading gives the same number as the reinterpretation for every such
-/// call: otherwise, or when the operand's sized value is not known, it is
-/// left for the run time, as it was before value calls were folded.
+/// 8-bit `8'hff` is -1), and §20.6.2 sizes `$bits(P)` by the parameter's
+/// type, which `const_eval_i64_with_params` does not model: an endpoint with
+/// either is evaluated on sized values, and folded only when that value is
+/// fully known.
 fn lsdd_eval(e: &Expression, env: &HashMap<String, Value>) -> Option<i64> {
-    let mut agree = true;
+    let mut sized = false;
+    let mut call = false;
     for_each_sub_expr(e, &mut |x| {
-        let ExprKind::SystemCall { name, args } = &x.kind else {
-            return;
-        };
-        if !agree || !((name == "$signed" || name == "$unsigned") && args.len() == 1) {
-            return;
-        }
-        // An operand the i64 evaluator cannot resolve leaves the whole
-        // endpoint unresolved below; only a resolved one is compared.
-        let Some(v) = const_eval_i64_with_params(&args[0], Some(env)) else {
-            return;
-        };
-        let sized = eval_const_expr_val(&args[0], env);
-        let w = sized.width;
-        if sized.is_real || sized.has_xz() || !(1..=64).contains(&w) || sized.to_i64() != Some(v)
-        {
-            agree = false;
-            return;
-        }
-        let low = if w < 64 {
-            (v as u64) & ((1u64 << w) - 1)
-        } else {
-            v as u64
-        };
-        let reinterpreted = if name == "$signed" {
-            if w < 64 && (low >> (w - 1)) & 1 == 1 {
-                Some((low | !((1u64 << w) - 1)) as i64)
-            } else {
-                Some(low as i64)
-            }
-        } else {
-            i64::try_from(low).ok()
-        };
-        agree = reinterpreted == Some(v);
+        sized |= matches!(&x.kind, ExprKind::SystemCall { name, .. }
+            if name == "$signed" || name == "$unsigned" || lsdd_is_decl_query(name));
+        call |= matches!(x.kind, ExprKind::Call { .. });
     });
-    if !agree {
+    // The plain reading must resolve too: the sized evaluator reads what it
+    // does not model as a known 0. With a constant function call in it, a
+    // sized endpoint is left for the run time.
+    let plain = const_eval_i64_with_params(e, Some(env))?;
+    if !sized {
+        return Some(plain);
+    }
+    if call {
         return None;
     }
-    const_eval_i64_with_params(e, Some(env))
+    let v = eval_const_expr_val(e, env);
+    if v.is_real || v.has_xz() || !(1..=64).contains(&v.width) {
+        return None;
+    }
+    v.to_i64()
 }
 
 /// One subroutine/process body. The fold runs against a lexically scoped
@@ -23224,7 +23200,7 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
         return;
     }
     // Nothing to gain on a name-free expression.
-    if !lsdd_names_value(e) {
+    if !lsdd_names_value(e) || lsdd_queries_a_declaration(e, env) {
         return;
     }
     let Some(v) = lsdd_eval(e, env) else {
