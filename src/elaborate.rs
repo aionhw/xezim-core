@@ -5330,6 +5330,11 @@ impl ElaboratedModule {
                     Some(&self.unpacked_decl_dims),
                     &self.parameters,
                 )
+            })
+            .or_else(|| {
+                self.with_unpacked_array_tables(|t| {
+                    concat_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, t)
+                })
             }) {
                 Some(parts) => {
                     for e in parts {
@@ -58168,6 +58173,174 @@ pub fn slice_array_assign_parts(
     )
 }
 
+/// The array tables [`concat_array_assign_parts`] reads.
+pub struct UnpackedArrayTables<'a> {
+    pub arrays: &'a HashMap<String, (i64, i64, u32)>,
+    pub arrays_2d: &'a HashMap<String, ((i64, i64), (i64, i64), u32)>,
+    pub arrays_nd: &'a HashMap<String, (Vec<(i64, i64)>, u32)>,
+    pub descending: &'a HashSet<String>,
+    pub decl_dims: &'a HashMap<String, Vec<(i64, i64)>>,
+    pub params: &'a HashMap<String, Value>,
+    /// Whether a name is a dynamic array, a queue or an associative array.
+    pub other_array: &'a dyn Fn(&str) -> bool,
+}
+
+impl ElaboratedModule {
+    /// `f` with this module's [`UnpackedArrayTables`].
+    pub fn with_unpacked_array_tables<R>(
+        &self,
+        f: impl FnOnce(&UnpackedArrayTables<'_>) -> R,
+    ) -> R {
+        let other = |n: &str| {
+            self.dynamic_arrays.contains(n)
+                || self.queue_vars.contains(n)
+                || self.associative_arrays.contains_key(n)
+        };
+        f(&UnpackedArrayTables {
+            arrays: &self.arrays,
+            arrays_2d: &self.arrays_2d,
+            arrays_nd: &self.arrays_nd,
+            descending: &self.descending_arrays,
+            decl_dims: &self.unpacked_decl_dims,
+            params: &self.parameters,
+            other_array: &other,
+        })
+    }
+}
+
+/// §10.3, §10.10: a continuous assignment of an unpacked array concatenation
+/// to a whole one-dimensional fixed unpacked array, `assign a = {x, w, m[i],
+/// s[0 +: 2]};`. Like a whole array, the concatenation has no signal of its
+/// own, so the assignment drove nothing. It becomes one assignment per
+/// element, the items' elements paired left to right with the target's: a
+/// whole one-dimensional array or a slice of one contributes each of its
+/// elements, a row `m[i]` of a two-dimensional array each element of that
+/// row (§7.4.4), and any other item one element. `None` for any other shape,
+/// or when the counts differ.
+pub fn concat_array_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    t: &UnpackedArrayTables<'_>,
+) -> Option<Vec<ContinuousAssignment>> {
+    let ExprKind::Concatenation(items) = &rhs.kind else {
+        return None;
+    };
+    let ExprKind::Ident(lh) = &lhs.kind else {
+        return None;
+    };
+    let whole_name = |h: &HierarchicalIdentifier| {
+        h.path.iter().all(|s| s.selects.is_empty()).then(|| {
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+    };
+    let names_array = |n: &str| {
+        t.arrays.contains_key(n)
+            || t.arrays_2d.contains_key(n)
+            || t.arrays_nd.contains_key(n)
+            || (t.other_array)(n)
+    };
+    let lname = whole_name(lh)?;
+    if (t.other_array)(&lname) {
+        return None;
+    }
+    let side = |e: &Expression, target: bool| {
+        slice_side_elems(
+            e,
+            t.arrays,
+            Some(t.descending),
+            Some(t.decl_dims),
+            t.params,
+            target,
+        )
+    };
+    let lhs_elems = side(lhs, true)?;
+    let mut rhs_elems: Vec<Expression> = Vec::with_capacity(lhs_elems.len());
+    for item in items {
+        match &item.kind {
+            ExprKind::Ident(h) => match whole_name(h) {
+                Some(n) if names_array(&n) => rhs_elems.extend(side(item, false)?),
+                Some(_) => rhs_elems.push(item.clone()),
+                None => return None,
+            },
+            ExprKind::RangeSelect { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(h) if whole_name(h).is_some_and(|n| names_array(&n)) => {
+                    rhs_elems.extend(side(item, false)?)
+                }
+                // A part-select of a packed vector is one element.
+                ExprKind::Ident(h) if whole_name(h).is_some() => rhs_elems.push(item.clone()),
+                _ => return None,
+            },
+            ExprKind::Index { .. } => {
+                // The selects down to the array (`m[i][j]` has two).
+                let mut base = item;
+                let mut selects = 0;
+                while let ExprKind::Index { expr, .. } = &base.kind {
+                    selects += 1;
+                    base = expr;
+                }
+                let ExprKind::Ident(h) = &base.kind else {
+                    return None;
+                };
+                let n = whole_name(h)?;
+                if selects > 1 {
+                    // An element of a two-dimensional array, or a select
+                    // of an element: one element. A sub-array of a deeper
+                    // array is not spread here.
+                    if t.arrays_nd.contains_key(&n) {
+                        return None;
+                    }
+                    rhs_elems.push(item.clone());
+                } else if let Some(&(_, inner, _)) = t.arrays_2d.get(&n) {
+                    let (l, r) = match t.decl_dims.get(&n) {
+                        Some(d) if d.len() == 2 => d[1],
+                        _ => inner,
+                    };
+                    let idx: Vec<i64> = if l >= r {
+                        (r..=l).rev().collect()
+                    } else {
+                        (l..=r).collect()
+                    };
+                    rhs_elems.extend(idx.into_iter().map(|j| index_expr(item.clone(), j)));
+                } else if t.arrays_nd.contains_key(&n) {
+                    return None;
+                } else {
+                    rhs_elems.push(item.clone());
+                }
+            }
+            ExprKind::Concatenation(_)
+            | ExprKind::Replication { .. }
+            | ExprKind::AssignmentPattern(_)
+            | ExprKind::MemberAccess { .. } => return None,
+            _ => rhs_elems.push(item.clone()),
+        }
+    }
+    if rhs_elems.len() != lhs_elems.len() || lhs_elems.is_empty() || lhs_elems.len() > 4096 {
+        return None;
+    }
+    Some(
+        lhs_elems
+            .into_iter()
+            .zip(rhs_elems)
+            .map(|(l, r)| ContinuousAssignment {
+                gate_delay_fall: None,
+                delay_select: None,
+                origin: None,
+                lhs: l,
+                rhs: r,
+                delay,
+                rhs_parent_scoped: false,
+                delay_fall: None,
+                delay_off: None,
+            })
+            .collect(),
+    )
+}
+
 /// The element expressions of one side of `slice_array_assign_parts`, left
 /// to right: a whole 1-D unpacked array, or a slice of one. `target` asks for
 /// constant bounds.
@@ -58661,7 +58834,9 @@ fn expand_whole_array_assign(
             Some(&elab.unpacked_decl_dims),
             &elab.parameters,
         )
-    }) {
+    })
+    .or_else(|| elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t)))
+    {
         Some(parts) => {
             elab.continuous_assigns.extend(parts);
             true
