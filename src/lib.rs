@@ -3832,16 +3832,25 @@ fn parse_and_elaborate(
     release_free_memory();
     oom_trace::checkpoint("elaborate.memory_released", &[]);
 
-    // §23.11: resolve bind targets incrementally on newly introduced scopes so
-    // unaffected hierarchy is elaborated once; fall back to full rebuild only
-    // when a rare cross-pass reference forces re-elaboration of existing scopes.
+    // §23.11: find every bind target in one walk that elaborates only the
+    // newly bound scopes on each step, then elaborate the root once more
+    // with all of them, so a bound instance takes its place at the end of
+    // its target. A design without resolved binds keeps the single walk.
     let mut bind_resolver = IncrementalBindResolver::new(&top_level_binds, &unit_bind_params);
-    if elaborate::inline_instantiations_with_binds(
+    let rebuild = elaborate::inline_instantiations_with_binds(
         &mut elab,
         &def_refs,
         &top_level_binds,
         &mut |elab| bind_resolver.resolve_step(elab),
-    )? {
+    )?;
+    if !rebuild {
+        for target in &bind_resolver.unresolved {
+            log_eprintln(&format!(
+                "[elab] no bind target instance '{}'; bind ignored",
+                target
+            ));
+        }
+    } else {
         for pass in 0..64 {
             let binds = std::mem::take(&mut elab.resolved_binds);
             let timescales = std::mem::take(&mut elab.module_timescale_exp);
@@ -4249,6 +4258,8 @@ struct IncrementalBindResolver<'a> {
     scanned_unit_binds: bool,
     path_site_resolved: crate::hasher::HashSet<usize>,
     path_site_complete: crate::hasher::HashSet<usize>,
+    /// Path targets no pass resolved, as the last step found them.
+    unresolved: Vec<String>,
 }
 
 impl<'a> IncrementalBindResolver<'a> {
@@ -4267,6 +4278,7 @@ impl<'a> IncrementalBindResolver<'a> {
             scanned_unit_binds: false,
             path_site_resolved: crate::hasher::HashSet::default(),
             path_site_complete: crate::hasher::HashSet::default(),
+            unresolved: Vec::new(),
         }
     }
 
@@ -4450,12 +4462,9 @@ impl<'a> IncrementalBindResolver<'a> {
             }
             unresolved.sort();
             unresolved.dedup();
-            for target in unresolved {
-                log_eprintln(&format!(
-                    "[elab] no bind target instance '{}'; bind ignored",
-                    target
-                ));
-            }
+            // Reported once by whichever pass ends the fixed point: here
+            // when no bind resolved, else the final root elaboration.
+            self.unresolved = unresolved;
             return Ok(Vec::new());
         }
 

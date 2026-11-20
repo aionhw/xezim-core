@@ -38204,6 +38204,7 @@ fn inline_instantiations_inner(
             filter,
             scopes: HashMap::default(),
             needs_full_rebuild: false,
+            kept_bound_ports: false,
         })
     });
     let top_meta = inline_module_items(
@@ -38266,6 +38267,16 @@ fn inline_instantiations_inner(
                     return Ok(true);
                 }
             }
+        }
+        // §23.11: a bound instance is inlined as if written at the end of its
+        // target's items, so it precedes the target's later siblings in the
+        // instance, signal and process order. The walk above appended the
+        // bound hierarchy after the whole design: it only discovers the
+        // complete set of bind targets. Elaborate the root once more with
+        // all of them, which yields the same design as a fixed point that
+        // rebuilds the root on every pass.
+        if !elab.resolved_binds.is_empty() || bs.kept_bound_ports {
+            return Ok(true);
         }
         drop(bs);
     }
@@ -43193,6 +43204,9 @@ struct BindWorklistState {
     filter: BindTargetFilter,
     scopes: HashMap<String, TargetScope>,
     needs_full_rebuild: bool,
+    /// A target's input ports were kept for a checker or other non-plain
+    /// bind: this walk is no longer the one a design without the bind gets.
+    kept_bound_ports: bool,
 }
 
 struct ModuleInlineMeta {
@@ -49647,12 +49661,19 @@ fn inline_instantiation_items(
                                 )
                             ) && !elab.checker_decls.contains_key(name)
                         };
-                        let bind_blocks_elision = bind_state.as_ref().is_some_and(|bs| {
-                            bs.filter.has_non_plain_bind
-                                && bs
-                                    .filter
-                                    .matches(inst_prefix.trim_end_matches('.'), sub_mod_name)
-                        });
+                        let bind_blocks_elision = match bind_state.as_deref_mut() {
+                            Some(bs)
+                                if bs.filter.has_non_plain_bind
+                                    && bs.filter.matches(
+                                        inst_prefix.trim_end_matches('.'),
+                                        sub_mod_name,
+                                    ) =>
+                            {
+                                bs.kept_bound_ports = true;
+                                true
+                            }
+                            _ => false,
+                        };
                         if !bind_blocks_elision
                             && !port_elision_blocked_by_items(
                                 &prepared_sub.effective_items,
