@@ -2524,6 +2524,12 @@ impl Preprocessor {
             }
             result = next;
         }
+        // A `" ... `" region still kept open (its macro never stops
+        // expanding, or the cap ended the chain) becomes a string literal
+        // here, so no stringify delimiter reaches the tokenizer.
+        if result.contains("`\"") {
+            result = Self::close_stringified_regions(&result);
+        }
         if self.paste_separated.replace(false) {
             result.retain(|c| c != PASTE_SEPARATOR);
         }
@@ -2663,6 +2669,16 @@ impl Preprocessor {
         // delimiters (`` `" ``) are backtick-prefixed and consumed by the
         // backtick handler below, so they never reach this path.
         let mut in_string = false;
+        // §22.5.1: a `" ... `" region includes "expansions of embedded
+        // macros", however deep the chain. One level expands per pass, and a
+        // region written as "..." would be a string literal to the next pass,
+        // where nothing expands (`` `"`INST.x`" `` with `INST = `TOP.u0 gave
+        // "`TOP.u0.x", #1338). So the region that is open in this pass
+        // remembers where its opening quote and its escaped quotes (`\`")
+        // sit in `result`; when a macro expanded inside it left a backtick,
+        // its closing delimiter restores them to `" and `\`" for the next
+        // pass, and `expand_macros` closes what never finishes.
+        let mut region: Option<StringifyRegion> = None;
         while i < bytes.len() {
             // Copy ordinary text in bulk: inside a string only `\\` and `"`
             // matter, outside it only `` ` `` and `"`.
@@ -2705,7 +2721,21 @@ impl Preprocessor {
                 }
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\"' {
                     // Stringification: replace with normal quote
-                    result.push('\"');
+                    match region.take() {
+                        None => {
+                            region = Some(StringifyRegion {
+                                start: result.len(),
+                                escapes: Vec::new(),
+                                unfinished: false,
+                            });
+                            result.push('\"');
+                        }
+                        Some(r) if r.unfinished => {
+                            r.reopen(&mut result);
+                            result.push_str("`\"");
+                        }
+                        Some(_) => result.push('\"'),
+                    }
                     i += 2;
                     continue;
                 }
@@ -2717,6 +2747,9 @@ impl Preprocessor {
                     // §22.5.1 `\`" — an ESCAPED quote inside the expanded
                     // string literal. Previously fell into the macro-name
                     // scan and came out mangled.
+                    if let Some(r) = region.as_mut() {
+                        r.escapes.push(result.len());
+                    }
                     result.push('\\');
                     result.push('\"');
                     i += 4;
@@ -2827,6 +2860,7 @@ impl Preprocessor {
                         }
                         let body = Self::substitute_formals(&def.body, &actuals);
                         let body_pasted = self.apply_token_pasting(&body);
+                        StringifyRegion::note_text(&mut region, &body_pasted);
                         result.push_str(&body_pasted);
                     } else {
                         // §22.5.1: a macro defined with a formal list must be
@@ -2842,6 +2876,7 @@ impl Preprocessor {
                             ));
                         }
                         let body_pasted = self.apply_token_pasting(&def.body);
+                        StringifyRegion::note_text(&mut region, &body_pasted);
                         result.push_str(&body_pasted);
                     }
                 } else {
@@ -2873,6 +2908,80 @@ impl Preprocessor {
             }
         }
         result
+    }
+
+    /// Turn the `` `" ... `" `` regions that `expand_macros_once` kept open
+    /// into string literals, with no further expansion: each `` `" `` becomes
+    /// `"` and each `` `\`" `` becomes `\"`, as one pass writes a finished
+    /// region. A `"` outside a delimiter starts a string literal that runs to
+    /// its closing `"` (§22.5.1), and its text is copied as it is.
+    fn close_stringified_regions(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        let mut i = 0;
+        let mut in_string = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 2,
+                b'"' => {
+                    in_string = !in_string;
+                    i += 1;
+                }
+                b'`' if !in_string && bytes.get(i + 1) == Some(&b'"') => {
+                    out.push_str(&text[last..i]);
+                    out.push('"');
+                    i += 2;
+                    last = i;
+                }
+                b'`' if !in_string && bytes[i..].starts_with(b"`\\`\"") => {
+                    out.push_str(&text[last..i]);
+                    out.push_str("\\\"");
+                    i += 4;
+                    last = i;
+                }
+                _ => i += 1,
+            }
+        }
+        out.push_str(&text[last.min(text.len())..]);
+        out
+    }
+}
+
+/// The `` `" ... `" `` region open in one `expand_macros_once` pass
+/// (§22.5.1). `start` is the offset in the pass's output of the `"` its
+/// opening delimiter was written as, and `escapes` the offsets of the `\"`
+/// each `` `\`" `` in it was written as.
+struct StringifyRegion {
+    start: usize,
+    escapes: Vec<usize>,
+    /// A macro expanded in the region inserted text that holds a backtick,
+    /// so the region has another level to expand.
+    unfinished: bool,
+}
+
+impl StringifyRegion {
+    /// Record macro text inserted at the current point of the pass.
+    fn note_text(region: &mut Option<Self>, text: &str) {
+        if let Some(r) = region {
+            r.unfinished |= text.contains('`');
+        }
+    }
+
+    /// Write the region's opening delimiter and escaped quotes back as
+    /// `` `" `` and `` `\`" ``, so the next pass reads it as a region again.
+    fn reopen(&self, result: &mut String) {
+        let tail = result.split_off(self.start + 1);
+        result.truncate(self.start);
+        result.push_str("`\"");
+        let mut last = 0;
+        for &e in &self.escapes {
+            let e = e - (self.start + 1);
+            result.push_str(&tail[last..e]);
+            result.push_str("`\\`\"");
+            last = e + 2;
+        }
+        result.push_str(&tail[last..]);
     }
 }
 
