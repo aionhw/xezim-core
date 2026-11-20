@@ -47353,6 +47353,19 @@ fn inline_instantiation_items(
                                 {
                                     resolved_two_state_ports.insert(port.name.name.as_str());
                                 }
+                                // §6.11.2, §23.3.3.2: a 2-state formal drops
+                                // X and Z on every write, including the
+                                // connection assign of a formal that keeps its
+                                // own storage (`input var bit [3:0] b` bound to
+                                // a 4-state net, a wider actual, an
+                                // expression). Only body declarations were
+                                // registered, so the formal kept the actual's
+                                // X and Z bits.
+                                if !is_real
+                                    && is_type_two_state_resolved(&resolved_dt, &elab.typedef_types)
+                                {
+                                    elab.two_state_signals.insert(sig_name.clone());
+                                }
                                 if let Some(ew) =
                                     packed_inner_elem_width(dt, &sub_merged_params, &elab.typedefs)
                                         .or_else(|| {
@@ -48063,6 +48076,16 @@ fn inline_instantiation_items(
                                         net_type,
                                         Some(&pd.data_type),
                                     );
+                                }
+                                // §6.11.2: as for an ANSI port, a 2-state
+                                // formal drops X and Z on every write.
+                                if !port_is_real
+                                    && is_type_two_state_resolved(
+                                        &pd.data_type,
+                                        &elab.typedef_types,
+                                    )
+                                {
+                                    elab.two_state_signals.insert(sig_name.clone());
                                 }
                             }
                         }
