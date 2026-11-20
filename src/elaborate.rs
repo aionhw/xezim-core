@@ -1095,7 +1095,7 @@ impl PendingAlways {
             &self.ctx.interface_map,
         );
         clear_type_bind_tls();
-        substitute_type_params_stmt(stmt, &self.ctx.type_binds)
+        substitute_type_params_stmt(stmt, &self.ctx.type_binds, &self.ctx.prefix)
     }
 }
 
@@ -1125,7 +1125,7 @@ impl PendingInitial {
             &self.ctx.interface_map,
         );
         clear_type_bind_tls();
-        let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
+        let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds, &self.ctx.prefix);
         let scope = self.scope();
         InitialBlock { stmt, scope }
     }
@@ -49425,7 +49425,11 @@ fn inline_module_items(
                         // type parameters (`T loc;`) has the type bound here, as
                         // in its initial and always blocks; the bare name has
                         // no binding once the instance is inlined.
-                        let items = substitute_type_params_stmts(items, &pend_ctx.type_binds);
+                        let items = substitute_type_params_stmts(
+                            items,
+                            &pend_ctx.type_binds,
+                            &pend_ctx.prefix,
+                        );
                         new_fd.items = cache.callable_bodies.intern(items.into());
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
@@ -49551,7 +49555,11 @@ fn inline_module_items(
                         });
                         scope_local_decl_types(&mut items, &scope_array_typedef);
                         // §6.20.3: as for a function above.
-                        let items = substitute_type_params_stmts(items, &pend_ctx.type_binds);
+                        let items = substitute_type_params_stmts(
+                            items,
+                            &pend_ctx.type_binds,
+                            &pend_ctx.prefix,
+                        );
                         new_td.items = cache.callable_bodies.intern(items.into());
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
@@ -59347,11 +59355,12 @@ fn with_outer_packed_dims(bound: &DataType, dims: &[PackedDimension]) -> Option<
 fn substitute_type_params_stmts(
     stmts: Vec<Statement>,
     binds: &HashMap<String, DataType>,
+    prefix: &str,
 ) -> Vec<Statement> {
     if binds.is_empty() {
         return stmts;
     }
-    substitute_type_params_block(stmts, binds)
+    substitute_type_params_block(stmts, binds, prefix)
 }
 
 /// §6.18, §6.20.3: the statements of one block or subroutine body. A typedef
@@ -59361,6 +59370,7 @@ fn substitute_type_params_stmts(
 fn substitute_type_params_block(
     stmts: Vec<Statement>,
     binds: &HashMap<String, DataType>,
+    prefix: &str,
 ) -> Vec<Statement> {
     let shadowed: Vec<&str> = stmts
         .iter()
@@ -59384,7 +59394,7 @@ fn substitute_type_params_block(
     };
     stmts
         .into_iter()
-        .map(|st| substitute_type_params_stmt(st, binds))
+        .map(|st| substitute_type_params_stmt(st, binds, prefix))
         .collect()
 }
 
@@ -59396,37 +59406,115 @@ fn substitute_type_params_block(
 /// own, §7.4.1); everything else passes through untouched, recursing into
 /// compound statements. No-op (identity, no clone churn beyond the move) when
 /// the binding map is empty.
-fn subst_type_param_dt(data_type: DataType, binds: &HashMap<String, DataType>) -> DataType {
+fn subst_type_param_dt(
+    data_type: DataType,
+    binds: &HashMap<String, DataType>,
+    prefix: &str,
+) -> DataType {
     match &data_type {
         DataType::TypeReference {
             name,
             dimensions,
             type_args,
-            ..
+            span,
         } if type_args.is_empty()
             && name.scopes.is_empty()
             && binds.contains_key(&name.name.name) =>
         {
-            with_outer_packed_dims(&binds[&name.name.name], dimensions)
-                .unwrap_or_else(|| data_type.clone())
+            let bound = &binds[&name.name.name];
+            // §7.4.1: `T [1:0] tmp;` with `T` bound to an integer atom
+            // (`int`) or an enum is a packed array of two `int` or enum
+            // elements, whose elements keep the atom's signedness and the
+            // enum's type. Neither is a vector with dimensions of its own, so
+            // name the instance's alias of the parameter (`u.T`), which
+            // outlives the inlining, as a typedef of that type is named.
+            let alias_bound = !dimensions.is_empty()
+                && !prefix.is_empty()
+                && matches!(bound, DataType::IntegerAtom { .. } | DataType::Enum(_));
+            let packed = if alias_bound {
+                None
+            } else {
+                with_outer_packed_dims(bound, dimensions)
+            };
+            packed.unwrap_or_else(|| {
+                if alias_bound {
+                    let mut alias = name.clone();
+                    alias.name.name = cat2(prefix, &name.name.name);
+                    DataType::TypeReference {
+                        name: alias,
+                        dimensions: dimensions.clone(),
+                        type_args: Vec::new(),
+                        span: *span,
+                    }
+                } else {
+                    data_type.clone()
+                }
+            })
+        }
+        // §6.20.3, §7.2: a struct or union written in the declaration
+        // (`struct packed { T a; T b; } s;`) or an enum on a type parameter
+        // (`enum T {A, B} e;`) names the parameter in its members.
+        DataType::Struct(_) | DataType::Enum(_) if names_bound_type_param(&data_type, binds) => {
+            match data_type {
+                DataType::Struct(mut su) => {
+                    for m in &mut su.members {
+                        m.data_type = subst_type_param_dt(
+                            std::mem::replace(&mut m.data_type, DataType::Void(m.span)),
+                            binds,
+                            prefix,
+                        );
+                    }
+                    DataType::Struct(su)
+                }
+                DataType::Enum(mut e) => {
+                    if let Some(b) = e.base_type.take() {
+                        e.base_type = Some(Box::new(subst_type_param_dt(*b, binds, prefix)));
+                    }
+                    DataType::Enum(e)
+                }
+                other => other,
+            }
         }
         _ => data_type,
     }
 }
 
-fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType>) -> Statement {
+/// Whether `subst_type_param_dt` would change a struct, union or enum type:
+/// a member, nested at any depth, or the enum base names a bound parameter.
+fn names_bound_type_param(dt: &DataType, binds: &HashMap<String, DataType>) -> bool {
+    match dt {
+        DataType::TypeReference {
+            name, type_args, ..
+        } => type_args.is_empty() && name.scopes.is_empty() && binds.contains_key(&name.name.name),
+        DataType::Struct(su) => su
+            .members
+            .iter()
+            .any(|m| names_bound_type_param(&m.data_type, binds)),
+        DataType::Enum(e) => e
+            .base_type
+            .as_deref()
+            .is_some_and(|b| names_bound_type_param(b, binds)),
+        _ => false,
+    }
+}
+
+fn substitute_type_params_stmt(
+    stmt: Statement,
+    binds: &HashMap<String, DataType>,
+    prefix: &str,
+) -> Statement {
     if binds.is_empty() {
         return stmt;
     }
     let Statement { kind, span } = stmt;
-    let sub = |st: Box<Statement>| Box::new(substitute_type_params_stmt(*st, binds));
+    let sub = |st: Box<Statement>| Box::new(substitute_type_params_stmt(*st, binds, prefix));
     let kind = match kind {
         StatementKind::VarDecl {
             data_type,
             lifetime,
             declarators,
         } => StatementKind::VarDecl {
-            data_type: subst_type_param_dt(data_type, binds),
+            data_type: subst_type_param_dt(data_type, binds, prefix),
             lifetime,
             declarators,
         },
@@ -59436,9 +59524,21 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
             declarators,
         } => StatementKind::ParamDecl {
             is_local,
-            data_type: subst_type_param_dt(data_type, binds),
+            data_type: subst_type_param_dt(data_type, binds, prefix),
             declarators,
         },
+        // §6.18: a block typedef built on a type parameter
+        // (`typedef T [1:0] pair_t;`) names its binding, as a declaration
+        // does. One that declares the parameter's own name has already taken
+        // it out of `binds` (`substitute_type_params_block`).
+        StatementKind::Typedef(mut td) => {
+            td.data_type = subst_type_param_dt(
+                std::mem::replace(&mut td.data_type, DataType::Void(span)),
+                binds,
+                prefix,
+            );
+            StatementKind::Typedef(td)
+        }
         StatementKind::If {
             unique_priority,
             condition,
@@ -59462,7 +59562,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
             items: items
                 .into_iter()
                 .map(|it| CaseItem {
-                    stmt: substitute_type_params_stmt(it.stmt, binds),
+                    stmt: substitute_type_params_stmt(it.stmt, binds, prefix),
                     ..it
                 })
                 .collect(),
@@ -59473,7 +59573,22 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
             step,
             body,
         } => StatementKind::For {
-            init,
+            // §12.7.1: a loop variable declared with a type parameter.
+            init: init
+                .into_iter()
+                .map(|it| match it {
+                    ForInit::VarDecl {
+                        data_type,
+                        name,
+                        init,
+                    } => ForInit::VarDecl {
+                        data_type: subst_type_param_dt(data_type, binds, prefix),
+                        name,
+                        init,
+                    },
+                    other => other,
+                })
+                .collect(),
             condition,
             step,
             body: sub(body),
@@ -59498,7 +59613,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
         StatementKind::Forever { body } => StatementKind::Forever { body: sub(body) },
         StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
             name,
-            stmts: substitute_type_params_block(stmts.into_vec(), binds).into(),
+            stmts: substitute_type_params_block(stmts.into_vec(), binds, prefix).into(),
         },
         StatementKind::ParBlock {
             name,
@@ -59507,7 +59622,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
         } => StatementKind::ParBlock {
             name,
             join_type,
-            stmts: substitute_type_params_block(stmts.into_vec(), binds).into(),
+            stmts: substitute_type_params_block(stmts.into_vec(), binds, prefix).into(),
         },
         StatementKind::TimingControl { control, stmt } => StatementKind::TimingControl {
             control,
@@ -59528,7 +59643,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
         StatementKind::RandCase { items } => StatementKind::RandCase {
             items: items
                 .into_iter()
-                .map(|(w, st)| (w, substitute_type_params_stmt(st, binds)))
+                .map(|(w, st)| (w, substitute_type_params_stmt(st, binds, prefix)))
                 .collect(),
         },
         StatementKind::WaitOrder {
