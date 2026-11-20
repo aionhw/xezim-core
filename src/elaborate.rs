@@ -5206,8 +5206,20 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
         return false;
     };
     let clock_port = |n: &str| n == "clk_in" || n == "clk_out";
+    // The shortcut forwards bits without applying either formal conversion.
+    let scalar_clock = |ty: &DataType| {
+        matches!(ty,
+        DataType::Implicit { dimensions, .. }
+        | DataType::IntegerVector {
+            kind: IntegerVectorType::Logic | IntegerVectorType::Reg,
+            dimensions, ..
+        } if dimensions.is_empty())
+    };
     let plain_net = |t: Option<&NetType>| {
-        matches!(t, None | Some(NetType::Wire | NetType::Tri | NetType::Uwire))
+        matches!(
+            t,
+            None | Some(NetType::Wire | NetType::Tri | NetType::Uwire)
+        )
     };
     let mut dirs: HashMap<&str, PortDirection> = HashMap::default();
     if let PortList::Ansi(ports) = def.ports() {
@@ -5217,7 +5229,12 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
             if let Some(d) = p.direction {
                 last = d;
             }
-            if clock_port(&p.name.name) && !plain_net(p.net_type.as_ref()) {
+            if clock_port(&p.name.name)
+                && (p.direction.is_none()
+                    || !p.dimensions.is_empty()
+                    || p.data_type.as_ref().is_some_and(|ty| !scalar_clock(ty))
+                    || !plain_net(p.net_type.as_ref()))
+            {
                 return false;
             }
             dirs.insert(p.name.name.as_str(), last);
@@ -5237,7 +5254,10 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
             ModuleItem::PortDeclaration(pd) => {
                 for d in &pd.declarators {
                     if d.init.is_some()
-                        || (clock_port(&d.name.name) && !plain_net(pd.net_type.as_ref()))
+                        || (clock_port(&d.name.name)
+                            && (!scalar_clock(&pd.data_type)
+                                || !d.dimensions.is_empty()
+                                || !plain_net(pd.net_type.as_ref())))
                     {
                         return false;
                     }
@@ -5245,25 +5265,26 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
-                let shaped = nd.delay.is_some()
+                let shaped = !scalar_clock(&nd.data_type)
+                    || nd.delay.is_some()
                     || nd.delay_fall.is_some()
                     || nd.delay_off.is_some()
                     || nd.strength.is_some()
                     || !plain_net(Some(&nd.net_type));
-                if nd
-                    .declarators
-                    .iter()
-                    .any(|d| clock_port(&d.name.name) && (shaped || d.init.is_some()))
-                {
+                if nd.declarators.iter().any(|d| {
+                    clock_port(&d.name.name)
+                        && (shaped || !d.dimensions.is_empty() || d.init.is_some())
+                }) {
                     return false;
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
-                if dd
-                    .declarators
-                    .iter()
-                    .any(|d| clock_port(&d.name.name) && d.init.is_some())
-                {
+                if dd.declarators.iter().any(|d| {
+                    clock_port(&d.name.name)
+                        && (!scalar_clock(&dd.data_type)
+                            || !d.dimensions.is_empty()
+                            || d.init.is_some())
+                }) {
                     return false;
                 }
             }
@@ -43179,7 +43200,14 @@ fn inline_module_items(
                     if let (Some(clk_out_expr), Some(clk_in_expr)) = (
                         port_map.get("clk_out").cloned(),
                         port_map.get("clk_in").cloned(),
-                    ) {
+                    ) && [&clk_in_expr, &clk_out_expr].iter().all(|expr| {
+                        whole_net_ident_name(expr).is_some_and(|name| {
+                            elab.signals
+                                .get(name.as_str())
+                                .is_some_and(|sig| sig.width == 1 && !sig.is_real)
+                                && !elab.arrays.contains_key(&name)
+                        })
+                    }) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
                             delay_select: None,
