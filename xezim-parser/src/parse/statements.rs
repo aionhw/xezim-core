@@ -924,40 +924,7 @@ impl Parser {
                     && (matches!(
                         self.peek_kind(),
                         TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
-                    ) || (self.peek_kind() == TokenKind::LBracket && {
-                        // Look-ahead: balance brackets and check what follows.
-                        // §7.4.1: a typedef may carry SEVERAL packed dims
-                        // (`s_t [1:0][1:0] m;`), so walk every consecutive
-                        // balanced group before judging — stopping at the
-                        // first `]` saw the second `[` and sent the declaration
-                        // down the expression path (a parse error), while the
-                        // same declaration at module scope parsed fine.
-                        let mut depth: i32 = 0;
-                        let mut k: usize = 0;
-                        let mut next_after = TokenKind::Eof;
-                        loop {
-                            let kind = self.peek_kind_n(k + 1);
-                            match kind {
-                                TokenKind::LBracket => depth += 1,
-                                TokenKind::RBracket => {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        next_after = self.peek_kind_n(k + 2);
-                                        if next_after != TokenKind::LBracket {
-                                            break;
-                                        }
-                                    }
-                                }
-                                TokenKind::Eof => break,
-                                _ => {}
-                            }
-                            k += 1;
-                            if k > 64 {
-                                break;
-                            }
-                        }
-                        matches!(next_after, TokenKind::Identifier)
-                    })) =>
+                    ) || self.peek_is_packed_dims_then_identifier()) =>
             {
                 let data_type = self.parse_data_type();
                 let mut declarators = Vec::new();
@@ -1536,6 +1503,42 @@ impl Parser {
         )
     }
 
+    /// At an identifier followed by one or more balanced `[...]` groups and
+    /// then an identifier: `typedef_t [packed-dims] var`, a declaration, as
+    /// opposed to `arr[idx] = ...`. §7.4.1: a typedef may carry SEVERAL
+    /// packed dims (`s_t [1:0][1:0] m;`), so every consecutive balanced group
+    /// is walked before judging.
+    fn peek_is_packed_dims_then_identifier(&self) -> bool {
+        if self.peek_kind() != TokenKind::LBracket {
+            return false;
+        }
+        let mut depth: i32 = 0;
+        let mut k: usize = 0;
+        let mut next_after = TokenKind::Eof;
+        loop {
+            let kind = self.peek_kind_n(k + 1);
+            match kind {
+                TokenKind::LBracket => depth += 1,
+                TokenKind::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        next_after = self.peek_kind_n(k + 2);
+                        if next_after != TokenKind::LBracket {
+                            break;
+                        }
+                    }
+                }
+                TokenKind::Eof => break,
+                _ => {}
+            }
+            k += 1;
+            if k > 64 {
+                break;
+            }
+        }
+        matches!(next_after, TokenKind::Identifier)
+    }
+
     fn parse_for_statement(&mut self) -> Statement {
         let start = self.current().span.start;
         self.expect(TokenKind::KwFor);
@@ -1574,10 +1577,10 @@ impl Parser {
                 if var_prefix
                     || self.is_data_type_keyword()
                     || (self.at(TokenKind::Identifier)
-                        && matches!(
+                        && (matches!(
                             self.peek_kind(),
                             TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash
-                        ))
+                        ) || self.peek_is_packed_dims_then_identifier()))
                 {
                     let dt = self.parse_data_type();
                     let name = self.parse_identifier();
