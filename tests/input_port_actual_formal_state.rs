@@ -56,3 +56,22 @@ endmodule
     assert_eq!(state("uw"), Some(false));
     assert_eq!(state("un"), Some(true));
 }
+
+/// §16.5.1, §16.9.3: a sampled input has a prehistory of its own. The
+/// clock, which supplies timing alone, can still use its parent's signal.
+#[test]
+fn sampled_operand_keeps_its_formal() {
+    let m = elaborate(
+        r#"
+module leaf(input clk, input [3:0] data);
+  always @(posedge clk) $display("%b", $past(data ^ 4'h2));
+endmodule
+module top;
+  reg clk = 0;
+  reg [3:0] data = 0;
+  leaf u(clk, data);
+endmodule"#,
+    );
+    assert!(m.input_port_actuals.iter().all(|port| port.formal() != "u.data"));
+    assert!(m.input_port_actuals.iter().any(|port| port.formal() == "u.clk"));
+}

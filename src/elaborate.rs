@@ -40161,6 +40161,8 @@ struct PreparedModuleItems {
     /// as driving every actual it is passed. Naming a port here only forgoes
     /// a shape fix; missing one would break a working design.
     body_driven_ports: std::collections::HashSet<String>,
+    /// §16.5.1: sampled input ports retain a distinct default from the driver.
+    sampled_ports: std::collections::HashSet<String>,
 }
 
 /// Base identifier of an assignment target (`a`, `a[i]`, `a[3:0].b`, and
@@ -40876,7 +40878,9 @@ fn prepare_module_items(
 
     // Fill literals before extracting shared sources so pending processes
     // reuse the cached values instead of parsing them in every instance.
-    prefill_literal_caches(&effective_items);
+    let mut sampled_ports = std::collections::HashSet::new();
+    prepare_body_operands(&effective_items, &mut sampled_ports);
+    sampled_ports.retain(|n| port_directions.get(n) == Some(&PortDirection::Input));
 
     // §9.2.1/§9.2.2 (#721): pending processes own the shared source body.
     // Run name/driver analysis and literal prefill before moving it out of
@@ -40955,6 +40959,7 @@ fn prepare_module_items(
         port_directions,
         local_names: std::rc::Rc::new(local_names),
         body_driven_ports,
+        sampled_ports,
     });
     if let Some((key, _)) = cache_key {
         Rc::make_mut(&mut prepared).effective_items.shrink_to_fit();
@@ -41075,7 +41080,7 @@ impl serde::Serialize for PreparedView<'_> {
         let p = self.0;
         let mut directions: Vec<_> = p.port_directions.iter().collect();
         directions.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let mut t = s.serialize_tuple(8)?;
+        let mut t = s.serialize_tuple(9)?;
         t.serialize_element(&p.effective_items)?;
         t.serialize_element(&Sources(&p.body_sources))?;
         t.serialize_element(&p.has_subroutines)?;
@@ -41084,6 +41089,7 @@ impl serde::Serialize for PreparedView<'_> {
         t.serialize_element(&directions)?;
         t.serialize_element(&sorted(p.local_names.iter()))?;
         t.serialize_element(&sorted(&p.body_driven_ports))?;
+        t.serialize_element(&sorted(&p.sampled_ports))?;
         t.end()
     }
 }
@@ -41093,7 +41099,8 @@ impl serde::Serialize for PreparedView<'_> {
 /// literal evaluators store there after their first evaluation of the node,
 /// computed the same way. A literal that draws the unsized-decimal wrap
 /// warning is left alone so the evaluator meeting it first still warns.
-fn prefill_literal_caches(items: &[ModuleItem]) {
+/// Also collect input names whose prehistory is observed by a sampled-value function.
+fn prepare_body_operands(items: &[ModuleItem], sampled: &mut std::collections::HashSet<String>) {
     fn fill(n: &NumberLiteral) {
         let NumberLiteral::Integer {
             size,
@@ -41126,19 +41133,26 @@ fn prefill_literal_caches(items: &[ModuleItem]) {
             cached_val.set(Some((vb, xz, w)));
         }
     }
-    fn expr(e: &Expression) {
+    let mut expr = |e: &Expression| {
         for_each_sub_expr(e, &mut |x| match &x.kind {
             ExprKind::Number(n) => fill(n),
-            ExprKind::Ident(h) => {
-                for seg in &h.path {
-                    for sel in &seg.selects {
-                        expr(sel);
-                    }
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$past" | "$rose" | "$fell" | "$stable" | "$changed" | "$sampled") =>
+            {
+                if let Some(operand) = args.first() {
+                    for_each_sub_expr(operand, &mut |e| {
+                        if let ExprKind::Ident(h) = &e.kind
+                            && h.root.is_none()
+                            && let Some(seg) = h.path.first()
+                        {
+                            sampled.insert(seg.name.name.clone());
+                        }
+                    });
                 }
             }
             _ => {}
         });
-    }
+    };
     for item in items {
         match item {
             ModuleItem::ContinuousAssign(ca) => {
@@ -41147,9 +41161,29 @@ fn prefill_literal_caches(items: &[ModuleItem]) {
                     expr(rhs);
                 }
             }
-            ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut |e| expr(e)),
-            ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut |e| expr(e)),
-            ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut |e| expr(e)),
+            ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut expr),
+            ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut expr),
+            ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut expr),
+            ModuleItem::FunctionDeclaration(f) => {
+                for stmt in &f.items { for_each_stmt_expr(stmt, &mut expr); }
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                for stmt in &t.items { for_each_stmt_expr(stmt, &mut expr); }
+            }
+            ModuleItem::AssertionItem(a) => {
+                expr(&a.expr);
+                for stmt in [&a.action, &a.else_action].into_iter().flatten() {
+                    for_each_stmt_expr(stmt, &mut expr);
+                }
+            }
+            ModuleItem::PropertyDeclaration(p) => {
+                if let Some(body) = &p.body { expr(body); }
+                for stmt in &p.items { for_each_stmt_expr(stmt, &mut expr); }
+            }
+            ModuleItem::SequenceDeclaration(s) => {
+                if let Some(body) = &s.body { expr(body); }
+                for stmt in &s.items { for_each_stmt_expr(stmt, &mut expr); }
+            }
             _ => {}
         }
     }
@@ -48056,6 +48090,7 @@ fn inline_module_items(
                             prepared_sub.port_directions.get(name.as_str()),
                             Some(PortDirection::Output)
                         ) && !no_subst_ports.contains(name.as_str())
+                            && !prepared_sub.sampled_ports.contains(name.as_str())
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
