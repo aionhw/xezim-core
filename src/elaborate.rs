@@ -31886,21 +31886,38 @@ fn expand_struct_driver(
     if ca.delay == 0 || out.len() - start < 2 || ca.delay_fall.is_some() || ca.delay_off.is_some() {
         return;
     }
-    let defaults: Option<Vec<_>> = out[start..]
-        .iter()
-        .map(|leaf| {
-            let name =
-                ident_flat_name(&leaf.lhs).or_else(|| scope_indexed_flat_name(&leaf.lhs, elab))?;
-            if let Some(sig) = elab.signals.get(&name) {
-                return (!sig.is_real && sig.width > 0).then(|| sig.value.resize(sig.width));
+    fn leaf_name(e: &Expression, elab: &ElaboratedModule) -> Option<String> {
+        match &e.kind {
+            ExprKind::Index { expr, index } => Some(format!("{}[{}]", leaf_name(expr, elab)?,
+                const_eval_i64_with_params(index, Some(&elab.parameters))?)),
+            ExprKind::MemberAccess {expr, member} => Some(format!("{}.{}", leaf_name(expr, elab)?, member.name)),
+            _ => ident_flat_name(e),
+        }
+    }
+    let defaults: Option<Vec<_>> = out[start..].iter().map(|leaf| {
+        let name = leaf_name(&leaf.lhs, elab)?;
+        if let Some(sig) = elab.signals.get(&name) {
+            return (!sig.is_real && sig.width > 0).then(|| sig.value.resize(sig.width));
+        }
+        // Array cells are normally allocated only when the simulator starts.
+        // Their source declaration already carries the leaf type and default.
+        let mut container = su;
+        let mut path = name.strip_prefix(base)?.strip_prefix('.')?.split('.').peekable();
+        while let Some(part) = path.next() {
+            let member = part.split('[').next()?;
+            let dt = &container.members.iter().find(|m|
+                m.declarators.iter().any(|d| d.name.name == member))?.data_type;
+            let dt = resolve_typedef_chain(dt, &elab.typedef_types);
+            if path.peek().is_none() {
+                let width = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
+                let value = default_value_for_type(dt, width);
+                return (!value.is_real && width > 0).then_some(value);
             }
-            let base = name.rsplit_once('[')?.0;
-            let width = elab.arrays.get(base)?.2;
-            let dt = elab.var_decl_types.get(base)?;
-            let value = default_value_for_type_resolved(dt, width, &elab.typedef_types);
-            (!value.is_real && width > 0).then_some(value)
-        })
-        .collect();
+            let DataType::Struct(inner) = dt else { return None; };
+            container = inner;
+        }
+        None
+    }).collect();
     let Some(defaults) = defaults else {
         return;
     };
