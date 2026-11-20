@@ -32859,28 +32859,6 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     r = r.resize_for_assign(w);
                 }
             }
-            // §11.8.2: a relational or equality operator's operands take REAL
-            // type from each other, and the real type propagates one operator
-            // into the integral side: `(UP - 2) > 1.0` compares -1.0. (An
-            // arithmetic operator's integral operand is converted from its
-            // self-determined value, which is what `l`/`r` already hold.)
-            if l.is_real != r.is_real
-                && matches!(
-                    op,
-                    BinaryOp::Eq
-                        | BinaryOp::Neq
-                        | BinaryOp::Lt
-                        | BinaryOp::Leq
-                        | BinaryOp::Gt
-                        | BinaryOp::Geq
-                )
-            {
-                if l.is_real {
-                    r = const_eval_in_real_context(right, params);
-                } else {
-                    l = const_eval_in_real_context(left, params);
-                }
-            }
             match op {
                 BinaryOp::Add => l.add(&r),
                 BinaryOp::Sub => l.sub(&r),
@@ -33526,10 +33504,22 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                 (else_expr, then_expr)
             };
             let v = eval_const_expr_val_inner(taken, params, types);
-            // §11.4.11/§11.8.2: a REAL other arm makes the result real, and
-            // the real type propagates into this integral arm.
-            if !v.is_real && const_context::infer(other, params, types).real {
+            if v.is_real && c.is_nonzero().is_some() {
+                return v;
+            }
+            let other_real = const_context::infer(other, params, types).real;
+            let v = if !v.is_real && other_real {
                 const_eval_in_real_context(taken, params)
+            } else {
+                v
+            };
+            if v.is_real && c.is_nonzero().is_none() {
+                let other = if other_real {
+                    eval_const_expr_val_inner(other, params, types)
+                } else {
+                    const_eval_in_real_context(other, params)
+                };
+                v.merge_unknown(&other)
             } else {
                 v
             }
@@ -50760,7 +50750,7 @@ fn eval_const_user_function<P: ParamLookup>(
                 Some(context.and_then(|(_, s)| s).unwrap_or(ty.signed)),
             ));
             // §11.4.11: only a condition with no known 1 bit is ambiguous.
-            if c.is_nonzero().is_none() && ty.integral {
+            if c.is_nonzero().is_none() && (ty.integral || ty.real) {
                 let left = eval_fn_expr_ctx(then_expr, locals, elab, depth, arm_context)?;
                 let right = eval_fn_expr_ctx(else_expr, locals, elab, depth, arm_context)?;
                 return Some(left.merge_unknown(&right));

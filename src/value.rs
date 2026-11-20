@@ -3048,6 +3048,12 @@ impl Value {
     /// and combined bitwise.
     #[inline]
     pub fn merge_unknown(&self, other: &Value) -> Value {
+        // §11.4.11, Table 7-1: unequal real arms yield the default real
+        // value. Equality is numeric after conversion to the result type.
+        if self.is_real || other.is_real {
+            let a = self.to_f64();
+            return Self::from_f64(if a == other.to_f64() { a } else { 0.0 });
+        }
         if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
             let bits = Self::wide_bitwise_lanes(
                 a,

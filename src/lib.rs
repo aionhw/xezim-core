@@ -264,7 +264,8 @@ pub use value::Value;
 ///         the default actual arguments of named sequences and properties kept in the
 ///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
 // §38.34: compiled artifacts retain observable continuous-driver contributions.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x50";
+// §11.8.2: folded real comparisons convert integral operands at their own width.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x51";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
