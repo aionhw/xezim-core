@@ -2316,7 +2316,13 @@ impl Parser {
                         | TokenKind::BitNand
                         | TokenKind::BitNor
                         | TokenKind::BitXnor
-                );
+                ) || (self.in_sva_seq && self.at(TokenKind::At));
+                // §16.13.1 / A.2.10: in a sequence the operand may also open
+                // with a clocking event (`clocking_event sequence_expr`), as
+                // in the multiclocked `b ##1 @(posedge clk2) ##1 ##1
+                // @(posedge clk) c`. Without `At` here the inner
+                // `##1 @(posedge clk) c` stopped at the `@`, and the enclosing
+                // parentheses failed with "expected RParen, found At".
                 if allow_rhs {
                     let rest = self.parse_expr_bp(3);
                     Expression::new(
