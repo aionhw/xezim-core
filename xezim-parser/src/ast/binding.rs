@@ -53,6 +53,26 @@ impl Bound {
 
     /// The tag of a §6.10 implicit net that a generate block declares.
     const BLOCK_IMPLICIT_NET: u32 = 1 << 31;
+    /// A typedef key assigned by package and compilation-unit scoping.
+    const EXTERNAL_TYPE: u32 = 1 << 30;
+    /// §6.18: the local type declaration follows this use.
+    const LATE_TYPE_DECLARATION: u32 = 1 << 29;
+
+    pub fn external_type(index: u32) -> Bound {
+        Bound(index | Self::EXTERNAL_TYPE)
+    }
+
+    pub fn external_type_index(self) -> Option<usize> {
+        (self.0 & Self::EXTERNAL_TYPE != 0).then_some((self.0 ^ Self::EXTERNAL_TYPE) as usize)
+    }
+
+    pub fn with_late_type_declaration(self) -> Bound {
+        Bound(self.0 | Self::LATE_TYPE_DECLARATION)
+    }
+
+    pub fn has_late_type_declaration(self) -> bool {
+        self.0 & Self::LATE_TYPE_DECLARATION != 0
+    }
 
     pub fn decl(d: DeclId) -> Bound {
         Bound(d.0 + 4)
@@ -66,7 +86,10 @@ impl Bound {
 
     /// The declaration in this definition's tree.
     pub fn as_decl(self) -> Option<DeclId> {
-        (self.0 & !Self::BLOCK_IMPLICIT_NET)
+        if self.external_type_index().is_some() {
+            return None;
+        }
+        (self.0 & !(Self::BLOCK_IMPLICIT_NET | Self::LATE_TYPE_DECLARATION))
             .checked_sub(4)
             .map(DeclId)
     }
