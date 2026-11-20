@@ -5209,6 +5209,10 @@ impl<'a> Definition<'a> {
 /// cell whose `clk_in` or `clk_out` net has a delay (§6.7.1, §28.16), a drive
 /// strength, or a net type that resolves or holds a value (§6.6): the direct
 /// assignment would drop it, and clock edges would arrive early or differ.
+/// And so is one whose `clk_in` or `clk_out` is not a scalar four-state
+/// value: a `bit` port turns an x or z clock into 0 (§6.11.2), and a vector,
+/// signed or unpacked port resizes or sign-extends the value it passes
+/// (§23.3.3), which the direct assignment of the connections would not.
 fn is_clock_passthrough_cell(def: &Definition) -> bool {
     let Definition::Module(_) = def else {
         return false;
@@ -5216,6 +5220,24 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
     let clock_port = |n: &str| n == "clk_in" || n == "clk_out";
     let plain_net = |t: Option<&NetType>| {
         matches!(t, None | Some(NetType::Wire | NetType::Tri | NetType::Uwire))
+    };
+    let scalar_4state = |dt: Option<&DataType>, unpacked: &[UnpackedDimension]| {
+        unpacked.is_empty()
+            && match dt {
+                None => true,
+                Some(DataType::Implicit {
+                    signing: None,
+                    dimensions,
+                    ..
+                })
+                | Some(DataType::IntegerVector {
+                    kind: IntegerVectorType::Logic | IntegerVectorType::Reg,
+                    signing: None,
+                    dimensions,
+                    ..
+                }) => dimensions.is_empty(),
+                Some(_) => false,
+            }
     };
     let mut dirs: HashMap<&str, PortDirection> = HashMap::default();
     if let PortList::Ansi(ports) = def.ports() {
@@ -5225,7 +5247,10 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
             if let Some(d) = p.direction {
                 last = d;
             }
-            if clock_port(&p.name.name) && !plain_net(p.net_type.as_ref()) {
+            if clock_port(&p.name.name)
+                && (!plain_net(p.net_type.as_ref())
+                    || !scalar_4state(p.data_type.as_ref(), &p.dimensions))
+            {
                 return false;
             }
             dirs.insert(p.name.name.as_str(), last);
@@ -5245,7 +5270,9 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
             ModuleItem::PortDeclaration(pd) => {
                 for d in &pd.declarators {
                     if d.init.is_some()
-                        || (clock_port(&d.name.name) && !plain_net(pd.net_type.as_ref()))
+                        || (clock_port(&d.name.name)
+                            && (!plain_net(pd.net_type.as_ref())
+                                || !scalar_4state(Some(&pd.data_type), &d.dimensions)))
                     {
                         return false;
                     }
@@ -5258,20 +5285,20 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
                     || nd.delay_off.is_some()
                     || nd.strength.is_some()
                     || !plain_net(Some(&nd.net_type));
-                if nd
-                    .declarators
-                    .iter()
-                    .any(|d| clock_port(&d.name.name) && (shaped || d.init.is_some()))
-                {
+                if nd.declarators.iter().any(|d| {
+                    clock_port(&d.name.name)
+                        && (shaped
+                            || d.init.is_some()
+                            || !scalar_4state(Some(&nd.data_type), &d.dimensions))
+                }) {
                     return false;
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
-                if dd
-                    .declarators
-                    .iter()
-                    .any(|d| clock_port(&d.name.name) && d.init.is_some())
-                {
+                if dd.declarators.iter().any(|d| {
+                    clock_port(&d.name.name)
+                        && (d.init.is_some() || !scalar_4state(Some(&dd.data_type), &d.dimensions))
+                }) {
                     return false;
                 }
             }
