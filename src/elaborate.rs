@@ -40867,6 +40867,12 @@ fn prepare_module_items(
             ModuleItem::PropertyDeclaration(pd) => {
                 local_names.insert(pd.name.name.clone());
             }
+            // §14.3: so is a clocking block (`u.cb`): `@(cb)` and `cb.a` in
+            // the instance name its own block, not a same-named block of the
+            // parent.
+            ModuleItem::ClockingDeclaration(cd) => {
+                local_names.insert(cd.name.name.clone());
+            }
             ModuleItem::SequenceDeclaration(sd) => {
                 local_names.insert(sd.name.name.clone());
             }
