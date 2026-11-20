@@ -32855,28 +32855,6 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     r = r.resize_for_assign(w);
                 }
             }
-            // §11.8.2: a relational or equality operator's operands take REAL
-            // type from each other, and the real type propagates one operator
-            // into the integral side: `(UP - 2) > 1.0` compares -1.0. (An
-            // arithmetic operator's integral operand is converted from its
-            // self-determined value, which is what `l`/`r` already hold.)
-            if l.is_real != r.is_real
-                && matches!(
-                    op,
-                    BinaryOp::Eq
-                        | BinaryOp::Neq
-                        | BinaryOp::Lt
-                        | BinaryOp::Leq
-                        | BinaryOp::Gt
-                        | BinaryOp::Geq
-                )
-            {
-                if l.is_real {
-                    r = const_eval_in_real_context(right, params);
-                } else {
-                    l = const_eval_in_real_context(left, params);
-                }
-            }
             match op {
                 BinaryOp::Add => l.add(&r),
                 BinaryOp::Sub => l.sub(&r),
