@@ -39548,7 +39548,13 @@ fn unpacked_connection_elements(
     if sels.len() > dims.len() {
         return None;
     }
-    let konst = |e: &Expression| const_eval_i64_with_params(e, Some(params));
+    // Inside an inlined instance the actual's names, its bounds' parameters
+    // included, carry the instance prefix (`w.N`), which the scope's own
+    // parameter map does not key; the design-wide table does.
+    let konst = |e: &Expression| {
+        const_eval_i64_with_params(e, Some(params))
+            .or_else(|| const_eval_i64_with_params(e, Some(&elab.parameters)))
+    };
     // `l` to `r`, one literal index each.
     let range = |l: i64, r: i64| -> Option<Vec<Expression>> {
         let count = l.abs_diff(r).checked_add(1)?;
