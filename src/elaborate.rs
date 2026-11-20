@@ -26018,6 +26018,16 @@ thread_local! {
     /// the imported package parameter still resolves.
     static PARAM_FALLBACK_TLS: std::cell::RefCell<HashMap<String, Value>>
         = std::cell::RefCell::new(HashMap::default());
+    /// §26.3: the `import` items of each inlined definition, by definition
+    /// name: `(package, Some(item))` for `import p::x`, `(package, None)` for
+    /// `import p::*`. Read by `imported_array_element`.
+    static DEF_IMPORTS_TLS: std::cell::RefCell<HashMap<String, Rc<[(String, Option<String>)]>>>
+        = std::cell::RefCell::new(HashMap::default());
+    /// §26.3: the definitions whose items are being read, innermost last,
+    /// each with the address of its parent's own parameter map
+    /// (`ImportScope`).
+    static IMPORT_SCOPE_TLS: std::cell::RefCell<Vec<(String, usize)>>
+        = const { std::cell::RefCell::new(Vec::new()) };
     /// Typedef bodies for `const_eval_user_call`. That path builds an empty
     /// module shell, so a generate-if that calls a package function could not
     /// see `typedef unit_type_t [0:4] fmt_unit_types_t` and indexed the formal
@@ -26039,6 +26049,7 @@ thread_local! {
 /// previous one's until it installed its own (#739).
 pub(crate) fn reset_const_eval_snapshots() {
     PARAM_FALLBACK_TLS.with(|c| c.borrow_mut().clear());
+    DEF_IMPORTS_TLS.with(|c| c.borrow_mut().clear());
     TYPEDEF_TYPES_TLS.with(|c| *c.borrow_mut() = None);
     TYPEDEF_WIDTHS_TLS.with(|c| *c.borrow_mut() = None);
 }
@@ -26060,6 +26071,76 @@ fn set_typedef_widths_tls(widths: &TypedefTable) {
 /// Look up `name` in the global parameter fallback (package/$unit params).
 fn param_fallback_get(name: &str) -> Option<Value> {
     PARAM_FALLBACK_TLS.with(|c| c.borrow().get(name).cloned())
+}
+
+/// §26.3: an instance's items are read with its definition's imports in
+/// scope, from where its parent binds them until the instance is inlined.
+/// The parent evaluates the expressions it wrote for the instance (its
+/// `#(...)` overrides) against its own parameter map, `parent_params`; an
+/// expression evaluated against that map is answered by the parent's
+/// imports instead.
+struct ImportScope;
+
+impl ImportScope {
+    fn enter(def: &str, parent_params: &HashMap<String, Value>) -> Self {
+        let parent = parent_params as *const HashMap<String, Value> as usize;
+        IMPORT_SCOPE_TLS.with(|s| s.borrow_mut().push((def.to_string(), parent)));
+        ImportScope
+    }
+}
+
+impl Drop for ImportScope {
+    fn drop(&mut self) {
+        IMPORT_SCOPE_TLS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// §26.3: element `index` of the array `name` (`V`, or a row `V[0]` of it)
+/// that the definition being read imports, under its package's qualified key
+/// (`p::V[0][index]`). An explicit `import p::V` names the package;
+/// otherwise exactly one of the wildcard-imported packages must declare the
+/// element. The innermost definition that imports it decides, from the one
+/// that wrote the expression outward (`ImportScope`).
+fn imported_array_element<P: ParamLookup>(name: &str, index: i64, params: &P) -> Option<Value> {
+    let (root, rows) = name.split_at(name.find('[').unwrap_or(name.len()));
+    let read = |pkg: &str| {
+        let key = format!("{pkg}::{root}{rows}[{index}]");
+        params
+            .get(&key)
+            .cloned()
+            .or_else(|| param_fallback_get(&key))
+    };
+    let map = params
+        .as_hashmap_base()
+        .map(|m| m as *const HashMap<String, Value> as usize);
+    let scopes = IMPORT_SCOPE_TLS.with(|s| s.borrow().clone());
+    // Evaluated against an instance's parent map: the parent (the entry
+    // before it, or the top) wrote it.
+    let end = scopes
+        .iter()
+        .rposition(|(_, parent)| map == Some(*parent))
+        .unwrap_or(scopes.len());
+    for (def, _) in scopes[..end].iter().rev() {
+        let Some(imports) = DEF_IMPORTS_TLS.with(|c| c.borrow().get(def).cloned()) else {
+            continue;
+        };
+        if let Some((pkg, _)) = imports
+            .iter()
+            .find(|(_, item)| item.as_deref() == Some(root))
+        {
+            return read(pkg);
+        }
+        let mut found = imports
+            .iter()
+            .filter(|(_, item)| item.is_none())
+            .filter_map(|(pkg, _)| read(pkg));
+        if let Some(value) = found.next() {
+            return found.next().is_none().then_some(value);
+        }
+    }
+    None
 }
 
 /// Fold a bare alias into the global parameter fallback so an inlined
@@ -33998,6 +34079,30 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     {
                         return ev.clone();
                     }
+                    // §26.3: an element of a PACKAGE array parameter read in
+                    // an instance's scope (`p::V[k]`, or `V[k]` after
+                    // `import p::*` or `import p::V`). The scope's map need not
+                    // hold it: a scoped name is in the package/$unit snapshot,
+                    // as its scalars are for the Ident arm, and a bare name is
+                    // read under the package that this definition imports it
+                    // from. An array of the scope's own (any row of it) takes
+                    // precedence. `keys()` collects every row of the lookup,
+                    // so scan them only once the package does hold this
+                    // element.
+                    let root = &k[..k.find('[').unwrap_or(k.len())];
+                    if !params.contains_key(root)
+                        && let Some(i) = signed_index
+                        && let Some(ev) = if root.contains("::") || root.contains('.') {
+                            param_fallback_get(&format!("{k}[{i}]"))
+                        } else {
+                            imported_array_element(k, i, params)
+                        }
+                        && !params.keys().iter().any(|name| {
+                            name.strip_prefix(root).is_some_and(|rest| rest.starts_with('['))
+                        })
+                    {
+                        return ev;
+                    }
                     // §7.4.6: an invalid array index reads the element's
                     // default; it must not select an unrelated bare name.
                     if let Some(value) = array_params::default_value(k) {
@@ -37124,6 +37229,15 @@ fn inline_instantiations_inner(
                                 );
                                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                 for assign in assignments {
+                                    // §6.20.2: an unpacked-array parameter was
+                                    // registered element by element in the
+                                    // passes above. `eval_param_value` reads
+                                    // the data type alone, without the
+                                    // declarator's dimensions, so folding it
+                                    // here wrote the bare name as 0.
+                                    if !assign.dimensions.is_empty() {
+                                        continue;
+                                    }
                                     // Implicit-typed param: use the sized-
                                     // literal width from the initializer when
                                     // present, instead of defaulting to 32.
@@ -42650,10 +42764,23 @@ fn bind_inlined_import_params(
     def: Definition,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    let mut imports: Vec<(String, Option<String>)> = Vec::new();
     for item in def.items() {
         if let ModuleItem::ImportDeclaration(imp) = item {
             process_import(imp, elab, definitions, true)?;
+            for ii in &imp.items {
+                let entry = (ii.package.name.clone(), ii.item.as_ref().map(|i| i.name.clone()));
+                if !imports.contains(&entry) {
+                    imports.push(entry);
+                }
+            }
         }
+    }
+    if !imports.is_empty() {
+        DEF_IMPORTS_TLS.with(|c| {
+            c.borrow_mut()
+                .insert(def.name().to_string(), imports.into());
+        });
     }
     Ok(())
 }
@@ -43121,6 +43248,11 @@ fn inline_module_items(
                         .insert(sub_mod.name().to_string());
                     bind_inlined_import_params(elab, sub_mod, definitions)?;
                 }
+                // §26.3: until this instance is inlined (the recursive call
+                // below), its own imports answer a bare imported array
+                // element (`imported_array_element`), except in the
+                // overrides this scope evaluates for it.
+                let _import_scope = ImportScope::enter(sub_mod.name(), scoped_eval_params);
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -44209,13 +44341,33 @@ fn inline_module_items(
                                                 } else {
                                                     None
                                                 };
+                                                // §6.20.2, §7.2.1: the element type may be
+                                                // a typedef of this body (not bound yet),
+                                                // and the generate constructs read
+                                                // `Info[k].variant`: inline the instance's
+                                                // types, as the scalar arm below does, and
+                                                // register the element layout under the
+                                                // array's name.
+                                                let inlined = inline_instance_typedefs(data_type);
+                                                let elem_dt = inlined.as_ref().unwrap_or(data_type);
+                                                if let Some(fields) = packed_struct_field_layout(
+                                                    elem_dt,
+                                                    local_map,
+                                                    &elab_ro.typedefs,
+                                                    &elab_ro.typedef_types,
+                                                ) {
+                                                    tls_register_struct_layout(
+                                                        &assign.name.name,
+                                                        &fields,
+                                                    );
+                                                }
                                                 if let Some(values) = array_params::elements(
                                                     elab_ro,
                                                     &assign.name.name,
                                                     &assign.dimensions,
                                                     init,
                                                     packed,
-                                                    data_type,
+                                                    elem_dt,
                                                     local_map,
                                                     init_params,
                                                 ) {
@@ -45339,6 +45491,9 @@ fn inline_module_items(
                         } else {
                             None
                         };
+                        // §6.20.2: with this body's own types inlined, as
+                        // the constant fold above evaluated the elements.
+                        let inlined = inline_instance_typedefs(data_type);
                         if array_params::register(
                             elab,
                             &inst_prefix,
@@ -45346,7 +45501,7 @@ fn inline_module_items(
                             &assign.dimensions,
                             init,
                             packed,
-                            data_type,
+                            inlined.as_ref().unwrap_or(data_type),
                             &snapshot,
                             if override_expr.is_some() {
                                 scoped_eval_params
