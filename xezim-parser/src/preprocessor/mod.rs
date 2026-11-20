@@ -73,6 +73,7 @@ pub struct Preprocessor {
     /// §22.9: pull direction of the ACTIVE `unconnected_drive region
     /// (Some(true)=pull1, Some(false)=pull0), None outside a region.
     unconnected_pull: Option<bool>,
+    default_net_pull: Option<bool>,
     /// Macro-expansion-time strict errors (bad argument counts). Interior
     /// mutability because `expand_macros*` run behind `&self`; drained into
     /// `errors` after each line is expanded.
@@ -344,6 +345,7 @@ impl Preprocessor {
             errors: Vec::new(),
             design_element_depth: 0,
             unconnected_pull: None,
+            default_net_pull: None,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
             undefined_seen: std::cell::RefCell::new(Vec::new()),
             paste_separated: std::cell::Cell::new(false),
@@ -1180,6 +1182,31 @@ impl Preprocessor {
                 pos.push((ln, 0));
                 continue;
             }
+            // §22.2: directives with a defined end can be followed by another
+            // directive or a text macro on the same physical line. Leave the
+            // macro tail intact, including nested backticks in its arguments.
+            let mut line = line;
+            let mut base_col = 0;
+            while let Some(n) = line.trim_start().strip_prefix('`')
+                .and_then(|rest| rest.find('`'))
+            {
+                let i = line.len() - line.trim_start().len() + n + 1;
+                let head = line[..i].trim();
+                let finished = matches!(head, "`resetall" | "`celldefine" | "`endcelldefine")
+                    || head.strip_prefix("`timescale").and_then(|t| t.split_once('/'))
+                        .is_some_and(|(u,p)| Self::parse_time_literal(u).is_some() && Self::parse_time_literal(p).is_some())
+                    || head.strip_prefix("`include").is_some_and(|t| {
+                        let t = t.trim(); t.starts_with('"') && t.ends_with('"') && t.len() > 1
+                    })
+                    || head.strip_prefix("`default_nettype").is_some_and(|t| t.split_whitespace().count() == 1);
+                if !finished { break; }
+                out.push_str(&line[..i]);
+                out.push('\n');
+                pos.push((ln, base_col));
+                base_col += line[..i].chars().count() as u32;
+                line = &line[i..];
+            }
+            let trimmed = fast_trim_start(line);
             // A line STARTING with a conditional directive may still carry
             // trailing content (`\`endif initial ...`; `\`endif junk`) —
             // §22.6 makes the directive its own token, so the tail must be
@@ -1189,10 +1216,10 @@ impl Preprocessor {
             if (trimmed.starts_with('`') && !starts_cond) || !line.contains('`') {
                 out.push_str(line);
                 out.push('\n');
-                pos.push((ln, 0));
+                pos.push((ln, base_col));
                 continue;
             }
-            let col_of = |byte: usize| line[..byte].chars().count() as u32;
+            let col_of = |byte: usize| base_col + line[..byte].chars().count() as u32;
             let b = line.as_bytes();
             let mut i = 0usize;
             let mut seg = 0usize;
@@ -1267,6 +1294,7 @@ impl Preprocessor {
         let saved_col_off = self.cur_col_off;
         // Text re-resolved after a macro expansion stays at the invocation:
         // every line it emits maps there, and the cursor does not move.
+        let starts_file = matches!(ctx, Ctx::File { included_from: None });
         let fixed = match ctx {
             Ctx::Macro(o) => Some(o),
             Ctx::File { included_from } => {
@@ -1293,6 +1321,10 @@ impl Preprocessor {
         let mut last_src: i64 = -1;
         // Origin for lines emitted on behalf of the current source line.
         let mut here = fixed.unwrap_or(LineOrigin::plain(self.cur_file_idx, 1, 0));
+        if starts_file && let Some(pull) = self.default_net_pull {
+            output.push_str(if pull { "`default_nettype tri1\n" } else { "`default_nettype tri0\n" });
+            sink.fill(&output, here);
+        }
         let mut joined: Vec<usize> = Vec::new();
 
         while let Some((li, line)) = lines.next() {
@@ -1632,6 +1664,19 @@ impl Preprocessor {
                 if rest.starts_with("none") {
                     crate::set_default_nettype_none_seen(true);
                 }
+                let pull = match rest.split_whitespace().next() {
+                    Some("tri0") => Some(false),
+                    Some("tri1") => Some(true),
+                    _ => None,
+                };
+                if pull.is_some() || self.default_net_pull.is_some() {
+                    output.push_str(match pull {
+                        Some(true) => "`default_nettype tri1",
+                        Some(false) => "`default_nettype tri0",
+                        None => "`default_nettype wire",
+                    });
+                }
+                self.default_net_pull = pull;
                 output.push('\n');
                 continue;
             }
@@ -1818,6 +1863,9 @@ impl Preprocessor {
                 // §22.3: `\`resetall` resets all compiler directives to their
                 // defaults, including clearing the active `\`timescale`, so a
                 // module declared after it has no explicit source-level timescale.
+                if self.default_net_pull.take().is_some() {
+                    output.push_str("`default_nettype wire");
+                }
                 self.timescale = None;
                 output.push('\n');
                 continue;

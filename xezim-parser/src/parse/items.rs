@@ -1463,6 +1463,18 @@ impl Parser {
                         port.direction = prev.direction;
                     }
                 }
+                // §23.2.2.3: a default pull applies to inferred net ports
+                // after inheritance. Explicit net kinds and variables retain
+                // their declaration.
+                if port.net_type.is_none() && !port.var_kw
+                    && !matches!(port.direction, Some(PortDirection::Ref))
+                    && !matches!(&port.data_type, Some(DataType::Interface { .. }))
+                    && (!matches!(port.direction, Some(PortDirection::Output))
+                        || matches!(&port.data_type, None | Some(DataType::Implicit { .. })))
+                {
+                    let n = self.default_net_pulls.partition_point(|(pos, _)| *pos <= port.span.start);
+                    port.net_type = n.checked_sub(1).and_then(|i| self.default_net_pulls[i].1);
+                }
                 // §23.2.2.4: only an input port takes a default value; an
                 // inout is a net.
                 if crate::strict_checks()
