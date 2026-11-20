@@ -19563,6 +19563,14 @@ fn create_implicit_nets(
 /// dotted reference (`testbench.chip_inst.dqs`) is a HIERARCHICAL path, and its
 /// first segment names an instance, not an undeclared net. Descending created a
 /// bogus `<prefix>.testbench` net that then drove the real one to X.
+///
+/// §6.10 makes a net only of a name "not declared previously in the scope
+/// ... or in any scope whose declarations can be directly referenced from
+/// the scope", so a name the binder found through an import or `$unit`
+/// (`Bound::NO_TARGET`: a wildcard-imported package enum label in
+/// `.i(op == SYS_CSR)`) is no candidate. As one it joined the inlined
+/// module's local names, so every use of it in the module took the instance
+/// path (`m.l.SYS_CSR`), which names nothing, and read x.
 fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
@@ -19573,7 +19581,7 @@ fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
                 Some(plain) => unit_storage::declares(plain),
                 None => hier.bound.as_decl().is_none() && unit_storage::declares(name),
             };
-            if unit {
+            if unit || hier.bound == Bound::NO_TARGET {
                 return;
             }
             out.push(hier.path[0].name.name.clone());
@@ -37864,6 +37872,52 @@ fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Ve
     )
 }
 
+/// §6.19: the labels of every enum type a definition declares something
+/// with in its own scope: a header or body parameter, an ANSI port, a port,
+/// net, data or nettype declaration, or a typedef (struct members' enums
+/// too, via `for_each_enum_member`). Each label is a constant of the scope
+/// declaring the type, as the scope tree records them. A generate region
+/// (§27.3) opens no scope, so its declarations count; a generate block's
+/// (§27.5) are its own, named only from inside it (or by a path through
+/// it), so a label declared there leaves the definition's same-named
+/// implicit net (§6.10) in place.
+fn visit_declared_enum_members(
+    params: &[ParameterDeclaration],
+    ports: &PortList,
+    items: &[ModuleItem],
+    f: &mut dyn FnMut(&Identifier),
+) {
+    use crate::scope_tree::for_each_enum_member;
+    fn param(p: &ParameterDeclaration, f: &mut dyn FnMut(&Identifier)) {
+        if let ParameterKind::Data { data_type, .. } = &p.kind {
+            for_each_enum_member(data_type, f);
+        }
+    }
+    fn body(items: &[ModuleItem], f: &mut dyn FnMut(&Identifier)) {
+        for item in items {
+            match item {
+                ModuleItem::TypedefDeclaration(t) => for_each_enum_member(&t.data_type, f),
+                ModuleItem::DataDeclaration(d) => for_each_enum_member(&d.data_type, f),
+                ModuleItem::NetDeclaration(d) => for_each_enum_member(&d.data_type, f),
+                ModuleItem::PortDeclaration(d) => for_each_enum_member(&d.data_type, f),
+                ModuleItem::NettypeDeclaration(n) => for_each_enum_member(&n.data_type, f),
+                ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                    param(p, f)
+                }
+                ModuleItem::GenerateRegion(g) => body(&g.items, f),
+                _ => {}
+            }
+        }
+    }
+    params.iter().for_each(|p| param(p, f));
+    if let PortList::Ansi(ps) = ports {
+        for dt in ps.iter().filter_map(|p| p.data_type.as_ref()) {
+            for_each_enum_member(dt, f);
+        }
+    }
+    body(items, f);
+}
+
 /// The declarations a generate rename applies to: data, nets, parameters,
 /// instances, subroutines, properties, sequences and typedefs (§23.9, §27.5:
 /// a generate block's declarations belong to its scope, so `g_a.look` and
@@ -42800,6 +42854,22 @@ fn inline_module_items(
                                 }
                             }
                         }
+                        // §6.19: an enum's labels are constants of the scope
+                        // that declares its type, so `.din(st == STREAM)`
+                        // with a module-local `typedef enum {..., STREAM}`
+                        // names a declared constant, and §6.10 does not
+                        // apply. The labels are registered when this
+                        // module's items are, after this pass, so they need
+                        // naming here as the parameters above do. Only the
+                        // module scope's: the actuals checked here are its
+                        // own (generate-region instances included), and a
+                        // generate block's label is not visible from them.
+                        visit_declared_enum_members(
+                            sub_mod.params(),
+                            sub_mod.ports(),
+                            sub_mod.items(),
+                            &mut |n| v.push(n.name.clone()),
+                        );
                         v.into_iter().collect()
                     };
                     let mut cands: Vec<String> = Vec::new();
