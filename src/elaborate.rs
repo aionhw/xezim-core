@@ -33500,6 +33500,9 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                 (else_expr, then_expr)
             };
             let v = eval_const_expr_val_inner(taken, params, types);
+            if v.is_real && c.is_nonzero().is_some() {
+                return v;
+            }
             let other_real = const_context::infer(other, params, types).real;
             let v = if !v.is_real && other_real {
                 const_eval_in_real_context(taken, params)
