@@ -31861,6 +31861,68 @@ fn has_unpacked_struct_type(elab: &ElaboratedModule) -> bool {
     })
 }
 
+/// §10.3.3: an inertial delay on a whole unpacked structure compares the
+/// whole value. Splitting the delay across leaves lets an unchanged leaf's
+/// earlier event survive when a sibling changes before delivery.
+fn expand_struct_driver(
+    elab: &mut ElaboratedModule,
+    ca: &ContinuousAssignment,
+    base: &str,
+    su: &crate::ast::types::StructUnionType,
+    out: &mut Vec<ContinuousAssignment>,
+) {
+    let start = out.len();
+    emit_struct_member_assigns(
+        &make_ident_expr(base), &ca.rhs, su, ca, &elab.typedef_types,
+        &elab.typedef_unpacked_dims, &elab.parameters, out, 0,
+    );
+    if ca.delay == 0 || out.len() - start < 2 || ca.delay_fall.is_some() || ca.delay_off.is_some() {
+        return;
+    }
+    let defaults: Option<Vec<_>> = out[start..].iter().map(|leaf| {
+        let name = ident_flat_name(&leaf.lhs).or_else(|| scope_indexed_flat_name(&leaf.lhs, elab))?;
+        if let Some(sig) = elab.signals.get(&name) {
+            return (!sig.is_real && sig.width > 0).then(|| sig.value.resize(sig.width));
+        }
+        let base = name.rsplit_once('[')?.0;
+        let width = elab.arrays.get(base)?.2;
+        let dt = elab.var_decl_types.get(base)?;
+        let value = default_value_for_type_resolved(dt, width, &elab.typedef_types);
+        (!value.is_real && width > 0).then_some(value)
+    }).collect();
+    let Some(defaults) = defaults else { return; };
+    let initial = Value::concat(&defaults);
+    let width = initial.width;
+    let span = ca.lhs.span;
+    let mut seq = start;
+    let stage = loop {
+        let name = format!("{base}$structdelay{seq}");
+        if !elab.signals.contains_key(&name) { break name; }
+        seq += 1;
+    };
+    elab.signals.insert(stage.clone(), Signal {name:stage.clone().into(), width,
+        is_const:false, is_signed:false, is_real:false, type_name:None, direction:None, value:initial});
+    let mut parts = Vec::with_capacity(defaults.len());
+    let mut hi = width;
+    for (leaf, initial) in out[start..].iter_mut().zip(defaults) {
+        let lo = hi - initial.width;
+        let slice = Expression::new(ExprKind::RangeSelect {
+            expr: Box::new(make_ident_expr(&stage)), kind: crate::ast::expr::RangeKind::Constant,
+            left: Box::new(int_literal(i64::from(hi - 1), span)), right: Box::new(int_literal(i64::from(lo), span)),
+        }, span);
+        hi = lo;
+        let rhs = std::mem::replace(&mut leaf.rhs, slice);
+        parts.push(make_syscall("$__xz_size_cast", vec![int_literal(i64::from(initial.width), span), rhs], span));
+        leaf.delay = 0;
+        leaf.origin = None;
+        leaf.delay_select = None;
+    }
+    let mut delayed = ca.clone();
+    delayed.lhs = make_ident_expr(&stage);
+    delayed.rhs = Expression::new(ExprKind::Concatenation(parts), span);
+    out.push(delayed);
+}
+
 pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
     if !has_unpacked_struct_type(elab) {
         return;
@@ -31899,17 +31961,7 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
             });
         match members {
             Some((base, su)) => {
-                emit_struct_member_assigns(
-                    &make_ident_expr(&base),
-                    &ca.rhs,
-                    &su,
-                    &ca,
-                    &elab.typedef_types,
-                    &elab.typedef_unpacked_dims,
-                    &elab.parameters,
-                    &mut expanded,
-                    0,
-                );
+                expand_struct_driver(elab, &ca, &base, &su, &mut expanded);
             }
             None => expanded.push(ca),
         }
@@ -51992,17 +52044,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     for ca in std::mem::take(&mut elab.continuous_assigns) {
         let target = struct_target(elab, &ca.lhs);
         match target {
-            Some((base, su)) => emit_struct_member_assigns(
-                &make_ident_expr(&base),
-                &ca.rhs,
-                &su,
-                &ca,
-                &elab.typedef_types,
-                &elab.typedef_unpacked_dims,
-                &elab.parameters,
-                &mut out,
-                0,
-            ),
+            Some((base, su)) => expand_struct_driver(elab, &ca, &base, &su, &mut out),
             None => out.push(ca),
         }
     }
@@ -53274,7 +53316,7 @@ pub fn is_delay_stage_net(name: &str) -> bool {
         tail.strip_prefix(p)
             .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
     };
-    tail == "netdrv" || numbered("netbit") || numbered("drv")
+    tail == "netdrv" || numbered("netbit") || numbered("drv") || numbered("structdelay")
 }
 
 /// §6.7.1 / §10.3.3 / §28.16: apply each recorded NET delay (`wire #2 w;`)
