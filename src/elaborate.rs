@@ -24069,7 +24069,16 @@ fn default_value_for_type_resolved(
     width: u32,
     typedef_types: &HashMap<String, DataType>,
 ) -> Value {
-    default_value_for_type(resolve_typedef_chain(dt, typedef_types), width)
+    let resolved = resolve_typedef_chain(dt, typedef_types);
+    // §7.2.1, §6.8: a packed struct whose members are all 2-state starts at
+    // 0, also when a member reaches its type through a typedef
+    // (`s_t [1:0] e;`), which `default_value_for_type` does not resolve.
+    if matches!(resolved, DataType::Struct(su) if su.packed)
+        && is_type_two_state_resolved(resolved, typedef_types)
+    {
+        return Value::zero(width);
+    }
+    default_value_for_type(resolved, width)
 }
 
 fn default_value_for_type(dt: &DataType, width: u32) -> Value {
