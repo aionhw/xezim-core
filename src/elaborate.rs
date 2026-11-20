@@ -63023,6 +63023,59 @@ mod prepared_callable_ownership_tests {
         }
     }
 
+    /// §20.8.1, §11.7, §20.6.2: a value system function of a parameter folds
+    /// per instance; a `$signed`/`$unsigned` whose reinterpretation at the
+    /// operand's own width differs from the plain value is not folded; a
+    /// query, with everything inside it, is left to the run time.
+    #[test]
+    fn dimension_fold_value_system_functions() {
+        let original = module_items(
+            "module leaf #(parameter logic [7:0] P = 8'hff, parameter int N = 1);
+               task t();
+                 logic [$clog2(N)-1:0] a;
+                 logic [($signed(P) < 0 ? 8 : 4)-1:0] b;
+                 logic [$unsigned(P)-1:0] c;
+                 logic [$bits($signed(N))-1:0] d;
+                 logic [$countones($signed(P))-1:0] e;
+                 logic [($signed(N) > 0 ? 6 : 2)-1:0] f;
+               endtask
+             endmodule",
+        );
+        for n in [256u64, 64] {
+            let mut prepared = original.clone();
+            literalize_stmt_decl_dims(
+                &mut prepared,
+                &HashMap::from_iter([
+                    ("P".into(), Value::from_u64(0xff, 8)),
+                    ("N".into(), Value::from_u64(n, 32)),
+                ]),
+            );
+            let body = callable_bodies(&prepared).remove(0);
+            let left = |index: usize| {
+                let StatementKind::VarDecl { data_type, .. } = &body[index].kind else {
+                    panic!("local declaration expected");
+                };
+                let DataType::IntegerVector { dimensions, .. } = data_type else {
+                    panic!("vector type expected");
+                };
+                let PackedDimension::Range { left, .. } = &dimensions[0] else {
+                    panic!("packed range expected");
+                };
+                left.clone()
+            };
+            let folded = |index: usize| match &left(index).kind {
+                ExprKind::Number(_) => const_eval_i64_with_params(&left(index), None),
+                _ => None,
+            };
+            assert_eq!(folded(0), Some(n.trailing_zeros() as i64 - 1));
+            assert_eq!(folded(1), None, "$signed of 8'hff must not fold as 255");
+            assert_eq!(folded(2), Some(254));
+            assert_eq!(folded(3), None, "a query must stay for the run time");
+            assert_eq!(folded(4), None, "$countones($signed(8'hff)) must not count 64 bits");
+            assert_eq!(folded(5), Some(5));
+        }
+    }
+
     /// §6.20.2/§6.20.4: a shared body containing declarations still folds
     /// instance widths independently and respects a block's shadowing binding.
     #[test]
