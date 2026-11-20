@@ -72,6 +72,8 @@ module top;
   leaf u(clk, data);
 endmodule"#,
     );
+    assert!(m.sampled_input_ports.contains("u.data"));
+    assert!(!m.sampled_input_ports.contains("u.clk"));
     assert!(m.input_port_actuals.iter().all(|port| port.formal() != "u.data"));
     assert!(m.input_port_actuals.iter().any(|port| port.formal() == "u.clk"));
 }

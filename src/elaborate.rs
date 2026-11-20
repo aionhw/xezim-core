@@ -4570,6 +4570,10 @@ pub struct ElaboratedModule {
     /// longer records anywhere else.
     #[serde(default)]
     pub input_port_actuals: Vec<InputPortActual>,
+    /// §16.5.1: these input formals must keep their own prehistory when the
+    /// simulator coalesces whole-net copies after elaboration.
+    #[serde(default)]
+    pub sampled_input_ports: HashSet<String>,
     /// Input ports whose net was never built (see [`set_port_elision`]): the
     /// [`elided_port_hash`] of each `<inst>.<port>` flat name, sorted. The
     /// simulator checks a failed name lookup against it, so a reference the
@@ -4935,6 +4939,7 @@ impl ElaboratedModule {
             port_aliases: HashMap::default(),
             interface_port_aliases: HashMap::default(),
             input_port_actuals: Vec::new(),
+            sampled_input_ports: HashSet::default(),
             elided_port_hashes: Vec::new(),
             elided_port_count: 0,
             elided_port_leaves: HashSet::default(),
@@ -48135,6 +48140,9 @@ fn inline_module_items(
                 // the two disagree — those resolve to `<inst>.<port>` instead,
                 // which is registered with the FORMAL's width and element
                 // stride and is driven by the connection assign pushed above.
+                for port in &prepared_sub.sampled_ports {
+                    elab.sampled_input_ports.insert(cat2(&inst_prefix, port));
+                }
                 let mut rewrite_port_map: HashMap<String, Expression> = port_map
                     .iter()
                     .filter(|(name, _)| {

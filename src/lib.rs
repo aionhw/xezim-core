@@ -265,7 +265,8 @@ pub use value::Value;
 ///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
 /// Driver contributions, net-cell resolution, delayed structures, interface-array
 /// bounds, sampled input nets and fill-literal state are preserved in this format.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x55";
+/// \x56 retains sampled input-formal identities through simulator aliasing (§16.5.1).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x56";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
