@@ -263,9 +263,10 @@ pub use value::Value;
 ///         module's time unit, the declared types of packed-array and structure ports, and
 ///         the default actual arguments of named sequences and properties kept in the
 ///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
-/// Preserve observable driver contributions, folded real comparison semantics,
-/// and the identity of input nets used by sampled-value functions.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x53";
+/// The current format also retains driver contributions, per-cell net resolution,
+/// whole-structure delay stages, interface-array bounds and sampled input nets.
+/// Folded real comparisons use the integral operands' self-determined widths.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x54";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
