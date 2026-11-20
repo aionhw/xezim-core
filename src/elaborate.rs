@@ -3233,6 +3233,7 @@ struct ArraySlot<'a> {
     /// The instance scope of the assignment (`""` for the top), whose
     /// parameters a `name:` index key names.
     scope: &'a str,
+    default_types: Option<&'a ElaboratedModule>,
 }
 
 #[derive(Debug, Clone)]

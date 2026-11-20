@@ -522,6 +522,7 @@ pub(super) fn emit_struct_member_assigns(
     typedef_types: &HashMap<String, DataType>,
     typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
     params: &HashMap<String, Value>,
+    default_types: Option<&ElaboratedModule>,
     out: &mut Vec<ContinuousAssignment>,
     depth: u32,
 ) {
@@ -566,6 +567,7 @@ pub(super) fn emit_struct_member_assigns(
                 typedef_types,
                 params,
                 ca.origin.as_ref().map_or("", |(_, scope)| scope),
+                default_types,
                 rhs.span,
             ),
             _ => None,
@@ -606,6 +608,7 @@ pub(super) fn emit_struct_member_assigns(
             typedef_types,
             typedef_unpacked_dims,
             params,
+            default_types,
             out,
             depth,
         );
@@ -632,6 +635,7 @@ pub(super) fn emit_member_elem_assigns(
     typedef_types: &HashMap<String, DataType>,
     typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
     params: &HashMap<String, Value>,
+    default_types: Option<&ElaboratedModule>,
     out: &mut Vec<ContinuousAssignment>,
     depth: u32,
 ) {
@@ -647,6 +651,7 @@ pub(super) fn emit_member_elem_assigns(
                     typedef_types,
                     typedef_unpacked_dims,
                     params,
+                    default_types,
                     out,
                     depth + 1,
                 );
@@ -685,6 +690,7 @@ pub(super) fn emit_member_elem_assigns(
             typedef_types,
             params,
             scope: ca.origin.as_ref().map_or("", |(_, scope)| scope),
+            default_types,
         };
         if elem
             .bind(&rhs, &lists, &mut Vec::new(), &mut leaves, outer_types)
@@ -956,6 +962,7 @@ impl PatternKeys {
     /// reach its members and elements; a pattern given as the default is the
     /// aggregate's own value. None when nothing covers it, or when a type
     /// key cannot be matched here.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn value_for(
         &self,
         dt: &DataType,
@@ -964,6 +971,7 @@ impl PatternKeys {
         typedef_types: &HashMap<String, DataType>,
         params: &dyn ParamLookup,
         span: Span,
+        matches_default: impl FnOnce(&Expression) -> bool,
     ) -> Option<(Expression, Vec<(DataType, Expression)>)> {
         let combined = self.combined_types(outer_types);
         let aggregate = is_array || pattern_slot_is_aggregate(dt, typedef_types)?;
@@ -983,6 +991,14 @@ impl PatternKeys {
         }
         if !aggregate {
             return self.default.clone().map(|d| (d, Vec::new()));
+        }
+        // §10.9.1/§10.9.2: a matching self-determined type takes the whole
+        // default. Keep the existing recursive binding for type-key patterns.
+        if let Some(d) = &self.default
+            && combined.is_empty()
+            && matches_default(d)
+        {
+            return Some((d.clone(), Vec::new()));
         }
         if let Some(d) = &self.default
             && matches!(
@@ -1073,6 +1089,16 @@ pub(super) fn pattern_type_signature(
     typedef_types: &HashMap<String, DataType>,
     params: &dyn ParamLookup,
 ) -> Option<String> {
+    pattern_type_signature_with(dt, params, |name, _| {
+        lookup_scoped_type(name, typedef_types)
+    })
+}
+
+fn pattern_type_signature_with<'a>(
+    dt: &'a DataType,
+    params: &dyn ParamLookup,
+    mut resolve: impl FnMut(&TypeName, &[Expression]) -> Option<&'a DataType>,
+) -> Option<String> {
     let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
         match d {
             PackedDimension::Range { left, right, .. } => Some((
@@ -1087,13 +1113,16 @@ pub(super) fn pattern_type_signature(
     for _ in 0..64 {
         match cur {
             DataType::TypeReference {
-                name, dimensions, ..
+                name,
+                dimensions,
+                type_args,
+                ..
             } => {
                 for d in dimensions {
                     let (l, r) = bounds(d)?;
                     out.push_str(&format!("[{l}:{r}]"));
                 }
-                cur = lookup_scoped_type(name, typedef_types)?;
+                cur = resolve(name, type_args)?;
             }
             DataType::IntegerVector {
                 kind,
@@ -1191,6 +1220,137 @@ fn vector_type_signature(
     Some(out)
 }
 
+/// §6.22.1(b), (d), (f), (h): follow typedefs to the same declaration for
+/// nominal types, and compare both bounds of every fixed array dimension.
+pub(super) fn continuous_default_matches(
+    elab: &ElaboratedModule,
+    scope: &str,
+    rhs: &Expression,
+    dt: &DataType,
+    dims: &[UnpackedDimension],
+) -> Option<()> {
+    CONST_FN_UNIT_TYPES
+        .with_borrow(|unit| continuous_default_match_in(elab, unit.as_ref(), scope, rhs, dt, dims))
+}
+
+fn continuous_default_match_in(
+    elab: &ElaboratedModule,
+    unit: Option<&HashMap<String, DataType>>,
+    scope: &str,
+    rhs: &Expression,
+    dt: &DataType,
+    dims: &[UnpackedDimension],
+) -> Option<()> {
+    let (types, params) = (&elab.typedef_types, &elab.parameters);
+    let no_dims = &[][..];
+    let mut rhs = rhs;
+    while let ExprKind::Paren(inner) = &rhs.kind {
+        rhs = inner;
+    }
+    let (rhs_type, rhs_dims) = match &rhs.kind {
+        ExprKind::TypedPattern { ty, .. } => (ty.as_ref(), no_dims),
+        ExprKind::SystemCall { name, args }
+            if matches!(name.as_str(), "$__xz_named_cast" | "$__xz_type_cast")
+                && let [target, _] = args.as_slice() =>
+        {
+            let cast_type = match &target.kind {
+                ExprKind::TypeLiteral(ty) => ty.as_ref(),
+                ExprKind::Ident(h) if h.bound.has_late_type_declaration() => return None,
+                ExprKind::Ident(h)
+                    if let Some(name) = simple_lhs_name(target)
+                        && !is_param_in_scope(&name, scope, params) =>
+                {
+                    let key = crate::pkg_scope::external_type_key(h.bound).or_else(|| {
+                        (h.bound.as_decl().is_some() || name.contains(['.', ':']))
+                            .then(|| lookup_typedef_key_in_scope(&name, scope, types))?
+                    })?;
+                    continuous_default_typedef(elab, unit, &key, false)?
+                }
+                _ => {
+                    let DataType::TypeReference { name, .. } =
+                        scoped_type_key_of_expr(target, types, params)?
+                    else {
+                        return None;
+                    };
+                    continuous_default_typedef(elab, unit, &name.qualified(), false)?
+                }
+            };
+            (cast_type, no_dims)
+        }
+        ExprKind::Ident(h) if h.root.is_none() => {
+            let name = ident_flat_name(rhs)?;
+            let ty = elab
+                .var_decl_types
+                .get(&name)
+                .or_else(|| elab.param_decl_types.get(&name))?;
+            let shape = elab.unpacked_decl_dims.get(&name);
+            if elab.dynamic_arrays.contains(&name)
+                || elab.associative_arrays.contains_key(&name)
+                || elab.coll_shapes.contains_key(&name)
+                || (shape.is_none() && is_unpacked_array_name(elab, &name))
+            {
+                return None;
+            }
+            (ty, shape.map_or(no_dims, Vec::as_slice))
+        }
+        _ => return None,
+    };
+    if dims.is_empty() != rhs_dims.is_empty()
+        || (!dims.is_empty() && declared_unpacked_dims(dims, params)?.as_slice() != rhs_dims)
+    {
+        return None;
+    }
+    let signature = |dt, has_array_shape| {
+        let mut resolved = dt;
+        let signature = pattern_type_signature_with(dt, params, |name, type_args| {
+            if name.bound.has_late_type_declaration()
+                || !type_args.is_empty()
+                || name.scopes.iter().any(|s| !s.type_args.is_empty())
+            {
+                return None;
+            }
+            let key = match crate::pkg_scope::external_type_key(name.bound) {
+                Some(key) => key,
+                None if name.has_scope()
+                    || name.bound.as_decl().is_some()
+                    || name.name.name.contains(['.', ':']) =>
+                {
+                    name.qualified()
+                }
+                None => return None,
+            };
+            resolved = continuous_default_typedef(elab, unit, &key, has_array_shape)?;
+            Some(resolved)
+        })?;
+        // A source offset alone cannot identify a declaration across files.
+        let nominal = matches!(resolved, DataType::Struct(_) | DataType::Enum(_))
+            .then(|| std::ptr::from_ref(resolved));
+        Some((signature, nominal))
+    };
+    (signature(dt, false)? == signature(rhs_type, !rhs_dims.is_empty())?).then_some(())
+}
+
+fn continuous_default_typedef<'a>(
+    elab: &'a ElaboratedModule,
+    unit: Option<&'a HashMap<String, DataType>>,
+    key: &str,
+    has_array_shape: bool,
+) -> Option<&'a DataType> {
+    let unit_name = crate::sv_parser::strip_unit_scope_name(key);
+    if !has_array_shape
+        && elab
+            .typedef_unpacked_dims
+            .get(unit_name.unwrap_or(key))
+            .is_some_and(|d| !d.is_empty())
+    {
+        return None;
+    }
+    match unit_name {
+        Some(name) => unit?.get(name),
+        None => elab.typedef_types.get(key),
+    }
+}
+
 /// §10.9.2: the item of each member of `flat` (name, type, unpacked
 /// dimensions, in declaration order) in the structure pattern `items`: by
 /// position, where a replication sets exactly the members; by member name;
@@ -1203,6 +1363,7 @@ fn bind_struct_pattern(
     typedef_types: &HashMap<String, DataType>,
     params: &HashMap<String, Value>,
     scope: &str,
+    default_types: Option<&ElaboratedModule>,
     span: Span,
 ) -> Option<Vec<(Expression, Vec<(DataType, Expression)>)>> {
     if let Some(ordered) = ordered_pattern_items(items, params) {
@@ -1225,7 +1386,19 @@ fn bind_struct_pattern(
     flat.iter()
         .map(|(m, mdt, mdims)| match by_name.get(m.as_str()) {
             Some(v) => Some(((*v).clone(), Vec::new())),
-            None => keys.value_for(mdt, !mdims.is_empty(), &[], typedef_types, params, span),
+            None => keys.value_for(
+                mdt,
+                !mdims.is_empty(),
+                &[],
+                typedef_types,
+                params,
+                span,
+                |d| {
+                    default_types.is_some_and(|elab| {
+                        continuous_default_matches(elab, scope, d, mdt, mdims).is_some()
+                    })
+                },
+            ),
         })
         .collect()
 }

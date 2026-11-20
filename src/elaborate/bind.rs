@@ -614,6 +614,18 @@ impl<'a> Binder<'a> {
         outcome.bound()
     }
 
+    fn note_type_declaration_order(&self, bound: Bound, site: Span) -> Bound {
+        if let Some(id) = bound.as_decl() {
+            let decl = &self.tree.decls[id.0 as usize];
+            if matches!(decl.kind, DeclKind::Typedef | DeclKind::TypeParam)
+                && decl.span.start > site.start
+            {
+                return bound.with_late_type_declaration();
+            }
+        }
+        bound
+    }
+
     fn head(&mut self, h: &mut HierarchicalIdentifier) {
         let Some(first) = h.path.first() else { return };
         // `NO_TARGET` here is the parser's `$unit::f(...)` (§3.12.1) or a
@@ -623,7 +635,7 @@ impl<'a> Binder<'a> {
         } else {
             self.resolve(&first.name.name, h.path.len() == 1)
         };
-        h.bound = match outcome {
+        let bound = match outcome {
             Outcome::Decl(d) => {
                 let decl = &self.tree.decls[d.0 as usize];
                 match decl.kind == DeclKind::ImplicitNet && decl.scope != self.tree.root {
@@ -633,6 +645,9 @@ impl<'a> Binder<'a> {
             }
             _ => outcome.bound(),
         };
+        if h.bound.external_type_index().is_none() {
+            h.bound = self.note_type_declaration_order(bound, first.name.span);
+        }
         if self.mentions.is_some() {
             let name = first.name.name.clone();
             self.note(h.span, &name, outcome);
@@ -1406,7 +1421,10 @@ impl<'a> Binder<'a> {
                 ..
             } => {
                 if name.scopes.is_empty() {
-                    name.bound = self.ident(&name.name);
+                    let bound = self.ident(&name.name);
+                    if name.bound.external_type_index().is_none() {
+                        name.bound = self.note_type_declaration_order(bound, name.name.span);
+                    }
                 }
                 for s in &mut name.scopes {
                     s.type_args.iter_mut().for_each(|a| self.expr(a));

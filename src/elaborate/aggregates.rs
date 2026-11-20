@@ -116,6 +116,13 @@ impl ArraySlot<'_> {
                     self.typedef_types,
                     self.params,
                     span,
+                    |d| {
+                        !subarray
+                            && self.default_types.is_some_and(|elab| {
+                                continuous_default_matches(elab, self.scope, d, self.elem_dt, &[])
+                                    .is_some()
+                            })
+                    },
                 ),
             })
             .collect()
@@ -266,6 +273,7 @@ pub(super) fn expand_struct_driver(
         &elab.typedef_types,
         &elab.typedef_unpacked_dims,
         &elab.parameters,
+        Some(&*elab),
         out,
         0,
     );

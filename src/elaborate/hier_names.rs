@@ -378,7 +378,7 @@ fn scope_index_selects_scopes(expr: &Expression, elab: &ElaboratedModule) -> boo
 
 /// Is `name` an unpacked array in the elaborated tables? Such a name
 /// selects ELEMENTS (§7.4.2), not scope instances (§27.6).
-fn is_unpacked_array_name(elab: &ElaboratedModule, name: &str) -> bool {
+pub(super) fn is_unpacked_array_name(elab: &ElaboratedModule, name: &str) -> bool {
     elab.arrays.contains_key(name)
         || elab.arrays_2d.contains_key(name)
         || elab.arrays_nd.contains_key(name)

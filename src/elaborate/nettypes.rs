@@ -1073,6 +1073,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             &elab.typedef_types,
                             &elab.typedef_unpacked_dims,
                             &elab.parameters,
+                            None,
                             kept,
                             0,
                         );
