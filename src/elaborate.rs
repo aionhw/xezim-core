@@ -12341,7 +12341,7 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters)
-                    .or_else(|| packed_full_dims_of(&dd_resolved, &elab.parameters))
+                    // Ranges on the declaration precede those supplied by its typedef.
                     .or_else(|| {
                         packed_full_dims_chained(
                             &dd.data_type,
@@ -12349,6 +12349,7 @@ pub fn elaborate_module_with_defs(
                             &elab.typedef_types,
                         )
                     })
+                    .or_else(|| packed_full_dims_of(&dd_resolved, &elab.parameters))
                 {
                     for decl in &dd.declarators {
                         elab.packed_full_dims
@@ -20006,7 +20007,7 @@ fn elaborate_items(
                     }
                 }
                 if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters)
-                    .or_else(|| packed_full_dims_of(&dd_resolved, &elab.parameters))
+                    // Ranges on the declaration precede those supplied by its typedef.
                     .or_else(|| {
                         packed_full_dims_chained(
                             &dd.data_type,
@@ -20014,6 +20015,7 @@ fn elaborate_items(
                             &elab.typedef_types,
                         )
                     })
+                    .or_else(|| packed_full_dims_of(&dd_resolved, &elab.parameters))
                 {
                     for decl in &dd.declarators {
                         elab.packed_full_dims
