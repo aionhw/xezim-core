@@ -98,7 +98,10 @@ fn text(e: &xezim_core::ast::expr::Expression) -> String {
             None => value.clone(),
         },
         ExprKind::Concatenation(parts) => {
-            format!("{{{}}}", parts.iter().map(text).collect::<Vec<_>>().join(", "))
+            format!(
+                "{{{}}}",
+                parts.iter().map(text).collect::<Vec<_>>().join(", ")
+            )
         }
         ExprKind::Binary { op, left, right } => {
             format!("({} {op:?} {})", text(left), text(right))
@@ -153,5 +156,47 @@ endmodule
         assigns.contains(&("b.io".to_string(), "w[2][4:2]".to_string()))
             && !assigns.iter().any(|(_, r)| r.contains("'z")),
         "the inout's connection has no z padding: {assigns:#?}"
+    );
+}
+
+/// The same range after the indices of an element of a two- or
+/// three-dimensional unpacked array: `mm[1][0][3:1]` on
+/// `logic [3:0][7:0] mm [0:1][0:1]` selects three 8-bit elements of the
+/// element `mm[1][0]`, 24 bits. Only a one-dimensional unpacked base was
+/// sized by elements, so these drew the 3-bit warning, and a real 16-bit
+/// mismatch was reported as 2 bits.
+#[test]
+fn range_after_index_of_a_multi_dimensional_unpacked_element() {
+    let diags = diagnostics(
+        r#"
+module pcw_snk2 (input logic [2:0][7:0] i, output logic [23:0] y);
+  assign y = i;
+endmodule
+module pcw_snk3 (input logic [2:0][7:0] i, output logic [23:0] y);
+  assign y = i;
+endmodule
+module pcw_snk4 (input logic [2:0][7:0] i, output logic [23:0] y);
+  assign y = i;
+endmodule
+module pcw_top4;
+  logic [3:0][7:0] mm [0:1][0:1];
+  logic [3:0][7:0] m3 [0:1][0:1][0:1];
+  logic [23:0] y0, y1, y2;
+  pcw_snk2 s0 (.i(mm[1][0][3:1]), .y(y0));
+  pcw_snk3 s1 (.i(m3[1][0][1][3:1]), .y(y1));
+  pcw_snk4 s2 (.i(mm[0][1][3:2]), .y(y2));
+endmodule
+"#,
+        "pcw_top4",
+    );
+    let mismatches: Vec<&String> = diags
+        .iter()
+        .filter(|d| d.contains("port width mismatch"))
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{diags:#?}");
+    assert!(
+        mismatches[0].contains("'pcw_snk4'")
+            && mismatches[0].contains("the connection is 16 bit(s)"),
+        "{diags:#?}"
     );
 }
