@@ -3700,6 +3700,9 @@ impl Value {
     /// says "either operand". A hard mismatch on a non-wildcard bit
     /// forces the result to 0; otherwise the result is 1.
     pub fn wildcard_eq(&self, other: &Value) -> Value {
+        if let Some((lhs, rhs)) = self.fill_pair(other) {
+            return lhs.wildcard_eq(&rhs);
+        }
         // SV §11.4.6: only x/z bits in the RIGHT operand (the pattern) are
         // wildcards (don't-cares). An x/z in the LEFT operand at a non-masked
         // position is NOT a wildcard — it makes the result x, unless some

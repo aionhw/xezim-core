@@ -33440,6 +33440,7 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
             // §20.5: `$signed(x)` reinterprets x as signed so a later width
             // extension sign-extends the MSB (`$signed(1'b1)` -> 2'b11), and
             // `$unsigned(x)` forces zero-extension.
+            v.is_fill = false;
             v.is_signed = name == "$signed";
             v
         }
