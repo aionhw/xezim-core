@@ -42232,6 +42232,10 @@ fn inline_module_items(
         }
         return Ok(());
     }
+    let has_header_elements = matches!(source_def, Definition::Module(m) if m.lexical_parent.is_some())
+        || source_def.params().iter().any(|p| matches!(&p.kind, ParameterKind::Data { assignments, .. }
+            if assignments.iter().any(|a| !a.dimensions.is_empty())));
+    let nonlexical_params = std::cell::OnceCell::new();
     // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
@@ -44155,135 +44159,24 @@ fn inline_module_items(
                             // packed value, so without slicing it here no element ever
                             // gets a value and `A[i]` reads 0.
                             if !assign.dimensions.is_empty() {
-                                let mut ov = sub_local_params.get(&assign.name.name).cloned();
-                                let mut pattern_init = None;
-                                // §23.10.2 / §10.9.1: an assignment-pattern
-                                // override (`.A('{-1, 18})`) assigns each item
-                                // to an element: pack the converted items,
-                                // element 0 leftmost, as the slicer expects.
-                                // Const-eval of the pattern itself yields 0.
-                                if let Some(ExprKind::AssignmentPattern(items)) = ovr_exprs
-                                    .get(&assign.name.name)
-                                    .map(|e| &peel_unpacked_typed_pattern(e).kind)
-                                {
-                                    // Any other pattern (replication, keyed,
-                                    // `default:`, nested rows, struct elements)
-                                    // is built element by element from the
-                                    // override itself, as a declared initializer is.
-                                    pattern_init = ovr_exprs.get(&assign.name.name);
-                                    ov = None;
-                                    let elem_t = param_integral_target(
-                                        data_type,
-                                        &inst_types,
-                                        &sub_local_params,
-                                        &elab.typedefs,
-                                        &elab.typedef_types,
-                                    );
-                                    if let Some(t) = elem_t.filter(|_| {
-                                        assign.dimensions.len() == 1
-                                            && items.iter().all(|it| {
-                                                matches!(it, AssignmentPatternItem::Ordered(e)
-                                                    if !matches!(e.kind, ExprKind::Replication { .. }
-                                                        | ExprKind::AssignmentPattern(_)))
-                                            })
-                                    }) {
-                                        pattern_init = None;
-                                        let elems: Vec<Value> = items
-                                            .iter()
-                                            .map(|it| {
-                                                let e = it.expr();
-                                                let own =
-                                                    eval_const_expr_val(e, scoped_eval_params);
-                                                convert_param_value(
-                                                    &own,
-                                                    Some(e),
-                                                    scoped_eval_params,
-                                                    t,
-                                                )
-                                            })
-                                            .collect();
-                                        ov = Some(Value::concat(&elems));
-                                    }
-                                }
-                                // A non-pattern override that names another
-                                // unpacked array (`#(.A(pkg::A))`, `#(.A(OFF))`)
-                                // is not a packed aggregate. The scalar value
-                                // stored for it is too narrow, so the slicer
-                                // below refuses it and every element stays at
-                                // the default (x for `logic`). Copy the source
-                                // elements instead.
-                                if pattern_init.is_none()
-                                    && let Some(expr) = ovr_exprs.get(&assign.name.name).cloned()
-                                    && !matches!(
-                                        peel_unpacked_typed_pattern(&expr).kind,
-                                        ExprKind::AssignmentPattern(_)
-                                    )
-                                {
-                                    let snapshot = sub_local_params.clone();
-                                    if array_params::register(
-                                        elab,
-                                        &inst_prefix,
-                                        &assign.name.name,
-                                        &assign.dimensions,
-                                        Some(&expr),
-                                        None,
-                                        data_type,
-                                        &snapshot,
-                                        scoped_eval_params,
-                                    ) {
-                                        // Body localparams in this instance
-                                        // (`OffloadInstr[0].instr_data`) read
-                                        // the bare element keys. The register
-                                        // above only stored the prefixed ones.
-                                        let elem_prefix =
-                                            format!("{inst_prefix}{}[", assign.name.name);
-                                        let mirrored: Vec<(String, Value)> = elab
-                                            .parameters
-                                            .iter()
-                                            .filter(|(k, _)| k.starts_with(&elem_prefix))
-                                            .map(|(k, v)| {
-                                                (k[inst_prefix.len()..].to_string(), v.clone())
-                                            })
-                                            .collect();
-                                        for (k, v) in mirrored {
-                                            sub_local_params.insert(k, v);
-                                        }
-                                        continue;
-                                    }
-                                }
-                                let snapshot = sub_local_params.clone();
-                                if let Some(init) = pattern_init {
-                                    if array_params::register(
-                                        elab,
-                                        &inst_prefix,
-                                        &assign.name.name,
-                                        &assign.dimensions,
-                                        Some(init),
-                                        None,
-                                        data_type,
-                                        &snapshot,
-                                        scoped_eval_params,
-                                    ) {
-                                        continue;
-                                    }
-                                } else if register_array_param(
-                                    elab,
-                                    &inst_prefix,
-                                    &assign.name.name,
-                                    &assign.dimensions,
-                                    assign.init.as_ref(),
-                                    ov.as_ref(),
-                                    data_type,
-                                    Some(&snapshot),
+                                // The initializer of an override is evaluated in the
+                                // parent; a default uses preceding header parameters.
+                                let actual = ovr_exprs.get(&assign.name.name);
+                                let init = actual.or(assign.init.as_ref());
+                                let override_val = if actual.is_some() { None } else {
+                                    sub_local_params.get(&assign.name.name)
+                                };
+                                let init_params = if actual.is_some() {
+                                    scoped_eval_params
+                                } else {
+                                    &sub_local_params
+                                };
+                                if let Some(array) = array_params::compute(
+                                    elab, &inst_prefix, &assign.name.name, &assign.dimensions,
+                                    init, override_val, data_type, &sub_local_params, init_params,
                                 ) {
-                                    // A child override `.R(R)` evaluates the
-                                    // name in this local env.
-                                    if let Some(whole) =
-                                        elab.parameters.get(&cat2(&inst_prefix, &assign.name.name))
-                                    {
-                                        sub_local_params
-                                            .insert(assign.name.name.clone(), whole.clone());
-                                    }
+                                    array.bind_local(&assign.name.name, &mut sub_local_params);
+                                    array.apply(elab, &inst_prefix);
                                     continue;
                                 }
                             }
@@ -44905,6 +44798,9 @@ fn inline_module_items(
 
                 // Inline all resolved parameters into global map with prefix
                 for (name, val) in &sub_local_params {
+                    if name.contains('[') && elab.parameters.contains_key(&cat2(&inst_prefix, name)) {
+                        continue;
+                    }
                     let full_name = cat2(&inst_prefix, &name);
                     elab.set_param(line!(), full_name.clone(), val.clone());
                     // Also add as a signal for simulation access
@@ -44962,12 +44858,23 @@ fn inline_module_items(
                         )
                     },
                 );
-                let mut sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
+                // §23.4: only a lexically nested module inherits the
+                // parent's array element names. Its other children can still
+                // use them in their actual parameters above. Share the compact
+                // inherited table among siblings of an array-bearing parent.
+                let lexical_child = matches!(sub_mod, Definition::Module(m)
+                    if m.lexical_parent.as_deref() == Some(source_def.name()));
+                let inherited = if has_header_elements && !lexical_child {
+                    nonlexical_params.get_or_init(|| local_params.iter()
+                        .filter(|(key, _)| key.split_once('[').is_none_or(|(base, _)| base.contains("::") || base.contains('.')))
+                        .map(|(k, v)| (k.clone(), v.clone())).collect())
+                } else { local_params };
+                let mut sub_merged_params: HashMap<String, Value> = if inherited.is_empty() {
                     sub_local_params.clone()
                 } else if sub_local_params.is_empty() {
-                    local_params.clone()
+                    inherited.clone()
                 } else {
-                    let mut m = local_params.clone();
+                    let mut m = inherited.clone();
                     for (k, v) in &sub_local_params {
                         m.insert(k.clone(), v.clone());
                     }

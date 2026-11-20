@@ -911,6 +911,7 @@ impl Parser {
                     fail_span,
                 ));
             Description::Module(crate::ast::module::ModuleDeclaration {
+                lexical_parent: None,
                 attrs: Vec::new(),
                 kind: crate::ast::module::ModuleKind::Module,
                 lifetime: None,

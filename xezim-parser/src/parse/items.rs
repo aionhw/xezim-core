@@ -903,6 +903,7 @@ impl Parser {
         self.check_param_specparams(&params, &items);
 
         ModuleDeclaration {
+            lexical_parent: None,
             attrs: Vec::new(),
             kind,
             lifetime,

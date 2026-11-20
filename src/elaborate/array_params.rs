@@ -612,6 +612,14 @@ pub(super) fn compute(
 }
 
 impl RegisteredArray {
+    pub(super) fn bind_local(&self, name: &str, params: &mut HashMap<String, Value>) {
+        params.insert(name.to_owned(), self.whole.clone());
+        params.extend(self.values.iter().cloned());
+        if let Some(fields) = &self.fields {
+            super::tls_register_struct_layout(name, fields);
+        }
+    }
+
     /// Write-only phase: apply the data computed by `compute` into an
     /// `ElaboratedModule`. Takes the `prefix` separately (not threaded through
     /// the struct) so the same computed value can back several prefixes.
