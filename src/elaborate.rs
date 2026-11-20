@@ -59427,6 +59427,46 @@ fn subst_type_param_dt(
                 }
             })
         }
+        // §6.18, §6.20.3: a block typedef of a class scope whose prefix is a
+        // type parameter bound to a class (`typedef C::hw_t l_t;`) names
+        // that class's member type.
+        DataType::TypeReference { name, .. }
+            if name.scopes.first().is_some_and(|head| {
+                head.type_args.is_empty()
+                    && matches!(binds.get(&head.name.name), Some(DataType::TypeReference { dimensions, .. }) if dimensions.is_empty())
+            }) =>
+        {
+            let DataType::TypeReference {
+                mut name,
+                dimensions,
+                type_args,
+                span,
+            } = data_type
+            else {
+                unreachable!()
+            };
+            let Some(DataType::TypeReference {
+                name: bound,
+                type_args: bound_args,
+                ..
+            }) = binds.get(&name.scopes[0].name.name)
+            else {
+                unreachable!()
+            };
+            let mut scopes = bound.scopes.clone();
+            scopes.push(crate::ast::types::TypeScope {
+                name: bound.name.clone(),
+                type_args: bound_args.clone(),
+            });
+            scopes.extend(name.scopes.drain(1..));
+            name.scopes = scopes;
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                span,
+            }
+        }
         // §6.20.3, §7.2: a struct or union written in the declaration
         // (`struct packed { T a; T b; } s;`) or an enum on a type parameter
         // (`enum T {A, B} e;`) names the parameter in its members.
