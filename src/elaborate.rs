@@ -54484,9 +54484,13 @@ fn fixed_net_cell(elab: &ElaboratedModule, expr: &Expression) -> Option<(String,
     }
     let &(lo, hi, _) = elab.arrays.get(&base)?;
     let index = const_eval_i64_with_params(index, Some(&elab.parameters))?;
-    (lo..=hi)
-        .contains(&index)
-        .then(|| (format!("{base}[{index}]"), base))
+    if !(lo..=hi).contains(&index) {
+        return None;
+    }
+    let cell = format!("{base}[{index}]");
+    // A separately declared scalar with brackets in its escaped name is
+    // distinct from this unpacked element, as in net_base_of.
+    (!elab.signals.contains_key(&cell)).then_some((cell, base))
 }
 
 fn register_fixed_net_cell(elab: &mut ElaboratedModule, expr: &mut Expression) {
@@ -54499,26 +54503,27 @@ fn register_fixed_net_cell(elab: &mut ElaboratedModule, expr: &mut Expression) {
     }
 }
 
-fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) {
+fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) -> HashMap<String, u32> {
     if elab.arrays.is_empty()
         || !elab
             .arrays
             .keys()
             .any(|name| elab.nets.contains(name.as_str()))
     {
-        return;
+        return HashMap::default();
     }
     // Only cells that need net resolution get scalar driver names. Ordinary
     // stores retain the element type and the port keeps its connection copy.
     let mut seen = HashSet::default();
-    let mut resolve = HashSet::default();
+    let mut resolve = HashMap::default();
+    let merged: HashSet<&str> = elab.net_port_merges.values().map(String::as_str).collect();
     let mut count = |lhs: &Expression| {
         if let Some((cell, base)) = fixed_net_cell(elab, lhs) {
             if !seen.insert(cell.clone())
                 || elab.resolved_net_kinds.contains_key(base.as_str())
-                || elab.net_port_merges.values().any(|actual| actual == &cell)
+                || merged.contains(cell.as_str())
             {
-                resolve.insert(cell);
+                resolve.insert(cell, elab.arrays[&base].2);
             }
         }
     };
@@ -54529,10 +54534,10 @@ fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) {
         count(&p.materialize_lhs());
     }
     if resolve.is_empty() {
-        return;
+        return HashMap::default();
     }
     for p in std::mem::take(&mut elab.pending_cont_assign) {
-        if fixed_net_cell(elab, &p.materialize_lhs()).is_some_and(|(cell, _)| resolve.contains(&cell)) {
+        if fixed_net_cell(elab, &p.materialize_lhs()).is_some_and(|(cell, _)| resolve.contains_key(&cell)) {
             elab.continuous_assigns.push(p.materialize(&elab.parameters));
         } else {
             elab.pending_cont_assign.push(p);
@@ -54540,15 +54545,16 @@ fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) {
     }
     let mut assignments = std::mem::take(&mut elab.continuous_assigns);
     for ca in &mut assignments {
-        if fixed_net_cell(elab, &ca.lhs).is_some_and(|(cell, _)| resolve.contains(&cell)) {
+        if fixed_net_cell(elab, &ca.lhs).is_some_and(|(cell, _)| resolve.contains_key(&cell)) {
             register_fixed_net_cell(elab, &mut ca.lhs);
         }
     }
     elab.continuous_assigns = assignments;
+    resolve
 }
 
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
-    normalize_net_cell_drivers(elab);
+    let resolved_cells = normalize_net_cell_drivers(elab);
     widen_overlapping_select_drivers(elab);
     // §10.11: the names an `alias` statement names are ONE physical net, so
     // a driver of any member of a group is a driver of the group's
@@ -55080,7 +55086,11 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             order.push(name.clone());
             let split = split_delays.contains(&name);
             Acc {
-                lhs: make_ident_expr(&name),
+                lhs: if resolved_cells.contains_key(&name) {
+                    make_net_lhs_expr(&name)
+                } else {
+                    make_ident_expr(&name)
+                },
                 delay: if split { 0 } else { ca.delay },
                 delay_fall: if split { None } else { ca.delay_fall },
                 delay_off: if split { None } else { ca.delay_off },
@@ -55185,7 +55195,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 let span = acc.lhs.span;
                 acc.weak = Some(make_fill_expr(one, span));
             }
-            let w = elab.signals.get(name).map(|s| s.width).unwrap_or(1).max(1);
+            let w = resolved_cells.get(name).copied().or_else(|| elab.signals.get(name).map(|s| s.width)).unwrap_or(1).max(1);
             let fill = if one { Value::ones(w) } else { Value::zero(w) };
             let e = strength.entry(name.clone()).or_default();
             e.0.push(StrengthDriver {
@@ -55233,7 +55243,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         if let Some(mut acc) = folded.remove(&name) {
             let span = acc.lhs.span;
             if !acc.tri.is_empty() {
-                let w = elab.signals.get(&name).map(|s| s.width).unwrap_or(1).max(1);
+                let w = resolved_cells.get(&name).copied().or_else(|| elab.signals.get(&name).map(|s| s.width)).unwrap_or(1).max(1);
                 let mut args = vec![acc.strong.take().unwrap_or_else(|| make_z_fill(w, span))];
                 for (ctl, data) in std::mem::take(&mut acc.tri) {
                     args.push(ctl);
@@ -55256,7 +55266,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             // asymmetric pair (`strong0, weak1`) came out wrong.
             let rhs = match elab.strength_drivers.get(&name) {
                 Some(drivers) => {
-                    let w = elab.signals.get(&name).map(|s| s.width).unwrap_or(1).max(1);
+                    let w = resolved_cells.get(&name).copied().or_else(|| elab.signals.get(&name).map(|s| s.width)).unwrap_or(1).max(1);
                     let mut args = vec![
                         const_value_literal(&Value::from_u64(u64::from(w), 32), span)
                             .expect("width literal"),
