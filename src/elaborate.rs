@@ -32551,11 +32551,14 @@ fn fixed_unpacked_index_lists(
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Vec<Vec<i64>>> {
     let dims = normalize_unpacked_dims(dims, params, typedef_types);
-    let declared = declared_unpacked_dims(&dims, params)?;
+    bounded_declared_index_lists(&declared_unpacked_dims(&dims, params)?)
+}
+
+fn bounded_declared_index_lists(declared: &[(i64, i64)]) -> Option<Vec<Vec<i64>>> {
     let mut total: u64 = 1;
     let mut out = Vec::with_capacity(declared.len());
-    for (l, r) in declared {
-        let n = (l - r).unsigned_abs() + 1;
+    for &(l, r) in declared {
+        let n = l.abs_diff(r).checked_add(1)?;
         total = total.saturating_mul(n);
         if total > 4096 {
             return None;
@@ -54317,6 +54320,98 @@ fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
     elab.var_decl_types.get(name).and_then(get_type_name)
 }
 
+// §7.6, §10.3: expose whole fixed-array copies to the member pass.
+fn pending_struct_array_copy_parts(
+    elab: &ElaboratedModule,
+    lhs: &Expression,
+    pending: &PendingContAssign,
+) -> Option<Vec<ContinuousAssignment>> {
+    let lhs_name = whole_net_ident_name(lhs)?;
+    let lhs_dims = elab.unpacked_decl_dims.get(&lhs_name)?;
+    let lhs_type = elab.var_decl_types.get(&lhs_name)?;
+    let element_type = resolve_typedef_chain(lhs_type, &elab.typedef_types);
+    if !matches!(element_type, DataType::Struct(su)
+        if !su.packed && !su.members.is_empty() && su.kind == StructUnionKind::Struct)
+        // Built-in net arrays can have member storage without member driver
+        // resolution. Keep their drivers on the array path.
+        || elab.z_init_signals.contains(&lhs_name)
+        || declared_type_name(elab, &lhs_name)
+            .and_then(|ty| elab.nettype_resolvers.get(&ty))
+            .is_some_and(|resolver| !resolver.is_empty())
+    {
+        return None;
+    }
+
+    let ca = pending.clone().materialize(&elab.parameters);
+    let rhs_name = whole_net_ident_name(&ca.rhs)?;
+    let rhs_dims = elab.unpacked_decl_dims.get(&rhs_name)?;
+    let rhs_type = elab.var_decl_types.get(&rhs_name)?;
+    // §6.22.2 / §7.6: both sides must name the same element type, and
+    // each pair of dimensions must have equal counts.
+    if !std::ptr::eq(
+        element_type,
+        resolve_typedef_chain(rhs_type, &elab.typedef_types),
+    )
+        || elab.z_init_signals.contains(&rhs_name)
+        || lhs_dims.is_empty()
+        || lhs_dims.len() != rhs_dims.len()
+        || lhs_dims
+            .iter()
+            .zip(rhs_dims)
+            .any(|(&(ll, lr), &(rl, rr))| ll.abs_diff(lr) != rl.abs_diff(rr))
+    {
+        return None;
+    }
+
+    // Only arrays with registered member signals can use the member pass.
+    let first_element = |name: &str, dims: &[(i64, i64)]| {
+        dims.iter().fold(name.to_string(), |mut path, (left, _)| {
+            use std::fmt::Write;
+            let _ = write!(path, "[{left}]");
+            path
+        })
+    };
+    if !elab.struct_members.contains_key(&first_element(&lhs_name, lhs_dims))
+        || !elab.struct_members.contains_key(&first_element(&rhs_name, rhs_dims))
+    {
+        return None;
+    }
+
+    if lhs_dims.len() > 1 {
+        let lhs_indices = cartesian_index_tuples(&bounded_declared_index_lists(lhs_dims)?);
+        let rhs_indices = cartesian_index_tuples(&bounded_declared_index_lists(rhs_dims)?);
+        return Some(
+            lhs_indices
+                .into_iter()
+                .zip(rhs_indices)
+                .map(|(lhs_indices, rhs_indices)| ContinuousAssignment {
+                    lhs: lhs_indices.into_iter().fold(ca.lhs.clone(), index_expr),
+                    rhs: rhs_indices.into_iter().fold(ca.rhs.clone(), index_expr),
+                    ..ca.clone()
+                })
+                .collect(),
+        );
+    }
+
+    let mut parts = whole_array_assign_parts_dir(
+        &ca.lhs,
+        &ca.rhs,
+        ca.delay,
+        &elab.arrays,
+        Some(&elab.descending_arrays),
+        Some(&elab.unpacked_decl_dims),
+    )?;
+    for part in &mut parts {
+        part.origin = ca.origin.clone();
+        part.rhs_parent_scoped = ca.rhs_parent_scoped;
+        part.delay_fall = ca.delay_fall;
+        part.delay_off = ca.delay_off;
+        part.delay_select = ca.delay_select;
+        part.gate_delay_fall = ca.gate_delay_fall;
+    }
+    Some(parts)
+}
+
 /// §6.6.7 user-defined nettype resolution, over the WHOLE elaborated design.
 ///
 /// Runs after `inline_instantiations`, so a net driven from several module
@@ -54402,13 +54497,19 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     // inlined) kind kept its whole-struct lhs, wrote a container no reader
     // looks at, and the parent's port copy read the leaves' defaults. Bring
     // exactly the entries landing on an unpacked struct into the eager list.
+    // Whole fixed arrays first need the same ordered split as the eager drain.
     {
+        let has_fixed_arrays = !elab.unpacked_decl_dims.is_empty();
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for pca in pending {
             let lhs = pca.materialize_lhs();
             if struct_target(elab, &lhs).is_some() {
                 let ca = pca.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
+            } else if has_fixed_arrays
+                && let Some(parts) = pending_struct_array_copy_parts(elab, &lhs, &pca)
+            {
+                elab.continuous_assigns.extend(parts);
             } else {
                 elab.pending_cont_assign.push(pca);
             }
