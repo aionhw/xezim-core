@@ -504,8 +504,9 @@ impl<'a> Binder<'a> {
 
     /// §23.9: innermost first. §26.3: at each scope, its declarations, then
     /// its explicit imports, then its wildcard imports. Then `$unit`, then
-    /// the hierarchy (§23.8.1).
-    fn resolve(&self, name: &str) -> Outcome {
+    /// the hierarchy (§23.8.1). `bare`: the name is the whole reference, not
+    /// the head of a path (`a.b`).
+    fn resolve(&self, name: &str, bare: bool) -> Outcome {
         // A.2.2.3: the delay value `1step` is carried as a name.
         if name.is_empty()
             || name.contains("::")
@@ -552,6 +553,13 @@ impl<'a> Binder<'a> {
         }
         if self.names.unit_declares(name) || STD_CLASSES.contains(&name) {
             return Outcome::None(Hide::Import);
+        }
+        // §3.13: definitions and packages have name spaces of their own, so
+        // a bare `LINK` that is this scope's implicit net (`.o(LINK)`, §6.10)
+        // names the net, also with a `module LINK` in the design. As a path
+        // head (`LINK.x`) it is still the definition's name.
+        if bare && let Some(d) = implicit {
+            return Outcome::Decl(d);
         }
         // §26.3: `p::x` reaches here with the package as its head.
         if name == "std"
@@ -601,7 +609,7 @@ impl<'a> Binder<'a> {
     /// A name with no `bound` field of its own; the caller may keep the
     /// binding.
     fn ident(&mut self, id: &Identifier) -> Bound {
-        let outcome = self.resolve(&id.name);
+        let outcome = self.resolve(&id.name, true);
         self.note(id.span, &id.name, outcome);
         outcome.bound()
     }
@@ -613,7 +621,7 @@ impl<'a> Binder<'a> {
         let outcome = if h.root.is_some() || h.bound == Bound::NO_TARGET {
             Outcome::None(Hide::Qualified)
         } else {
-            self.resolve(&first.name.name)
+            self.resolve(&first.name.name, h.path.len() == 1)
         };
         h.bound = match outcome {
             Outcome::Decl(d) => {
@@ -645,7 +653,7 @@ impl<'a> Binder<'a> {
         let outcome = if h.root.is_some() {
             Outcome::None(Hide::Qualified)
         } else {
-            self.resolve(&head)
+            self.resolve(&head, false)
         };
         if h.path.len() == 1 {
             h.bound = match outcome {
@@ -746,7 +754,7 @@ impl<'a> Binder<'a> {
         };
         let class = match self.hidden.find(name) {
             Some((_, _, class)) => class.clone(),
-            None => match self.resolve(name) {
+            None => match self.resolve(name, false) {
                 Outcome::Decl(d) => self.tree.decl_types.get(&d).cloned(),
                 _ => None,
             },
@@ -1097,7 +1105,7 @@ impl<'a> Binder<'a> {
     fn class(&mut self, c: &mut ClassDeclaration) {
         // §6.18: a base may be a typedef of the enclosing scope.
         if let Some(e) = c.extends.as_mut().filter(|e| e.scopes.is_empty()) {
-            e.bound = self.resolve(&e.name.name).bound();
+            e.bound = self.resolve(&e.name.name, false).bound();
         }
         let mark = self.hidden.len();
         let unknown = self.unknown_members;
@@ -1842,7 +1850,7 @@ impl<'a> Binder<'a> {
                         }
                         AssignmentPatternItem::Named(id, v) => {
                             if id.type_key.is_none() {
-                                id.bound = self.resolve(&id.name).bound();
+                                id.bound = self.resolve(&id.name, false).bound();
                             }
                             self.expr(v);
                         }
