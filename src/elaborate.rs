@@ -31873,46 +31873,81 @@ fn expand_struct_driver(
 ) {
     let start = out.len();
     emit_struct_member_assigns(
-        &make_ident_expr(base), &ca.rhs, su, ca, &elab.typedef_types,
-        &elab.typedef_unpacked_dims, &elab.parameters, out, 0,
+        &make_ident_expr(base),
+        &ca.rhs,
+        su,
+        ca,
+        &elab.typedef_types,
+        &elab.typedef_unpacked_dims,
+        &elab.parameters,
+        out,
+        0,
     );
     if ca.delay == 0 || out.len() - start < 2 || ca.delay_fall.is_some() || ca.delay_off.is_some() {
         return;
     }
-    let defaults: Option<Vec<_>> = out[start..].iter().map(|leaf| {
-        let name = ident_flat_name(&leaf.lhs).or_else(|| scope_indexed_flat_name(&leaf.lhs, elab))?;
-        if let Some(sig) = elab.signals.get(&name) {
-            return (!sig.is_real && sig.width > 0).then(|| sig.value.resize(sig.width));
-        }
-        let base = name.rsplit_once('[')?.0;
-        let width = elab.arrays.get(base)?.2;
-        let dt = elab.var_decl_types.get(base)?;
-        let value = default_value_for_type_resolved(dt, width, &elab.typedef_types);
-        (!value.is_real && width > 0).then_some(value)
-    }).collect();
-    let Some(defaults) = defaults else { return; };
+    let defaults: Option<Vec<_>> = out[start..]
+        .iter()
+        .map(|leaf| {
+            let name =
+                ident_flat_name(&leaf.lhs).or_else(|| scope_indexed_flat_name(&leaf.lhs, elab))?;
+            if let Some(sig) = elab.signals.get(&name) {
+                return (!sig.is_real && sig.width > 0).then(|| sig.value.resize(sig.width));
+            }
+            let base = name.rsplit_once('[')?.0;
+            let width = elab.arrays.get(base)?.2;
+            let dt = elab.var_decl_types.get(base)?;
+            let value = default_value_for_type_resolved(dt, width, &elab.typedef_types);
+            (!value.is_real && width > 0).then_some(value)
+        })
+        .collect();
+    let Some(defaults) = defaults else {
+        return;
+    };
     let initial = Value::concat(&defaults);
     let width = initial.width;
     let span = ca.lhs.span;
     let mut seq = start;
     let stage = loop {
         let name = format!("{base}$structdelay{seq}");
-        if !elab.signals.contains_key(&name) { break name; }
+        if !elab.signals.contains_key(&name) {
+            break name;
+        }
         seq += 1;
     };
-    elab.signals.insert(stage.clone(), Signal {name:stage.clone().into(), width,
-        is_const:false, is_signed:false, is_real:false, type_name:None, direction:None, value:initial});
+    elab.signals.insert(
+        stage.clone(),
+        Signal {
+            name: stage.clone().into(),
+            width,
+            is_const: false,
+            is_signed: false,
+            is_real: false,
+            type_name: None,
+            direction: None,
+            value: initial,
+        },
+    );
     let mut parts = Vec::with_capacity(defaults.len());
     let mut hi = width;
     for (leaf, initial) in out[start..].iter_mut().zip(defaults) {
         let lo = hi - initial.width;
-        let slice = Expression::new(ExprKind::RangeSelect {
-            expr: Box::new(make_ident_expr(&stage)), kind: crate::ast::expr::RangeKind::Constant,
-            left: Box::new(int_literal(i64::from(hi - 1), span)), right: Box::new(int_literal(i64::from(lo), span)),
-        }, span);
+        let slice = Expression::new(
+            ExprKind::RangeSelect {
+                expr: Box::new(make_ident_expr(&stage)),
+                kind: crate::ast::expr::RangeKind::Constant,
+                left: Box::new(int_literal(i64::from(hi - 1), span)),
+                right: Box::new(int_literal(i64::from(lo), span)),
+            },
+            span,
+        );
         hi = lo;
         let rhs = std::mem::replace(&mut leaf.rhs, slice);
-        parts.push(make_syscall("$__xz_size_cast", vec![int_literal(i64::from(initial.width), span), rhs], span));
+        parts.push(make_syscall(
+            "$__xz_size_cast",
+            vec![int_literal(i64::from(initial.width), span), rhs],
+            span,
+        ));
         leaf.delay = 0;
         leaf.origin = None;
         leaf.delay_select = None;
@@ -54286,14 +54321,18 @@ pub fn unify_alias_nets(elab: &mut ElaboratedModule) {
 /// §7.4.2: a constant subscript on a fixed array of nets names a whole
 /// net cell. A subscript on a packed vector is a part of the same net.
 fn fixed_net_cell(elab: &ElaboratedModule, expr: &Expression) -> Option<(String, String)> {
-    let ExprKind::Index { expr: base, index } = &expr.kind else { return None; };
+    let ExprKind::Index { expr: base, index } = &expr.kind else {
+        return None;
+    };
     let base = ident_flat_name(base)?;
     if !elab.nets.contains(base.as_str()) || elab.dynamic_arrays.contains(&base) {
         return None;
     }
     let &(lo, hi, _) = elab.arrays.get(&base)?;
     let index = const_eval_i64_with_params(index, Some(&elab.parameters))?;
-    (lo..=hi).contains(&index).then(|| (format!("{base}[{index}]"), base))
+    (lo..=hi)
+        .contains(&index)
+        .then(|| (format!("{base}[{index}]"), base))
 }
 
 fn register_fixed_net_cell(elab: &mut ElaboratedModule, expr: &mut Expression) {
@@ -54307,13 +54346,19 @@ fn register_fixed_net_cell(elab: &mut ElaboratedModule, expr: &mut Expression) {
 }
 
 fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) {
-    if elab.arrays.is_empty() || !elab.arrays.keys().any(|name| elab.nets.contains(name.as_str())) {
+    if elab.arrays.is_empty()
+        || !elab
+            .arrays
+            .keys()
+            .any(|name| elab.nets.contains(name.as_str()))
+    {
         return;
     }
     // Keep unrelated instance assignments lazy.
     for p in std::mem::take(&mut elab.pending_cont_assign) {
         if fixed_net_cell(elab, &p.materialize_lhs()).is_some() {
-            elab.continuous_assigns.push(p.materialize(&elab.parameters));
+            elab.continuous_assigns
+                .push(p.materialize(&elab.parameters));
         } else {
             elab.pending_cont_assign.push(p);
         }
