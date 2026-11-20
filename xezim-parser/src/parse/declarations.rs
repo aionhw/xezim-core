@@ -617,7 +617,10 @@ impl Parser {
         } else if self.at(TokenKind::Identifier)
             && (matches!(
                 self.peek_kind(),
-                TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
+                TokenKind::Identifier
+                    | TokenKind::EscapedIdentifier
+                    | TokenKind::Hash
+                    | TokenKind::DoubleColon
             ) || (self.peek_kind() == TokenKind::LBracket && self.dims_then_identifier(1)))
         {
             self.parse_data_type()
