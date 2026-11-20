@@ -32002,7 +32002,7 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
         return;
     }
     let mut expanded: Vec<ContinuousAssignment> = Vec::new();
-    for ca in elab.continuous_assigns.drain(..) {
+    for ca in std::mem::take(&mut elab.continuous_assigns) {
         let members = simple_lhs_name(&ca.lhs)
             .and_then(|n| {
                 let tn = elab.signals.get(&n).and_then(|s| s.type_name.clone())?;
