@@ -798,6 +798,28 @@ fn diag_kind_key(msg: &str) -> &str {
 thread_local! {
     static ELAB_DIAG_COUNTS: std::cell::RefCell<crate::hasher::HashMap<String, u32>> =
         std::cell::RefCell::new(crate::hasher::HashMap::default());
+    /// Set while elaboration does work that a later pass repeats.
+    static ELAB_DIAG_MUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with elaboration diagnostics dropped: neither printed, counted
+/// nor recorded by a warn-once site, because a later pass elaborates the
+/// same scopes again and reports them there.
+pub(crate) fn with_elab_diags_muted<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ELAB_DIAG_MUTED.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(ELAB_DIAG_MUTED.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether elaboration diagnostics are currently dropped
+/// (`with_elab_diags_muted`).
+pub(crate) fn elab_diags_muted() -> bool {
+    ELAB_DIAG_MUTED.with(|c| c.get())
 }
 
 /// Reset the per-kind diagnostic counters (start of an elaboration run).
@@ -813,6 +835,9 @@ pub fn elab_diag_reset_counts() {
 /// the reader can see the rest. Suppressed messages are dropped from the
 /// capture sink too, so a warm-cache replay reproduces the same output.
 pub(crate) fn elab_diag(msg: String) {
+    if elab_diags_muted() {
+        return;
+    }
     let n = ELAB_DIAG_COUNTS.with(|c| {
         let mut m = c.borrow_mut();
         let e = m.entry(diag_kind_key(&msg).to_string()).or_insert(0);

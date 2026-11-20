@@ -22206,7 +22206,7 @@ fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
         } else {
             SANE_MAX_PACKED_WIDTH
         };
-        if SUPPRESS_WIDTH_WARNINGS.with(|c| c.get()) {
+        if SUPPRESS_WIDTH_WARNINGS.with(|c| c.get()) || crate::elab_diags_muted() {
             return replacement;
         }
         let key = format!("{}|{}", ctx, detail);
@@ -38509,28 +38509,36 @@ fn inline_instantiations_inner(
         );
     }
     if let (Some((_, resolve_step)), Some(mut bs)) = (bind_driver, bind_state) {
-        for pass in 0..64 {
-            let new_binds = resolve_step(elab)?;
-            if new_binds.is_empty() {
-                break;
-            }
-            if pass == 63 {
-                return Err("bind hierarchy does not converge (§23.11)".into());
-            }
-            for (target_path, directives) in new_binds {
-                inline_bound_items(
-                    elab,
-                    &target_path,
-                    &directives,
-                    definitions,
-                    &mut cache,
-                    &param_scope,
-                    &mut bs,
-                )?;
-                if bs.needs_full_rebuild {
-                    return Ok(true);
+        // The bound scopes inlined here are elaborated again by the root
+        // elaboration below, which reports their diagnostics once.
+        let discovered = crate::with_elab_diags_muted(|| -> Result<bool, String> {
+            for pass in 0..64 {
+                let new_binds = resolve_step(elab)?;
+                if new_binds.is_empty() {
+                    break;
+                }
+                if pass == 63 {
+                    return Err("bind hierarchy does not converge (§23.11)".into());
+                }
+                for (target_path, directives) in new_binds {
+                    inline_bound_items(
+                        elab,
+                        &target_path,
+                        &directives,
+                        definitions,
+                        &mut cache,
+                        &param_scope,
+                        &mut bs,
+                    )?;
+                    if bs.needs_full_rebuild {
+                        return Ok(true);
+                    }
                 }
             }
+            Ok(false)
+        })?;
+        if discovered {
+            return Ok(true);
         }
         // §23.11: a bound instance is inlined as if written at the end of its
         // target's items, so it precedes the target's later siblings in the
@@ -42448,6 +42456,9 @@ fn warn_port_width_mismatch(
 ) {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+    if crate::elab_diags_muted() {
+        return;
+    }
     let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let key = (sub_mod_name.to_string(), port.to_string());
     let first = seen.lock().map(|mut g| g.insert(key)).unwrap_or(false);
