@@ -369,7 +369,6 @@ impl Outcome {
 const UNVISITED: &[&str] = &[
     "alias",
     "assign-delay",
-    "clocking-signal",
     "defparam",
     "dpi-export",
     "dpi-import",
@@ -1282,6 +1281,7 @@ impl<'a> Binder<'a> {
     }
 
     fn clocking(&mut self, c: &mut ClockingDeclaration) {
+        c.decl = self.own_decl(&c.name.name);
         if let Some(s) = &c.clock_signal {
             c.clock_bound = self.ident(s);
         }
@@ -1295,8 +1295,13 @@ impl<'a> Binder<'a> {
             }
             match &mut s.bound_to {
                 Some(e) => self.expr(e),
-                // §14.3: the clockvar names its signal; the rename keeps it.
-                None => self.with_pos("clocking-signal", |b| _ = b.ident(&s.name)),
+                // §14.3: the clockvar names its signal, which a generate
+                // block may declare.
+                None => {
+                    let mut bound = Bound::UNSET;
+                    self.with_pos("clocking-signal", |b| bound = b.ident(&s.name));
+                    s.bound = bound;
+                }
             }
         }
         c.items.iter_mut().for_each(|s| self.stmt(s));
@@ -2284,6 +2289,7 @@ fn renamed_key(tree: &ScopeTree, scope: ScopeId, name: &str, kind: DeclKind) -> 
         | DeclKind::Instance
         | DeclKind::Property
         | DeclKind::Sequence
+        | DeclKind::Clocking
         | DeclKind::Typedef
         // §6.10, §27: a block's implicit net is the block's.
         | DeclKind::ImplicitNet => tree.key(scope, name, &[]),

@@ -37917,6 +37917,15 @@ fn visit_renamed_decls(items: &[ModuleItem], visit: &mut dyn FnMut(&str, Bound, 
             // §16.12, §16.8.
             ModuleItem::PropertyDeclaration(p) => visit(&p.name.name, p.decl, DeclKind::Property),
             ModuleItem::SequenceDeclaration(p) => visit(&p.name.name, p.decl, DeclKind::Sequence),
+            // §14.3: a clocking block is a declaration of the block, so each
+            // copy of a generate block has its own (`g[1].cb`), as a block's
+            // data does. A designation (`default clocking cb;`) declares
+            // none; it takes the block's key when the block is the block's.
+            ModuleItem::ClockingDeclaration(c)
+                if c.clock_signal.is_some() || !c.signals.is_empty() || !c.is_default =>
+            {
+                visit(&c.name.name, c.decl, DeclKind::Clocking)
+            }
             // §6.18. A forward declaration keeps its name: it may name a
             // class, and classes keep theirs.
             ModuleItem::TypedefDeclaration(t) if !matches!(t.data_type, DataType::Void(_)) => {
@@ -38441,6 +38450,7 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             match &mut out {
                 ModuleItem::PropertyDeclaration(p) => gen_rename(p.decl, &mut p.name.name),
                 ModuleItem::SequenceDeclaration(p) => gen_rename(p.decl, &mut p.name.name),
+                ModuleItem::ClockingDeclaration(c) => gen_rename(c.decl, &mut c.name.name),
                 _ => {}
             }
             out
@@ -38498,6 +38508,12 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
             for s in &mut c.signals {
                 for e in [&mut s.skew, &mut s.bound_to].into_iter().flatten() {
                     *e = gen_expr(e);
+                }
+                // §14.3: a clockvar without `= expression` is the signal of
+                // its name where the block is declared: the copy's own
+                // signal when the generate block declares one (`g[1].a`).
+                if s.bound_to.is_none() {
+                    gen_rename(s.bound, &mut s.name.name);
                 }
             }
             c.items = c.items.iter().map(gen_stmt).collect();

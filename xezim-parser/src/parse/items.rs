@@ -2904,6 +2904,7 @@ impl Parser {
                                         skew: sig_skew.clone(),
                                         skew_edge: sig_edge,
                                         bound_to,
+                                        bound: Default::default(),
                                         span: self.span_from(sstart),
                                     });
                                 }
@@ -2938,6 +2939,7 @@ impl Parser {
                     name: id,
                     clock_signal: clock_signal_id,
                     clock_bound: Default::default(),
+                    decl: Default::default(),
                     clock_edge,
                     default_input_skew: default_input_skew.map(Box::new),
                     default_output_skew: default_output_skew.map(Box::new),
@@ -3166,6 +3168,7 @@ impl Parser {
                             name,
                             clock_signal: None,
                             clock_bound: Default::default(),
+                            decl: Default::default(),
                             clock_edge: None,
                             default_input_skew: None,
                             default_output_skew: None,
