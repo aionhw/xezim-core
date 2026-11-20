@@ -22592,12 +22592,13 @@ fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
         }
         ExprKind::SystemCall { name, args } => {
             if args.is_empty() && matches!(name.as_str(), "$time" | "$stime" | "$realtime") {
-                let real = *name == "$realtime";
-                *name = if real {
-                    "$__xz_realtime_at".to_string()
-                } else {
-                    "$__xz_time_at".to_string()
-                };
+                // §20.3.2: `$stime` keeps its own name, the 32-bit read.
+                *name = match name.as_str() {
+                    "$realtime" => "$__xz_realtime_at",
+                    "$stime" => "$__xz_stime_at",
+                    _ => "$__xz_time_at",
+                }
+                .to_string();
                 args.push(Expression::new(
                     ExprKind::Number(NumberLiteral::Real(u as f64)),
                     e.span,
