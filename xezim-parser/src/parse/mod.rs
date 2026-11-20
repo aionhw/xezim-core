@@ -26,6 +26,8 @@ fn compact_syntax_list<T>(mut items: Vec<T>) -> Vec<T> {
 }
 
 pub struct Parser {
+    // §22.8 directive transitions in source order, consumed outside the grammar.
+    default_net_pulls: Vec<(usize, Option<crate::ast::types::NetType>)>,
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
@@ -141,8 +143,26 @@ impl Parser {
 
     pub fn new(tokens: Vec<Token>) -> Self {
         crate::record_reference_census(&tokens);
-        let tokens = Self::join_one_step(tokens);
+        let mut tokens = Self::join_one_step(tokens);
+        let mut default_net_pulls = Vec::new();
+        let mut after_directive = false;
+        tokens.retain(|token| {
+            if after_directive {
+                after_directive = false;
+                let net = match token.kind {
+                    TokenKind::KwTri0 => Some(crate::ast::types::NetType::Tri0),
+                    TokenKind::KwTri1 => Some(crate::ast::types::NetType::Tri1),
+                    TokenKind::Eof => return true,
+                    _ => None,
+                };
+                default_net_pulls.push((token.span.start, net));
+                return false;
+            }
+            after_directive = token.kind == TokenKind::Directive && token.text == "`default_nettype";
+            !after_directive
+        });
         Self {
+            default_net_pulls,
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
@@ -911,6 +931,7 @@ impl Parser {
                     fail_span,
                 ));
             Description::Module(crate::ast::module::ModuleDeclaration {
+                lexical_parent: None,
                 attrs: Vec::new(),
                 kind: crate::ast::module::ModuleKind::Module,
                 lifetime: None,

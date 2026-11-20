@@ -15,6 +15,9 @@ pub enum ModuleKind {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ModuleDeclaration {
+    /// Enclosing module when a nested definition is hoisted (§23.4).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lexical_parent: Option<String>,
     pub attrs: Vec<AttributeInstance>,
     pub kind: ModuleKind,
     pub lifetime: Option<Lifetime>,

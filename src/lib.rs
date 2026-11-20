@@ -265,7 +265,7 @@ pub use value::Value;
 ///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
 /// Preserve observable driver contributions, folded real comparison semantics,
 /// and the identity of input nets used by sampled-value functions.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x52";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x53";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -2181,6 +2181,7 @@ fn parse_and_elaborate(
                     for item in m.items.drain(..) {
                         if let ast::decl::ModuleItem::NestedModule(inner) = item {
                             let mut inner = *inner;
+                            inner.lexical_parent = Some(m.name.name.clone());
                             hoist_nested(&mut inner, out);
                             out.push(inner);
                         } else {
@@ -2344,6 +2345,7 @@ fn parse_and_elaborate(
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
                 let m = ast::module::ModuleDeclaration {
+                    lexical_parent: None,
                     attrs: Vec::new(),
                     kind: ast::module::ModuleKind::Module,
                     lifetime: None,
@@ -4347,6 +4349,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         })
         .collect();
     ast::module::ModuleDeclaration {
+        lexical_parent: None,
         attrs: vec![],
         kind: ast::module::ModuleKind::Module,
         lifetime: None,
