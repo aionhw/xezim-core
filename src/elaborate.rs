@@ -41687,8 +41687,9 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
 /// §7.4.3: the width of one element of the dimension a part-select on the
 /// index chain `base` addresses, when that dimension is not the last: on
 /// `logic [3:0][5:0][7:0] a`, after `a[2]` the range counts 8-bit elements.
-/// The first index of an element of a one-dimensional unpacked array selects
-/// the element. None for a select of bits or a layout not on file.
+/// The first indices of an element of an unpacked array, one per unpacked
+/// dimension, select the element. None for a select of bits or a layout not
+/// on file.
 fn chain_range_elem_width(base: &Expression, elab: &ElaboratedModule) -> Option<u32> {
     use crate::ast::expr::ExprKind as EK;
     let mut cur = base;
@@ -41709,9 +41710,14 @@ fn chain_range_elem_width(base: &Expression, elab: &ElaboratedModule) -> Option<
         .map(|s| s.name.name.as_str())
         .collect::<Vec<_>>()
         .join(".");
-    let (depth, total) = match elab.arrays.get(&name) {
-        Some(&(_, _, elem_w)) => (1, elem_w),
-        None => (0, elab.signals.get(&name)?.width),
+    let (depth, total) = if let Some(&(_, _, elem_w)) = elab.arrays.get(&name) {
+        (1, elem_w)
+    } else if let Some(&(_, _, elem_w)) = elab.arrays_2d.get(&name) {
+        (2, elem_w)
+    } else if let Some((dims, elem_w)) = elab.arrays_nd.get(&name) {
+        (dims.len(), *elem_w)
+    } else {
+        (0, elab.signals.get(&name)?.width)
     };
     let level = layers.checked_sub(depth)?;
     let dims = elab.packed_full_dims.get(&name)?;
