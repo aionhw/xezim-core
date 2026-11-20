@@ -42491,7 +42491,18 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
             if let Some(sig) = elab.signals.get(&name) {
                 return Some(sig.width);
             }
-            elab.parameters.get(&name).map(|v| v.width)
+            // §26.3: a package constant `pk::P` is registered as `pk::P`.
+            elab.parameters
+                .get(&name)
+                .or_else(|| {
+                    (h.path.len() == 2)
+                        .then(|| {
+                            elab.parameters
+                                .get(&format!("{}::{}", h.path[0].name.name, h.path[1].name.name))
+                        })
+                        .flatten()
+                })
+                .map(|v| v.width)
         }
         EK::Index { expr: base, .. } => {
             // A bit-select of a packed vector is 1 bit; an element-select of
@@ -50087,6 +50098,24 @@ fn inline_instantiation_items(
                         )
                         && elab.two_state_signals.contains(&array_formal)
                         && port_actual_may_carry_xz(actual, elab, local_params)
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
+                    // §23.3.3.8, §6.12.1: a real net, variable or parameter
+                    // on an integral formal, or an integral one on a real
+                    // formal, converts through the connection assign. A
+                    // literal is converted in place (`port_literal_for_formal`).
+                    if is_input
+                        && let ExprKind::Ident(h) = &literal_actual.kind
+                        && let Some(n) = whole_net_ident_name(literal_actual)
+                        && let Some(actual_real) = match elab.signals.get(&n) {
+                            Some(s) => Some(s.is_real),
+                            None => port_actual_param(h, local_params, elab).map(|v| v.is_real),
+                        }
+                        && elab
+                            .signals
+                            .get(&array_formal)
+                            .is_some_and(|f| f.is_real != actual_real)
                     {
                         no_subst_ports.insert(pname.clone());
                     }
