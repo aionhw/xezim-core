@@ -13865,11 +13865,13 @@ pub fn elaborate_module_with_defs(
                             // (zero) element, and a bare collection initializer was
                             // dropped.
                             // §10.9.1: retain fixed-array patterns as whole assignments,
-                            // including keyed/default entries and declared direction.
+                            // including keyed/default entries and declared direction, and
+                            // fixed-array concatenations, whose array operands (`{w, 5}`, a row
+                            // `m[1]`) contribute every element in the target's declared order.
                             if (!is_dynamic_dim
                                 && matches!(
                                     peel_unpacked_typed_pattern(init_expr).kind,
-                                    ExprKind::AssignmentPattern(_)
+                                    ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                                 ))
                                 || (is_dynamic_dim
                                     && !matches!(
@@ -20960,11 +20962,13 @@ fn elaborate_items(
                             // (zero) element, and a bare collection initializer was
                             // dropped.
                             // §10.9.1: retain fixed-array patterns as whole assignments,
-                            // including keyed/default entries and declared direction.
+                            // including keyed/default entries and declared direction, and
+                            // fixed-array concatenations, whose array operands (`{w, 5}`, a row
+                            // `m[1]`) contribute every element in the target's declared order.
                             if (!is_dynamic_dim
                                 && matches!(
                                     peel_unpacked_typed_pattern(init_expr).kind,
-                                    ExprKind::AssignmentPattern(_)
+                                    ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                                 ))
                                 || (is_dynamic_dim
                                     && !matches!(
@@ -38498,11 +38502,13 @@ fn inline_instantiations_inner(
                                 // (zero) element, and a bare collection initializer was
                                 // dropped.
                                 // §10.9.1: retain fixed-array patterns as whole assignments,
-                                // including keyed/default entries and declared direction.
+                                // including keyed/default entries and declared direction, and
+                                // fixed-array concatenations, whose array operands (`{w, 5}`, a row
+                                // `m[1]`) contribute every element in the target's declared order.
                                 if (!is_dynamic_dim
                                     && matches!(
                                         peel_unpacked_typed_pattern(init_expr).kind,
-                                        ExprKind::AssignmentPattern(_)
+                                        ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                                     ))
                                     || (is_dynamic_dim
                                         && !matches!(
