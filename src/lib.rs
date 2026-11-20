@@ -263,7 +263,8 @@ pub use value::Value;
 ///         module's time unit, the declared types of packed-array and structure ports, and
 ///         the default actual arguments of named sequences and properties kept in the
 ///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4f";
+// §38.34: compiled artifacts retain observable continuous-driver contributions.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x50";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -3889,6 +3890,7 @@ fn parse_and_elaborate(
     // §6.6.7: fold user-defined nettype drivers — after inlining, so drivers
     // arriving from several instances through ports resolve together with any
     // written in the parent. Must precede the bitwise fold below.
+    elaborate::stage_vpi_net_drivers(&mut elab);
     elaborate::resolve_user_nettype_drivers(&mut elab)?;
     elab_phase("switches and nettype drivers", &mut phase_t);
     // §7.2.2: a whole-struct continuous assign that arrived through inlining

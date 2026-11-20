@@ -4964,6 +4964,10 @@ impl ElaboratedModule {
         for p in pending_initial {
             self.initial_blocks.push(p.materialize());
         }
+        self.materialize_pending_cont_assigns();
+    }
+
+    fn materialize_pending_cont_assigns(&mut self) {
         let pending_ca = std::mem::take(&mut self.pending_cont_assign);
         // One allocation for the lot: growing the table a push at a time
         // copies it at every doubling, old and new buffer held together,
@@ -53324,6 +53328,86 @@ fn retarget_lvalue_net(e: &mut Expression, from: &str, to: &str) {
     }
 }
 
+thread_local! {
+    static VPI_NET_DRIVERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Retain continuous-driver values for an elaboration whose nets can receive
+/// VPI deposits (IEEE 1800-2023 §38.34), including an exported image.
+pub fn set_vpi_net_drivers(enabled: bool) {
+    VPI_NET_DRIVERS.set(enabled);
+}
+
+/// Whether the current elaboration must preserve the value of each driver.
+pub fn vpi_net_drivers() -> bool {
+    VPI_NET_DRIVERS.get()
+}
+
+/// A deposit holds until a driver's value changes. Put the driver's value in
+/// its own signal before resolution folds several contributions together. An
+/// input transition that recomputes the same contribution then has no event
+/// to propagate, even though the visible net differs from that contribution.
+pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
+    if !vpi_net_drivers() {
+        return;
+    }
+    elab.materialize_pending_cont_assigns();
+    let mut seq = 0usize;
+    for mut ca in std::mem::take(&mut elab.continuous_assigns) {
+        let name = whole_net_ident_name_scoped(&ca.lhs, elab);
+        let signal = name
+            .as_deref()
+            .filter(|name| is_net_name(elab, name))
+            .and_then(|name| elab.signals.get(name))
+            .filter(|_| ca.origin.is_some() && !cont_assign_has_own_delay(&ca))
+            .cloned();
+        if let Some(mut signal) = signal {
+            // Keep strength on the contribution consumed by the resolver.
+            let rhs = match &mut ca.rhs {
+                Expression {
+                    kind: ExprKind::SystemCall { name, args },
+                    ..
+                } if matches!(
+                    name.as_str(),
+                    "$__drive" | "$__weak" | "$__pull" | "$__supply"
+                ) =>
+                {
+                    args.first_mut()
+                }
+                rhs => Some(rhs),
+            };
+            if let Some(rhs) = rhs
+                && !matches!(&rhs.kind, ExprKind::Ident(h) if h.path.iter().all(|seg| seg.selects.is_empty()))
+                && !matches!(
+                    &rhs.kind,
+                    ExprKind::Number(_) | ExprKind::AssignmentPattern(_)
+                )
+            {
+                let stage = loop {
+                    let candidate = format!("{}$vpidrv{seq}", signal.name);
+                    seq += 1;
+                    if !elab.signals.contains_key(candidate.as_str()) {
+                        break candidate;
+                    }
+                };
+                let value = std::mem::replace(rhs, make_ident_expr(&stage));
+                signal.name = stage.clone().into();
+                signal.direction = None;
+                // A stage carries the underlying value. Giving it the nettype
+                // again would call that type's resolution function twice.
+                signal.type_name = None;
+                elab.signals.insert(stage.clone(), signal);
+                let mut producer = ca.clone();
+                producer.lhs = make_ident_expr(&stage);
+                producer.rhs = value;
+                ca.origin = None;
+                elab.continuous_assigns.push(producer);
+            }
+        }
+        elab.continuous_assigns.push(ca);
+    }
+}
+
 /// A stage net that elaboration synthesized to carry delays — a delayed
 /// net's driver side `<net>$netdrv` or per-bit stage `<net>$netbit<i>`
 /// (`apply_net_delays`), a delayed driver's own net `<net>$drv<k>`
@@ -53339,7 +53423,7 @@ pub fn is_delay_stage_net(name: &str) -> bool {
         tail.strip_prefix(p)
             .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
     };
-    tail == "netdrv" || numbered("netbit") || numbered("drv")
+    tail == "netdrv" || numbered("netbit") || numbered("drv") || numbered("vpidrv")
 }
 
 /// §6.7.1 / §10.3.3 / §28.16: apply each recorded NET delay (`wire #2 w;`)
