@@ -267,7 +267,11 @@ pub use value::Value;
 /// bounds, sampled input nets and fill-literal state are preserved in this format.
 /// \x56 retains sampled input-formal identities through simulator aliasing (§16.5.1).
 // §10.9.1: continuous packed array defaults retain their element type.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x57";
+/// \x58 = \x57 + a macro chain inside a `" ... `" region expanded to the end (§22.5.1), each
+///         generate copy's clocking block registered under the copy's name with its clockvar
+///         signals, and an instance's block named from inside the instance (§14.3, §27.4), and
+///         `[N]` sized by an imported parameter next to another package's type N (§26.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x58";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
