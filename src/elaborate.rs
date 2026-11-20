@@ -8806,6 +8806,64 @@ fn port_actual_is_unsigned_concat(e: &Expression) -> bool {
     }
 }
 
+/// The value of a port actual naming a parameter of the connecting scope or
+/// a package constant (`pk::P`, a two-segment path), if it names one.
+fn port_actual_param<'a>(
+    h: &crate::ast::expr::HierarchicalIdentifier,
+    params: &'a HashMap<String, Value>,
+    elab: &'a ElaboratedModule,
+) -> Option<&'a Value> {
+    if h.path.iter().any(|s| !s.selects.is_empty()) {
+        return None;
+    }
+    let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+    let dotted = segs.join(".");
+    params
+        .get(&dotted)
+        .or_else(|| elab.parameters.get(&dotted))
+        .or_else(|| (segs.len() == 2).then(|| elab.parameters.get(&segs.join("::")))?)
+}
+
+/// §6.11.2, §6.6.5: can a simple port actual (`port_actual_is_simple`) read
+/// as X or Z? A 2-state signal or a parameter without X/Z bits cannot. A
+/// literal is answered by its digits. Anything not known to be 2-state can.
+fn port_actual_may_carry_xz(
+    e: &Expression,
+    elab: &ElaboratedModule,
+    params: &HashMap<String, Value>,
+) -> bool {
+    match &e.kind {
+        ExprKind::Paren(inner) => port_actual_may_carry_xz(inner, elab, params),
+        ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+            value.contains(['x', 'X', 'z', 'Z', '?'])
+        }
+        ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => !matches!(c, '0' | '1'),
+        ExprKind::Number(_) | ExprKind::StringLiteral(_) => false,
+        ExprKind::Ident(h) => {
+            if h.path.is_empty() {
+                return true;
+            }
+            let name = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if elab.signals.contains_key(&name) {
+                return !elab.two_state_signals.contains(&name);
+            }
+            port_actual_param(h, params, elab).is_none_or(Value::has_xz)
+        }
+        ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. } => port_actual_may_carry_xz(expr, elab, params),
+        ExprKind::Concatenation(parts) | ExprKind::Replication { exprs: parts, .. } => parts
+            .iter()
+            .any(|p| port_actual_may_carry_xz(p, elab, params)),
+        _ => true,
+    }
+}
+
 /// Where a §6.21 violation was found, for the diagnostic.
 #[derive(Clone, Copy)]
 pub(crate) struct StaticInitScope<'a> {
@@ -50008,6 +50066,28 @@ fn inline_instantiation_items(
                     // select of one, a literal, a concatenation of those) is
                     // substituted.
                     if is_input && !port_actual_is_simple(actual, local_params, &elab.parameters) {
+                        no_subst_ports.insert(pname.clone());
+                    }
+                    let mut literal_actual: &Expression = actual;
+                    while let ExprKind::Paren(inner) = &literal_actual.kind {
+                        literal_actual = inner;
+                    }
+                    // §6.11.2, §23.3.3.8: a 2-state formal reads its actual
+                    // through an assignment that maps X and Z to 0.
+                    // Substituting a 4-state net, variable or X-bearing
+                    // parameter renamed the formal onto it, so the body read
+                    // the X and Z bits (`input var bit [3:0] b` bound to a
+                    // `logic` holding 4'b1x01 printed 1x01). Keep the formal,
+                    // whose connection assign converts. A literal actual is
+                    // converted in place instead (`port_literal_for_formal`).
+                    if is_input
+                        && !matches!(
+                            literal_actual.kind,
+                            ExprKind::Number(_) | ExprKind::StringLiteral(_)
+                        )
+                        && elab.two_state_signals.contains(&array_formal)
+                        && port_actual_may_carry_xz(actual, elab, local_params)
+                    {
                         no_subst_ports.insert(pname.clone());
                     }
                     // §23.3.3.8: "The sign attribute shall not cross hierarchy".
