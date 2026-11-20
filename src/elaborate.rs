@@ -50184,15 +50184,23 @@ fn inline_instantiation_items(
                         no_subst_ports.insert(pname.clone());
                     }
                     // §6.6.5: a high-impedance driver lets the pull value win.
+                    // §6.6.4: a trireg holds its charge on the bits no driver
+                    // drives. Either needs the formal's own net when the
+                    // actual can carry Z: a Z-bearing literal, a 4-state
+                    // variable, a parameter or a concatenation. A whole net
+                    // collapses with the formal into the dominating net type
+                    // instead (§23.3.3.7, see `port_aliases`).
                     if is_input
-                        && matches!(
-                            &fill_actual.kind,
-                            ExprKind::Number(NumberLiteral::Integer { value, .. })
-                                if value.contains(['z', 'Z', '?'])
-                        )
+                        && port_actual_may_carry_xz(fill_actual, elab, local_params)
+                        && !whole_net_ident_name_scoped(actual, elab)
+                            .is_some_and(|n| is_net_name(elab, &n))
                         && matches!(
                             elab.resolved_net_kinds.get(&array_formal),
-                            Some(ResolvedNetKind::Tri0 | ResolvedNetKind::Tri1)
+                            Some(
+                                ResolvedNetKind::Tri0
+                                    | ResolvedNetKind::Tri1
+                                    | ResolvedNetKind::ChargeStorage
+                            )
                         )
                     {
                         no_subst_ports.insert(pname.clone());
