@@ -266,7 +266,8 @@ pub use value::Value;
 /// Driver contributions, net-cell resolution, delayed structures, interface-array
 /// bounds, sampled input nets and fill-literal state are preserved in this format.
 /// \x56 retains sampled input-formal identities through simulator aliasing (§16.5.1).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x56";
+// §10.9.1: continuous packed array defaults retain their element type.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x57";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

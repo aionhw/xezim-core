@@ -5018,15 +5018,7 @@ impl ElaboratedModule {
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.
-            match whole_array_assign_parts_dir_with_params(
-                &ca.lhs,
-                &ca.rhs,
-                ca.delay,
-                &self.arrays,
-                Some(&self.descending_arrays),
-                Some(&self.unpacked_decl_dims),
-                Some(&self.parameters),
-            )
+            match self.whole_array_driver_parts(&ca.lhs, &ca.rhs, ca.delay, &self.unpacked_decl_dims)
             .or_else(|| {
                 slice_array_assign_parts(
                     &ca.lhs,
@@ -55787,7 +55779,7 @@ pub fn whole_array_assign_parts_dir_with_params(
     let pattern = peel_unpacked_typed_pattern(rhs);
     if let ExprKind::AssignmentPattern(_) = &pattern.kind {
         return pattern_array_assign_parts(
-            lhs, pattern, delay, arrays, descending, decl_dims, params,
+            lhs, pattern, delay, arrays, descending, decl_dims, params, None,
         );
     }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
@@ -56097,6 +56089,46 @@ pub fn whole_array_row_assign_parts(
     )
 }
 
+impl ElaboratedModule {
+    /// §10.9.1: retain the declared packed element type when an inherited
+    /// default reaches the leaves of a continuous unpacked-array driver.
+    pub fn whole_array_driver_parts(
+        &self,
+        lhs: &Expression,
+        rhs: &Expression,
+        delay: u64,
+        decl_dims: &HashMap<String, Vec<(i64, i64)>>,
+    ) -> Option<Vec<ContinuousAssignment>> {
+        let pattern = peel_unpacked_typed_pattern(rhs);
+        if matches!(pattern.kind, ExprKind::AssignmentPattern(_)) {
+            let name = whole_net_ident_name(lhs)?;
+            let element = self.var_decl_types.get(&name).filter(|ty| {
+                pattern_slot_is_aggregate(ty, &self.typedef_types) == Some(true)
+                    && !matches!(resolve_typedef_chain(ty, &self.typedef_types), DataType::Struct(s) if !s.packed)
+            });
+            return pattern_array_assign_parts(
+                lhs,
+                pattern,
+                delay,
+                &self.arrays,
+                Some(&self.descending_arrays),
+                Some(decl_dims),
+                Some(&self.parameters),
+                element,
+            );
+        }
+        whole_array_assign_parts_dir_with_params(
+            lhs,
+            rhs,
+            delay,
+            &self.arrays,
+            Some(&self.descending_arrays),
+            Some(decl_dims),
+            Some(&self.parameters),
+        )
+    }
+}
+
 /// §10.3 / §10.9: `assign arr = '{...};` — a continuous assignment of an
 /// assignment pattern to a whole unpacked array drives each element with
 /// its item: positional (`'{3, 4}`, the first item at the LEFT bound),
@@ -56111,6 +56143,7 @@ fn pattern_array_assign_parts(
     descending: Option<&HashSet<String>>,
     decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
     params: Option<&HashMap<String, Value>>,
+    packed_element: Option<&DataType>,
 ) -> Option<Vec<ContinuousAssignment>> {
     let ExprKind::Ident(lh) = &lhs.kind else {
         return None;
@@ -56137,16 +56170,20 @@ fn pattern_array_assign_parts(
     if total > 4096 {
         return None;
     }
-    let mut out: Vec<(Vec<i64>, Expression)> = Vec::new();
+    let mut out: Vec<(Vec<i64>, Expression, bool)> = Vec::new();
     pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out, params)?;
     Some(
         out.into_iter()
-            .map(|(idx, e)| ContinuousAssignment {
+            .map(|(idx, e, inherited)| ContinuousAssignment {
                 gate_delay_fall: None,
                 delay_select: None,
                 origin: None,
                 lhs: make_multi_index_expr(ln, &idx),
-                rhs: e,
+                rhs: if inherited {
+                    packed_default_value(e, packed_element)
+                } else {
+                    e
+                },
                 delay,
                 rhs_parent_scoped: false,
                 delay_fall: None,
@@ -56156,20 +56193,56 @@ fn pattern_array_assign_parts(
     )
 }
 
+/// Put the leaf in a one-element packed array of its own type. Applying
+/// `default:` to that element lets the ordinary packed pattern evaluator
+/// store a matching value whole or descend into its members (§10.9.1).
+fn packed_default_value(value: Expression, element: Option<&DataType>) -> Expression {
+    let Some(mut ty) = element.cloned() else {
+        return value;
+    };
+    let dimensions = match &mut ty {
+        DataType::IntegerVector { dimensions, .. }
+        | DataType::Implicit { dimensions, .. }
+        | DataType::TypeReference { dimensions, .. } => dimensions,
+        DataType::Struct(s) => &mut s.dimensions,
+        DataType::Enum(e) => &mut e.dimensions,
+        _ => return value,
+    };
+    let span = value.span;
+    dimensions.insert(
+        0,
+        PackedDimension::Range {
+            left: Box::new(make_udp_int_expr(0)),
+            right: Box::new(make_udp_int_expr(0)),
+            span,
+        },
+    );
+    Expression::new(
+        ExprKind::TypedPattern {
+            ty: Box::new(ty),
+            pattern: Box::new(Expression::new(
+                ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(value)]),
+                span,
+            )),
+        },
+        span,
+    )
+}
+
 /// The element assignments of pattern `e` over the dimensions `dims`
 /// (declared `(left, right)`, outermost first), below index prefix `idx`.
 fn pattern_leaves(
     e: &Expression,
     dims: &[(i64, i64)],
     idx: &mut Vec<i64>,
-    out: &mut Vec<(Vec<i64>, Expression)>,
+    out: &mut Vec<(Vec<i64>, Expression, bool)>,
     params: Option<&HashMap<String, Value>>,
 ) -> Option<()> {
     let Some(&(l, r)) = dims.first() else {
         if matches!(e.kind, ExprKind::AssignmentPattern(_)) {
             return None;
         }
-        out.push((idx.clone(), e.clone()));
+        out.push((idx.clone(), e.clone(), false));
         return Some(());
     };
     let ExprKind::AssignmentPattern(items) = &peel_unpacked_typed_pattern(e).kind else {
@@ -56244,10 +56317,10 @@ fn default_leaves(
     d: &Expression,
     dims: &[(i64, i64)],
     idx: &mut Vec<i64>,
-    out: &mut Vec<(Vec<i64>, Expression)>,
+    out: &mut Vec<(Vec<i64>, Expression, bool)>,
 ) {
     let Some(&(l, r)) = dims.first() else {
-        out.push((idx.clone(), d.clone()));
+        out.push((idx.clone(), d.clone(), true));
         return;
     };
     for i in l.min(r)..=l.max(r) {
@@ -56283,15 +56356,7 @@ fn expand_whole_array_assign(
     delay: u64,
     elab: &mut ElaboratedModule,
 ) -> bool {
-    match whole_array_assign_parts_dir_with_params(
-        lhs,
-        rhs,
-        delay,
-        &elab.arrays,
-        Some(&elab.descending_arrays),
-        Some(&elab.unpacked_decl_dims),
-        Some(&elab.parameters),
-    )
+    match elab.whole_array_driver_parts(lhs, rhs, delay, &elab.unpacked_decl_dims)
     .or_else(|| {
         slice_array_assign_parts(
             lhs,
