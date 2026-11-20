@@ -47672,6 +47672,9 @@ fn inline_module_items(
                     // an indexed SCOPE (`g[1].w`, §27.6) names a whole net, so
                     // it does get one.
                     if let Some(actual) = whole_net_ident_name_scoped(parent_expr, elab).or_else(|| {
+                        if prepared_sub.port_directions.get(port_name) != Some(&PortDirection::Inout) {
+                            return None;
+                        }
                         let (cell, base) = fixed_net_cell(elab, parent_expr)?;
                         elab.nets.insert(cell.clone());
                         if let Some(k) = elab.resolved_net_kinds.get(base.as_str()).cloned() {
@@ -54505,19 +54508,41 @@ fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) {
     {
         return;
     }
-    // Keep unrelated instance assignments lazy.
+    // Only cells that need net resolution get scalar driver names. Ordinary
+    // stores retain the element type and the port keeps its connection copy.
+    let mut seen = HashSet::default();
+    let mut resolve = HashSet::default();
+    let mut count = |lhs: &Expression| {
+        if let Some((cell, base)) = fixed_net_cell(elab, lhs) {
+            if !seen.insert(cell.clone())
+                || elab.resolved_net_kinds.contains_key(base.as_str())
+                || elab.net_port_merges.values().any(|actual| actual == &cell)
+            {
+                resolve.insert(cell);
+            }
+        }
+    };
+    for ca in &elab.continuous_assigns {
+        count(&ca.lhs);
+    }
+    for p in &elab.pending_cont_assign {
+        count(&p.materialize_lhs());
+    }
+    if resolve.is_empty() {
+        return;
+    }
     for p in std::mem::take(&mut elab.pending_cont_assign) {
-        if fixed_net_cell(elab, &p.materialize_lhs()).is_some() {
-            elab.continuous_assigns
-                .push(p.materialize(&elab.parameters));
+        if fixed_net_cell(elab, &p.materialize_lhs()).is_some_and(|(cell, _)| resolve.contains(&cell)) {
+            elab.continuous_assigns.push(p.materialize(&elab.parameters));
         } else {
             elab.pending_cont_assign.push(p);
         }
     }
     let mut assignments = std::mem::take(&mut elab.continuous_assigns);
     for ca in &mut assignments {
-        register_fixed_net_cell(elab, &mut ca.lhs);
-        register_fixed_net_cell(elab, &mut ca.rhs);
+        if fixed_net_cell(elab, &ca.lhs).is_some_and(|(cell, _)| resolve.contains(&cell)) {
+            register_fixed_net_cell(elab, &mut ca.lhs);
+        }
     }
     elab.continuous_assigns = assignments;
 }
