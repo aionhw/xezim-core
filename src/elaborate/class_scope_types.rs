@@ -7,7 +7,7 @@
 //! as a class scope (`C::hw_t` with `parameter type C = cfg_t`) names the
 //! class it is bound to.
 
-use super::{TYPEDEF_SHAPES_TLS, member_access_chain_as_scopes};
+use super::{TYPEDEF_SHAPES_TLS, member_access_chain_as_scopes, parse_spec_args};
 use crate::ast::Description;
 use crate::ast::Identifier;
 use crate::ast::decl::{ClassDeclaration, ClassItem, ModuleItem, PackageItem, ParameterKind};
@@ -349,6 +349,34 @@ fn arg_type_name(e: &Expression) -> Option<(TypeName, Vec<Expression>)> {
                 },
                 Vec::new(),
             ))
+        }
+        // A specialization of a class written as the argument
+        // (`E#(cfgw#(8))::hw_t`): the class with its own arguments.
+        ExprKind::Specialization {
+            base,
+            type_args_text,
+        } => {
+            let (name, args) = arg_type_name(base)?;
+            if !args.is_empty() {
+                return None;
+            }
+            let args = parse_spec_args(type_args_text)
+                .into_iter()
+                .map(|(n, v)| match n {
+                    Some(n) => Some(Expression::new(
+                        ExprKind::NamedArg {
+                            name: Identifier {
+                                name: n,
+                                span: e.span,
+                            },
+                            expr: v.map(Box::new),
+                        },
+                        e.span,
+                    )),
+                    None => v,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((name, args))
         }
         ExprKind::MemberAccess { .. } => {
             let (scopes, leaf) = member_access_chain_as_scopes(e)?;
