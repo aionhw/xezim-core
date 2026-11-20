@@ -2,7 +2,8 @@
 //! path and whether the formal is 2-state, which sets the value the port's
 //! time-0 update starts from (0 for `bit`, unknown for `logic` or `wire`).
 //! The simulator needs it for elided ports, whose own net and type entries
-//! are gone; a scalar ANSI port is not in `two_state_signals` either.
+//! are gone. A 2-state formal is renamed only to a 2-state actual: one that
+//! can carry X or Z keeps the formal (§6.11.2), so `ub` and `un` connect `b`.
 
 fn elaborate(src: &str) -> xezim_core::ElaboratedModule {
     xezim_core::parse_and_elaborate_multi(
@@ -35,10 +36,11 @@ module kn (c);
 endmodule
 module top;
   logic s = 0;
+  bit b = 0;
   kl ul (.c(s));
-  kb ub (.c(s));
+  kb ub (.c(b));
   kw uw (.c(s));
-  kn un (.c(s));
+  kn un (.c(b));
 endmodule
 "#,
     );
