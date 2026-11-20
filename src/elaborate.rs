@@ -41228,6 +41228,12 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
                     }
                 }
             }
+            // §7.4.3, §11.5.1: after an index the range selects elements of
+            // the NEXT dimension: `.o(a[2][4:2])` on `logic [3:0][5:0][7:0] a`
+            // is three 8-bit elements, 24 bits, not 3.
+            if let Some(ew) = chain_range_elem_width(base, elab) {
+                return Some(count * ew);
+            }
             Some(count)
         }
         EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
@@ -41240,6 +41246,46 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// §7.4.3: the width of one element of the dimension a part-select on the
+/// index chain `base` addresses, when that dimension is not the last: on
+/// `logic [3:0][5:0][7:0] a`, after `a[2]` the range counts 8-bit elements.
+/// The first index of an element of a one-dimensional unpacked array selects
+/// the element. None for a select of bits or a layout not on file.
+fn chain_range_elem_width(base: &Expression, elab: &ElaboratedModule) -> Option<u32> {
+    use crate::ast::expr::ExprKind as EK;
+    let mut cur = base;
+    let mut layers = 0usize;
+    while let EK::Index { expr, .. } = &cur.kind {
+        cur = expr;
+        layers += 1;
+    }
+    let EK::Ident(h) = &cur.kind else {
+        return None;
+    };
+    if layers == 0 {
+        return None;
+    }
+    let name = h
+        .path
+        .iter()
+        .map(|s| s.name.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let (depth, total) = match elab.arrays.get(&name) {
+        Some(&(_, _, elem_w)) => (1, elem_w),
+        None => (0, elab.signals.get(&name)?.width),
+    };
+    let level = layers.checked_sub(depth)?;
+    let dims = elab.packed_full_dims.get(&name)?;
+    let counts: Vec<u64> = dims.iter().map(|&(l, r)| l.abs_diff(r) + 1).collect();
+    if dims.len() <= level + 1 || counts.iter().product::<u64>() != u64::from(total) {
+        return None;
+    }
+    u32::try_from(counts[level + 1..].iter().product::<u64>())
+        .ok()
+        .filter(|&w| w > 1)
 }
 
 /// Warn once per (module, port) about a width-mismatched connection. §23.3.3
