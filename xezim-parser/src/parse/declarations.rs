@@ -603,13 +603,22 @@ impl Parser {
             .unwrap_or(PortDirection::Input);
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         // Optional shared data type (implicit 1-bit when omitted, e.g. `input x;`).
+        // §13.4, A.2.7: a tf_port_declaration takes a data_type_or_implicit,
+        // and a user-defined type may carry packed dimensions (A.2.2.1:
+        // `type_identifier { packed_dimension }`), so `input s_t [1:0] in;`
+        // names the type `s_t`. Look past the bracket groups as a module's
+        // non-ANSI port declaration does: an identifier there is the port
+        // name; `input x [3:0];` is a port `x` with an unpacked dimension.
+        // Taking `s_t` as the port left `in;` behind as an expression
+        // statement, so the body's next declaration was reported as
+        // following a statement (§9.3.1).
         let data_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
             self.parse_data_type()
         } else if self.at(TokenKind::Identifier)
-            && matches!(
+            && (matches!(
                 self.peek_kind(),
                 TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
-            )
+            ) || (self.peek_kind() == TokenKind::LBracket && self.dims_then_identifier(1)))
         {
             self.parse_data_type()
         } else if self.at(TokenKind::LBracket) {
