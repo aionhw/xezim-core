@@ -259,6 +259,10 @@ pub use value::Value;
 /// \x4f = \x4e + a named assignment pattern key carries its lexically bound type name, real and
 ///         realtime type keys are one type (§10.9.1, §26.3, §6.12), and aliased nets of a
 ///         user-defined nettype resolve as one net (§10.11, §6.6.7).
+///         Also typedefs of real classified as real, UDP instance delays in the holding
+///         module's time unit, the declared types of packed-array and structure ports, and
+///         the default actual arguments of named sequences and properties kept in the
+///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
 pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4f";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
