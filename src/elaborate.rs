@@ -63116,9 +63116,10 @@ mod prepared_callable_ownership_tests {
     }
 
     /// §20.8.1, §11.7, §20.6.2: a value system function of a parameter folds
-    /// per instance; a `$signed`/`$unsigned` whose reinterpretation at the
-    /// operand's own width differs from the plain value is not folded; a
-    /// query, with everything inside it, is left to the run time.
+    /// per instance; `$signed`/`$unsigned` reinterpret the operand at its own
+    /// width (`$signed` of an 8-bit `8'hff` is -1); a query of a parameter
+    /// folds to its type's width, and a query of a variable is left to the
+    /// run time.
     #[test]
     fn dimension_fold_value_system_functions() {
         let original = module_items(
@@ -63130,6 +63131,8 @@ mod prepared_callable_ownership_tests {
                  logic [$bits($signed(N))-1:0] d;
                  logic [$countones($signed(P))-1:0] e;
                  logic [($signed(N) > 0 ? 6 : 2)-1:0] f;
+                 logic [7:0] w;
+                 logic [$bits(w)-1:0] g;
                endtask
              endmodule",
         );
@@ -63160,11 +63163,20 @@ mod prepared_callable_ownership_tests {
                 _ => None,
             };
             assert_eq!(folded(0), Some(n.trailing_zeros() as i64 - 1));
-            assert_eq!(folded(1), None, "$signed of 8'hff must not fold as 255");
+            assert_eq!(folded(1), Some(7), "$signed of 8'hff is -1, not 255");
             assert_eq!(folded(2), Some(254));
-            assert_eq!(folded(3), None, "a query must stay for the run time");
-            assert_eq!(folded(4), None, "$countones($signed(8'hff)) must not count 64 bits");
+            assert_eq!(folded(3), Some(31), "$bits of the 32-bit N");
+            assert_eq!(
+                folded(4),
+                Some(7),
+                "$countones($signed(8'hff)) counts 8 bits"
+            );
             assert_eq!(folded(5), Some(5));
+            assert_eq!(
+                folded(7),
+                None,
+                "a query of a variable stays for the run time"
+            );
         }
     }
 
