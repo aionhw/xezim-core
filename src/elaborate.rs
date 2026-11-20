@@ -41392,10 +41392,12 @@ struct InlineCache {
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
     /// Cache-disabled shared source bodies keyed by original `Arc` pointer,
     /// avoiding repeated cloning/interning across sibling instances (#193).
+    /// The source is held weakly: a prepared body released after its
+    /// instance is freed, and the entry still keeps its address from reuse.
     shared_callable_sources: HashMap<
         usize,
         (
-            std::sync::Arc<Vec<Statement>>,
+            std::sync::Weak<Vec<Statement>>,
             crate::ast::shared_vec::SharedVec<Statement>,
         ),
     >,
@@ -41441,7 +41443,7 @@ impl InlineCache {
     ) -> crate::ast::shared_vec::SharedVec<Statement> {
         let ptr = std::sync::Arc::as_ptr(source.as_arc()) as usize;
         if let Some((orig, shared)) = self.shared_callable_sources.get(&ptr)
-            && std::sync::Arc::ptr_eq(orig, source.as_arc())
+            && std::sync::Weak::ptr_eq(orig, &std::sync::Arc::downgrade(source.as_arc()))
         {
             return shared.clone();
         }
@@ -41449,7 +41451,7 @@ impl InlineCache {
         let interned = self.callable_bodies.intern(disabled);
         self.shared_callable_sources.insert(
             ptr,
-            (std::sync::Arc::clone(source.as_arc()), interned.clone()),
+            (std::sync::Arc::downgrade(source.as_arc()), interned.clone()),
         );
         interned
     }
