@@ -1003,6 +1003,26 @@ impl CallableRewriteCtx {
         ports: &[crate::ast::decl::FunctionPort],
         source_items: &[Statement],
     ) -> Vec<Statement> {
+        self.rewrite_body(ports, source_items, false)
+    }
+
+    /// The rewrite of `materialize_body` done while the instance is inlined,
+    /// for a body `callable_body_names_scopes` keeps out of the shared form:
+    /// only the statement rewrite makes private copies, as it always did.
+    fn rewrite_body_now(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        source_items: &[Statement],
+    ) -> Vec<Statement> {
+        self.rewrite_body(ports, source_items, true)
+    }
+
+    fn rewrite_body(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        source_items: &[Statement],
+        private_rewrite: bool,
+    ) -> Vec<Statement> {
         let mut fn_locals = (*self.ctx.local_names).clone();
         for p in ports {
             fn_locals.remove(&p.name.name);
@@ -1011,7 +1031,7 @@ impl CallableRewriteCtx {
             fn_locals.remove(n);
         }
         let formal_names: Vec<&str> = ports.iter().map(|p| p.name.name.as_str()).collect();
-        let mut items = with_type_bind_tls(&self.ctx, || {
+        let rewrite = || {
             with_shadowed(
                 &formal_names,
                 &self.ctx.port_map,
@@ -1026,6 +1046,13 @@ impl CallableRewriteCtx {
                     )
                 },
             )
+        };
+        let mut items = with_type_bind_tls(&self.ctx, || {
+            if private_rewrite {
+                crate::ast::cache::without_scope_caches(rewrite)
+            } else {
+                rewrite()
+            }
         });
         if let Some(lat) = &self.local_array_typedefs {
             let prefix = &self.ctx.prefix;
@@ -1056,6 +1083,70 @@ impl CallableRewriteCtx {
         }
         substitute_type_params_stmts(items, &self.ctx.type_binds, &self.ctx.prefix)
     }
+}
+
+/// §23.8, §23.8.1: whether rewriting `items` into an instance consults the
+/// instance tree: a dotted or rooted name or a member access, which the
+/// rewrite may resolve upward or downward through the hierarchy, a call the
+/// binder left to the hierarchy, or a hierarchical `disable`. The tree
+/// grows while the design is inlined, and an instance joins it only after
+/// its own subroutines were rewritten, so such a body is rewritten into its
+/// instance right away, against the tree as it stands then (#193).
+fn callable_body_names_scopes(items: &[Statement]) -> bool {
+    // `for_each_stmt_expr` reaches the expressions of nested statements; a
+    // `disable` or a local `typedef` at any depth needs its own walk.
+    fn statement_names_scopes(s: &Statement) -> bool {
+        use crate::ast::stmt::StatementKind as K;
+        let nested = |st: &Statement| statement_names_scopes(st);
+        match &s.kind {
+            K::Disable(h) => h.path.len() >= 2 || h.root.is_some(),
+            K::Typedef(_) => true,
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => stmts.iter().any(nested),
+            K::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => nested(then_stmt) || else_stmt.as_deref().is_some_and(nested),
+            K::Case { items, .. } => items.iter().any(|it| nested(&it.stmt)),
+            K::RandCase { items } => items.iter().any(|(_, st)| nested(st)),
+            K::Assertion(a) => [&a.action, &a.else_action]
+                .into_iter()
+                .flatten()
+                .any(|st| nested(st)),
+            K::WaitOrder { pass, fail, .. } => {
+                [pass, fail].into_iter().flatten().any(|st| nested(st))
+            }
+            K::For { body, .. }
+            | K::Foreach { body, .. }
+            | K::ForeachTail { body, .. }
+            | K::Forever { body }
+            | K::ForeverTail { body }
+            | K::RsAction { body }
+            | K::While { body, .. }
+            | K::DoWhile { body, .. }
+            | K::Repeat { body, .. }
+            | K::TimingControl { stmt: body, .. }
+            | K::Wait { stmt: body, .. } => nested(body),
+            _ => false,
+        }
+    }
+    items.iter().any(|s| {
+        let mut hit = statement_names_scopes(s);
+        if !hit {
+            for_each_stmt_expr(s, &mut |e| {
+                for_each_sub_expr(e, &mut |x| match &x.kind {
+                    ExprKind::Ident(h)
+                        if h.path.len() >= 2 || h.root.is_some() || h.bound.is_upward() =>
+                    {
+                        hit = true
+                    }
+                    ExprKind::MemberAccess { .. } => hit = true,
+                    _ => {}
+                })
+            });
+        }
+        hit
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -50437,10 +50528,20 @@ fn inline_instantiation_items(
                             }
                         }
                         let key = new_fd.name.name.name.clone();
-                        new_fd.items = cache.share_callable_source(&fd.items);
-                        elab.functions.insert(key.clone(), new_fd);
-                        if let Some(cctx) = &callable_ctx {
-                            elab.deferred_function_bodies.insert(key, Rc::clone(cctx));
+                        match &callable_ctx {
+                            Some(cctx) if callable_body_names_scopes(&fd.items) => {
+                                new_fd.items = cache.callable_bodies.intern(
+                                    cctx.rewrite_body_now(&fd.ports, &fd.items).into(),
+                                );
+                                elab.functions.insert(key, new_fd);
+                            }
+                            _ => {
+                                new_fd.items = cache.share_callable_source(&fd.items);
+                                elab.functions.insert(key.clone(), new_fd);
+                                if let Some(cctx) = &callable_ctx {
+                                    elab.deferred_function_bodies.insert(key, Rc::clone(cctx));
+                                }
+                            }
                         }
                     }
                     // §16.6/§16.8: a named property or sequence of an INLINED
@@ -50550,10 +50651,20 @@ fn inline_instantiation_items(
                             }
                         }
                         let key = new_td.name.name.name.clone();
-                        new_td.items = cache.share_callable_source(&td.items);
-                        elab.tasks.insert(key.clone(), new_td);
-                        if let Some(cctx) = &callable_ctx {
-                            elab.deferred_task_bodies.insert(key, Rc::clone(cctx));
+                        match &callable_ctx {
+                            Some(cctx) if callable_body_names_scopes(&td.items) => {
+                                new_td.items = cache.callable_bodies.intern(
+                                    cctx.rewrite_body_now(&td.ports, &td.items).into(),
+                                );
+                                elab.tasks.insert(key, new_td);
+                            }
+                            _ => {
+                                new_td.items = cache.share_callable_source(&td.items);
+                                elab.tasks.insert(key.clone(), new_td);
+                                if let Some(cctx) = &callable_ctx {
+                                    elab.deferred_task_bodies.insert(key, Rc::clone(cctx));
+                                }
+                            }
                         }
                     }
                     if let ModuleItem::ClassDeclaration(cd) = sub_item {
