@@ -132,11 +132,14 @@ pub(super) fn fixed_unpacked_index_lists(
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Vec<Vec<i64>>> {
     let dims = normalize_unpacked_dims(dims, params, typedef_types);
-    let declared = declared_unpacked_dims(&dims, params)?;
+    bounded_declared_index_lists(&declared_unpacked_dims(&dims, params)?)
+}
+
+pub(super) fn bounded_declared_index_lists(declared: &[(i64, i64)]) -> Option<Vec<Vec<i64>>> {
     let mut total: u64 = 1;
     let mut out = Vec::with_capacity(declared.len());
-    for (l, r) in declared {
-        let n = (l - r).unsigned_abs() + 1;
+    for &(l, r) in declared {
+        let n = l.abs_diff(r).checked_add(1)?;
         total = total.saturating_mul(n);
         if total > 4096 {
             return None;
