@@ -5500,7 +5500,14 @@ fn is_const_expr<P: ParamLookup>(expr: &Expression, params: &P) -> bool {
                 .first()
                 .map(|s| s.name.name.as_str())
                 .unwrap_or("");
-            params.contains_key(last) || (hier.path.len() > 1 && params.contains_key(base))
+            params.contains_key(last)
+                || (hier.path.len() > 1 && params.contains_key(base))
+                // §26.3: `p::Info[k].variant` reaches here folded into the
+                // path `p.Info[k].variant` (generate bodies are rewritten
+                // that way); the package parameter is under `p::Info`.
+                || hier.path.get(1).is_some_and(|second| {
+                    params.contains_key(&format!("{base}::{}", second.name.name))
+                })
         }
         ExprKind::Unary { operand, .. } => is_const_expr(operand, params),
         ExprKind::Binary { left, right, .. } => {
@@ -5526,6 +5533,15 @@ fn is_const_expr<P: ParamLookup>(expr: &Expression, params: &P) -> bool {
             // an imported package constant / enum value, resolved by bare name).
             is_const_expr(expr, params)
                 || params.contains_key(&member.name)
+                // §26.3, §6.20: a package parameter named with its package
+                // (`p::Info`, then `p::Info[k].variant`) is a constant
+                // whether or not this scope imports it; its value is under
+                // the scoped key.
+                || matches!(&expr.kind, ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && params.contains_key(&format!("{}::{}", h.path[0].name.name, member.name)))
                 // §8.23: a class-scoped constant (`cls::N`, `cls#(4)::N`).
                 || class_scoped_const(expr, &member.name, params).is_some()
         }
