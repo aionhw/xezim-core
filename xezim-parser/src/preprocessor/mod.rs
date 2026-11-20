@@ -2860,8 +2860,18 @@ impl Preprocessor {
                         }
                         let body = Self::substitute_formals(&def.body, &actuals);
                         let body_pasted = self.apply_token_pasting(&body);
-                        StringifyRegion::note_text(&mut region, &body_pasted);
-                        result.push_str(&body_pasted);
+                        // The text of a macro with arguments keeps the white
+                        // space after its formal list, which separates the
+                        // expansion from a token before the usage. Inside a
+                        // `" region it would become part of the string:
+                        // `` `"x`F(top)`" `` is "xtop.u0".
+                        let text = if region.is_some() {
+                            body_pasted.trim_start()
+                        } else {
+                            &body_pasted
+                        };
+                        StringifyRegion::note_text(&mut region, text);
+                        result.push_str(text);
                     } else {
                         // §22.5.1: a macro defined with a formal list must be
                         // invoked with parentheses, even when empty.
