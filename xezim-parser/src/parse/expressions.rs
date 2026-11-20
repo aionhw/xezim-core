@@ -1,7 +1,7 @@
 //! Expression parsing (IEEE 1800-2017 §A.8) with Pratt precedence climbing.
 
-use super::{Parser, compact_syntax_list};
 use super::items::ConstraintPos;
+use super::{Parser, compact_syntax_list};
 use crate::ast::Identifier;
 use crate::ast::Span;
 use crate::ast::expr::*;
@@ -1293,6 +1293,14 @@ impl Parser {
                         }
                         self.bump();
                     }
+                } else if matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ) {
+                    // §16.13.1, §9.4.2: `clocking_event ::= @ identifier`
+                    // too: `a ##1 @e b` changes the clock to the event `e`.
+                    // The name is the event, not the start of the operand.
+                    let _ = self.parse_hierarchical_identifier();
                 }
                 self.parse_expr_bp(0)
             }
@@ -2316,7 +2324,18 @@ impl Parser {
                         | TokenKind::BitNand
                         | TokenKind::BitNor
                         | TokenKind::BitXnor
+                        | TokenKind::EscapedIdentifier
+                        | TokenKind::RealLiteral
+                        | TokenKind::UnbasedUnsizedLiteral
+                        | TokenKind::StringLiteral
+                        | TokenKind::LBrace
+                        | TokenKind::KwFirst_match
                 ) || (self.in_sva_seq && self.at(TokenKind::At));
+                // A.2.10: the operand is any sequence_expr, so it may also
+                // open with an escaped name, a real, unbased or string
+                // literal, a concatenation (`##1 {a, b} == 2'b11`) or
+                // `first_match(...)`; each of these left a bare delay and
+                // an "unexpected" error at the closing parenthesis.
                 // §16.13.1 / A.2.10: in a sequence the operand may also open
                 // with a clocking event (`clocking_event sequence_expr`), as
                 // in the multiclocked `b ##1 @(posedge clk2) ##1 ##1
