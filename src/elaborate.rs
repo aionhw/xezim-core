@@ -47521,7 +47521,14 @@ fn inline_module_items(
                     // separate object and gets no alias. A net reached through
                     // an indexed SCOPE (`g[1].w`, §27.6) names a whole net, so
                     // it does get one.
-                    if let Some(actual) = whole_net_ident_name_scoped(parent_expr, elab) {
+                    if let Some(actual) = whole_net_ident_name_scoped(parent_expr, elab).or_else(|| {
+                        let (cell, base) = fixed_net_cell(elab, parent_expr)?;
+                        elab.nets.insert(cell.clone());
+                        if let Some(k) = elab.resolved_net_kinds.get(base.as_str()).cloned() {
+                            elab.resolved_net_kinds.insert(cell.clone(), k);
+                        }
+                        Some(cell)
+                    }) {
                         // §23.3.3.2: only a formal that is a NET is merged with
                         // its actual. A formal that declares a VARIABLE
                         // (`input var`) is connected by an implied continuous
@@ -54234,7 +54241,51 @@ pub fn unify_alias_nets(elab: &mut ElaboratedModule) {
     }
 }
 
+/// §7.4.2: a constant subscript on a fixed array of nets names a whole
+/// net cell. A subscript on a packed vector is a part of the same net.
+fn fixed_net_cell(elab: &ElaboratedModule, expr: &Expression) -> Option<(String, String)> {
+    let ExprKind::Index { expr: base, index } = &expr.kind else { return None; };
+    let base = ident_flat_name(base)?;
+    if !elab.nets.contains(base.as_str()) || elab.dynamic_arrays.contains(&base) {
+        return None;
+    }
+    let &(lo, hi, _) = elab.arrays.get(&base)?;
+    let index = const_eval_i64_with_params(index, Some(&elab.parameters))?;
+    (lo..=hi).contains(&index).then(|| (format!("{base}[{index}]"), base))
+}
+
+fn register_fixed_net_cell(elab: &mut ElaboratedModule, expr: &mut Expression) {
+    if let Some((cell, base)) = fixed_net_cell(elab, expr) {
+        elab.nets.insert(cell.clone());
+        if let Some(kind) = elab.resolved_net_kinds.get(base.as_str()).cloned() {
+            elab.resolved_net_kinds.insert(cell.clone(), kind);
+        }
+        *expr = make_ident_expr(&cell);
+    }
+}
+
+fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) {
+    if elab.arrays.is_empty() || !elab.arrays.keys().any(|name| elab.nets.contains(name.as_str())) {
+        return;
+    }
+    // Keep unrelated instance assignments lazy.
+    for p in std::mem::take(&mut elab.pending_cont_assign) {
+        if fixed_net_cell(elab, &p.materialize_lhs()).is_some() {
+            elab.continuous_assigns.push(p.materialize(&elab.parameters));
+        } else {
+            elab.pending_cont_assign.push(p);
+        }
+    }
+    let mut assignments = std::mem::take(&mut elab.continuous_assigns);
+    for ca in &mut assignments {
+        register_fixed_net_cell(elab, &mut ca.lhs);
+        register_fixed_net_cell(elab, &mut ca.rhs);
+    }
+    elab.continuous_assigns = assignments;
+}
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
+    normalize_net_cell_drivers(elab);
     widen_overlapping_select_drivers(elab);
     // §10.11: the names an `alias` statement names are ONE physical net, so
     // a driver of any member of a group is a driver of the group's
