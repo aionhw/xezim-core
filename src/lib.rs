@@ -1900,6 +1900,9 @@ fn parse_and_elaborate(
     oom_trace::checkpoint("prepare.body_types.ready", &[]);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     oom_trace::checkpoint("prepare.package_types.ready", &[]);
+    // §8.25.1: the parameterized classes whose typedefs name a member of a
+    // type parameter, for `Cls#(args)::t` lookups.
+    elaborate::class_scope_types::install(&all_descriptions);
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
     oom_trace::checkpoint("prepare.automatic.ready", &[]);
     scope_tree::build_design(&mut all_descriptions);

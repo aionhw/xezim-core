@@ -17,6 +17,7 @@ use std::rc::Rc;
 pub(crate) mod array_params;
 pub mod bind;
 mod canonical;
+pub(crate) mod class_scope_types;
 mod const_context;
 mod const_function_scope;
 #[cfg(test)]
@@ -6012,6 +6013,33 @@ pub fn specialized_class_scope_width(
     name: &crate::ast::types::TypeName,
     elab: &ElaboratedModule,
 ) -> Option<u32> {
+    specialized_class_scope_width_at(name, elab, 0)
+}
+
+/// `specialized_class_scope_width` after `depth` rewrites of the name.
+fn specialized_class_scope_width_at(
+    name: &crate::ast::types::TypeName,
+    elab: &ElaboratedModule,
+    depth: u32,
+) -> Option<u32> {
+    // §8.25.1, §6.20.3: a typedef naming a member of a type parameter
+    // (`typedef T::m t;`), or a scope that names a class through a type
+    // parameter or typedef (`C::t`, `e_t::t`), is sized as the name it
+    // stands for, which may be a specialization itself (`Cfg#(8)::m`).
+    // The alias applies only where the scoped key is missing, as in
+    // `lookup_scoped_type`.
+    // When the rewritten name does not size, the forms below still apply.
+    if depth < 8
+        && let Some(alt) = class_scope_types::specialized(name).or_else(|| {
+            (!elab.typedefs.contains_key(&name.qualified()))
+                .then(|| class_scope_types::through_alias(name))
+                .flatten()
+        })
+        && let Some(w) = specialized_class_scope_width_at(&alt, elab, depth + 1)
+            .or_else(|| lookup_scoped_type(&alt, &elab.typedefs).copied())
+    {
+        return Some(w);
+    }
     // The scope link carrying `#(...)` args names the specialized class;
     // without one, a link may be a typedef naming a specialization. The
     // links after it (and the classes the typedef nests into) name classes
@@ -7033,11 +7061,39 @@ pub fn lookup_scoped_type<'a, T>(
     name: &crate::ast::types::TypeName,
     table: &'a HashMap<String, T>,
 ) -> Option<&'a T> {
+    lookup_scoped_type_at(name, table, 0)
+}
+
+/// `lookup_scoped_type` after `depth` rewrites of the name (a bound on
+/// alias cycles).
+fn lookup_scoped_type_at<'a, T>(
+    name: &crate::ast::types::TypeName,
+    table: &'a HashMap<String, T>,
+    depth: u32,
+) -> Option<&'a T> {
     if name.scopes.is_empty() {
         return table.get(&name.name.name);
     }
+    const MAX_REWRITES: u32 = 8;
+    // §8.25.1: `Cls#(args)::t` whose typedef names a member of a type
+    // parameter is that argument's member type; the `Cls::t` key below is
+    // the default specialization's.
+    if depth < MAX_REWRITES
+        && let Some(alt) = class_scope_types::specialized(name)
+        && let Some(found) = lookup_scoped_type_at(&alt, table, depth + 1)
+    {
+        return Some(found);
+    }
     table
         .get(&name.qualified())
+        .or_else(|| {
+            // §6.20.3: a type parameter or typedef used as a class scope
+            // (`C::t`) names the class it is bound to.
+            (depth < MAX_REWRITES)
+                .then(|| class_scope_types::through_alias(name))
+                .flatten()
+                .and_then(|alt| lookup_scoped_type_at(&alt, table, depth + 1))
+        })
         .or_else(|| table.get(&name.name.name))
 }
 
