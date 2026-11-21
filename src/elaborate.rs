@@ -54491,16 +54491,7 @@ fn make_net_lhs_expr(name: &str) -> Expression {
         return Expression::new(
             ExprKind::Index {
                 expr: Box::new(make_ident_expr(base)),
-                index: Box::new(Expression::new(
-                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                        size: None,
-                        signed: false,
-                        base: crate::ast::expr::NumberBase::Decimal,
-                        value: idx.to_string(),
-                        cached_val: Default::default(),
-                    }),
-                    Span::dummy(),
-                )),
+                index: Box::new(int_literal(idx, Span::dummy())),
             },
             Span::dummy(),
         );
@@ -54883,7 +54874,9 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     // latter in the writing instance, just as for an indexed port actual.
     let driver_net = |elab: &ElaboratedModule, e: &Expression, scope: &str| {
         if let Some(mut name) = net_base_of(elab, e) {
-            if let Some(short) = name.strip_prefix(&elab.name).and_then(|s| s.strip_prefix('.'))
+            // The parser can retain "$root" as the first path segment.
+            let absolute = name.strip_prefix("$root.").unwrap_or(&name);
+            if let Some(short) = absolute.strip_prefix(&elab.name).and_then(|s| s.strip_prefix('.'))
                 && net_resolver.contains_key(short)
                 && !net_resolver.contains_key(&name)
             {
