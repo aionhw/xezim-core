@@ -879,8 +879,18 @@ pub(crate) fn record_adopted_lib_file(path: std::path::PathBuf, module: &str) {
     }
 }
 
-/// The adopted-library record, in adoption order. Does not clear — a single
-/// CLI run elaborates once.
+/// Forget the library files a previous elaboration adopted and the texts
+/// they were preprocessed to; called at the start of each elaboration.
+fn clear_adopted_libs() {
+    if let Ok(mut v) = adopted_lib_files_cell().lock() {
+        v.clear();
+    }
+    if let Ok(mut t) = adopted_lib_texts_cell().lock() {
+        t.clear();
+    }
+}
+
+/// The adopted-library record of the last elaboration, in adoption order.
 pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
     adopted_lib_files_cell()
         .lock()
@@ -3102,6 +3112,10 @@ fn parse_and_elaborate(
     // A previous elaboration's library files on this thread must not locate
     // this design's spans.
     elaborate::set_elab_library_sources(Default::default());
+    // Nor may the library files it adopted, or the texts they were
+    // preprocessed to, reach this design's `--dump-merged-sv` or VPI model:
+    // both records are process-wide.
+    clear_adopted_libs();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(
             &mut definitions,
