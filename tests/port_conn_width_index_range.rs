@@ -203,13 +203,21 @@ endmodule
 
 #[test]
 fn indexed_range_counts_elements_with_variable_start() {
-    for select in ["pos +: 2", "pos -: 2"] {
-        let src = format!("module sink(input logic [23:0] a); endmodule
+    // The width warning is reported once per (module, port) pair, so each
+    // select connects a sink of its own.
+    for (k, select) in ["pos +: 2", "pos -: 2"].into_iter().enumerate() {
+        let src = format!(
+            "module sink{k}(input logic [23:0] a); endmodule
             module top(input int pos, input logic [3:0][5:0][7:0] words);
-              sink u(words[1][{select}]);
-            endmodule");
+              sink{k} u(words[1][{select}]);
+            endmodule"
+        );
         let messages = diagnostics(&src, "top");
-        assert!(messages.iter().any(|d| d.contains("port width mismatch")
-            && d.contains("16 bit(s)")), "{select}: {messages:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|d| d.contains("port width mismatch") && d.contains("16 bit(s)")),
+            "{select}: {messages:?}"
+        );
     }
 }
