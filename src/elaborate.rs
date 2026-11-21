@@ -28024,17 +28024,14 @@ fn tls_typedef_shape(name: &str) -> TypedefShapeSave {
     })
 }
 
-/// §20.7: register type parameter `name`, bound to `dt` as written and to
-/// `resolved` after typedef resolution, in TYPEDEF_SHAPES_TLS. Its dimensions
+/// §20.7: capture the packed and unpacked shape of a type actual. Its dimensions
 /// are folded in `env`, the scope that wrote them, and a bound typedef brings
 /// its unpacked dimensions (`typedef logic [3:0] ua_t [0:2]`).
-fn tls_register_type_param_shape(
-    name: &str,
+fn type_param_shape(
     dt: &DataType,
-    resolved: &DataType,
+    mut shape: DataType,
     env: &HashMap<String, Value>,
-) {
-    let mut shape = resolved.clone();
+) -> (DataType, Vec<UnpackedDimension>) {
     lsdd_data_type(&mut shape, env);
     let mut unpacked = match dt {
         DataType::TypeReference {
@@ -28057,7 +28054,7 @@ fn tls_register_type_param_shape(
             _ => {}
         }
     }
-    tls_register_typedef_shape(name, &shape, &unpacked);
+    (shape, unpacked)
 }
 
 fn tls_restore_typedef_shape(name: &str, saved: TypedefShapeSave) {
@@ -43479,7 +43476,7 @@ fn scope_override_typerefs(
     prefix: &str,
     typedef_types: &HashMap<String, DataType>,
 ) -> DataType {
-    if prefix.is_empty() || local.is_empty() {
+    if prefix.is_empty() || local.is_empty() || !names_local_typedef(dt, local) {
         return dt.clone();
     }
     let scoped: std::collections::HashSet<String> = local
@@ -45755,27 +45752,34 @@ fn inline_instantiation_items(
                 // registered there for this instance; prior entries restored
                 // after it.
                 let mut saved_type_shapes: Vec<(String, TypedefShapeSave)> = Vec::new();
-                for (tp_name, tp_dt) in &type_overrides {
-                    // §6.20.3: this body's typedefs by their instance keys,
-                    // so the child's own same-named typedefs, bound below,
-                    // cannot capture them.
-                    let scoped_dt = scope_override_typerefs(
-                        tp_dt,
-                        parent_local_typedefs,
-                        prefix,
-                        &elab.typedef_types,
-                    );
-                    let resolved_dt =
-                        resolve_typedef_chain(&scoped_dt, &elab.typedef_types).clone();
-                    let w = resolve_type_width(
-                        &resolved_dt,
-                        Some(scoped_eval_params),
-                        Some(&elab.typedefs),
-                    );
+                // §6.20.3: capture every actual in the instantiating scope before
+                // installing the first child binding. In .A(byte), .B(A), B
+                // takes the parent's A, including its original unpacked shape.
+                let actuals: Vec<_> = type_overrides
+                    .into_iter()
+                    .map(|(name, dt)| {
+                        let scoped = scope_override_typerefs(
+                            &dt,
+                            parent_local_typedefs,
+                            prefix,
+                            &elab.typedef_types,
+                        );
+                        let resolved = resolve_typedef_chain(&scoped, &elab.typedef_types).clone();
+                        let (shape, dims) = type_param_shape(&dt, resolved, scoped_eval_params);
+                        let width = resolve_type_width(
+                            &shape,
+                            Some(scoped_eval_params),
+                            Some(&elab.typedefs),
+                        );
+                        (name, shape, dims, width)
+                    })
+                    .collect();
+                let mut type_overrides = Vec::with_capacity(actuals.len());
+                for (tp_name, resolved_dt, dims, w) in actuals {
                     saved_type_binds.push((
                         tp_name.clone(),
-                        elab.typedefs.get(tp_name).copied(),
-                        elab.typedef_types.get(tp_name).cloned(),
+                        elab.typedefs.get(&tp_name).copied(),
+                        elab.typedef_types.get(&tp_name).cloned(),
                     ));
                     typedefs_insert_traced(
                         &mut elab.typedefs,
@@ -45784,9 +45788,10 @@ fn inline_instantiation_items(
                         w,
                     );
                     // The override's dimensions are the parent's expressions.
-                    saved_type_shapes.push((tp_name.clone(), tls_typedef_shape(tp_name)));
-                    tls_register_type_param_shape(tp_name, tp_dt, &resolved_dt, scoped_eval_params);
-                    elab.typedef_types.insert(tp_name.clone(), resolved_dt);
+                    saved_type_shapes.push((tp_name.clone(), tls_typedef_shape(&tp_name)));
+                    tls_register_typedef_shape(&tp_name, &resolved_dt, &dims);
+                    elab.typedef_types.insert(tp_name.clone(), resolved_dt.clone());
+                    type_overrides.push((tp_name, resolved_dt));
                 }
 
                 // Helper to add parameters from a list of items.
@@ -46863,12 +46868,9 @@ fn inline_instantiation_items(
                                             tls_typedef_shape(&a.name.name),
                                         ));
                                     }
-                                    tls_register_type_param_shape(
-                                        &a.name.name,
-                                        def_dt,
-                                        &resolved_dt,
-                                        &sub_local_params,
-                                    );
+                                    let (shape, dims) =
+                                        type_param_shape(def_dt, resolved_dt, &sub_local_params);
+                                    tls_register_typedef_shape(&a.name.name, &shape, &dims);
                                 }
                             }
                         }
@@ -50523,24 +50525,16 @@ fn inline_instantiation_items(
                 for p_decl in sub_mod.params_and_body_types() {
                     if let ParameterKind::Type { assignments } = &p_decl.kind {
                         for a in assignments {
-                            // §6.20.3: an override names this body's typedefs
-                            // by their instance keys, which outlive the
-                            // inlining (the default is the child's own).
-                            let dt = type_overrides
+                            let resolved = type_overrides
                                 .iter()
                                 .find(|(n, _)| n == &a.name.name)
-                                .map(|(_, d)| {
-                                    scope_override_typerefs(
-                                        d,
-                                        parent_local_typedefs,
-                                        prefix,
-                                        &elab.typedef_types,
-                                    )
-                                })
-                                .or_else(|| a.init.clone());
-                            if let Some(dt) = dt {
-                                let mut resolved =
-                                    resolve_typedef_chain(&dt, &elab.typedef_types).clone();
+                                .map(|(_, dt)| dt.clone())
+                                .or_else(|| {
+                                    a.init.as_ref().map(|dt| {
+                                        resolve_typedef_chain(dt, &elab.typedef_types).clone()
+                                    })
+                                });
+                            if let Some(mut resolved) = resolved {
                                 // Same fold as the scoped alias below. Statement
                                 // substitution (`word_t'(imm)`) bakes this
                                 // binding in, and a later eval of `Cfg.W`
