@@ -291,7 +291,9 @@ pub use value::Value;
 ///         assignments of unpacked concatenations (§6.8, §10.3, §10.10), and time reads and time
 ///         literals of continuous assignments in the declaring module's unit (§3.14.2.3, §5.8).
 /// \x69 retains scoped runtime driver delays, shortreal metadata and full packed memory widths.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x69";
+/// \x6A records the packed shape of the top module's ANSI ports (§7.4.1, §7.2) and keeps a
+///         shortreal input formal's own storage for a real actual (§6.12, §23.3.3.8).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6A";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
