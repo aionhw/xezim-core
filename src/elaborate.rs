@@ -16086,9 +16086,7 @@ pub fn elaborate_module_with_defs(
         elab.program_initial_blocks.extend(initials);
     }
 
-    if let Some(error) = PACKED_WIDTH_ERROR.with(|slot| slot.take()) {
-        return Err(error);
-    }
+    check_packed_widths()?;
     Ok(elab)
 }
 
@@ -22268,8 +22266,7 @@ fn count_byte_occurrences(blob: &[u8], needle: &[u8]) -> usize {
 /// drops variables referenced nowhere, so a leftover multi-megabit debug
 /// array (a real customer-BFM pattern) neither warns nor allocates there.
 /// Returns Some(filtered copy) when at least one declarator was elided.
-/// Guards: packed width beyond `SANE_MAX_PACKED_WIDTH` (probed QUIETLY, so
-/// the kept path still warns exactly as before), no initializer, no
+/// Guards: a large packed width (probed without recording diagnostics), no initializer, no
 /// unpacked dimensions, and the name's serialized-AST occurrence count is
 /// exactly the declarator itself.
 fn filter_dead_giant_declarators(
@@ -22318,19 +22315,18 @@ fn filter_dead_giant_declarators(
     Some(filtered)
 }
 
-// Combine packed-dimension widths with saturating math and clamp the result to
-// `SANE_MAX_PACKED_WIDTH`, warning once PER DISTINCT DETAIL when an absurd
-// width is suppressed. `detail` carries whatever identity the call site can
-// cheaply assemble (offending range bounds, parameter names + resolved
-// values, source byte offset) so the user can find the declaration — a bare
-// "somewhere a width underflowed" was unactionable on customer designs.
 thread_local! {
-    /// Pre-elaboration scans (xezim's should-fail lint) resolve widths on the
-    /// RAW AST — before dead-declaration elision has decided anything — so
-    /// their clamp calls must not emit user-facing warnings. Elaboration
-    /// proper re-resolves every KEPT declaration and warns there.
+    // Width queries also run speculatively; report the first over-limit
+    // declaration encountered when elaborating the selected hierarchy.
     static PACKED_WIDTH_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static SUPPRESS_WIDTH_WARNINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn check_packed_widths() -> Result<(), String> {
+    PACKED_WIDTH_ERROR.with(|slot| match slot.take() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    })
 }
 
 /// Scoped suppression of `clamp_packed_width` warnings (clamping itself is
@@ -37497,6 +37493,7 @@ fn inline_instantiations_core(
     bind_driver: Option<(&[crate::ast::decl::BindDirective], &mut BindResolveStep<'_>)>,
 ) -> Result<bool, String> {
     let _oom_trace = crate::oom_trace::session();
+    PACKED_WIDTH_ERROR.with(|slot| slot.take());
     let _oom_inline = crate::oom_trace::scope("inline hierarchy", "", &elab.name, &elab.name);
     port_elision_setup();
     let _port_elision_guard = PortElisionGuard;
@@ -37508,6 +37505,7 @@ fn inline_instantiations_core(
     elab.elided_port_hashes.dedup();
     // The instances' and interfaces' own arrays, as the top's.
     register_nd_struct_array_members(elab);
+    check_packed_widths()?;
     Ok(false)
 }
 

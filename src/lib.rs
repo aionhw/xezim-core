@@ -4078,6 +4078,7 @@ fn parse_and_elaborate(
     }
     elab_phase("post-inline passes", &mut phase_t);
     oom_trace::model("elaboration complete", &elab, None);
+    elaborate::check_packed_widths()?;
     Ok((definitions, elab))
 }
 
