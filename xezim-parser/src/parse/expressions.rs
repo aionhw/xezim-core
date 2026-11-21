@@ -1679,7 +1679,22 @@ impl<'a> Parser<'a> {
                     return Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 }
                 let tok = self.bump();
-                let name = self.token_text(tok).into_owned();
+                let mut name = self.token_text(tok).into_owned();
+                // §20.6.1, §26.3: a package-qualified value and a
+                // dotted block member have different declarations even when
+                // their expression trees lower to the same member path.
+                if name == "$typename" {
+                    let mut head = self.pos;
+                    while self.tokens.get(head).is_some_and(|t| t.kind == TokenKind::LParen) {
+                        head += 1;
+                    }
+                    if self.tokens.get(head).is_some_and(|t|
+                        matches!(t.kind, TokenKind::Identifier | TokenKind::EscapedIdentifier))
+                        && self.tokens.get(head + 1).is_some_and(|t| t.kind == TokenKind::DoubleColon)
+                    {
+                        name = "$__xz_scoped_typename".to_string();
+                    }
+                }
                 let args = if self.at(TokenKind::LParen) {
                     self.parse_call_args_inner(matches!(
                         name.as_str(),
