@@ -5789,6 +5789,12 @@ fn is_const_expr<P: ParamLookup>(expr: &Expression, params: &P) -> bool {
     match &expr.kind {
         ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
         ExprKind::Ident(hier) => {
+            // §11.2.1: a select on a constant is constant only when its index
+            // is too. Rewritten generate conditions store indices directly on
+            // path segments instead of passing through the Index arm below.
+            if !hier.path.iter().flat_map(|s| &s.selects).all(|s| is_const_expr(s, params)) {
+                return false;
+            }
             let last = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
             // Const if the leaf is a param/enum const (`X`, `pkg::C`), or — for a
             // hierarchical `pt.FIELD` — the BASE is a const struct param.
@@ -5802,9 +5808,11 @@ fn is_const_expr<P: ParamLookup>(expr: &Expression, params: &P) -> bool {
                 // §26.3: `p::Info[k].variant` reaches here folded into the
                 // path `p.Info[k].variant` (generate bodies are rewritten
                 // that way); the package parameter is under `p::Info`.
-                || hier.path.get(1).is_some_and(|second| {
-                    params.contains_key(&format!("{base}::{}", second.name.name))
-                })
+                || (hier.root.is_none()
+                    && hier.path.first().is_some_and(|s| s.selects.is_empty())
+                    && hier.path.get(1).is_some_and(|second| {
+                        params.contains_key(&format!("{base}::{}", second.name.name))
+                    }))
         }
         ExprKind::Unary { operand, .. } => is_const_expr(operand, params),
         ExprKind::Binary { left, right, .. } => {
