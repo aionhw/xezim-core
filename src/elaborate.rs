@@ -4530,7 +4530,7 @@ pub struct ElaboratedModule {
     /// expression (the common `@(clk) <expr>` shape — see the property
     /// parser). Used by `assert property (p_name)` to inline the body.
     #[serde(default)]
-    pub property_decls: HashMap<String, crate::ast::expr::Expression>,
+    pub property_decls: HashMap<String, Rc<Expression>>,
     /// §16.6: formal port NAMES of each named property/sequence, keyed like
     /// `property_decls`. Empty vec for portless declarations.
     pub property_params: HashMap<String, Vec<String>>,
@@ -6989,11 +6989,11 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 let params: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
                 elab.property_decls
                     .entry(name.clone())
-                    .or_insert_with(|| body.clone());
+                    .or_insert_with(|| Rc::new(body.clone()));
                 elab.property_params
                     .entry(name.clone())
                     .or_insert_with(|| params.clone());
-                elab.property_decls.insert(qualified.clone(), body.clone());
+                elab.property_decls.insert(qualified.clone(), Rc::new(body.clone()));
                 if defaults.iter().any(|d| d.is_some()) {
                     elab.property_param_defaults
                         .entry(name.clone())
@@ -15594,7 +15594,7 @@ pub fn elaborate_module_with_defs(
                     // Sequences share the property_decls map for
                     // `assert property (s)` style references.
                     elab.property_decls
-                        .insert(sd.name.name.clone(), body.clone());
+                        .insert(sd.name.name.clone(), Rc::new(body.clone()));
                     elab.property_params.insert(
                         sd.name.name.clone(),
                         sd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -15606,7 +15606,7 @@ pub fn elaborate_module_with_defs(
                 elab.sequences.insert(pd.name.name.clone());
                 if let Some(body) = &pd.body {
                     elab.property_decls
-                        .insert(pd.name.name.clone(), body.clone());
+                        .insert(pd.name.name.clone(), Rc::new(body.clone()));
                     elab.property_params.insert(
                         pd.name.name.clone(),
                         pd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -21611,7 +21611,7 @@ fn elaborate_items(
                     // Sequences share the property_decls map for
                     // `assert property (s)` style references.
                     elab.property_decls
-                        .insert(sd.name.name.clone(), body.clone());
+                        .insert(sd.name.name.clone(), Rc::new(body.clone()));
                     elab.property_params.insert(
                         sd.name.name.clone(),
                         sd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -21623,7 +21623,7 @@ fn elaborate_items(
                 elab.sequences.insert(pd.name.name.clone());
                 if let Some(body) = &pd.body {
                     elab.property_decls
-                        .insert(pd.name.name.clone(), body.clone());
+                        .insert(pd.name.name.clone(), Rc::new(body.clone()));
                     elab.property_params.insert(
                         pd.name.name.clone(),
                         pd.ports.iter().map(|p| p.name.clone()).collect(),
@@ -41585,6 +41585,7 @@ struct InlineCache {
     /// It owns no body: one that `prepared` released is gone from here too.
     equal_prepared: HashMap<(String, usize), EqualPrepared>,
     process_bodies: crate::ast_intern::AstInterner<Rc<Statement>>,
+    named_sva_bodies: crate::ast_intern::AstInterner<Rc<Expression>>,
     callable_bodies: crate::ast_intern::AstInterner<crate::ast::shared_vec::SharedVec<Statement>>,
     /// Cache-disabled shared source bodies keyed by original `Arc` pointer,
     /// avoiding repeated cloning/interning across sibling instances (#193).
@@ -50943,39 +50944,39 @@ fn inline_instantiation_items(
                         let key = cat2(&inst_prefix, &name);
                         elab.sequences.insert(key.clone());
                         if let Some(body) = body {
-                            let mut sva_locals = (*prepared_sub.local_names).clone();
-                            let mut sva_ports = (*rewrite_port_map).clone();
-                            for p in ports {
-                                sva_locals.remove(&p.name);
-                                sva_ports.remove(&p.name);
-                            }
-                            let body = rewrite_expr(
-                                body,
-                                &inst_prefix,
-                                &sva_ports,
-                                &sva_locals,
-                                &sub_interface_map,
+                            let formals: Vec<&str> =
+                                ports.iter().map(|p| p.name.as_str()).collect();
+                            with_shadowed(
+                                &formals,
+                                &rewrite_port_map,
+                                &prepared_sub.local_names,
+                                |ports, locals| {
+                                    let rewrite = |expr: &Expression| {
+                                        rewrite_expr(
+                                            expr,
+                                            &inst_prefix,
+                                            ports,
+                                            locals,
+                                            &sub_interface_map,
+                                        )
+                                    };
+                                    // §16.6, §16.8: only complete, rewritten bodies can
+                                    // share. Their formal widths and lookups depend on the call.
+                                    let body =
+                                        crate::ast::cache::without_scope_caches(|| rewrite(body));
+                                    elab.property_decls.insert(
+                                        key.clone(),
+                                        cache.named_sva_bodies.intern(Rc::new(body)),
+                                    );
+                                    if defaults.iter().any(Option::is_some) {
+                                        let defaults = defaults
+                                            .iter()
+                                            .map(|d| d.as_ref().map(&rewrite))
+                                            .collect();
+                                        elab.property_param_defaults.insert(key.clone(), defaults);
+                                    }
+                                },
                             );
-                            elab.property_decls.insert(key.clone(), body);
-                            // §16.8: a default actual argument is resolved in
-                            // the scope of the declaration, as the body is.
-                            if defaults.iter().any(|d| d.is_some()) {
-                                let defaults = defaults
-                                    .iter()
-                                    .map(|d| {
-                                        d.as_ref().map(|d| {
-                                            rewrite_expr(
-                                                d,
-                                                &inst_prefix,
-                                                &sva_ports,
-                                                &sva_locals,
-                                                &sub_interface_map,
-                                            )
-                                        })
-                                    })
-                                    .collect();
-                                elab.property_param_defaults.insert(key.clone(), defaults);
-                            }
                             elab.property_params
                                 .insert(key, ports.iter().map(|p| p.name.clone()).collect());
                         }
@@ -63422,7 +63423,7 @@ fn process_import(
                         }) if &name.name == sym_name => {
                             elab.sequences.insert(name.name.clone());
                             if let Some(body) = body {
-                                elab.property_decls.insert(name.name.clone(), body.clone());
+                                elab.property_decls.insert(name.name.clone(), Rc::new(body.clone()));
                                 elab.property_params.insert(
                                     name.name.clone(),
                                     ports.iter().map(|p| p.name.clone()).collect(),

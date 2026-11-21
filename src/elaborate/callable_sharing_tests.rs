@@ -333,3 +333,27 @@ fn deferred_callable_preserves_shadowing_ports_typedefs_type_params_and_const_fn
     assert!(!names.contains(&"u.state".to_string()), "must stay shadowed: {names:?}");
     assert!(names.contains(&"bus".to_string()), "port substituted: {names:?}");
 }
+
+/// §16.6, §16.8: a formal stays local to the call; an instance signal
+/// qualifies the same declaration differently in each instance.
+#[test]
+fn named_sva_shares_only_identical_rewritten_bodies() {
+    let elab = elaborate(
+        r#"
+        module leaf(input logic x);
+          logic value;
+          property p(x); x; endproperty
+          sequence s; value; endsequence
+        endmodule
+        module top; logic a, b; leaf left(a); leaf right(b); endmodule
+    "#,
+    );
+    let body = &elab.property_decls["left.p"];
+    assert!(Rc::ptr_eq(body, &elab.property_decls["right.p"]));
+    assert!(!Rc::ptr_eq(
+        &elab.property_decls["left.s"],
+        &elab.property_decls["right.s"]
+    ));
+    body.cached_width.set(Some(17));
+    assert_eq!(body.cached_width.get(), None);
+}
