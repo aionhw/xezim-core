@@ -368,3 +368,32 @@ fn coverpoint_real_is_not_recognized_under_sv2017() {
         "`coverpoint real` must not be accepted under SV-2017"
     );
 }
+
+/// §6.24.1, §19.5: a real cast is the operand in both modes. Its keyword
+/// does not mark the coverpoint declaration; the expression carries the type.
+#[test]
+fn coverpoint_real_cast_is_an_expression() {
+    use sv_parser::ast::expr::ExprKind;
+    use sv_parser::ast::types::DataType;
+
+    for sv2023 in [false, true] {
+        for cast in ["real'(x)", "real /* casting type */ ' (x)"] {
+            let src = format!(
+                "module m; int x; covergroup cg;
+                   cp: coverpoint {cast} iff (x != 0) {{ bins three = {{3.0}}; }}
+                 endgroup endmodule"
+            );
+            let cp = first_coverpoint(&src, sv2023);
+            assert!(!cp.is_real);
+            assert!(cp.iff_guard.is_some());
+            assert_eq!(cp.bins.len(), 1);
+            let ExprKind::SystemCall { name, args } = cp.expr.kind else {
+                panic!("missing cast in {cast}");
+            };
+            assert_eq!(name, "$__xz_type_cast");
+            assert!(matches!(&args[0].kind, ExprKind::TypeLiteral(dt)
+                if matches!(&**dt, DataType::Real { .. })));
+            assert!(matches!(&args[1].kind, ExprKind::Ident(_)));
+        }
+    }
+}

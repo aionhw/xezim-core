@@ -1928,15 +1928,7 @@ impl<'a> Parser<'a> {
             | TokenKind::KwReal
             | TokenKind::KwShortreal
             | TokenKind::KwRealtime
-                if {
-                    // Look ahead: is this type_keyword'(expr) ?
-                    let next = self.peek_kind();
-                    next == TokenKind::IntegerLiteral
-                        && self
-                            .tokens
-                            .get(self.pos + 1)
-                            .is_some_and(|t| self.token_text(t) == "'")
-                } =>
+                if self.followed_by_cast_quote() =>
             {
                 let cast_kw = self.current_kind();
                 self.bump(); // skip type keyword

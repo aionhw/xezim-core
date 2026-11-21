@@ -6039,7 +6039,10 @@ impl<'a> Parser<'a> {
                 // so that under SV-2017 `real` stays whatever it was before
                 // (an ordinary expression token) rather than being silently
                 // swallowed as a modifier.
-                let is_real = crate::is_sv2023() && self.eat(TokenKind::KwReal).is_some();
+                // §6.24.1: in `real'(expr)` the keyword belongs to the cast.
+                let is_real = crate::is_sv2023()
+                    && !self.followed_by_cast_quote()
+                    && self.eat(TokenKind::KwReal).is_some();
                 // `parse_expression` includes `iff` as a low-precedence
                 // binary op (`BinaryOp::Iff`), so `v iff (guard)` parses
                 // as `Binary(Iff, v, guard)` — split that back into

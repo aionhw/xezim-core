@@ -110,6 +110,13 @@ impl<'a> Parser<'a> {
             .unwrap_or(TokenKind::Eof)
     }
 
+    /// The lexer represents the stand-alone apostrophe of a cast as an
+    /// integer-literal token, distinct from based and unbased literals.
+    pub(super) fn followed_by_cast_quote(&self) -> bool {
+        self.tokens.get(self.pos + 1).is_some_and(|next|
+            next.kind == TokenKind::IntegerLiteral && next.text == "'")
+    }
+
     #[allow(dead_code)]
     pub(super) fn peek_kind_n(&self, n: usize) -> TokenKind {
         self.tokens
