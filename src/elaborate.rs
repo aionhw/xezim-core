@@ -52949,7 +52949,12 @@ fn eval_const_user_function<P: ParamLookup>(
                 // only when all are signed, and compared with `===`.
                 let mut types = const_context::Types::default();
                 let mut common = const_context::infer(expr, &ParamEnv::Overlay { base: &elab.parameters, top: &*locals }, &mut types);
+                let mut has_ranges = false;
                 for pat in items.iter().flat_map(|item| &item.patterns) {
+                    if *kind == CaseKind::CaseInside && matches!(pat.kind, ExprKind::Range(..)) {
+                        has_ranges = true;
+                        continue;
+                    }
                     let ty = const_context::infer(pat, &ParamEnv::Overlay { base: &elab.parameters, top: &*locals }, &mut types);
                     common.width = common.width.max(ty.width);
                     common.signed &= ty.signed;
@@ -52965,8 +52970,27 @@ fn eval_const_user_function<P: ParamLookup>(
                         v.resize_for_assign(common.width)
                     }
                 };
-                let sel = fit(eval_fn_expr_ctx(expr, locals, elab, depth, context)?);
-                if sel.is_real {
+                let sel = if has_ranges {
+                    fn unparenthesized(mut expr: &Expression) -> &ExprKind {
+                        while let ExprKind::Paren(inner) = &expr.kind {
+                            expr = inner;
+                        }
+                        &expr.kind
+                    }
+                    // Like the runtime matcher, only size operation selectors
+                    // and selectors compared with an unbased unsized item.
+                    let sized = matches!(
+                        unparenthesized(expr),
+                        ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
+                    ) || items.iter().flat_map(|item| &item.patterns).any(|pat| {
+                        matches!(unparenthesized(pat), ExprKind::Number(NumberLiteral::UnbasedUnsized(_)))
+                    });
+                    let context = (sized && common.integral).then_some((common.width, None));
+                    eval_fn_expr_ctx(expr, locals, elab, depth, context)?
+                } else {
+                    fit(eval_fn_expr_ctx(expr, locals, elab, depth, context)?)
+                };
+                if sel.is_real && *kind != CaseKind::CaseInside {
                     return None;
                 }
                 let mut chosen: Option<&Statement> = None;
@@ -52976,18 +53000,35 @@ fn eval_const_user_function<P: ParamLookup>(
                     }
                     let mut hit = false;
                     for pat in &item.patterns {
-                        let v = fit(eval_fn_expr_ctx(pat, locals, elab, depth, context)?);
-                        if v.is_real {
-                            return None;
-                        }
-                        let hit_now = match kind {
-                            CaseKind::Casex => sel.casex_eq(&v),
-                            CaseKind::Casez => sel.casez_eq(&v),
-                            // §12.5.4: a `case inside` value item matches as `==?`.
-                            CaseKind::CaseInside => sel.wildcard_eq(&v),
-                            CaseKind::Case => sel.case_eq(&v),
+                        let hit_now = if let ExprKind::Range(lo, hi) = &pat.kind
+                            && has_ranges
+                        {
+                            // §11.4.13, §12.5.4: compare both inclusive bounds.
+                            let lo_ok = matches!(lo.kind, ExprKind::Dollar)
+                                || sel.greater_equal(&eval_fn_expr(lo, locals, elab, depth)?).is_true();
+                            let hi_ok = matches!(hi.kind, ExprKind::Dollar)
+                                || sel.less_equal(&eval_fn_expr(hi, locals, elab, depth)?).is_true();
+                            lo_ok && hi_ok
+                        } else {
+                            let v = if has_ranges {
+                                eval_fn_expr(pat, locals, elab, depth)?
+                            } else {
+                                fit(eval_fn_expr_ctx(pat, locals, elab, depth, context)?)
+                            };
+                            if v.is_real && *kind != CaseKind::CaseInside {
+                                return None;
+                            }
+                            match kind {
+                                CaseKind::Casex => sel.casex_eq(&v),
+                                CaseKind::Casez => sel.casez_eq(&v),
+                                CaseKind::CaseInside if sel.is_real || v.is_real => sel.is_equal(&v),
+                                // §12.5.4: an integral value item matches as `==?`.
+                                CaseKind::CaseInside => sel.wildcard_eq(&v),
+                                CaseKind::Case => sel.case_eq(&v),
+                            }
+                            .is_true()
                         };
-                        if hit_now.is_true() {
+                        if hit_now {
                             hit = true;
                             break;
                         }
