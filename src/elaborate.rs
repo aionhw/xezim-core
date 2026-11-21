@@ -7395,6 +7395,25 @@ fn lookup_scoped_type_at<'a, T>(
         .or_else(|| table.get(&name.name.name))
 }
 
+/// §6.18, §7.4.4: the member declarator supplies the outer dimensions
+/// of an unpacked array. A typedef can supply additional inner dimensions.
+pub fn struct_member_dims<'a>(
+    dt: &DataType,
+    declared: &'a [UnpackedDimension],
+    typedef_dims: &HashMap<String, Vec<UnpackedDimension>>,
+) -> std::borrow::Cow<'a, [UnpackedDimension]> {
+    if let DataType::TypeReference { name, dimensions, .. } = dt
+        && dimensions.is_empty()
+        && let Some(inner) = lookup_scoped_type(name, typedef_dims)
+        && !inner.is_empty()
+    {
+        let mut dims = declared.to_vec();
+        dims.extend_from_slice(inner);
+        return std::borrow::Cow::Owned(dims);
+    }
+    std::borrow::Cow::Borrowed(declared)
+}
+
 /// A (possibly nested) `MemberAccess` chain rooted at a plain identifier —
 /// the expression shape of `pkg::wide_t` / `pkg::cls::t` — flattened into
 /// (scope links, leaf name). `None` when the expression is not a pure
@@ -31698,7 +31717,7 @@ fn emit_struct_member_assigns(
             flat.push((
                 d.name.name.clone(),
                 m.data_type.clone(),
-                d.dimensions.clone(),
+                struct_member_dims(&m.data_type, &d.dimensions, typedef_unpacked_dims).into_owned(),
             ));
         }
     }
@@ -32960,23 +32979,11 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
             let mbase = format!("{}.{}", base, mdecl.name.name);
             // §6.18, §7.4.5: a member typed by a dimensioned typedef takes the
             // typedef's unpacked dimensions after its own.
-            let typed_mdecl;
-            let mdecl = match &member.data_type {
-                DataType::TypeReference {
-                    name, dimensions, ..
-                } if dimensions.is_empty() => {
-                    match lookup_scoped_type(name, &elab.typedef_unpacked_dims) {
-                        Some(td) => {
-                            let mut d = mdecl.clone();
-                            d.dimensions.extend(td.iter().cloned());
-                            typed_mdecl = d;
-                            &typed_mdecl
-                        }
-                        None => mdecl,
-                    }
-                }
-                _ => mdecl,
-            };
+            let dims = struct_member_dims(
+                &member.data_type,
+                &mdecl.dimensions,
+                &elab.typedef_unpacked_dims,
+            );
             // §7.2.1: a DYNAMIC member (`int d[]`, `int q[$]`, `int a[key]`)
             // is its own collection object under `var.member`, registered as
             // the module-scope declaration path does. Here a queue was taken
@@ -32985,7 +32992,7 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
             // `m[N]` with `N` a constant parses as an associative dimension
             // keyed by the type `N`; classify the normalized dimensions.
             let mdims =
-                normalize_unpacked_dims(&mdecl.dimensions, &elab.parameters, &elab.typedef_types);
+                normalize_unpacked_dims(&dims, &elab.parameters, &elab.typedef_types);
             record_coll_shape(elab, &mbase, &mdims, None);
             match mdims.first() {
                 Some(UnpackedDimension::Associative { data_type: kdt, .. }) => {
@@ -33030,14 +33037,10 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
                 }
                 _ => {}
             }
-            if mdecl.dimensions.is_empty() {
+            if mdims.is_empty() {
                 register_member_leaf(elab, &mbase, &member.data_type);
             } else {
-                let dims = normalize_unpacked_dims(
-                    &mdecl.dimensions,
-                    &elab.parameters,
-                    &elab.typedef_types,
-                );
+                let dims = mdims;
                 let shape: Option<Vec<(i64, i64)>> = dims
                     .iter()
                     .map(|d| extract_array_range(std::slice::from_ref(d), &elab.parameters))
@@ -55164,7 +55167,12 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                                 (
                                     d.name.name.clone(),
                                     m.data_type.clone(),
-                                    d.dimensions.clone(),
+                                    struct_member_dims(
+                                        &m.data_type,
+                                        &d.dimensions,
+                                        &elab.typedef_unpacked_dims,
+                                    )
+                                    .into_owned(),
                                 )
                             })
                         })
