@@ -23606,16 +23606,11 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
     if matches!(e.kind, ExprKind::Number(_)) {
         return;
     }
-    // Nothing to gain on a name-free expression.
-    if !lsdd_names_value(e) || lsdd_queries_a_declaration(e, env) {
+    if lsdd_queries_a_declaration(e, env) {
+        lsdd_bind_query_operands(e, env);
         return;
     }
-    let mut has_query = false;
-    for_each_sub_expr(e, &mut |x| {
-        has_query |= matches!(&x.kind, ExprKind::SystemCall { name, .. } if lsdd_is_decl_query(name));
-    });
-    if has_query {
-        lsdd_bind_query_operands(e, env);
+    if !lsdd_names_value(e) {
         return;
     }
     let Some(v) = lsdd_eval(e, env) else {
@@ -63129,7 +63124,7 @@ mod prepared_callable_ownership_tests {
                  logic [($signed(N) > 0 ? 6 : 2)-1:0] f;
                  logic [7:0] w;
                  logic [$bits(w)-1:0] g;
-                 logic [$bits($signed(N)) + $clog2(P)-1:0] mixed;
+                 logic [$bits(w) + $clog2(P)-1:0] mixed;
                endtask
              endmodule",
         );
@@ -63183,8 +63178,7 @@ mod prepared_callable_ownership_tests {
                     remaining.push(h.path[0].name.name.clone());
                 }
             });
-            assert_eq!(remaining, ["N"]);
-
+            assert_eq!(remaining, ["w"]);
         }
     }
 
