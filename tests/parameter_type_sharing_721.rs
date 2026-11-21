@@ -60,11 +60,13 @@ fn instances_share_the_type_of_a_parameter_declaration() {
     let m = elaborate(SRC);
     for name in ["W", "S0", "S1", "MASK", "NAMED", "g[0].STEP", "g[1].STEP"] {
         let a = shared(&m, &format!("a.{name}"));
+        // §6.20.2, §23.10: a range written with `W` holds the instance's
+        // folded bounds, so `b` (W = 16) has a type of its own and `c`
+        // (W = 8) shares `a`'s.
+        let w_dependent = name == "MASK" || name.ends_with("STEP");
         for inst in ["b", "c"] {
-            assert!(
-                Rc::ptr_eq(a, shared(&m, &format!("{inst}.{name}"))),
-                "{inst}.{name}"
-            );
+            let same = Rc::ptr_eq(a, shared(&m, &format!("{inst}.{name}")));
+            assert_eq!(same, !(w_dependent && inst == "b"), "{inst}.{name}");
         }
     }
     // The parameters of one declaration share it too, in a module, the top
