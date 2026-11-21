@@ -1457,21 +1457,8 @@ impl<'a> Parser<'a> {
             } else {
                 let mut patterns = Vec::new();
                 loop {
-                    // case_inside permits value_range patterns of the form
-                    // `[lo:hi]`. Detect the bare-LBracket start and consume
-                    // the range as a single Expr::Range value; downstream
-                    // elaboration / case-eval can map it.
                     if matches!(kind, CaseKind::CaseInside) && self.at(TokenKind::LBracket) {
-                        let bstart = self.current_span().start;
-                        self.bump(); // [
-                        let lo = self.parse_expression();
-                        self.expect(TokenKind::Colon);
-                        let hi = self.parse_expression();
-                        self.expect(TokenKind::RBracket);
-                        patterns.push(Expression::new(
-                            ExprKind::Range(Box::new(lo), Box::new(hi)),
-                            self.span_from(bstart),
-                        ));
+                        patterns.push(self.parse_case_inside_range());
                     } else {
                         patterns.push(self.parse_expression());
                     }

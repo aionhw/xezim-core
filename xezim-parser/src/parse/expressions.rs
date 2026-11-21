@@ -224,6 +224,197 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a bracketed value range for set membership (§11.4.13).
+    fn parse_inside_range(&mut self, start: usize) -> Expression {
+        // Plain ranges use the full expression grammar in both language modes.
+        let tolerance_enabled = crate::is_sv2023() && self.range_has_tolerance();
+        self.expect(TokenKind::LBracket);
+        // Parse the lower/centre expression with a binding
+        // power that excludes `+`/`-`/`%`, so `+/-` and `+%-`
+        // tokens stay available for tolerance detection.
+        // Simple operands or parenthesised expressions
+        // remain supported.
+        let center = if tolerance_enabled {
+            let mut center = self.parse_expr_bp(31);
+            // A bare `+`/`-` here (not the start of a
+            // `+/-`/`+%-` tolerance marker) means the
+            // lower/centre bound is itself an additive
+            // expression, e.g. `[A+B:C]` — fold it into
+            // `center` instead of leaving it for the
+            // tolerance check below to misparse.
+            loop {
+                if self.tolerance_separator_at(0).is_some() {
+                    break;
+                }
+                let op = if self.at(TokenKind::Plus) {
+                    BinaryOp::Add
+                } else if self.at(TokenKind::Minus) {
+                    BinaryOp::Sub
+                } else {
+                    break;
+                };
+                self.bump();
+                let rhs = self.parse_expr_bp(30);
+                center = Expression::new(
+                    ExprKind::Binary {
+                        op,
+                        left: Box::new(center),
+                        right: Box::new(rhs),
+                    },
+                    self.span_from(start),
+                );
+            }
+            center
+        } else {
+            self.parse_expression()
+        };
+        // IEEE 1800-2023 §11.4.13: tolerance ranges
+        // `[A +/- B]` → `[A-B : A+B]`
+        // `[A +%- B]` → `[A*(100-B)/100 : A*(100+B)/100]`
+        // `+/-` and `+%-` lex as three separate tokens
+        // (Plus, Slash|Percent, Minus); we detect the triple.
+        let separator = tolerance_enabled
+            .then(|| self.tolerance_separator_at(0))
+            .flatten();
+        let (lo, hi) = if let Some(separator) = separator {
+            self.bump();
+            self.bump();
+            self.bump();
+            let delta = self.parse_expression();
+            self.expect(TokenKind::RBracket);
+            if separator == TokenKind::Slash {
+                let lo = Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Sub,
+                        left: Box::new(center.clone()),
+                        right: Box::new(delta.clone()),
+                    },
+                    self.span_from(start),
+                );
+                let hi = Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(center),
+                        right: Box::new(delta),
+                    },
+                    self.span_from(start),
+                );
+                (lo, hi)
+            } else {
+                let hundred = || {
+                    Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            signed: false,
+                            size: None,
+                            base: NumberBase::Decimal,
+                            value: "100".into(),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                        }),
+                        self.span_from(start),
+                    )
+                };
+                let make = |sign_neg: bool, c: Expression, d: Expression| {
+                    let op = if sign_neg {
+                        BinaryOp::Sub
+                    } else {
+                        BinaryOp::Add
+                    };
+                    let pm = Expression::new(
+                        ExprKind::Binary {
+                            op,
+                            left: Box::new(hundred()),
+                            right: Box::new(d),
+                        },
+                        c.span,
+                    );
+                    let mul = Expression::new(
+                        ExprKind::Binary {
+                            op: BinaryOp::Mul,
+                            left: Box::new(c),
+                            right: Box::new(pm),
+                        },
+                        self.span_from(start),
+                    );
+                    Expression::new(
+                        ExprKind::Binary {
+                            op: BinaryOp::Div,
+                            left: Box::new(mul),
+                            right: Box::new(hundred()),
+                        },
+                        self.span_from(start),
+                    )
+                };
+                (
+                    make(true, center.clone(), delta.clone()),
+                    make(false, center, delta),
+                )
+            }
+        } else {
+            self.expect(TokenKind::Colon);
+            let hi = self.parse_expression();
+            self.expect(TokenKind::RBracket);
+            (center, hi)
+        };
+        Expression::new(
+            ExprKind::Range(Box::new(lo), Box::new(hi)),
+            self.span_from(start),
+        )
+    }
+
+    fn tolerance_separator_at(&self, offset: usize) -> Option<TokenKind> {
+        match (
+            self.peek_kind_n(offset),
+            self.peek_kind_n(offset + 1),
+            self.peek_kind_n(offset + 2),
+        ) {
+            (
+                TokenKind::Plus,
+                separator @ (TokenKind::Slash | TokenKind::Percent),
+                TokenKind::Minus,
+            ) => {
+                // The three pieces must form one token in the source.
+                let start = self.pos + offset;
+                let plus = self.tokens.span_at(start);
+                let middle = self.tokens.span_at(start + 1);
+                let minus = self.tokens.span_at(start + 2);
+                (plus.end == middle.start && middle.end == minus.start).then_some(separator)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn parse_case_inside_range(&mut self) -> Expression {
+        // §12.5.4 uses the same value ranges as the inside operator.
+        self.parse_inside_range(self.current_span().start)
+    }
+
+    fn range_has_tolerance(&self) -> bool {
+        let mut depth = 0;
+        for (index, token) in self.tokens.iter_from(self.pos + 1).enumerate() {
+            match token.kind {
+                TokenKind::LParen
+                | TokenKind::LBracket
+                | TokenKind::LBrace
+                | TokenKind::ApostropheLBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Colon if depth == 0 => break,
+                TokenKind::Plus
+                    if depth == 0 && self.tolerance_separator_at(index + 1).is_some() =>
+                {
+                    return true;
+                }
+                TokenKind::Semicolon | TokenKind::Eof => break,
+                _ => {}
+            }
+        }
+        false
+    }
+
     pub(super) fn parse_expr_bp(&mut self, min_bp: u8) -> Expression {
         self.parse_expr_bp_ctx(min_bp, false)
     }
@@ -274,153 +465,8 @@ impl<'a> Parser<'a> {
                     if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
                         break;
                     }
-                    // Handle [lo:hi] ranges
                     if self.at(TokenKind::LBracket) {
-                        self.bump();
-                        // Parse the lower/centre expression with a binding
-                        // power that excludes `+`/`-`/`%`, so `+/-` and `+%-`
-                        // tokens stay available for tolerance detection.
-                        // Simple operands or parenthesised expressions
-                        // remain supported.
-                        let center = if crate::is_sv2023() {
-                            let mut center = self.parse_expr_bp(31);
-                            // A bare `+`/`-` here (not the start of a
-                            // `+/-`/`+%-` tolerance marker) means the
-                            // lower/centre bound is itself an additive
-                            // expression, e.g. `[A+B:C]` — fold it into
-                            // `center` instead of leaving it for the
-                            // tolerance check below to misparse.
-                            loop {
-                                let is_tol_abs = self.at(TokenKind::Plus)
-                                    && self.peek_kind() == TokenKind::Slash
-                                    && self.peek_kind_n(2) == TokenKind::Minus;
-                                let is_tol_pct = self.at(TokenKind::Plus)
-                                    && self.peek_kind() == TokenKind::Percent
-                                    && self.peek_kind_n(2) == TokenKind::Minus;
-                                if is_tol_abs || is_tol_pct {
-                                    break;
-                                }
-                                let op = if self.at(TokenKind::Plus) {
-                                    BinaryOp::Add
-                                } else if self.at(TokenKind::Minus) {
-                                    BinaryOp::Sub
-                                } else {
-                                    break;
-                                };
-                                self.bump();
-                                let rhs = self.parse_expr_bp(30);
-                                center = Expression::new(
-                                    ExprKind::Binary {
-                                        op,
-                                        left: Box::new(center),
-                                        right: Box::new(rhs),
-                                    },
-                                    self.span_from(start),
-                                );
-                            }
-                            center
-                        } else {
-                            self.parse_expression()
-                        };
-                        // IEEE 1800-2023 §11.4.13: tolerance ranges
-                        // `[A +/- B]` → `[A-B : A+B]`
-                        // `[A +%- B]` → `[A*(100-B)/100 : A*(100+B)/100]`
-                        // `+/-` and `+%-` lex as three separate tokens
-                        // (Plus, Slash|Percent, Minus); we detect the triple.
-                        let is_tol_abs = crate::is_sv2023()
-                            && self.at(TokenKind::Plus)
-                            && self.peek_kind() == TokenKind::Slash
-                            && self.peek_kind_n(2) == TokenKind::Minus;
-                        let is_tol_pct = crate::is_sv2023()
-                            && self.at(TokenKind::Plus)
-                            && self.peek_kind() == TokenKind::Percent
-                            && self.peek_kind_n(2) == TokenKind::Minus;
-                        if is_tol_abs || is_tol_pct {
-                            self.bump();
-                            self.bump();
-                            self.bump();
-                            let delta = self.parse_expression();
-                            self.expect(TokenKind::RBracket);
-                            let (lo, hi) = if is_tol_abs {
-                                let lo = Expression::new(
-                                    ExprKind::Binary {
-                                        op: BinaryOp::Sub,
-                                        left: Box::new(center.clone()),
-                                        right: Box::new(delta.clone()),
-                                    },
-                                    self.span_from(start),
-                                );
-                                let hi = Expression::new(
-                                    ExprKind::Binary {
-                                        op: BinaryOp::Add,
-                                        left: Box::new(center),
-                                        right: Box::new(delta),
-                                    },
-                                    self.span_from(start),
-                                );
-                                (lo, hi)
-                            } else {
-                                let hundred = || {
-                                    Expression::new(
-                                        ExprKind::Number(NumberLiteral::Integer {
-                                            signed: false,
-                                            size: None,
-                                            base: NumberBase::Decimal,
-                                            value: "100".into(),
-                                            cached_val: crate::ast::cache::LiteralCache::new(None),
-                                        }),
-                                        self.span_from(start),
-                                    )
-                                };
-                                let make = |sign_neg: bool, c: Expression, d: Expression| {
-                                    let op = if sign_neg {
-                                        BinaryOp::Sub
-                                    } else {
-                                        BinaryOp::Add
-                                    };
-                                    let pm = Expression::new(
-                                        ExprKind::Binary {
-                                            op,
-                                            left: Box::new(hundred()),
-                                            right: Box::new(d),
-                                        },
-                                        c.span,
-                                    );
-                                    let mul = Expression::new(
-                                        ExprKind::Binary {
-                                            op: BinaryOp::Mul,
-                                            left: Box::new(c),
-                                            right: Box::new(pm),
-                                        },
-                                        self.span_from(start),
-                                    );
-                                    Expression::new(
-                                        ExprKind::Binary {
-                                            op: BinaryOp::Div,
-                                            left: Box::new(mul),
-                                            right: Box::new(hundred()),
-                                        },
-                                        self.span_from(start),
-                                    )
-                                };
-                                (
-                                    make(true, center.clone(), delta.clone()),
-                                    make(false, center, delta),
-                                )
-                            };
-                            ranges.push(Expression::new(
-                                ExprKind::Range(Box::new(lo), Box::new(hi)),
-                                self.span_from(start),
-                            ));
-                        } else {
-                            self.expect(TokenKind::Colon);
-                            let hi = self.parse_expression();
-                            self.expect(TokenKind::RBracket);
-                            ranges.push(Expression::new(
-                                ExprKind::Range(Box::new(center), Box::new(hi)),
-                                self.span_from(start),
-                            ));
-                        }
+                        ranges.push(self.parse_inside_range(start));
                     } else {
                         ranges.push(self.parse_expression());
                     }
