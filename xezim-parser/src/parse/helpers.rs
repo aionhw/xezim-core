@@ -114,7 +114,7 @@ impl<'a> Parser<'a> {
     /// integer-literal token, distinct from based and unbased literals.
     pub(super) fn followed_by_cast_quote(&self) -> bool {
         self.tokens.get(self.pos + 1).is_some_and(|next|
-            next.kind == TokenKind::IntegerLiteral && next.text == "'")
+            next.kind == TokenKind::IntegerLiteral && self.token_text(next) == "'")
     }
 
     #[allow(dead_code)]
