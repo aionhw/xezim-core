@@ -617,7 +617,7 @@ impl<'a> Parser<'a> {
         // following a statement (§9.3.1).
         let data_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
             self.parse_data_type()
-        } else if self.at(TokenKind::Identifier)
+        } else if matches!(self.current().kind, TokenKind::Identifier | TokenKind::EscapedIdentifier)
             && (matches!(
                 self.peek_kind(),
                 TokenKind::Identifier

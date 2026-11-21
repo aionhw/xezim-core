@@ -272,7 +272,7 @@ impl<'a> Parser<'a> {
                     span: self.span_from(start),
                 }
             }
-            TokenKind::Identifier => {
+            TokenKind::Identifier | TokenKind::EscapedIdentifier => {
                 let name = self.parse_type_name();
                 // Parse optional parameterized type list #(...). Collect
                 // the positional arguments as expressions; named (.NAME(expr))

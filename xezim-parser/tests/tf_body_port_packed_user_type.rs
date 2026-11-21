@@ -40,6 +40,11 @@ module top;
       o = tmp;
     end
   endtask
+  task escaped;
+    input \s_t [1:0] \packed.port ;
+    output t_t \scalar.port ;
+    input \legacy.port [2];
+  endtask
   function automatic logic legacy;
     input x [3:0];
     logic y;
@@ -99,6 +104,14 @@ fn body_port_of_packed_user_type_names_the_port() {
             ("b".into(), Some(2), 0),
             ("c".into(), Some(1), 0),
             ("u".into(), Some(1), 1),
+        ]
+    );
+    assert_eq!(
+        ports_of(items, "escaped"),
+        vec![
+            ("packed.port".into(), Some(1), 0),
+            ("scalar.port".into(), Some(0), 0),
+            ("legacy.port".into(), None, 1),
         ]
     );
     assert_eq!(ports_of(items, "legacy"), vec![("x".into(), None, 1)]);
