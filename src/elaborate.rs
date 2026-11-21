@@ -492,6 +492,9 @@ pub struct StrengthDriver {
     pub s1: u8,
 }
 
+/// Expressions in global ticks for the rise, fall, and turn-off delays.
+pub type DelayExpressions = Box<[Option<Expression>; 3]>;
+
 /// A continuous assignment: assign lhs = rhs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContinuousAssignment {
@@ -509,6 +512,8 @@ pub struct ContinuousAssignment {
     /// `delay_fall`: a primitive that stays the only driver of its net keeps
     /// its fall delay in `gate_fall_delays`, including net-delay lowering.
     pub gate_delay_fall: Option<u64>,
+    /// Runtime delay operands when any operand depends on simulation state.
+    pub delay_exprs: Option<DelayExpressions>,
     /// §10.3.3 / §28.16: physical (low bit, width, vector shape) before
     /// driver widening. A bit-select is scalar; a width-one part is vector.
     pub delay_select: Option<(u32, u32, bool)>,
@@ -1356,26 +1361,18 @@ impl PendingContAssign {
         root_mark_hier_ca_rhs(&self.lhs_source, &mut rhs, &|_| false, &|n| {
             self.ctx.upward.borrow().packages.contains(n)
         });
-        let eval_delay = |src: &Option<std::rc::Rc<Expression>>| -> Option<u64> {
-            src.as_ref().map(|d| {
-                let d = rewrite_expr(
-                    d,
-                    &self.ctx.prefix,
-                    &self.ctx.port_map,
-                    &self.ctx.local_names,
-                    &self.ctx.interface_map,
-                );
-                eval_const_expr(&d, params)
-            })
-        };
-        let delay = eval_delay(&self.delay_source).unwrap_or(0);
-        let delay_fall = eval_delay(&self.delay_fall_source);
-        let delay_off = eval_delay(&self.delay_off_source);
+        let operands = [self.delay_source, self.delay_fall_source, self.delay_off_source].map(|src| {
+            src.map(|d| rewrite_expr(&d, &self.ctx.prefix, &self.ctx.port_map,
+                &self.ctx.local_names, &self.ctx.interface_map))
+        });
+        let (delay, delay_fall, delay_off, delay_exprs) =
+            cont_assign_delays(operands.each_ref().map(Option::as_ref), params);
         let origin = self
             .origin_span
             .map(|sp| (sp, std::sync::Arc::clone(&self.ctx.origin_scope)));
         ContinuousAssignment {
             gate_delay_fall: None,
+            delay_exprs,
             delay_select: None,
             origin,
             lhs,
@@ -4698,7 +4695,7 @@ pub struct ElaboratedModule {
     /// net is declared and consumed by `apply_net_delays` before the drivers
     /// are folded, so nothing downstream (and no cached artifact) sees it.
     #[serde(skip)]
-    pub net_delays: HashMap<String, (u64, Option<u64>, Option<u64>)>,
+    pub net_delays: HashMap<String, (u64, Option<u64>, Option<u64>, Option<DelayExpressions>)>,
     /// §6.20.6: names of `const` variables that carry a declaration-time
     /// initializer (lowered to a synthetic initial assignment). The const's
     /// single legal write is that initializer, so the const-write validator
@@ -5286,7 +5283,7 @@ impl ElaboratedModule {
             // needs the same per-element expansion — otherwise an array OUTPUT
             // PORT driven that way never propagates and the parent's array
             // stays x for the whole run.
-            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, self) {
+            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, &ca.delay_exprs, self) {
                 self.continuous_assigns.push(ca);
             }
         }
@@ -10084,7 +10081,7 @@ fn check_module_use_before_decl(
                     }
                     ModuleItem::ModuleInstantiation(mi) => self.instantiation(mi, scope),
                     ModuleItem::GateInstantiation(g) => {
-                        for e in [&g.delay, &g.delay_fall].into_iter().flatten() {
+                        for e in [&g.delay, &g.delay_fall, &g.delay_off].into_iter().flatten() {
                             self.expr(e, scope);
                         }
                         for e in g.instances.iter().flat_map(|i| &i.terminals) {
@@ -12610,6 +12607,7 @@ pub fn elaborate_module_with_defs(
                                 );
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     gate_delay_fall: None,
+                                    delay_exprs: decl_dly.3,
                                     delay_select: None,
                                     origin: Some((init_expr.span, top_origin_scope())),
                                     lhs: make_ident_expr(&decl.name.name),
@@ -12834,6 +12832,7 @@ pub fn elaborate_module_with_defs(
                             net_declaration_driver(nd, &decl.name.name, init_expr, &mut elab);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_exprs: decl_dly.3,
                             delay_select: None,
                             origin: Some((init_expr.span, top_origin_scope())),
                             lhs: make_ident_expr(&decl.name.name),
@@ -14102,6 +14101,7 @@ pub fn elaborate_module_with_defs(
                         if nettype_net && let Some(init_expr) = decl.init.as_ref() {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_exprs: None,
                                 delay_select: None,
                                 origin: Some((init_expr.span, top_origin_scope())),
                                 lhs: make_ident_expr(&decl.name.name),
@@ -15386,19 +15386,8 @@ pub fn elaborate_module_with_defs(
                 elab.alias_groups.push(names);
             }
             ModuleItem::ContinuousAssign(ca) => {
-                let delay = ca
-                    .delay
-                    .as_ref()
-                    .map(|d| eval_const_expr(d, &elab.parameters))
-                    .unwrap_or(0);
-                let delay_fall = ca
-                    .delay_fall
-                    .as_ref()
-                    .map(|d| eval_const_expr(d, &elab.parameters));
-                let delay_off = ca
-                    .delay_off
-                    .as_ref()
-                    .map(|d| eval_const_expr(d, &elab.parameters));
+                let (delay, delay_fall, delay_off, delay_exprs) = cont_assign_delays(
+                    [ca.delay.as_deref(), ca.delay_fall.as_deref(), ca.delay_off.as_deref()], &elab.parameters);
                 for (lhs, rhs) in &ca.assignments {
                     // §10.3.1 / §21.2.1.5: record the drive strength pair on
                     // the target net so `%v` can report it (e.g. "Pu0").
@@ -15435,9 +15424,10 @@ pub fn elaborate_module_with_defs(
                         &|n| elab.struct_members.contains_key(n),
                         &|n| elab.packages.contains(n),
                     );
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
+                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, &mut elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_exprs: delay_exprs.clone(),
                             delay_select: None,
                             origin: Some((ca.span, top_origin_scope())),
                             lhs: lhs.clone(),
@@ -15646,6 +15636,7 @@ pub fn elaborate_module_with_defs(
                 for (delayed, source) in &sb.delayed_nets {
                     elab.continuous_assigns.push(ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_exprs: None,
                         delay_select: None,
                         origin: None,
                         lhs: make_ident_expr(delayed),
@@ -20542,6 +20533,7 @@ fn elaborate_items(
                         let decl_rhs = net_declaration_driver(nd, &decl.name.name, init_expr, elab);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_exprs: decl_dly.3,
                             delay_select: None,
                             origin: Some((init_expr.span, top_origin_scope())),
                             lhs: make_ident_expr(&decl.name.name),
@@ -21368,19 +21360,8 @@ fn elaborate_items(
                 }
             }
             ModuleItem::ContinuousAssign(ca) => {
-                let delay = ca
-                    .delay
-                    .as_ref()
-                    .map(|d| eval_const_expr(d, &elab.parameters))
-                    .unwrap_or(0);
-                let delay_fall = ca
-                    .delay_fall
-                    .as_ref()
-                    .map(|d| eval_const_expr(d, &elab.parameters));
-                let delay_off = ca
-                    .delay_off
-                    .as_ref()
-                    .map(|d| eval_const_expr(d, &elab.parameters));
+                let (delay, delay_fall, delay_off, delay_exprs) = cont_assign_delays(
+                    [ca.delay.as_deref(), ca.delay_fall.as_deref(), ca.delay_off.as_deref()], &elab.parameters);
                 for (lhs, rhs) in &ca.assignments {
                     // §10.3.1 / §21.2.1.5: record the drive strength pair on
                     // the target net so `%v` can report it (e.g. "Pu0").
@@ -21417,9 +21398,10 @@ fn elaborate_items(
                         &|n| elab.struct_members.contains_key(n),
                         &|n| elab.packages.contains(n),
                     );
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
+                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_exprs: delay_exprs.clone(),
                             delay_select: None,
                             origin: Some((ca.span, top_origin_scope())),
                             lhs: lhs.clone(),
@@ -21662,6 +21644,7 @@ fn elaborate_items(
                 for (delayed, source) in &sb.delayed_nets {
                     elab.continuous_assigns.push(ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_exprs: None,
                         delay_select: None,
                         origin: None,
                         lhs: make_ident_expr(delayed),
@@ -22922,6 +22905,9 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
                 if let Some(d) = gi.delay.as_mut() {
                     rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
+                if let Some(d) = gi.delay_off.as_mut() {
+                    rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                }
                 if let Some(d) = gi.delay_fall.as_mut() {
                     rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
@@ -23729,16 +23715,25 @@ fn net_declaration_driver(
     }
 }
 
+/// A dynamic delay uses the ordinary delayed-driver path even when its
+/// current value is zero. Preserve every specified operand so transition
+/// selection can use their values at the instant the RHS changes.
+fn cont_assign_delays(
+    operands: [Option<&Expression>; 3],
+    params: &HashMap<String, Value>,
+) -> (u64, Option<u64>, Option<u64>, Option<DelayExpressions>) {
+    if operands.iter().flatten().any(|e| !is_const_expr(e, params)) {
+        return (1, None, None, Some(Box::new(operands.map(|e| e.cloned()))));
+    }
+    let [rise, fall, off] = operands.map(|e| e.map(|e| eval_const_expr(e, params)));
+    (rise.unwrap_or(0), fall, off, None)
+}
+
 fn net_decl_assign_delay(
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,
-) -> (u64, Option<u64>, Option<u64>) {
-    let ev = |d: Option<&Expression>| d.map(|d| eval_const_expr(d, params));
-    (
-        ev(nd.delay.as_deref()).unwrap_or(0),
-        ev(nd.delay_fall.as_deref()),
-        ev(nd.delay_off.as_deref()),
-    )
+) -> (u64, Option<u64>, Option<u64>, Option<DelayExpressions>) {
+    cont_assign_delays([nd.delay.as_deref(), nd.delay_fall.as_deref(), nd.delay_off.as_deref()], params)
 }
 
 /// §6.7.1 / §10.3.3: the NET delay of `decl` (declared by `nd`) as (rise,
@@ -23755,13 +23750,13 @@ fn net_delay_of(
     decl: &crate::ast::decl::NetDeclarator,
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,
-) -> Option<(u64, Option<u64>, Option<u64>)> {
+) -> Option<(u64, Option<u64>, Option<u64>, Option<DelayExpressions>)> {
     nd.delay.as_ref()?;
     if decl.init.is_some() || !decl.dimensions.is_empty() {
         return None;
     }
-    let (rise, fall, off) = net_decl_assign_delay(nd, params);
-    (rise != 0 || fall.unwrap_or(0) != 0 || off.unwrap_or(0) != 0).then_some((rise, fall, off))
+    let (rise, fall, off, exprs) = net_decl_assign_delay(nd, params);
+    (rise != 0 || fall.unwrap_or(0) != 0 || off.unwrap_or(0) != 0).then_some((rise, fall, off, exprs))
 }
 
 /// §9.4.5 intra-assignment delays are canonicalized pre-parse into
@@ -31701,6 +31696,7 @@ fn emit_struct_member_assigns(
     if depth > 16 {
         out.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_exprs: ca.delay_exprs.clone(),
             delay_select: ca.delay_select,
             origin: ca.origin.clone(),
             lhs: lhs_base.clone(),
@@ -31824,6 +31820,7 @@ fn emit_member_elem_assigns(
             }
             _ => out.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: ca.delay_exprs.clone(),
                 delay_select: ca.delay_select,
                 origin: ca.origin.clone(),
                 lhs,
@@ -32808,6 +32805,7 @@ fn expand_struct_driver(
             span,
         ));
         leaf.delay = 0;
+        leaf.delay_exprs = None;
         leaf.origin = None;
         leaf.delay_select = None;
     }
@@ -39551,7 +39549,7 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
     match &mut out {
         ModuleItem::FinalConstruct(fc) => fc.stmt = gen_stmt(&fc.stmt),
         ModuleItem::GateInstantiation(g) => {
-            for d in [&mut g.delay, &mut g.delay_fall].into_iter().flatten() {
+            for d in [&mut g.delay, &mut g.delay_fall, &mut g.delay_off].into_iter().flatten() {
                 *d = gen_expr(d);
             }
             for t in g.instances.iter_mut().flat_map(|i| i.terminals.iter_mut()) {
@@ -45293,6 +45291,7 @@ fn inline_instantiation_items(
                     ) {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_exprs: None,
                             delay_select: None,
                             origin: None,
                             lhs: clk_out_expr,
@@ -48203,7 +48202,13 @@ fn inline_instantiation_items(
                             );
                             for decl in &nd.declarators {
                                 let sig_name = cat2(&inst_prefix, &decl.name.name);
-                                if let Some(d) = net_delay_of(decl, nd, &sub_merged_params) {
+                                if let Some(mut d) = net_delay_of(decl, nd, &sub_merged_params) {
+                                    if let Some(exprs) = &mut d.3 {
+                                        for operand in exprs.iter_mut().flatten() {
+                                            *operand = rewrite_expr(operand, &inst_prefix, &port_map,
+                                                &prepared_sub.local_names, &sub_interface_map);
+                                        }
+                                    }
                                     elab.net_delays.insert(sig_name.clone(), d);
                                 }
                                 let effective_dims = normalize_unpacked_dims(
@@ -49779,6 +49784,7 @@ fn inline_instantiation_items(
                                 Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
                                         gate_delay_fall: None,
+                                        delay_exprs: None,
                                         delay_select: None,
                                         origin: None,
                                         lhs: sub_expr,
@@ -49792,6 +49798,7 @@ fn inline_instantiation_items(
                                 Some(PortDirection::Output) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
                                         gate_delay_fall: None,
+                                        delay_exprs: None,
                                         delay_select: None,
                                         origin: None,
                                         lhs: parent_elem,
@@ -49978,6 +49985,7 @@ fn inline_instantiation_items(
                             }
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_exprs: None,
                                 delay_select: None,
                                 origin: None,
                                 lhs: sub_expr,
@@ -49991,6 +49999,7 @@ fn inline_instantiation_items(
                         Some(PortDirection::Output) => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_exprs: None,
                                 delay_select: None,
                                 origin: None,
                                 lhs: parent_expr.clone(),
@@ -50004,6 +50013,7 @@ fn inline_instantiation_items(
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_exprs: None,
                                 delay_select: None,
                                 origin: None,
                                 lhs: sub_expr,
@@ -51243,6 +51253,7 @@ fn inline_instantiation_items(
                             let delay_rc = gi.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
                             let delay_fall_rc =
                                 gi.delay_fall.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                            let delay_off_rc = gi.delay_off.as_ref().cloned().map(std::rc::Rc::new);
                             for (lhs_rc, rhs_rc) in pairs {
                                 // §28.4: mark the driven net gate-driven, as
                                 // `gate_inst_to_assigns` does at the top level,
@@ -51265,7 +51276,7 @@ fn inline_instantiation_items(
                                     strength: None,
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
-                                    delay_off_source: None,
+                                    delay_off_source: delay_off_rc.clone(),
                                     origin_span: None,
                                 });
                             }
@@ -51347,6 +51358,7 @@ fn inline_instantiation_items(
                             );
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 gate_delay_fall: None,
+                                delay_exprs: None,
                                 delay_select: None,
                                 origin: None,
                                 lhs,
@@ -55277,6 +55289,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         // that element of the resolved value (§6.6.7).
                         let template = ContinuousAssignment {
                             gate_delay_fall: None,
+                            delay_exprs: None,
                             delay_select: None,
                             origin: None,
                             lhs: mlhs.clone(),
@@ -55304,6 +55317,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     }
                     kept.push(ContinuousAssignment {
                         gate_delay_fall: None,
+                        delay_exprs: None,
                         delay_select: None,
                         origin: None,
                         lhs: mlhs,
@@ -55318,6 +55332,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             None => {
                 kept.push(ContinuousAssignment {
                     gate_delay_fall: None,
+                    delay_exprs: None,
                     delay_select: None,
                     origin: None,
                     // §6.6.8: an element name (`a[0]`) must emit a real
@@ -55963,6 +55978,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         for (port, root) in members {
             cas.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: None,
                 delay_select: None,
                 origin: None,
                 lhs: make_ident_expr(port),
@@ -56031,7 +56047,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
     let mut names: Vec<String> = drivers.keys().cloned().collect();
     names.sort();
     for net in names {
-        let (rise, fall, off) = delays[&net];
+        let (rise, fall, off, delay_exprs) = delays.remove(&net).unwrap();
         let (width, is_real) = elab
             .signals
             .get(&net)
@@ -56062,6 +56078,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             let ca = &mut elab.continuous_assigns[drivers[&net][0]];
             // §28.16: this is a net delay, even on a [0:0] vector.
             ca.delay_select = Some((0, width, false));
+            ca.delay_exprs = delay_exprs;
             ca.delay = rise;
             ca.delay_fall = fall;
             ca.delay_off = off;
@@ -56108,6 +56125,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         if !per_bit {
             elab.continuous_assigns.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: delay_exprs.clone(),
                 delay_select: None,
                 origin: None,
                 lhs: make_ident_expr(&net),
@@ -56148,6 +56166,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             );
             elab.continuous_assigns.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: delay_exprs.clone(),
                 delay_select: None,
                 origin: None,
                 lhs: make_ident_expr(&b),
@@ -56162,6 +56181,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         bits.reverse();
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_exprs: None,
             delay_select: None,
             origin: None,
             lhs: make_ident_expr(&net),
@@ -56625,6 +56645,7 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
         elab.udp_instances[i].output = Expression::new(make_ident_expr(&stage).kind, span);
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_exprs: None,
             delay_select: None,
             origin: None,
             lhs: make_ident_expr(&net),
@@ -56738,6 +56759,7 @@ fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule) {
         let span = elab.clocking_blocks[cb].span;
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_exprs: None,
             delay_select: None,
             origin: None,
             lhs: make_ident_expr(&canon),
@@ -56787,9 +56809,9 @@ pub fn unify_alias_nets(elab: &mut ElaboratedModule) {
                 elab.supply_nets.insert(m.clone());
             }
         }
-        if let Some(delay) = members.iter().find_map(|m| elab.net_delays.get(m).copied()) {
+        if let Some(delay) = members.iter().find_map(|m| elab.net_delays.get(m).cloned()) {
             for m in members {
-                elab.net_delays.insert(m.clone(), delay);
+                elab.net_delays.insert(m.clone(), delay.clone());
             }
         }
         for m in members {
@@ -57409,6 +57431,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             elab.continuous_assigns.push(delayed);
             ca.rhs = marked.unwrap_or_else(|| Expression::new(rhs.kind, ca.rhs.span));
             ca.delay = 0;
+            ca.delay_exprs = None;
             ca.delay_fall = None;
             ca.delay_off = None;
         }
@@ -57613,6 +57636,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             };
             elab.continuous_assigns.push(ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: None,
                 delay_select: None,
                 origin: None,
                 lhs: acc.lhs,
@@ -57702,6 +57726,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
 
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_exprs: None,
             delay_select: None,
             origin: None,
             lhs: term_a,
@@ -57717,6 +57742,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
         });
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: None,
+            delay_exprs: None,
             delay_select: None,
             origin: None,
             lhs: term_b,
@@ -57784,18 +57810,8 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
     // rewrite; carried onto the lowered cont-assign, whose delayed-update
     // path models the §28.9 single-delay INERTIAL behavior (a pulse
     // narrower than the delay is filtered).
-    let delay = gi
-        .delay
-        .as_ref()
-        .map(|d| eval_const_expr(d, &elab.parameters))
-        .unwrap_or(0);
-    // §28.16: keep the fall delay on this primitive's assignment so it
-    // survives splitting several drivers of the same net. The name map also
-    // carries the primitive delay-mode override to the runtime.
-    let fall = gi
-        .delay_fall
-        .as_ref()
-        .map(|d| eval_const_expr(d, &elab.parameters));
+    let (delay, fall, off, delay_exprs) = cont_assign_delays(
+        [gi.delay.as_ref(), gi.delay_fall.as_ref(), gi.delay_off.as_ref()], &elab.parameters);
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
         // Mark the driven net as gate-driven so the runtime keeps §28.4 truth-
@@ -57812,6 +57828,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
         }
         elab.continuous_assigns.push(ContinuousAssignment {
             gate_delay_fall: fall,
+            delay_exprs: delay_exprs.clone(),
             delay_select: None,
             origin: None,
             lhs: lhs.clone(),
@@ -57819,7 +57836,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
             delay,
             rhs_parent_scoped: false,
             delay_fall: None,
-            delay_off: None,
+            delay_off: off,
         });
     }
 }
@@ -58181,6 +58198,7 @@ pub fn whole_array_assign_parts_dir_with_params(
         (0..=n)
             .map(|k| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: None,
                 delay_select: None,
                 origin: None,
                 lhs: index_expr(lhs.clone(), if ld { lhi - k } else { llo + k }),
@@ -58227,6 +58245,7 @@ pub fn slice_array_assign_parts(
             .zip(rhs_elems)
             .map(|(l, r)| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: None,
                 delay_select: None,
                 origin: None,
                 lhs: l,
@@ -58610,6 +58629,7 @@ pub fn whole_array_row_assign_parts(
         (0..=n)
             .map(|k| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: None,
                 delay_select: None,
                 origin: None,
                 lhs: make_index_expr(ln, if ld { lhi - k } else { llo + k }),
@@ -58710,6 +58730,7 @@ fn pattern_array_assign_parts(
         out.into_iter()
             .map(|(idx, e, inherited)| ContinuousAssignment {
                 gate_delay_fall: None,
+                delay_exprs: None,
                 delay_select: None,
                 origin: None,
                 lhs: make_multi_index_expr(ln, &idx),
@@ -58888,6 +58909,7 @@ fn expand_whole_array_assign(
     lhs: &Expression,
     rhs: &Expression,
     delay: u64,
+    delay_exprs: &Option<DelayExpressions>,
     elab: &mut ElaboratedModule,
 ) -> bool {
     match elab.whole_array_driver_parts(lhs, rhs, delay, &elab.unpacked_decl_dims)
@@ -58904,7 +58926,8 @@ fn expand_whole_array_assign(
     })
     .or_else(|| elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t)))
     {
-        Some(parts) => {
+        Some(mut parts) => {
+            for part in &mut parts { part.delay_exprs = delay_exprs.clone(); }
             elab.continuous_assigns.extend(parts);
             true
         }
@@ -59359,6 +59382,7 @@ fn tri_port_select_pull(
         delay_fall: None,
         delay_off: None,
         gate_delay_fall: None,
+        delay_exprs: None,
     })
 }
 

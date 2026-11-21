@@ -997,9 +997,12 @@ pub struct GateInstantiation {
     /// §28.11 `#(rise, fall)` — the FALL delay (second expression), applied to
     /// 1→0 output transitions. `None` when the spec gave a single delay, in
     /// which case the rise value governs both edges. A third (turn-off) value
-    /// is still skipped.
+    /// is carried separately for primitives that allow delay3.
     #[cfg_attr(feature = "serde", serde(default))]
     pub delay_fall: Option<Expression>,
+    /// §28.11: optional turn-off delay of a delay3 primitive.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_off: Option<Expression>,
     pub instances: Vec<GateInstance>,
     pub span: Span,
 }

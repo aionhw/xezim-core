@@ -885,7 +885,7 @@ impl<'a> Binder<'a> {
                 }
             }
             ModuleItem::GateInstantiation(g) => self.with_pos("gate", |b| {
-                [&mut g.delay, &mut g.delay_fall]
+                [&mut g.delay, &mut g.delay_fall, &mut g.delay_off]
                     .into_iter()
                     .flatten()
                     .for_each(|e| b.expr(e));

@@ -3803,11 +3803,10 @@ impl<'a> Parser<'a> {
         }
         // Optional `#(delay)` or `#delay` spec between the gate keyword and
         // the first instance: `buf #(D) name (...)`. §28.11: the list is
-        // `(rise, fall, turn-off)` — capture rise AND fall (the turn-off value
-        // is still skipped). Collapsing fall onto rise made every 1->0 edge
-        // use the rise delay.
+        // `(rise, fall, turn-off)` for a delay3 primitive.
         let mut delay: Option<Expression> = None;
         let mut delay_fall: Option<Expression> = None;
+        let mut delay_off = None;
         if self.eat(TokenKind::Hash).is_some() {
             if self.eat(TokenKind::LParen).is_some() {
                 let rise = self.parse_expression();
@@ -3815,6 +3814,10 @@ impl<'a> Parser<'a> {
                 if self.eat(TokenKind::Comma).is_some() {
                     let fall = self.parse_expression();
                     delay_fall = Some(self.parse_mintypmax_rest(fall));
+                    if self.eat(TokenKind::Comma).is_some() {
+                        let off = self.parse_expression();
+                        delay_off = Some(self.parse_mintypmax_rest(off));
+                    }
                 }
                 let mut depth = 1;
                 while depth > 0 && !self.at(TokenKind::Eof) {
@@ -3868,6 +3871,7 @@ impl<'a> Parser<'a> {
             gate_type,
             delay,
             delay_fall,
+            delay_off,
             instances,
             span: self.span_from(start),
         }

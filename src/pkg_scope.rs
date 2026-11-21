@@ -3215,6 +3215,7 @@ impl Rw<'_> {
             ModuleItem::GateInstantiation(g) => {
                 self.opt(&mut g.delay);
                 self.opt(&mut g.delay_fall);
+                self.opt(&mut g.delay_off);
                 for i in &mut g.instances {
                     i.terminals.iter_mut().for_each(|t| self.expr(t));
                 }

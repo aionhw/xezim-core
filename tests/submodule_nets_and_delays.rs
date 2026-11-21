@@ -129,3 +129,31 @@ endmodule
     assert!(!m.implicit_nets.contains("m1"), "phantom implicit net m1");
     assert!(!m.signals.contains_key("m1"), "phantom signal m1");
 }
+
+#[test]
+fn variable_delays_survive_port_rewriting_and_net_staging() {
+    let m = elab(
+        r#"
+`timescale 1ns/1ps
+module child #(parameter int PD = 1) (input a, input [3:0] dv);
+  wire c, g;
+  assign #(dv + PD, 2, dv) c = a;
+  wire #(dv) init_net = a;
+  buf #(dv) drive(g, a);
+endmodule
+module top;
+  logic a;
+  int d;
+  wire out;
+  assign #(d) out = a;
+  child u(a, d[3:0]);
+endmodule
+"#,
+    );
+    for (target, arity) in [("out", 1), ("u.c", 3), ("u.init_net", 1), ("u.g", 1)] {
+        let ca = assign_to(&m, target);
+        assert_ne!(ca.delay, 0, "{target} must use the delayed driver path");
+        let args = ca.delay_exprs.as_ref().expect("runtime operands");
+        assert_eq!(args.iter().flatten().count(), arity, "{target}");
+    }
+}
