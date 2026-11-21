@@ -271,7 +271,26 @@ pub use value::Value;
 ///         generate copy's clocking block registered under the copy's name with its clockvar
 ///         signals, and an instance's block named from inside the instance (§14.3, §27.4), and
 ///         `[N]` sized by an imported parameter next to another package's type N (§26.3).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x58";
+/// \x59 = \x58 + cycle delay operands that open with a clocking event, a concatenation, a
+///         literal, an escaped name or first_match (§16.13.1, A.2.10); packed user-defined port
+///         types of subroutine bodies and escaped port names after a type (§13.4, §5.6.1), enum
+///         labels and imported names kept out of the implicit nets of port actuals (§6.19,
+///         §6.10, §26.3), a gated_clk_cell elaborated from its body unless it is a plain
+///         pass-through (§23.3.2), connection widths of ranges after an index (§7.4.3) and
+///         prefixed parameter bounds of unpacked port slices folded (§7.4.6); type parameter
+///         overrides resolved with the instantiating instance's typedefs, block-local type
+///         parameters with packed dimensions, package array elements in generate conditions
+///         below the top, class typedefs through specializations, 2-state struct initial values,
+///         statement-local dimensions folded per instance and library-file macros kept across
+///         library files (§6.20.3, §7.4.1, §26.3, §8.25.1, §7.2.1, §20.6.2, §22.5.1); compact
+///         tokens, nested bind targets elaborated per newly bound scope and instance function and
+///         task bodies shared until used (§23.11, §13.4); literal input actuals converted to the
+///         formal's type, 2-state port formals, formals kept for X/Z-, real- and pull-sensitive
+///         actuals, package constant actual widths and the scoped `$stime` read (§23.3.3.8,
+///         §6.11.2, §6.6.5, §20.3.2), fixed-array declaration initializers and continuous
+///         assignments of unpacked concatenations (§6.8, §10.3, §10.10), and time reads and time
+///         literals of continuous assignments in the declaring module's unit (§3.14.2.3, §5.8).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x59";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
