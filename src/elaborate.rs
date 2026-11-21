@@ -5641,6 +5641,7 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
 
 fn get_type_name(dt: &DataType) -> Option<String> {
     match dt {
+        DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. } => Some("shortreal".into()),
         DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
         DataType::Interface { name, .. } => Some(name.name.clone()),
         _ => None,
@@ -34195,9 +34196,10 @@ fn eval_const_expr_val_with_ctx<P: ParamLookup>(
         ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" && args.len() == 2 => {
             if let ExprKind::TypeLiteral(dt) = &args[0].kind {
                 if is_type_real(dt) {
-                    return Value::from_f64(
-                        eval_const_expr_val_inner(&args[1], params, types).to_f64(),
-                    );
+                    let f = eval_const_expr_val_inner(&args[1], params, types).to_f64();
+                    return Value::from_f64(if matches!(dt.as_ref(), DataType::Real {
+                        kind: crate::ast::types::RealType::ShortReal, ..
+                    }) { f as f32 as f64 } else { f });
                 }
                 let w = TYPEDEFS_TLS
                     .with(|c| {
