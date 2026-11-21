@@ -56072,13 +56072,14 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
                 ca.rhs.span,
             );
         }
-        if !staged.contains(&net) && !per_bit {
-            // A lone undelayed driver of the whole net IS the net's value:
-            // the net delay is simply its delay.
+        if !staged.contains(&net) && !per_bit && delay_exprs.is_none() {
+            // A constant delay is already rounded to ticks and can be applied
+            // directly to the lone driver. A variable net delay must evaluate
+            // in the declaring net's time precision, even if a different
+            // module supplied the driver, so it keeps a separate stage.
             let ca = &mut elab.continuous_assigns[drivers[&net][0]];
             // §28.16: this is a net delay, even on a [0:0] vector.
             ca.delay_select = Some((0, width, false));
-            ca.delay_exprs = delay_exprs;
             ca.delay = rise;
             ca.delay_fall = fall;
             ca.delay_off = off;

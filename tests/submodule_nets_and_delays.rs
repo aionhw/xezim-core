@@ -157,3 +157,30 @@ endmodule
         assert_eq!(args.iter().flatten().count(), arity, "{target}");
     }
 }
+
+#[test]
+fn variable_net_delay_retains_its_own_scope_for_an_external_driver() {
+    let m = elab(
+        r#"
+module sub;
+  timeunit 1ns;
+  timeprecision 100ps;
+  real d = 0.16;
+  wire #(d) y;
+endmodule
+module top;
+  timeunit 1ns;
+  timeprecision 1ps;
+  logic a;
+  sub u();
+  assign u.y = a;
+endmodule
+"#,
+    );
+    let stage = assign_to(&m, "u.y");
+    assert!(stage.delay_exprs.is_some());
+    assert!(stage.origin.is_none(), "the stage derives its scope from u.y");
+    let driver = assign_to(&m, "u.y$netdrv");
+    assert!(driver.delay_exprs.is_none());
+    assert_eq!(driver.origin.as_ref().unwrap().1.as_ref(), "");
+}
