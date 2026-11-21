@@ -642,7 +642,8 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                 // $rtoi TRUNCATES toward zero (unlike an assignment to int,
                 // which rounds).
                 "$rtoi" => Value::rtoi(f),
-                "$itor" => Value::from_f64(f),
+                // Apply assignment rounding (§6.12.1) and convert integer zero to +0.0 (§20.5).
+                "$itor" => Value::from_f64(if v.is_real { f.round() + 0.0 } else { f }),
                 "$realtobits" => Value::from_u64(f.to_bits(), 64),
                 "$bitstoreal" => Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0))),
                 "$shortrealtobits" => Value::from_u64((f as f32).to_bits() as u64, 32),
