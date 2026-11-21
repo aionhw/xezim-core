@@ -55242,6 +55242,16 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             })
     };
 
+    // §5.6.1: a declared escaped scalar can end in brackets. Only an
+    // unpacked element, which has no separate signal declaration, needs
+    // its brackets rebuilt as an Index expression.
+    let net_expr = |elab: &ElaboratedModule, name: &str| {
+        if name.ends_with(']') && elab.signals.contains_key(name) {
+            make_ident_expr(name)
+        } else {
+            make_net_lhs_expr(name)
+        }
+    };
     // Emit `lhs = rhs`, expanded member-wise when the nettype wraps an unpacked
     // struct (one signal per member, so a whole-struct write has nowhere to go).
     let emit = |kept: &mut Vec<ContinuousAssignment>,
@@ -55250,9 +55260,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 members: &NetMembers,
                 delay: u64,
                 span: Span,
-                typedef_types: &HashMap<String, DataType>,
-                typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
-                params: &HashMap<String, Value>| {
+                elab: &ElaboratedModule| {
         match members {
             Some(ms) => {
                 for (m, mdt, mdims) in ms {
@@ -55292,9 +55300,9 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                             mdt,
                             mdims,
                             &template,
-                            typedef_types,
-                            typedef_unpacked_dims,
-                            params,
+                            &elab.typedef_types,
+                            &elab.typedef_unpacked_dims,
+                            &elab.parameters,
                             kept,
                             0,
                         );
@@ -55320,7 +55328,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     origin: None,
                     // §6.6.8: an element name (`a[0]`) must emit a real
                     // Index LHS, not a flat ident literally named `a[0]`.
-                    lhs: make_net_lhs_expr(lhs),
+                    lhs: net_expr(elab, lhs),
                     rhs,
                     delay,
                     rhs_parent_scoped: true,
@@ -55380,13 +55388,11 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     emit(
                         &mut kept,
                         m,
-                        make_net_lhs_expr(src),
+                        net_expr(elab, src),
                         &mm,
                         0,
                         span,
-                        &elab.typedef_types,
-                        &elab.typedef_unpacked_dims,
-                        &elab.parameters,
+                        elab,
                     );
                 }
             }
@@ -55501,9 +55507,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     &None,
                     dly,
                     span,
-                    &elab.typedef_types,
-                    &elab.typedef_unpacked_dims,
-                    &elab.parameters,
+                    elab,
                 );
             }
             Expression::new(
@@ -55521,9 +55525,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             &members,
             delay,
             span,
-            &elab.typedef_types,
-            &elab.typedef_unpacked_dims,
-            &elab.parameters,
+            elab,
         );
 
         // Every other net in the component names the same physical node.
@@ -55546,13 +55548,11 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 emit(
                     &mut kept,
                     m,
-                    make_net_lhs_expr(&root),
+                    net_expr(elab, &root),
                     &mm,
                     0,
                     span,
-                    &elab.typedef_types,
-                    &elab.typedef_unpacked_dims,
-                    &elab.parameters,
+                    elab,
                 );
             }
         }
@@ -55612,13 +55612,11 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     emit(
                         &mut kept,
                         dest,
-                        make_net_lhs_expr(src),
+                        net_expr(elab, src),
                         &single_mem,
                         0,
                         Span::dummy(),
-                        &elab.typedef_types,
-                        &elab.typedef_unpacked_dims,
-                        &elab.parameters,
+                        elab,
                     );
                 }
             }
