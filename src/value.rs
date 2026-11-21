@@ -548,14 +548,9 @@ impl Value {
         }
     }
 
-    /// Hard ceiling on a single Value's bit width (1 Mibit ≈ 128 KiB of `Wide`
-    /// storage). No legitimate scalar/packed value is this wide; a larger width
-    /// is always an artifact of a parameter underflow — e.g. `[N-1:0]` or a
-    /// part-select/`infer_lhs_width` where N resolved to 0, so `N-1` wrapped to
-    /// ~u32::MAX. Without this cap such a width allocates multiple GB and OOMs
-    /// the run (notably black-parrot config-table extraction the const-evaluator
-    /// can't resolve). Matches `elaborate::SANE_MAX_PACKED_WIDTH`.
-    pub const MAX_WIDTH: u32 = 1 << 20;
+    /// Absolute storage limit in bits. The default declaration limit is lower
+    /// and can be raised for large packed behavioural memories.
+    pub const MAX_WIDTH: u32 = 1 << 27;
 
     /// Clamp an absurd (underflowed) width to `MAX_WIDTH`, warning once.
     ///

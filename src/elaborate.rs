@@ -10995,6 +10995,7 @@ pub fn elaborate_module_with_defs(
     top_level_lets: &[LetDeclaration],
     seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
+    PACKED_WIDTH_ERROR.with(|slot| slot.take());
     let _oom_trace = crate::oom_trace::session();
     let _oom_definition = crate::oom_trace::definition(module, "elaborate module", module.name());
     let mut elab = ElaboratedModule::new(module.name().to_string());
@@ -16085,6 +16086,9 @@ pub fn elaborate_module_with_defs(
         elab.program_initial_blocks.extend(initials);
     }
 
+    if let Some(error) = PACKED_WIDTH_ERROR.with(|slot| slot.take()) {
+        return Err(error);
+    }
     Ok(elab)
 }
 
@@ -22149,25 +22153,23 @@ fn elaborate_generate_for(
     Ok(())
 }
 
-/// Largest plausible width for a single PACKED signal/net/port (1 Mibit ≈
-/// 128 KiB as a Wide value). No real RTL declares a single packed vector wider
-/// than this; a computed width at/above it is invariably a parameter-resolution
-/// underflow (e.g. `[N-1:0]` with N evaluating to 0, so `N-1` wraps to ~u32::MAX
-/// → a multi-GB phantom signal that OOMs elaboration). Clamp such widths so
-/// elaboration survives a config the const-evaluator can't fully resolve. The
-/// largest legitimate value observed across the corpus (black-parrot's
-/// `all_cfgs_gp` config table) is 344064 bits, well under this cap.
-pub const SANE_MAX_PACKED_WIDTH: u32 = 1 << 20;
+/// Default implementation limit for a single packed declaration, in bits.
+/// Packed behavioural memories can legitimately be several megabits wide.
+pub const SANE_MAX_PACKED_WIDTH: u32 = 1 << 24;
 
-/// Width substituted for an absurd (underflowed) packed width. A width past the
-/// sane cap is never real data — it comes from `[N-1:0]` with N resolving to 0,
-/// so `N-1` wraps to ~u32::MAX. The slice carries no meaningful value, so we
-/// collapse it to a single bit: this keeps both elaboration AND simulation
-/// memory bounded (a 1 Mibit clamp still costs 128 KiB/signal and, once such a
-/// phantom feeds continuous-assign/always evaluation, re-materializes per
-/// update and OOMs the run). 1 bit is exactly as wrong as any other clamp for a
-/// config the const-evaluator could not resolve, but free.
-const UNDERFLOW_WIDTH_PLACEHOLDER: u32 = 1;
+/// Unreferenced declarations can be dropped below the allocation limit.
+const DEAD_DECL_WIDTH_THRESHOLD: u32 = 1 << 20;
+
+pub fn max_packed_width() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("XEZIM_MAX_PACKED_WIDTH")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n > 0 && n <= Value::MAX_WIDTH)
+            .unwrap_or(SANE_MAX_PACKED_WIDTH)
+    })
+}
 
 /// Quiet width probe for the dead-declaration elision below: mirrors
 /// `resolve_type_width`'s IntegerVector/TypeReference math WITHOUT the
@@ -22186,7 +22188,7 @@ fn quiet_packed_width_probe(
             };
             let l = const_eval_i64_with_params(left, Some(params))?;
             let r = const_eval_i64_with_params(right, Some(params))?;
-            total = total.saturating_mul(((l - r).abs() + 1) as u64);
+            total = total.saturating_mul(l.abs_diff(r).saturating_add(1));
         }
         Some(total)
     };
@@ -22277,7 +22279,7 @@ fn filter_dead_giant_declarators(
 ) -> Option<crate::ast::decl::DataDeclaration> {
     let Some(defs) = all_defs else { return None };
     let w = quiet_packed_width_probe(&dd.data_type, &elab.parameters, &elab.typedefs);
-    if w <= SANE_MAX_PACKED_WIDTH as u64 {
+    if w <= DEAD_DECL_WIDTH_THRESHOLD.min(max_packed_width()) as u64 {
         return None;
     }
     let candidates: Vec<usize> = dd
@@ -22327,6 +22329,7 @@ thread_local! {
     /// RAW AST — before dead-declaration elision has decided anything — so
     /// their clamp calls must not emit user-facing warnings. Elaboration
     /// proper re-resolves every KEPT declaration and warns there.
+    static PACKED_WIDTH_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static SUPPRESS_WIDTH_WARNINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -22340,59 +22343,25 @@ pub fn with_width_warnings_suppressed<R>(f: impl FnOnce() -> R) -> R {
 }
 
 fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
-    if w > SANE_MAX_PACKED_WIDTH as u64 {
-        use std::sync::{Mutex, OnceLock};
-        static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-        let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-        // Two very different causes land here and they need different answers:
-        //
-        //  * A genuine UNDERFLOW — `[N-1:0]` with N resolving to 0 wraps `N-1`
-        //    to ~u32::MAX. The slice carries no meaningful data, so collapsing
-        //    it to 1 bit is right.
-        //
-        //  * A LEGITIMATELY LARGE vector — e.g. `wire [N*W-1:0]` with
-        //    N*W = 4_194_304. That is real, declarable data that merely
-        //    exceeds our cap. Collapsing it to 1 bit used to manufacture
-        //    downstream breakage: a later `flat[i*W +: W]` then selects bits
-        //    far above the (now 1-bit) signal, which underflowed
-        //    `high_eff - low` in the write paths. Clamp to the cap instead, so
-        //    the low bits still behave and out-of-range selects are simply
-        //    no-ops.
-        //
-        // Anything at or past 2^31 could not have been written deliberately
-        // and is treated as the wraparound case.
-        let is_wraparound = w >= (1u64 << 31);
-        let replacement = if is_wraparound {
-            UNDERFLOW_WIDTH_PLACEHOLDER
-        } else {
-            SANE_MAX_PACKED_WIDTH
-        };
-        if SUPPRESS_WIDTH_WARNINGS.with(|c| c.get()) || crate::elab_diags_muted() {
-            return replacement;
-        }
-        let key = format!("{}|{}", ctx, detail);
-        if seen.lock().map(|mut g| g.insert(key)).unwrap_or(false) {
-            let detail_part = if detail.is_empty() {
-                String::new()
-            } else {
-                format!(", {}", detail)
-            };
-            let cause = if is_wraparound {
-                "a parameter likely resolved to 0 causing an `[N-1:0]` underflow"
-            } else {
-                "the declared width is genuinely larger than xezim's cap; \
-                 selects above the cap read/write nothing"
-            };
-            crate::elab_diag(format!(
-                "[xezim][warning] packed width {} exceeds sane cap {} ({}{}); \
-                 clamping to {} bit — {}",
-                w, SANE_MAX_PACKED_WIDTH, ctx, detail_part, replacement, cause
-            ));
-        }
-        replacement
-    } else {
-        w as u32
+    let limit = max_packed_width();
+    if w <= u64::from(limit) {
+        return w as u32;
     }
+    if !SUPPRESS_WIDTH_WARNINGS.with(|c| c.get()) && !crate::elab_diags_muted() {
+        PACKED_WIDTH_ERROR.with(|slot| {
+            let mut error = slot.borrow_mut();
+            if error.is_none() {
+                *error = Some(format!(
+                    "packed width {w} exceeds implementation limit {limit} ({ctx}, {detail}); \
+                     set XEZIM_MAX_PACKED_WIDTH to a supported width up to {} bits",
+                    Value::MAX_WIDTH
+                ));
+            }
+        });
+    }
+    // Width queries also run during tentative scans. Keep temporary storage
+    // bounded until the enclosing elaboration returns the captured error.
+    1
 }
 
 /// Describe an underflowed packed range for `clamp_packed_width` detail:
@@ -24288,8 +24257,8 @@ pub fn resolve_type_width_env<P: ParamLookup>(
                     let lv = const_eval_i64_with_params_env(left, params);
                     let rv = const_eval_i64_with_params_env(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
-                        let w = ((l - r).abs() + 1) as u64;
-                        if w > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
+                        let w = l.abs_diff(r).saturating_add(1);
+                        if w > max_packed_width() as u64 && culprit.is_none() {
                             culprit = Some(describe_packed_range(left, right, l, r, params.map(ParamLookup::to_hashmap).as_deref()));
                         }
                         dims_desc.push_str(&format!("[{}:{}]", l, r));
@@ -24304,7 +24273,7 @@ pub fn resolve_type_width_env<P: ParamLookup>(
             // (`[2047:0][2047:0]`); name the dims and the source byte offset
             // so the offending declaration is findable (grep the
             // --dump-merged-sv output at that offset).
-            if total > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
+            if total > max_packed_width() as u64 && culprit.is_none() {
                 culprit = Some(format!(
                     "dims {} at {}",
                     dims_desc,
@@ -24335,7 +24304,7 @@ pub fn resolve_type_width_env<P: ParamLookup>(
                     let lv = const_eval_i64_with_params_env(left, params);
                     let rv = const_eval_i64_with_params_env(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
-                        let w = ((l - r).abs() + 1) as u64;
+                        let w = l.abs_diff(r).saturating_add(1);
                         total = total.saturating_mul(w);
                     }
                 }
@@ -24376,7 +24345,7 @@ pub fn resolve_type_width_env<P: ParamLookup>(
                             const_eval_i64_with_params_env(left, params),
                             const_eval_i64_with_params_env(right, params),
                         ) {
-                            let w = ((l - r).abs() + 1) as u64;
+                            let w = l.abs_diff(r).saturating_add(1);
                             total = total.saturating_mul(w);
                         }
                     }
@@ -24471,7 +24440,7 @@ pub fn resolve_type_width_env<P: ParamLookup>(
                         const_eval_i64_with_params_env(left, params),
                         const_eval_i64_with_params_env(right, params),
                     ) {
-                        w = w.saturating_mul(((l - r).abs() + 1) as u64);
+                        w = w.saturating_mul(l.abs_diff(r).saturating_add(1));
                     }
                 }
             }
