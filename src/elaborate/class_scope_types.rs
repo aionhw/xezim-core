@@ -105,7 +105,7 @@ fn class_type_scope(c: &ClassDeclaration) -> Option<ClassTypeScope> {
     if type_params.is_empty() {
         return None;
     }
-    let mut typedefs = HashMap::default();
+    let mut typedefs: HashMap<String, (String, Option<TypeName>)> = HashMap::default();
     for item in &c.items {
         let ClassItem::Typedef(td) = item else {
             continue;
@@ -125,6 +125,20 @@ fn class_type_scope(c: &ClassDeclaration) -> Option<ClassTypeScope> {
         let entry = match name.scopes.split_first() {
             None if type_params.contains(&name.name.name.as_str()) => {
                 (name.name.name.clone(), None)
+            }
+            // A second typedef of a preceding class typedef has the same
+            // binding in each specialization (§6.18, §8.25.1).
+            None => {
+                let local = name
+                    .name
+                    .name
+                    .strip_prefix(&c.name.name)
+                    .and_then(|suffix| suffix.strip_prefix("::"))
+                    .unwrap_or(&name.name.name);
+                let Some(binding) = typedefs.get(local) else {
+                    continue;
+                };
+                binding.clone()
             }
             Some((head, rest))
                 if head.type_args.is_empty() && type_params.contains(&head.name.name.as_str()) =>
