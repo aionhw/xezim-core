@@ -200,3 +200,16 @@ endmodule
         "{diags:#?}"
     );
 }
+
+#[test]
+fn indexed_range_counts_elements_with_variable_start() {
+    for select in ["pos +: 2", "pos -: 2"] {
+        let src = format!("module sink(input logic [23:0] a); endmodule
+            module top(input int pos, input logic [3:0][5:0][7:0] words);
+              sink u(words[1][{select}]);
+            endmodule");
+        let messages = diagnostics(&src, "top");
+        assert!(messages.iter().any(|d| d.contains("port width mismatch")
+            && d.contains("16 bit(s)")), "{select}: {messages:?}");
+    }
+}

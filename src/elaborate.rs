@@ -42573,12 +42573,18 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
             expr: base,
             left,
             right,
-            kind: crate::ast::expr::RangeKind::Constant,
+            kind,
             ..
         } => {
-            let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
             let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
-            let count = ((l - r).unsigned_abs() + 1) as u32;
+            let count = match kind {
+                crate::ast::expr::RangeKind::Constant => {
+                    let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
+                    u32::try_from(l.abs_diff(r).checked_add(1)?).ok()?
+                }
+                // §11.5.1: the starting position may vary, but the width is constant.
+                _ => u32::try_from(r).ok().filter(|&n| n > 0)?,
+            };
             // §7.4.1: a constant range on a packed MULTI-D base selects
             // ELEMENTS, so the connection carries count × elem_w bits.
             // `.p(arr[1:0])` on a packed array of 128-bit structs is 256
@@ -42592,7 +42598,7 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
                     .join(".");
                 if let Some(&ew) = elab.packed_signal_elem_widths.get(&name) {
                     if ew > 1 {
-                        return Some(count * ew);
+                        return count.checked_mul(ew);
                     }
                 }
             }
@@ -42600,7 +42606,7 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
             // the NEXT dimension: `.o(a[2][4:2])` on `logic [3:0][5:0][7:0] a`
             // is three 8-bit elements, 24 bits, not 3.
             if let Some(ew) = chain_range_elem_width(base, elab) {
-                return Some(count * ew);
+                return count.checked_mul(ew);
             }
             Some(count)
         }
