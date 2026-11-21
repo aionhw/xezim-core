@@ -1230,7 +1230,7 @@ impl Parser {
     /// Whether the bracket groups starting `n` tokens ahead are followed by
     /// an identifier: `my_t [3:0] x` (a type, packed dimensions, a name), not
     /// `a [4]` (a name and its unpacked dimensions, §7.4.2, #657).
-    fn dims_then_identifier(&self, mut n: usize) -> bool {
+    pub(super) fn dims_then_identifier(&self, mut n: usize) -> bool {
         while self.peek_kind_n(n) == TokenKind::LBracket {
             let mut depth = 0usize;
             loop {
