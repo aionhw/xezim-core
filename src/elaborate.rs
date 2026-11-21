@@ -22742,6 +22742,17 @@ pub fn scope_time_decl_inits(items: &mut [ModuleItem], unit_exp: i32, prec_exp: 
                     scope_time_expr(e, unit_exp, prec_exp);
                 }
             }
+            // §3.14.2.3, §20.3: `$time`, `$stime` and `$realtime` on the right
+            // of a continuous assignment read in this module's unit, as in a
+            // net declaration assignment above. The assignment runs from
+            // whatever process changed its operands, so unscoped it reported
+            // that process's unit (`assign t = a ? $time : 0;` in a 1 ps child
+            // read 499 at 499 fs from a 1 fs parent).
+            ModuleItem::ContinuousAssign(ca) => {
+                for (_, rhs) in ca.assignments.iter_mut() {
+                    scope_time_expr(rhs, unit_exp, prec_exp);
+                }
+            }
             // Generate scopes are the same module scope for timing purposes.
             ModuleItem::GenerateFor(gf) => scope_time_decl_inits(&mut gf.items, unit_exp, prec_exp),
             ModuleItem::GenerateIf(gi) => {
