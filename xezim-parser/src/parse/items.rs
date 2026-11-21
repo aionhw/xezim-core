@@ -6009,11 +6009,17 @@ impl Parser {
         match self.current_kind() {
             TokenKind::KwCoverpoint => {
                 self.bump();
-                // §19.5 (SV-2023) `coverpoint real <expr>`. Gated on --sv2023
-                // so that under SV-2017 `real` stays whatever it was before
-                // (an ordinary expression token) rather than being silently
-                // swallowed as a modifier.
-                let is_real = crate::is_sv2023() && self.eat(TokenKind::KwReal).is_some();
+                // §19.5 and §6.24.1: leave `real'(expr)` to expression parsing.
+                // The SV-2023 `coverpoint real <expr>` extension also accepts
+                // integer literals, so match only the bare apostrophe token.
+                let is_real = crate::is_sv2023()
+                    && self.at(TokenKind::KwReal)
+                    && !self.tokens.get(self.pos + 1).is_some_and(|token| {
+                        token.kind == TokenKind::IntegerLiteral && token.text == "'"
+                    });
+                if is_real {
+                    self.bump();
+                }
                 // `parse_expression` includes `iff` as a low-precedence
                 // binary op (`BinaryOp::Iff`), so `v iff (guard)` parses
                 // as `Binary(Iff, v, guard)` — split that back into

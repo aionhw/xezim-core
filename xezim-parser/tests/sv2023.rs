@@ -337,6 +337,41 @@ fn coverpoint_real_keyword_marks_is_real() {
     assert!(cp.is_real, "`coverpoint real` must set is_real");
 }
 
+/// IEEE 1800-2023 §19.5 and Annex A.2.11 allow an expression here.
+/// §6.24.1 and Annex A.8.4 define the cast. Annex A.2.2.1 admits `real`
+/// via `casting_type` → `simple_type` → `non_integer_type`.
+#[test]
+fn coverpoint_accepts_real_cast() {
+    use sv_parser::ast::expr::ExprKind;
+    use sv_parser::ast::types::{DataType, RealType};
+
+    let src = r#"
+module m;
+  int x;
+  covergroup cg;
+    cp: coverpoint real'(x) iff (x > 0) { bins three = {3.0}; }
+  endgroup
+endmodule
+"#;
+    // The cast already parses in SV-2017 mode.
+    for sv2023 in [false, true] {
+        let cp = first_coverpoint(src, sv2023);
+        let ExprKind::SystemCall { name, args } = &cp.expr.kind else {
+            panic!("expected a cast expression, got {:?}", cp.expr.kind);
+        };
+        assert_eq!(name, "$__xz_type_cast");
+        assert!(matches!(
+            args.as_slice(),
+            [ty, operand]
+                if matches!(&ty.kind, ExprKind::TypeLiteral(dt)
+                    if matches!(dt.as_ref(), DataType::Real { kind: RealType::Real, .. }))
+                    && matches!(&operand.kind, ExprKind::Ident(_))
+        ));
+        assert!(cp.iff_guard.is_some());
+        assert_eq!(cp.bins.len(), 1);
+    }
+}
+
 #[test]
 fn plain_coverpoint_keeps_is_real_false() {
     let src = "module m;\n\
