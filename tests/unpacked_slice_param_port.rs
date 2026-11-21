@@ -73,3 +73,41 @@ endmodule
         "each port element takes the matching slice element: {pairs:?}"
     );
 }
+
+#[test]
+fn indexed_slices_use_the_enclosing_instances_parameter_and_direction() {
+    let m = elaborate(
+        r#"
+module sink(input [7:0] p[0:1], output [7:0] q);
+  assign q = p[0] ^ p[1];
+endmodule
+module wrap #(parameter BASE = 0, W = 2) (output [7:0] a, b);
+  wire [7:0] arr[7:0];
+  sink up(.p(arr[BASE +: W]), .q(a));
+  sink down(.p(arr[BASE -: W]), .q(b));
+endmodule
+module t;
+  parameter BASE = 6;
+  wire [7:0] a, b, c, d;
+  wrap #(.BASE(2)) lo(.a(a), .b(b));
+  wrap #(.BASE(4)) hi(.a(c), .b(d));
+endmodule
+"#,
+    );
+    let pairs: Vec<_> = m
+        .continuous_assigns
+        .iter()
+        .map(|ca| (text(&ca.lhs), text(&ca.rhs)))
+        .collect();
+    for (instance, base) in [("lo", 2), ("hi", 4)] {
+        for (sink, indices) in [("up", [base + 1, base]), ("down", [base, base - 1])] {
+            for (port, index) in indices.iter().enumerate() {
+                let pair = (
+                    format!("{instance}.{sink}.p[{port}]"),
+                    format!("{instance}.arr[{index}]"),
+                );
+                assert!(pairs.contains(&pair), "missing {pair:?} in {pairs:?}");
+            }
+        }
+    }
+}
