@@ -293,7 +293,9 @@ pub use value::Value;
 /// \x69 retains scoped runtime driver delays, shortreal metadata and full packed memory widths.
 /// \x6A records the packed shape of the top module's ANSI ports (§7.4.1, §7.2) and keeps a
 ///         shortreal input formal's own storage for a real actual (§6.12, §23.3.3.8).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6A";
+/// \x6B = \x6A + tolerance ranges in set membership case items and case inside ranges in constant
+///         functions (§11.4.13, §12.5.4, §13.4.3).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6B";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
