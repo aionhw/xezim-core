@@ -23315,6 +23315,35 @@ fn lsdd_queries_a_declaration(expr: &Expression, env: &HashMap<String, Value>) -
     found
 }
 
+/// Bind values in the arithmetic around a declaration query without evaluating
+/// the query against the parameter-only scope. Preserve each substituted
+/// parameter's original width and sign for enclosing casts and operations.
+fn lsdd_bind_query_operands(e: &mut Expression, env: &HashMap<String, Value>) {
+    match &mut e.kind {
+        ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() => {
+            if let Some(bound) = env.get(&h.path[0].name.name).and_then(|v| const_value_literal(v, e.span)) {
+                *e = bound;
+            }
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => lsdd_bind_query_operands(operand, env),
+        ExprKind::Binary { left, right, .. } => {
+            lsdd_bind_query_operands(left, env);
+            lsdd_bind_query_operands(right, env);
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            for part in [condition, then_expr, else_expr] {
+                lsdd_bind_query_operands(part, env);
+            }
+        }
+        ExprKind::SystemCall { name, args } if !lsdd_is_decl_query(name) => {
+            for arg in args {
+                lsdd_bind_query_operands(arg, env);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// §20.6, §20.7: system functions that query a declaration rather than
 /// compute from a value.
 fn lsdd_is_decl_query(name: &str) -> bool {
@@ -23573,6 +23602,14 @@ fn lsdd_expr(e: &mut Expression, env: &HashMap<String, Value>) {
     }
     // Nothing to gain on a name-free expression.
     if !lsdd_names_value(e) || lsdd_queries_a_declaration(e, env) {
+        return;
+    }
+    let mut has_query = false;
+    for_each_sub_expr(e, &mut |x| {
+        has_query |= matches!(&x.kind, ExprKind::SystemCall { name, .. } if lsdd_is_decl_query(name));
+    });
+    if has_query {
+        lsdd_bind_query_operands(e, env);
         return;
     }
     let Some(v) = lsdd_eval(e, env) else {
@@ -64981,6 +65018,7 @@ mod prepared_callable_ownership_tests {
                  logic [($signed(N) > 0 ? 6 : 2)-1:0] f;
                  logic [7:0] w;
                  logic [$bits(w)-1:0] g;
+                 logic [$bits($signed(N)) + $clog2(P)-1:0] mixed;
                endtask
              endmodule",
         );
@@ -65025,6 +65063,17 @@ mod prepared_callable_ownership_tests {
                 None,
                 "a query of a variable stays for the run time"
             );
+            // A value name outside the query enables folding. The inner
+            // declaration still belongs to the runtime scope.
+            assert_eq!(folded(8), None);
+            let mut remaining = Vec::new();
+            for_each_sub_expr(&left(8), &mut |x| {
+                if let ExprKind::Ident(h) = &x.kind {
+                    remaining.push(h.path[0].name.name.clone());
+                }
+            });
+            assert_eq!(remaining, ["N"]);
+
         }
     }
 
