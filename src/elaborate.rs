@@ -54873,6 +54873,27 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         return Ok(());
     }
 
+    // §23.6, §27.6: a continuous driver can reach a resolved net from a
+    // different module or through an indexed generate scope. Qualify the
+    // latter in the writing instance, just as for an indexed port actual.
+    let driver_net = |elab: &ElaboratedModule, e: &Expression, scope: &str| {
+        if let Some(mut name) = net_base_of(elab, e) {
+            if let Some(short) = name.strip_prefix(&elab.name).and_then(|s| s.strip_prefix('.'))
+                && net_resolver.contains_key(short)
+                && !net_resolver.contains_key(&name)
+            {
+                name = short.to_owned();
+            }
+            return Some(name);
+        }
+        if !matches!(e.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_)) {
+            return None;
+        }
+        let prefix = scope.trim_end_matches('.');
+        let prefix = if prefix.is_empty() { String::new() } else { format!("{prefix}.") };
+        scope_indexed_net_name(e, &prefix, elab)
+    };
+
     // A sub-module body may still sit in the LAZY pending list, where two
     // instances driving one parent net are invisible. Materialize exactly the
     // entries landing on a nettype net — the treatment
@@ -54884,7 +54905,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             // A member of one too (`u.p.V`): a port connection taken apart.
             // §6.6.8: an element select of a nettype ARRAY (`a[0]`) names that
             // element's resolvable net too.
-            if net_base_of(elab, &lhs).is_some_and(|n| {
+            if driver_net(elab, &lhs, &pca.ctx.prefix).is_some_and(|n| {
                 net_resolver.contains_key(&n)
                     || n.match_indices('.')
                         .any(|(i, _)| net_resolver.contains_key(&n[..i]))
@@ -54993,7 +55014,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             .map(|(net, m)| (net.to_string(), m.to_string()))
     };
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        let Some(lhs_name) = net_base_of(elab, &ca.lhs).filter(|n| net_resolver.contains_key(n))
+        let scope = ca.origin.as_ref().map_or("", |(_, s)| s.as_ref());
+        let Some(lhs_name) = driver_net(elab, &ca.lhs, scope).filter(|n| net_resolver.contains_key(n))
         else {
             // §6.6.7, §23.3.3: a port connection of a resolver-less
             // unpacked-struct net arrives member by member (`n.V = u.p.V`).
@@ -55038,7 +55060,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         // assignment is not a merge even though both ends are nettype nets.
         // An element select on the RHS (`u.i = a[0]`) is likewise a directional
         // read of the element, whose own fold writes the element's storage.
-        if let Some(rhs_name) = ca.origin.is_none().then(|| net_base_of(elab, &ca.rhs)).flatten() {
+        if let Some(rhs_name) = ca.origin.is_none().then(|| driver_net(elab, &ca.rhs, scope)).flatten() {
             if net_resolver.contains_key(&rhs_name) && rhs_name != lhs_name {
                 if let (Some(&a), Some(&b)) = (net_id.get(&lhs_name), net_id.get(&rhs_name)) {
                     dsu.union(a, b);
@@ -55046,10 +55068,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 continue;
             }
         }
-        if !delays.contains_key(&lhs_name) {
-            delays.insert(lhs_name.clone(), ca.delay);
-        }
-        if !order.contains(&lhs_name) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = delays.entry(lhs_name.clone()) {
+            entry.insert(ca.delay);
             order.push(lhs_name.clone());
         }
         let scope = ca
@@ -55119,6 +55139,40 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         }
         let ds = real_drivers.remove(n).unwrap_or_default();
         comp_drivers.entry(rep).or_default().extend(ds);
+    }
+
+    // §14.16: an output clockvar has a driver even before its first
+    // synchronous drive. It is written by the clocking scheduler.
+    let mut clock_driven = HashSet::default();
+    for cb in elab.clocking_blocks.values() {
+        for signal in &cb.signals {
+            if signal.direction == crate::ast::types::PortDirection::Input {
+                continue;
+            }
+            let target = match &signal.bound_to {
+                Some(e) => driver_net(elab, e, ""),
+                None => Some(signal.name.name.clone()),
+            };
+            if let Some(id) = target.and_then(|s| net_id.get(&s).copied()) {
+                clock_driven.insert(dsu.find(id));
+            }
+        }
+    }
+
+    // §6.7.3: each undriven physical net gets one time-zero call with
+    // an empty driver array. Keep the existing order of driven components,
+    // and append undriven representatives in their stable declaration-key
+    // order. Unpacked arrays resolve on their elements, not their container.
+    for (idx, name) in all_nets.iter().enumerate() {
+        let root_id = dsu.find(idx as u32);
+        if dsu_rep[root_id as usize] == idx as u32
+            && !net_resolver[name].is_empty()
+            && !comp_drivers.contains_key(name)
+            && !elab.arrays.contains_key(name)
+            && !clock_driven.contains(&root_id)
+        {
+            comp_order.push(name.clone());
+        }
     }
 
     // §6.6.7: count the drivers of each resolver-less net over its whole
@@ -55274,11 +55328,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
 
     for root in comp_order {
         let drivers = comp_drivers.remove(&root).unwrap_or_default();
-        if drivers.is_empty() {
-            continue;
-        }
         let resolver = net_resolver[&root].clone();
-        let span = drivers[0].0.span;
+        let span = drivers.first().map_or_else(Span::dummy, |d| d.0.span);
         let members = struct_members(elab, &root);
         // §10.3.3: a delay on one continuous assignment delays that driver's
         // contribution alone, before resolution folds the others in. A single
@@ -59101,14 +59152,23 @@ fn scope_indexed_flat_name_params(
     match &expr.kind {
         // A bare scope name: the base of an indexed scope.
         ExprKind::Ident(h) => {
-            if h.path.len() != 1 || !h.path[0].selects.is_empty() {
-                return None;
+            let mut flat = String::new();
+            for seg in &h.path {
+                if !flat.is_empty() {
+                    flat.push('.');
+                }
+                flat.push_str(&seg.name.name);
+                for index in &seg.selects {
+                    let idx = const_eval_i64_with_params(index, Some(params))?;
+                    use std::fmt::Write;
+                    write!(&mut flat, "[{idx}]").ok()?;
+                }
             }
-            Some(h.path[0].name.name.clone())
+            (!flat.is_empty()).then_some(flat)
         }
         ExprKind::Index { expr: base, index } => {
             let prefix = scope_indexed_flat_name_params(base, params)?;
-            let idx = eval_const_expr(index, params);
+            let idx = const_eval_i64_with_params(index, Some(params))?;
             Some(format!("{prefix}[{idx}]"))
         }
         ExprKind::MemberAccess { expr: base, member } => {
