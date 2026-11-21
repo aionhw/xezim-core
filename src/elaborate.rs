@@ -27059,6 +27059,29 @@ fn register_port_packed_shape(elab: &mut ElaboratedModule, name: &str, data_type
     }
 }
 
+/// §6.12: `name` is a `shortreal` variable or net, declared directly or
+/// through a typedef.
+fn signal_is_shortreal(elab: &ElaboratedModule, name: &str) -> bool {
+    let Some(sig) = elab.signals.get(name).filter(|s| s.is_real) else {
+        return false;
+    };
+    if sig.type_name.as_deref() == Some("shortreal") {
+        return true;
+    }
+    elab.var_decl_types
+        .get(name)
+        .or_else(|| sig.type_name.as_ref().and_then(|ty| elab.typedef_types.get(ty)))
+        .is_some_and(|dt| {
+            matches!(
+                resolve_typedef_chain(dt, &elab.typedef_types),
+                DataType::Real {
+                    kind: crate::ast::types::RealType::ShortReal,
+                    ..
+                }
+            )
+        })
+}
+
 /// Runtime twin of `register_packed_array_elem_w`. Const-eval already slices
 /// `FP_ENCODINGS[fmt]` via the TLS tables; a function call with a variable
 /// index (`fpnew_pkg::bias(src_fmt_q)`, `exp_bits(dst_fmt_q)`) goes through
@@ -50168,10 +50191,15 @@ fn inline_instantiation_items(
                             Some(s) => Some(s.is_real),
                             None => port_actual_param(h, local_params, elab).map(|v| v.is_real),
                         }
-                        && elab
-                            .signals
-                            .get(&array_formal)
-                            .is_some_and(|f| f.is_real != actual_real)
+                        && elab.signals.get(&array_formal).is_some_and(|f| {
+                            f.is_real != actual_real
+                                // §6.12, §23.3.3.8: a shortreal formal rounds a
+                                // real actual to binary32, so it keeps its own
+                                // storage too (and a real formal a shortreal one).
+                                || (f.is_real
+                                    && signal_is_shortreal(elab, &array_formal)
+                                        != signal_is_shortreal(elab, &n))
+                        })
                     {
                         no_subst_ports.insert(pname.clone());
                     }
