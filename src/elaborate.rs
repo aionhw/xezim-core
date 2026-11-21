@@ -58261,7 +58261,6 @@ pub fn slice_array_assign_parts(
             .into_iter()
             .zip(rhs_elems)
             .map(|(l, r)| ContinuousAssignment {
-                delay_exprs: None,
                 gate_delay_fall: None,
                 delay_exprs: None,
                 delay_select: None,
