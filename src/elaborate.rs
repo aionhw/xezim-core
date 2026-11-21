@@ -5853,6 +5853,10 @@ fn is_const_expr<P: ParamLookup>(expr: &Expression, params: &P) -> bool {
         ExprKind::Index { expr, index } => {
             is_const_expr(expr, params) && is_const_expr(index, params)
         }
+        // §11.2.1: a constant part-select can itself be an index.
+        ExprKind::RangeSelect { expr, left, right, .. } => {
+            is_const_expr(expr, params) && is_const_expr(left, params) && is_const_expr(right, params)
+        }
         // §20.6.2 / §20.7: `$bits` and the array queries are constant over a
         // fixed-size TYPE or a declared fixed-size VARIABLE — the operand
         // itself need not be constant, only its declared type

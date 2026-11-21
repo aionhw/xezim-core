@@ -9,6 +9,7 @@ package cfg;
   parameter entry_t Entries [2] = '{{'{{0}}, '{{1}}}};
 endpackage
 module top;
+  localparam bit [3:0] SELECTOR = 4'b1001;
   int runtime_index;
   for (genvar k = 0; k < 2; k++) begin : g
     if (cfg::Entries[{index}].enabled) begin : selected
@@ -38,4 +39,12 @@ fn scoped_parameter_member_rejects_a_variable_index() {
         error.contains("Generate if condition must be a constant expression"),
         "{error}"
     );
+}
+
+#[test]
+fn scoped_parameter_member_accepts_a_constant_part_select_index() {
+    let design = elaborate("SELECTOR[1:0]").expect("constant part-select index");
+    for signal in ["g[0].selected.found", "g[1].selected.found"] {
+        assert!(design.signals.get(signal).is_some(), "{signal}");
+    }
 }
