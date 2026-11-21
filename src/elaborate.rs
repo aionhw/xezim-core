@@ -11713,6 +11713,12 @@ pub fn elaborate_module_with_defs(
                 }
                 if port_shape.is_empty() {
                     signals_insert_traced(&mut elab.signals, line!(), port.name.name.clone(), sig);
+                    // §7.4.1, §7.2: a packed multi-D or packed-struct port keeps its
+                    // shape like a variable. Unrecorded, `o[1]` of an `output logic
+                    // [5:0][7:0] o` on the top module was a one-bit select.
+                    if let Some(dt) = &port.data_type {
+                        register_port_packed_shape(&mut elab, &port.name.name, dt);
+                    }
                     // §7.2/§23.2.2: a port whose type is an UNPACKED STRUCT is
                     // stored member-wise, exactly like a variable of the same
                     // type — the flat container above only carries the width.
@@ -12338,71 +12344,7 @@ pub fn elaborate_module_with_defs(
                     // `output logic [3:0][9:0] o; assign o[1] = v;` degraded
                     // to a bit-window write (only the low bits landed) and
                     // struct-port member writes missed the layout.
-                    // §7.4.1: the packed dims may live on the TYPEDEF (`typedef
-                    // b_t [0:3] w_t; output w_t o;`): one step of a bare
-                    // reference, as the DataDeclaration arm takes.
-                    if let Some(ew) =
-                        packed_inner_elem_width(&pd.data_type, &elab.parameters, &elab.typedefs)
-                            .or_else(|| {
-                                let one = bare_typedef_step(&pd.data_type, &elab.typedef_types)?;
-                                packed_inner_elem_width(&one, &elab.parameters, &elab.typedefs)
-                            })
-                    {
-                        elab.packed_signal_elem_widths
-                            .entry(decl.name.name.clone())
-                            .or_insert(ew);
-                    }
-                    // A TYPEDEF'd element with declared dims (`output u8_t
-                    // [0:7] o;`): chain them with the typedef's, as the
-                    // DataDeclaration arm does. Unrecorded, the ascending
-                    // `[0:7]` fell back to [7:0] element order (§7.4.1).
-                    if let Some(fd) =
-                        packed_full_dims_of(&pd.data_type, &elab.parameters).or_else(|| {
-                            packed_full_dims_chained(
-                                &pd.data_type,
-                                &elab.parameters,
-                                &elab.typedef_types,
-                            )
-                        })
-                    {
-                        elab.packed_full_dims
-                            .entry(decl.name.name.clone())
-                            .or_insert(fd);
-                    }
-                    if let Some(fields) = packed_struct_field_layout(
-                        &pd.data_type,
-                        &elab.parameters,
-                        &elab.typedefs,
-                        &elab.typedef_types,
-                    ) {
-                        if !fields.is_empty() {
-                            // §7.4.1: a packed ARRAY of the struct (`output
-                            // s_t [0:3] o;`): its dims, the struct the
-                            // innermost, as the ANSI arm records them.
-                            let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-                            if let Some(fd) =
-                                packed_typedef_array_dims(&pd.data_type, struct_w, &elab.parameters)
-                            {
-                                elab.packed_full_dims
-                                    .entry(decl.name.name.clone())
-                                    .or_insert(fd);
-                            }
-                            tls_register_struct_layout(&decl.name.name, &fields);
-                            elab.packed_struct_fields
-                                .entry(decl.name.name.clone())
-                                .or_insert(fields);
-                            // §7.2, §7.4.1: and its members' packed shapes,
-                            // as the ANSI and DataDeclaration arms record
-                            // them. Unrecorded, `arg.vec[1]` of a `logic
-                            // [3:0][7:0] vec` member was a one-bit select.
-                            register_member_packed_meta(
-                                &mut elab,
-                                &decl.name.name,
-                                &pd.data_type,
-                                None,
-                            );
-                        }
-                    }
+                    register_port_packed_shape(&mut elab, &decl.name.name, &pd.data_type);
                     // §6.18/§7.4: a PORT declared with an ARRAY typedef
                     // (`typedef logic [A-1:0] T[B]; input T x;`) inherits the
                     // typedef's UNPACKED dimensions — the Data path has always
@@ -27068,6 +27010,53 @@ fn const_packed_array_elem<P: ParamLookup>(
     }
     let lo = packed_elem_slot_lo(base_val.width, ew, msb0, low, idx)?;
     Some(base_val.range_select((lo + ew - 1) as usize, lo as usize))
+}
+
+/// §7.4.1, §7.2: the packed shape of a port of the module being elaborated,
+/// as a variable declaration records it: the element width and dimensions of
+/// a packed multi-D or typedef'd array, and the field layout of a packed
+/// structure (and of a packed array of one). The packed dims may live on the
+/// TYPEDEF (`typedef b_t [0:3] w_t; output w_t o;`): one step of a bare
+/// reference, as the DataDeclaration arm takes. A TYPEDEF'd element with
+/// declared dims (`output u8_t [0:7] o;`) chains them with the typedef's;
+/// unrecorded, the ascending `[0:7]` fell back to [7:0] element order.
+fn register_port_packed_shape(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
+    if let Some(ew) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs)
+        .or_else(|| {
+            let one = bare_typedef_step(data_type, &elab.typedef_types)?;
+            packed_inner_elem_width(&one, &elab.parameters, &elab.typedefs)
+        })
+    {
+        elab.packed_signal_elem_widths
+            .entry(name.to_string())
+            .or_insert(ew);
+    }
+    if let Some(fd) = packed_full_dims_of(data_type, &elab.parameters).or_else(|| {
+        packed_full_dims_chained(data_type, &elab.parameters, &elab.typedef_types)
+    }) {
+        elab.packed_full_dims.entry(name.to_string()).or_insert(fd);
+    }
+    if let Some(fields) = packed_struct_field_layout(
+        data_type,
+        &elab.parameters,
+        &elab.typedefs,
+        &elab.typedef_types,
+    ) && !fields.is_empty()
+    {
+        // §7.4.1: a packed ARRAY of the struct (`output s_t [0:3] o;`): its
+        // dims, the struct the innermost.
+        let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+        if let Some(fd) = packed_typedef_array_dims(data_type, struct_w, &elab.parameters) {
+            elab.packed_full_dims.entry(name.to_string()).or_insert(fd);
+        }
+        tls_register_struct_layout(name, &fields);
+        elab.packed_struct_fields
+            .entry(name.to_string())
+            .or_insert(fields);
+        // §7.2, §7.4.1: and its members' packed shapes. Unrecorded,
+        // `arg.vec[1]` of a `logic [3:0][7:0] vec` member was a one-bit select.
+        register_member_packed_meta(elab, name, data_type, None);
+    }
 }
 
 /// Runtime twin of `register_packed_array_elem_w`. Const-eval already slices
