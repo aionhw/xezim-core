@@ -290,7 +290,8 @@ pub use value::Value;
 ///         §6.11.2, §6.6.5, §20.3.2), fixed-array declaration initializers and continuous
 ///         assignments of unpacked concatenations (§6.8, §10.3, §10.10), and time reads and time
 ///         literals of continuous assignments in the declaring module's unit (§3.14.2.3, §5.8).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x59";
+/// \x69 retains scoped runtime driver delays, shortreal metadata and full packed memory widths.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x69";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
