@@ -28310,6 +28310,8 @@ fn elaborate_block_items(
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
 ) -> Result<(), String> {
+    // §27.5: these parameter names already carry their generate scope.
+    record_param_decl_types(elab, item_param_decls(items), str::to_string, |dt| Rc::new(dt.clone()));
     let outer = DECL_SHAPE_LAYERS_TLS.with(|c| c.borrow().type_params.clone());
     let (shapes, type_params) = collect_decl_shapes(&PortList::Empty, items, &[], &outer);
     if shapes.is_empty() && type_params.len() == outer.len() {
@@ -47106,9 +47108,10 @@ fn inline_instantiation_items(
                         .chain(item_param_decls(&prepared_sub.effective_items)),
                     |n| cat2(&inst_prefix, n),
                     |dt| {
+                        let folded = fold_packed_dims_with(dt, &sub_local_params, &|_, _| true);
                         instance_decl_type(
                             &mut cache.decl_types,
-                            dt,
+                            folded.as_ref().unwrap_or(dt),
                             &sub_typedef_names_all,
                             &inst_prefix,
                             sub_mod.name(),
