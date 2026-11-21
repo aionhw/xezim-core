@@ -67,6 +67,16 @@ fn library_file_macros_reach_later_library_files() {
     };
     let m = elaborate(&dir, v(&["mid.v", "aleaf.v"])).expect("-v");
     assert_eq!(m.parameters.get("u.l.X").and_then(|v| v.to_i64()), Some(5));
+    // The macro reaches only the files read after the one that defines it:
+    // with the leaf's file named first, `W` is undefined there.
+    let reversed = elaborate(&dir, v(&["aleaf.v", "mid.v"]));
+    assert!(
+        reversed
+            .as_ref()
+            .map_or(true, |m| m.parameters.get("u.l.X").and_then(|v| v.to_i64())
+                != Some(5)),
+        "a macro of a library file read later reached an earlier one"
+    );
     write(&dir, "v/undef.v", "`undef W\n");
     let undefined = elaborate(&dir, v(&["mid.v", "undef.v", "aleaf.v"]));
     assert!(
@@ -88,5 +98,17 @@ fn library_file_macros_reach_later_library_files() {
     elaborate(&dir, cli).expect("guarded file named twice");
     let text = xezim_core::preprocess_adopted_lib(&guarded).expect("the adopted file's text");
     assert!(text.contains("module mid"), "{text}");
+    // The next elaboration in this process, with no library files, keeps
+    // nothing of this one's adopted files or their texts.
     xezim_core::set_library_cli(Default::default());
+    xezim_core::parse_and_elaborate_multi(
+        &["module top;\nendmodule\n".to_string()],
+        Some("top"),
+        &[],
+        &[dir.join("top.v").display().to_string()],
+        &[],
+    )
+    .expect("a design without library files");
+    assert!(xezim_core::adopted_lib_files().is_empty());
+    assert!(xezim_core::preprocess_adopted_lib(&guarded).is_none());
 }
