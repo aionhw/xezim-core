@@ -746,14 +746,23 @@ pub(crate) fn packed_struct_field_layout_env(
     flatten_struct_fields(dt, params, typedefs, typedef_types)
 }
 
+/// Recursively flatten nested struct/union members so multi-segment paths
+/// like `u.s.a` resolve via a single `packed_struct_fields` lookup. A member
+/// that is a packed array of packed structs expands into per-element
+/// pseudo-fields (`dw[1]`, `dw[1].value`, §7.4.2). One walker for every
+/// declaration path: the inlined-instance paths used a variant without the
+/// expansion, so `b_o.dw[0].value <= d` in a sub-module had no layout to land
+/// in and left the whole variable x, while the same code in the top module
+/// worked.
 pub(super) fn flatten_struct_fields(
     dt: &DataType,
     params: &dyn ParamLookup,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Vec<(String, u32, u32)>> {
-    // See scoped_type_owner — member dims of a `pkg::T` struct need the
-    // package's own params visible bare.
+    // A NESTED member typed by ANOTHER package's scoped typedef
+    // (`q::inner_t` inside p's struct) needs q's params bare for ITS member
+    // dims — re-derive the owner at every nesting level.
     let owner_own;
     let stacked;
     let params: &dyn ParamLookup = match scoped_type_owner(dt, typedef_types) {
@@ -767,6 +776,35 @@ pub(super) fn flatten_struct_fields(
         }
         None => params,
     };
+    // §6.18: a CIRCULAR typedef makes this nesting
+    // infinite (`typedef T1; struct packed { T1 x; } T2;
+    // typedef T2 [1:0] T3; typedef T3 T1;`) — the walk
+    // recursed until the stack overflowed and the
+    // process ABORTED (ivtest sv_typedef_circular2).
+    // Bound the depth so malformed input is diagnosed
+    // instead of crashing the tool. Real designs nest
+    // far shallower than this.
+    thread_local! {
+        static SUBFIELD_DEPTH: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(0) };
+    }
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            SUBFIELD_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+        }
+    }
+    let depth = SUBFIELD_DEPTH.with(|c| {
+        let d = c.get();
+        c.set(d + 1);
+        d
+    });
+    let _guard = DepthGuard;
+    if depth > 32 {
+        return None;
+    }
+    // Field-count cap; see the resource guard at the end.
+    const MAX_FLAT_FIELDS: usize = 8192;
     let resolved = resolve_typedef_chain(dt, typedef_types);
     if let DataType::Struct(su) = resolved {
         let is_union = matches!(su.kind, StructUnionKind::Union);
@@ -777,10 +815,95 @@ pub(super) fn flatten_struct_fields(
                 raw.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
             }
         }
+        // §7.4.2: a member that is a PACKED ARRAY of packed
+        // struct (`row_entry_t [1:0] sub_list;`) expands into
+        // per-element pseudo-fields `sub_list[i]` plus their
+        // subfields `sub_list[i].f`, so indexed member paths
+        // resolve through the parent's flat layout. Plain
+        // recursion would mis-register `sub_list.f` aliasing
+        // only element 0; it is kept only for a member too
+        // large to expand within MAX_FLAT_FIELDS, which then
+        // keeps the rest of the layout instead of losing it.
+        let expand_member = |mn: &str,
+                             mw: u32,
+                             mdt: &DataType,
+                             base_off: u32,
+                             out: &mut Vec<(String, u32, u32)>| {
+            // §26.3: a member typed by a package's struct (`q::entry_t [N-1:0]
+            // a`) sizes the element's fields with that package's parameters,
+            // while the bounds written on the member are this scope's. The
+            // element comes back as a bare struct, which no longer names its
+            // package, so take the owner from the member's type here.
+            let elem_own;
+            let elem_stacked;
+            let elem_params: &dyn ParamLookup = match scoped_type_owner(mdt, typedef_types) {
+                Some(pkg) => {
+                    elem_own = owner_param_overrides(&pkg, params);
+                    elem_stacked = StackedParamEnv {
+                        base: params,
+                        top: &elem_own,
+                    };
+                    &elem_stacked
+                }
+                None => params,
+            };
+            if let Some((dims, elem_dt)) = packed_struct_array_info_env(mdt, params, typedef_types)
+            {
+                let counts: Vec<u64> = dims
+                    .iter()
+                    .map(|(l, r)| (l - r).unsigned_abs() + 1)
+                    .collect();
+                let n: u64 = counts.iter().product();
+                if n > 0 && mw as u64 % n == 0 {
+                    let elem_w = (mw as u64 / n) as u32;
+                    let elem_subs =
+                        flatten_struct_fields(&elem_dt, elem_params, typedefs, typedef_types)
+                            .unwrap_or_default();
+                    let expanded = (n as usize).saturating_mul(1 + elem_subs.len());
+                    if out.len().saturating_add(expanded) > MAX_FLAT_FIELDS {
+                        return false;
+                    }
+                    // Enumerate every index tuple (odometer).
+                    let mut idx: Vec<i64> = dims.iter().map(|(l, r)| *l.min(r)).collect();
+                    loop {
+                        if let Some(lo) = packed_elem_lsb_offset(&dims, &idx, elem_w) {
+                            let mut nm = mn.to_string();
+                            for i in &idx {
+                                nm.push_str(&format!("[{}]", i));
+                            }
+                            out.push((nm.clone(), base_off + lo, elem_w));
+                            for (sn, so, sw) in &elem_subs {
+                                out.push((format!("{}.{}", nm, sn), base_off + lo + so, *sw));
+                            }
+                        }
+                        // advance odometer (innermost fastest)
+                        let mut j = dims.len();
+                        loop {
+                            if j == 0 {
+                                return true;
+                            }
+                            j -= 1;
+                            let (l, r) = dims[j];
+                            let hi = l.max(r);
+                            if idx[j] < hi {
+                                idx[j] += 1;
+                                break;
+                            }
+                            idx[j] = l.min(r);
+                        }
+                    }
+                }
+                return true; // array member: skip plain recursion
+            }
+            false
+        };
         let mut out: Vec<(String, u32, u32)> = Vec::new();
         if is_union {
             for (mn, mw, mdt) in &raw {
                 out.push((mn.clone(), 0, *mw));
+                if expand_member(mn, *mw, mdt, 0, &mut out) {
+                    continue;
+                }
                 if let Some(subs) = flatten_struct_fields(mdt, params, typedefs, typedef_types) {
                     for (sn, so, sw) in subs {
                         out.push((format!("{}.{}", mn, sn), so, sw));
@@ -791,6 +914,10 @@ pub(super) fn flatten_struct_fields(
             let mut offset: u32 = 0;
             for (mn, mw, mdt) in raw.iter().rev() {
                 out.push((mn.clone(), offset, *mw));
+                if expand_member(mn, *mw, mdt, offset, &mut out) {
+                    offset += mw;
+                    continue;
+                }
                 if let Some(subs) = flatten_struct_fields(mdt, params, typedefs, typedef_types) {
                     for (sn, so, sw) in subs {
                         out.push((format!("{}.{}", mn, sn), offset + so, sw));
@@ -798,6 +925,24 @@ pub(super) fn flatten_struct_fields(
                 }
                 offset += mw;
             }
+        }
+        // Resource guard, paired with the depth bound
+        // above: each level of a packed-array-of-struct
+        // member MULTIPLIES the generated field names,
+        // so a circular typedef is exponential in depth
+        // — bounding depth alone still spun for minutes
+        // formatting names. Capping each level's result
+        // bounds the whole walk. A real packed struct
+        // has orders of magnitude fewer leaves; say so
+        // rather than silently truncating.
+        if out.len() > MAX_FLAT_FIELDS {
+            crate::elab_diag(format!(
+                "[xezim][warning] packed layout for a struct flattens to over {} fields — \
+                 not registering it (a circular typedef, per IEEE 1800-2017 §6.18, \
+                 reaches this); member selects on it will not resolve through the layout.",
+                MAX_FLAT_FIELDS
+            ));
+            return None;
         }
         Some(out)
     } else {
