@@ -363,6 +363,128 @@ pub(super) fn simple_actual_signedness(
     }
 }
 
+/// §7.2.1, §7.4, §11.8.1: the declared signedness of a port actual that
+/// selects an element of an unpacked array (`sa[0]`, `m[1][0]`), a member of
+/// a packed struct (`st.f`, `o.i.a`) or a member of an array element
+/// (`ia[1].a`), when its width is also `width`. An element has its array's
+/// element type and a member its own declared type, so either is signed only
+/// when that type is. The width is read from the tables the connection uses
+/// (`arrays*` for an element, `packed_struct_fields` for a member), which
+/// `port_conn_width` does not read for a member. `None` for anything else, or
+/// when the type or the width cannot be read: such an actual keeps the
+/// formal's own net.
+pub(super) fn declared_select_signedness(
+    e: &Expression,
+    elab: &ElaboratedModule,
+    width: u32,
+) -> Option<bool> {
+    enum Step<'a> {
+        Index,
+        Member(&'a str),
+    }
+    fn flatten<'a>(
+        e: &'a Expression,
+        elab: &ElaboratedModule,
+        steps: &mut Vec<Step<'a>>,
+    ) -> Option<String> {
+        match &e.kind {
+            ExprKind::Paren(inner) => flatten(inner, elab, steps),
+            ExprKind::MemberAccess { expr, member } => {
+                let root = flatten(expr, elab, steps)?;
+                steps.push(Step::Member(member.name.as_str()));
+                Some(root)
+            }
+            ExprKind::Index { expr, .. } => {
+                let root = flatten(expr, elab, steps)?;
+                steps.push(Step::Index);
+                Some(root)
+            }
+            ExprKind::Ident(h) => {
+                // The root is the longest leading run of segments that names a
+                // declared variable; only its last segment may carry selects,
+                // and the segments after it are members.
+                let names: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                let k = (1..=h.path.len()).rev().find(|&k| {
+                    h.path[..k - 1].iter().all(|s| s.selects.is_empty())
+                        && elab.var_decl_types.contains_key(&names[..k].join("."))
+                })?;
+                for (j, seg) in h.path.iter().enumerate().skip(k - 1) {
+                    if j >= k {
+                        steps.push(Step::Member(seg.name.name.as_str()));
+                    }
+                    for sel in &seg.selects {
+                        if matches!(sel.kind, ExprKind::Range(..)) {
+                            return None;
+                        }
+                        steps.push(Step::Index);
+                    }
+                }
+                Some(names[..k].join("."))
+            }
+            _ => None,
+        }
+    }
+    let mut steps = Vec::new();
+    let root = flatten(e, elab, &mut steps)?;
+    let (unpacked, elem_w) = if let Some(&(_, _, w)) = elab.arrays.get(&root) {
+        (1, w)
+    } else if let Some(&(_, _, w)) = elab.arrays_2d.get(&root) {
+        (2, w)
+    } else if let Some((dims, w)) = elab.arrays_nd.get(&root) {
+        (dims.len(), *w)
+    } else {
+        (0, 0)
+    };
+    // Exactly one index per unpacked dimension, then only members.
+    let indices = steps
+        .iter()
+        .take_while(|s| matches!(s, Step::Index))
+        .count();
+    let members: Vec<&str> = steps[indices..]
+        .iter()
+        .map(|s| match s {
+            Step::Member(m) => Some(*m),
+            Step::Index => None,
+        })
+        .collect::<Option<_>>()?;
+    if indices != unpacked || (unpacked == 0 && members.is_empty()) {
+        return None;
+    }
+    let actual_w = if members.is_empty() {
+        elem_w
+    } else {
+        let path = members.join(".");
+        elab.packed_struct_fields
+            .get(&root)?
+            .iter()
+            .find(|(m, _, _)| *m == path)?
+            .2
+    };
+    if actual_w != width || width == 0 {
+        return None;
+    }
+    let mut dt = elab.var_decl_types.get(&root)?;
+    for m in &members {
+        let DataType::Struct(su) = resolve_typedef_chain(dt, &elab.typedef_types) else {
+            return None;
+        };
+        if !su.packed {
+            return None;
+        }
+        dt = &su
+            .members
+            .iter()
+            .find(|mm| mm.declarators.iter().any(|d| d.name.name == *m))?
+            .data_type;
+    }
+    match resolve_typedef_chain(dt, &elab.typedef_types) {
+        DataType::IntegerAtom { .. }
+        | DataType::IntegerVector { .. }
+        | DataType::Enum(_)
+        | DataType::Struct(_) => Some(is_type_signed_resolved(dt, &elab.typedef_types)),
+        _ => None,
+    }
+}
 
 /// §11.8.1: "Concatenation results are unsigned, regardless of the operands."
 /// A port actual that is a concatenation or replication therefore carries no

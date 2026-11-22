@@ -5533,9 +5533,12 @@ pub(super) fn inline_instantiation_items(
                     // instead of -5. §11.8.1 always leaves a concatenation or
                     // replication unsigned; keep the formal so its own sign
                     // governs the body and the connection assign converts.
+                    // An element of a signed unpacked array or a signed member
+                    // is no bit-select: it keeps its declared sign (§7.4.1).
                     if is_input
                         && formal_signed
                         && port_actual_is_unsigned_concat(actual)
+                        && declared_select_signedness(actual, elab, formal) != Some(true)
                     {
                         no_subst_ports.insert(pname.clone());
                     }
@@ -5687,10 +5690,20 @@ pub(super) fn inline_instantiation_items(
                     // formal's signedness: an element of a signed unpacked
                     // array or a signed struct member renamed into an unsigned
                     // port made `p < 0` true there.
-                    if is_input {
+                    // A literal is exempt: `port_literal_for_formal` converts it
+                    // to the formal's type in place (`.en(1)`, an unsized and so
+                    // signed decimal, into `input logic en`), and a real literal
+                    // into a real formal needs no conversion.
+                    if is_input
+                        && !matches!(
+                            literal_actual.kind,
+                            ExprKind::Number(_) | ExprKind::StringLiteral(_)
+                        )
+                    {
                         let formal_signed =
                             elab.signals.get(&formal_key).is_some_and(|s| s.is_signed);
                         if simple_actual_signedness(actual, elab, local_params)
+                            .or_else(|| declared_select_signedness(actual, elab, formal))
                             != Some(formal_signed)
                         {
                             no_subst_ports.insert(pname.clone());
