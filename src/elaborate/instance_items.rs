@@ -5677,6 +5677,25 @@ pub(super) fn inline_instantiation_items(
                             no_subst_ports.insert(pname.clone());
                         }
                     }
+                    // §23.3.3.7, §11.8.1: the formal's own declaration decides
+                    // whether the body reads the port as signed, and the
+                    // connection converts the actual to it. A select or a
+                    // concatenation is unsigned, so substituting
+                    // `{c[11], c}` for `input logic signed [12:0] e_i` made
+                    // `e_i < 0` false and `a_i - e_i` unsigned in the body.
+                    // Keep the formal unless the actual is known to have the
+                    // formal's signedness: an element of a signed unpacked
+                    // array or a signed struct member renamed into an unsigned
+                    // port made `p < 0` true there.
+                    if is_input {
+                        let formal_signed =
+                            elab.signals.get(&formal_key).is_some_and(|s| s.is_signed);
+                        if simple_actual_signedness(actual, elab, local_params)
+                            != Some(formal_signed)
+                        {
+                            no_subst_ports.insert(pname.clone());
+                        }
+                    }
                     let Some(actual_w) = port_conn_width(actual, elab) else {
                         continue;
                     };
