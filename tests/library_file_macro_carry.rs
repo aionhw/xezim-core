@@ -157,5 +157,65 @@ fn library_file_macros_follow_the_carry_mode() {
         let (x, _) = run(&dir, "", &[("W", "4")], cli);
         assert_eq!(x, Some(4), "{carry:?} -y command-line define");
     }
+    // A library file that uses a macro it does not see, which a carry
+    // switch would pass it, gets a note naming that switch.
+    write(
+        &dir,
+        "v/use_leaf.v",
+        "module leaf;\n  localparam int X = `W;\nendmodule\n",
+    );
+    // The leaf does not parse without `W`, so the design does not elaborate.
+    let notes = |top_macros: &str, cli| {
+        xezim_core::set_library_cli(cli);
+        xezim_core::elab_diag_capture_begin();
+        let _ = xezim_core::parse_and_elaborate_multi(
+            &[format!("{top_macros}module top;\n  mid u();\nendmodule\n")],
+            Some("top"),
+            &[dir.display().to_string()],
+            &[dir.join("top.sv").display().to_string()],
+            &[],
+        );
+        xezim_core::elab_diag_capture_take()
+            .into_iter()
+            .filter(|m| m.contains("uses macro `W"))
+            .collect::<Vec<_>>()
+    };
+    for (top_macros, files, carry, switch) in [
+        (
+            "",
+            ["mid.v", "use_leaf.v"],
+            Carry::None,
+            Some("--carry-lib-macros"),
+        ),
+        (
+            "",
+            ["mid.v", "use_leaf.v"],
+            Carry::Source,
+            Some("--carry-lib-macros"),
+        ),
+        ("", ["mid.v", "use_leaf.v"], Carry::Library, None),
+        (
+            "`define W 7\n",
+            ["plain_mid.v", "use_leaf.v"],
+            Carry::None,
+            Some("--carry-src-macros"),
+        ),
+        (
+            "`define W 7\n",
+            ["plain_mid.v", "use_leaf.v"],
+            Carry::Source,
+            None,
+        ),
+        ("", ["use_leaf.v", "mid.v"], Carry::None, None),
+    ] {
+        let found = notes(top_macros, v(&files, carry));
+        match switch {
+            Some(switch) => assert!(
+                found.len() == 1 && found[0].contains(switch) && found[0].contains("use_leaf.v"),
+                "{carry:?} {files:?}: {found:?}"
+            ),
+            None => assert!(found.is_empty(), "{carry:?} {files:?}: {found:?}"),
+        }
+    }
     xezim_core::set_library_cli(Default::default());
 }
