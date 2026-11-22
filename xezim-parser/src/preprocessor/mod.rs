@@ -82,6 +82,9 @@ pub struct Preprocessor {
     /// Undefined macro names seen while expanding the current line; reported
     /// (located at the use) when the line is done.
     undefined_seen: std::cell::RefCell<Vec<String>>,
+    /// Every undefined macro name a use was reported for, in first-use
+    /// order (`undefined_macros`).
+    undefined_used: std::cell::RefCell<Vec<String>>,
     /// Whether `apply_token_pasting` left a `PASTE_SEPARATOR` that
     /// `expand_macros` must remove; a 0x01 byte of the source is kept.
     paste_separated: std::cell::Cell<bool>,
@@ -348,6 +351,7 @@ impl Preprocessor {
             default_net_pull: None,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
             undefined_seen: std::cell::RefCell::new(Vec::new()),
+            undefined_used: std::cell::RefCell::new(Vec::new()),
             paste_separated: std::cell::Cell::new(false),
             map_files: Vec::new(),
             map_macros: Vec::new(),
@@ -382,6 +386,12 @@ impl Preprocessor {
         static REPORTED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
         let names: Vec<String> = self.undefined_seen.borrow_mut().drain(..).collect();
         for name in names {
+            {
+                let mut used = self.undefined_used.borrow_mut();
+                if !used.contains(&name) {
+                    used.push(name.clone());
+                }
+            }
             let fresh = REPORTED
                 .lock()
                 .map(|mut g| g.get_or_insert_with(HashSet::new).insert(name.clone()))
@@ -819,6 +829,12 @@ impl Preprocessor {
 
     pub fn define(&mut self, name: String, value: MacroDef) {
         self.defines.insert(name, value);
+    }
+
+    /// The undefined macros this preprocessor met a use of (and left as
+    /// literal text), each once, in first-use order.
+    pub fn undefined_macros(&self) -> Vec<String> {
+        self.undefined_used.borrow().clone()
     }
 
     pub fn snapshot_defines(&self) -> HashMap<String, MacroDef> {
