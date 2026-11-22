@@ -1,9 +1,8 @@
-//! §22.5.1, §3.12.1: a text macro a `-y`/`-v` library file defines, itself
-//! or through an `include` of the design's headers, stays defined for the
-//! library files read after it: library files are read as part of the one
-//! compilation, in the order their modules are resolved. Each library file
-//! used to start from the primary sources' macros only, so a library module
-//! that included the headers did not share them with the library modules it
+//! §22.5.1, §3.12.1: under `--carry-lib-macros` (`LibraryMacroCarry::Library`)
+//! a text macro a `-y`/`-v` library file defines, itself or through an
+//! `include` of the design's headers, stays defined for the library files
+//! read after it, in the order their modules are resolved, so a library
+//! module that includes the headers shares them with the library modules it
 //! instantiates. One test, since the library list is process-wide.
 
 use std::path::Path;
@@ -31,6 +30,7 @@ fn y(dirs: &[&Path]) -> xezim_core::LibraryCli {
     xezim_core::LibraryCli {
         lib_dirs: dirs.iter().map(|d| d.display().to_string()).collect(),
         lib_exts: Some(vec!["v".into()]),
+        macro_carry: xezim_core::LibraryMacroCarry::Library,
         ..Default::default()
     }
 }
@@ -63,6 +63,7 @@ fn library_file_macros_reach_later_library_files() {
             .iter()
             .map(|n| dir.join("v").join(n).display().to_string())
             .collect(),
+        macro_carry: xezim_core::LibraryMacroCarry::Library,
         ..Default::default()
     };
     let m = elaborate(&dir, v(&["mid.v", "aleaf.v"])).expect("-v");
