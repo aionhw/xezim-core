@@ -60,12 +60,12 @@ endmodule
     assert!(renamed("u_unsigned"));
 }
 
-/// An actual whose signedness elaboration cannot read here (an element of
-/// an unpacked array, a struct member) keeps the formal for either formal
-/// signedness: renaming `sa[0]` of `logic signed [12:0] sa [2]` into an
-/// unsigned port made `e_i < 0` true in the body.
+/// An element of an unpacked array or a struct member of the other
+/// signedness keeps the formal: renaming `sa[0]` of
+/// `logic signed [12:0] sa [2]` into an unsigned port made `e_i < 0` true in
+/// the body.
 #[test]
-fn an_actual_of_unknown_signedness_keeps_the_formal() {
+fn an_element_or_member_of_the_other_signedness_keeps_the_formal() {
     let m = elaborate(
         r#"
 module ks (input logic signed [12:0] e_i);
@@ -171,4 +171,100 @@ endmodule
     assert!(renamed("s_signed"));
     assert!(!renamed("u_signed"));
     assert!(!renamed("s_unsigned"));
+}
+
+/// A literal actual is converted to the formal's type in place, so it is
+/// still substituted whatever its own signedness: `.en(1)` (an unsized
+/// decimal, signed) into `input logic en` and a real literal into a real
+/// formal.
+#[test]
+fn a_literal_actual_is_renamed_whatever_its_signedness() {
+    let m = elaborate(
+        r#"
+module ku (input logic [7:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module ks (input logic signed [7:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module kr (input real e_i);
+  real r;
+  always_comb r = e_i;
+endmodule
+module top;
+  ku u_unsized (.e_i(1));
+  ku u_signed (.e_i(8'sd3));
+  ks s_unsigned (.e_i(8'd3));
+  kr r_real (.e_i(1.5));
+endmodule
+"#,
+    );
+    let renamed = |inst: &str| {
+        m.input_port_actuals
+            .iter()
+            .map(|p| p.formal())
+            .any(|f| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+    };
+    assert!(renamed("u_unsized"));
+    assert!(renamed("u_signed"));
+    assert!(renamed("s_unsigned"));
+    assert!(renamed("r_real"));
+}
+
+/// §7.2.1, §7.4: an element of an unpacked array has the array's element
+/// type and a struct member its own declared type, so an actual of the
+/// formal's signedness and width is still renamed, and one of the other
+/// signedness, or of another width, keeps the formal.
+#[test]
+fn an_element_or_member_actual_is_renamed_by_its_declared_type() {
+    let m = elaborate(
+        r#"
+module ks (input logic signed [7:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module ku (input logic [7:0] e_i);
+  wire lt = e_i < 0;
+endmodule
+module ku4 (input logic [3:0] e_i);
+  wire hi = e_i == 4'hf;
+endmodule
+module top;
+  typedef struct packed { logic signed [7:0] a; logic [7:0] b; } in_t;
+  typedef struct packed { in_t i; logic [7:0] c; } out_t;
+  logic signed [7:0] sa [2];
+  logic [7:0] ua [2];
+  logic [7:0] u2 [2][2];
+  in_t ia [2];
+  out_t o;
+  ks s_elem (.e_i(sa[1]));
+  ku u_elem (.e_i(ua[0]));
+  ku u_elem2 (.e_i(u2[1][0]));
+  ku u_selem (.e_i(sa[0]));
+  ks s_member (.e_i(o.i.a));
+  ku u_member (.e_i(o.c));
+  ku u_smember (.e_i(o.i.a));
+  ku u_arrmem (.e_i(ia[1].b));
+  ks s_arrmem (.e_i(ia[0].a));
+  ks s_uarrmem (.e_i(ia[0].b));
+  ku4 u_narrow (.e_i(o.c));
+endmodule
+"#,
+    );
+    let renamed = |inst: &str| {
+        m.input_port_actuals
+            .iter()
+            .map(|p| p.formal())
+            .any(|f| f.rsplit('.').nth(1) == Some(inst) && f.ends_with(".e_i"))
+    };
+    assert!(renamed("s_elem"));
+    assert!(renamed("u_elem"));
+    assert!(renamed("u_elem2"));
+    assert!(renamed("s_member"));
+    assert!(renamed("u_member"));
+    assert!(renamed("u_arrmem"));
+    assert!(renamed("s_arrmem"));
+    assert!(!renamed("u_selem"));
+    assert!(!renamed("u_smember"));
+    assert!(!renamed("s_uarrmem"));
+    assert!(!renamed("u_narrow"));
 }
