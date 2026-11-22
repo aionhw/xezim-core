@@ -3724,6 +3724,42 @@ pub(super) fn inline_instantiation_items(
                                     nd.net_type,
                                     Some(&nd.data_type),
                                 );
+                                // §7.2.1, §6.7.1: a packed-struct NET's declared
+                                // type and field layout, as the top-level net
+                                // arm and this instance's variable and port arms
+                                // register them. Without the layout a member
+                                // read (`n.a`) did not resolve to the net's
+                                // bits, so a reader was never woken by the net
+                                // and kept a stale value; the same declaration
+                                // in the top module worked.
+                                if let DataType::Struct(su) =
+                                    resolve_typedef_chain(&nd.data_type, &elab.typedef_types)
+                                    && su.packed
+                                    && let Some(fields) = flatten_struct_fields(
+                                        &nd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    )
+                                    && !fields.is_empty()
+                                {
+                                    elab.var_decl_types.insert(
+                                        sig_name.clone(),
+                                        scope_local_typerefs(
+                                            &nd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        ),
+                                    );
+                                    tls_register_struct_layout(&sig_name, &fields);
+                                    elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                    register_member_packed_meta(
+                                        elab,
+                                        &sig_name,
+                                        &nd.data_type,
+                                        Some(&sub_merged_params),
+                                    );
+                                }
                                 let init_value = default_net_value(nd.net_type, width, net_is_real);
                                 signals_insert_traced(
                                     &mut elab.signals,

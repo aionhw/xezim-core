@@ -162,7 +162,7 @@ pub(super) fn struct_typedef_self_reference(
             // packed struct containing `T1`. Resolving only at MEMBER level
             // missed that, so the cycle went undetected, the typedef was
             // registered, and every later type walker
-            // (`flatten_struct_fields`, `flatten_subfields`,
+            // (`flatten_struct_fields`,
             // `is_type_signed_resolved`) recursed on it until the stack
             // overflowed and the process aborted (ivtest sv_typedef_circular2).
             DataType::TypeReference { name, .. } => {
