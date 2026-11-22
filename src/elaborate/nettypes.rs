@@ -1,50 +1,77 @@
 use super::*;
 
-// §7.6, §10.3: expose whole fixed-array copies to the member pass.
-fn pending_struct_array_copy_parts(
-    elab: &ElaboratedModule,
-    lhs: &Expression,
-    pending: &PendingContAssign,
-) -> Option<Vec<ContinuousAssignment>> {
-    let lhs_name = whole_net_ident_name(lhs)?;
-    let lhs_dims = elab.unpacked_decl_dims.get(&lhs_name)?;
-    let lhs_type = elab.var_decl_types.get(&lhs_name)?;
-    let element_type = resolve_typedef_chain(lhs_type, &elab.typedef_types);
-    if !matches!(element_type, DataType::Struct(su)
-        if !su.packed && !su.members.is_empty() && su.kind == StructUnionKind::Struct)
-        // Built-in net arrays can have member storage without member driver
-        // resolution. Keep their drivers on the array path.
-        || elab.z_init_signals.contains(&lhs_name)
-        || declared_type_name(elab, &lhs_name)
-            .and_then(|ty| elab.nettype_resolvers.get(&ty))
-            .is_some_and(|resolver| !resolver.is_empty())
-    {
+/// §7.6: one side of a continuous copy between fixed arrays of an unpacked
+/// structure type: its constant storage path (a plain, hierarchical `u.a`
+/// or member `x.arr` array name, optionally with leading constant indices,
+/// a row `a[4]`), the fixed dimensions left below that path, and the element
+/// structure. None for any other expression.
+fn struct_array_side<'e>(
+    elab: &'e ElaboratedModule,
+    expr: &Expression,
+) -> Option<(String, &'e [(i64, i64)], &'e StructUnionType)> {
+    let path = const_parameter_path(expr, Some(&elab.parameters))?;
+    let mut base = path.as_str();
+    let mut rank = 0;
+    while base.ends_with(']') {
+        let bracket = base.rfind('[')?;
+        base[bracket + 1..base.len() - 1].parse::<i64>().ok()?;
+        base = &base[..bracket];
+        rank += 1;
+    }
+    // Built-in net arrays can have member storage without member driver
+    // resolution. Keep their drivers on the array path.
+    if elab.z_init_signals.contains(base) {
         return None;
     }
+    let dims = elab.unpacked_decl_dims.get(base)?.get(rank..)?;
+    if dims.is_empty() {
+        return None;
+    }
+    let dt = elab
+        .var_decl_types
+        .get(base)
+        .or_else(|| declared_type_name(elab, base).and_then(|tn| elab.typedef_types.get(&tn)))?;
+    match resolve_typedef_chain(dt, &elab.typedef_types) {
+        DataType::Struct(su)
+            if !su.packed && !su.members.is_empty() && su.kind == StructUnionKind::Struct =>
+        {
+            Some((path, dims, su))
+        }
+        _ => None,
+    }
+}
 
-    let ca = pending.clone().materialize(&elab.parameters);
-    let rhs_name = whole_net_ident_name(&ca.rhs)?;
-    let rhs_dims = elab.unpacked_decl_dims.get(&rhs_name)?;
-    let rhs_type = elab.var_decl_types.get(&rhs_name)?;
-    // §6.22.2 / §7.6: both sides must name the same element type, and
-    // each pair of dimensions must have equal counts.
-    if !std::ptr::eq(
-        element_type,
-        resolve_typedef_chain(rhs_type, &elab.typedef_types),
-    ) || elab.z_init_signals.contains(&rhs_name)
-        || lhs_dims.is_empty()
+/// §7.6, §10.3: a continuous copy between fixed arrays, or rows of them, of
+/// one unpacked structure type, as one assignment per element pair in
+/// left-to-right order, so the member pass drives each element's members.
+/// None for any other shape.
+pub(super) fn struct_array_copy_parts(
+    elab: &ElaboratedModule,
+    ca: &ContinuousAssignment,
+) -> Option<Vec<ContinuousAssignment>> {
+    let (lhs_path, lhs_dims, lhs_su) = struct_array_side(elab, &ca.lhs)?;
+    let (rhs_path, rhs_dims, rhs_su) = struct_array_side(elab, &ca.rhs)?;
+    let lhs_base = lhs_path.split('[').next().unwrap_or(&lhs_path);
+    // §6.22.2 / §7.6: both sides name the same element type (one
+    // declaration, whatever spelling reached it: `S` through an import and
+    // `p::S`), and each pair of dimensions has equal counts.
+    let same_type = std::ptr::eq(lhs_su, rhs_su)
+        || (lhs_su.span != Span::dummy() && lhs_su.span == rhs_su.span);
+    if !same_type
         || lhs_dims.len() != rhs_dims.len()
         || lhs_dims
             .iter()
             .zip(rhs_dims)
             .any(|(&(ll, lr), &(rl, rr))| ll.abs_diff(lr) != rl.abs_diff(rr))
+        || declared_type_name(elab, lhs_base)
+            .and_then(|ty| elab.nettype_resolvers.get(&ty))
+            .is_some_and(|resolver| !resolver.is_empty())
     {
         return None;
     }
-
     // Only arrays with registered member signals can use the member pass.
-    let first_element = |name: &str, dims: &[(i64, i64)]| {
-        dims.iter().fold(name.to_string(), |mut path, (left, _)| {
+    let first_element = |path: &str, dims: &[(i64, i64)]| {
+        dims.iter().fold(path.to_string(), |mut path, (left, _)| {
             use std::fmt::Write;
             let _ = write!(path, "[{left}]");
             path
@@ -52,47 +79,26 @@ fn pending_struct_array_copy_parts(
     };
     if !elab
         .struct_members
-        .contains_key(&first_element(&lhs_name, lhs_dims))
+        .contains_key(&first_element(&lhs_path, lhs_dims))
         || !elab
             .struct_members
-            .contains_key(&first_element(&rhs_name, rhs_dims))
+            .contains_key(&first_element(&rhs_path, rhs_dims))
     {
         return None;
     }
-
-    if lhs_dims.len() > 1 {
-        let lhs_indices = cartesian_index_tuples(&bounded_declared_index_lists(lhs_dims)?);
-        let rhs_indices = cartesian_index_tuples(&bounded_declared_index_lists(rhs_dims)?);
-        return Some(
-            lhs_indices
-                .into_iter()
-                .zip(rhs_indices)
-                .map(|(lhs_indices, rhs_indices)| ContinuousAssignment {
-                    lhs: lhs_indices.into_iter().fold(ca.lhs.clone(), index_expr),
-                    rhs: rhs_indices.into_iter().fold(ca.rhs.clone(), index_expr),
-                    ..ca.clone()
-                })
-                .collect(),
-        );
-    }
-
-    let mut parts = whole_array_assign_parts_dir(
-        &ca.lhs,
-        &ca.rhs,
-        ca.delay,
-        &elab.arrays,
-        Some(&elab.descending_arrays),
-        Some(&elab.unpacked_decl_dims),
-    )?;
-    for part in &mut parts {
-        part.origin = ca.origin.clone();
-        part.rhs_parent_scoped = ca.rhs_parent_scoped;
-        part.delay_fall = ca.delay_fall;
-        part.delay_off = ca.delay_off;
-        part.delay_select = ca.delay_select;
-        part.gate_delay_fall = ca.gate_delay_fall;
-    }
-    Some(parts)
+    let lhs_indices = cartesian_index_tuples(&bounded_declared_index_lists(lhs_dims)?);
+    let rhs_indices = cartesian_index_tuples(&bounded_declared_index_lists(rhs_dims)?);
+    Some(
+        lhs_indices
+            .into_iter()
+            .zip(rhs_indices)
+            .map(|(lhs_indices, rhs_indices)| ContinuousAssignment {
+                lhs: lhs_indices.into_iter().fold(ca.lhs.clone(), index_expr),
+                rhs: rhs_indices.into_iter().fold(ca.rhs.clone(), index_expr),
+                ..ca.clone()
+            })
+            .collect(),
+    )
 }
 
 /// §6.6.7 user-defined nettype resolution, over the WHOLE elaborated design.
@@ -190,7 +196,9 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                 let ca = pca.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else if has_fixed_arrays
-                && let Some(parts) = pending_struct_array_copy_parts(elab, &lhs, &pca)
+                && struct_array_side(elab, &lhs).is_some()
+                && let Some(parts) =
+                    struct_array_copy_parts(elab, &pca.clone().materialize(&elab.parameters))
             {
                 elab.continuous_assigns.extend(parts);
             } else {
@@ -205,11 +213,26 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     // member's own signal — a `real` member stays real (a `MemberAccess` lhs
     // here wrote `4.5` as `5`).
     let mut out: Vec<ContinuousAssignment> = Vec::new();
+    let has_fixed_arrays = !elab.unpacked_decl_dims.is_empty();
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        let target = struct_target(elab, &ca.lhs);
-        match target {
-            Some((base, su)) => expand_struct_driver(elab, &ca, &base, &su, &mut out),
-            None => out.push(ca),
+        if let Some((base, su)) = struct_target(elab, &ca.lhs) {
+            expand_struct_driver(elab, &ca, &base, &su, &mut out);
+            continue;
+        }
+        // A whole copy the per-module pass left unsplit: a multidimensional
+        // array, a row, a hierarchical or a member array (§7.6).
+        let parts = has_fixed_arrays
+            .then(|| struct_array_copy_parts(elab, &ca))
+            .flatten();
+        let Some(parts) = parts else {
+            out.push(ca);
+            continue;
+        };
+        for part in parts {
+            match struct_target(elab, &part.lhs) {
+                Some((base, su)) => expand_struct_driver(elab, &part, &base, &su, &mut out),
+                None => out.push(part),
+            }
         }
     }
     elab.continuous_assigns = out;
