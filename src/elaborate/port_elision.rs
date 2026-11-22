@@ -273,6 +273,97 @@ pub(super) fn port_actual_is_simple(
     }
 }
 
+/// §11.8.1: whether a port actual that `port_actual_is_simple` accepts is a
+/// signed expression. A part-select, a bit-select of a vector, a
+/// concatenation and a replication are unsigned; a whole net or parameter
+/// and a literal keep their own signedness, as does a package parameter
+/// (`p::V`, §26.3), which is bound under its scoped name. `None` when it
+/// cannot tell (an element of an unpacked array, a struct member).
+pub(super) fn simple_actual_signedness(
+    e: &Expression,
+    elab: &ElaboratedModule,
+    params: &HashMap<String, Value>,
+) -> Option<bool> {
+    let lookup = |name: &str| {
+        elab.signals.get(name).map(|sig| sig.is_signed).or_else(|| {
+            params
+                .get(name)
+                .or_else(|| elab.parameters.get(name))
+                .map(|v| v.is_signed)
+        })
+    };
+    match &e.kind {
+        ExprKind::Paren(inner) => simple_actual_signedness(inner, elab, params),
+        ExprKind::Number(NumberLiteral::Integer {
+            size, signed, base, ..
+        }) => Some(*signed || (size.is_none() && matches!(base, NumberBase::Decimal))),
+        ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) | ExprKind::StringLiteral(_) => {
+            Some(false)
+        }
+        ExprKind::Ident(h) => {
+            if let Some(name) = whole_net_ident_name(e) {
+                return lookup(&name).or_else(|| match h.path.as_slice() {
+                    [pkg, member] if elab.packages.contains(&pkg.name.name) => {
+                        lookup(&format!("{}::{}", pkg.name.name, member.name.name))
+                    }
+                    _ => None,
+                });
+            }
+            // A select in the name: a bit- or part-select of a packed vector
+            // is unsigned; an element of an unpacked array is not known here.
+            let base: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+            let base = base.join(".");
+            let last_selects = h.path.last().map_or(0, |s| s.selects.len());
+            let earlier_selects = h.path.iter().rev().skip(1).any(|s| !s.selects.is_empty());
+            let unpacked = elab.arrays.contains_key(&base)
+                || elab.arrays_2d.contains_key(&base)
+                || elab.arrays_nd.contains_key(&base);
+            (!earlier_selects
+                && last_selects > 0
+                && !unpacked
+                && elab.signals.contains_key(base.as_str()))
+            .then_some(false)
+        }
+        ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+            // A bit- or part-select of a packed vector is unsigned however many
+            // packed dimensions it goes through (§11.8.1): `a[1][3:1]` on
+            // `logic [3:0][5:0][7:0] a` is a select of a select of `a`.
+            let mut inner = expr.as_ref();
+            let mut nested = false;
+            while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } =
+                &inner.kind
+            {
+                inner = expr;
+                nested = true;
+            }
+            // The width check after this one skips an actual it can't measure,
+            // so a nested select is known here only when it can be measured:
+            // otherwise `p[1][2]` (8 bits) could rename `input logic [3:0]`.
+            if nested && port_conn_width(e, elab).is_none() {
+                return None;
+            }
+            let base = whole_net_ident_name(inner)?;
+            let unpacked = elab.arrays.contains_key(&base)
+                || elab.arrays_2d.contains_key(&base)
+                || elab.arrays_nd.contains_key(&base);
+            (!unpacked && elab.signals.contains_key(base.as_str())).then_some(false)
+        }
+        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+            ExprKind::Ident(bh)
+                if bh.path.len() == 1
+                    && bh.path[0].selects.is_empty()
+                    && elab.packages.contains(&bh.path[0].name.name) =>
+            {
+                lookup(&format!("{}::{}", bh.path[0].name.name, member.name))
+            }
+            _ => None,
+        },
+        ExprKind::Concatenation(_) | ExprKind::Replication { .. } => Some(false),
+        _ => None,
+    }
+}
+
+
 /// §11.8.1: "Concatenation results are unsigned, regardless of the operands."
 /// A port actual that is a concatenation or replication therefore carries no
 /// sign into a signed formal — §23.3.3.8 keeps the sign of a bounded formal
