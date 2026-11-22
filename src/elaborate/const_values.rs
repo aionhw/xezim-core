@@ -737,8 +737,18 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                 if let Some((w, signed)) = const_typedef_cast_target(&nm, scoped.as_deref(), params)
                 {
                     let v = eval_const_expr_val_with_ctx(&args[1], params, Some(w), types);
-                    if !v.is_real {
-                        let mut out = v.resize(w);
+                    // A scoped name can fall back to a same-named typedef in
+                    // another scope. Convert a real only for a resolved type.
+                    if !v.is_real
+                        || scoped.as_ref().is_none_or(|key| {
+                            TYPEDEF_SHAPES_TLS.with(|shapes| shapes.borrow().0.contains_key(key))
+                        })
+                    {
+                        let mut out = if v.is_real {
+                            Value::from_real_wrapped(v.to_f64(), w)
+                        } else {
+                            v.resize(w)
+                        };
                         out.is_signed = signed;
                         return out;
                     }
@@ -779,18 +789,22 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                         resolve_type_width_env(dt, Some(params), b.as_ref())
                     })
                     .max(1);
-                // §6.24.1: an integral target is the operand's context width.
+                // §6.24.1, §6.19.4: the integral target (or enum base type)
+                // supplies the operand's context width.
                 let integral = matches!(
                     dt.as_ref(),
-                    DataType::IntegerAtom { .. } | DataType::IntegerVector { .. }
+                    DataType::IntegerAtom { .. } | DataType::IntegerVector { .. } | DataType::Enum(_)
                 );
                 let v = if integral {
                     eval_const_expr_val_with_ctx(&args[1], params, Some(w), types)
                 } else {
                     eval_const_expr_val_inner(&args[1], params, types)
                 };
-                let mut out = if v.is_real {
-                    // §6.24.1: real-to-int conversion ROUNDS (away from zero).
+                let mut out = if integral && v.is_real {
+                    // §6.12.1, §6.24.1: round as for runtime assignment.
+                    // Adding 0.5 first can round a value just below a tie up.
+                    Value::from_real_wrapped(v.to_f64(), w)
+                } else if v.is_real {
                     let f = v.to_f64();
                     let r = if f >= 0.0 {
                         (f + 0.5).floor()
