@@ -535,6 +535,12 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn parse_constraint_range(&mut self) -> ConstraintRange {
+        // §18.5.3, §19.5.1: a distribution item and a covergroup bin take a
+        // `value_range`, which includes the tolerance forms (§11.4.13).
+        if self.at(TokenKind::LBracket) && crate::is_sv2023() && self.range_has_tolerance() {
+            let (lo, hi) = self.parse_value_range_bounds(self.current_span().start);
+            return ConstraintRange::Range { lo, hi };
+        }
         if self.at(TokenKind::LBracket) {
             self.bump();
             let lo = self.parse_expression();

@@ -226,6 +226,16 @@ impl<'a> Parser<'a> {
 
     /// Parse a bracketed value range for set membership (§11.4.13).
     fn parse_inside_range(&mut self, start: usize) -> Expression {
+        let (lo, hi) = self.parse_value_range_bounds(start);
+        Expression::new(
+            ExprKind::Range(Box::new(lo), Box::new(hi)),
+            self.span_from(start),
+        )
+    }
+
+    /// The bounds of a bracketed `value_range` (A.6.7): `[lo : hi]`, or in
+    /// 1800-2023 a tolerance range `[A +/- B]` / `[A +%- B]` (§11.4.13).
+    pub(super) fn parse_value_range_bounds(&mut self, start: usize) -> (Expression, Expression) {
         // Plain ranges use the full expression grammar in both language modes.
         let tolerance_enabled = crate::is_sv2023() && self.range_has_tolerance();
         self.expect(TokenKind::LBracket);
@@ -355,10 +365,7 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::RBracket);
             (center, hi)
         };
-        Expression::new(
-            ExprKind::Range(Box::new(lo), Box::new(hi)),
-            self.span_from(start),
-        )
+        (lo, hi)
     }
 
     fn tolerance_separator_at(&self, offset: usize) -> Option<TokenKind> {
@@ -388,7 +395,7 @@ impl<'a> Parser<'a> {
         self.parse_inside_range(self.current_span().start)
     }
 
-    fn range_has_tolerance(&self) -> bool {
+    pub(super) fn range_has_tolerance(&self) -> bool {
         let mut depth = 0;
         for (index, token) in self.tokens.iter_from(self.pos + 1).enumerate() {
             match token.kind {
