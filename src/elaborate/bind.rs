@@ -1932,10 +1932,20 @@ impl<'a> Binder<'a> {
             let Some(first) = path.path.get(explicit + 1) else { return };
             let indexed_scope = path.path[explicit + 1..path.path.len() - 1]
                 .iter().any(|seg| !seg.selects.is_empty());
-            let own_instance = path.path[explicit].name.name == this.tree.def
-                && matches!(this.resolve(&first.name.name, false), Outcome::Decl(d)
-                    if this.tree.decls[d.0 as usize].scope == this.tree.root
-                        && this.tree.decls[d.0 as usize].kind == DeclKind::Instance);
+            let mut own_instance = false;
+            if path.path[explicit].name.name == this.tree.def
+                && let Outcome::Decl(id) = this.resolve(&first.name.name, false)
+            {
+                let declaration = &this.tree.decls[id.0 as usize];
+                if declaration.scope != this.tree.root
+                    || !matches!(declaration.kind, DeclKind::Instance | DeclKind::Label)
+                {
+                    // A local array or aggregate already uses its own
+                    // rooted member/element resolver, including dynamic indices.
+                    return;
+                }
+                own_instance = declaration.kind == DeclKind::Instance;
+            }
             if own_instance && !indexed_scope {
                 path.path.drain(..=explicit);
             } else if explicit == 0 {
