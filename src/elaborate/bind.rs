@@ -1957,7 +1957,23 @@ impl<'a> Binder<'a> {
                 // the absolute target when it cannot be shortened safely.
                 return;
             }
-            e.kind = ExprKind::Ident(path);
+            // The parser can attach the first packed index to the last
+            // path segment when another select follows it (`mem[3][7:0]`).
+            // After rebasing a named instance, preserve it as a data select,
+            // separate from the indexes that enter instance scopes.
+            let selections = if own_instance && !indexed_scope {
+                std::mem::take(&mut path.path.last_mut().unwrap().selects)
+            } else {
+                Vec::new()
+            };
+            let mut target = Expression::new(ExprKind::Ident(path), e.span);
+            for index in selections {
+                target = Expression::new(ExprKind::Index {
+                    expr: Box::new(target),
+                    index: Box::new(index),
+                }, e.span);
+            }
+            *e = target;
         }
         normalize(self, e);
         self.expr(e);
