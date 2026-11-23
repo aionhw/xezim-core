@@ -429,6 +429,71 @@ pub(super) fn check_enum_member_duplicates(
     Ok(())
 }
 
+thread_local! {
+    /// True while `process_local_typedef` registers a typedef that the scope
+    /// being elaborated declares itself.
+    static LOCAL_TYPEDEF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `process_typedef` for a typedef the elaborated scope declares itself. Its
+/// enum members ARE the local declarations that `local_decl_displaces`
+/// names, so they are registered under their bare names; only a package's
+/// same-named members give way to them (§26.3, §6.19). Without this a
+/// module's own `typedef enum {.., EEW8} EEW_e;` registered no `EEW8` of its
+/// own when an un-imported package also declared one, and `EEW8` read the
+/// package's value.
+pub(super) fn process_local_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    let prev = LOCAL_TYPEDEF.with(|c| c.replace(true));
+    process_typedef(td, elab);
+    LOCAL_TYPEDEF.with(|c| c.set(prev));
+}
+
+/// §26.3, §3.12.1, §6.19: put each `$unit` enum member that a package also
+/// declares back under its bare name once the design is elaborated.
+///
+/// Every package registers its enum members under their bare names,
+/// imported or not, and the last registration wins; the package
+/// registration that runs while instances are inlined comes after the
+/// `$unit` typedefs. `pkg_scope` has already spelled each run-time reference
+/// to a package's member `pkg::NAME` wherever the package's declaration is
+/// the one in scope, so a bare run-time reference that is left names the
+/// `$unit` member. A member the top module declares itself displaces the
+/// `$unit` one as it does a package's, so `process_typedef` leaves it.
+/// Constant contexts were evaluated during elaboration and keep what they
+/// read then. Without this, the testbench package's `EEW8 = 8` replaced the
+/// RTL's `$unit` `EEW8 = 2`, which a 3-bit `EEW_e` truncates to `EEW_NONE`.
+pub fn reassert_unit_enum_members(elab: &mut ElaboratedModule, defs: &HashMap<String, Definition>) {
+    if !crate::pkg_scope::any_member_qualified() {
+        return;
+    }
+    for td in ordered_typedefs(defs) {
+        let DataType::Enum(et) = &td.data_type else {
+            continue;
+        };
+        let contested = et.members.iter().any(|m| {
+            enum_member_names(m, &elab.parameters)
+                .iter()
+                .any(|n| crate::pkg_scope::member_is_qualified(n))
+        });
+        if contested {
+            process_typedef(td, elab);
+        }
+    }
+}
+
+/// The names one enum member declaration declares (`A[2]` declares `A0`,
+/// `A1`; §6.19).
+pub(super) fn enum_member_names(
+    member: &EnumMember,
+    params: &HashMap<String, Value>,
+) -> Vec<String> {
+    expand_enum_member(member, 0, params)
+        .0
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // A later package may reuse a bare typedef name with scalar geometry.
     // Do not carry an earlier declaration's packed element stride into it.
@@ -499,8 +564,10 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                 //
                 // The member still joins `members_ordered`, so it stays
                 // reachable the only way §26.3 allows once shadowed: qualified
-                // as `pkg::NAME`.
-                if elab.local_decl_displaces(&nm) {
+                // as `pkg::NAME`. A typedef of the scope itself
+                // (`process_local_typedef`) is that local declaration, so its
+                // members are registered.
+                if !LOCAL_TYPEDEF.with(|c| c.get()) && elab.local_decl_displaces(&nm) {
                     members_ordered.push((nm.clone(), val));
                     continue;
                 }
