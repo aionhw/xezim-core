@@ -449,7 +449,7 @@ pub(super) fn process_local_typedef(td: &TypedefDeclaration, elab: &mut Elaborat
 }
 
 /// §26.3, §3.12.1, §6.19: the bare-name entries of the `$unit` enum members
-/// that a package also declares, as the `$unit` typedefs just registered them.
+/// that a package also declares, as the `$unit` enums just registered them.
 pub(super) fn contested_unit_member_slots(
     defs: &HashMap<String, Definition>,
     elab: &ElaboratedModule,
