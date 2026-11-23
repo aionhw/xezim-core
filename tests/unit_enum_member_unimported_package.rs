@@ -114,3 +114,48 @@ endmodule
     assert_eq!(d.parameters["B"].to_i64(), Some(4));
     assert_eq!(d.parameters["C"].to_i64(), Some(10));
 }
+
+/// Putting the `$unit` member back leaves the top module's own enum members
+/// and typedefs alone: only `B` collides with the package, so the module's
+/// `A` and its own `U` keep their values and width.
+#[test]
+fn only_the_colliding_unit_member_is_put_back() {
+    let d = elaborate(
+        r#"
+typedef enum logic [2:0] {A = 1, B = 2} U;
+package tb_pkg;
+  typedef enum int {B = 8} P;
+endpackage
+module t;
+  typedef enum logic [3:0] {A = 5} U;
+  U u;
+  initial u = A;
+endmodule
+"#,
+    );
+    assert_eq!(d.parameters["A"].to_i64(), Some(5));
+    assert_eq!(d.signals["A"].width, 4);
+    assert_eq!(d.parameters["B"].to_i64(), Some(2));
+    assert_eq!(d.typedefs["U"], 4);
+}
+
+/// §6.19: `A[2]` declares `A0` and `A1`, and a package's `A0` collides with
+/// the generated name like with any other.
+#[test]
+fn ranged_unit_member_keeps_its_bare_entry() {
+    let d = elaborate(
+        r#"
+typedef enum int {A[2] = 1} U;
+package tb_pkg;
+  typedef enum int {A0 = 8, Z} P;
+endpackage
+module t;
+  U u;
+  initial u = A0;
+endmodule
+"#,
+    );
+    assert_eq!(d.parameters["A0"].to_i64(), Some(1));
+    assert_eq!(d.parameters["A1"].to_i64(), Some(2));
+    assert_eq!(d.parameters["tb_pkg::A0"].to_i64(), Some(8));
+}
