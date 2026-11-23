@@ -49,6 +49,9 @@ pub struct DesignNames {
     /// §23.9: module, interface, program, package, checker and primitive
     /// names, which can start a path.
     definitions: HashSet<String>,
+    /// §23.3.1: the modules, interfaces and programs nothing instantiates:
+    /// the top-level instances.
+    tops: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -60,6 +63,22 @@ struct ClassNames {
 impl DesignNames {
     pub fn collect(descs: &[Description]) -> Self {
         let mut n = Self::default();
+        let mut instantiated = std::collections::HashSet::new();
+        for d in descs {
+            let (name, items) = match d {
+                Description::Module(m) => (&m.name, &m.items),
+                Description::Interface(m) => (&m.name, &m.items),
+                Description::Program(m) => (&m.name, &m.items),
+                Description::Bind(b) => {
+                    instantiated.insert(b.instantiation.module_name.name.clone());
+                    continue;
+                }
+                _ => continue,
+            };
+            crate::collect_instantiated_modules(items, &mut instantiated);
+            n.tops.insert(name.name.clone());
+        }
+        n.tops.retain(|t| !instantiated.contains(t));
         for d in descs {
             let def = match d {
                 Description::Module(m) => Some(&m.name),
@@ -630,11 +649,50 @@ impl<'a> Binder<'a> {
         let Some(first) = h.path.first() else { return };
         // `NO_TARGET` here is the parser's `$unit::f(...)` (§3.12.1) or a
         // randsequence production's value (§18.17.7).
-        let outcome = if h.root.is_some() || h.bound == Bound::NO_TARGET {
+        let lexical = h.root.is_none() && h.bound != Bound::NO_TARGET;
+        let outcome = if !lexical {
             Outcome::None(Hide::Qualified)
         } else {
             self.resolve(&first.name.name, h.path.len() == 1)
         };
+        // §23.6, §23.8: a path headed by the name of a top-level module that
+        // nothing here declares starts at that top-level instance. A
+        // top-level instance's items carry no prefix in the flattened
+        // design, and the spelling with the module name reached them only on
+        // some paths (a store through an instance array never landed, an
+        // element store in a loop kept one bit). In the top-level module
+        // itself, a path to one of its own items is that item's path; from
+        // anywhere else it is spelled `$root.<top>.…`.
+        let mut outcome = outcome;
+        if lexical
+            && !self.callee
+            && h.path.len() >= 2
+            && first.selects.is_empty()
+            && outcome == Outcome::None(Hide::Qualified)
+            && self.names.tops.contains(first.name.name.as_str())
+            && !self.names.packages.contains_key(first.name.name.as_str())
+        {
+            let own = (first.name.name == self.tree.def)
+                .then(|| self.resolve(&h.path[1].name.name, h.path.len() == 2))
+                .filter(|o| {
+                    matches!(o, Outcome::Decl(d)
+                        if self.tree.decls[d.0 as usize].scope == self.tree.root)
+                });
+            match own {
+                Some(o) => {
+                    h.path.remove(0);
+                    outcome = o;
+                }
+                None => {
+                    let mut root = first.clone();
+                    root.name.name = "$root".to_string();
+                    h.path.insert(0, root);
+                }
+            }
+            h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            h.cached_resolved_name = crate::ast::cache::NameCache::new();
+        }
+        let Some(first) = h.path.first() else { return };
         let bound = match outcome {
             Outcome::Decl(d) => {
                 let decl = &self.tree.decls[d.0 as usize];

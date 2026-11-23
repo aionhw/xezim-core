@@ -4787,7 +4787,7 @@ fn resolve_instance_binds(
     Ok(changed)
 }
 
-fn collect_instantiated_modules(
+pub(crate) fn collect_instantiated_modules(
     items: &[ast::decl::ModuleItem],
     set: &mut std::collections::HashSet<String>,
 ) {
