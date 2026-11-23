@@ -299,7 +299,11 @@ pub use value::Value;
 ///         own storage for an actual of the other signedness, element and member actuals included
 ///         (§23.3.3.7, §11.8.1), and registers an inlined instance's per-element packed-struct
 ///         layouts and packed-struct nets (§7.2, §7.4.2).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6B";
+/// \x6C registers a generate block's nettype nets with their declaration assignments as drivers,
+///         keeps a nettype declaration's delay (§6.6.7, §10.3.1, §10.3.3, §27.2), declares a
+///         variable for a nettype name the module's own type hides (§26.5) and lowers tolerance
+///         range bounds to `$__xz_tolerance` (§11.4.13).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6C";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
