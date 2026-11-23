@@ -246,13 +246,13 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         if let Some(v) = elab.ascending_packed.get(&net).copied() {
             elab.ascending_packed.insert(drv.clone(), v);
         }
-        if let Some(v) = elab.packed_full_dims.get(&net).cloned() {
+        if let Some(v) = elab.packed_full_dims.get_shared(&net).cloned() {
             elab.packed_full_dims.insert(drv.clone(), v);
         }
         if let Some(v) = elab.packed_signal_elem_widths.get(&net).copied() {
             elab.packed_signal_elem_widths.insert(drv.clone(), v);
         }
-        if let Some(v) = elab.packed_struct_fields.get(&net).cloned() {
+        if let Some(v) = elab.packed_struct_fields.get_shared(&net).cloned() {
             elab.packed_struct_fields.insert(drv.clone(), v);
         }
         if let Some(v) = elab.var_decl_types.get(&net).cloned() {
@@ -446,7 +446,7 @@ pub(super) fn cont_assign_net_span(
         if let Some(&(_, hi)) = elab.ascending_packed.get(&n) {
             return Some(hi - p);
         }
-        match elab.packed_full_dims.get(&n).map(|d| d.as_slice()) {
+        match elab.packed_full_dims.get(&n).map(|d| d.as_ref()) {
             None => Some(p),
             Some([(dl, dr)]) if dl >= dr => Some(p - dr),
             Some([(_, dr)]) => Some(dr - p),

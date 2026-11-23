@@ -1993,11 +1993,14 @@ pub struct ElaboratedModule {
     /// definition: (package, explicitly imported item or `None` for `*`).
     #[serde(default)]
     pub def_pkg_imports: HashMap<String, Vec<(String, Option<String>)>>,
-    /// Names of declared sequences and properties (so `@name` event control resolves).
-    pub sequences: HashSet<String>,
-    /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
+    /// Names of bodyless sequences, properties, and checkers (so `@name` event
+    /// control resolves). Declarations with bodies live in `property_decls`
+    /// alone (#721); query both via [`Self::has_named_sva`].
+    pub sequences: crate::shared_names::SharedNameSet,
+    /// Packed struct bit-field layout: container_name -> shared slice of
+    /// `(member_name, lsb_offset, width)`.
     /// Members are stored by bit offset so MemberAccess can slice the container.
-    pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    pub packed_struct_fields: crate::shared_names::SharedSliceMap<(String, u32, u32)>,
     /// For the port width-mismatch diagnostic: typedef name -> (field name ->
     /// identifiers its range expression reads), captured from the ORIGINAL
     /// (pre-fold) struct declaration. The stored `typedef_types` folds these
@@ -2022,7 +2025,7 @@ pub struct ElaboratedModule {
     /// neither preserves source order. Used by `%p` (LRM §21.2.1.7), which must
     /// print `'{member:value, ...}` in declaration order.
     #[serde(default)]
-    pub struct_members: HashMap<String, Vec<String>>,
+    pub struct_members: crate::shared_names::SharedSliceMap<String>,
     /// Packed multi-dimensional signal element width: signal_name -> element_width.
     /// For `logic [3:0][7:0] words;` stores `"words" -> 8` so that `words[i]`
     /// resolves to an 8-bit slice rather than a 1-bit select. Also keyed for
@@ -2035,7 +2038,7 @@ pub struct ElaboratedModule {
     /// the correct flat bit slice with index normalization for ascending /
     /// non-zero-based ranges (LRM §7.4.1).
     #[serde(default)]
-    pub packed_full_dims: HashMap<String, Vec<(i64, i64)>>,
+    pub packed_full_dims: crate::shared_names::SharedSliceMap<(i64, i64)>,
     /// §6.9.1 / §10.3.3: declared vector net shape, including equal bounds.
     /// Keyed by final flat net name; independent of array query/select tables.
     pub vector_nets: crate::shared_names::SharedNameSet,
@@ -2083,10 +2086,11 @@ pub struct ElaboratedModule {
     /// expression (the common `@(clk) <expr>` shape — see the property
     /// parser). Used by `assert property (p_name)` to inline the body.
     #[serde(default)]
-    pub property_decls: HashMap<String, Rc<Expression>>,
-    /// §16.6: formal port NAMES of each named property/sequence, keyed like
-    /// `property_decls`. Empty vec for portless declarations.
-    pub property_params: HashMap<String, Vec<String>>,
+    pub property_decls: crate::shared_names::SharedNameMap<Rc<Expression>>,
+    /// §16.6: formal port NAMES of each parameterized named property/sequence,
+    /// keyed like `property_decls`. Portless declarations are omitted (#721).
+    #[serde(default)]
+    pub property_params: crate::shared_names::SharedSliceMap<String>,
     /// §16.8, §16.12: the default actual argument of each formal, keyed like
     /// `property_decls` and parallel to `property_params`; absent when no
     /// formal of the declaration has one. A declaration of an inlined
@@ -2622,15 +2626,15 @@ impl ElaboratedModule {
             pkg_var_decls: HashMap::default(),
             pkg_var_init_blocks: Vec::new(),
             def_pkg_imports: HashMap::default(),
-            sequences: HashSet::default(),
-            packed_struct_fields: HashMap::default(),
+            sequences: Default::default(),
+            packed_struct_fields: Default::default(),
             struct_field_range_idents: HashMap::default(),
             var_decl_types: Default::default(),
             param_decl_types: Default::default(),
-            struct_members: HashMap::default(),
+            struct_members: Default::default(),
             packed_signal_elem_widths: HashMap::default(),
             typedef_elem_widths: HashMap::default(),
-            packed_full_dims: HashMap::default(),
+            packed_full_dims: Default::default(),
             vector_nets: Default::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
@@ -2638,8 +2642,8 @@ impl ElaboratedModule {
             interfaces: HashSet::default(),
             interface_param_defaults: HashMap::default(),
             checker_decls: HashMap::default(),
-            property_decls: HashMap::default(),
-            property_params: HashMap::default(),
+            property_decls: Default::default(),
+            property_params: Default::default(),
             property_param_defaults: HashMap::default(),
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
@@ -2779,6 +2783,12 @@ impl ElaboratedModule {
             crate::ast::cache::without_scope_caches(|| ctx.materialize_body(&td.ports, &td.items))
                 .into();
         true
+    }
+
+    /// Whether `name` is a declared sequence, property, or checker — either
+    /// with a body in `property_decls` or bodyless in `sequences` (#721).
+    pub fn has_named_sva(&self, name: &str) -> bool {
+        self.property_decls.contains_key(name) || self.sequences.contains(name)
     }
 
     /// Materialize every deferred instance-scoped function and task body in

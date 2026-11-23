@@ -519,9 +519,12 @@ pub(super) fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &st
     }
     // §23.6: aggregate member paths retain their owning declaration;
     // they must not fall back to a namesake in another generate scope.
-    elab.struct_members.entry(base.to_string()).or_insert_with(|| {
-        su.members.iter().flat_map(|m| m.declarators.iter())
-            .map(|d| d.name.name.clone()).collect()
+    elab.struct_members.insert_if_absent(base, || {
+        su.members
+            .iter()
+            .flat_map(|m| m.declarators.iter())
+            .map(|d| d.name.name.clone())
+            .collect::<Vec<_>>()
     });
     // IEEE 1800-2017 §7.3: a union is ONE piece of storage accessed through any
     // of its member names — writing `u.a` must be readable as `u.b`. So an

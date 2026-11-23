@@ -412,25 +412,28 @@ pub(super) fn hoist_package_params(
                 _ => continue,
             };
             let qualified = format!("{}::{}", p.name.name, name);
-            elab.sequences.insert(name.clone());
-            elab.sequences.insert(qualified.clone());
             if let Some(body) = body {
-                let params: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+                let shared_body = Rc::new(body.clone());
                 elab.property_decls
                     .entry(name.clone())
-                    .or_insert_with(|| Rc::new(body.clone()));
-                elab.property_params
-                    .entry(name.clone())
-                    .or_insert_with(|| params.clone());
-                elab.property_decls.insert(qualified.clone(), Rc::new(body.clone()));
+                    .or_insert_with(|| Rc::clone(&shared_body));
+                elab.property_decls.insert(qualified.clone(), shared_body);
+                if !ports.is_empty() {
+                    let params: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+                    elab.property_params
+                        .insert_if_absent(name.clone(), || params.clone());
+                    elab.property_params.insert(qualified.clone(), params);
+                }
                 if defaults.iter().any(|d| d.is_some()) {
                     elab.property_param_defaults
                         .entry(name.clone())
                         .or_insert_with(|| defaults.clone());
                     elab.property_param_defaults
-                        .insert(qualified.clone(), defaults.clone());
+                        .insert(qualified, defaults.clone());
                 }
-                elab.property_params.insert(qualified, params);
+            } else {
+                elab.sequences.insert(name.clone());
+                elab.sequences.insert(qualified);
             }
         }
     }

@@ -3456,7 +3456,8 @@ pub(super) fn inline_instantiation_items(
                                         },
                                     )
                                 {
-                                    elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
+                                    elab.packed_full_dims
+                                        .insert_if_absent(sig_name.clone(), || fd);
                                 }
                                 if let Some(fields) = packed_struct_field_layout(
                                     &pd.data_type,
@@ -6376,7 +6377,6 @@ pub(super) fn inline_instantiation_items(
                     };
                     if let Some((name, ports, body, defaults)) = named_sva {
                         let key = cat2(&inst_prefix, &name);
-                        elab.sequences.insert(key.clone());
                         if let Some(body) = body {
                             let formals: Vec<&str> =
                                 ports.iter().map(|p| p.name.as_str()).collect();
@@ -6411,8 +6411,13 @@ pub(super) fn inline_instantiation_items(
                                     }
                                 },
                             );
-                            elab.property_params
-                                .insert(key, ports.iter().map(|p| p.name.clone()).collect());
+                            if !ports.is_empty() {
+                                let names: Vec<String> =
+                                    ports.iter().map(|p| p.name.clone()).collect();
+                                elab.property_params.insert(key, names);
+                            }
+                        } else {
+                            elab.sequences.insert(key);
                         }
                     }
                     // §35.4: a DPI import declared inside a CHILD module was

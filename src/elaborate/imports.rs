@@ -921,14 +921,16 @@ pub(super) fn process_import(
                             body,
                             ..
                         }) if &name.name == sym_name => {
-                            elab.sequences.insert(name.name.clone());
                             if let Some(body) = body {
                                 elab.property_decls.insert(name.name.clone(), Rc::new(body.clone()));
-                                elab.property_params.insert(
-                                    name.name.clone(),
-                                    ports.iter().map(|p| p.name.clone()).collect(),
-                                );
+                                if !ports.is_empty() {
+                                    let names: Vec<String> =
+                                        ports.iter().map(|p| p.name.clone()).collect();
+                                    elab.property_params.insert(name.name.clone(), names);
+                                }
                                 register_sva_port_defaults(elab, &name.name, port_defaults);
+                            } else {
+                                elab.sequences.insert(name.name.clone());
                             }
                             found = true;
                         }

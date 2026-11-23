@@ -4382,29 +4382,31 @@ pub fn elaborate_module_with_defs(
                 elab.lets.insert(ld.name.name.clone(), ld.clone());
             }
             ModuleItem::SequenceDeclaration(sd) => {
-                elab.sequences.insert(sd.name.name.clone());
                 if let Some(body) = &sd.body {
                     // Sequences share the property_decls map for
                     // `assert property (s)` style references.
                     elab.property_decls
                         .insert(sd.name.name.clone(), Rc::new(body.clone()));
-                    elab.property_params.insert(
-                        sd.name.name.clone(),
-                        sd.ports.iter().map(|p| p.name.clone()).collect(),
-                    );
+                    if !sd.ports.is_empty() {
+                        let names: Vec<String> = sd.ports.iter().map(|p| p.name.clone()).collect();
+                        elab.property_params.insert(sd.name.name.clone(), names);
+                    }
                     register_sva_port_defaults(&mut elab, &sd.name.name, &sd.port_defaults);
+                } else {
+                    elab.sequences.insert(sd.name.name.clone());
                 }
             }
             ModuleItem::PropertyDeclaration(pd) => {
-                elab.sequences.insert(pd.name.name.clone());
                 if let Some(body) = &pd.body {
                     elab.property_decls
                         .insert(pd.name.name.clone(), Rc::new(body.clone()));
-                    elab.property_params.insert(
-                        pd.name.name.clone(),
-                        pd.ports.iter().map(|p| p.name.clone()).collect(),
-                    );
+                    if !pd.ports.is_empty() {
+                        let names: Vec<String> = pd.ports.iter().map(|p| p.name.clone()).collect();
+                        elab.property_params.insert(pd.name.name.clone(), names);
+                    }
                     register_sva_port_defaults(&mut elab, &pd.name.name, &pd.port_defaults);
+                } else {
+                    elab.sequences.insert(pd.name.name.clone());
                 }
             }
             // LRM §17.2 — register the checker name and store its

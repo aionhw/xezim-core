@@ -2,14 +2,15 @@
 //! and is scoped to elaboration or artifact loading; live designs continue to
 //! own their names after the registry and its allocation are released.
 
-use crate::hasher::{DeterministicState, HashMap};
-use serde::{Deserialize, Deserializer, Serialize};
+use crate::hasher::{DeterministicState, HashMap, HashSet};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     borrow::{Borrow, Cow},
     cell::RefCell,
     collections::hash_map,
     hash::{BuildHasher, Hash, Hasher},
     ops::{Deref, Index},
+    rc::Rc,
     sync::{Arc, Weak},
 };
 
@@ -476,6 +477,346 @@ impl<'a> IntoIterator for &'a SharedNameSet {
     }
 }
 
+/// Shared immutable slice stored once per distinct value inside a
+/// [`SharedSliceMap`]. Cloning copies the reference-counted pointer in O(1),
+/// while dereferencing, `.as_slice()`, and `&SharedSlice<T>` iteration behave
+/// like `&[T]`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct SharedSlice<T>(Rc<[T]>);
+
+impl<T> Clone for SharedSlice<T> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<T> SharedSlice<T> {
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Deref for SharedSlice<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> AsRef<[T]> for SharedSlice<T> {
+    fn as_ref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> Borrow<[T]> for SharedSlice<T> {
+    fn borrow(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedSlice<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T: PartialEq> PartialEq<Vec<T>> for SharedSlice<T> {
+    fn eq(&self, other: &Vec<T>) -> bool {
+        &*self.0 == other.as_slice()
+    }
+}
+
+impl<T: PartialEq> PartialEq<SharedSlice<T>> for Vec<T> {
+    fn eq(&self, other: &SharedSlice<T>) -> bool {
+        self.as_slice() == &*other.0
+    }
+}
+
+impl<T: PartialEq> PartialEq<[T]> for SharedSlice<T> {
+    fn eq(&self, other: &[T]) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl<T> From<Vec<T>> for SharedSlice<T> {
+    fn from(v: Vec<T>) -> Self {
+        Self(Rc::from(v))
+    }
+}
+
+impl<T: Clone> From<SharedSlice<T>> for Vec<T> {
+    fn from(s: SharedSlice<T>) -> Self {
+        s.0.to_vec()
+    }
+}
+
+impl<T: Serialize> Serialize for SharedSlice<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+/// Converts a slice value into an interned [`SharedSlice<T>`] inside a
+/// [`SharedSliceMap`].
+pub trait IntoSharedSlice<T> {
+    fn into_shared_slice(self, intern: &mut HashSet<SharedSlice<T>>) -> SharedSlice<T>;
+}
+
+impl<T: Eq + Hash> IntoSharedSlice<T> for Vec<T> {
+    fn into_shared_slice(self, intern: &mut HashSet<SharedSlice<T>>) -> SharedSlice<T> {
+        if let Some(existing) = intern.get(self.as_slice()) {
+            return existing.clone();
+        }
+        let shared = SharedSlice(Rc::from(self));
+        intern.insert(shared.clone());
+        shared
+    }
+}
+
+impl<T: Eq + Hash> IntoSharedSlice<T> for SharedSlice<T> {
+    fn into_shared_slice(self, intern: &mut HashSet<SharedSlice<T>>) -> SharedSlice<T> {
+        if let Some(existing) = intern.get(self.as_slice()) {
+            return existing.clone();
+        }
+        intern.insert(self.clone());
+        self
+    }
+}
+
+/// Deterministic map with shared keys ([`SharedName`]) and deduplicated
+/// immutable slice values ([`SharedSlice<T>`]).
+///
+/// Signals and declarations across repeated module instances share the same
+/// packed dimensions, struct layouts, member lists and SVA formal lists.
+/// Interning both key text and slice storage eliminates per-instance heap
+/// allocations while keeping the wire format identical to
+/// `HashMap<String, Vec<T>>` (#721).
+#[derive(Clone, Debug)]
+pub struct SharedSliceMap<T> {
+    map: SharedNameMap<SharedSlice<T>>,
+    intern: HashSet<SharedSlice<T>>,
+}
+
+impl<T> Default for SharedSliceMap<T> {
+    fn default() -> Self {
+        Self {
+            map: SharedNameMap::default(),
+            intern: HashSet::default(),
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for SharedSliceMap<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.map.len() == other.map.len()
+            && self
+                .map
+                .iter()
+                .all(|(k, v)| other.map.get(k.as_str()).is_some_and(|ov| ov == v))
+    }
+}
+
+impl<T: Eq> Eq for SharedSliceMap<T> {}
+
+impl<T> SharedSliceMap<T> {
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.intern.clear();
+    }
+    pub fn reserve(&mut self, additional: usize) {
+        self.map.reserve(additional);
+    }
+    pub fn get<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<&SharedSlice<T>>
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.map.get(key)
+    }
+    pub fn get_shared<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<&SharedSlice<T>>
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.map.get(key)
+    }
+    pub fn retain(&mut self, predicate: impl FnMut(&String, &mut SharedSlice<T>) -> bool) {
+        self.map.retain(predicate);
+    }
+    pub fn contains_key<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> bool
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.map.contains_key(key)
+    }
+    pub fn remove<Q: ?Sized + Hash + Eq>(&mut self, key: &Q) -> Option<SharedSlice<T>>
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.map.remove(key)
+    }
+    pub fn values(&self) -> hash_map::Values<'_, SharedName, SharedSlice<T>> {
+        self.map.values()
+    }
+    pub fn iter(&self) -> Iter<'_, SharedSlice<T>> {
+        self.map.iter()
+    }
+    pub fn keys(&self) -> Keys<'_, SharedSlice<T>> {
+        self.map.keys()
+    }
+    pub fn shared_key<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<&SharedName>
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.map.shared_key(key)
+    }
+    pub fn distinct_slices(&self) -> usize {
+        self.intern.len()
+    }
+}
+
+impl<T: Eq + Hash> SharedSliceMap<T> {
+    pub fn shrink_to_fit(&mut self) {
+        self.map.shrink_to_fit();
+        self.intern.shrink_to_fit();
+    }
+
+    pub fn insert<K: Into<SharedName>, V: IntoSharedSlice<T>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Option<SharedSlice<T>> {
+        let shared = value.into_shared_slice(&mut self.intern);
+        self.map.insert(key, shared)
+    }
+
+    pub fn insert_if_absent<K: Into<SharedName>, V: IntoSharedSlice<T>>(
+        &mut self,
+        key: K,
+        value: impl FnOnce() -> V,
+    ) {
+        let key = key.into();
+        if !self.map.contains_key(key.as_str()) {
+            let shared = value().into_shared_slice(&mut self.intern);
+            self.map.insert(key, shared);
+        }
+    }
+
+    pub fn entry<K: Into<SharedName>>(&mut self, key: K) -> SharedSliceEntry<'_, T> {
+        SharedSliceEntry {
+            map: self,
+            key: key.into(),
+        }
+    }
+}
+
+pub struct SharedSliceEntry<'a, T> {
+    map: &'a mut SharedSliceMap<T>,
+    key: SharedName,
+}
+
+impl<'a, T: Eq + Hash> SharedSliceEntry<'a, T> {
+    pub fn or_insert<V: IntoSharedSlice<T>>(self, default: V) -> &'a SharedSlice<T> {
+        if !self.map.contains_key(self.key.as_str()) {
+            self.map.insert(self.key.clone(), default);
+        }
+        self.map.get(self.key.as_str()).expect("entry inserted")
+    }
+
+    pub fn or_insert_with<V: IntoSharedSlice<T>>(
+        self,
+        default: impl FnOnce() -> V,
+    ) -> &'a SharedSlice<T> {
+        if !self.map.contains_key(self.key.as_str()) {
+            self.map.insert(self.key.clone(), default());
+        }
+        self.map.get(self.key.as_str()).expect("entry inserted")
+    }
+}
+
+impl<Q: ?Sized + Hash + Eq, T> Index<&Q> for SharedSliceMap<T>
+where
+    SharedName: Borrow<Q>,
+{
+    type Output = SharedSlice<T>;
+    fn index(&self, key: &Q) -> &SharedSlice<T> {
+        &self.map[key]
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedSliceMap<T> {
+    type Item = (&'a String, &'a SharedSlice<T>);
+    type IntoIter = Iter<'a, SharedSlice<T>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<K: Into<SharedName>, T: Eq + Hash, V: IntoSharedSlice<T>> Extend<(K, V)>
+    for SharedSliceMap<T>
+{
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl<K: Into<SharedName>, T: Eq + Hash, V: IntoSharedSlice<T>> FromIterator<(K, V)>
+    for SharedSliceMap<T>
+{
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut map = Self::default();
+        map.extend(iter);
+        map
+    }
+}
+
+impl<T: Serialize> Serialize for SharedSliceMap<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.map.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de> + Eq + Hash> Deserialize<'de> for SharedSliceMap<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de> + Eq + Hash> serde::de::Visitor<'de> for Visitor<T> {
+            type Value = SharedSliceMap<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map from names to slices")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = SharedSliceMap::default();
+                if let Some(size) = access.size_hint() {
+                    out.reserve(size);
+                }
+                while let Some((k, v)) = access.next_entry::<SharedName, Vec<T>>()? {
+                    out.insert(k, v);
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +998,48 @@ mod tests {
             bincode::serde::decode_from_slice(&bytes, config).unwrap();
         assert_eq!(back.len(), names.len());
         assert!(names.iter().all(|n| back.contains(n)));
+    }
+
+    /// #721: packed dimension, struct layout and SVA parameter maps share key
+    /// text and deduplicated slice storage while encoding identically to
+    /// `HashMap<String, Vec<T>>`.
+    #[test]
+    fn shared_slice_map_shares_keys_and_slices_and_encodes_like_vec_map() {
+        let _scope = registry_scope();
+        let mut signals: SharedNameMap<u8> = SharedNameMap::default();
+        let mut shared: SharedSliceMap<(i64, i64)> = SharedSliceMap::default();
+        let mut plain: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
+        for i in 0..32 {
+            let key = format!("top.g[{i}].u.vec");
+            signals.insert(key.as_str(), 0);
+            let dims = vec![(3, 0), (7, 0)];
+            shared.insert(key.clone(), dims.clone());
+            plain.insert(key, dims);
+        }
+        assert_eq!(shared.len(), 32);
+        assert_eq!(shared.distinct_slices(), 1);
+        let first = shared.get_shared("top.g[0].u.vec").unwrap();
+        for i in 1..32 {
+            let key = format!("top.g[{i}].u.vec");
+            assert!(first.ptr_eq(shared.get_shared(&key).unwrap()));
+            assert!(
+                shared
+                    .shared_key(&key)
+                    .unwrap()
+                    .ptr_eq(signals.shared_key(&key).unwrap())
+            );
+        }
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&shared, config).unwrap();
+        assert_eq!(bincode::serde::encode_to_vec(&plain, config).unwrap(), bytes);
+        let (back, _): (SharedSliceMap<(i64, i64)>, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(back.len(), 32);
+        assert_eq!(back.distinct_slices(), 1);
+        assert!(
+            back.get_shared("top.g[0].u.vec")
+                .unwrap()
+                .ptr_eq(back.get_shared("top.g[31].u.vec").unwrap())
+        );
     }
 }

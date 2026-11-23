@@ -723,7 +723,7 @@ pub(super) fn register_member_packed_meta(
                 .or_insert(ew);
         }
         if let Some(fd) = fd {
-            elab.packed_full_dims.entry(key).or_insert(fd);
+            elab.packed_full_dims.insert_if_absent(key, || fd);
         }
     }
 }

@@ -422,7 +422,7 @@ fn validate_expr_idents_as(
                    !elab.arrays_2d.contains_key(name) && !elab.arrays_nd.contains_key(name) &&
                    !elab.classes.contains_key(name) && !elab.typedefs.contains_key(name) &&
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
-                   !elab.sequences.contains(name) &&
+                   !elab.has_named_sva(name) &&
                    // §19.7.1 `cg::type_option.f` scopes on the covergroup name.
                    !elab.covergroups.contains_key(name) &&
                    // §23.11: an instance a compilation-unit bind adds to
@@ -663,7 +663,7 @@ fn validate_event_idents(
             // `__xz_default_clocking` marker — both resolve at simulation
             // time to the block's clock event, not to a declared signal.
             if !elab.signals.contains_key(&id.name) && !elab.parameters.contains_key(&id.name)
-                && !elab.sequences.contains(&id.name) && !locals.contains(&id.name)
+                && !elab.has_named_sva(&id.name) && !locals.contains(&id.name)
                 && !elab.clocking_blocks.contains_key(&id.name)
                 && id.name != "__xz_default_clocking"
                 && id.name != "__xz_default_clocking0"

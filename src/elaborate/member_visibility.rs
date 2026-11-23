@@ -644,7 +644,7 @@ pub(super) fn extend_elaborated_decl_leaves(elab: &ElaboratedModule, names: &mut
     for k in elab.lets.keys() {
         add_key(k);
     }
-    for k in elab.sequences.iter() {
+    for k in elab.sequences.iter().chain(elab.property_decls.keys()) {
         add_key(k);
     }
     for k in elab.clocking_blocks.keys() {
