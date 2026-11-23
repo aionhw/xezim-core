@@ -42,6 +42,30 @@ fn width(design: &ElaboratedModule, name: &str) -> u32 {
         .width
 }
 
+#[test]
+fn packed_typedef_waits_for_transitive_package_parameter() {
+    let design = elaborate(
+        "package cfg; localparam AW = 4; endpackage
+         package bus;
+           localparam Hosts = 2;
+           localparam Slv = cfg::AW;
+           localparam Mst = Slv + $clog2(Hosts);
+           typedef logic [Mst-1:0] id_t;
+           typedef logic [Slv+$clog2(Hosts)-1:0] direct_t;
+           typedef struct packed { id_t id; logic [99:0] payload; } channel_t;
+         endpackage
+         module top;
+           bus::channel_t ch;
+           localparam int id_width = $bits(bus::id_t);
+           localparam int direct_width = $bits(bus::direct_t);
+         endmodule",
+    );
+    assert_eq!(param(&design, "bus::Mst"), 5);
+    assert_eq!(param(&design, "id_width"), 5);
+    assert_eq!(param(&design, "direct_width"), 5);
+    assert_eq!(width(&design, "ch"), 105);
+}
+
 /// A module parameter hides the package parameter of the same name for its
 /// bare spelling, the scoped spelling still reads the package's, and an
 /// override from the parent hides the default.
