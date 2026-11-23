@@ -3714,6 +3714,42 @@ mod tests {
         &name.name.name
     }
 
+    /// §26.3: the enum member imported into the module is nearer than a
+    /// compilation-unit parameter. A function formal still hides the import.
+    #[test]
+    fn imported_enum_member_shadows_unit_parameter() {
+        let items = module_items(
+            r#"
+parameter RED = 0;
+package p; typedef enum { RED = 64 } op_t; endpackage
+package other; parameter RED = 33; endpackage
+module m;
+  import p::*;
+  function int imported(); return RED; endfunction
+  function int shadow(int RED); return RED; endfunction
+endmodule
+"#,
+        );
+        let mut functions = items.into_iter().filter_map(|item| match item {
+            ModuleItem::FunctionDeclaration(f) => Some(f),
+            _ => None,
+        });
+        let imported = functions.next().unwrap();
+        let shadow = functions.next().unwrap();
+        let StatementKind::Return(Some(expr)) = &imported.items[0].kind else {
+            panic!("expected a return");
+        };
+        let ExprKind::MemberAccess { expr, member } = &expr.kind else {
+            panic!("expected the package member");
+        };
+        assert_eq!(plain_ident(expr), Some("p"));
+        assert_eq!(member.name, "RED");
+        let StatementKind::Return(Some(expr)) = &shadow.items[0].kind else {
+            panic!("expected a return");
+        };
+        assert_eq!(plain_ident(expr), Some("RED"));
+    }
+
     /// §23.9/§26.3: a child block's typedef cannot hide an outer import.
     #[test]
     fn child_typedef_does_not_shadow_enclosing_or_sibling_statements() {

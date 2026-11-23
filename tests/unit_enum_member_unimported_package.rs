@@ -29,6 +29,23 @@ endmodule
     assert_eq!(d.parameters["tb_pkg::EEW8"].to_i64(), Some(8));
 }
 
+/// §26.3: a module constant reads the imported enum member ahead of the
+/// parameter in the enclosing compilation unit.
+#[test]
+fn imported_member_in_a_constant_beats_unit_parameter() {
+    let d = elaborate(
+        r#"
+parameter RED = 0;
+package p; typedef enum int { RED = 64 } op_t; endpackage
+module t;
+  import p::*;
+  localparam int SELECTED = RED;
+endmodule
+"#,
+    );
+    assert_eq!(d.parameters["SELECTED"].to_i64(), Some(64));
+}
+
 #[test]
 fn module_member_keeps_its_bare_entry() {
     let d = elaborate(
@@ -183,4 +200,33 @@ endmodule
     assert_eq!(d.parameters["A"].to_i64(), Some(3));
     assert_eq!(d.parameters["A2"].to_i64(), Some(4));
     assert_eq!(d.parameters["q::A"].to_i64(), Some(8));
+}
+
+/// IEEE 1800-2023 §6.19, §26.3. Qualification preserves the enum's
+/// signedness, width and four-state value in a constant expression.
+#[test]
+fn imported_enum_constants_keep_their_declared_type() {
+    let d = elaborate(
+        r#"
+package p;
+  typedef enum int { RED = -1 } op_t;
+  typedef enum bit [31:0] { MASK = '1 } mask_t;
+  typedef enum logic [3:0] { UNK = 4'b1x0z } unknown_t;
+  typedef enum logic signed [79:0] { WIDE = -1 } wide_t;
+endpackage
+package q;
+  typedef enum int { RED, MASK, UNK, WIDE } collision_t;
+endpackage
+module t;
+  import p::*;
+  localparam bit NEG = RED < 0;
+  localparam bit UNS = MASK < 0;
+  localparam bit FOUR = UNK === 4'b1x0z;
+  localparam bit WNEG = WIDE < 0;
+endmodule
+"#,
+    );
+    for (name, expected) in [("NEG", 1), ("UNS", 0), ("FOUR", 1), ("WNEG", 1)] {
+        assert_eq!(d.parameters[name].to_u64(), Some(expected), "{name}");
+    }
 }
