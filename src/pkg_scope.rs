@@ -69,6 +69,12 @@ pub fn member_is_qualified(name: &str) -> bool {
     QUALIFIED_MEMBERS.with(|m| m.borrow().contains(name))
 }
 
+/// True when this pass spelled any enum member `pkg::name` for the current
+/// design (see `member_is_qualified`).
+pub fn any_member_qualified() -> bool {
+    QUALIFIED_MEMBERS.with(|m| !m.borrow().is_empty())
+}
+
 /// What a package declares and imports, for owner lookups.
 #[derive(Default)]
 struct PkgInfo {

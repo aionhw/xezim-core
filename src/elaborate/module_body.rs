@@ -1246,7 +1246,7 @@ pub fn elaborate_module_with_defs(
                     .is_none()
             {
                 check_enum_member_duplicates(td, &elab)?;
-                process_typedef(td, &mut elab);
+                process_local_typedef(td, &mut elab);
             }
         }
     }
@@ -3927,7 +3927,7 @@ pub fn elaborate_module_with_defs(
                         )
                     });
                 }
-                process_typedef(td, &mut elab);
+                process_local_typedef(td, &mut elab);
             }
             ModuleItem::TimeunitsDecl(td) => {
                 if let Some(u) = &td.unit {

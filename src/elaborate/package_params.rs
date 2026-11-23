@@ -111,7 +111,53 @@ pub(super) fn overlay_pkg_params(
             }
         }
     }
+    // §26.3, §6.19: an enum member of `p` that a declaration of the
+    // elaborated scope displaces (`local_decl_displaces`) is not registered
+    // under its bare name, which holds the local member instead.
+    if !(elab.wildcard_shadowed.is_empty() && elab.foreign_package_names.is_empty()) {
+        overlay_pkg_members(p, elab, &mut saved, |elab, nm| {
+            elab.local_decl_displaces(nm)
+        });
+    }
     saved
+}
+
+/// §26.3, §6.19: bind each enum member of `p` that `pick` selects to its bare
+/// name, from its `p::NAME` entry, recording the entry it replaces in
+/// `saved`. `p`'s own constants (`localparam int PE = EEW8;` in `p`) read
+/// `p`'s member while `p`'s items are evaluated, like `p`'s parameters, even
+/// where the bare name holds a `$unit` or local member of the same name.
+pub(super) fn overlay_pkg_members(
+    p: &crate::ast::module::PackageDeclaration,
+    elab: &mut ElaboratedModule,
+    saved: &mut Vec<(String, Option<Value>)>,
+    pick: impl Fn(&ElaboratedModule, &str) -> bool,
+) {
+    for item in &p.items {
+        let crate::ast::decl::PackageItem::Typedef(td) = item else {
+            continue;
+        };
+        let DataType::Enum(et) = &td.data_type else {
+            continue;
+        };
+        let signed = is_type_signed_resolved(&td.data_type, &elab.typedef_types);
+        for member in &et.members {
+            for nm in enum_member_names(member, &elab.parameters) {
+                if !pick(elab, &nm) {
+                    continue;
+                }
+                let key = format!("{}::{nm}", p.name.name);
+                let Some(mut v) = elab.parameters.get(&key).cloned() else {
+                    continue;
+                };
+                if !v.is_real {
+                    v.is_signed = signed;
+                }
+                saved.push((nm.clone(), elab.parameters.get(&nm).cloned()));
+                elab.set_param(line!(), nm, v);
+            }
+        }
+    }
 }
 
 pub(super) fn restore_overlay(elab: &mut ElaboratedModule, saved: Vec<(String, Option<Value>)>) {
