@@ -34,7 +34,11 @@ fn packed_array_ports_keep_dims_and_element_width() {
         ("asc", vec![(0, 3), (3, 0)], 4),
         ("w3", vec![(3, 0), (5, 0), (7, 0)], 48),
     ] {
-        assert_eq!(m.packed_full_dims.get(name), Some(&dims), "{name}");
+        assert_eq!(
+            m.packed_full_dims.get(name).map(|d| d.as_slice()),
+            Some(dims.as_slice()),
+            "{name}"
+        );
         assert_eq!(m.packed_signal_elem_widths.get(name), Some(&elem), "{name}");
     }
 }
@@ -46,7 +50,7 @@ fn packed_struct_ports_keep_their_fields() {
         m.packed_struct_fields
             .get(name)
             .unwrap_or_else(|| panic!("no fields for {name}"))
-            .clone()
+            .to_vec()
     };
     let want = vec![("hi".to_string(), 4, 4), ("lo".to_string(), 0, 4)];
     let mut got = fields("s");
@@ -55,5 +59,8 @@ fn packed_struct_ports_keep_their_fields() {
     let mut got = fields("sa");
     got.sort();
     assert_eq!(got, want);
-    assert_eq!(m.packed_full_dims.get("sa"), Some(&vec![(1, 0), (7, 0)]));
+    assert_eq!(
+        m.packed_full_dims.get("sa").map(|d| d.as_slice()),
+        Some([(1, 0), (7, 0)].as_slice())
+    );
 }

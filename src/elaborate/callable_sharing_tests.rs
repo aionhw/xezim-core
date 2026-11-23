@@ -356,4 +356,54 @@ fn named_sva_shares_only_identical_rewritten_bodies() {
     ));
     body.cached_width.set(Some(17));
     assert_eq!(body.cached_width.get(), None);
+    // #721: declarations with bodies omit `sequences`; portless declarations
+    // omit `property_params`, and repeated parameterized ones share one slice.
+    assert!(elab.has_named_sva("left.p"));
+    assert!(elab.has_named_sva("left.s"));
+    assert!(!elab.sequences.contains("left.p"));
+    assert!(!elab.sequences.contains("left.s"));
+    assert!(!elab.property_params.contains_key("left.s"));
+    assert!(!elab.property_params.contains_key("right.s"));
+    assert!(
+        elab.property_params
+            .get_shared("left.p")
+            .unwrap()
+            .ptr_eq(elab.property_params.get_shared("right.p").unwrap())
+    );
+}
+
+/// #721: packed dimensions and struct layouts across repeated instances share
+/// both key text and immutable slice allocations.
+#[test]
+fn packed_dims_and_struct_layouts_share_slices_across_instances() {
+    let elab = elaborate(
+        r#"
+        typedef struct packed { logic [15:0] a; logic [7:0] b; } word_s;
+        typedef struct { int x; int y; } plain_s;
+        module leaf;
+          logic [3:0][7:0] vec;
+          word_s st;
+          plain_s u;
+        endmodule
+        module top; leaf left(); leaf right(); endmodule
+    "#,
+    );
+    assert!(
+        elab.packed_full_dims
+            .get_shared("left.vec")
+            .unwrap()
+            .ptr_eq(elab.packed_full_dims.get_shared("right.vec").unwrap())
+    );
+    assert!(
+        elab.packed_struct_fields
+            .get_shared("left.st")
+            .unwrap()
+            .ptr_eq(elab.packed_struct_fields.get_shared("right.st").unwrap())
+    );
+    assert!(
+        elab.struct_members
+            .get_shared("left.u")
+            .unwrap()
+            .ptr_eq(elab.struct_members.get_shared("right.u").unwrap())
+    );
 }

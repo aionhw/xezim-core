@@ -58,7 +58,7 @@ fn design() -> xezim_core::elaborate::ElaboratedModule {
 #[test]
 fn typedef_element_port_keeps_ascending_dims() {
     let m = design();
-    let dims = |n: &str| m.packed_full_dims.get(n).cloned();
+    let dims = |n: &str| m.packed_full_dims.get(n).map(|d| d.to_vec());
     assert_eq!(dims("u1.o"), Some(vec![(0, 7), (7, 0)]));
     assert_eq!(dims("u2.o"), Some(vec![(0, 7), (7, 0)]));
     assert_eq!(dims("u2.i"), Some(vec![(1, 4), (7, 0)]));

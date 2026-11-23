@@ -53,16 +53,16 @@ fn body_localparams_keep_scoped_packed_geometry() {
         assert_eq!(model.packed_signal_elem_widths.get(key), Some(&2), "{key}");
     }
     assert_eq!(
-        model.packed_full_dims.get("u.L"),
-        Some(&vec![(1, 0), (1, 0)])
+        model.packed_full_dims.get("u.L").map(|d| d.as_slice()),
+        Some([(1, 0), (1, 0)].as_slice())
     );
     assert_eq!(
-        model.packed_full_dims.get("u.A"),
-        Some(&vec![(0, 1), (1, 0)])
+        model.packed_full_dims.get("u.A").map(|d| d.as_slice()),
+        Some([(0, 1), (1, 0)].as_slice())
     );
     assert_eq!(
-        model.packed_full_dims.get("u.R"),
-        Some(&vec![(3, 2), (1, 0)])
+        model.packed_full_dims.get("u.R").map(|d| d.as_slice()),
+        Some([(3, 2), (1, 0)].as_slice())
     );
 }
 
@@ -74,8 +74,8 @@ fn body_geometry_uses_each_instances_resolved_types_and_parameters() {
             let key = format!("{instance}.{name}");
             assert_eq!(model.packed_signal_elem_widths.get(&key), Some(&w), "{key}");
             assert_eq!(
-                model.packed_full_dims.get(&key),
-                Some(&vec![(n - 1, 0), (i64::from(w) - 1, 0)]),
+                model.packed_full_dims.get(&key).map(|d| d.as_slice()),
+                Some([(n - 1, 0), (i64::from(w) - 1, 0)].as_slice()),
                 "{key}"
             );
         }
@@ -86,8 +86,8 @@ fn body_geometry_uses_each_instances_resolved_types_and_parameters() {
             "{key}"
         );
         assert_eq!(
-            model.packed_full_dims.get(&key),
-            Some(&vec![(n - 1, 0), (1, 0), (i64::from(w) - 1, 0)])
+            model.packed_full_dims.get(&key).map(|d| d.as_slice()),
+            Some([(n - 1, 0), (1, 0), (i64::from(w) - 1, 0)].as_slice())
         );
         assert_eq!(
             model.parameters[&format!("{instance}.FIRST")].to_i64(),
