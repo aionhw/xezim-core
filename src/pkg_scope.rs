@@ -1227,15 +1227,46 @@ fn module_dpi_names(items: &[ModuleItem], out: &mut HashSet<String>) {
 }
 
 /// The member names an enum type declares (`enum {A, B}`); empty for any
-/// other type. A ranged member (`A[2]`) declares generated names, left out.
+/// other type. A ranged member declares generated names (§6.19: `A[2]`
+/// declares `A0` and `A1`, `A[1:3]` declares `A1` to `A3`); they are listed
+/// when the range is written with integer literals, and left out when it
+/// names a parameter, which this pass cannot evaluate.
 fn enum_members(dt: &DataType, out: &mut HashSet<String>) {
     if let DataType::Enum(et) = dt {
-        out.extend(
-            et.members
-                .iter()
-                .filter(|m| m.range.is_none())
-                .map(|m| m.name.name.clone()),
-        );
+        for m in &et.members {
+            match &m.range {
+                None => {
+                    out.insert(m.name.name.clone());
+                }
+                Some((lo, hi)) => {
+                    let (Some(lo), Some(hi)) = (literal_i64(lo), literal_i64(hi)) else {
+                        continue;
+                    };
+                    if lo.abs_diff(hi) > 4096 {
+                        continue;
+                    }
+                    out.extend((lo.min(hi)..=lo.max(hi)).map(|i| format!("{}{i}", m.name.name)));
+                }
+            }
+        }
+    }
+}
+
+/// The value of a constant written with integer literals alone (`2`, and the
+/// `2 - 1` the parser makes the upper bound of `A[2]`).
+fn literal_i64(e: &Expression) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Number(_) => crate::elaborate::const_eval_i64_with_params(e, None),
+        ExprKind::Paren(x) => literal_i64(x),
+        ExprKind::Binary { op, left, right } => {
+            let (l, r) = (literal_i64(left)?, literal_i64(right)?);
+            match op {
+                crate::ast::expr::BinaryOp::Add => l.checked_add(r),
+                crate::ast::expr::BinaryOp::Sub => l.checked_sub(r),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
