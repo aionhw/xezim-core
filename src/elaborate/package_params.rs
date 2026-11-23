@@ -337,10 +337,12 @@ pub(super) fn hoist_package_struct_params(
                         &elab.typedef_types,
                     ) {
                         if !fields.is_empty() {
+                            // §26.3: the bare name is visible only where the
+                            // package is imported (`register_bare_struct_param`).
                             let bare = assign.name.name.clone();
                             let dotted = format!("{}.{}", p.name.name, bare);
                             let qualified = format!("{}::{}", p.name.name, bare);
-                            for key in [&bare, &dotted, &qualified] {
+                            for key in [&dotted, &qualified] {
                                 tls_register_struct_layout(key, &fields);
                                 elab.packed_struct_fields
                                     .entry(key.clone())

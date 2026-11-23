@@ -556,6 +556,38 @@ pub(super) fn package_referenced_names(
     out
 }
 
+/// §7.2.1, §26.3: the field layout and member constants (`K.c`) of a
+/// struct-typed package parameter `name` imported here, under the bare name
+/// the import makes visible. The package registers them only under its own
+/// qualified names: a bare registration there reached every scope, so a
+/// module's own struct variable `K` read the package's `K.c`.
+fn register_bare_struct_param(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
+    let Some(fields) = flatten_struct_fields(
+        data_type,
+        &elab.parameters,
+        &elab.typedefs,
+        &elab.typedef_types,
+    ) else {
+        return;
+    };
+    if fields.is_empty() {
+        return;
+    }
+    tls_register_struct_layout(name, &fields);
+    if let Some(v) = elab.parameters.get(name).cloned() {
+        register_struct_param_members(
+            |k, v| {
+                elab.set_param(line!(), k, v);
+            },
+            name,
+            &v,
+            &fields,
+        );
+    }
+    register_struct_member_elem_widths(name, data_type, &elab.parameters, &elab.typedef_types);
+    elab.packed_struct_fields.insert(name.to_string(), fields);
+}
+
 pub(super) fn process_import(
     imp: &ImportDeclaration,
     elab: &mut ElaboratedModule,
@@ -565,6 +597,15 @@ pub(super) fn process_import(
     for ii in &imp.items {
         let pkg_name = &ii.package.name;
         if let Some(Definition::Package(pkg)) = defs.get(pkg_name) {
+            // §23.3.2, §26.3: an instance's import is inlined into the
+            // flattened design, whose bare names are the top-level scope's.
+            // A name that scope already declares stays its own; the
+            // instance's references are spelled `pkg::name`
+            // (`qualify_colliding_package_types`).
+            let parent_owned = inline_only
+                && ii.item.as_ref().is_some_and(|sym| {
+                    elab.parameters.contains_key(&sym.name) || elab.signals.contains_key(&sym.name)
+                });
             let mut pkg_overlay = overlay_pkg_params(pkg, elab);
             let mut imported_params: HashSet<String> = HashSet::default();
             if let Some(sym) = &ii.item {
@@ -580,6 +621,10 @@ pub(super) fn process_import(
                             {
                                 for assign in assignments {
                                     if &assign.name.name == sym_name {
+                                        if parent_owned {
+                                            found = true;
+                                            break;
+                                        }
                                         imported_params.insert(assign.name.name.clone());
                                         if register_visible_array_param(
                                             elab, pkg_name, assign, data_type,
@@ -705,6 +750,11 @@ pub(super) fn process_import(
                                                 type_name: get_type_name(data_type),
                                             },
                                         );
+                                        register_bare_struct_param(
+                                            elab,
+                                            &assign.name.name,
+                                            data_type,
+                                        );
                                         found = true;
                                         break;
                                     }
@@ -761,7 +811,9 @@ pub(super) fn process_import(
                                         expand_enum_member(member, next_val, &elab.parameters);
                                     next_val = nv;
                                     for (nm, val) in entries {
-                                        if &nm == sym_name {
+                                        if &nm == sym_name && parent_owned {
+                                            found = true;
+                                        } else if &nm == sym_name {
                                             let v = wide_vals
                                                 .as_ref()
                                                 .and_then(|m| m.get(&nm))
@@ -1210,21 +1262,11 @@ pub(super) fn process_import(
                                         // register its field layout, or member
                                         // selects (`CDEF.a`) read x at runtime
                                         // and 0 in const context.
-                                        if let Some(fields) = flatten_struct_fields(
+                                        register_bare_struct_param(
+                                            elab,
+                                            &assign.name.name,
                                             data_type,
-                                            &elab.parameters,
-                                            &elab.typedefs,
-                                            &elab.typedef_types,
-                                        ) {
-                                            if !fields.is_empty() {
-                                                tls_register_struct_layout(
-                                                    &assign.name.name,
-                                                    &fields,
-                                                );
-                                                elab.packed_struct_fields
-                                                    .insert(assign.name.name.clone(), fields);
-                                            }
-                                        }
+                                        );
                                     }
                                 }
                             }

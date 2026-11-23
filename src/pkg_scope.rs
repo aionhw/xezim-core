@@ -992,6 +992,7 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
+                module_level_values(&m.ports, &m.items, &mut other_values, &mut other_members);
             }
             Description::Interface(m) => {
                 for pd in &m.params {
@@ -999,6 +1000,7 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
+                module_level_values(&m.ports, &m.items, &mut other_values, &mut other_members);
             }
             Description::Program(m) => {
                 for pd in &m.params {
@@ -1006,6 +1008,7 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
+                module_level_values(&m.ports, &m.items, &mut other_values, &mut other_members);
             }
             _ => {}
         }
@@ -1211,6 +1214,49 @@ fn module_level_types(
             }
             _ => {}
         }
+    }
+}
+
+/// §23.3.2, §26.3: the parameters, ports, nets and variables a module,
+/// interface or program declares at its own level. The design is flattened
+/// into one name space whose bare names are its top-level scope's, so an
+/// instance's bare reference to a package value or enum member it imports
+/// is spelled `pkg::name` once any of them reuses that name.
+fn module_level_values(
+    ports: &PortList,
+    items: &[ModuleItem],
+    values: &mut HashSet<String>,
+    members: &mut HashSet<String>,
+) {
+    let port_names: Vec<String> = match ports {
+        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
+        PortList::NonAnsi(ids) => ids.iter().map(|id| id.name.clone()).collect(),
+        PortList::Empty => Vec::new(),
+    };
+    members.extend(port_names.iter().cloned());
+    values.extend(port_names);
+    for it in items {
+        let mut names: HashSet<String> = HashSet::default();
+        match it {
+            ModuleItem::PortDeclaration(p) => {
+                names.extend(p.declarators.iter().map(|d| d.name.name.clone()))
+            }
+            ModuleItem::NetDeclaration(n) => {
+                names.extend(n.declarators.iter().map(|d| d.name.name.clone()))
+            }
+            ModuleItem::DataDeclaration(d) => {
+                names.extend(d.declarators.iter().map(|d| d.name.name.clone()))
+            }
+            ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                param_names(p, &mut HashSet::default(), &mut names)
+            }
+            ModuleItem::GenerateRegion(g) => {
+                module_level_values(&PortList::Empty, &g.items, values, members)
+            }
+            _ => {}
+        }
+        members.extend(names.iter().cloned());
+        values.extend(names);
     }
 }
 
