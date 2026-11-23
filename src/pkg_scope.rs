@@ -914,6 +914,7 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
     let mut other: HashSet<String> = HashSet::default();
     let mut other_members: HashSet<String> = HashSet::default();
     let mut other_values: HashSet<String> = HashSet::default();
+    let mut module_values: HashSet<String> = HashSet::default();
     for d in descs {
         match d {
             Description::Package(p) => {
@@ -992,7 +993,7 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
-                module_level_values(&m.ports, &m.items, &mut other_values, &mut other_members);
+                module_level_values(&m.ports, &m.items, &mut module_values, &mut other_members);
             }
             Description::Interface(m) => {
                 for pd in &m.params {
@@ -1000,7 +1001,7 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
-                module_level_values(&m.ports, &m.items, &mut other_values, &mut other_members);
+                module_level_values(&m.ports, &m.items, &mut module_values, &mut other_members);
             }
             Description::Program(m) => {
                 for pd in &m.params {
@@ -1008,7 +1009,7 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
                 }
                 module_level_types(&m.items, &mut other, &mut other_members);
                 module_dpi_names(&m.items, &mut other_values);
-                module_level_values(&m.ports, &m.items, &mut other_values, &mut other_members);
+                module_level_values(&m.ports, &m.items, &mut module_values, &mut other_members);
             }
             _ => {}
         }
@@ -1028,7 +1029,13 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
     };
     let colliding = clash(|pi| &pi.types, &other);
     let colliding_members = clash(|pi| &pi.members, &other_members);
-    let colliding_values = clash(|pi| &pi.values, &other_values);
+    let mut colliding_values = clash(|pi| &pi.values, &other_values);
+    // §23.8.1: a module data name can collide with a flattened package
+    // value. It does not change a package subroutine's import binding.
+    for pi in pkgs.values() {
+        colliding_values.extend(pi.params.iter().chain(&pi.vars)
+            .filter(|name| module_values.contains(*name)).cloned());
+    }
     let pkg_params: HashSet<String> = pkgs
         .values()
         .flat_map(|pi| pi.params.iter().cloned())
