@@ -93,6 +93,7 @@ mod patterns;
 mod port_elision;
 mod port_widths;
 mod prepare;
+mod resolver_state;
 mod semantic_checks;
 mod spans;
 mod specify;

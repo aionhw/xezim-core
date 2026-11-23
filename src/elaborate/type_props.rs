@@ -448,7 +448,7 @@ pub fn is_type_signed(dt: &DataType) -> bool {
 
 /// Look up a §6.6.7 nettype resolution function — by bare name, or as a package
 /// member hoisted under a `pkg::name` key.
-fn lookup_resolver<'a>(
+pub(super) fn lookup_resolver<'a>(
     elab: &'a ElaboratedModule,
     name: &str,
 ) -> Option<&'a crate::ast::decl::FunctionDeclaration> {
@@ -486,15 +486,19 @@ pub(super) fn validate_resolver(
         ));
     };
 
-    // §6.6.7: "the resolution function shall be an automatic function". A
-    // static one leaks the previous call's locals and return value between
-    // resolutions of different nets, which surfaces as a stale value rather
-    // than an error.
-    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic) {
+    // §6.6.7: "A resolution function shall be automatic (or preserve no state
+    // information)". A static one is accepted when it writes each static
+    // variable it reads earlier in the same call, as `res = 0.0;` before the
+    // accumulating loop does. One that reads a value left by the previous call
+    // would resolve to a stale value rather than an error, so it is rejected.
+    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
+        && let Err(var) = super::resolver_state::static_carried_variable(elab, fd)
+    {
         return Err(format!(
-            "nettype '{}' resolution function '{}' must be declared `automatic` \
-             (IEEE 1800-2017 6.6.7)",
-            nettype, name
+            "nettype '{}' resolution function '{}' is static and reads {} before writing it, \
+             so it preserves state between calls; declare it `automatic` or write the variable \
+             first (IEEE 1800-2023 6.6.7)",
+            nettype, name, var
         ));
     }
 
