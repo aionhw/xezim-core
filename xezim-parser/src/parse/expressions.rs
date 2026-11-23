@@ -278,11 +278,10 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_expression()
         };
-        // IEEE 1800-2023 §11.4.13: tolerance ranges
-        // `[A +/- B]` → `[A-B : A+B]`
-        // `[A +%- B]` → `[A*(100-B)/100 : A*(100+B)/100]`
-        // `+/-` and `+%-` lex as three separate tokens
-        // (Plus, Slash|Percent, Minus); we detect the triple.
+        // IEEE 1800-2023 §11.4.13: tolerance ranges `[A +/- B]` (absolute)
+        // and `[A +%- B]` (relative, `A*B/100.0`). `+/-` and `+%-` lex as
+        // three separate tokens (Plus, Slash|Percent, Minus); we detect the
+        // triple.
         let separator = tolerance_enabled
             .then(|| self.tolerance_separator_at(0))
             .flatten();
@@ -292,73 +291,35 @@ impl<'a> Parser<'a> {
             self.bump();
             let delta = self.parse_expression();
             self.expect(TokenKind::RBracket);
-            if separator == TokenKind::Slash {
-                let lo = Expression::new(
-                    ExprKind::Binary {
-                        op: BinaryOp::Sub,
-                        left: Box::new(center.clone()),
-                        right: Box::new(delta.clone()),
+            // The tolerance is converted to the type of `A` (truncated from
+            // real to integral) and the bounds are ordered, so both depend on
+            // the operand types: evaluation computes them.
+            let relative = separator == TokenKind::Percent;
+            let bound = |upper: bool, span| {
+                let mode = 2 * u8::from(relative) + u8::from(upper);
+                Expression::new(
+                    ExprKind::SystemCall {
+                        name: crate::ast::expr::TOLERANCE_BOUND_FN.to_string(),
+                        args: vec![
+                            center.clone(),
+                            delta.clone(),
+                            Expression::new(
+                                ExprKind::Number(NumberLiteral::Integer {
+                                    signed: false,
+                                    size: None,
+                                    base: NumberBase::Decimal,
+                                    value: mode.to_string().into(),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                                }),
+                                span,
+                            ),
+                        ],
                     },
-                    self.span_from(start),
-                );
-                let hi = Expression::new(
-                    ExprKind::Binary {
-                        op: BinaryOp::Add,
-                        left: Box::new(center),
-                        right: Box::new(delta),
-                    },
-                    self.span_from(start),
-                );
-                (lo, hi)
-            } else {
-                let hundred = || {
-                    Expression::new(
-                        ExprKind::Number(NumberLiteral::Integer {
-                            signed: false,
-                            size: None,
-                            base: NumberBase::Decimal,
-                            value: "100".into(),
-                            cached_val: crate::ast::cache::LiteralCache::new(None),
-                        }),
-                        self.span_from(start),
-                    )
-                };
-                let make = |sign_neg: bool, c: Expression, d: Expression| {
-                    let op = if sign_neg {
-                        BinaryOp::Sub
-                    } else {
-                        BinaryOp::Add
-                    };
-                    let pm = Expression::new(
-                        ExprKind::Binary {
-                            op,
-                            left: Box::new(hundred()),
-                            right: Box::new(d),
-                        },
-                        c.span,
-                    );
-                    let mul = Expression::new(
-                        ExprKind::Binary {
-                            op: BinaryOp::Mul,
-                            left: Box::new(c),
-                            right: Box::new(pm),
-                        },
-                        self.span_from(start),
-                    );
-                    Expression::new(
-                        ExprKind::Binary {
-                            op: BinaryOp::Div,
-                            left: Box::new(mul),
-                            right: Box::new(hundred()),
-                        },
-                        self.span_from(start),
-                    )
-                };
-                (
-                    make(true, center.clone(), delta.clone()),
-                    make(false, center, delta),
+                    span,
                 )
-            }
+            };
+            let span = self.span_from(start);
+            (bound(false, span), bound(true, span))
         } else {
             self.expect(TokenKind::Colon);
             let hi = self.parse_expression();

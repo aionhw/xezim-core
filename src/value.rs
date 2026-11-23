@@ -1426,6 +1426,81 @@ impl Value {
         }
     }
 
+    /// IEEE 1800-2023 §11.4.13: one bound of the tolerance range `[a +/- b]`,
+    /// or of `[a +%- b]` when `relative`. The tolerance is `b`, or
+    /// `a * b / 100.0`, converted to the type of `a` -- truncated, not
+    /// rounded, from real to integral -- and the range runs from the lower to
+    /// the higher of `a - tolerance` and `a + tolerance`.
+    pub fn tolerance_bound(a: &Value, b: &Value, relative: bool, upper: bool) -> Value {
+        if a.is_real {
+            let c = a.to_f64();
+            let t = if relative {
+                c * b.to_f64() / 100.0
+            } else {
+                b.to_f64()
+            };
+            let (lo, hi) = if t < 0.0 {
+                (c + t, c - t)
+            } else {
+                (c - t, c + t)
+            };
+            return Value::from_f64(if upper { hi } else { lo });
+        }
+        let w = a.width.clamp(1, 128);
+        let unknown = a.has_xz() || (!b.is_real && b.has_xz());
+        if unknown || a.width > 128 {
+            let mut x = Value::all_x(a.width.max(1));
+            x.is_signed = a.is_signed;
+            return x;
+        }
+        let wrap = |v: i128, signed: bool| -> i128 {
+            if w == 128 {
+                return v;
+            }
+            let m = v & ((1i128 << w) - 1);
+            if signed && (m >> (w - 1)) & 1 == 1 {
+                m - (1i128 << w)
+            } else {
+                m
+            }
+        };
+        let as_i128 = |v: &Value| -> i128 {
+            let width = v.width.clamp(1, 128);
+            let raw = v.to_u128() as i128;
+            if width == 128 {
+                return raw;
+            }
+            let m = raw & ((1i128 << width) - 1);
+            if v.is_signed && (m >> (width - 1)) & 1 == 1 {
+                m - (1i128 << width)
+            } else {
+                m
+            }
+        };
+        let c = as_i128(a);
+        let t = if relative {
+            (c as f64 * b.to_f64() / 100.0).trunc() as i128
+        } else if b.is_real {
+            b.to_f64().trunc() as i128
+        } else {
+            as_i128(b)
+        };
+        let t = wrap(t, a.is_signed);
+        let lo = wrap(c.wrapping_sub(t), a.is_signed);
+        let hi = wrap(c.wrapping_add(t), a.is_signed);
+        let less = |x: i128, y: i128| {
+            if a.is_signed {
+                x < y
+            } else {
+                (x as u128) < (y as u128)
+            }
+        };
+        let (lo, hi) = if less(hi, lo) { (hi, lo) } else { (lo, hi) };
+        let mut v = Value::from_u128(if upper { hi } else { lo } as u128, a.width.max(1));
+        v.is_signed = a.is_signed;
+        v
+    }
+
     /// IEEE 1800-2023 §20.5: `$rtoi(r)`, a signed 32-bit `integer` holding `r`
     /// truncated toward zero. The truncated value is taken as a 64-bit
     /// integer whose low 32 bits are the result; a value outside the 64-bit

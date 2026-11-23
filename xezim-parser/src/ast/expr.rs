@@ -37,6 +37,12 @@ impl Expression {
     }
 }
 
+/// IEEE 1800-2023 §11.4.13: `$__xz_tolerance(A, B, mode)` is one bound of the
+/// tolerance range `[A +/- B]` (mode 0 low, 1 high) or `[A +%- B]` (mode 2
+/// low, 3 high). The bound depends on the type of `A`, which the parser does
+/// not know, so evaluation computes it (`Value::tolerance_bound`).
+pub const TOLERANCE_BOUND_FN: &str = "$__xz_tolerance";
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExprKind {

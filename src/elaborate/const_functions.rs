@@ -1244,6 +1244,7 @@ pub(super) fn const_fn_expr_supported(e: &Expression) -> bool {
         }
         ExprKind::SystemCall { name, args } => {
             (matches!(name.as_str(), "$clog2" | "$bits" | "$signed" | "$unsigned")
+                || (name == crate::ast::expr::TOLERANCE_BOUND_FN && args.len() == 3)
                 || (matches!(
                     name.as_str(),
                     "$rtoi"

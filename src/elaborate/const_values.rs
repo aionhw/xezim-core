@@ -624,6 +624,17 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
         // §20.5 real↔integer conversions and rounding in CONSTANT context.
         // None had const-eval arms, so `localparam int PI_I = $rtoi(PI*100.0)`
         // evaluated to 0.
+        // §11.4.13: a tolerance range bound.
+        ExprKind::SystemCall { name, args }
+            if name == crate::ast::expr::TOLERANCE_BOUND_FN && args.len() == 3 =>
+        {
+            let a = eval_const_expr_val_inner(&args[0], params, types);
+            let b = eval_const_expr_val_inner(&args[1], params, types);
+            let mode = eval_const_expr_val_inner(&args[2], params, types)
+                .to_u64()
+                .unwrap_or(0);
+            Value::tolerance_bound(&a, &b, mode & 2 != 0, mode & 1 != 0)
+        }
         ExprKind::SystemCall { name, args }
             if matches!(
                 name.as_str(),
