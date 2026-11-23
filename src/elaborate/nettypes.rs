@@ -279,25 +279,57 @@ fn net_base_of(elab: &ElaboratedModule, e: &Expression) -> Option<String> {
 }
 
 /// §6.6.7, §10.3.1: the declaration assignment of a user-defined-nettype net
-/// (`rn n = e;`) is a continuous driver of the net, subject to its
-/// resolution function.
+/// (`rn #3 n = e;`) is a continuous driver of the net, subject to its
+/// resolution function. §10.3.3: its delay belongs to that driver. The parser
+/// keeps the `#3` in the type's argument list, which the delay pass has already
+/// scaled to ticks for a nettype name.
 pub(super) fn nettype_declaration_driver(
+    dd: &crate::ast::decl::DataDeclaration,
     name: &str,
     init: &Expression,
     rhs_parent_scoped: bool,
+    params: &HashMap<String, Value>,
 ) -> ContinuousAssignment {
+    let (delay, delay_fall, delay_off, delay_exprs) = nettype_delay(dd, params);
     ContinuousAssignment {
         gate_delay_fall: None,
-        delay_exprs: None,
+        delay_exprs,
         delay_select: None,
         origin: Some((init.span, top_origin_scope())),
         lhs: make_ident_expr(name),
         rhs: init.clone(),
-        delay: 0,
+        delay,
         rhs_parent_scoped,
-        delay_fall: None,
-        delay_off: None,
+        delay_fall,
+        delay_off,
     }
+}
+
+/// The (rise, fall, turn-off) ticks of a nettype net declaration's delay.
+fn nettype_delay(
+    dd: &crate::ast::decl::DataDeclaration,
+    params: &HashMap<String, Value>,
+) -> (u64, Option<u64>, Option<u64>, Option<DelayExpressions>) {
+    let args: &[Expression] = match &dd.data_type {
+        DataType::TypeReference { type_args, .. } => type_args,
+        _ => &[],
+    };
+    cont_assign_delays([args.first(), args.get(1), args.get(2)], params)
+}
+
+/// §6.7.1, §10.3.3: without a declaration assignment, a nettype net's delay
+/// is a net delay, which delays every driver of the net (`rn #2 n;`).
+pub(super) fn nettype_net_delay(
+    dd: &crate::ast::decl::DataDeclaration,
+    decl: &crate::ast::stmt::VarDeclarator,
+    params: &HashMap<String, Value>,
+) -> Option<(u64, Option<u64>, Option<u64>, Option<DelayExpressions>)> {
+    if decl.init.is_some() || !decl.dimensions.is_empty() {
+        return None;
+    }
+    let (rise, fall, off, exprs) = nettype_delay(dd, params);
+    (rise != 0 || fall.unwrap_or(0) != 0 || off.unwrap_or(0) != 0 || exprs.is_some())
+        .then_some((rise, fall, off, exprs))
 }
 
 /// §6.6.8: an emit LHS naming an ARRAY ELEMENT (`a[0]`) must be a real Index

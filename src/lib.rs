@@ -2077,6 +2077,31 @@ fn parse_and_elaborate(
     oom_trace::checkpoint("prepare.body_types.ready", &[]);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     oom_trace::checkpoint("prepare.package_types.ready", &[]);
+    // §6.6.7: the compilation-unit and package nettypes, whose nets keep a
+    // delay in the type's argument list for the delay rewrite to scale.
+    {
+        let mut names = crate::hasher::HashSet::default();
+        for desc in &all_descriptions {
+            match desc {
+                ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
+                    names.insert(n.name.name.clone());
+                }
+                ast::Description::Package(p) => {
+                    for item in &p.items {
+                        if let ast::decl::PackageItem::Nettype(n) = item {
+                            // A colliding name already carries its package.
+                            if !n.name.name.contains("::") {
+                                names.insert(format!("{}::{}", p.name.name, n.name.name));
+                            }
+                            names.insert(n.name.name.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        elaborate::set_design_nettype_names(names);
+    }
     // §8.25.1: the parameterized classes whose typedefs name a member of a
     // type parameter, for `Cls#(args)::t` lookups.
     elaborate::class_scope_types::install(&all_descriptions);

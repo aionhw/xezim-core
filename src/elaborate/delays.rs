@@ -266,9 +266,66 @@ fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
     }
 }
 
+thread_local! {
+    /// §6.6.7: the nettype names a design element can see while its delays
+    /// are rewritten: those of the compilation units and packages
+    /// (`set_design_nettype_names`), then also its own, less the names its
+    /// own typedefs and classes hide.
+    static NETTYPE_NAMES: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::default();
+}
+
+/// Record the nettype names the compilation units and packages of the design
+/// declare, before its design elements' delays are rewritten.
+pub fn set_design_nettype_names(names: HashSet<String>) {
+    NETTYPE_NAMES.with(|n| *n.borrow_mut() = names);
+}
+
 pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, prec_s: f64, tick_s: f64) {
+    // §6.18, §26.5: the element's own nettypes are visible in it, and its own
+    // typedefs and classes hide outer nettypes of the same name.
+    let outer = NETTYPE_NAMES.with(|n| n.borrow().clone());
+    let mut visible = outer.clone();
+    for item in items.iter() {
+        match item {
+            ModuleItem::NettypeDeclaration(nd) => {
+                visible.insert(nd.name.name.clone());
+            }
+            ModuleItem::TypedefDeclaration(td) if !td.forward => {
+                visible.remove(&td.name.name);
+            }
+            ModuleItem::ClassDeclaration(cd) => {
+                visible.remove(&cd.name.name);
+            }
+            _ => {}
+        }
+    }
+    NETTYPE_NAMES.with(|n| *n.borrow_mut() = visible);
     rewrite_module_item_delays(items, unit_s, prec_s, tick_s);
+    NETTYPE_NAMES.with(|n| *n.borrow_mut() = outer);
     scope_time_decl_inits(items, secs_to_exp(unit_s), secs_to_exp(prec_s));
+}
+
+/// §6.6.7 `net_declaration ::= nettype_identifier [delay_control] ...`: the
+/// parser keeps a nettype net's delay (`rn #3 n = e;`) in the type's argument
+/// list, since it cannot tell a nettype name from a class name there.
+fn nettype_delay_args(dd: &mut crate::ast::decl::DataDeclaration) -> Option<&mut Vec<Expression>> {
+    let DataType::TypeReference {
+        name, type_args, ..
+    } = &mut dd.data_type
+    else {
+        return None;
+    };
+    if type_args.is_empty() || type_args.len() > 3 {
+        return None;
+    }
+    let key = match name.scopes.as_slice() {
+        [] => name.name.name.clone(),
+        [pkg] => format!("{}::{}", pkg.name.name, name.name.name),
+        _ => return None,
+    };
+    NETTYPE_NAMES
+        .with(|n| n.borrow().contains(&key))
+        .then_some(type_args)
 }
 
 /// §5.8 for a VALUE-position time literal in a DECLARATION initialiser.
@@ -501,6 +558,14 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
                     .flatten()
                 {
                     rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                }
+            }
+            // `rn #2 n = a;` — a nettype net's delay likewise.
+            ModuleItem::DataDeclaration(dd) => {
+                if let Some(args) = nettype_delay_args(dd) {
+                    for d in args.iter_mut() {
+                        rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                    }
                 }
             }
             // `wire #2 w = a;` — a net declaration delay likewise.

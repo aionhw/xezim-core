@@ -3085,12 +3085,31 @@ pub fn elaborate_module_with_defs(
                         // net the same way, instead of the one-time
                         // procedural write a variable gets below.
                         let nettype_net = declared_user_nettype(&elab, &dd.data_type).is_some();
+                        if nettype_net
+                            && let Some(d) = nettype_net_delay(dd, decl, &elab.parameters)
+                        {
+                            elab.net_delays.insert(decl.name.name.clone(), d);
+                        }
                         if nettype_net && let Some(init_expr) = decl.init.as_ref() {
-                            elab.continuous_assigns.push(nettype_declaration_driver(
+                            let ca = nettype_declaration_driver(
+                                dd,
                                 &decl.name.name,
                                 init_expr,
                                 true,
-                            ));
+                                &elab.parameters,
+                            );
+                            // A delayed driver has not arrived yet: the net
+                            // starts from its type's default, not the value.
+                            if (ca.delay != 0 || ca.delay_exprs.is_some())
+                                && let Some(sig) = elab.signals.get_mut(&decl.name.name)
+                            {
+                                sig.value = default_value_for_type_resolved(
+                                    &dd.data_type,
+                                    w,
+                                    &elab.typedef_types,
+                                );
+                            }
+                            elab.continuous_assigns.push(ca);
                         }
                         if let Some(view) = &data_modport_view {
                             elab.modport_views

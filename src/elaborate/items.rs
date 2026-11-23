@@ -325,6 +325,9 @@ pub(super) fn elaborate_items(
                     let nettype_net = declared_user_nettype(elab, &dd.data_type).is_some();
                     if nettype_net {
                         elab.nets.insert(decl.name.name.clone());
+                        if let Some(d) = nettype_net_delay(dd, decl, &elab.parameters) {
+                            elab.net_delays.insert(decl.name.name.clone(), d);
+                        }
                     }
                     let shape_dims = normalize_unpacked_dims(
                         &decl.dimensions,
@@ -699,7 +702,13 @@ pub(super) fn elaborate_items(
                         // continuous driver, not an initial value.
                         let decl_driver =
                             decl.init.as_deref().filter(|_| nettype_net).map(|init| {
-                                nettype_declaration_driver(&decl.name.name, init, false)
+                                nettype_declaration_driver(
+                                    dd,
+                                    &decl.name.name,
+                                    init,
+                                    false,
+                                    &elab.parameters,
+                                )
                             });
                         let procedural_init = decl.init.as_deref().filter(|init| {
                             decl_driver.is_none() && !is_const_expr(init, &elab.parameters)
