@@ -138,6 +138,121 @@ pub(super) fn bind_inlined_import_params(
     Ok(())
 }
 
+/// Acyclic, portless module-type binds in compilation-unit scope are known
+/// before the first hierarchy walk (§23.11). Attach those while visiting
+/// their targets. The regular resolver is still needed when instance names
+/// can take precedence, or a bound connection can affect its host.
+pub(super) fn unit_module_binds(
+    unit_binds: &[BindDirective],
+    definitions: &HashMap<String, Definition>,
+    checker_decls: &HashMap<String, crate::ast::decl::CheckerDeclaration>,
+) -> Option<HashMap<String, Vec<BindDirective>>> {
+    if unit_binds.is_empty() {
+        return None;
+    }
+    let mut binds: HashMap<String, Vec<BindDirective>> = HashMap::default();
+    for bind in unit_binds {
+        let target = &bind.target_module.name;
+        let inst = &bind.instantiation;
+        let bound = &inst.module_name.name;
+        let Some(Definition::Module(module)) = definitions.get(bound) else {
+            return None;
+        };
+        if !bind.target_path.is_empty()
+            || !bind.extra_paths.is_empty()
+            || !bind.gen_scope.is_empty()
+            || !matches!(definitions.get(target), Some(Definition::Module(_)))
+            || checker_decls.contains_key(bound)
+            || inst.params.is_some()
+            || !module.params.is_empty()
+            || module.ports.get(0).is_some()
+            || inst
+                .instances
+                .iter()
+                .any(|i| !i.dimensions.is_empty() || !i.connections.is_empty())
+            || module.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ModuleItem::ModuleInstantiation(_)
+                        | ModuleItem::GenerateRegion(_)
+                        | ModuleItem::GenerateFor(_)
+                        | ModuleItem::GenerateIf(_)
+                        | ModuleItem::GenerateCase(_)
+                        | ModuleItem::NestedModule(_)
+                )
+            })
+        {
+            return None;
+        }
+        let group = binds.entry(target.clone()).or_default();
+        if !group
+            .iter()
+            .any(|previous| crate::bind_directive_matches(previous, bind))
+        {
+            group.push(bind.clone());
+        }
+    }
+    // The old resolver also recognizes a top-level instance with the same
+    // name as a target. Avoid that ambiguity, plus local bind sites whose
+    // activation and declaration context the regular resolver tracks.
+    fn unambiguous(items: &[ModuleItem], binds: &HashMap<String, Vec<BindDirective>>) -> bool {
+        items.iter().all(|item| match item {
+            ModuleItem::Bind(_) | ModuleItem::Defparam(_) | ModuleItem::NestedModule(_) => false,
+            ModuleItem::ModuleInstantiation(inst) => inst
+                .instances
+                .iter()
+                .all(|i| !binds.contains_key(&i.name.name)),
+            ModuleItem::GenerateRegion(region) => unambiguous(&region.items, binds),
+            ModuleItem::GenerateFor(loop_) => unambiguous(&loop_.items, binds),
+            ModuleItem::GenerateIf(cond) => cond
+                .branches
+                .iter()
+                .all(|(_, branch)| unambiguous(branch, binds)),
+            ModuleItem::GenerateCase(case) => case
+                .arms
+                .iter()
+                .all(|arm| unambiguous(&arm.items, binds)),
+            _ => true,
+        })
+    }
+    if !definitions
+        .values()
+        .all(|def| unambiguous(def.items(), &binds))
+        || unit_binds.iter().any(|b| {
+            b.instantiation
+                .instances
+                .iter()
+                .any(|i| binds.contains_key(&i.name.name))
+        })
+    {
+        return None;
+    }
+    // Eliminate leaves of the binding graph. Cycles stay on the existing
+    // fixed-point path with its nonconvergence diagnostic.
+    let mut pending: HashSet<&str> = binds.keys().map(String::as_str).collect();
+    for _ in 0..63 {
+        if pending.is_empty() {
+            break;
+        }
+        let leaves: Vec<_> = pending
+            .iter()
+            .copied()
+            .filter(|target| {
+                binds[*target]
+                    .iter()
+                    .all(|b| !pending.contains(b.instantiation.module_name.name.as_str()))
+            })
+            .collect();
+        if leaves.is_empty() {
+            return None;
+        }
+        for leaf in leaves {
+            pending.remove(leaf);
+        }
+    }
+    pending.is_empty().then_some(binds)
+}
+
 impl BindTargetFilter {
     pub(super) fn collect(
         top_def_name: &str,
@@ -790,6 +905,10 @@ pub(super) fn inline_module_items(
     param_scope: &param_scope::ParamScope,
     mut bind_state: Option<&mut BindWorklistState>,
 ) -> Result<ModuleInlineMeta, String> {
+    if let Some(binds) = cache.unit_module_binds.get(source_def.name()) {
+        elab.resolved_binds
+            .insert(prefix.trim_end_matches('.').to_string(), binds.clone());
+    }
     // Bind this module's imported type names BEFORE its body is prepared or
     // resolved. The top-module path re-runs its imports
     // (`elaborate_module_with_defs`); the inlined-instance path never processed

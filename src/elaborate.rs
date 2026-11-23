@@ -3277,6 +3277,8 @@ struct PreparedModuleItems {
 /// instance.
 #[derive(Default)]
 struct InlineCache {
+    /// Portless compilation-unit binds keyed by target definition (§23.11).
+    unit_module_binds: HashMap<String, Vec<crate::ast::decl::BindDirective>>,
     /// Prepared bodies (`prepare_module_items`).
     prepared: prepared_bodies::PreparedBodies,
     /// Whether preparation leaves value-parameter references symbolic.

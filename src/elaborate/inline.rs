@@ -1157,6 +1157,14 @@ fn inline_instantiations_inner(
     set_typedef_types_tls(&elab.typedef_types);
     set_typedef_widths_tls(&elab.typedefs);
     let mut cache = InlineCache::default();
+    let bind_driver = if let Some(binds) = bind_driver.as_ref().and_then(|(unit_binds, _)| {
+        super::bind_inline::unit_module_binds(unit_binds, definitions, &elab.checker_decls)
+    }) {
+        cache.unit_module_binds = binds;
+        None
+    } else {
+        bind_driver
+    };
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
     // §23.10/§26.3: the snapshot is held once; each scope takes from it only
