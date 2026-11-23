@@ -41,14 +41,17 @@ module child;
   import p::*;
   localparam int SELECTED = RED;
 endmodule
+module observer;
+  localparam int OUTSIDE = RED;
+endmodule
 module t;
   child c();
-  localparam int OUTSIDE = RED;
+  observer separate();
 endmodule
 "#,
     );
     assert_eq!(d.parameters["c.SELECTED"].to_i64(), Some(64));
-    assert_eq!(d.parameters["OUTSIDE"].to_i64(), Some(0));
+    assert_eq!(d.parameters["separate.OUTSIDE"].to_i64(), Some(0));
 }
 
 #[test]
