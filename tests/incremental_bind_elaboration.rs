@@ -73,6 +73,24 @@ fn four_level_nested_bind_matches_direct_hierarchy() {
 }
 
 #[test]
+fn portless_unit_bind_prefers_a_same_named_instance() {
+    let model = elaborate(
+        r#"
+module watched; endmodule
+module different; endmodule
+module observer; wire flag = 1; endmodule
+module top;
+  watched actual();
+  different watched();
+endmodule
+bind watched observer o();
+"#,
+    );
+    assert!(model.signals.contains_key("watched.o.flag"));
+    assert!(!model.signals.contains_key("actual.o.flag"));
+}
+
+#[test]
 fn nested_bind_target_instance_selection_and_bind_created_path() {
     let model = elaborate(
         r#"
