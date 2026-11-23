@@ -266,6 +266,19 @@ pub fn elaborate_module_with_defs(
         // wrong generate branch. Then the struct parameters themselves.
         hoist_package_params(defs, &mut elab);
         hoist_package_struct_params(defs, &mut elab);
+        // §6.19, §26.3: a `$unit` enum member initialized from a package
+        // parameter that this hoist has just settled (`A = p::K`, with
+        // `localparam int K = E;` and `E` a member of `p`'s enum) read the
+        // parameter's first-pass value, 0. Register the `$unit` enums once
+        // more, then record the entries of their members that a package also
+        // declares, which `reassert_unit_enum_members` puts back once
+        // instances are inlined.
+        for td in ordered_typedefs(defs) {
+            if matches!(td.data_type, DataType::Enum(_)) {
+                process_typedef(td, &mut elab);
+            }
+        }
+        elab.unit_member_slots = contested_unit_member_slots(defs, &elab);
     }
 
     crate::oom_trace::checkpoint("elaborate.global_definitions.ready", &[("functions", elab.functions.len())]);
@@ -1246,7 +1259,7 @@ pub fn elaborate_module_with_defs(
                     .is_none()
             {
                 check_enum_member_duplicates(td, &elab)?;
-                process_typedef(td, &mut elab);
+                process_local_typedef(td, &mut elab);
             }
         }
     }
@@ -3927,7 +3940,7 @@ pub fn elaborate_module_with_defs(
                         )
                     });
                 }
-                process_typedef(td, &mut elab);
+                process_local_typedef(td, &mut elab);
             }
             ModuleItem::TimeunitsDecl(td) => {
                 if let Some(u) = &td.unit {

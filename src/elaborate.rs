@@ -1756,6 +1756,11 @@ pub struct ElaboratedModule {
     /// an explicit packed range (`output [7:0] x;`).
     #[serde(skip)]
     pub ranged_port_widths: HashMap<String, u32>,
+    /// Transient (§26.3, §6.19): the bare-name parameter and signal entries
+    /// of each `$unit` enum member that a package also declares, as the
+    /// `$unit` typedefs registered them (`reassert_unit_enum_members`).
+    #[serde(skip)]
+    pub unit_member_slots: Vec<(String, Value, Signal)>,
     /// Transient (§26.3): bare type entries `rebind_imported_typedefs` hid
     /// for the scope being prepared, because an import of that scope binds
     /// the name as a constant: name, width, type, unpacked dimensions and
@@ -2665,6 +2670,7 @@ impl ElaboratedModule {
             decl_sites: HashMap::default(),
             foreign_package_names: HashSet::default(),
             foreign_displaced: HashSet::default(),
+            unit_member_slots: Vec::new(),
             two_state_signals: HashSet::default(),
             z_init_signals: HashSet::default(),
             pending_always: Vec::new(),

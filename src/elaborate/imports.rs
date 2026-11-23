@@ -607,6 +607,14 @@ pub(super) fn process_import(
                     elab.parameters.contains_key(&sym.name) || elab.signals.contains_key(&sym.name)
                 });
             let mut pkg_overlay = overlay_pkg_params(pkg, elab);
+            // §26.3: the initializers this import evaluates read the
+            // package's own members, not the `$unit` or local members of the
+            // same name that the bare names hold in the importing scope.
+            if crate::pkg_scope::any_member_qualified() {
+                overlay_pkg_members(pkg, elab, &mut pkg_overlay, |_, nm| {
+                    crate::pkg_scope::member_is_qualified(nm)
+                });
+            }
             let mut imported_params: HashSet<String> = HashSet::default();
             if let Some(sym) = &ii.item {
                 let sym_name = &sym.name;
