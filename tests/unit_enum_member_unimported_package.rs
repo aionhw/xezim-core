@@ -159,3 +159,28 @@ endmodule
     assert_eq!(d.parameters["A1"].to_i64(), Some(2));
     assert_eq!(d.parameters["tb_pkg::A0"].to_i64(), Some(8));
 }
+
+/// A `$unit` member initialized from a package parameter that reads one of
+/// the package's own enum members is put back with the settled value.
+#[test]
+fn unit_member_from_a_package_parameter_keeps_its_value() {
+    let d = elaborate(
+        r#"
+package p;
+  typedef enum int {E = 3} T;
+  localparam int K = E;
+endpackage
+typedef enum int {A = p::K, A2} U;
+package q;
+  typedef enum int {A = 8} Q;
+endpackage
+module t;
+  U u;
+  initial u = A;
+endmodule
+"#,
+    );
+    assert_eq!(d.parameters["A"].to_i64(), Some(3));
+    assert_eq!(d.parameters["A2"].to_i64(), Some(4));
+    assert_eq!(d.parameters["q::A"].to_i64(), Some(8));
+}
