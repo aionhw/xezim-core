@@ -1187,6 +1187,17 @@ pub fn elaborate_module_with_defs(
             };
             for assign in assignments {
                 let name = assign.name.name.as_str();
+                // A package's flattened constant can already occupy this
+                // slot. Seed the local value before any dependent bounds or
+                // generate conditions read it (§26.3).
+                if elab.local_decl_displaces(name)
+                    && !param_overrides.contains_key(name)
+                    && elab.parameters.contains_key(name)
+                {
+                    elab.remove_param(name);
+                    elab.signals.remove(name);
+                    elab.decl_sites.remove(name);
+                }
                 // Already bound => instantiation override; leave it alone.
                 if elab.parameters.contains_key(name) {
                     continue;
@@ -4240,19 +4251,20 @@ pub fn elaborate_module_with_defs(
                         &|n| elab.struct_members.contains_key(n),
                         &|n| elab.packages.contains(n),
                     );
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, &mut elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: delay_exprs.clone(),
-                            delay_select: None,
-                            origin: Some((ca.span, top_origin_scope())),
-                            lhs: lhs.clone(),
-                            rhs: rhs_final,
-                            delay,
-                            rhs_parent_scoped: false,
-                            delay_fall,
-                            delay_off,
-                        });
+                    let driver = ContinuousAssignment {
+                        gate_delay_fall: None,
+                        delay_exprs: delay_exprs.clone(),
+                        delay_select: None,
+                        origin: Some((ca.span, top_origin_scope())),
+                        lhs: lhs.clone(),
+                        rhs: rhs_final,
+                        delay,
+                        rhs_parent_scoped: false,
+                        delay_fall,
+                        delay_off,
+                    };
+                    if !expand_whole_array_assign(&driver, &mut elab) {
+                        elab.continuous_assigns.push(driver);
                     }
                 }
             }

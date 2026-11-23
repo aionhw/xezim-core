@@ -796,12 +796,10 @@ fn make_multi_index_expr(name: &str, idx: &[i64]) -> Expression {
 /// Push the expansion of a whole-array continuous assign, returning true when
 /// it consumed the assignment.
 pub(super) fn expand_whole_array_assign(
-    lhs: &Expression,
-    rhs: &Expression,
-    delay: u64,
-    delay_exprs: &Option<DelayExpressions>,
+    driver: &ContinuousAssignment,
     elab: &mut ElaboratedModule,
 ) -> bool {
+    let (lhs, rhs, delay) = (&driver.lhs, &driver.rhs, driver.delay);
     match elab.whole_array_driver_parts(lhs, rhs, delay, &elab.unpacked_decl_dims)
     .or_else(|| {
         slice_array_assign_parts(
@@ -817,7 +815,9 @@ pub(super) fn expand_whole_array_assign(
     .or_else(|| elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t)))
     {
         Some(mut parts) => {
-            for part in &mut parts { part.delay_exprs = delay_exprs.clone(); }
+            for part in &mut parts {
+                part.inherit_driver_metadata(driver);
+            }
             elab.continuous_assigns.extend(parts);
             true
         }

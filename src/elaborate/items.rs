@@ -1050,19 +1050,20 @@ pub(super) fn elaborate_items(
                         &|n| elab.struct_members.contains_key(n),
                         &|n| elab.packages.contains(n),
                     );
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: delay_exprs.clone(),
-                            delay_select: None,
-                            origin: Some((ca.span, top_origin_scope())),
-                            lhs: lhs.clone(),
-                            rhs: rhs_final,
-                            delay,
-                            rhs_parent_scoped: false,
-                            delay_fall,
-                            delay_off,
-                        });
+                    let driver = ContinuousAssignment {
+                        gate_delay_fall: None,
+                        delay_exprs: delay_exprs.clone(),
+                        delay_select: None,
+                        origin: Some((ca.span, top_origin_scope())),
+                        lhs: lhs.clone(),
+                        rhs: rhs_final,
+                        delay,
+                        rhs_parent_scoped: false,
+                        delay_fall,
+                        delay_off,
+                    };
+                    if !expand_whole_array_assign(&driver, elab) {
+                        elab.continuous_assigns.push(driver);
                     }
                 }
             }

@@ -659,6 +659,17 @@ pub struct ContinuousAssignment {
     pub origin: Option<(crate::ast::Span, std::sync::Arc<str>)>,
 }
 
+impl ContinuousAssignment {
+    /// Keep the original driver context on each unpacked array element.
+    pub fn inherit_driver_metadata(&mut self, driver: &Self) {
+        self.delay_fall = driver.delay_fall;
+        self.delay_off = driver.delay_off;
+        self.delay_exprs.clone_from(&driver.delay_exprs);
+        self.origin.clone_from(&driver.origin);
+        self.rhs_parent_scoped = driver.rhs_parent_scoped;
+    }
+}
+
 /// The `ContinuousAssignment::origin` scope of the top module, one string
 /// for all of its assignments.
 fn top_origin_scope() -> std::sync::Arc<str> {
@@ -2846,7 +2857,7 @@ impl ElaboratedModule {
             // needs the same per-element expansion — otherwise an array OUTPUT
             // PORT driven that way never propagates and the parent's array
             // stays x for the whole run.
-            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, &ca.delay_exprs, self) {
+            if !expand_whole_array_assign(&ca, self) {
                 self.continuous_assigns.push(ca);
             }
         }
@@ -2897,7 +2908,8 @@ impl ElaboratedModule {
                 })
             }) {
                 Some(parts) => {
-                    for e in parts {
+                    for mut e in parts {
+                        e.inherit_driver_metadata(&ca);
                         f(e);
                     }
                 }
