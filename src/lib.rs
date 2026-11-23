@@ -3422,12 +3422,33 @@ fn parse_and_elaborate(
                 static PKG_SCOPE: std::cell::RefCell<Option<(String, crate::hasher::HashSet<String>)>> =
                     const { std::cell::RefCell::new(None) };
             }
+            // A package-qualified name can still be unavailable in this partial
+            // table. Defer the expression to typed elaboration (§6.18, §26.3)
+            // before an unknown operand becomes a literal typedef bound.
+            fn early_integer(expr: &ast::expr::Expression, table: &PTable) -> Option<i64> {
+                use ast::expr::ExprKind;
+                let mut bound = true;
+                elaborate::for_each_sub_expr(expr, &mut |node| match &node.kind {
+                    ExprKind::Ident(h) => {
+                        bound &= h.root.is_none()
+                            && matches!(h.path.as_slice(), [seg]
+                                if seg.selects.is_empty() && table.contains_key(&seg.name.name));
+                    }
+                    ExprKind::MemberAccess { .. } => bound = false,
+                    _ => {}
+                });
+                if bound {
+                    elaborate::const_eval_i64_with_params(expr, Some(table))
+                } else {
+                    None
+                }
+            }
             fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
                 if matches!(e.kind, ast::expr::ExprKind::Number(_)) {
                     return;
                 }
                 if !table.is_empty()
-                    && let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table))
+                    && let Some(v) = early_integer(e, table)
                     && v >= 0
                 {
                     *e = ast::expr::Expression::new(
@@ -3597,7 +3618,7 @@ fn parse_and_elaborate(
                         table.remove(&a.name.name);
                         if let Some(init) = &a.init {
                             if let Some(v) =
-                                elaborate::const_eval_i64_with_params(init, Some(table))
+                                early_integer(init, table)
                                 && holds_unchanged(data_type, v, table)
                             {
                                 let mut val = Value::from_u64(v as u64, 32);
