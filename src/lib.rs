@@ -1499,7 +1499,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
             ],
         );
         let mut parser = sv_parser::parse::Parser::new(tokens);
-        let source_ast = parser.parse_source_text();
+        let mut source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
         drop(parser);
 
@@ -1617,6 +1617,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 ("preprocessed_bytes", preprocessed.len()),
             ],
         );
+        elaborate::lower_verilog_2005_initializers(source_path.as_deref(), &mut source_ast.descriptions);
         all_descriptions.extend(source_ast.descriptions);
         preprocessed_texts.push(preprocessed);
         line_maps.push(line_map);
@@ -5038,7 +5039,7 @@ fn resolve_library_modules(
             eprintln!("{}", e);
         }
         let preprocessed_cleanly = pp.errors().is_empty();
-        let result = sv_parser::parse(&preprocessed);
+        let mut result = sv_parser::parse(&preprocessed);
         // Spans index the re-parsed text; it is the preprocessed text again
         // (nothing is left to expand), so the map applies to it.
         let line_map = line_map.filter(|_| result.source_text == preprocessed);
@@ -5143,6 +5144,7 @@ fn resolve_library_modules(
                 _ => None,
             })
             .collect();
+        elaborate::lower_verilog_2005_initializers(Some(&path), &mut result.source.descriptions);
         let file_index = lib_sources.files.len() as u32;
         let mut defined: Vec<String> = Vec::new();
         for desc in result.source.descriptions {
