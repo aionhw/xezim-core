@@ -649,51 +649,11 @@ impl<'a> Binder<'a> {
         let Some(first) = h.path.first() else { return };
         // `NO_TARGET` here is the parser's `$unit::f(...)` (§3.12.1) or a
         // randsequence production's value (§18.17.7).
-        let lexical = h.root.is_none() && h.bound != Bound::NO_TARGET;
-        let outcome = if !lexical {
+        let outcome = if h.root.is_some() || h.bound == Bound::NO_TARGET {
             Outcome::None(Hide::Qualified)
         } else {
             self.resolve(&first.name.name, h.path.len() == 1)
         };
-        // §23.6, §23.8: top-level items have no top-name prefix in the
-        // flattened design. In another definition, preserve the absolute
-        // path explicitly so it wins over the executing instance's scope.
-        let mut outcome = outcome;
-        if !self.callee && outcome == Outcome::None(Hide::Qualified) {
-            let explicit = usize::from(first.name.name == "$root");
-            if (lexical || explicit != 0)
-                && h.path.len() >= explicit + 2
-                && let Some(top) = h.path.get(explicit)
-                && top.selects.is_empty()
-                && self.names.tops.contains(top.name.name.as_str())
-                && (explicit != 0 || !self.names.packages.contains_key(top.name.name.as_str()))
-            {
-                let member = &h.path[explicit + 1].name.name;
-                let has_indexed_scope = h.path[explicit + 1..h.path.len() - 1]
-                    .iter().any(|segment| !segment.selects.is_empty());
-                let own = (top.name.name == self.tree.def && !has_indexed_scope)
-                    .then(|| self.resolve(member, h.path.len() == explicit + 2))
-                    .filter(|o| matches!(o, Outcome::Decl(d)
-                        if self.tree.decls[d.0 as usize].scope == self.tree.root));
-                if let Some(o) = own {
-                    h.path.drain(..=explicit);
-                    if explicit == 0 {
-                        outcome = o;
-                    } else {
-                        // Keep the absolute binding when dropping the
-                        // already known top from the storage path.
-                        h.root = Some("$root".to_string());
-                    }
-                } else if explicit == 0 {
-                    let mut root = first.clone();
-                    root.name.name = "$root".to_string();
-                    h.path.insert(0, root);
-                }
-                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
-                h.cached_resolved_name = crate::ast::cache::NameCache::new();
-            }
-        }
-        let Some(first) = h.path.first() else { return };
         let bound = match outcome {
             Outcome::Decl(d) => {
                 let decl = &self.tree.decls[d.0 as usize];
@@ -1553,7 +1513,7 @@ impl<'a> Binder<'a> {
             | StatementKind::RsReturn => {}
             StatementKind::Expr(e) => self.expr(e),
             StatementKind::BlockingAssign { lvalue, rvalue } => {
-                self.expr(lvalue);
+                self.procedural_target(lvalue);
                 self.expr(rvalue);
             }
             StatementKind::NonblockingAssign {
@@ -1561,7 +1521,7 @@ impl<'a> Binder<'a> {
                 delay,
                 rvalue,
             } => {
-                self.expr(lvalue);
+                self.procedural_target(lvalue);
                 if let Some(d) = delay {
                     self.expr(d);
                 }
@@ -1686,11 +1646,11 @@ impl<'a> Binder<'a> {
             StatementKind::ProceduralContinuous(pc) => match pc {
                 ProceduralContinuous::Assign { lvalue, rvalue }
                 | ProceduralContinuous::Force { lvalue, rvalue } => {
-                    self.expr(lvalue);
+                    self.procedural_target(lvalue);
                     self.expr(rvalue);
                 }
                 ProceduralContinuous::Deassign(e) | ProceduralContinuous::Release(e) => {
-                    self.expr(e)
+                    self.procedural_target(e)
                 }
             },
             // §6.5: a declaration hides from its point to the block's end.
@@ -1944,12 +1904,56 @@ impl<'a> Binder<'a> {
         })
     }
 
-    fn expr(&mut self, e: &mut Expression) {
-        if !self.callee && matches!(e.kind, ExprKind::MemberAccess { .. })
-            && let Some(path) = self.top_member_path(e)
-        {
+    /// §23.6: the procedural store paths need an absolute instance name
+    /// before lowering selects. Keep expression and declaration lookup in
+    /// their original shape. Ordinary member/index targets are unchanged.
+    fn procedural_target(&mut self, e: &mut Expression) {
+        fn normalize(this: &Binder<'_>, e: &mut Expression) {
+            match &mut e.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                    normalize(this, expr);
+                    return;
+                }
+                ExprKind::Concatenation(parts) => {
+                    for part in parts {
+                        normalize(this, part);
+                    }
+                    return;
+                }
+                ExprKind::Paren(inner) => {
+                    normalize(this, inner);
+                    return;
+                }
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {}
+                _ => return,
+            }
+            let Some(mut path) = this.top_member_path(e) else { return };
+            let explicit = usize::from(path.path[0].name.name == "$root");
+            let Some(first) = path.path.get(explicit + 1) else { return };
+            let indexed_scope = path.path[explicit + 1..path.path.len() - 1]
+                .iter().any(|seg| !seg.selects.is_empty());
+            let own_instance = path.path[explicit].name.name == this.tree.def
+                && matches!(this.resolve(&first.name.name, false), Outcome::Decl(d)
+                    if this.tree.decls[d.0 as usize].scope == this.tree.root
+                        && this.tree.decls[d.0 as usize].kind == DeclKind::Instance);
+            if own_instance && !indexed_scope {
+                path.path.drain(..=explicit);
+            } else if explicit == 0 {
+                let mut root = path.path[0].clone();
+                root.name.name = "$root".to_string();
+                path.path.insert(0, root);
+            } else {
+                // The original explicitly rooted shape already identifies
+                // the absolute target when it cannot be shortened safely.
+                return;
+            }
             e.kind = ExprKind::Ident(path);
         }
+        normalize(self, e);
+        self.expr(e);
+    }
+
+    fn expr(&mut self, e: &mut Expression) {
         match &mut e.kind {
             ExprKind::Number(_)
             | ExprKind::StringLiteral(_)
