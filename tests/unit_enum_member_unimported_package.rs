@@ -37,13 +37,18 @@ fn imported_member_in_a_constant_beats_unit_parameter() {
         r#"
 parameter RED = 0;
 package p; typedef enum int { RED = 64 } op_t; endpackage
-module t;
+module child;
   import p::*;
   localparam int SELECTED = RED;
 endmodule
+module t;
+  child c();
+  localparam int OUTSIDE = RED;
+endmodule
 "#,
     );
-    assert_eq!(d.parameters["SELECTED"].to_i64(), Some(64));
+    assert_eq!(d.parameters["c.SELECTED"].to_i64(), Some(64));
+    assert_eq!(d.parameters["OUTSIDE"].to_i64(), Some(0));
 }
 
 #[test]
@@ -208,6 +213,7 @@ endmodule
 fn imported_enum_constants_keep_their_declared_type() {
     let d = elaborate(
         r#"
+parameter RED = 0;
 package p;
   typedef enum int { RED = -1 } op_t;
   typedef enum bit [31:0] { MASK = '1 } mask_t;
@@ -217,16 +223,30 @@ endpackage
 package q;
   typedef enum int { RED, MASK, UNK, WIDE } collision_t;
 endpackage
-module t;
+module child;
   import p::*;
   localparam bit NEG = RED < 0;
   localparam bit UNS = MASK < 0;
   localparam bit FOUR = UNK === 4'b1x0z;
   localparam bit WNEG = WIDE < 0;
+  localparam bit QUALIFIED = p::RED < 0 && p::UNK === 4'b1x0z;
+endmodule
+module t;
+  child c();
 endmodule
 "#,
     );
-    for (name, expected) in [("NEG", 1), ("UNS", 0), ("FOUR", 1), ("WNEG", 1)] {
-        assert_eq!(d.parameters[name].to_u64(), Some(expected), "{name}");
+    for (name, expected) in [
+        ("NEG", 1),
+        ("UNS", 0),
+        ("FOUR", 1),
+        ("WNEG", 1),
+        ("QUALIFIED", 1),
+    ] {
+        assert_eq!(
+            d.parameters[&format!("c.{name}")].to_u64(),
+            Some(expected),
+            "{name}"
+        );
     }
 }
