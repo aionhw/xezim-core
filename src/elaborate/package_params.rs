@@ -504,6 +504,7 @@ pub(super) fn hoist_package_params(
             // its inits are evaluated (`LOG2(SZ)` — the formal binds the bare
             // name), restored after the package so nothing leaks unimported.
             let mut pkg_overlay: Vec<(String, Option<Value>)> = Vec::new();
+            let mut pkg_layouts = ScopedStructLayouts::default();
             for item in &p.items {
                 let crate::ast::decl::PackageItem::Parameter(pd) = item else {
                     continue;
@@ -622,6 +623,26 @@ pub(super) fn hoist_package_params(
                     // overlay in the hoist loop below.
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
                     let scoped = format!("{}.{}", p.name.name, assign.name.name);
+                    // IEEE 1800-2017 §6.20.2, §7.2.1, §26.3: a dependent
+                    // constant selects this packed member in the declaring
+                    // package, before a consumer uses the value as a width.
+                    let may_be_struct = match data_type {
+                        DataType::Struct(_) => true,
+                        DataType::TypeReference { dimensions, .. } => dimensions.is_empty(),
+                        _ => false,
+                    };
+                    if may_be_struct
+                        && assign.dimensions.is_empty()
+                        && let Some(fields) = flatten_struct_fields(
+                            data_type,
+                            &elab.parameters,
+                            &elab.typedefs,
+                            &elab.typedef_types,
+                        )
+                    {
+                        tls_register_struct_layout(&scoped, &fields);
+                        pkg_layouts.bind_fields(&assign.name.name, fields);
+                    }
                     register_pkg_param_elem(elab, "", &scoped, data_type);
                 }
             }
