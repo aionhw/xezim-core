@@ -382,7 +382,11 @@ pub(super) fn has_instance_arrays(items: &[ModuleItem]) -> bool {
 /// The widths and unpacked shapes of the signals and ports of the scope
 /// holding `items` (a definition's body), which an instance array's
 /// connections are sliced by.
-type ScopeShapes = (HashMap<String, u32>, HashMap<String, Vec<(i64, i64)>>);
+type ScopeShapes = (
+    HashMap<String, u32>,
+    HashMap<String, Vec<(i64, i64)>>,
+    HashMap<String, (Vec<(i64, i64)>, u32)>,
+);
 
 pub(super) fn ai_scope_shapes(
     items: &[ModuleItem],
@@ -406,37 +410,106 @@ pub(super) fn ai_scope_shapes(
             }
         }
     }
-    (widths, unpacked_shapes)
+    let mut packed = ai_scan_packed_shapes(items, local_params, typedef_widths);
+    if let PortList::Ansi(ports) = source_def.ports() {
+        for port in ports {
+            let Some(dt) = &port.data_type else {
+                continue;
+            };
+            if let Some(dims) = packed_full_dims_of(dt, local_params) {
+                let width = resolve_type_width(dt, Some(local_params), Some(typedef_widths)).max(1);
+                packed.insert(port.name.name.clone(), (dims, width));
+            }
+        }
+    }
+    (widths, unpacked_shapes, packed)
+}
+
+/// §23.2.3, §23.10: the parameters a module's header ports are sized by in
+/// one of its instances: the instantiating scope's `params`, then each
+/// header parameter, from the instance's override (evaluated in the
+/// instantiating scope) or else from its default.
+fn ai_instance_header_params(
+    def: &Definition,
+    overrides: Option<&[crate::ast::decl::ParamConnection]>,
+    params: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    use crate::ast::decl::{ParamConnection as PC, ParamValue as PV};
+    let mut env = params.clone();
+    let overrides = overrides.unwrap_or_default();
+    let mut position = 0usize;
+    for decl in def.params() {
+        let ParameterKind::Data { assignments, .. } = &decl.kind else {
+            if !decl.local {
+                position += 1;
+            }
+            continue;
+        };
+        for assign in assignments {
+            let named = overrides.iter().find_map(|o| match o {
+                PC::Named { name, value } if name.name == assign.name.name => Some(value.as_ref()),
+                _ => None,
+            });
+            let positional = (!decl.local)
+                .then(|| match overrides.get(position) {
+                    Some(PC::Ordered(value)) => Some(value.as_ref()),
+                    _ => None,
+                })
+                .flatten();
+            if !decl.local {
+                position += 1;
+            }
+            let value = match named.or(positional) {
+                Some(Some(PV::Expr(e))) => const_eval_i64_with_params(e, Some(params)),
+                _ => assign
+                    .init
+                    .as_ref()
+                    .and_then(|e| const_eval_i64_with_params(e, Some(&env))),
+            };
+            // A value this cannot fold keeps what the scope had.
+            if let Some(v) = value {
+                let mut v = Value::from_u64(v as u64, 32);
+                v.is_signed = true;
+                env.insert(assign.name.name.clone(), v);
+            }
+        }
+    }
+    env
 }
 
 /// §23.3.2: replace each array of instances among `items` by its elements.
 pub(super) fn ai_expand_instance_arrays(
     items: &mut [ModuleItem],
-    (widths, unpacked_shapes): &ScopeShapes,
+    (widths, unpacked_shapes, packed): &ScopeShapes,
     definitions: &HashMap<String, Definition>,
     local_params: &HashMap<String, Value>,
     typedef_widths: &HashMap<String, u32>,
 ) {
+    let cx = AiCtx {
+        widths,
+        packed,
+        unpacked: unpacked_shapes,
+        params: local_params,
+    };
     for item in items.iter_mut() {
         if let ModuleItem::ModuleInstantiation(inst) = item {
             if inst.instances.iter().any(|h| !h.dimensions.is_empty()) {
                 let def = definitions.get(&inst.module_name.name);
+                // §23.3.3.5: the formals are the child's, sized by its own
+                // parameters.
+                let header_params = def.map(|d| {
+                    ai_instance_header_params(d, inst.params.as_deref(), local_params)
+                });
+                let header_params = header_params.as_ref().unwrap_or(local_params);
                 let port_widths = def
-                    .map(|d| ai_module_port_widths(d, local_params, typedef_widths))
+                    .map(|d| ai_module_port_widths(d, header_params, typedef_widths))
                     .unwrap_or_default();
                 let port_shapes = def
-                    .map(|d| ai_module_port_shapes(d, local_params))
+                    .map(|d| ai_module_port_shapes(d, header_params))
                     .unwrap_or_default();
                 let port_names = def.map(ai_module_port_names).unwrap_or_default();
-                inst.instances = ai_expand_instances(
-                    &inst.instances,
-                    &port_widths,
-                    &port_shapes,
-                    &port_names,
-                    widths,
-                    unpacked_shapes,
-                    local_params,
-                );
+                inst.instances =
+                    ai_expand_instances(&inst.instances, &port_widths, &port_shapes, &port_names, cx);
             }
         }
     }
