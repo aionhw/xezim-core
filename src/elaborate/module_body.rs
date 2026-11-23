@@ -1104,6 +1104,38 @@ pub fn elaborate_module_with_defs(
             elab.nettype_resolvers.entry(nt.clone()).or_default();
         }
     }
+    // §6.18, §26.3, §26.5: a module's own typedef, class or type parameter
+    // hides a compilation-unit or package nettype of the same name, so a
+    // declaration spelled with that name declares a variable. (A module-local
+    // nettype and typedef of one name would be a redeclaration.)
+    let mut hidden: HashSet<String> = HashSet::default();
+    let type_params = |pd: &ParameterDeclaration, hidden: &mut HashSet<String>| {
+        if let ParameterKind::Type { assignments } = &pd.kind {
+            hidden.extend(assignments.iter().map(|a| a.name.name.clone()));
+        }
+    };
+    for pd in module.params() {
+        type_params(pd, &mut hidden);
+    }
+    for item in module.items() {
+        match item {
+            ModuleItem::TypedefDeclaration(td) if !td.forward => {
+                hidden.insert(td.name.name.clone());
+            }
+            ModuleItem::ClassDeclaration(cd) => {
+                hidden.insert(cd.name.name.clone());
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                type_params(pd, &mut hidden);
+            }
+            _ => {}
+        }
+    }
+    hidden.retain(|n| nettype_info.contains_key(n));
+    for n in &hidden {
+        user_nettypes.remove(n);
+    }
+    elab.shadowed_nettypes = hidden;
 
     // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
     // the items, so a declaration whose width depends on one of them is sized
@@ -3052,21 +3084,13 @@ pub fn elaborate_module_with_defs(
                         // fewer driver. A non-constant initializer drives the
                         // net the same way, instead of the one-time
                         // procedural write a variable gets below.
-                        let nettype_net = get_type_name(&dd.data_type)
-                            .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
+                        let nettype_net = declared_user_nettype(&elab, &dd.data_type).is_some();
                         if nettype_net && let Some(init_expr) = decl.init.as_ref() {
-                            elab.continuous_assigns.push(ContinuousAssignment {
-                                gate_delay_fall: None,
-                                delay_exprs: None,
-                                delay_select: None,
-                                origin: Some((init_expr.span, top_origin_scope())),
-                                lhs: make_ident_expr(&decl.name.name),
-                                rhs: init_expr.as_ref().clone(),
-                                delay: 0,
-                                rhs_parent_scoped: true,
-                                delay_fall: None,
-                                delay_off: None,
-                            });
+                            elab.continuous_assigns.push(nettype_declaration_driver(
+                                &decl.name.name,
+                                init_expr,
+                                true,
+                            ));
                         }
                         if let Some(view) = &data_modport_view {
                             elab.modport_views

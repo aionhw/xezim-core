@@ -1815,6 +1815,12 @@ pub struct ElaboratedModule {
     /// written, so a loaded artifact has the folds already applied.
     #[serde(skip)]
     pub nettype_resolvers: HashMap<String, String>,
+    /// §6.18, §26.3, §26.5: nettype names of the compilation unit or a
+    /// package that the module hides with its own typedef, class or type
+    /// parameter of the same name. A declaration whose type is spelled with
+    /// one of these names is a variable of that type, not a nettype net.
+    #[serde(skip)]
+    pub shadowed_nettypes: HashSet<String>,
     /// Array declarations: base_name -> (lo_index, hi_index, element_width)
     pub arrays: HashMap<String, (i64, i64, u32)>,
     /// Associative arrays: name -> true if string-keyed
@@ -2571,6 +2577,7 @@ impl ElaboratedModule {
             typedefs: TypedefTable::default(),
             typedef_types: SharedMap::default(),
             nettype_resolvers: HashMap::default(),
+            shadowed_nettypes: HashSet::default(),
             arrays: HashMap::default(),
             associative_arrays: HashMap::default(),
             assoc_elem_widths: HashMap::default(),

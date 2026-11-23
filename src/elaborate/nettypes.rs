@@ -278,6 +278,28 @@ fn net_base_of(elab: &ElaboratedModule, e: &Expression) -> Option<String> {
     }
 }
 
+/// §6.6.7, §10.3.1: the declaration assignment of a user-defined-nettype net
+/// (`rn n = e;`) is a continuous driver of the net, subject to its
+/// resolution function.
+pub(super) fn nettype_declaration_driver(
+    name: &str,
+    init: &Expression,
+    rhs_parent_scoped: bool,
+) -> ContinuousAssignment {
+    ContinuousAssignment {
+        gate_delay_fall: None,
+        delay_exprs: None,
+        delay_select: None,
+        origin: Some((init.span, top_origin_scope())),
+        lhs: make_ident_expr(name),
+        rhs: init.clone(),
+        delay: 0,
+        rhs_parent_scoped,
+        delay_fall: None,
+        delay_off: None,
+    }
+}
+
 /// §6.6.8: an emit LHS naming an ARRAY ELEMENT (`a[0]`) must be a real Index
 /// expression — a flat ident literally named `a[0]` does not resolve to the
 /// element's storage.
@@ -596,11 +618,17 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     // element (`a[0]`), which the seeding above put in the resolver. A
     // bare array name (`a`) keeps the whole-array key a driver may have.
 
+    // §6.18, §26.5: a variable whose type name the top module's own typedef
+    // or type parameter takes from an outer nettype is not a nettype net.
+    let hidden =
+        |name: &str, tn: &str| elab.shadowed_nettypes.contains(tn) && !elab.nets.contains(name);
     // net name -> resolver, for every signal whose declared type is a nettype.
     let mut net_resolver: HashMap<String, String> = HashMap::default();
     for (name, sig) in &elab.signals {
         if let Some(tn) = &sig.type_name {
-            if let Some(r) = elab.nettype_resolvers.get(tn) {
+            if let Some(r) = elab.nettype_resolvers.get(tn)
+                && !hidden(name, tn)
+            {
                 net_resolver.insert(name.clone(), r.clone());
             }
         }
@@ -623,7 +651,9 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             continue;
         }
         if let Some(tn) = get_type_name(dt) {
-            if let Some(r) = elab.nettype_resolvers.get(&tn) {
+            if let Some(r) = elab.nettype_resolvers.get(&tn)
+                && !hidden(name, &tn)
+            {
                 from_decls.push((name.clone(), r.clone()));
             }
         }

@@ -319,6 +319,13 @@ pub(super) fn elaborate_items(
                             "net",
                         ));
                     }
+                    // §6.6.7, §27.2: a generate block declares a nettype net
+                    // like a module does; its resolution function admits
+                    // several continuous drivers (§6.5).
+                    let nettype_net = declared_user_nettype(elab, &dd.data_type).is_some();
+                    if nettype_net {
+                        elab.nets.insert(decl.name.name.clone());
+                    }
                     let shape_dims = normalize_unpacked_dims(
                         &decl.dimensions,
                         &elab.parameters,
@@ -688,12 +695,19 @@ pub(super) fn elaborate_items(
                             }
                         }
                     } else {
-                        let procedural_init = decl
+                        // §10.3.1: a nettype net's declaration assignment is a
+                        // continuous driver, not an initial value.
+                        let decl_driver =
+                            decl.init.as_deref().filter(|_| nettype_net).map(|init| {
+                                nettype_declaration_driver(&decl.name.name, init, false)
+                            });
+                        let procedural_init = decl.init.as_deref().filter(|init| {
+                            decl_driver.is_none() && !is_const_expr(init, &elab.parameters)
+                        });
+                        let init_val = if let Some(init_expr) = decl
                             .init
                             .as_deref()
-                            .filter(|init| !is_const_expr(init, &elab.parameters));
-                        let init_val = if let Some(init_expr) =
-                            decl.init.as_deref().filter(|_| procedural_init.is_none())
+                            .filter(|_| decl_driver.is_none() && procedural_init.is_none())
                         {
                             let mut rv =
                                 eval_init_for_target(init_expr, &elab.parameters, width, is_real);
@@ -727,6 +741,9 @@ pub(super) fn elaborate_items(
                             decl.name.name.clone(),
                             sig,
                         );
+                        if let Some(ca) = decl_driver {
+                            elab.continuous_assigns.push(ca);
+                        }
                         if let Some(view) = &data_modport_view {
                             elab.modport_views
                                 .insert(decl.name.name.clone(), view.clone());

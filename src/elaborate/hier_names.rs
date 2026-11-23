@@ -300,10 +300,28 @@ pub(super) fn is_net_name(elab: &ElaboratedModule, name: &str) -> bool {
         return true;
     }
     elab.signals.get(name).is_some_and(|s| {
-        s.type_name
-            .as_deref()
-            .is_some_and(|t| elab.nettype_resolvers.contains_key(t))
+        s.type_name.as_deref().is_some_and(|t| {
+            elab.nettype_resolvers.contains_key(t) && !elab.shadowed_nettypes.contains(t)
+        })
     })
+}
+
+/// §6.6.7: the user-defined nettype a declaration of type `dt` declares a
+/// net of, by the nettype's registry key. A type name the module hides with
+/// its own typedef, class or type parameter names that declaration instead
+/// (§6.18, §26.3, §26.5), so the object is a variable.
+pub(super) fn declared_user_nettype(elab: &ElaboratedModule, dt: &DataType) -> Option<String> {
+    let DataType::TypeReference { name, .. } = dt else {
+        return None;
+    };
+    let bare = &name.name.name;
+    let key = match name.scopes.as_slice() {
+        [] if elab.shadowed_nettypes.contains(bare) => return None,
+        [] => bare.clone(),
+        [pkg] => format!("{}::{}", pkg.name.name, bare),
+        _ => return None,
+    };
+    elab.nettype_resolvers.contains_key(&key).then_some(key)
 }
 
 /// The user-defined nettype (§6.6.7) `name` is declared with, if any: its
