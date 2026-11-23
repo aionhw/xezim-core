@@ -655,42 +655,35 @@ impl<'a> Binder<'a> {
         } else {
             self.resolve(&first.name.name, h.path.len() == 1)
         };
-        // §23.6, §23.8: a path headed by the name of a top-level module that
-        // nothing here declares starts at that top-level instance. A
-        // top-level instance's items carry no prefix in the flattened
-        // design, and the spelling with the module name reached them only on
-        // some paths (a store through an instance array never landed, an
-        // element store in a loop kept one bit). In the top-level module
-        // itself, a path to one of its own items is that item's path; from
-        // anywhere else it is spelled `$root.<top>.…`.
+        // §23.6, §23.8: top-level items have no top-name prefix in the
+        // flattened design. In another definition, preserve the absolute
+        // path explicitly so it wins over the executing instance's scope.
         let mut outcome = outcome;
-        if lexical
-            && !self.callee
-            && h.path.len() >= 2
-            && first.selects.is_empty()
-            && outcome == Outcome::None(Hide::Qualified)
-            && self.names.tops.contains(first.name.name.as_str())
-            && !self.names.packages.contains_key(first.name.name.as_str())
-        {
-            let own = (first.name.name == self.tree.def)
-                .then(|| self.resolve(&h.path[1].name.name, h.path.len() == 2))
-                .filter(|o| {
-                    matches!(o, Outcome::Decl(d)
-                        if self.tree.decls[d.0 as usize].scope == self.tree.root)
-                });
-            match own {
-                Some(o) => {
-                    h.path.remove(0);
+        if !self.callee && outcome == Outcome::None(Hide::Qualified) {
+            let explicit = usize::from(first.name.name == "$root");
+            if (lexical || explicit != 0)
+                && h.path.len() >= explicit + 2
+                && let Some(top) = h.path.get(explicit)
+                && top.selects.is_empty()
+                && self.names.tops.contains(top.name.name.as_str())
+                && (explicit != 0 || !self.names.packages.contains_key(top.name.name.as_str()))
+            {
+                let member = &h.path[explicit + 1].name.name;
+                let own = (top.name.name == self.tree.def)
+                    .then(|| self.resolve(member, h.path.len() == explicit + 2))
+                    .filter(|o| matches!(o, Outcome::Decl(d)
+                        if self.tree.decls[d.0 as usize].scope == self.tree.root));
+                if let Some(o) = own {
+                    h.path.drain(..=explicit);
                     outcome = o;
-                }
-                None => {
+                } else if explicit == 0 {
                     let mut root = first.clone();
                     root.name.name = "$root".to_string();
                     h.path.insert(0, root);
                 }
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
             }
-            h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
-            h.cached_resolved_name = crate::ast::cache::NameCache::new();
         }
         let Some(first) = h.path.first() else { return };
         let bound = match outcome {
@@ -1881,7 +1874,74 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// §23.6: a dotted path can parse as member and index expressions.
+    /// Fold only paths that start at a known top instance. Indexes below
+    /// the final member stay ordinary select expressions in `expr`.
+    fn top_member_path(&self, e: &Expression) -> Option<HierarchicalIdentifier> {
+        fn collect<'a>(
+            e: &'a Expression,
+            tail: &mut Vec<Result<&'a Identifier, &'a Expression>>,
+        ) -> Option<&'a HierarchicalIdentifier> {
+            match &e.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    tail.push(Ok(member));
+                    collect(expr, tail)
+                }
+                ExprKind::Index { expr, index } => {
+                    tail.push(Err(index));
+                    collect(expr, tail)
+                }
+                ExprKind::Ident(h) => Some(h),
+                _ => None,
+            }
+        }
+        let mut tail = Vec::new();
+        let base = collect(e, &mut tail)?;
+        let head = base.path.first()?;
+        if base.root.is_some() || !head.selects.is_empty() {
+            return None;
+        }
+        let explicit = head.name.name == "$root";
+        let top = if explicit {
+            base.path.get(1).map(|seg| &seg.name).or_else(|| match tail.last()? {
+                Ok(id) => Some(*id),
+                Err(_) => None,
+            })?
+        } else {
+            &head.name
+        };
+        if !self.names.tops.contains(top.name.as_str())
+            || (!explicit && (self.names.packages.contains_key(top.name.as_str())
+                || self.resolve(&top.name, false) != Outcome::None(Hide::Qualified)))
+        {
+            return None;
+        }
+        let mut path = base.path.clone();
+        for step in tail.into_iter().rev() {
+            match step {
+                Ok(name) => path.push(crate::ast::expr::HierPathSegment {
+                    name: name.clone(),
+                    selects: Vec::new(),
+                }),
+                Err(index) => path.last_mut()?.selects.push(index.clone()),
+            }
+        }
+        Some(HierarchicalIdentifier {
+            path,
+            root: None,
+            span: e.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: Bound::UNSET,
+        })
+    }
+
     fn expr(&mut self, e: &mut Expression) {
+        if !self.callee && matches!(e.kind, ExprKind::MemberAccess { .. })
+            && let Some(path) = self.top_member_path(e)
+        {
+            e.kind = ExprKind::Ident(path);
+        }
         match &mut e.kind {
             ExprKind::Number(_)
             | ExprKind::StringLiteral(_)
