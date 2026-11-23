@@ -675,7 +675,13 @@ impl<'a> Binder<'a> {
                         if self.tree.decls[d.0 as usize].scope == self.tree.root));
                 if let Some(o) = own {
                     h.path.drain(..=explicit);
-                    outcome = o;
+                    if explicit == 0 {
+                        outcome = o;
+                    } else {
+                        // Keep the absolute binding when dropping the
+                        // already known top from the storage path.
+                        h.root = Some("$root".to_string());
+                    }
                 } else if explicit == 0 {
                     let mut root = first.clone();
                     root.name.name = "$root".to_string();
