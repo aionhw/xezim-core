@@ -4047,7 +4047,7 @@ fn parse_and_elaborate(
     elab_phase("inline instantiations", &mut phase_t);
     // §26.3: a bare `$unit` enum member that a package also declares reads
     // the `$unit` value at run time, not the last package registered.
-    elaborate::reassert_unit_enum_members(&mut elab, &def_refs);
+    elaborate::reassert_unit_enum_members(&mut elab);
     // Re-register any compilation-unit-scope CLASS whose name a module
     // clobbered in `definitions`/`def_refs` (§3.13 class/module name-space
     // coexistence). `inline_instantiations` could not see it because the

@@ -448,6 +448,36 @@ pub(super) fn process_local_typedef(td: &TypedefDeclaration, elab: &mut Elaborat
     LOCAL_TYPEDEF.with(|c| c.set(prev));
 }
 
+/// §26.3, §3.12.1, §6.19: the bare-name entries of the `$unit` enum members
+/// that a package also declares, as the `$unit` typedefs just registered them.
+pub(super) fn contested_unit_member_slots(
+    defs: &HashMap<String, Definition>,
+    elab: &ElaboratedModule,
+) -> Vec<(String, Value, Signal)> {
+    if !crate::pkg_scope::any_member_qualified() {
+        return Vec::new();
+    }
+    let mut slots = Vec::new();
+    for td in ordered_typedefs(defs) {
+        let DataType::Enum(et) = &td.data_type else {
+            continue;
+        };
+        for member in &et.members {
+            for nm in enum_member_names(member, &elab.parameters) {
+                if !crate::pkg_scope::member_is_qualified(&nm) {
+                    continue;
+                }
+                if let (Some(v), Some(sig)) =
+                    (elab.parameters.get(&nm), elab.signals.get(nm.as_str()))
+                {
+                    slots.push((nm.clone(), v.clone(), sig.clone()));
+                }
+            }
+        }
+    }
+    slots
+}
+
 /// §26.3, §3.12.1, §6.19: put each `$unit` enum member that a package also
 /// declares back under its bare name once the design is elaborated.
 ///
@@ -457,27 +487,20 @@ pub(super) fn process_local_typedef(td: &TypedefDeclaration, elab: &mut Elaborat
 /// `$unit` typedefs. `pkg_scope` has already spelled each run-time reference
 /// to a package's member `pkg::NAME` wherever the package's declaration is
 /// the one in scope, so a bare run-time reference that is left names the
-/// `$unit` member. A member the top module declares itself displaces the
-/// `$unit` one as it does a package's, so `process_typedef` leaves it.
-/// Constant contexts were evaluated during elaboration and keep what they
-/// read then. Without this, the testbench package's `EEW8 = 8` replaced the
-/// RTL's `$unit` `EEW8 = 2`, which a 3-bit `EEW_e` truncates to `EEW_NONE`.
-pub fn reassert_unit_enum_members(elab: &mut ElaboratedModule, defs: &HashMap<String, Definition>) {
-    if !crate::pkg_scope::any_member_qualified() {
-        return;
-    }
-    for td in ordered_typedefs(defs) {
-        let DataType::Enum(et) = &td.data_type else {
+/// `$unit` member. Only those members' parameter and signal entries are put
+/// back, from `unit_member_slots`; the typedef tables, other members and a
+/// member the top module declares itself (which displaces the `$unit` one as
+/// it does a package's) are left as they are. Constant contexts were
+/// evaluated during elaboration and keep what they read then. Without this,
+/// the testbench package's `EEW8 = 8` replaced the RTL's `$unit` `EEW8 = 2`,
+/// which a 3-bit `EEW_e` truncates to `EEW_NONE`.
+pub fn reassert_unit_enum_members(elab: &mut ElaboratedModule) {
+    for (nm, v, sig) in std::mem::take(&mut elab.unit_member_slots) {
+        if elab.local_decl_displaces(&nm) {
             continue;
-        };
-        let contested = et.members.iter().any(|m| {
-            enum_member_names(m, &elab.parameters)
-                .iter()
-                .any(|n| crate::pkg_scope::member_is_qualified(n))
-        });
-        if contested {
-            process_typedef(td, elab);
         }
+        elab.set_param(line!(), nm.clone(), v);
+        signals_insert_traced(&mut elab.signals, line!(), nm, sig);
     }
 }
 

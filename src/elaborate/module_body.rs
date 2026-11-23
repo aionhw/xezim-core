@@ -251,6 +251,7 @@ pub fn elaborate_module_with_defs(
         for td in ordered_typedefs(defs) {
             process_typedef(td, &mut elab);
         }
+        elab.unit_member_slots = contested_unit_member_slots(defs, &elab);
         let unit_types: HashMap<String, DataType> = ordered_typedefs(defs)
             .into_iter()
             .filter_map(|td| {
