@@ -1,9 +1,10 @@
 //! IEEE 1800-2023 §11.4.13 and §12.5.4: both set membership forms
-//! parse the same tolerance bounds.
+//! parse the same tolerance bounds. Each bound is a `$__xz_tolerance`
+//! call, which evaluation computes from the operand types.
 
 use sv_parser::ast::Description;
 use sv_parser::ast::decl::ModuleItem;
-use sv_parser::ast::expr::{BinaryOp, ExprKind, Expression};
+use sv_parser::ast::expr::{ExprKind, Expression, NumberLiteral, TOLERANCE_BOUND_FN};
 use sv_parser::ast::stmt::{CaseKind, StatementKind};
 
 const SOURCE: &str = r#"
@@ -28,15 +29,22 @@ module top;
 endmodule
 "#;
 
-fn bound_ops(range: &Expression) -> (BinaryOp, BinaryOp) {
+/// The modes of a tolerance range's two bound calls: 0/1 for `+/-`, 2/3 for
+/// `+%-`.
+fn bound_ops(range: &Expression) -> (String, String) {
     let ExprKind::Range(lo, hi) = &range.kind else {
         panic!("expected a range");
     };
-    let (ExprKind::Binary { op: lo, .. }, ExprKind::Binary { op: hi, .. }) = (&lo.kind, &hi.kind)
-    else {
-        panic!("expected arithmetic bounds");
+    let mode = |e: &Expression| match &e.kind {
+        ExprKind::SystemCall { name, args } if name == TOLERANCE_BOUND_FN && args.len() == 3 => {
+            match &args[2].kind {
+                ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.to_string(),
+                _ => panic!("expected a literal mode"),
+            }
+        }
+        _ => panic!("expected a tolerance bound"),
     };
-    (*lo, *hi)
+    (mode(lo), mode(hi))
 }
 
 #[test]
@@ -74,8 +82,8 @@ fn tolerance_case_items_share_inside_range_lowering() {
     assert_eq!(patterns.len(), 3);
     assert_eq!(ranges.len(), 2);
     assert!(items[1].is_default);
-    assert_eq!(bound_ops(&patterns[0]), (BinaryOp::Sub, BinaryOp::Add));
-    assert_eq!(bound_ops(&patterns[1]), (BinaryOp::Div, BinaryOp::Div));
+    assert_eq!(bound_ops(&patterns[0]), ("0".into(), "1".into()));
+    assert_eq!(bound_ops(&patterns[1]), ("2".into(), "3".into()));
     for (pattern, range) in patterns.iter().zip(ranges) {
         assert_eq!(bound_ops(pattern), bound_ops(range));
     }
