@@ -669,7 +669,9 @@ impl<'a> Binder<'a> {
                 && (explicit != 0 || !self.names.packages.contains_key(top.name.name.as_str()))
             {
                 let member = &h.path[explicit + 1].name.name;
-                let own = (top.name.name == self.tree.def)
+                let has_indexed_scope = h.path[explicit + 1..h.path.len() - 1]
+                    .iter().any(|segment| !segment.selects.is_empty());
+                let own = (top.name.name == self.tree.def && !has_indexed_scope)
                     .then(|| self.resolve(member, h.path.len() == explicit + 2))
                     .filter(|o| matches!(o, Outcome::Decl(d)
                         if self.tree.decls[d.0 as usize].scope == self.tree.root));
