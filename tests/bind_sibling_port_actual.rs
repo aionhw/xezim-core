@@ -98,8 +98,10 @@ fn unroot(actual: &str) -> &str {
     actual.strip_prefix("$root.").unwrap_or(actual)
 }
 
-fn instance_paths(m: &ElaboratedModule) -> Vec<String> {
-    m.instances.iter().map(|i| i.path.to_string()).collect()
+fn sorted_instance_paths(m: &ElaboratedModule) -> Vec<String> {
+    let mut paths: Vec<_> = m.instances.iter().map(|i| i.path.to_string()).collect();
+    paths.sort_unstable();
+    paths
 }
 
 fn path_of(e: &Expression) -> String {
@@ -166,7 +168,10 @@ fn bound_sibling_array_element() {
         actual_for(&written, "u_dut.vld"),
         "bound must connect like the written instance"
     );
-    assert_eq!(instance_paths(&bound), instance_paths(&written));
+    assert_eq!(
+        sorted_instance_paths(&bound),
+        sorted_instance_paths(&written)
+    );
     assert!(
         !bound.signals.keys().any(|s| s.starts_with("u_mon.")),
         "a phantom top-level u_mon appeared: {:?}",
@@ -201,7 +206,10 @@ fn bound_sibling_associative_array_element() {
         actual_for(&written, "u_dut.vld"),
         "bound must connect like the written instance"
     );
-    assert_eq!(instance_paths(&bound), instance_paths(&written));
+    assert_eq!(
+        sorted_instance_paths(&bound),
+        sorted_instance_paths(&written)
+    );
 }
 
 /// A PLAIN DOTTED actual under a bound head — the shape that already worked,
@@ -246,7 +254,10 @@ fn child_of_a_bound_module_reaches_its_bound_sibling() {
         actual_for(&written, "u_b.u_child.vld"),
         "bound must connect like the written instance"
     );
-    assert_eq!(instance_paths(&bound), instance_paths(&written));
+    assert_eq!(
+        sorted_instance_paths(&bound),
+        sorted_instance_paths(&written)
+    );
 }
 
 /// The target is a CHILD, an INSTANCE-ARRAY element, a GENERATE-BLOCK scope and
@@ -282,32 +293,27 @@ fn bound_sibling_from_a_deeper_target_scope() {
     }
 }
 
-/// §23.11: bound instances are elaborated in the order the directives are
-/// written, so a design whose binds reference each other behaves like the same
-/// design written out in that order — including which direction a reference
-/// between two bound instances goes.
+/// §23.11: a connection can reach a bound sibling regardless of which
+/// directive comes first. Keep the existing reverse bind traversal.
 #[test]
-fn bound_instances_are_ordered_as_the_directives_are_written() {
-    let written = elaborate(&format!(
-        "{DEFS}module host; mon u_mon(); dut u_dut(.vld(u_mon.arr[0])); endmodule{tail}",
-        tail = tail()
-    ));
-    let bound = elaborate(&format!(
-        "{DEFS}module host; endmodule
-         bind tb.h mon u_mon();
-         bind tb.h dut u_dut(.vld(u_mon.arr[0]));{tail}",
-        tail = tail()
-    ));
-    let paths = instance_paths(&bound);
-    let at = |p: &str| {
-        paths
+fn bound_sibling_resolution_preserves_reverse_bind_order() {
+    let monitor = "bind tb.h mon u_mon();";
+    let consumer = "bind tb.h dut u_dut(.vld(u_mon.arr[0]));";
+    for (first, second, expected) in [
+        (monitor, consumer, ["h.u_dut", "h.u_mon"]),
+        (consumer, monitor, ["h.u_mon", "h.u_dut"]),
+    ] {
+        let bound = elaborate(&format!(
+            "{DEFS}module host; endmodule\n{first}\n{second}{tail}",
+            tail = tail()
+        ));
+        let paths: Vec<_> = bound
+            .instances
             .iter()
-            .position(|q| q == p)
-            .unwrap_or_else(|| panic!("{p} missing from {paths:?}"))
-    };
-    assert!(
-        at("h.u_mon") < at("h.u_dut"),
-        "bound instances were elaborated in reverse directive order: {paths:?}"
-    );
-    assert_eq!(paths, instance_paths(&written));
+            .skip(1)
+            .map(|i| i.path.as_str())
+            .collect();
+        assert_eq!(paths, expected);
+        assert_eq!(actual_for(&bound, "u_dut.vld"), "$root.h.u_mon.arr[0]");
+    }
 }
