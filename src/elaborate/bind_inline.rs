@@ -831,6 +831,7 @@ pub(super) fn inline_bound_items(
 
     let mut bound: Vec<ModuleItem> = directives
         .iter()
+        .rev()
         .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
         .collect();
     let has_arrays = has_instance_arrays(&bound);
@@ -1142,6 +1143,7 @@ pub(super) fn inline_module_items(
         let prepared = Rc::make_mut(&mut prepared_source);
         let mut bound: Vec<ModuleItem> = binds
             .iter()
+            .rev()
             .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
             .collect();
         // §23.11, §23.3.2: a bound array of instances is expanded like one
