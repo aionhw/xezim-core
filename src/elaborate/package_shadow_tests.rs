@@ -3,12 +3,7 @@
 
 use super::*;
 
-fn shadows(
-    source: &str,
-) -> (
-    std::collections::HashSet<String>,
-    std::collections::HashSet<String>,
-) {
+fn shadows(source: &str) -> (HashSet<String>, HashSet<String>) {
     let parsed = crate::parse(source);
     assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
     let mut defs = HashMap::default();

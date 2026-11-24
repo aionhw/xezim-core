@@ -297,12 +297,10 @@ pub fn elaborate_module_with_defs(
     // §26.3: names a wildcard import brings in that are ALSO declared locally
     // — the local declaration shadows the imported one (no duplicate error).
     if let Some(defs) = all_defs {
-        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), module.params(), defs)
-            .into_iter()
-            .collect();
-        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs)
-            .into_iter()
-            .collect();
+        // These sets are serialized. Retain the deterministic insertion
+        // order instead of rebuilding them from a randomly seeded set.
+        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), module.params(), defs);
+        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs);
     }
     // §26.3: an explicit import conflicts with a header declaration;
     // unlike a wildcard import, it cannot be displaced by that declaration.

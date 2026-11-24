@@ -58,7 +58,7 @@ pub(super) fn stmt_contains_nonblocking(s: &Statement) -> bool {
 pub(super) fn compute_foreign_package_names(
     items: &[ModuleItem],
     defs: &HashMap<String, Definition>,
-) -> std::collections::HashSet<String> {
+) -> HashSet<String> {
     // Any mention of a package in an import — wildcard or explicit — makes its
     // names legitimately visible here, and a collision with one of those is a
     // real conflict (or, for a wildcard, a legal shadow handled separately).
@@ -84,10 +84,10 @@ pub(super) fn compute_foreign_package_names(
     if !defs.iter().any(|(name, def)| {
         matches!(def, Definition::Package(_)) && !imported.contains(name.as_str())
     }) {
-        return std::collections::HashSet::default();
+        return HashSet::default();
     }
     let local = collect_local_scope_names(items);
-    let mut out = std::collections::HashSet::default();
+    let mut out = HashSet::default();
     for (pkg_name, def) in defs {
         if imported.contains(pkg_name.as_str()) {
             continue;
@@ -196,13 +196,13 @@ pub(super) fn compute_wildcard_shadowed(
     items: &[ModuleItem],
     params: &[ParameterDeclaration],
     defs: &HashMap<String, Definition>,
-) -> std::collections::HashSet<String> {
+) -> HashSet<String> {
     // With no wildcard import, there is no imported name to shadow. In
     // particular, explicit imports follow a different conflict rule (§26.3).
     if !items.iter().any(|item| matches!(item,
         ModuleItem::ImportDeclaration(imp) if imp.items.iter().any(|ii| ii.item.is_none())))
     {
-        return std::collections::HashSet::default();
+        return HashSet::default();
     }
     // §26.3 ordering rule: a local declaration only legally SHADOWS a
     // wildcard-imported name if it precedes any use of that name. A name that a
@@ -237,7 +237,7 @@ pub(super) fn compute_wildcard_shadowed(
             }
         }
     }
-    let mut out = std::collections::HashSet::default();
+    let mut out = HashSet::default();
     for item in items {
         if let ModuleItem::ImportDeclaration(imp) = item {
             for ii in &imp.items {
