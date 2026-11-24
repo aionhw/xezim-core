@@ -287,10 +287,9 @@ pub fn concat_array_assign_parts(
                     rhs_elems.push(item.clone());
                 }
             }
-            ExprKind::Concatenation(_)
-            | ExprKind::Replication { .. }
-            | ExprKind::AssignmentPattern(_)
-            | ExprKind::MemberAccess { .. } => return None,
+            ExprKind::AssignmentPattern(_) | ExprKind::MemberAccess { .. } => return None,
+            // §10.10.3: nested braces are a self-determined concatenation
+            // evaluated as one element, just like other scalar expressions.
             _ => rhs_elems.push(item.clone()),
         }
     }
