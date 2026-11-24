@@ -6226,7 +6226,7 @@ pub(super) fn inline_instantiation_items(
                 // §13.3/#721: only callable signatures need these literal
                 // expressions. Empty instances must not copy every ancestor's
                 // parameters into another retained map at each hierarchy level.
-                let param_expr_map: HashMap<String, Expression> = if prepared_sub.has_subroutines {
+                let mut param_expr_map: HashMap<String, Expression> = if prepared_sub.has_subroutines {
                     sub_merged_params
                         .iter()
                         .filter_map(|(k, v)| {
@@ -6256,6 +6256,14 @@ pub(super) fn inline_instantiation_items(
                 } else {
                     HashMap::default()
                 };
+                let member_replacements: Vec<_> = param_expr_map
+                    .iter()
+                    .filter(|(name, _)| name.contains('.'))
+                    .map(|(name, expr)| {
+                        (format!("{}{name}", expr_rewrite::PARAM_MEMBER_KEY_PREFIX), expr.clone())
+                    })
+                    .collect();
+                param_expr_map.extend(member_replacements);
                 let no_local: std::collections::HashSet<String> =
                     std::collections::HashSet::default();
                 let no_iface: HashMap<String, String> = HashMap::default();
