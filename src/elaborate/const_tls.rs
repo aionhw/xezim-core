@@ -123,6 +123,9 @@ thread_local! {
     /// every call site. Maps `name → (lo, hi, ndim)`.
     pub(super) static ARRAYS_TLS: std::cell::RefCell<Option<HashMap<String, (i64, i64, u32)>>>
         = const { std::cell::RefCell::new(None) };
+    // Fixed-size live variables supplied by the procedural declaration evaluator.
+    static QUERY_WIDTHS_TLS: std::cell::RefCell<HashMap<String, u32>>
+        = std::cell::RefCell::new(HashMap::default());
     /// Const-eval support for struct-member select `s.field` (IEEE 1800-2017
     /// §7.2.1): packed-struct field layout `name → [(field, lsb_offset, width)]`,
     /// mirroring `ElaboratedModule.packed_struct_fields`. Lets `eval_const_expr_val`
@@ -1197,6 +1200,22 @@ fn bits_of_signal_expr(
     struct_fields: &crate::shared_names::SharedSliceMap<(String, u32, u32)>,
     arrays: &HashMap<String, (i64, i64, u32)>,
 ) -> Option<u32> {
+    // §20.6.2: a concatenation's width is the sum of its operands.
+    // Instance-port substitution can leave operands named by their stored
+    // signals or replaced by literals, so check both sources of width.
+    if let ExprKind::Concatenation(parts) = &arg.kind {
+        return parts.iter().try_fold(0u32, |total, part| {
+            let width = decl_select_bits(part, Some(params))
+                .and_then(|bits| u32::try_from(bits).ok())
+                .or_else(|| {
+                    bits_of_signal_expr(
+                        part, signals, params, prefix, typedefs, typedef_types, struct_fields, arrays,
+                    )
+                })
+                .or_else(|| const_self_width(part, params))?;
+            total.checked_add(width)
+        });
+    }
     // `$signed`/`$unsigned` are width-preserving wrappers.
     if let ExprKind::SystemCall { name, args } = &arg.kind {
         if (name == "$unsigned" || name == "$signed") && args.len() == 1 {
@@ -1368,6 +1387,25 @@ pub(super) fn with_typedefs_owned<R>(typedefs: HashMap<String, u32>, f: impl FnO
     TYPEDEFS_TLS.with(|td| *td.borrow_mut() = prev);
     TYPEDEFS_TLS_MIRROR.with(|m| m.set(prev_mirror));
     r
+}
+
+/// Make the widths of fixed-size procedural variables available to `$bits`.
+pub fn with_query_widths<R>(widths: HashMap<String, u32>, f: impl FnOnce() -> R) -> R {
+    struct Restore(HashMap<String, u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUERY_WIDTHS_TLS.with(|w| w.replace(std::mem::take(&mut self.0)));
+        }
+    }
+    let _restore = Restore(QUERY_WIDTHS_TLS.with(|w| w.replace(widths)));
+    f()
+}
+
+pub(super) fn live_query_width(hier: &HierarchicalIdentifier) -> Option<u32> {
+    if hier.path.len() != 1 || hier.root.is_some() || !hier.path[0].selects.is_empty() {
+        return None;
+    }
+    QUERY_WIDTHS_TLS.with(|widths| widths.borrow().get(&hier.path[0].name.name).copied())
 }
 
 /// LRM §20.7 — install the array-range table for the duration of `f`.

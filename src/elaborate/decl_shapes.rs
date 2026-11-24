@@ -764,9 +764,14 @@ fn collect_decl_shapes(
     let mut m: HashMap<String, StoredDeclShape> = HashMap::default();
     if let PortList::Ansi(ps) = ports {
         for p in ps {
-            if let Some(dt) = &p.data_type
-                && decl_shape_is_fixed(dt, &p.dimensions)
-            {
+            // §23.2.2.3: an untyped ANSI port has an implicit logic type.
+            let implicit = DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: p.span,
+            };
+            let dt = p.data_type.as_ref().unwrap_or(&implicit);
+            if decl_shape_is_fixed(dt, &p.dimensions) {
                 m.entry(p.name.name.clone()).or_insert_with(|| {
                     StoredDeclShape::new(dt, &p.dimensions, by_type_param(dt), false)
                 });

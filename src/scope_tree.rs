@@ -802,6 +802,10 @@ pub fn build_design(descs: &mut [Description]) {
 /// and keep its tree: a reader of its bindings needs it as for any other.
 pub fn adopt(def: &mut crate::SourceDefinition) {
     use crate::SourceDefinition as D;
+    if let D::Package(package) = def {
+        DESIGN_NAMES.with(|n| Rc::make_mut(&mut n.borrow_mut()).register_package(package));
+        return;
+    }
     let mut trees = Vec::new();
     let names = DESIGN_NAMES.with(|n| n.borrow().clone());
     let audit = bind::audit_enabled();

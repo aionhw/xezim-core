@@ -866,10 +866,10 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                     }
                     ExprKind::Ident(hier) => {
                         let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                        // First try parameter ident → its Value width.
-                        params
-                            .and_then(|p| p.get(name))
-                            .map(|v| v.width as i64)
+                        // §20.6.2: a live local shadows a same-named constant.
+                        live_query_width(hier)
+                            .or_else(|| params.and_then(|p| p.get(name)).map(|v| v.width))
+                            .map(i64::from)
                             // §20.6.2: a declared variable of this scope, sized
                             // from its declared type (every unpacked dimension
                             // included), then a typedef with unpacked dimensions.
@@ -1054,8 +1054,9 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                                             n
                                         )
                                     });
-                                    params
-                                        .and_then(|m| m.get(n).map(|v| v.width as i64))
+                                    live_query_width(hier)
+                                        .or_else(|| params.and_then(|m| m.get(n)).map(|v| v.width))
+                                        .map(i64::from)
                                         .or_else(|| {
                                             TYPEDEFS_TLS.with(|td| {
                                                 let b = td.borrow();

@@ -453,9 +453,8 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     // one global slot a same-named typedef elsewhere can own.
                     let scoped = (hier.path.len() >= 2)
                         .then(|| format!("{}::{}", hier.path[hier.path.len() - 2].name.name, n));
-                    params
-                        .get(n)
-                        .map(|v| v.width)
+                    live_query_width(hier)
+                        .or_else(|| params.get(n).map(|v| v.width))
                         // §20.6.2: a declared variable of this scope, then a
                         // typedef with unpacked dimensions — see the matching
                         // arm in `const_eval_i64_with_params`.

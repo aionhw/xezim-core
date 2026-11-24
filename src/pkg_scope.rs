@@ -1619,11 +1619,11 @@ impl Rw<'_> {
     /// `$unit`) declare it. All of them share one flat table keyed by the
     /// bare name, where the last package registered wins, so the reference
     /// is spelled `pkg::n`, the qualified lookup.
-    fn resolve_value(&self, n: &str) -> Option<String> {
+    fn resolve_value(&self, n: &str) -> Result<Option<String>, Vec<String>> {
         let member = self.info.colliding_members.contains(n);
         let colliding = member || self.info.colliding_values.contains(n);
         if !colliding && (self.in_const == 0 || !self.info.pkg_params.contains(n)) {
-            return None;
+            return Ok(None);
         }
         // §26.3: enum members and other values compete at the same lexical scope.
         let owner = |q: &str| {
@@ -1644,7 +1644,7 @@ impl Rw<'_> {
                         .get(p)
                         .is_some_and(|pi| pi.members.contains(n))
                 {
-                    return (self.in_const == 0).then(|| p.clone());
+                    return Ok((self.in_const == 0).then(|| p.clone()));
                 }
                 if self
                     .info
@@ -1656,8 +1656,10 @@ impl Rw<'_> {
                     // classes keep the package's value, which is bound by
                     // its bare name only while the package registers, and
                     // which a module may shadow in the flattened design.
-                    return (self.info.pkgs[p].params.contains(n) && (colliding || depth > 0))
-                        .then(|| p.clone());
+                    return Ok(
+                        (self.info.pkgs[p].params.contains(n) && (colliding || depth > 0))
+                            .then(|| p.clone()),
+                    );
                 }
             }
             let inherited = f.inherits
@@ -1669,13 +1671,13 @@ impl Rw<'_> {
                             .is_none_or(|ci| ci.values.contains(n))
                     }));
             if f.values.contains(n) || inherited {
-                return None;
+                return Ok(None);
             }
             if !colliding && (f.pkg.is_none() || depth == 0) {
                 continue;
             }
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
-                return owner(q);
+                return Ok(owner(q));
             }
             let cands: BTreeSet<String> = f
                 .wild
@@ -1687,11 +1689,11 @@ impl Rw<'_> {
             }
             match cands.len() {
                 0 => {}
-                1 => return cands.into_iter().next(),
-                _ => return None,
+                1 => return Ok(cands.into_iter().next()),
+                _ => return Err(cands.into_iter().collect()),
             }
         }
-        None
+        Ok(None)
     }
 
     /// The renamed storage `pkg::n` of the package variable a bare `n`
@@ -1764,11 +1766,11 @@ impl Rw<'_> {
 
     /// `n` (a bare identifier) rewritten to `pkg::n` when it names a
     /// colliding package value (see `resolve_value`).
-    fn qualify_value(&self, e: &mut Expression) -> bool {
+    fn qualify_value(&mut self, e: &mut Expression) -> bool {
         let Some(n) = plain_ident(e) else {
             return false;
         };
-        let Some(p) = self.resolve_value(n) else {
+        let Some(p) = self.resolve_value_with_diagnostic(n) else {
             return false;
         };
         let span = e.span;
@@ -1969,14 +1971,28 @@ impl Rw<'_> {
         self.info.pkgs.contains_key(n) && !self.value_shadowed(n)
     }
 
-    fn ambiguous(&mut self, n: &str, pkgs: &[String]) {
+    fn resolve_value_with_diagnostic(&mut self, n: &str) -> Option<String> {
+        match self.resolve_value(n) {
+            Ok(owner) => owner,
+            Err(packages) => {
+                self.ambiguous("name", n, &packages);
+                None
+            }
+        }
+    }
+
+    fn ambiguous(&mut self, kind: &str, n: &str, pkgs: &[String]) {
         let list: Vec<String> = pkgs.iter().map(|p| format!("'{}'", p)).collect();
+        let scope = self.frames.iter().rev()
+            .find_map(|f| f.cls.as_deref().or(f.module.as_deref()).or(f.pkg.as_deref()))
+            .unwrap_or("$unit");
         self.errors.push(format!(
-            "type '{}' is declared by more than one wildcard-imported package ({}), so it \
-             is not visible here; import it explicitly or qualify it (`{}::{}`) \
-             (IEEE 1800-2017 §26.3)",
+            "{kind} '{}' is declared by more than one wildcard-imported package ({}), so it \
+             is not visible in scope '{}'; import it explicitly or qualify it (`{}::{}`) \
+             (IEEE 1800-2023 §26.3)",
             n,
             list.join(", "),
+            scope,
             pkgs[0],
             n
         ));
@@ -1989,7 +2005,7 @@ impl Rw<'_> {
             Res::To(m) => id.name = m,
             Res::Ambiguous(c) => {
                 let n = id.name.clone();
-                self.ambiguous(&n, &c);
+                self.ambiguous("type", &n, &c);
             }
         }
     }
@@ -2213,7 +2229,7 @@ impl Rw<'_> {
         {
             return None;
         }
-        let pkg = self.resolve_value(n)?;
+        let pkg = self.resolve_value(n).ok().flatten()?;
         let member = crate::ast::Identifier {
             name: n.to_string(),
             span: name.name.span,
@@ -2353,7 +2369,7 @@ impl Rw<'_> {
                         if let Res::To(m) = self.resolve(n) {
                             h.path[0].name.name = m;
                         }
-                    } else if let Some(p) = self.resolve_value(n) {
+                    } else if let Some(p) = self.resolve_value_with_diagnostic(n) {
                         let span = e.span;
                         let member = h.path[0].name.clone();
                         *e = Expression::new(
@@ -2427,6 +2443,16 @@ impl Rw<'_> {
                 }
             }
             ExprKind::SystemCall { name, args } => {
+                // §6.24.1, §26.3: a named cast's target can be a type or a
+                // size expression. Report ambiguous imported types while the
+                // lexical import context is still available.
+                if name == "$__xz_named_cast"
+                    && let Some(n) = args.first().and_then(plain_ident)
+                    && !self.value_shadowed(n)
+                    && let Res::Ambiguous(pkgs) = self.resolve(n)
+                {
+                    self.ambiguous("type", n, &pkgs);
+                }
                 args.iter_mut().for_each(|a| self.expr(a));
                 if name == "$__xz_named_cast"
                     && let Some(target) = args.first_mut()
