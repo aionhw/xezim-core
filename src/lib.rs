@@ -306,7 +306,9 @@ pub use value::Value;
 /// \x6D stores sparse SVA metadata (#721): `sequences` holds only bodyless sequence/property and
 ///         checker names (declarations with bodies live in `property_decls`), and
 ///         `property_params` omits portless declarations.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6D";
+/// \x6E boxes rare `ContinuousAssignment` origin and multi-delay metadata (#721) and encodes
+///         `HierarchicalIdentifier::root` as `HierRoot`.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6E";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -4501,12 +4503,12 @@ impl<'a> IncrementalBindResolver<'a> {
             list.push(String::new());
         }
         for inst in &elab.instances[self.indexed_instances..] {
-            self.host_paths.insert(inst.path.clone());
-            let list = self.hosts_of.entry(inst.def_name.clone()).or_default();
+            self.host_paths.insert(inst.path.to_string());
+            let list = self.hosts_of.entry(inst.def_name.to_string()).or_default();
             new_hosts_start
                 .entry(inst.def_name.as_str())
                 .or_insert(list.len());
-            list.push(inst.path.clone());
+            list.push(inst.path.to_string());
         }
         self.indexed_instances = elab.instances.len();
 
@@ -4704,7 +4706,7 @@ fn resolve_instance_binds(
     host_paths.insert(String::new());
     hosts_of.entry(elab.name.as_str()).or_default().push("");
     for i in &elab.instances {
-        host_paths.insert(i.path.clone());
+        host_paths.insert(i.path.to_string());
         hosts_of
             .entry(i.def_name.as_str())
             .or_default()

@@ -13,7 +13,7 @@ fn range_path(path: &str) -> Option<(&str, i64, i64)> {
 /// instance such as `actual[1:2].PARAM`.
 pub(super) fn register_views(
     bindings: &mut HashMap<String, String>,
-    shapes: &HashMap<String, Vec<(i64, i64)>>,
+    shapes: &crate::shared_names::SharedSliceMap<(i64, i64)>,
     ports: &PortList,
     params: &HashMap<String, Value>,
 ) {

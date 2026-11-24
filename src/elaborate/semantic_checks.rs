@@ -177,7 +177,7 @@ pub(super) fn validate_enum_assignments(elab: &ElaboratedModule) -> Result<(), S
                     None => elab
                         .signals
                         .get(name)
-                        .and_then(|sig| sig.type_name.as_deref()),
+                        .and_then(|sig| sig.type_name.as_deref().map(String::as_str)),
                 };
                 if let Some(tname) = tname
                     && let Some(members) = elab.enum_members.get(tname)

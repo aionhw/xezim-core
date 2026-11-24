@@ -33,7 +33,7 @@ pub(super) fn rewrite_expr_impl(
                 }
                 if gen_rename_declares(bare) {
                     let mut rooted = hier.clone();
-                    rooted.root = Some("$root".to_string());
+                    rooted.root = Some(crate::ast::expr::HierRoot::Root);
                     return Expression::new(ExprKind::Ident(rooted), expr.span);
                 }
                 if !local_names.contains(hier.path[0].name.name.as_str()) {
@@ -224,7 +224,7 @@ pub(super) fn rewrite_expr_impl(
                     // grafted head too — the appended segments name FIELDS of
                     // the actual's net, so the whole path stays absolute.
                     if collides && mhier.root.is_none() {
-                        mhier.root = Some("$root".to_string());
+                        mhier.root = Some(crate::ast::expr::HierRoot::Root);
                     }
                     // Graft seg0's selects onto the mapped target's last
                     // segment, then append the trailing segments verbatim

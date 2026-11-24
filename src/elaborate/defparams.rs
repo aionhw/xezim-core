@@ -341,12 +341,12 @@ pub(super) fn scope_local_type_name(
     tn: Option<String>,
     local_typedefs: &std::collections::HashSet<String>,
     inst_prefix: &str,
-) -> Option<String> {
+) -> Option<SharedName> {
     tn.map(|t| {
         if local_typedefs.contains(&t) {
-            cat2(&inst_prefix, &t)
+            cat2(&inst_prefix, &t).into()
         } else {
-            t
+            t.into()
         }
     })
 }

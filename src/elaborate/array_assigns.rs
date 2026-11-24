@@ -32,7 +32,7 @@ pub fn whole_array_assign_parts_dir(
     delay: u64,
     arrays: &HashMap<String, (i64, i64, u32)>,
     descending: Option<&HashSet<String>>,
-    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    decl_dims: Option<&crate::shared_names::SharedSliceMap<(i64, i64)>>,
 ) -> Option<Vec<ContinuousAssignment>> {
     whole_array_assign_parts_dir_with_params(lhs, rhs, delay, arrays, descending, decl_dims, None)
 }
@@ -45,7 +45,7 @@ pub fn whole_array_assign_parts_dir_with_params(
     delay: u64,
     arrays: &HashMap<String, (i64, i64, u32)>,
     descending: Option<&HashSet<String>>,
-    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    decl_dims: Option<&crate::shared_names::SharedSliceMap<(i64, i64)>>,
     params: Option<&HashMap<String, Value>>,
 ) -> Option<Vec<ContinuousAssignment>> {
     let pattern = peel_unpacked_typed_pattern(rhs);
@@ -85,17 +85,12 @@ pub fn whole_array_assign_parts_dir_with_params(
     let (ld, rd) = (desc(ln), desc(rn));
     Some(
         (0..=n)
-            .map(|k| ContinuousAssignment {
-                gate_delay_fall: None,
-                delay_exprs: None,
-                delay_select: None,
-                origin: None,
-                lhs: index_expr(lhs.clone(), if ld { lhi - k } else { llo + k }),
-                rhs: index_expr(rhs.clone(), if rd { rhi - k } else { rlo + k }),
-                delay,
-                rhs_parent_scoped: false,
-                delay_fall: None,
-                delay_off: None,
+            .map(|k| {
+                ContinuousAssignment::with_delay(
+                    index_expr(lhs.clone(), if ld { lhi - k } else { llo + k }),
+                    index_expr(rhs.clone(), if rd { rhi - k } else { rlo + k }),
+                    delay,
+                )
             })
             .collect(),
     )
@@ -115,7 +110,7 @@ pub fn slice_array_assign_parts(
     delay: u64,
     arrays: &HashMap<String, (i64, i64, u32)>,
     descending: Option<&HashSet<String>>,
-    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    decl_dims: Option<&crate::shared_names::SharedSliceMap<(i64, i64)>>,
     params: &HashMap<String, Value>,
 ) -> Option<Vec<ContinuousAssignment>> {
     if !matches!(lhs.kind, ExprKind::RangeSelect { .. })
@@ -132,18 +127,7 @@ pub fn slice_array_assign_parts(
         lhs_elems
             .into_iter()
             .zip(rhs_elems)
-            .map(|(l, r)| ContinuousAssignment {
-                gate_delay_fall: None,
-                delay_exprs: None,
-                delay_select: None,
-                origin: None,
-                lhs: l,
-                rhs: r,
-                delay,
-                rhs_parent_scoped: false,
-                delay_fall: None,
-                delay_off: None,
-            })
+            .map(|(l, r)| ContinuousAssignment::with_delay(l, r, delay))
             .collect(),
     )
 }
@@ -154,7 +138,7 @@ pub struct UnpackedArrayTables<'a> {
     pub arrays_2d: &'a HashMap<String, ((i64, i64), (i64, i64), u32)>,
     pub arrays_nd: &'a HashMap<String, (Vec<(i64, i64)>, u32)>,
     pub descending: &'a HashSet<String>,
-    pub decl_dims: &'a HashMap<String, Vec<(i64, i64)>>,
+    pub decl_dims: &'a crate::shared_names::SharedSliceMap<(i64, i64)>,
     pub params: &'a HashMap<String, Value>,
     /// Whether a name is a dynamic array, a queue or an associative array.
     pub other_array: &'a dyn Fn(&str) -> bool,
@@ -301,18 +285,7 @@ pub fn concat_array_assign_parts(
         lhs_elems
             .into_iter()
             .zip(rhs_elems)
-            .map(|(l, r)| ContinuousAssignment {
-                delay_exprs: None,
-                gate_delay_fall: None,
-                delay_select: None,
-                origin: None,
-                lhs: l,
-                rhs: r,
-                delay,
-                rhs_parent_scoped: false,
-                delay_fall: None,
-                delay_off: None,
-            })
+            .map(|(l, r)| ContinuousAssignment::with_delay(l, r, delay))
             .collect(),
     )
 }
@@ -324,7 +297,7 @@ fn slice_side_elems(
     e: &Expression,
     arrays: &HashMap<String, (i64, i64, u32)>,
     descending: Option<&HashSet<String>>,
-    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    decl_dims: Option<&crate::shared_names::SharedSliceMap<(i64, i64)>>,
     params: &HashMap<String, Value>,
     target: bool,
 ) -> Option<Vec<Expression>> {
@@ -479,7 +452,7 @@ pub fn whole_array_row_assign_parts(
     arrays_2d: &HashMap<String, ((i64, i64), (i64, i64), u32)>,
     params: &HashMap<String, Value>,
     descending: Option<&HashSet<String>>,
-    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    decl_dims: Option<&crate::shared_names::SharedSliceMap<(i64, i64)>>,
 ) -> Option<Vec<ContinuousAssignment>> {
     let (ExprKind::Ident(lh), ExprKind::Index { expr, index }) = (&lhs.kind, &rhs.kind) else {
         return None;
@@ -517,17 +490,12 @@ pub fn whole_array_row_assign_parts(
     let (ld, rd) = (desc(ln, 0), desc(rn, 1));
     Some(
         (0..=n)
-            .map(|k| ContinuousAssignment {
-                gate_delay_fall: None,
-                delay_exprs: None,
-                delay_select: None,
-                origin: None,
-                lhs: make_index_expr(ln, if ld { lhi - k } else { llo + k }),
-                rhs: make_multi_index_expr(rn, &[row, if rd { ihi - k } else { ilo + k }]),
-                delay,
-                rhs_parent_scoped: false,
-                delay_fall: None,
-                delay_off: None,
+            .map(|k| {
+                ContinuousAssignment::with_delay(
+                    make_index_expr(ln, if ld { lhi - k } else { llo + k }),
+                    make_multi_index_expr(rn, &[row, if rd { ihi - k } else { ilo + k }]),
+                    delay,
+                )
             })
             .collect(),
     )
@@ -541,7 +509,7 @@ impl ElaboratedModule {
         lhs: &Expression,
         rhs: &Expression,
         delay: u64,
-        decl_dims: &HashMap<String, Vec<(i64, i64)>>,
+        decl_dims: &crate::shared_names::SharedSliceMap<(i64, i64)>,
     ) -> Option<Vec<ContinuousAssignment>> {
         let pattern = peel_unpacked_typed_pattern(rhs);
         if matches!(pattern.kind, ExprKind::AssignmentPattern(_)) {
@@ -585,7 +553,7 @@ fn pattern_array_assign_parts(
     delay: u64,
     arrays: &HashMap<String, (i64, i64, u32)>,
     descending: Option<&HashSet<String>>,
-    decl_dims: Option<&HashMap<String, Vec<(i64, i64)>>>,
+    decl_dims: Option<&crate::shared_names::SharedSliceMap<(i64, i64)>>,
     params: Option<&HashMap<String, Value>>,
     packed_element: Option<&DataType>,
 ) -> Option<Vec<ContinuousAssignment>> {
@@ -597,7 +565,7 @@ fn pattern_array_assign_parts(
     }
     let ln = &lh.path[0].name.name;
     let dims: Vec<(i64, i64)> = match decl_dims.and_then(|d| d.get(ln)) {
-        Some(d) if !d.is_empty() => d.clone(),
+        Some(d) if !d.is_empty() => d.to_vec(),
         _ => {
             let &(lo, hi, _) = arrays.get(ln)?;
             if descending.is_some_and(|d| d.contains(ln)) {
@@ -618,21 +586,16 @@ fn pattern_array_assign_parts(
     pattern_leaves(rhs, &dims, &mut Vec::new(), &mut out, params)?;
     Some(
         out.into_iter()
-            .map(|(idx, e, inherited)| ContinuousAssignment {
-                gate_delay_fall: None,
-                delay_exprs: None,
-                delay_select: None,
-                origin: None,
-                lhs: make_multi_index_expr(ln, &idx),
-                rhs: if inherited {
-                    packed_default_value(e, packed_element)
-                } else {
-                    e
-                },
-                delay,
-                rhs_parent_scoped: false,
-                delay_fall: None,
-                delay_off: None,
+            .map(|(idx, e, inherited)| {
+                ContinuousAssignment::with_delay(
+                    make_multi_index_expr(ln, &idx),
+                    if inherited {
+                        packed_default_value(e, packed_element)
+                    } else {
+                        e
+                    },
+                    delay,
+                )
             })
             .collect(),
     )
@@ -817,7 +780,11 @@ pub(super) fn expand_whole_array_assign(
     .or_else(|| elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t)))
     {
         Some(mut parts) => {
-            for part in &mut parts { part.delay_exprs = delay_exprs.clone(); }
+            if delay_exprs.is_some() {
+                for part in &mut parts {
+                    part.set_delay_exprs(delay_exprs.clone());
+                }
+            }
             elab.continuous_assigns.extend(parts);
             true
         }

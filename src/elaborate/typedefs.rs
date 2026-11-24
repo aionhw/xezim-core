@@ -546,7 +546,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                         is_real: false,
                         direction: None,
                         value: v,
-                        type_name: Some(td.name.name.clone()),
+                        type_name: Some(td.name.name.as_str().into()),
                     },
                 );
                 members_ordered.push((nm.clone(), val));

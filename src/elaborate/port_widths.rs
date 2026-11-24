@@ -375,8 +375,9 @@ fn explain_conn_width(actual: &Expression, elab: &ElaboratedModule, parent_def: 
     if let Some(sig) = elab.signals.get(&name) {
         let ty = sig
             .type_name
-            .clone()
-            .unwrap_or_else(|| "<anonymous>".to_string());
+            .as_deref()
+            .map(String::as_str)
+            .unwrap_or("<anonymous>");
         out.push_str(&format!(
             "\n  connection '{}' is declared as '{}' ({} bit(s))",
             name, ty, sig.width
@@ -414,7 +415,7 @@ fn explain_conn_width(actual: &Expression, elab: &ElaboratedModule, parent_def: 
     let type_name = elab
         .signals
         .get(&name)
-        .and_then(|s| s.type_name.clone())
+        .and_then(|s| s.type_name.as_deref().cloned())
         .or_else(|| elab.var_decl_types.get(&name).and_then(get_type_name));
     if let Some(tn) = type_name {
         let chain_root = elab

@@ -418,7 +418,11 @@ pub fn duplicate_decl_error(elab: &ElaboratedModule, name: &str, span: Span, kin
 /// silently misses those nets: their drivers are never gathered and their
 /// members never written, below the top level only.
 pub(super) fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
-    if let Some(tn) = elab.signals.get(name).and_then(|sig| sig.type_name.clone()) {
+    if let Some(tn) = elab
+        .signals
+        .get(name)
+        .and_then(|sig| sig.type_name.as_deref().cloned())
+    {
         return Some(tn);
     }
     elab.var_decl_types.get(name).and_then(get_type_name)

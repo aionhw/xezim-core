@@ -1774,7 +1774,7 @@ impl<'a> Parser<'a> {
                 self.bump(); // local
                 self.bump(); // ::
                 let mut hier = self.parse_hierarchical_identifier();
-                hier.root = Some(LOCAL_SCOPE_ROOT.to_string());
+                hier.root = Some(HierRoot::Local);
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
 

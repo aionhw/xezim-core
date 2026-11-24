@@ -375,10 +375,85 @@ pub enum BinaryOp {
 /// `HierarchicalIdentifier::root` of a §18.7.1 `local::name` reference.
 pub const LOCAL_SCOPE_ROOT: &str = "local";
 
+/// Root qualifier of a hierarchical identifier (`$root`, `$unit`, `local::`).
+///
+/// Stored as a 1-byte enum so `Option<HierRoot>` packs beside `Bound` inside
+/// `HierarchicalIdentifier` instead of adding a 24-byte `Option<String>` to
+/// every `Expression` in the AST (aionhw/xezim#721).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HierRoot {
+    Root,
+    Unit,
+    Local,
+}
+
+impl HierRoot {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "$root",
+            Self::Unit => "$unit",
+            Self::Local => LOCAL_SCOPE_ROOT,
+        }
+    }
+}
+
+impl std::ops::Deref for HierRoot {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for HierRoot {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for HierRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for HierRoot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for HierRoot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HierRootVisitor;
+
+        impl serde::de::Visitor<'_> for HierRootVisitor {
+            type Value = HierRoot;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"$root\", \"$unit\", or \"local\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "$root" => Ok(HierRoot::Root),
+                    "$unit" => Ok(HierRoot::Unit),
+                    LOCAL_SCOPE_ROOT => Ok(HierRoot::Local),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(HierRootVisitor)
+    }
+}
+
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HierarchicalIdentifier {
-    pub root: Option<String>,
+    pub root: Option<HierRoot>,
     pub path: Vec<HierPathSegment>,
     pub span: Span,
     /// Cached signal ID for fast lookup during simulation (set on first access).

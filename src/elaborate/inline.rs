@@ -585,7 +585,7 @@ fn inline_instantiations_inner(
                                             is_real: false,
                                             direction: None,
                                             value: Value::zero(width),
-                                            type_name: get_type_name(&dd.data_type),
+                                            type_name: get_type_name(&dd.data_type).map(SharedName::from),
                                         },
                                     );
                                     qualified_decl = d;
@@ -989,6 +989,7 @@ fn inline_instantiations_inner(
                                     elab.var_decl_types
                                         .entry(qualified.clone())
                                         .or_insert(owned_type);
+                                    let tn = tn.map(SharedName::from);
                                     elab.pkg_var_decls.insert(
                                         qualified.clone(),
                                         Signal {

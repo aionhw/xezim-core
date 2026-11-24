@@ -330,7 +330,7 @@ pub(super) fn declared_user_nettype(elab: &ElaboratedModule, dt: &DataType) -> O
 /// own.
 pub(super) fn user_nettype_of(elab: &ElaboratedModule, name: &str) -> Option<String> {
     let tn = match elab.signals.get(name) {
-        Some(s) => s.type_name.clone(),
+        Some(s) => s.type_name.as_deref().cloned(),
         None => elab.var_decl_types.get(name).and_then(get_type_name),
     }?;
     elab.nettype_resolvers.contains_key(&tn).then_some(tn)
@@ -451,11 +451,9 @@ pub(super) fn tri_port_select_pull(
         elab.tri_select_pulls.insert((net.clone(), b));
     }
     let span = actual.span;
-    Some(ContinuousAssignment {
-        delay_select: None,
-        origin: None,
-        lhs: actual.clone(),
-        rhs: make_syscall(
+    Some(ContinuousAssignment::plain(
+        actual.clone(),
+        make_syscall(
             "$__pull",
             vec![
                 make_fill_expr(one, span),
@@ -463,13 +461,7 @@ pub(super) fn tri_port_select_pull(
             ],
             span,
         ),
-        delay: 0,
-        rhs_parent_scoped: false,
-        delay_fall: None,
-        delay_off: None,
-        gate_delay_fall: None,
-        delay_exprs: None,
-    })
+    ))
 }
 
 /// A continuous assign whose LHS names a HIERARCHICAL target writes into a
@@ -626,7 +618,7 @@ pub(super) fn upward_scope_rewrite(
     path.extend(below.map(segment));
     path.extend(new_hier.path.drain(1..));
     new_hier.path = path;
-    new_hier.root = Some("$root".to_string());
+    new_hier.root = Some(crate::ast::expr::HierRoot::Root);
     new_hier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
     new_hier.cached_resolved_name = crate::ast::cache::NameCache::new();
     Some(ExprKind::Ident(new_hier))
@@ -705,7 +697,7 @@ pub(super) fn resolve_upward_module_name(
         s.name.name = (*seg).to_string();
         h.path.insert(i, s);
     }
-    h.root = Some("$root".to_string());
+    h.root = Some(crate::ast::expr::HierRoot::Root);
 }
 
 /// Mark every identifier in an EXPRESSION port actual as parent-rooted
@@ -721,7 +713,7 @@ pub(super) fn mark_actual_rooted(e: &mut Expression, is_package: &dyn Fn(&str) -
     match &mut e.kind {
         ExprKind::Ident(h) => {
             if h.root.is_none() && !(h.path.len() > 1 && is_package(&h.path[0].name.name)) {
-                h.root = Some("$root".to_string());
+                h.root = Some(crate::ast::expr::HierRoot::Root);
             }
             for seg in &mut h.path {
                 for sel in &mut seg.selects {

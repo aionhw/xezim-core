@@ -64,7 +64,7 @@ pub(super) fn elaborate_items(
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
-                                existing.type_name = get_type_name(&pd.data_type);
+                                existing.type_name = get_type_name(&pd.data_type).map(SharedName::from);
                                 existing.value = default_port_value(
                                     Some(pd.direction),
                                     Some(&pd.data_type),
@@ -111,7 +111,7 @@ pub(super) fn elaborate_items(
                             port_decl_net_type(pd),
                         ),
                         is_real,
-                        type_name: get_type_name(&pd.data_type),
+                        type_name: get_type_name(&pd.data_type).map(SharedName::from),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(net_type) = port_decl_net_type(pd) {
@@ -151,24 +151,24 @@ pub(super) fn elaborate_items(
                         direction: None,
                         value: init_value,
                         is_real,
-                        type_name: get_type_name(&nd.data_type),
+                        type_name: get_type_name(&nd.data_type).map(SharedName::from),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(init_expr) = &decl.init {
                         let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
                         let decl_rhs = net_declaration_driver(nd, &decl.name.name, init_expr, elab);
-                        elab.continuous_assigns.push(ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: decl_dly.3,
-                            delay_select: None,
-                            origin: Some((init_expr.span, top_origin_scope())),
-                            lhs: make_ident_expr(&decl.name.name),
-                            rhs: decl_rhs,
-                            delay: decl_dly.0,
-                            rhs_parent_scoped: false,
-                            delay_fall: decl_dly.1,
-                            delay_off: decl_dly.2,
-                        });
+                        elab.continuous_assigns.push(ContinuousAssignment::with_extras(
+                            make_ident_expr(&decl.name.name),
+                            decl_rhs,
+                            decl_dly.0,
+                            false,
+                            decl_dly.1,
+                            decl_dly.2,
+                            None,
+                            decl_dly.3,
+                            None,
+                            Some((init_expr.span, top_origin_scope())),
+                        ));
                     }
                 }
             }
@@ -742,7 +742,7 @@ pub(super) fn elaborate_items(
                             is_real,
                             direction: None,
                             value: init_val,
-                            type_name: get_type_name(&dd.data_type),
+                            type_name: get_type_name(&dd.data_type).map(SharedName::from),
                         };
                         signals_insert_traced(
                             &mut elab.signals,
@@ -947,7 +947,7 @@ pub(super) fn elaborate_items(
                                         direction: None,
                                         value: pv,
                                         is_real: false,
-                                        type_name: get_type_name(data_type),
+                                        type_name: get_type_name(data_type).map(SharedName::from),
                                     },
                                 );
                                 continue;
@@ -1004,7 +1004,7 @@ pub(super) fn elaborate_items(
                                     direction: None,
                                     value: val,
                                     is_real,
-                                    type_name: get_type_name(data_type),
+                                    type_name: get_type_name(data_type).map(SharedName::from),
                                 },
                             );
                         }
@@ -1051,18 +1051,18 @@ pub(super) fn elaborate_items(
                         &|n| elab.packages.contains(n),
                     );
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: delay_exprs.clone(),
-                            delay_select: None,
-                            origin: Some((ca.span, top_origin_scope())),
-                            lhs: lhs.clone(),
-                            rhs: rhs_final,
+                        elab.continuous_assigns.push(ContinuousAssignment::with_extras(
+                            lhs.clone(),
+                            rhs_final,
                             delay,
-                            rhs_parent_scoped: false,
+                            false,
                             delay_fall,
                             delay_off,
-                        });
+                            None,
+                            delay_exprs.clone(),
+                            None,
+                            Some((ca.span, top_origin_scope())),
+                        ));
                     }
                 }
             }
@@ -1129,7 +1129,7 @@ pub(super) fn elaborate_items(
                                 is_signed: false,
                                 direction: None,
                                 value: Value::new(1),
-                                type_name: Some(inst.module_name.name.clone()),
+                                type_name: Some(inst.module_name.name.as_str().into()),
                                 is_real: false,
                             },
                         );
@@ -1296,18 +1296,10 @@ pub(super) fn elaborate_items(
                 // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
-                    elab.continuous_assigns.push(ContinuousAssignment {
-                        gate_delay_fall: None,
-                        delay_exprs: None,
-                        delay_select: None,
-                        origin: None,
-                        lhs: make_ident_expr(delayed),
-                        rhs: make_ident_expr(source),
-                        delay: 0,
-                        rhs_parent_scoped: false,
-                        delay_fall: None,
-                        delay_off: None,
-                    });
+                    elab.continuous_assigns.push(ContinuousAssignment::plain(
+                        make_ident_expr(delayed),
+                        make_ident_expr(source),
+                    ));
                 }
                 if !sb.timing_checks.is_empty() {
                     let timing_consts: Vec<Vec<Option<i64>>> = {

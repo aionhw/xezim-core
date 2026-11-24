@@ -96,7 +96,7 @@ fn check_new_assignment(
     };
     let type_name = elab.signals.get(&name).and_then(|s| s.type_name.clone());
     if let Some(tn) = type_name {
-        if let Some(cls) = elab.classes.get(&tn) {
+        if let Some(cls) = elab.classes.get(tn.as_str()) {
             if cls.is_interface {
                 return Err(format!("Cannot instantiate interface class '{}'", tn));
             }

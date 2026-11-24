@@ -165,7 +165,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
         }
         // Only consume unpacked dimensions, never packed bit selects or a
         // partial array. The element's declared type lives on the array.
-        if elab.unpacked_decl_dims.get(base).map_or(0, Vec::len) != rank {
+        if elab.unpacked_decl_dims.get(base).map_or(0, |d| d.len()) != rank {
             return None;
         }
         let dt = elab.var_decl_types.get(base).or_else(|| {
@@ -291,18 +291,18 @@ pub(super) fn nettype_declaration_driver(
     params: &HashMap<String, Value>,
 ) -> ContinuousAssignment {
     let (delay, delay_fall, delay_off, delay_exprs) = nettype_delay(dd, params);
-    ContinuousAssignment {
-        gate_delay_fall: None,
-        delay_exprs,
-        delay_select: None,
-        origin: Some((init.span, top_origin_scope())),
-        lhs: make_ident_expr(name),
-        rhs: init.clone(),
+    ContinuousAssignment::with_extras(
+        make_ident_expr(name),
+        init.clone(),
         delay,
         rhs_parent_scoped,
         delay_fall,
         delay_off,
-    }
+        None,
+        delay_exprs,
+        None,
+        Some((init.span, top_origin_scope())),
+    )
 }
 
 /// The (rise, fall, turn-off) ticks of a nettype net declaration's delay.
@@ -658,7 +658,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     let mut net_resolver: HashMap<String, String> = HashMap::default();
     for (name, sig) in &elab.signals {
         if let Some(tn) = &sig.type_name {
-            if let Some(r) = elab.nettype_resolvers.get(tn)
+            if let Some(r) = elab.nettype_resolvers.get(tn.as_str())
                 && !hidden(name, tn)
             {
                 net_resolver.insert(name.clone(), r.clone());
@@ -873,7 +873,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             .map(|(net, m)| (net.to_string(), m.to_string()))
     };
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        let scope = ca.origin.as_ref().map_or("", |(_, s)| s.as_ref());
+        let scope = ca.origin().map_or("", |(_, s)| s.as_ref());
         let Some(lhs_name) = driver_net(elab, &ca.lhs, scope).filter(|n| net_resolver.contains_key(n))
         else {
             // §6.6.7, §23.3.3: a port connection of a resolver-less
@@ -919,7 +919,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         // assignment is not a merge even though both ends are nettype nets.
         // An element select on the RHS (`u.i = a[0]`) is likewise a directional
         // read of the element, whose own fold writes the element's storage.
-        if let Some(rhs_name) = ca.origin.is_none().then(|| driver_net(elab, &ca.rhs, scope)).flatten() {
+        if let Some(rhs_name) = ca.origin().is_none().then(|| driver_net(elab, &ca.rhs, scope)).flatten() {
             if net_resolver.contains_key(&rhs_name) && rhs_name != lhs_name {
                 if let (Some(&a), Some(&b)) = (net_id.get(&lhs_name), net_id.get(&rhs_name)) {
                     dsu.union(a, b);
@@ -932,8 +932,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             order.push(lhs_name.clone());
         }
         let scope = ca
-            .origin
-            .as_ref()
+            .origin()
             .map(|(_, s)| s.to_string())
             .unwrap_or_default();
         real_drivers
@@ -1136,16 +1135,11 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         // of its own; each element is its own leaf, and gets
                         // that element of the resolved value (§6.6.7).
                         let template = ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: None,
-                            delay_select: None,
-                            origin: None,
                             lhs: mlhs.clone(),
                             rhs: mrhs.clone(),
                             delay,
                             rhs_parent_scoped: true,
-                            delay_fall: None,
-                            delay_off: None,
+                            extras: None,
                         };
                         emit_member_elem_assigns(
                             mlhs,
@@ -1165,33 +1159,23 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         continue;
                     }
                     kept.push(ContinuousAssignment {
-                        gate_delay_fall: None,
-                        delay_exprs: None,
-                        delay_select: None,
-                        origin: None,
                         lhs: mlhs,
                         rhs: mrhs,
                         delay,
                         rhs_parent_scoped: true,
-                        delay_fall: None,
-                        delay_off: None,
+                        extras: None,
                     });
                 }
             }
             None => {
                 kept.push(ContinuousAssignment {
-                    gate_delay_fall: None,
-                    delay_exprs: None,
-                    delay_select: None,
-                    origin: None,
                     // §6.6.8: an element name (`a[0]`) must emit a real
                     // Index LHS, not a flat ident literally named `a[0]`.
                     lhs: net_expr(elab, lhs),
                     rhs,
                     delay,
                     rhs_parent_scoped: true,
-                    delay_fall: None,
-                    delay_off: None,
+                    extras: None,
                 })
             }
         }
@@ -1625,18 +1609,82 @@ pub fn vpi_net_drivers() -> bool {
 /// input transition that recomputes the same contribution then has no event
 /// to propagate, even though the visible net differs from that contribution.
 pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
-    if !vpi_net_drivers() {
+    if !vpi_net_drivers() || (elab.nets.is_empty() && elab.nettype_resolvers.is_empty()) {
         return;
     }
-    elab.materialize_pending_cont_assigns();
+    fn rhs_needs_vpi_stage(rhs: &Expression) -> bool {
+        let inner = match rhs {
+            Expression {
+                kind: ExprKind::SystemCall { name, args },
+                ..
+            } if matches!(
+                name.as_str(),
+                "$__drive" | "$__weak" | "$__pull" | "$__supply"
+            ) =>
+            {
+                args.first()
+            }
+            rhs => Some(rhs),
+        };
+        let Some(inner) = inner else {
+            return false;
+        };
+        !matches!(&inner.kind, ExprKind::Ident(h) if h.path.iter().all(|seg| seg.selects.is_empty()))
+            && !matches!(
+                &inner.kind,
+                ExprKind::Number(_) | ExprKind::AssignmentPattern(_)
+            )
+    }
+    fn ca_needs_vpi_stage(ca: &ContinuousAssignment, elab: &ElaboratedModule) -> bool {
+        if ca.origin().is_none() || cont_assign_has_own_delay(ca) || !rhs_needs_vpi_stage(&ca.rhs) {
+            return false;
+        }
+        whole_net_ident_name_scoped(&ca.lhs, elab).is_some_and(|name| {
+            is_net_name(elab, &name) && elab.signals.contains_key(name.as_str())
+        })
+    }
+    // Materialize only pending assignments that actually target a declared net
+    // with a source origin, keeping non-net and synthetic pending assigns lazy
+    // instead of duplicating the entire continuous_assigns table (#721).
+    if !elab.pending_cont_assign.is_empty() {
+        let pending = std::mem::take(&mut elab.pending_cont_assign);
+        for p in pending {
+            if p.origin_span.is_some()
+                && whole_net_ident_name_scoped(&p.materialize_lhs(), elab).is_some_and(|name| {
+                    is_net_name(elab, &name) && elab.signals.contains_key(name.as_str())
+                })
+            {
+                let ca = p.materialize(&elab.parameters);
+                if !expand_whole_array_assign(
+                    &ca.lhs,
+                    &ca.rhs,
+                    ca.delay,
+                    &ca.delay_exprs().cloned(),
+                    elab,
+                ) {
+                    elab.continuous_assigns.push(ca);
+                }
+            } else {
+                elab.pending_cont_assign.push(p);
+            }
+        }
+    }
+    let staged_count = elab
+        .continuous_assigns
+        .iter()
+        .filter(|ca| ca_needs_vpi_stage(ca, elab))
+        .count();
+    if staged_count == 0 {
+        return;
+    }
     let mut seq = 0usize;
-    for mut ca in std::mem::take(&mut elab.continuous_assigns) {
-        let name = whole_net_ident_name_scoped(&ca.lhs, elab);
-        let signal = name
-            .as_deref()
-            .filter(|name| is_net_name(elab, name))
-            .and_then(|name| elab.signals.get(name))
-            .filter(|_| ca.origin.is_some() && !cont_assign_has_own_delay(&ca))
+    let old = std::mem::take(&mut elab.continuous_assigns);
+    elab.continuous_assigns = Vec::with_capacity(old.len() + staged_count);
+    for mut ca in old {
+        let signal = ca_needs_vpi_stage(&ca, elab)
+            .then(|| whole_net_ident_name_scoped(&ca.lhs, elab))
+            .flatten()
+            .and_then(|name| elab.signals.get(name.as_str()))
             .cloned();
         if let Some(mut signal) = signal {
             // Keep strength on the contribution consumed by the resolver.
@@ -1653,13 +1701,7 @@ pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
                 }
                 rhs => Some(rhs),
             };
-            if let Some(rhs) = rhs
-                && !matches!(&rhs.kind, ExprKind::Ident(h) if h.path.iter().all(|seg| seg.selects.is_empty()))
-                && !matches!(
-                    &rhs.kind,
-                    ExprKind::Number(_) | ExprKind::AssignmentPattern(_)
-                )
-            {
+            if let Some(rhs) = rhs {
                 let stage = loop {
                     let candidate = format!("{}$vpidrv{seq}", signal.name);
                     seq += 1;
@@ -1677,7 +1719,7 @@ pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
                 let mut producer = ca.clone();
                 producer.lhs = make_ident_expr(&stage);
                 producer.rhs = value;
-                ca.origin = None;
+                ca.set_origin(None);
                 elab.continuous_assigns.push(producer);
             }
         }

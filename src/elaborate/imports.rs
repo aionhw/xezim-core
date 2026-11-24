@@ -747,7 +747,7 @@ pub(super) fn process_import(
                                                 is_real,
                                                 direction: None,
                                                 value: v,
-                                                type_name: get_type_name(data_type),
+                                                type_name: get_type_name(data_type).map(SharedName::from),
                                             },
                                         );
                                         register_bare_struct_param(
@@ -841,7 +841,7 @@ pub(super) fn process_import(
                                                     is_real: false,
                                                     direction: None,
                                                     value: v,
-                                                    type_name: Some(td.name.name.clone()),
+                                                    type_name: Some(td.name.name.as_str().into()),
                                                 },
                                             );
                                             found = true;
@@ -1024,7 +1024,7 @@ pub(super) fn process_import(
                                             is_real,
                                             direction: None,
                                             value: v,
-                                            type_name: get_type_name(&dd.data_type),
+                                            type_name: get_type_name(&dd.data_type).map(SharedName::from),
                                         },
                                     );
                                     if matches!(
@@ -1257,7 +1257,7 @@ pub(super) fn process_import(
                                                 is_real,
                                                 direction: None,
                                                 value: v,
-                                                type_name: get_type_name(data_type),
+                                                type_name: get_type_name(data_type).map(SharedName::from),
                                             },
                                         );
                                         // §7.2.1: STRUCT-typed package param —
@@ -1481,7 +1481,7 @@ pub(super) fn process_import(
                                         is_real,
                                         direction: None,
                                         value: v,
-                                        type_name: tn,
+                                        type_name: tn.map(SharedName::from),
                                     },
                                 );
                                 if let Some(fields) = &struct_fields {

@@ -540,7 +540,7 @@ pub(super) fn create_implicit_nets(
                         Value::new(width.max(1))
                     },
                     is_real,
-                    type_name: Some(nt.clone()),
+                    type_name: Some(nt.as_str().into()),
                 },
             );
             // Registering the struct member leaves is what makes a struct-typed

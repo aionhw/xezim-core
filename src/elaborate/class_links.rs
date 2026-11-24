@@ -9,7 +9,7 @@ pub fn null_init_class_handles(elab: &mut ElaboratedModule) {
     let cls_names: std::collections::HashSet<String> = elab.classes.keys().cloned().collect();
     for sig in elab.signals.values_mut() {
         if let Some(tn) = &sig.type_name {
-            if cls_names.contains(tn) {
+            if cls_names.contains(tn.as_str()) {
                 sig.value = Value::zero(sig.width);
             }
         }

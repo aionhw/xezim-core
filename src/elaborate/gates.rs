@@ -463,18 +463,18 @@ pub(super) fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut Elaborated
                 }
             }
         }
-        elab.continuous_assigns.push(ContinuousAssignment {
-            gate_delay_fall: fall,
-            delay_exprs: delay_exprs.clone(),
-            delay_select: None,
-            origin: None,
-            lhs: lhs.clone(),
+        elab.continuous_assigns.push(ContinuousAssignment::with_extras(
+            lhs.clone(),
             rhs,
             delay,
-            rhs_parent_scoped: false,
-            delay_fall: None,
-            delay_off: off,
-        });
+            false,
+            None,
+            off,
+            fall,
+            delay_exprs.clone(),
+            None,
+            None,
+        ));
     }
 }
 

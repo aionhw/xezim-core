@@ -44,7 +44,7 @@ pub(super) fn register_generate_labels(items: &[ModuleItem], elab: &mut Elaborat
                     is_real: false,
                     direction: None,
                     value: Value::new(1),
-                    type_name: Some("$genblock".to_string()),
+                    type_name: Some("$genblock".into()),
                 },
             );
         }

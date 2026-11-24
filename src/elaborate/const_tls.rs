@@ -706,12 +706,16 @@ pub(super) fn signal_is_shortreal(elab: &ElaboratedModule, name: &str) -> bool {
     let Some(sig) = elab.signals.get(name).filter(|s| s.is_real) else {
         return false;
     };
-    if sig.type_name.as_deref() == Some("shortreal") {
+    if sig.type_name.as_deref().map(String::as_str) == Some("shortreal") {
         return true;
     }
     elab.var_decl_types
         .get(name)
-        .or_else(|| sig.type_name.as_ref().and_then(|ty| elab.typedef_types.get(ty)))
+        .or_else(|| {
+            sig.type_name
+                .as_ref()
+                .and_then(|ty| elab.typedef_types.get(ty.as_str()))
+        })
         .is_some_and(|dt| {
             matches!(
                 resolve_typedef_chain(dt, &elab.typedef_types),

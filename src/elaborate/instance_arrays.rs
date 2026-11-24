@@ -513,19 +513,23 @@ pub(super) fn unpacked_connection_elements(
         _ => {}
     }
     let (name, sels) = split(expr)?;
-    let dims = elab.unpacked_decl_dims.get(&name).cloned().or_else(|| {
-        if let Some(&(lo, hi, _)) = elab.arrays.get(&name) {
-            Some(vec![if elab.descending_arrays.contains(&name) {
-                (hi, lo)
+    let dims = elab
+        .unpacked_decl_dims
+        .get(&name)
+        .map(|d| d.to_vec())
+        .or_else(|| {
+            if let Some(&(lo, hi, _)) = elab.arrays.get(&name) {
+                Some(vec![if elab.descending_arrays.contains(&name) {
+                    (hi, lo)
+                } else {
+                    (lo, hi)
+                }])
+            } else if let Some(&(d0, d1, _)) = elab.arrays_2d.get(&name) {
+                Some(vec![d0, d1])
             } else {
-                (lo, hi)
-            }])
-        } else if let Some(&(d0, d1, _)) = elab.arrays_2d.get(&name) {
-            Some(vec![d0, d1])
-        } else {
-            elab.arrays_nd.get(&name).map(|(d, _)| d.clone())
-        }
-    })?;
+                elab.arrays_nd.get(&name).map(|(d, _)| d.clone())
+            }
+        })?;
     if sels.len() > dims.len() {
         return None;
     }

@@ -695,7 +695,11 @@ pub fn elaborate_module_with_defs(
                             ansi_port_net_type(port),
                         )
                     }),
-                    type_name: port.data_type.as_ref().and_then(get_type_name),
+                    type_name: port
+                        .data_type
+                        .as_ref()
+                        .and_then(get_type_name)
+                        .map(SharedName::from),
                 };
                 elab.port_order.push(port.name.name.clone());
                 if let Some(net_type) = ansi_port_net_type(port) {
@@ -1447,7 +1451,7 @@ pub fn elaborate_module_with_defs(
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
-                                existing.type_name = get_type_name(&pd.data_type);
+                                existing.type_name = get_type_name(&pd.data_type).map(SharedName::from);
                                 existing.value = default_port_value(
                                     Some(pd.direction),
                                     Some(&pd.data_type),
@@ -1494,7 +1498,7 @@ pub fn elaborate_module_with_defs(
                             is_real,
                             port_decl_net_type(pd),
                         ),
-                        type_name: get_type_name(&pd.data_type),
+                        type_name: get_type_name(&pd.data_type).map(SharedName::from),
                     };
                     if !elab.port_order.contains(&decl.name.name) {
                         elab.port_order.push(decl.name.name.clone());
@@ -1593,18 +1597,18 @@ pub fn elaborate_module_with_defs(
                                     init_expr,
                                     &mut elab,
                                 );
-                                elab.continuous_assigns.push(ContinuousAssignment {
-                                    gate_delay_fall: None,
-                                    delay_exprs: decl_dly.3,
-                                    delay_select: None,
-                                    origin: Some((init_expr.span, top_origin_scope())),
-                                    lhs: make_ident_expr(&decl.name.name),
-                                    rhs: decl_rhs,
-                                    delay: decl_dly.0,
-                                    rhs_parent_scoped: false,
-                                    delay_fall: decl_dly.1,
-                                    delay_off: decl_dly.2,
-                                });
+                                elab.continuous_assigns.push(ContinuousAssignment::with_extras(
+                                    make_ident_expr(&decl.name.name),
+                                    decl_rhs,
+                                    decl_dly.0,
+                                    false,
+                                    decl_dly.1,
+                                    decl_dly.2,
+                                    None,
+                                    decl_dly.3,
+                                    None,
+                                    Some((init_expr.span, top_origin_scope())),
+                                ));
                             }
                             continue;
                         }
@@ -1649,7 +1653,7 @@ pub fn elaborate_module_with_defs(
                         is_real,
                         direction: None,
                         value: init_value,
-                        type_name: get_type_name(&nd.data_type),
+                        type_name: get_type_name(&nd.data_type).map(SharedName::from),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     // The declared type, same as the variable arm: the
@@ -1818,18 +1822,18 @@ pub fn elaborate_module_with_defs(
                         let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
                         let decl_rhs =
                             net_declaration_driver(nd, &decl.name.name, init_expr, &mut elab);
-                        elab.continuous_assigns.push(ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: decl_dly.3,
-                            delay_select: None,
-                            origin: Some((init_expr.span, top_origin_scope())),
-                            lhs: make_ident_expr(&decl.name.name),
-                            rhs: decl_rhs,
-                            delay: decl_dly.0,
-                            rhs_parent_scoped: false,
-                            delay_fall: decl_dly.1,
-                            delay_off: decl_dly.2,
-                        });
+                        elab.continuous_assigns.push(ContinuousAssignment::with_extras(
+                            make_ident_expr(&decl.name.name),
+                            decl_rhs,
+                            decl_dly.0,
+                            false,
+                            decl_dly.1,
+                            decl_dly.2,
+                            None,
+                            decl_dly.3,
+                            None,
+                            Some((init_expr.span, top_origin_scope())),
+                        ));
                     }
                 }
             }
@@ -1865,7 +1869,7 @@ pub fn elaborate_module_with_defs(
                         elab.enum_members
                             .insert(decl.name.name.clone(), members.clone());
                         if let Some(sig) = elab.signals.get_mut(&decl.name.name) {
-                            sig.type_name = Some(decl.name.name.clone());
+                            sig.type_name = Some(decl.name.name.as_str().into());
                         }
                     }
                 }
@@ -2035,7 +2039,7 @@ pub fn elaborate_module_with_defs(
                             existing.width = width;
                             existing.is_signed = is_signed;
                             existing.is_real = decl_is_real;
-                            existing.type_name = get_type_name(&dd.data_type);
+                            existing.type_name = get_type_name(&dd.data_type).map(SharedName::from);
                             existing.value = if decl_is_real {
                                 Value::from_f64(0.0)
                             } else {
@@ -2792,7 +2796,7 @@ pub fn elaborate_module_with_defs(
                                             is_real: false,
                                             direction: None,
                                             value: Value::zero(1),
-                                            type_name: Some("event".to_string()),
+                                            type_name: Some("event".into()),
                                         },
                                     );
                                 }
@@ -3054,7 +3058,7 @@ pub fn elaborate_module_with_defs(
                             is_real,
                             direction: None,
                             value: init_val,
-                            type_name: get_type_name(&dd.data_type),
+                            type_name: get_type_name(&dd.data_type).map(SharedName::from),
                         };
                         signals_insert_traced(
                             &mut elab.signals,
@@ -3100,7 +3104,7 @@ pub fn elaborate_module_with_defs(
                             );
                             // A delayed driver has not arrived yet: the net
                             // starts from its type's default, not the value.
-                            if (ca.delay != 0 || ca.delay_exprs.is_some())
+                            if (ca.delay != 0 || ca.delay_exprs().is_some())
                                 && let Some(sig) = elab.signals.get_mut(&decl.name.name)
                             {
                                 sig.value = default_value_for_type_resolved(
@@ -3883,7 +3887,7 @@ pub fn elaborate_module_with_defs(
                                 is_real: current_is_real,
                                 direction: None,
                                 value: val,
-                                type_name: get_type_name(data_type),
+                                type_name: get_type_name(data_type).map(SharedName::from),
                             },
                         );
                     }
@@ -4228,18 +4232,18 @@ pub fn elaborate_module_with_defs(
                         &|n| elab.packages.contains(n),
                     );
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, &mut elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_exprs: delay_exprs.clone(),
-                            delay_select: None,
-                            origin: Some((ca.span, top_origin_scope())),
-                            lhs: lhs.clone(),
-                            rhs: rhs_final,
+                        elab.continuous_assigns.push(ContinuousAssignment::with_extras(
+                            lhs.clone(),
+                            rhs_final,
                             delay,
-                            rhs_parent_scoped: false,
+                            false,
                             delay_fall,
                             delay_off,
-                        });
+                            None,
+                            delay_exprs.clone(),
+                            None,
+                            Some((ca.span, top_origin_scope())),
+                        ));
                     }
                 }
             }
@@ -4439,18 +4443,10 @@ pub fn elaborate_module_with_defs(
                 // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
-                    elab.continuous_assigns.push(ContinuousAssignment {
-                        gate_delay_fall: None,
-                        delay_exprs: None,
-                        delay_select: None,
-                        origin: None,
-                        lhs: make_ident_expr(delayed),
-                        rhs: make_ident_expr(source),
-                        delay: 0,
-                        rhs_parent_scoped: false,
-                        delay_fall: None,
-                        delay_off: None,
-                    });
+                    elab.continuous_assigns.push(ContinuousAssignment::plain(
+                        make_ident_expr(delayed),
+                        make_ident_expr(source),
+                    ));
                 }
                 if !sb.timing_checks.is_empty() {
                     let timing_consts: Vec<Vec<Option<i64>>> = {
@@ -4510,7 +4506,7 @@ pub fn elaborate_module_with_defs(
                                 is_real: false,
                                 direction: None,
                                 value: Value::new(1),
-                                type_name: Some(inst.module_name.name.clone()),
+                                type_name: Some(inst.module_name.name.as_str().into()),
                             },
                         );
                     }

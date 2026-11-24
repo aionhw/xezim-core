@@ -63,7 +63,7 @@ fn reference(
     // The reserved name is declared nowhere else. The plain name may be: an
     // enclosing instance's own declaration would take a relative reference.
     if target.storage == plain && target.contested {
-        h.root = Some("$root".to_string());
+        h.root = Some(crate::ast::expr::HierRoot::Root);
     }
     h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
     h.cached_resolved_name = crate::ast::cache::NameCache::new();

@@ -132,7 +132,7 @@ pub(super) fn expr_to_arg_string(ex: &Expression) -> String {
             if h.path.len() == 1 && h.root.is_none() {
                 h.path[0].name.name.clone()
             } else {
-                let mut parts: Vec<String> = h.root.iter().cloned().collect();
+                let mut parts: Vec<String> = h.root.iter().map(|r| r.as_str().to_string()).collect();
                 parts.extend(h.path.iter().map(|seg| seg.name.name.clone()));
                 parts.join("::")
             }

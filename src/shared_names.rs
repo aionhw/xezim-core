@@ -122,6 +122,10 @@ pub(crate) fn registry_scope() -> RegistryScope {
 pub struct SharedName(Arc<String>);
 
 impl SharedName {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -198,6 +202,11 @@ impl PartialEq<String> for SharedName {
         **self == *rhs
     }
 }
+impl PartialEq<SharedName> for String {
+    fn eq(&self, rhs: &SharedName) -> bool {
+        self.as_str() == rhs.as_str()
+    }
+}
 impl PartialEq<str> for SharedName {
     fn eq(&self, rhs: &str) -> bool {
         self.as_str() == rhs
@@ -250,6 +259,12 @@ impl<V> SharedNameMap<V> {
     {
         self.0.get(key)
     }
+    pub fn get_key_value<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<(&String, &V)>
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.0.get_key_value(key).map(|(k, v)| (&**k, v))
+    }
     pub fn get_mut<Q: ?Sized + Hash + Eq>(&mut self, key: &Q) -> Option<&mut V>
     where
         SharedName: Borrow<Q>,
@@ -267,6 +282,12 @@ impl<V> SharedNameMap<V> {
         SharedName: Borrow<Q>,
     {
         self.0.remove(key)
+    }
+    pub fn remove_entry<Q: ?Sized + Hash + Eq>(&mut self, key: &Q) -> Option<(String, V)>
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.0.remove_entry(key).map(|(k, v)| (k.into(), v))
     }
     pub fn insert<K: Into<SharedName>>(&mut self, key: K, value: V) -> Option<V> {
         self.0.insert(key.into(), value)
