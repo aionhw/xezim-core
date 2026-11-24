@@ -39,7 +39,7 @@ fn split_output_connections_write_member_leaves() {
         let connections: Vec<_> = model
             .continuous_assigns
             .iter()
-            .filter_map(|ca| Some((name(&ca.lhs)?, name(&ca.rhs)?)))
+            .filter_map(|ca| Some((name(&ca.lhs_expr())?, name(&ca.rhs_expr())?)))
             .collect();
         for (element, instance) in [(4, first), (5, second)] {
             for member in ["a", "b"] {

@@ -514,7 +514,7 @@ fn arg_type(e: &Expression) -> Option<DataType> {
         ExprKind::Paren(x) => arg_type(x),
         _ => plain_ident(e).map(|n| {
             keyword_type(n, e.span).unwrap_or_else(|| DataType::TypeReference {
-                name: TypeName {
+                name: Box::new(TypeName {
                     scopes: Vec::new(),
                     name: crate::ast::Identifier {
                         name: n.to_string(),
@@ -522,7 +522,7 @@ fn arg_type(e: &Expression) -> Option<DataType> {
                     },
                     span: e.span,
                     bound: Default::default(),
-                },
+                }),
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
                 span: e.span,
@@ -670,13 +670,12 @@ fn design_classes(descs: &[Description]) -> Vec<(ClassScope<'_>, &ClassDeclarati
             Description::Package(p) => {
                 for it in &p.items {
                     if let PackageItem::Class(c) = it {
-                        out.push((ClassScope::Package(p.name.name.as_str()), c));
+                        out.push((ClassScope::Package(p.name.name.as_str()), c.as_ref()));
                     }
                 }
             }
-            Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
-                out.push((ClassScope::Unit, c))
-            }
+            Description::Class(c) => out.push((ClassScope::Unit, c)),
+            Description::PackageItem(PackageItem::Class(c)) => out.push((ClassScope::Unit, c)),
             Description::Module(m) => module_classes(&m.items, &m.name.name, &mut out),
             Description::Interface(m) => module_classes(&m.items, &m.name.name, &mut out),
             Description::Program(m) => module_classes(&m.items, &m.name.name, &mut out),
@@ -968,11 +967,18 @@ fn collect(descs: &[Description], unit: &Frame) -> Option<Info> {
                     }
                 }
             }
-            Description::TypedefDecl(td) | Description::PackageItem(PackageItem::Typedef(td)) => {
+            Description::TypedefDecl(td) => {
                 other.insert(td.name.name.clone());
                 enum_members(&td.data_type, &mut other_members);
             }
-            Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
+            Description::PackageItem(PackageItem::Typedef(td)) => {
+                other.insert(td.name.name.clone());
+                enum_members(&td.data_type, &mut other_members);
+            }
+            Description::Class(c) => {
+                other.insert(c.name.name.clone());
+            }
+            Description::PackageItem(PackageItem::Class(c)) => {
                 other.insert(c.name.name.clone());
             }
             Description::PackageItem(PackageItem::Nettype(n)) => {
@@ -1348,11 +1354,18 @@ fn unit_frame(descs: &[Description]) -> Frame {
     let mut f = Frame::default();
     for d in descs {
         match d {
-            Description::TypedefDecl(td) | Description::PackageItem(PackageItem::Typedef(td)) => {
+            Description::TypedefDecl(td) => {
                 f.types.insert(td.name.name.clone());
                 enum_members(&td.data_type, &mut f.values);
             }
-            Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
+            Description::PackageItem(PackageItem::Typedef(td)) => {
+                f.types.insert(td.name.name.clone());
+                enum_members(&td.data_type, &mut f.values);
+            }
+            Description::Class(c) => {
+                f.types.insert(c.name.name.clone());
+            }
+            Description::PackageItem(PackageItem::Class(c)) => {
                 f.types.insert(c.name.name.clone());
             }
             Description::PackageItem(PackageItem::Nettype(n)) => {
@@ -2933,7 +2946,7 @@ impl Rw<'_> {
         for p in ports {
             self.dtype(&mut p.data_type);
             self.unpacked(&mut p.dimensions);
-            self.opt(&mut p.default);
+            self.opt_box(&mut p.default);
         }
     }
 
@@ -3244,7 +3257,7 @@ impl Rw<'_> {
                     self.dtype(t);
                 }
                 self.unpacked(&mut p.dimensions);
-                self.opt(&mut p.default);
+                self.opt_box(&mut p.default);
             }
         }
         if let Some(hdr) = self.frames.last_mut() {
@@ -3278,9 +3291,11 @@ impl Rw<'_> {
             }
             ModuleItem::NetDeclaration(n) => {
                 self.dtype(&mut n.data_type);
-                self.opt_box(&mut n.delay);
-                self.opt_box(&mut n.delay_fall);
-                self.opt_box(&mut n.delay_off);
+                if let Some(ex) = n.extras.as_deref_mut() {
+                    self.opt_box(&mut ex.delay);
+                    self.opt_box(&mut ex.delay_fall);
+                    self.opt_box(&mut ex.delay_off);
+                }
                 for d in &mut n.declarators {
                     self.unpacked(&mut d.dimensions);
                     self.opt_box(&mut d.init);
@@ -3317,9 +3332,9 @@ impl Rw<'_> {
             }
             ModuleItem::ModuleInstantiation(mi) => self.instantiation(mi),
             ModuleItem::GateInstantiation(g) => {
-                self.opt(&mut g.delay);
-                self.opt(&mut g.delay_fall);
-                self.opt(&mut g.delay_off);
+                self.opt_box(&mut g.delay);
+                self.opt_box(&mut g.delay_fall);
+                self.opt_box(&mut g.delay_off);
                 for i in &mut g.instances {
                     i.terminals.iter_mut().for_each(|t| self.expr(t));
                 }

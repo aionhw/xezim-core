@@ -48,11 +48,11 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             .iter()
             .filter(|ca| ca.origin().is_none())
             .filter_map(|ca| {
-                let port = ident_flat_name(&ca.rhs)?;
-                let actual = ident_flat_name(&ca.lhs)?;
-                (elab.port_aliases.get(&port).map(SharedName::as_str) == Some(actual.as_str())
-                    && elab.nets.contains(&port))
-                    .then_some((port, actual))
+                let port = ca.rhs_ident_name()?;
+                let actual = ca.lhs_ident_name()?;
+                (elab.port_aliases.get(port.as_ref()).map(SharedName::as_str) == Some(actual.as_ref())
+                    && elab.nets.contains(port.as_ref()))
+                    .then(|| (port.into_owned(), actual.into_owned()))
             })
             .collect()
     };
@@ -101,18 +101,27 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
         // port's own drivers onto the delayed net, and let the port follow it.
         let is_connection = |ca: &ContinuousAssignment| {
             ca.origin().is_none()
-                && ident_flat_name(&ca.rhs).is_some_and(|p| {
-                    merged.contains_key(&p)
-                        && ident_flat_name(&ca.lhs).as_deref()
-                            == elab.port_aliases.get(&p).map(SharedName::as_str)
+                && ca.rhs_ident_name().is_some_and(|p| {
+                    merged.contains_key(p.as_ref())
+                        && ca.lhs_ident_name().as_deref()
+                            == elab.port_aliases.get(p.as_ref()).map(SharedName::as_str)
                 })
         };
         let mut cas = std::mem::take(&mut elab.continuous_assigns);
         cas.retain(|ca| !is_connection(ca));
         for ca in cas.iter_mut() {
-            for (n, _) in targets_of(&ca.lhs) {
-                if let Some(root) = merged.get(&n) {
-                    retarget_lvalue_net(&mut ca.lhs, &n, root);
+            match ca {
+                ContinuousAssignment::PlainLink { lhs, .. } => {
+                    if let Some(root) = merged.get(lhs.as_str()) {
+                        *lhs = root.as_str().into();
+                    }
+                }
+                ContinuousAssignment::Full(f) => {
+                    for (n, _) in targets_of(&f.lhs) {
+                        if let Some(root) = merged.get(&n) {
+                            retarget_lvalue_net(&mut f.lhs, &n, root);
+                        }
+                    }
                 }
             }
         }
@@ -145,8 +154,8 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
     let mut staged: HashSet<String> = HashSet::default();
     let mut gate_staged: HashSet<String> = HashSet::default();
     for (i, ca) in elab.continuous_assigns.iter().enumerate() {
-        let ts = targets_of(&ca.lhs);
-        let own_delay = ca.delay != 0 || ca.delay_fall().is_some() || ca.delay_off().is_some();
+        let ts = targets_of(&ca.lhs_expr());
+        let own_delay = ca.delay() != 0 || ca.delay_fall().is_some() || ca.delay_off().is_some();
         let gate_delay = !own_delay && cont_assign_has_own_delay(ca);
         for (n, whole) in ts.iter().filter(|(n, _)| is_net(n)) {
             let ds = drivers.entry(n.clone()).or_default();
@@ -204,7 +213,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             // §28.4/§28.5: retain z→x even on the delayed evaluator path.
             // A conditional ending in z could be a MOS or a buf input;
             // those indistinguishable lowered forms keep the old path.
-            let ca = &mut elab.continuous_assigns[drivers[&net][0]];
+            let ca = elab.continuous_assigns[drivers[&net][0]].make_full_mut();
             ca.rhs = Expression::new(
                 ExprKind::Binary {
                     op: BinaryOp::BitXor,
@@ -222,7 +231,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             let ca = &mut elab.continuous_assigns[drivers[&net][0]];
             // §28.16: this is a net delay, even on a [0:0] vector.
             ca.set_delay_select(Some((0, width, false)));
-            ca.delay = rise;
+            ca.set_delay(rise);
             ca.set_delay_fall(fall);
             ca.set_delay_off(off);
             continue;
@@ -260,7 +269,14 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
             elab.gate_fall_delays.insert(drv.clone(), f);
         }
         for &i in drivers.get(&net).map(|v| v.as_slice()).unwrap_or(&[]) {
-            retarget_lvalue_net(&mut elab.continuous_assigns[i].lhs, &net, &drv);
+            match &mut elab.continuous_assigns[i] {
+                ContinuousAssignment::PlainLink { lhs, .. } => {
+                    if lhs.as_str() == net.as_str() {
+                        *lhs = drv.as_str().into();
+                    }
+                }
+                ContinuousAssignment::Full(f) => retarget_lvalue_net(&mut f.lhs, &net, &drv),
+            }
         }
         for u in elab.udp_instances.iter_mut() {
             retarget_lvalue_net(&mut u.output, &net, &drv);
@@ -294,7 +310,7 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
                     is_real: false,
                     is_const: false,
                     direction: None,
-                    value: Value::all_z(1),
+                    value: Value::all_z(1).into(),
                     type_name: None,
                 },
             );
@@ -336,17 +352,18 @@ pub fn apply_net_delays(elab: &mut ElaboratedModule) {
 /// §10.3.3, §28.16: does this driver delay its own transitions? A primitive
 /// with a zero rise delay and a fall delay (`buf #(0, 5)`) does.
 pub(super) fn cont_assign_has_own_delay(ca: &ContinuousAssignment) -> bool {
-    ca.delay != 0
+    ca.delay() != 0
         || ca.delay_fall().is_some()
         || ca.delay_off().is_some()
         || ca.gate_delay_fall().is_some_and(|f| f != 0)
 }
 
 fn gate_tristate_parts(ca: &ContinuousAssignment) -> Option<(&Expression, &Expression)> {
-    if ca.origin().is_some() {
+    let f = ca.as_full()?;
+    if f.origin().is_some() {
         return None;
     }
-    match &ca.rhs.kind {
+    match &f.rhs.kind {
         ExprKind::Conditional {
             condition,
             then_expr,
@@ -562,10 +579,20 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     // child module) is invisible to a scan of `elab.continuous_assigns`, so
     // an overlapping-select net driven only from a sub-module was never
     // widened and its overlapping selects stayed per-bit (#1062).
+    let ca_driver_span = |ca: &ContinuousAssignment, elab: &ElaboratedModule| match ca {
+        ContinuousAssignment::PlainLink { lhs, .. } => {
+            if !elab.nets.contains(lhs.as_str()) {
+                return None;
+            }
+            let w = elab.signals.get(lhs.as_str()).map(|s| s.width).filter(|&w| w > 0)?;
+            Some((alias_canonical(&elab.alias_canon, lhs.to_string()), 0, w - 1))
+        }
+        ContinuousAssignment::Full(f) => cont_assign_driver_span(&f.lhs, elab),
+    };
     let materialized_spans: Vec<Option<(String, u32, u32)>> = elab
         .continuous_assigns
         .iter()
-        .map(|ca| cont_assign_driver_span(&ca.lhs, elab))
+        .map(|ca| ca_driver_span(ca, elab))
         .collect();
     let mut pending_spans: Vec<Option<(String, u32, u32)>> =
         Vec::with_capacity(elab.pending_cont_assign.len());
@@ -578,11 +605,14 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
         if let Some((n, lo, hi)) = s {
             // A member of a packed-struct net drives that part of the net,
             // so it is a select driver like a bit-select (§7.2.1).
-            let is_select = match &ca.lhs.kind {
-                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
-                    packed_member_net_span(&ca.lhs, elab).is_some()
-                }
-                _ => true,
+            let is_select = match ca {
+                ContinuousAssignment::PlainLink { .. } => false,
+                ContinuousAssignment::Full(f) => match &f.lhs.kind {
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                        packed_member_net_span(&f.lhs, elab).is_some()
+                    }
+                    _ => true,
+                },
             };
             by_net
                 .entry(n.as_str())
@@ -637,15 +667,18 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     let spans: Vec<Option<(String, u32, u32)>> = elab
         .continuous_assigns
         .iter()
-        .map(|ca| cont_assign_driver_span(&ca.lhs, elab))
+        .map(|ca| ca_driver_span(ca, elab))
         .collect();
     // A driver that already names the whole net needs no widening; a member
     // of a packed-struct net does (§7.2.1).
     let whole_net_drives: Vec<bool> = elab
         .continuous_assigns
         .iter()
-        .map(|ca| {
-            ident_flat_name(&ca.lhs).is_some() && packed_member_net_span(&ca.lhs, elab).is_none()
+        .map(|ca| match ca {
+            ContinuousAssignment::PlainLink { .. } => true,
+            ContinuousAssignment::Full(f) => {
+                ident_flat_name(&f.lhs).is_some() && packed_member_net_span(&f.lhs, elab).is_none()
+            }
         })
         .collect();
     let z_fill = make_z_fill;
@@ -656,7 +689,14 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
         .map(|(ca, s)| {
             s.as_ref()
                 .filter(|(n, _, _)| widen.contains(n))
-                .and_then(|_| continuous_assign_delay_select(&ca.lhs, elab, None))
+                .and_then(|_| match ca {
+                    ContinuousAssignment::PlainLink { .. } => {
+                        continuous_assign_delay_select(&ca.lhs_expr(), elab, None)
+                    }
+                    ContinuousAssignment::Full(f) => {
+                        continuous_assign_delay_select(&f.lhs, elab, None)
+                    }
+                })
         })
         .collect();
     for (((ca, s), delay_select), whole_net_drive) in elab
@@ -671,12 +711,10 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
             continue;
         }
         let w = elab.signals.get(&n).map(|s| s.width).unwrap_or(0);
-        let span = ca.rhs.span;
-        // A tristate primitive keeps its `ctl ? data : 'z` shape (the
-        // resolution below treats an unknown control specially); only the
-        // data is widened.
         let gate_ctl = gate_tristate_parts(ca).map(|(c, _)| c.clone());
-        let rhs = std::mem::replace(&mut ca.rhs, Expression::new(ExprKind::Empty, span));
+        let ca_full = ca.make_full_mut();
+        let span = ca_full.rhs.span;
+        let rhs = std::mem::replace(&mut ca_full.rhs, Expression::new(ExprKind::Empty, span));
         // §28.12: a drive-strength marker (`$__weak(v, pair)`, a pullup's
         // `$__pull`) stays outermost so the fold still sees the driver's
         // strength; only its value is widened.
@@ -718,19 +756,19 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
         } else {
             Expression::new(ExprKind::Concatenation(parts), span)
         };
-        ca.rhs = match gate_ctl {
+        ca_full.rhs = match gate_ctl {
             Some(ctl) => make_tristate(ctl, widened, span),
             None => widened,
         };
         if let Some((name, rest)) = marker {
             let mut args = vec![std::mem::replace(
-                &mut ca.rhs,
+                &mut ca_full.rhs,
                 Expression::new(ExprKind::Empty, span),
             )];
             args.extend(rest);
-            ca.rhs = make_syscall(&name, args, span);
+            ca_full.rhs = make_syscall(&name, args, span);
         }
-        ca.lhs = make_ident_expr(&n);
+        ca_full.lhs = make_ident_expr(&n);
         ca.set_delay_select(delay_select);
     }
 }
@@ -757,8 +795,8 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
         return;
     }
     for ca in &elab.continuous_assigns {
-        if let Some(n) = ident_flat_name(&ca.lhs)
-            && let Some(c) = drivers.get_mut(&n)
+        if let Some(n) = ca.lhs_ident_name()
+            && let Some(c) = drivers.get_mut(n.as_ref())
         {
             *c += 1;
         }
@@ -859,7 +897,7 @@ fn stage_shared_clocking_outputs(elab: &mut ElaboratedModule) {
         *drivers.entry(canon_of(net)).or_insert(0) += 1;
     }
     for ca in &elab.continuous_assigns {
-        let Some(n) = ident_flat_name(&ca.lhs) else {
+        let Some(n) = ca.lhs_ident_name() else {
             continue;
         };
         let n = canon_of(&n);
@@ -1003,7 +1041,9 @@ fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) -> HashMap<String, u3
         }
     };
     for ca in &elab.continuous_assigns {
-        count(&ca.lhs);
+        if let ContinuousAssignment::Full(f) = ca {
+            count(&f.lhs);
+        }
     }
     for p in &elab.pending_cont_assign {
         count(&p.materialize_lhs());
@@ -1020,8 +1060,10 @@ fn normalize_net_cell_drivers(elab: &mut ElaboratedModule) -> HashMap<String, u3
     }
     let mut assignments = std::mem::take(&mut elab.continuous_assigns);
     for ca in &mut assignments {
-        if fixed_net_cell(elab, &ca.lhs).is_some_and(|(cell, _)| resolve.contains_key(&cell)) {
-            register_fixed_net_cell(elab, &mut ca.lhs);
+        if let ContinuousAssignment::Full(f) = ca
+            && fixed_net_cell(elab, &f.lhs).is_some_and(|(cell, _)| resolve.contains_key(&cell))
+        {
+            register_fixed_net_cell(elab, &mut f.lhs);
         }
     }
     elab.continuous_assigns = assignments;
@@ -1120,6 +1162,24 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         let rest = flat.strip_prefix(top_name.as_str())?.strip_prefix('.')?;
         alias_canon.get(rest).cloned()
     };
+    let alias_lookup_ca = |ca: &ContinuousAssignment| -> Option<String> {
+        if alias_canon.is_empty() {
+            return None;
+        }
+        match ca {
+            ContinuousAssignment::PlainLink { lhs, .. } => {
+                if let Some(c) = alias_lookup_name(lhs.as_str()) {
+                    return Some(c);
+                }
+                if top_shadowed {
+                    return None;
+                }
+                let rest = lhs.as_str().strip_prefix(top_name.as_str())?.strip_prefix('.')?;
+                alias_canon.get(rest).cloned()
+            }
+            ContinuousAssignment::Full(f) => alias_lookup_lhs(&f.lhs),
+        }
+    };
     // §26.2: a package net driven by its qualified name (`assign
     // nets::w = ...`, a port connected to `nets::w`) is the hoisted bare net
     // `w`. Spelled `nets.w` its drivers were never counted together, so a
@@ -1127,7 +1187,8 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // displaces the bare name (`local_decl_displaces`): that is another net.
     if !elab.packages.is_empty() {
         for ca in elab.continuous_assigns.iter_mut() {
-            if let ExprKind::Ident(h) = &ca.lhs.kind
+            if let ContinuousAssignment::Full(f) = ca
+                && let ExprKind::Ident(h) = &f.lhs.kind
                 && h.root.is_none()
                 && h.path.len() == 2
                 && h.path.iter().all(|s| s.selects.is_empty())
@@ -1141,7 +1202,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                     && !elab.wildcard_shadowed.contains(&bare)
                     && !elab.foreign_package_names.contains(&bare)
                 {
-                    ca.lhs = make_ident_expr(&bare);
+                    f.lhs = make_ident_expr(&bare);
                 }
             }
         }
@@ -1173,20 +1234,23 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // drivers resolve replaces it below.
     let mut single: Vec<(String, StrengthDriver)> = Vec::new();
     for ca in &elab.continuous_assigns {
+        let Some(f) = ca.as_full() else {
+            continue;
+        };
         // §23.3.3.3: the connection of an INOUT port is a copy of the net
         // onto itself; it contributes no strength of its own.
-        if ca.rhs_parent_scoped
-            && let Some(f) = ident_flat_name(&ca.lhs)
-            && merged_formals.contains(&f)
+        if f.rhs_parent_scoped
+            && let Some(lhs_name) = ident_flat_name(&f.lhs)
+            && merged_formals.contains(&lhs_name)
         {
             continue;
         }
         // §10.11: the group's members are one net, so the strength a driver
         // records belongs to the group's canonical net.
-        let n = match alias_lookup_lhs(&ca.lhs) {
+        let n = match alias_lookup_lhs(&f.lhs) {
             Some(c) => c,
             None => {
-                let Some(n) = ident_flat_name(&ca.lhs) else {
+                let Some(n) = ident_flat_name(&f.lhs) else {
                     continue;
                 };
                 alias_lookup_name(&n).unwrap_or(n)
@@ -1205,7 +1269,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                     s1: 6,
                 },
             ));
-        } else if let ExprKind::SystemCall { name, args } = &ca.rhs.kind
+        } else if let ExprKind::SystemCall { name, args } = &f.rhs.kind
             && matches!(
                 name.as_str(),
                 "$__supply" | "$__drive" | "$__pull" | "$__weak"
@@ -1242,9 +1306,12 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // (`input wire clk_i`, and §23.2.2.3 implicit-net ports like
     // `input logic clk_i`); leave it to the fan-out.
     let is_hier_port_drive = |ca: &ContinuousAssignment| -> bool {
-        matches!(&ca.lhs.kind,
+        let Some(f) = ca.as_full() else {
+            return false;
+        };
+        matches!(&f.lhs.kind,
             ExprKind::Ident(h) if h.path.len() > 1 && h.path.iter().all(|s| s.selects.is_empty()))
-            && ident_flat_name(&ca.lhs)
+            && ident_flat_name(&f.lhs)
                 .is_some_and(|n| elab.signals.get(&n).is_some_and(|s| s.direction.is_some()))
     };
     // The net a continuous assignment drives, and whether it drives it at
@@ -1254,21 +1321,21 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // a hierarchical drive onto a port of an alias group DOES drive the
     // physical net.
     let driver_net = |ca: &ContinuousAssignment, hier: bool| -> Option<String> {
-        let flat = ident_flat_name(&ca.lhs);
+        let flat = ca.lhs_ident_name();
         // §23.3.3.3: the connection of an INOUT port is a copy of the net
         // onto itself; it drives nothing.
-        if ca.rhs_parent_scoped
+        if ca.rhs_parent_scoped()
             && flat.as_deref().is_some_and(|f| merged_formals.contains(f))
         {
             return None;
         }
-        match alias_lookup_lhs(&ca.lhs) {
+        match alias_lookup_ca(ca) {
             Some(c) => Some(c),
             None => {
                 if hier {
                     None
                 } else {
-                    flat
+                    flat.map(std::borrow::Cow::into_owned)
                 }
             }
         }
@@ -1277,9 +1344,9 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // inlined connect), so counting costs no copy per assign.
     let mut counts: HashMap<std::borrow::Cow<'_, str>, usize> = HashMap::default();
     for ca in &elab.continuous_assigns {
-        if ca.rhs_parent_scoped
-            && let Some(f) = ident_flat_name(&ca.lhs)
-            && merged_formals.contains(&f)
+        if ca.rhs_parent_scoped()
+            && let Some(f) = ca.lhs_ident_name()
+            && merged_formals.contains(f.as_ref())
         {
             // §23.3.3.3: the connection of an INOUT port is a copy of the
             // net onto itself; it drives nothing.
@@ -1287,7 +1354,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         }
         // §10.11: a driver of an alias member drives the group's canonical
         // net, so it is counted there.
-        if let Some(c) = alias_lookup_lhs(&ca.lhs) {
+        if let Some(c) = alias_lookup_ca(ca) {
             *counts
                 .entry(std::borrow::Cow::Owned(c))
                 .or_insert(0) += 1;
@@ -1296,11 +1363,16 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         if is_hier_port_drive(ca) {
             continue;
         }
-        let n = match &ca.lhs.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                Some(std::borrow::Cow::Borrowed(h.path[0].name.name.as_str()))
+        let n = match ca {
+            ContinuousAssignment::PlainLink { lhs, .. } => {
+                Some(std::borrow::Cow::Borrowed(lhs.as_str()))
             }
-            _ => ident_flat_name(&ca.lhs).map(std::borrow::Cow::Owned),
+            ContinuousAssignment::Full(f) => match &f.lhs.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some(std::borrow::Cow::Borrowed(h.path[0].name.name.as_str()))
+                }
+                _ => ident_flat_name(&f.lhs).map(std::borrow::Cow::Owned),
+            },
         };
         if let Some(n) = n {
             *counts.entry(n).or_insert(0) += 1;
@@ -1397,7 +1469,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             if let Some(sig) = elab.signals.get_mut(n)
                 && !sig.is_real
             {
-                sig.value = Value::all_z(sig.width.max(1));
+                sig.value = Value::all_z(sig.width.max(1)).into();
             }
         }
     };
@@ -1529,40 +1601,43 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             let rhs = make_ident_expr(&drv);
             let mut delayed = ca.clone();
             if delayed.origin().is_some() && delayed.delay_select().is_none() {
-                delayed.set_delay_select(continuous_assign_delay_select(&ca.lhs, elab, None));
+                delayed.set_delay_select(continuous_assign_delay_select(&ca.lhs_expr(), elab, None));
             }
-            delayed.lhs = make_ident_expr(&drv);
+            let delayed_full = delayed.make_full_mut();
+            delayed_full.lhs = make_ident_expr(&drv);
             if split_gate_delays.contains(&name)
                 && let Some(fall) = ca.gate_delay_fall()
             {
-                delayed.set_delay_fall(Some(fall));
+                delayed_full.set_delay_fall(Some(fall));
                 elab.gate_driven_nets.insert(drv.clone());
-                if fall != ca.delay {
+                if fall != ca.delay() {
                     elab.gate_fall_delays.insert(drv.clone(), fall);
                 }
             }
+            let ca_full = ca.make_full_mut();
             // A strength marker stays on the folded driver (its level and
             // §28.12 pair); the delayed driver net carries the bare value.
-            let marked = match &ca.rhs.kind {
-                ExprKind::SystemCall { name: m, args } if marker_level(&ca.rhs).is_some() => {
-                    delayed.rhs = args
+            let marked = match &ca_full.rhs.kind {
+                ExprKind::SystemCall { name: m, args } if marker_level(&ca_full.rhs).is_some() => {
+                    delayed_full.rhs = args
                         .first()
                         .cloned()
-                        .unwrap_or_else(|| make_z_expr(ca.rhs.span));
-                    let mut margs = vec![Expression::new(rhs.kind.clone(), ca.rhs.span)];
+                        .unwrap_or_else(|| make_z_expr(ca_full.rhs.span));
+                    let mut margs = vec![Expression::new(rhs.kind.clone(), ca_full.rhs.span)];
                     margs.extend(args.iter().skip(1).cloned());
-                    Some(make_syscall(m, margs, ca.rhs.span))
+                    Some(make_syscall(m, margs, ca_full.rhs.span))
                 }
                 _ => None,
             };
             elab.continuous_assigns.push(delayed);
-            ca.rhs = marked.unwrap_or_else(|| Expression::new(rhs.kind, ca.rhs.span));
-            ca.delay = 0;
-            ca.set_delay_exprs(None);
-            ca.set_delay_fall(None);
-            ca.set_delay_off(None);
+            ca_full.rhs = marked.unwrap_or_else(|| Expression::new(rhs.kind, ca_full.rhs.span));
+            ca_full.delay = 0;
+            ca_full.set_delay_exprs(None);
+            ca_full.set_delay_fall(None);
+            ca_full.set_delay_off(None);
         }
-        let span = ca.rhs.span;
+        let ca_full = ca.into_full();
+        let span = ca_full.rhs.span;
         let slot = folded.entry(name.clone()).or_insert_with(|| {
             order.push(name.clone());
             let split = split_delays.contains(&name);
@@ -1572,9 +1647,9 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 } else {
                     make_ident_expr(&name)
                 },
-                delay: if split { 0 } else { ca.delay },
-                delay_fall: if split { None } else { ca.delay_fall() },
-                delay_off: if split { None } else { ca.delay_off() },
+                delay: if split { 0 } else { ca_full.delay },
+                delay_fall: if split { None } else { ca_full.delay_fall() },
+                delay_off: if split { None } else { ca_full.delay_off() },
                 supply: None,
                 strong: None,
                 weak: None,
@@ -1591,12 +1666,22 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 | Some(ResolvedNetKind::Wor)
                 | Some(ResolvedNetKind::RealSum)
         ) {
-            if let Some((ctl, data)) = gate_tristate_parts(&ca) {
-                slot.tri.push((ctl.clone(), data.clone()));
+            if ca_full.origin().is_none()
+                && let ExprKind::Conditional {
+                    condition: ctl,
+                    then_expr: data,
+                    else_expr,
+                } = &ca_full.rhs.kind
+                && matches!(
+                    else_expr.kind,
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized('z'))
+                )
+            {
+                slot.tri.push((ctl.as_ref().clone(), data.as_ref().clone()));
                 let e = strength.entry(name.clone()).or_default();
                 e.0.push(StrengthDriver {
-                    value: data.clone(),
-                    ctl: Some(ctl.clone()),
+                    value: data.as_ref().clone(),
+                    ctl: Some(ctl.as_ref().clone()),
                     s0: 6,
                     s1: 6,
                 });
@@ -1605,17 +1690,17 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
         // Unwrap a strength marker into the raw value for its level's chain.
-        let marked = marker_level(&ca.rhs);
+        let marked = marker_level(&ca_full.rhs);
         let level = marked.unwrap_or(1);
-        let code = marker_code(&ca.rhs).unwrap_or(6 * 8 + 6);
+        let code = marker_code(&ca_full.rhs).unwrap_or(6 * 8 + 6);
         let rhs = if marked.is_some() {
-            if let ExprKind::SystemCall { args, .. } = ca.rhs.kind {
+            if let ExprKind::SystemCall { args, .. } = ca_full.rhs.kind {
                 args.into_iter().next().unwrap_or_else(|| make_z_expr(span))
             } else {
                 make_z_expr(span)
             }
         } else {
-            ca.rhs
+            ca_full.rhs
         };
         let e = strength.entry(name.clone()).or_default();
         e.0.push(StrengthDriver {
@@ -1820,8 +1905,8 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
         let mut take_drivers = |name: &str| -> Option<Expression> {
             let mut rhs: Vec<Expression> = Vec::new();
             elab.continuous_assigns.retain(|ca| {
-                if ident_flat_name(&ca.lhs).map(&norm).as_deref() == Some(name) {
-                    rhs.push(ca.rhs.clone());
+                if ca.lhs_ident_name().map(|s| norm(s.into_owned())).as_deref() == Some(name) {
+                    rhs.push(ca.rhs_expr().into_owned());
                     false
                 } else {
                     true
@@ -1851,23 +1936,21 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
             span,
         );
 
-        elab.continuous_assigns.push(ContinuousAssignment {
-            lhs: term_a,
-            rhs: make_syscall(
-                "$__tranif",
-                vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
-                span,
-            ),
-            delay: 0,
-            rhs_parent_scoped: true,
-            extras: None,
-        });
-        elab.continuous_assigns.push(ContinuousAssignment {
-            lhs: term_b,
-            rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
-            delay: 0,
-            rhs_parent_scoped: true,
-            extras: None,
-        });
+        elab.continuous_assigns
+            .push(ContinuousAssignment::plain_scoped(
+                term_a,
+                make_syscall(
+                    "$__tranif",
+                    vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
+                    span,
+                ),
+                true,
+            ));
+        elab.continuous_assigns
+            .push(ContinuousAssignment::plain_scoped(
+                term_b,
+                make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
+                true,
+            ));
     }
 }

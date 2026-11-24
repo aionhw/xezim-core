@@ -64,7 +64,7 @@ endmodule
     let pairs: Vec<(String, String)> = m
         .continuous_assigns
         .iter()
-        .map(|ca| (text(&ca.lhs), text(&ca.rhs)))
+        .map(|ca| (text(&ca.lhs_expr()), text(&ca.rhs_expr())))
         .filter(|(l, _)| l.starts_with("w.s.p["))
         .collect();
     assert!(
@@ -97,7 +97,7 @@ endmodule
     let pairs: Vec<_> = m
         .continuous_assigns
         .iter()
-        .map(|ca| (text(&ca.lhs), text(&ca.rhs)))
+        .map(|ca| (text(&ca.lhs_expr()), text(&ca.rhs_expr())))
         .collect();
     for (instance, base) in [("lo", 2), ("hi", 4)] {
         for (sink, indices) in [("up", [base + 1, base]), ("down", [base, base - 1])] {

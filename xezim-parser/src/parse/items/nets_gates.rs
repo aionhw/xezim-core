@@ -99,11 +99,13 @@ impl<'a> Parser<'a> {
         let (delay, delay_fall, delay_off) = delay;
         NetDeclaration {
             net_type,
-            strength,
             data_type,
-            delay: delay.map(Box::new),
-            delay_fall: delay_fall.map(Box::new),
-            delay_off: delay_off.map(Box::new),
+            extras: NetDeclaration::make_extras(
+                strength,
+                delay.map(Box::new),
+                delay_fall.map(Box::new),
+                delay_off.map(Box::new),
+            ),
             declarators,
             span: self.span_from(start),
         }
@@ -274,9 +276,9 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Semicolon);
         GateInstantiation {
             gate_type,
-            delay,
-            delay_fall,
-            delay_off,
+            delay: delay.map(Box::new),
+            delay_fall: delay_fall.map(Box::new),
+            delay_off: delay_off.map(Box::new),
             instances,
             span: self.span_from(start),
         }

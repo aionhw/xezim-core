@@ -657,7 +657,7 @@ impl RegisteredArray {
                     is_signed: value.is_signed,
                     is_real: value.is_real,
                     direction: None,
-                    value,
+                    value: value.into(),
                     type_name: None,
                 },
             );

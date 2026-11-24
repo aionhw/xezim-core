@@ -845,10 +845,12 @@ impl<'a> Binder<'a> {
             }
             ModuleItem::NetDeclaration(d) => {
                 self.data_type(&mut d.data_type);
-                [&mut d.delay, &mut d.delay_fall, &mut d.delay_off]
-                    .into_iter()
-                    .flatten()
-                    .for_each(|e| self.expr(e));
+                if let Some(ex) = d.extras.as_deref_mut() {
+                    [&mut ex.delay, &mut ex.delay_fall, &mut ex.delay_off]
+                        .into_iter()
+                        .flatten()
+                        .for_each(|e| self.expr(e));
+                }
                 for v in &mut d.declarators {
                     v.decl = self.own_decl(&v.name.name);
                     self.unpacked(&mut v.dimensions);

@@ -355,13 +355,13 @@ pub(super) fn class(
                     port.data_type = data_type(&port.data_type, prefix, bindings);
                     hide(&mut method_bindings, &port.name.name);
                     if let Some(e) = &port.default {
-                        port.default = Some(rewrite_expr(
+                        port.default = Some(Box::new(rewrite_expr(
                             e,
                             "",
                             bindings,
                             &empty_names,
                             &empty_interfaces,
-                        ));
+                        )));
                     }
                 }
                 for name in stmt_list_declared_names(body) {

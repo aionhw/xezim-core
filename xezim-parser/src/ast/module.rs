@@ -108,6 +108,6 @@ pub struct AnsiPort {
     pub data_type: Option<DataType>,
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
-    pub default: Option<Expression>,
+    pub default: Option<Box<Expression>>,
     pub span: Span,
 }

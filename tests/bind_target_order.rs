@@ -60,14 +60,10 @@ fn initial_scopes(m: &xezim_core::ElaboratedModule) -> Vec<String> {
 fn assign_targets(m: &xezim_core::ElaboratedModule) -> Vec<String> {
     m.continuous_assigns
         .iter()
-        .map(|c| match &c.lhs.kind {
-            xezim_core::ast::expr::ExprKind::Ident(h) => h
-                .path
-                .iter()
-                .map(|s| s.name.name.as_str())
-                .collect::<Vec<_>>()
-                .join("."),
-            other => panic!("assignment target {other:?}"),
+        .map(|c| {
+            c.lhs_ident_name()
+                .map(|s| s.into_owned())
+                .unwrap_or_else(|| panic!("assignment target {:?}", c.lhs_expr()))
         })
         .collect()
 }

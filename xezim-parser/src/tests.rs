@@ -1165,7 +1165,7 @@ fn net_declaration_strength_pairs_survive_parsing() {
         let crate::ast::decl::ModuleItem::NetDeclaration(net) = &module.items[0] else {
             panic!("net")
         };
-        assert_eq!(net.strength.as_deref(), Some(pair));
+        assert_eq!(net.strength(), Some(pair));
     }
 }
 

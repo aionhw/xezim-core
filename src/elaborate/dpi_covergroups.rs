@@ -26,9 +26,11 @@ pub(super) fn register_class_covergroups(c: &ClassDeclaration, elab: &mut Elabor
         if let ClassItem::Covergroup(cg) = item {
             elab.covergroups
                 .entry(cg.name.name.clone())
-                .or_insert_with(|| cg.clone());
-            elab.covergroups
-                .insert(format!("{}::{}", c.name.name, cg.name.name), cg.clone());
+                .or_insert_with(|| cg.as_ref().clone());
+            elab.covergroups.insert(
+                format!("{}::{}", c.name.name, cg.name.name),
+                cg.as_ref().clone(),
+            );
         }
     }
 }

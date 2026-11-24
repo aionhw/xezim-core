@@ -78,10 +78,10 @@ fn rhs_of(design: &xezim_core::ElaboratedModule, lhs: &str) -> Vec<String> {
     let mut seen = Vec::new();
     for ca in &design.continuous_assigns {
         let mut l = Vec::new();
-        names(&ca.lhs, &mut l);
+        names(&ca.lhs_expr(), &mut l);
         if l.first().map(String::as_str) == Some(lhs) {
             let mut r = Vec::new();
-            names(&ca.rhs, &mut r);
+            names(&ca.rhs_expr(), &mut r);
             return r;
         }
         seen.extend(l);
@@ -174,7 +174,7 @@ endmodule",
     assert!(
         d.continuous_assigns.iter().any(|ca| {
             let mut l = Vec::new();
-            names(&ca.lhs, &mut l);
+            names(&ca.lhs_expr(), &mut l);
             l == ["g.h.s2"]
         }),
         "no continuous assign drives 'g.h.s2'"

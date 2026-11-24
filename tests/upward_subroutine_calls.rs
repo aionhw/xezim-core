@@ -35,17 +35,18 @@ fn callee_of(m: &ElaboratedModule, lhs: &str) -> String {
     let ca = m
         .continuous_assigns
         .iter()
-        .find(|ca| name(&ca.lhs) == lhs)
+        .find(|ca| name(&ca.lhs_expr()) == lhs)
         .unwrap_or_else(|| {
             panic!(
                 "no continuous assign drives {lhs}; have {:?}",
                 m.continuous_assigns
                     .iter()
-                    .map(|ca| name(&ca.lhs))
+                    .map(|ca| name(&ca.lhs_expr()))
                     .collect::<Vec<_>>()
             )
         });
-    match &ca.rhs.kind {
+    let rhs = ca.rhs_expr();
+    match &rhs.kind {
         ExprKind::Call { func, .. } => name(func),
         other => panic!("not a call: {other:?}"),
     }

@@ -31,14 +31,14 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        ModuleItem::GenerateIf(GenerateIf {
+        ModuleItem::GenerateIf(Box::new(GenerateIf {
             branches,
             branch_labels,
             branch_label_decls: Vec::new(),
             branch_direct,
             implicit_name: String::new(),
             span: self.span_from(start),
-        })
+        }))
     }
 
     pub(super) fn parse_generate_case(&mut self, start: u32) -> ModuleItem {
@@ -72,12 +72,12 @@ impl<'a> Parser<'a> {
             });
         }
         self.expect(TokenKind::KwEndcase);
-        ModuleItem::GenerateCase(GenerateCase {
+        ModuleItem::GenerateCase(Box::new(GenerateCase {
             selector,
             arms,
             implicit_name: String::new(),
             span: self.span_from(start),
-        })
+        }))
     }
 
     pub(super) fn parse_generate_branch_items(&mut self) -> Vec<ModuleItem> {

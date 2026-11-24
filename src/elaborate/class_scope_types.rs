@@ -306,7 +306,7 @@ fn default_type_name(class: &ClassTypeScope, param: &str) -> Option<(TypeName, V
             dimensions,
             type_args,
             ..
-        } if dimensions.is_empty() => Some((name.clone(), type_args.clone())),
+        } if dimensions.is_empty() => Some((name.as_ref().clone(), type_args.clone())),
         _ => None,
     }
 }
@@ -341,7 +341,7 @@ fn arg_type_name(e: &Expression) -> Option<(TypeName, Vec<Expression>)> {
                 dimensions,
                 type_args,
                 ..
-            } if dimensions.is_empty() => Some((name.clone(), type_args.clone())),
+            } if dimensions.is_empty() => Some((name.as_ref().clone(), type_args.clone())),
             _ => None,
         },
         // A built-in type keyword argument (`#(byte)`) is no type name.

@@ -601,7 +601,7 @@ pub(super) fn create_target_implicit_nets(
                 width: 1,
                 is_signed: false,
                 direction: None,
-                value: Value::new(1),
+                value: Value::new(1).into(),
                 is_real: false,
                 type_name: None,
             },
@@ -1031,7 +1031,7 @@ pub(super) fn inline_module_items(
                 format!("{}{}", prefix, b.gen_scope)
                     .trim_end_matches('.')
                     .to_string(),
-                b.clone(),
+                b.as_ref().clone(),
             ));
         }
     }

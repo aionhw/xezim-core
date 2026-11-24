@@ -93,8 +93,8 @@ impl<'a> Parser<'a> {
                     None
                 };
                 DataType::Interface {
-                    name,
-                    modport,
+                    name: Box::new(name),
+                    modport: modport.map(Box::new),
                     type_args,
                     span: self.span_from(start),
                 }
@@ -211,8 +211,8 @@ impl<'a> Parser<'a> {
                     None
                 };
                 DataType::Interface {
-                    name,
-                    modport,
+                    name: Box::new(name),
+                    modport: modport.map(Box::new),
                     type_args,
                     span: self.span_from(start),
                 }
@@ -244,7 +244,7 @@ impl<'a> Parser<'a> {
                             bound: Default::default(),
                         };
                         return DataType::TypeReference {
-                            name,
+                            name: Box::new(name),
                             dimensions: Vec::new(),
                             type_args: Vec::new(),
                             span,
@@ -283,15 +283,15 @@ impl<'a> Parser<'a> {
                     let modport = Some(self.parse_identifier());
                     let _dimensions = self.parse_packed_dimensions();
                     DataType::Interface {
-                        name: name.name,
-                        modport,
+                        name: Box::new(name.name),
+                        modport: modport.map(Box::new),
                         type_args: type_args.clone(),
                         span: self.span_from(start),
                     }
                 } else {
                     let dimensions = self.parse_packed_dimensions();
                     DataType::TypeReference {
-                        name,
+                        name: Box::new(name),
                         dimensions,
                         type_args,
                         span: self.span_from(start),

@@ -43,17 +43,17 @@ fn rhs_of(m: &ElaboratedModule, lhs: &str) -> (bool, String) {
     let ca = m
         .continuous_assigns
         .iter()
-        .find(|ca| ident(&ca.lhs).1 == lhs)
+        .find(|ca| ident(&ca.lhs_expr()).1 == lhs)
         .unwrap_or_else(|| {
             panic!(
                 "no continuous assign drives {lhs}; have {:?}",
                 m.continuous_assigns
                     .iter()
-                    .map(|ca| ident(&ca.lhs).1)
+                    .map(|ca| ident(&ca.lhs_expr()).1)
                     .collect::<Vec<_>>()
             )
         });
-    ident(&ca.rhs)
+    ident(&ca.rhs_expr())
 }
 
 const WATCH: &str = r#"

@@ -448,7 +448,13 @@ pub(super) fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut Elaborated
     // path models the §28.9 single-delay INERTIAL behavior (a pulse
     // narrower than the delay is filtered).
     let (delay, fall, off, delay_exprs) = cont_assign_delays(
-        [gi.delay.as_ref(), gi.delay_fall.as_ref(), gi.delay_off.as_ref()], &elab.parameters);
+        [
+            gi.delay.as_deref(),
+            gi.delay_fall.as_deref(),
+            gi.delay_off.as_deref(),
+        ],
+        &elab.parameters,
+    );
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
         // Mark the driven net as gate-driven so the runtime keeps §28.4 truth-
@@ -614,7 +620,7 @@ pub(super) fn lower_udp_instances(
                                     width: 1,
                                     is_signed: false,
                                     direction: None,
-                                    value: Value::new(1),
+                                    value: Value::new(1).into(),
                                     is_real: false,
                                     type_name: None,
                                 },

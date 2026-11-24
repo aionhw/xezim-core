@@ -49,7 +49,7 @@ endmodule
                     _ => {}
                 }
             }
-            check_rhs(&ca.rhs, &mut calls);
+            check_rhs(&ca.rhs_expr(), &mut calls);
         }
         assert_eq!(calls, 1, "{direction}: dropped or repeated pattern item");
     }

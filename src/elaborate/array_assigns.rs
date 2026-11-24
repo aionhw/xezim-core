@@ -761,13 +761,13 @@ pub(super) fn expanded_array_assign_parts(
     driver: &ContinuousAssignment,
     elab: &ElaboratedModule,
 ) -> Option<Vec<ContinuousAssignment>> {
-    let (lhs, rhs, delay) = (&driver.lhs, &driver.rhs, driver.delay);
+    let (lhs, rhs, delay) = (driver.lhs_expr(), driver.rhs_expr(), driver.delay());
     let mut parts = elab
-        .whole_array_driver_parts(lhs, rhs, delay, &elab.unpacked_decl_dims)
+        .whole_array_driver_parts(&lhs, &rhs, delay, &elab.unpacked_decl_dims)
         .or_else(|| {
             slice_array_assign_parts(
-                lhs,
-                rhs,
+                &lhs,
+                &rhs,
                 delay,
                 &elab.arrays,
                 Some(&elab.descending_arrays),
@@ -776,7 +776,7 @@ pub(super) fn expanded_array_assign_parts(
             )
         })
         .or_else(|| {
-            elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t))
+            elab.with_unpacked_array_tables(|t| concat_array_assign_parts(&lhs, &rhs, delay, t))
         })?;
     for part in &mut parts {
         part.inherit_driver_metadata(driver);

@@ -1736,7 +1736,7 @@ fn elaborate_class_in_scope(
                             is_signed,
                             is_real,
                             direction: None,
-                            value: v,
+                            value: v.into(),
                             type_name: get_type_name(&p.data_type).map(SharedName::from),
                         },
                     );
@@ -1771,7 +1771,7 @@ fn elaborate_class_in_scope(
                     property_types.insert(
                         cg_name.clone(),
                         DataType::TypeReference {
-                            name: TypeName {
+                            name: Box::new(TypeName {
                                 scopes: Vec::new(),
                                 name: Identifier {
                                     name: cg_name.clone(),
@@ -1779,7 +1779,7 @@ fn elaborate_class_in_scope(
                                 },
                                 span: cg.name.span,
                                 bound: Default::default(),
-                            },
+                            }),
                             dimensions: Vec::new(),
                             type_args: Vec::new(),
                             span: cg.name.span,
@@ -1794,7 +1794,7 @@ fn elaborate_class_in_scope(
                             is_signed: false,
                             is_real: false,
                             direction: None,
-                            value: Value::new(32),
+                            value: Value::new(32).into(),
                             type_name: Some(cg_name.as_str().into()),
                         },
                     );
@@ -1819,7 +1819,7 @@ fn elaborate_class_in_scope(
                 if m.qualifiers.contains(&ClassQualifier::Static) {
                     static_methods.insert(name.clone());
                 }
-                methods.insert(name, m.clone());
+                methods.insert(name, m.as_ref().clone());
             }
             ClassItem::Constraint(con) => {
                 constraints.insert(con.name.name.clone(), con.clone());
@@ -1937,7 +1937,7 @@ fn elaborate_class_in_scope(
                                     is_signed: is_type_signed(data_type),
                                     is_real: false,
                                     direction: None,
-                                    value: Value::zero(ew),
+                                    value: Value::zero(ew).into(),
                                     type_name: get_type_name(data_type).map(SharedName::from),
                                 },
                             );
@@ -1998,7 +1998,7 @@ fn elaborate_class_in_scope(
                             is_signed: implicit_no_dims || is_type_signed(data_type),
                             is_real: false,
                             direction: None,
-                            value: v,
+                            value: v.into(),
                             type_name: get_type_name(data_type).map(SharedName::from),
                         },
                     );

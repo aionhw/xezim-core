@@ -784,7 +784,7 @@ fn validate_modport_writes(elab: &ElaboratedModule) -> Result<(), String> {
     }
 
     for ca in &elab.continuous_assigns {
-        check_lvalue(&ca.lhs, elab, "continuous assign")?;
+        check_lvalue(&ca.lhs_expr(), elab, "continuous assign")?;
     }
     for ab in &elab.always_blocks {
         walk_stmt(&ab.stmt, elab)?;
@@ -987,8 +987,8 @@ pub(super) fn validate_constant_part_select_bounds(elab: &ElaboratedModule) -> R
         }
     }
     for ca in &elab.continuous_assigns {
-        walk_expr(&ca.lhs, elab)?;
-        walk_expr(&ca.rhs, elab)?;
+        walk_expr(&ca.lhs_expr(), elab)?;
+        walk_expr(&ca.rhs_expr(), elab)?;
     }
     for ab in &elab.always_blocks {
         walk_stmt(&ab.stmt, elab)?;

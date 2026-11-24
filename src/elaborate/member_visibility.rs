@@ -312,14 +312,17 @@ pub(super) fn validate_member_visibility(elab: &ElaboratedModule) -> Result<(), 
     }
     let empty_locals: HashMap<String, crate::ast::types::DataType> = HashMap::default();
     for ca in &elab.continuous_assigns {
+        let Some(f) = ca.as_full() else {
+            continue;
+        };
         record(check_assign_member_visibility(
-            &ca.lhs,
+            &f.lhs,
             elab,
             mod_scope,
             &empty_locals,
         ));
         record(check_assign_member_visibility(
-            &ca.rhs,
+            &f.rhs,
             elab,
             mod_scope,
             &empty_locals,

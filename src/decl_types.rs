@@ -34,9 +34,9 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DeclTypeMap {
-    map: HashMap<String, Rc<DataType>>,
+    map: SharedNameMap<Rc<DataType>>,
     #[serde(skip)]
-    dotted: OnceLock<BTreeSet<String>>,
+    dotted: OnceLock<BTreeSet<SharedName>>,
 }
 
 impl DeclTypeMap {
@@ -68,7 +68,7 @@ impl DeclTypeMap {
         assert!(prefix.contains('.'));
         let keys = self.dotted.get_or_init(|| {
             self.map
-                .keys()
+                .shared_keys()
                 .filter(|key| key.contains('.'))
                 .cloned()
                 .collect()
@@ -88,13 +88,14 @@ impl DeclTypeMap {
     }
     /// Record a type that other signals hold too.
     pub fn insert_shared(&mut self, name: String, ty: Rc<DataType>) -> Option<Rc<DataType>> {
+        let key: SharedName = name.into();
         if let Some(keys) = self.dotted.get_mut()
-            && name.contains('.')
-            && !self.map.contains_key(&name)
+            && key.contains('.')
+            && !self.map.contains_key(key.as_str())
         {
-            keys.insert(name.clone());
+            keys.insert(key.clone());
         }
-        self.map.insert(name, ty)
+        self.map.insert(key, ty)
     }
     pub fn remove(&mut self, name: &str) -> Option<Rc<DataType>> {
         if name.contains('.')
@@ -114,10 +115,10 @@ impl DeclTypeMap {
         self.map.retain(|name, ty| keep(name, ty));
     }
     /// The entries themselves, for code that moves them between tables.
-    pub fn as_map(&self) -> &HashMap<String, Rc<DataType>> {
+    pub fn as_map(&self) -> &SharedNameMap<Rc<DataType>> {
         &self.map
     }
-    pub fn as_map_mut(&mut self) -> &mut HashMap<String, Rc<DataType>> {
+    pub fn as_map_mut(&mut self) -> &mut SharedNameMap<Rc<DataType>> {
         // The caller may change any key.
         self.dotted.take();
         &mut self.map
@@ -125,7 +126,7 @@ impl DeclTypeMap {
     pub fn iter(&self) -> Iter<'_> {
         Iter(self.map.iter())
     }
-    pub fn keys(&self) -> hash_map::Keys<'_, String, Rc<DataType>> {
+    pub fn keys(&self) -> shared_names::Keys<'_, Rc<DataType>> {
         self.map.keys()
     }
     pub fn values(&self) -> impl Iterator<Item = &DataType> {
@@ -140,7 +141,7 @@ impl std::ops::Index<&str> for DeclTypeMap {
     }
 }
 
-pub struct Entry<'a>(hash_map::Entry<'a, String, Rc<DataType>>);
+pub struct Entry<'a>(hash_map::Entry<'a, SharedName, Rc<DataType>>);
 
 impl Entry<'_> {
     pub fn or_insert_with(self, make: impl FnOnce() -> DataType) {
@@ -151,7 +152,7 @@ impl Entry<'_> {
     }
 }
 
-pub struct Iter<'a>(hash_map::Iter<'a, String, Rc<DataType>>);
+pub struct Iter<'a>(shared_names::Iter<'a, Rc<DataType>>);
 
 impl<'a> Iterator for Iter<'a> {
     type Item = (&'a String, &'a DataType);
@@ -481,7 +482,7 @@ mod tests {
         // Bulk mutable access may replace keys without changing the length.
         let raw = types.as_map_mut();
         raw.remove("s.a.b");
-        raw.insert("s.d".into(), Rc::new(ty.clone()));
+        raw.insert("s.d", Rc::new(ty.clone()));
         assert_eq!(members(&types), ["s.c", "s.d"]);
         types.entry("s.e".into()).or_insert(ty.clone());
         types.retain(|name, _| name != "s.c");

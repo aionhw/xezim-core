@@ -164,14 +164,16 @@ pub fn elaborate_module_with_defs(
                             crate::ast::decl::PackageItem::Function(f)
                                 if f.name.scopes.is_empty() =>
                             {
-                                elab.functions
-                                    .insert_if_absent_with(f.name.name.name.clone(), || f.clone());
+                                elab.functions.insert_if_absent_with(
+                                    f.name.name.name.clone(),
+                                    || f.as_ref().clone(),
+                                );
                                 // §26.3: the qualified key — `pkg::f(...)` must
                                 // reach THIS package's declaration even when a
                                 // later package hoists the same bare name.
                                 elab.functions.insert(
                                     format!("{}::{}", p.name.name, f.name.name.name),
-                                    f.clone(),
+                                    f.as_ref().clone(),
                                 );
                                 elab.pkg_subr_owner
                                     .entry(f.name.name.name.clone())
@@ -180,10 +182,10 @@ pub fn elaborate_module_with_defs(
                             crate::ast::decl::PackageItem::Task(t) if t.name.scopes.is_empty() => {
                                 elab.tasks
                                     .entry(t.name.name.name.clone())
-                                    .or_insert_with(|| t.clone());
+                                    .or_insert_with(|| t.as_ref().clone());
                                 elab.tasks.insert(
                                     format!("{}::{}", p.name.name, t.name.name.name),
-                                    t.clone(),
+                                    t.as_ref().clone(),
                                 );
                                 elab.pkg_subr_owner
                                     .entry(t.name.name.name.clone())
@@ -339,7 +341,7 @@ pub fn elaborate_module_with_defs(
             && fd.name.scopes.is_empty()
         {
             elab.functions
-                .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
+                .insert_if_absent_with(fd.name.name.name.clone(), || fd.as_ref().clone());
         }
     }
     crate::oom_trace::checkpoint("elaborate.functions.registered", &[("functions", elab.functions.len())]);
@@ -453,7 +455,7 @@ pub fn elaborate_module_with_defs(
                                             is_signed: is_type_signed(data_type),
                                             is_real: false,
                                             direction: None,
-                                            value: val_v,
+                                            value: val_v.into(),
                                             type_name: None,
                                         },
                                     );
@@ -705,7 +707,7 @@ pub fn elaborate_module_with_defs(
                             is_real,
                             ansi_port_net_type(port),
                         )
-                    }),
+                    }).into(),
                     type_name: port
                         .data_type
                         .as_ref()
@@ -791,7 +793,7 @@ pub fn elaborate_module_with_defs(
                 && fd.name.scopes.is_empty()
             {
                 elab.functions
-                    .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
+                    .insert_if_absent_with(fd.name.name.name.clone(), || fd.as_ref().clone());
             }
         }
         set_funcs_tls(&elab.functions);
@@ -944,7 +946,7 @@ pub fn elaborate_module_with_defs(
                     );
                 }
                 crate::ast::decl::PackageItem::Let(l) => {
-                    elab.lets.insert(l.name.name.clone(), l.clone());
+                    elab.lets.insert(l.name.name.clone(), l.as_ref().clone());
                 }
                 crate::ast::decl::PackageItem::DPIImport(di) => {
                     register_dpi_import(di, &mut elab, Some(p.name.name.as_str()))?;
@@ -1480,7 +1482,7 @@ pub fn elaborate_module_with_defs(
                                     width,
                                     is_real,
                                     pd.net_type,
-                                );
+                                ).into();
                             }
                             if !elab.port_order.contains(&decl.name.name) {
                                 elab.port_order.push(decl.name.name.clone());
@@ -1519,7 +1521,7 @@ pub fn elaborate_module_with_defs(
                             width,
                             is_real,
                             port_decl_net_type(pd),
-                        ),
+                        ).into(),
                         type_name: get_type_name(&pd.data_type).map(SharedName::from),
                     };
                     if !elab.port_order.contains(&decl.name.name) {
@@ -1593,7 +1595,7 @@ pub fn elaborate_module_with_defs(
                     if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_some() {
                             existing.value =
-                                default_net_value(nd.net_type, existing.width, existing.is_real);
+                                default_net_value(nd.net_type, existing.width, existing.is_real).into();
                             // §6.8: port and net signing MERGE — signed if
                             // EITHER declaration says signed (an explicit
                             // `unsigned` on one side does not downgrade the
@@ -1674,7 +1676,7 @@ pub fn elaborate_module_with_defs(
                         is_signed,
                         is_real,
                         direction: None,
-                        value: init_value,
+                        value: init_value.into(),
                         type_name: get_type_name(&nd.data_type).map(SharedName::from),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
@@ -2064,7 +2066,7 @@ pub fn elaborate_module_with_defs(
                             existing.type_name = get_type_name(&dd.data_type).map(SharedName::from);
                             existing.value = if decl_is_real {
                                 Value::from_f64(0.0)
-                            } else {
+.into()                            } else {
                                 default_port_value(
                                     existing.direction,
                                     Some(&dd.data_type),
@@ -2072,7 +2074,7 @@ pub fn elaborate_module_with_defs(
                                     decl_is_real,
                                     None,
                                 )
-                            };
+.into()                            };
                         }
                         if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
@@ -2817,7 +2819,7 @@ pub fn elaborate_module_with_defs(
                                             is_signed: false,
                                             is_real: false,
                                             direction: None,
-                                            value: Value::zero(1),
+                                            value: Value::zero(1).into(),
                                             type_name: Some("event".into()),
                                         },
                                     );
@@ -2966,7 +2968,7 @@ pub fn elaborate_module_with_defs(
                                         is_signed: false,
                                         is_real: false,
                                         direction: None,
-                                        value: Value::from_u64(init_items.len() as u64, 32),
+                                        value: Value::from_u64(init_items.len() as u64, 32).into(),
                                         type_name: None,
                                     };
                                     signals_insert_traced(
@@ -3079,7 +3081,7 @@ pub fn elaborate_module_with_defs(
                             is_signed,
                             is_real,
                             direction: None,
-                            value: init_val,
+                            value: init_val.into(),
                             type_name: get_type_name(&dd.data_type).map(SharedName::from),
                         };
                         signals_insert_traced(
@@ -3126,14 +3128,14 @@ pub fn elaborate_module_with_defs(
                             );
                             // A delayed driver has not arrived yet: the net
                             // starts from its type's default, not the value.
-                            if (ca.delay != 0 || ca.delay_exprs().is_some())
+                            if (ca.delay() != 0 || ca.delay_exprs().is_some())
                                 && let Some(sig) = elab.signals.get_mut(&decl.name.name)
                             {
                                 sig.value = default_value_for_type_resolved(
                                     &dd.data_type,
                                     w,
                                     &elab.typedef_types,
-                                );
+                                ).into();
                             }
                             elab.continuous_assigns.push(ca);
                         }
@@ -3767,7 +3769,7 @@ pub fn elaborate_module_with_defs(
                                                     is_signed: signed,
                                                     is_real: false,
                                                     direction: None,
-                                                    value: val_v,
+                                                    value: val_v.into(),
                                                     type_name: None,
                                                 },
                                             );
@@ -3908,7 +3910,7 @@ pub fn elaborate_module_with_defs(
                                 is_signed: current_signed,
                                 is_real: current_is_real,
                                 direction: None,
-                                value: val,
+                                value: val.into(),
                                 type_name: get_type_name(data_type).map(SharedName::from),
                             },
                         );
@@ -4087,7 +4089,8 @@ pub fn elaborate_module_with_defs(
                 // silently overrides same-named free functions, so a bare call
                 // dispatches the class body without `this` binding.
                 if fd.name.scopes.is_empty() {
-                    elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                    elab.functions
+                        .insert(fd.name.name.name.clone(), fd.as_ref().clone());
                 }
             }
             ModuleItem::TaskDeclaration(td) => {
@@ -4180,7 +4183,8 @@ pub fn elaborate_module_with_defs(
                         ));
                     }
                     elab.note_decl_site(&td.name.name.name, td.name.name.span, "task", true);
-                    elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                    elab.tasks
+                        .insert(td.name.name.name.clone(), td.as_ref().clone());
                 }
             }
             ModuleItem::AliasDecl(terms) => {
@@ -4311,7 +4315,7 @@ pub fn elaborate_module_with_defs(
             ModuleItem::AssertionItem(a) => {
                 elab.initial_blocks.push(InitialBlock {
                     stmt: crate::ast::stmt::Statement::new(
-                        crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                        crate::ast::stmt::StatementKind::Assertion(a.as_ref().clone()),
                         a.span,
                     ),
                     scope: String::new(),
@@ -4349,7 +4353,8 @@ pub fn elaborate_module_with_defs(
                 elaborate_generate_for(gf, &mut elab, cls_defs)?;
             }
             ModuleItem::CovergroupDeclaration(cg) => {
-                elab.covergroups.insert(cg.name.name.clone(), cg.clone());
+                elab.covergroups
+                    .insert(cg.name.name.clone(), cg.as_ref().clone());
             }
             ModuleItem::ClockingDeclaration(cd) => {
                 // §14.12 standalone designation `default clocking <name>;`
@@ -4364,7 +4369,7 @@ pub fn elaborate_module_with_defs(
                         existing.is_default = true;
                     } else {
                         elab.clocking_blocks
-                            .insert(cd.name.name.clone(), cd.clone());
+                            .insert(cd.name.name.clone(), cd.as_ref().clone());
                     }
                     continue;
                 }
@@ -4376,7 +4381,7 @@ pub fn elaborate_module_with_defs(
                     .clocking_blocks
                     .get(&cd.name.name)
                     .is_some_and(|p| p.is_default && p.clock_signal.is_none());
-                let mut cd_owned = cd.clone();
+                let mut cd_owned = cd.as_ref().clone();
                 if was_default {
                     cd_owned.is_default = true;
                 }
@@ -4406,7 +4411,7 @@ pub fn elaborate_module_with_defs(
                 register_nested_classes(cd, &cd.name.name, &mut elab);
             }
             ModuleItem::LetDeclaration(ld) => {
-                elab.lets.insert(ld.name.name.clone(), ld.clone());
+                elab.lets.insert(ld.name.name.clone(), ld.as_ref().clone());
             }
             ModuleItem::SequenceDeclaration(sd) => {
                 if let Some(body) = &sd.body {
@@ -4443,7 +4448,8 @@ pub fn elaborate_module_with_defs(
             // site (the legacy "always-on" shape).
             ModuleItem::CheckerDeclaration(cd) => {
                 elab.sequences.insert(cd.name.name.clone());
-                elab.checker_decls.insert(cd.name.name.clone(), cd.clone());
+                elab.checker_decls
+                    .insert(cd.name.name.clone(), cd.as_ref().clone());
                 let has_ports = !matches!(cd.ports, crate::ast::module::PortList::Empty);
                 if !has_ports {
                     let body = cd.items.clone();
@@ -4528,7 +4534,7 @@ pub fn elaborate_module_with_defs(
                                 is_signed: false,
                                 is_real: false,
                                 direction: None,
-                                value: Value::new(1),
+                                value: Value::new(1).into(),
                                 type_name: Some(inst.module_name.name.as_str().into()),
                             },
                         );
@@ -4612,12 +4618,14 @@ pub fn elaborate_module_with_defs(
                 for it in &p.items {
                     match it {
                         crate::ast::decl::PackageItem::Task(td) if td.name.name.name == sv => {
-                            elab.tasks.entry(q.clone()).or_insert_with(|| td.clone());
+                            elab.tasks
+                                .entry(q.clone())
+                                .or_insert_with(|| td.as_ref().clone());
                             found = true;
                         }
                         crate::ast::decl::PackageItem::Function(fd) if fd.name.name.name == sv => {
                             elab.functions
-                                .insert_if_absent_with(q.clone(), || fd.clone());
+                                .insert_if_absent_with(q.clone(), || fd.as_ref().clone());
                             found = true;
                         }
                         _ => {}
@@ -4728,8 +4736,8 @@ pub fn elaborate_module_with_defs(
         validate_stmt_idents(&ab.stmt, &elab, &mut block_labels.clone())?;
     }
     for ca in &elab.continuous_assigns {
-        validate_expr_idents(&ca.lhs, &elab, &HashSet::default())?;
-        validate_expr_idents(&ca.rhs, &elab, &HashSet::default())?;
+        validate_expr_idents(&ca.lhs_expr(), &elab, &HashSet::default())?;
+        validate_expr_idents(&ca.rhs_expr(), &elab, &HashSet::default())?;
     }
 
     crate::oom_trace::checkpoint("elaborate.identifiers.ready", &[("signals", elab.signals.len())]);

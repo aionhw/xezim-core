@@ -285,7 +285,7 @@ impl<'a> Parser<'a> {
                 let mut class = self.parse_class_declaration();
                 class.virtual_kw = is_virtual;
                 class.is_interface = true;
-                Some(ModuleItem::ClassDeclaration(class))
+                Some(ModuleItem::ClassDeclaration(Box::new(class)))
             }
             _ if self.is_data_type_keyword() => {
                 Some(ModuleItem::DataDeclaration(self.parse_data_declaration()))
@@ -304,9 +304,9 @@ impl<'a> Parser<'a> {
                 let pd = self.parse_parameter_decl_stmt();
                 Some(ModuleItem::LocalparamDeclaration(pd))
             }
-            TokenKind::KwTypedef => Some(ModuleItem::TypedefDeclaration(
+            TokenKind::KwTypedef => Some(ModuleItem::TypedefDeclaration(Box::new(
                 self.parse_typedef_declaration(),
-            )),
+            ))),
             TokenKind::KwAlways
             | TokenKind::KwAlways_comb
             | TokenKind::KwAlways_ff
@@ -325,29 +325,29 @@ impl<'a> Parser<'a> {
                 if matches!(kind, AlwaysKind::Always | AlwaysKind::AlwaysFf) {
                     Self::infer_procedural_assertion_clocks(&mut stmt);
                 }
-                Some(ModuleItem::AlwaysConstruct(AlwaysConstruct {
+                Some(ModuleItem::AlwaysConstruct(Box::new(AlwaysConstruct {
                     kind,
                     stmt,
                     span: self.span_from(start),
                     gen_scope: String::new(),
-                }))
+                })))
             }
             TokenKind::KwInitial => {
                 self.bump();
                 let st = self.parse_statement();
-                Some(ModuleItem::InitialConstruct(InitialConstruct {
+                Some(ModuleItem::InitialConstruct(Box::new(InitialConstruct {
                     stmt: st,
                     span: self.span_from(start),
                     gen_scope: String::new(),
-                }))
+                })))
             }
             TokenKind::KwFinal => {
                 self.bump();
                 let st = self.parse_statement();
-                Some(ModuleItem::FinalConstruct(FinalConstruct {
+                Some(ModuleItem::FinalConstruct(Box::new(FinalConstruct {
                     stmt: st,
                     span: self.span_from(start),
-                }))
+                })))
             }
             // §10.11 `alias a = b [= c ...];` — carried whole; elaboration
             // unifies the named nets onto one signal.
@@ -454,20 +454,24 @@ impl<'a> Parser<'a> {
             }
             TokenKind::KwFunction => {
                 if is_extern {
-                    Some(ModuleItem::FunctionDeclaration(
+                    Some(ModuleItem::FunctionDeclaration(Box::new(
                         self.parse_function_prototype(),
-                    ))
+                    )))
                 } else {
-                    Some(ModuleItem::FunctionDeclaration(
+                    Some(ModuleItem::FunctionDeclaration(Box::new(
                         self.parse_function_declaration(),
-                    ))
+                    )))
                 }
             }
             TokenKind::KwTask => {
                 if is_extern {
-                    Some(ModuleItem::TaskDeclaration(self.parse_task_prototype()))
+                    Some(ModuleItem::TaskDeclaration(Box::new(
+                        self.parse_task_prototype(),
+                    )))
                 } else {
-                    Some(ModuleItem::TaskDeclaration(self.parse_task_declaration()))
+                    Some(ModuleItem::TaskDeclaration(Box::new(
+                        self.parse_task_declaration(),
+                    )))
                 }
             }
             TokenKind::KwImport => {
@@ -494,7 +498,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwClass => {
                 let mut class = self.parse_class_declaration();
                 class.virtual_kw = is_virtual;
-                Some(ModuleItem::ClassDeclaration(class))
+                Some(ModuleItem::ClassDeclaration(Box::new(class)))
             }
             TokenKind::KwConstraint => {
                 // Out-of-class constraint definition: `constraint ClassName::name { ... }`.
@@ -558,7 +562,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwBind => {
                 self.bump(); // bind
                 match self.try_bind_directive() {
-                    Some(b) => Some(ModuleItem::Bind(b)),
+                    Some(b) => Some(ModuleItem::Bind(Box::new(b))),
                     None => Some(ModuleItem::Null),
                 }
             }
@@ -902,7 +906,7 @@ impl<'a> Parser<'a> {
                     name: "default".to_string(),
                     span: self.span_from(start),
                 });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
+                Some(ModuleItem::ClockingDeclaration(Box::new(ClockingDeclaration {
                     name: id,
                     clock_signal: clock_signal_id,
                     clock_bound: Default::default(),
@@ -916,7 +920,7 @@ impl<'a> Parser<'a> {
                     items,
                     endlabel,
                     span: self.span_from(start),
-                }))
+                })))
             }
             // §16.14.4: read and set aside, as a simulator checks no
             // restriction; it was a parse error that lost the rest of the
@@ -926,7 +930,9 @@ impl<'a> Parser<'a> {
                 Some(ModuleItem::Null)
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
-                Some(ModuleItem::AssertionItem(self.parse_assertion_statement()))
+                Some(ModuleItem::AssertionItem(Box::new(
+                    self.parse_assertion_statement(),
+                )))
             }
             TokenKind::KwProperty => {
                 let start = self.current_span().start;
@@ -1022,7 +1028,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::KwEndproperty);
                 let endlabel = self.parse_end_label();
                 let items = Vec::new();
-                Some(ModuleItem::PropertyDeclaration(PropertyDeclaration {
+                Some(ModuleItem::PropertyDeclaration(Box::new(PropertyDeclaration {
                     name,
                     ports,
                     port_defaults,
@@ -1031,7 +1037,7 @@ impl<'a> Parser<'a> {
                     endlabel,
                     span: self.span_from(start),
                     decl: Default::default(),
-                }))
+                })))
             }
             TokenKind::KwSequence => {
                 let start = self.current_span().start;
@@ -1099,7 +1105,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::KwEndsequence);
                 let endlabel = self.parse_end_label();
                 let items = Vec::new();
-                Some(ModuleItem::SequenceDeclaration(SequenceDeclaration {
+                Some(ModuleItem::SequenceDeclaration(Box::new(SequenceDeclaration {
                     name,
                     ports,
                     port_defaults,
@@ -1108,11 +1114,11 @@ impl<'a> Parser<'a> {
                     endlabel,
                     span: self.span_from(start),
                     decl: Default::default(),
-                }))
+                })))
             }
-            TokenKind::KwCovergroup => Some(ModuleItem::CovergroupDeclaration(
+            TokenKind::KwCovergroup => Some(ModuleItem::CovergroupDeclaration(Box::new(
                 self.parse_covergroup_declaration(),
-            )),
+            ))),
             TokenKind::KwDefault => {
                 self.bump();
                 if self.at(TokenKind::KwClocking) {
@@ -1131,21 +1137,23 @@ impl<'a> Parser<'a> {
                         self.bump(); // clocking
                         let name = self.parse_identifier();
                         self.expect(TokenKind::Semicolon);
-                        return Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
-                            name,
-                            clock_signal: None,
-                            clock_bound: Default::default(),
-                            decl: Default::default(),
-                            clock_edge: None,
-                            default_input_skew: None,
-                            default_output_skew: None,
-                            default_output_edge: None,
-                            is_default: true,
-                            signals: Vec::new(),
-                            items: Vec::new(),
-                            endlabel: None,
-                            span: self.span_from(start),
-                        }));
+                        return Some(ModuleItem::ClockingDeclaration(Box::new(
+                            ClockingDeclaration {
+                                name,
+                                clock_signal: None,
+                                clock_bound: Default::default(),
+                                decl: Default::default(),
+                                clock_edge: None,
+                                default_input_skew: None,
+                                default_output_skew: None,
+                                default_output_edge: None,
+                                is_default: true,
+                                signals: Vec::new(),
+                                items: Vec::new(),
+                                endlabel: None,
+                                span: self.span_from(start),
+                            },
+                        )));
                     }
                     // §14.11: mark the block so procedural `##N` knows which
                     // clocking block to synchronize to.
@@ -1166,7 +1174,7 @@ impl<'a> Parser<'a> {
                     let guard = self.parse_expression();
                     self.expect(TokenKind::Semicolon);
                     let span = self.span_from(start);
-                    Some(ModuleItem::AssertionItem(
+                    Some(ModuleItem::AssertionItem(Box::new(
                         crate::ast::stmt::AssertionStatement {
                             kind: crate::ast::stmt::AssertionKind::Assert,
                             expr: Expression::new(
@@ -1186,7 +1194,7 @@ impl<'a> Parser<'a> {
                             inferred_clock: None,
                             span,
                         },
-                    ))
+                    )))
                 } else {
                     None
                 }
@@ -1210,15 +1218,17 @@ impl<'a> Parser<'a> {
                 self.pop_let_scope();
                 self.expect(TokenKind::KwEndchecker);
                 let endlabel = self.parse_end_label();
-                Some(ModuleItem::CheckerDeclaration(CheckerDeclaration {
+                Some(ModuleItem::CheckerDeclaration(Box::new(CheckerDeclaration {
                     name,
                     ports,
                     items,
                     endlabel,
                     span: self.span_from(start),
-                }))
+                })))
             }
-            TokenKind::KwLet => Some(ModuleItem::LetDeclaration(self.parse_let_declaration())),
+            TokenKind::KwLet => Some(ModuleItem::LetDeclaration(Box::new(
+                self.parse_let_declaration(),
+            ))),
             TokenKind::KwNettype => {
                 let start = self.current_span().start;
                 self.bump();
@@ -1230,12 +1240,14 @@ impl<'a> Parser<'a> {
                     None
                 };
                 self.expect(TokenKind::Semicolon);
-                Some(ModuleItem::NettypeDeclaration(NettypeDeclaration {
-                    data_type,
-                    name,
-                    resolver,
-                    span: self.span_from(start),
-                }))
+                Some(ModuleItem::NettypeDeclaration(Box::new(
+                    NettypeDeclaration {
+                        data_type,
+                        name,
+                        resolver,
+                        span: self.span_from(start),
+                    },
+                )))
             }
             TokenKind::KwFor => {
                 let s = self.current_span().start;

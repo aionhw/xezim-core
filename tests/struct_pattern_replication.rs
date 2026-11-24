@@ -27,7 +27,8 @@ endmodule
     );
     assert_eq!(design.continuous_assigns.len(), 4);
     for ca in &design.continuous_assigns {
-        assert!(matches!(ca.rhs.kind, ExprKind::Number(_)), "{:?}", ca.rhs);
+        let rhs = ca.rhs_expr();
+        assert!(matches!(rhs.kind, ExprKind::Number(_)), "{:?}", rhs);
     }
 }
 
@@ -44,7 +45,8 @@ endmodule
 "#,
     );
     assert_eq!(design.parameters["P"].to_u64(), Some(0x12341234));
-    let ExprKind::AssignmentPattern(items) = &design.continuous_assigns[0].rhs.kind else {
+    let rhs = design.continuous_assigns[0].rhs_expr();
+    let ExprKind::AssignmentPattern(items) = &rhs.kind else {
         panic!("pattern retained");
     };
     assert!(matches!(items[0], AssignmentPatternItem::Ordered(_)));
@@ -64,7 +66,8 @@ module top;
 endmodule
 "#
         ));
-        let ExprKind::AssignmentPattern(items) = &design.continuous_assigns[0].rhs.kind else {
+        let rhs = design.continuous_assigns[0].rhs_expr();
+        let ExprKind::AssignmentPattern(items) = &rhs.kind else {
             panic!("pattern retained");
         };
         let AssignmentPatternItem::Ordered(e) = &items[0] else {
@@ -116,7 +119,8 @@ endmodule
     // The structure helper still declines it, preserving that binding path.
     assert_eq!(design.continuous_assigns.len(), 4);
     for ca in &design.continuous_assigns {
-        assert!(matches!(ca.rhs.kind, ExprKind::Number(_)), "{:?}", ca.rhs);
+        let rhs = ca.rhs_expr();
+        assert!(matches!(rhs.kind, ExprKind::Number(_)), "{:?}", rhs);
     }
 }
 
@@ -138,7 +142,8 @@ endmodule
         assert_eq!(design.parameters["P"].to_u64(), Some(0x0707));
         assert_eq!(design.continuous_assigns.len(), 2);
         for ca in &design.continuous_assigns {
-            assert!(matches!(ca.rhs.kind, ExprKind::Number(_)), "{:?}", ca.rhs);
+            let rhs = ca.rhs_expr();
+            assert!(matches!(rhs.kind, ExprKind::Number(_)), "{:?}", rhs);
         }
     }
 }
@@ -165,7 +170,8 @@ module top;
 endmodule
 "#
         ));
-        let ExprKind::AssignmentPattern(items) = &design.continuous_assigns[0].rhs.kind else {
+        let rhs = design.continuous_assigns[0].rhs_expr();
+        let ExprKind::AssignmentPattern(items) = &rhs.kind else {
             panic!("pattern retained");
         };
         assert!(xezim_core::elaborate::struct_pattern_replication(items, members).is_none());
@@ -239,7 +245,8 @@ module top;
 endmodule
 "#
         ));
-        let ExprKind::AssignmentPattern(items) = &design.continuous_assigns[0].rhs.kind else {
+        let rhs = design.continuous_assigns[0].rhs_expr();
+        let ExprKind::AssignmentPattern(items) = &rhs.kind else {
             panic!("pattern retained");
         };
         assert!(
@@ -277,7 +284,8 @@ module top;
 endmodule
 "#
         ));
-        let ExprKind::AssignmentPattern(items) = &design.continuous_assigns[0].rhs.kind else {
+        let rhs = design.continuous_assigns[0].rhs_expr();
+        let ExprKind::AssignmentPattern(items) = &rhs.kind else {
             panic!("pattern retained");
         };
         assert!(
@@ -303,7 +311,8 @@ module top;
 endmodule
 "#,
     );
-    let ExprKind::AssignmentPattern(items) = &design.continuous_assigns[0].rhs.kind else {
+    let rhs = design.continuous_assigns[0].rhs_expr();
+    let ExprKind::AssignmentPattern(items) = &rhs.kind else {
         panic!("pattern retained");
     };
     assert!(xezim_core::elaborate::struct_pattern_replication(items, 2).is_none());

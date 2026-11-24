@@ -181,8 +181,10 @@ fn inline_instantiations_inner(
                     if let crate::ast::decl::PackageItem::Function(fd) = item
                         && fd.name.scopes.is_empty()
                     {
-                        elab.functions
-                            .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
+                        elab.functions.insert_if_absent_with(
+                            fd.name.name.name.clone(),
+                            || fd.as_ref().clone(),
+                        );
                     }
                 }
                 set_funcs_tls(&elab.functions);
@@ -573,7 +575,7 @@ fn inline_instantiations_inner(
                                             is_signed,
                                             is_real: false,
                                             direction: None,
-                                            value: Value::zero(width),
+                                            value: Value::zero(width).into(),
                                             type_name: get_type_name(&dd.data_type).map(SharedName::from),
                                         },
                                     );
@@ -988,7 +990,7 @@ fn inline_instantiations_inner(
                                             is_signed,
                                             is_real,
                                             direction: None,
-                                            value: v.clone(),
+                                            value: v.clone().into(),
                                             type_name: tn.clone(),
                                         },
                                     );
@@ -1001,7 +1003,7 @@ fn inline_instantiations_inner(
                                             is_signed,
                                             is_real,
                                             direction: None,
-                                            value: v,
+                                            value: v.into(),
                                             type_name: tn,
                                         });
                                     continue;
@@ -1081,7 +1083,7 @@ fn inline_instantiations_inner(
                                                 is_signed: false,
                                                 is_real: false,
                                                 direction: None,
-                                                value: Value::from_u64(init_items.len() as u64, 32),
+                                                value: Value::from_u64(init_items.len() as u64, 32).into(),
                                                 type_name: None,
                                             },
                                         );
@@ -1369,27 +1371,39 @@ fn inline_instantiations_inner(
         block.stmt = rewrite_root(&block.stmt);
     }
     for assign in &mut elab.continuous_assigns {
-        if !(root_identity
-            && identity_rewrite::can_preserve_root_cont_assign_expr(&assign.lhs, signals))
-        {
-            assign.lhs = rewrite_expr(
-                &assign.lhs,
-                prefix,
-                &port_map,
-                get_local_names(),
-                &interface_map,
-            );
-        }
-        if !(root_identity
-            && identity_rewrite::can_preserve_root_cont_assign_expr(&assign.rhs, signals))
-        {
-            assign.rhs = rewrite_expr(
-                &assign.rhs,
-                prefix,
-                &port_map,
-                get_local_names(),
-                &interface_map,
-            );
+        match assign {
+            ContinuousAssignment::PlainLink { lhs, rhs, .. } if root_identity => {
+                if !signals.contains_key(lhs.as_str()) || !signals.contains_key(rhs.as_str()) {
+                    let f = assign.make_full_mut();
+                    f.lhs = rewrite_expr(&f.lhs, prefix, &port_map, get_local_names(), &interface_map);
+                    f.rhs = rewrite_expr(&f.rhs, prefix, &port_map, get_local_names(), &interface_map);
+                }
+            }
+            _ => {
+                let f = assign.make_full_mut();
+                if !(root_identity
+                    && identity_rewrite::can_preserve_root_cont_assign_expr(&f.lhs, signals))
+                {
+                    f.lhs = rewrite_expr(
+                        &f.lhs,
+                        prefix,
+                        &port_map,
+                        get_local_names(),
+                        &interface_map,
+                    );
+                }
+                if !(root_identity
+                    && identity_rewrite::can_preserve_root_cont_assign_expr(&f.rhs, signals))
+                {
+                    f.rhs = rewrite_expr(
+                        &f.rhs,
+                        prefix,
+                        &port_map,
+                        get_local_names(),
+                        &interface_map,
+                    );
+                }
+            }
         }
     }
     drop(local_names_cell);

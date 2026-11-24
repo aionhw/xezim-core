@@ -1592,7 +1592,12 @@ mod constant_overlay_tests {
         let ModuleItem::LocalparamDeclaration(pd) = &m.items[1] else { panic!() };
         let ParameterKind::Data { assignments, .. } = &pd.kind else { panic!() };
         let expr = assignments[0].init.as_ref().unwrap();
-        let old = FUNCS_TLS.with(|c| c.replace(Some(Rc::new(HashMap::from_iter([("f".into(),fd.clone())])))));
+        let old = FUNCS_TLS.with(|c| {
+            c.replace(Some(Rc::new(HashMap::from_iter([(
+                "f".into(),
+                fd.as_ref().clone(),
+            )]))))
+        });
         let base = HashMap::from_iter([("P".into(),Value::from_u64(3,32))]);
         let top = HashMap::from_iter([("P".into(),Value::from_u64(9,32))]);
         let env = ParamEnv::Overlay { base: &base, top: &top };

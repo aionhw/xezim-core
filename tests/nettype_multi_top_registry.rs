@@ -46,7 +46,9 @@ fn a_unit_resolver_runs_in_a_multi_top_design() {
         m.nettype_resolvers
     );
     assert!(
-        m.continuous_assigns.iter().any(|ca| calls(&ca.rhs, "rsum")),
+        m.continuous_assigns
+            .iter()
+            .any(|ca| calls(&ca.rhs_expr(), "rsum")),
         "no call of the resolution function"
     );
 }

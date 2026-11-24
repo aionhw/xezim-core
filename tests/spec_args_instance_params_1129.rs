@@ -63,7 +63,7 @@ endmodule
     d.materialize_pending();
     let mut texts = Vec::new();
     for ca in &d.continuous_assigns {
-        spec_texts(&ca.rhs, &mut texts);
+        spec_texts(&ca.rhs_expr(), &mut texts);
     }
     texts.sort();
     assert_eq!(
@@ -99,7 +99,7 @@ endmodule
 "#);
     d.materialize_pending();
     let mut texts = Vec::new();
-    for ca in &d.continuous_assigns { spec_texts(&ca.rhs, &mut texts); }
+    for ca in &d.continuous_assigns { spec_texts(&ca.rhs_expr(), &mut texts); }
     assert_eq!(texts.len(), 2, "{texts:?}");
     for text in texts {
         assert!(!text.contains("u.bus"), "{text}");

@@ -98,9 +98,9 @@ pub(super) fn inline_instantiation_items(
                                     direction: None,
                                     value: if is_real {
                                         Value::from_f64(0.0)
-                                    } else {
+.into()                                    } else {
                                         Value::new(width)
-                                    },
+.into()                                    },
                                     is_real,
                                     type_name: Some(sub_mod_name.as_str().into()),
                                 },
@@ -129,7 +129,7 @@ pub(super) fn inline_instantiation_items(
                                     width: 1,
                                     is_signed: false,
                                     direction: None,
-                                    value: Value::zero(1),
+                                    value: Value::zero(1).into(),
                                     is_real: false,
                                     type_name: Some(sub_mod_name.as_str().into()),
                                 },
@@ -595,7 +595,7 @@ pub(super) fn inline_instantiation_items(
                                     ..
                                 })
                             );
-                            port_defaults.push((name.clone(), def.clone(), is_string));
+                            port_defaults.push((name.clone(), def.as_ref().clone(), is_string));
                         } else if let Some(pull1) = pulled {
                             let lit = Expression::new(
                                 ExprKind::Number(NumberLiteral::UnbasedUnsized(if pull1 {
@@ -724,12 +724,12 @@ pub(super) fn inline_instantiation_items(
                                 });
                             }
                             return Some(DataType::TypeReference {
-                                name: TypeName {
+                                name: Box::new(TypeName {
                                     scopes,
                                     name: hier.path[hier.path.len() - 1].name.clone(),
                                     span: v.span,
                                     bound: Default::default(),
-                                },
+                                }),
                                 dimensions: Vec::new(),
                                 type_args: Vec::new(),
                                 span: v.span,
@@ -743,12 +743,12 @@ pub(super) fn inline_instantiation_items(
                     // deeper.
                     if let Some((scopes, leaf)) = member_access_chain_as_scopes(v) {
                         return Some(DataType::TypeReference {
-                            name: TypeName {
+                            name: Box::new(TypeName {
                                 scopes,
                                 name: leaf,
                                 span: v.span,
                                 bound: Default::default(),
-                            },
+                            }),
                             dimensions: Vec::new(),
                             type_args: Vec::new(),
                             span: v.span,
@@ -1588,7 +1588,7 @@ pub(super) fn inline_instantiation_items(
                         && fd.name.scopes.is_empty()
                     {
                         elab.functions
-                            .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
+                            .insert_if_absent_with(fd.name.name.name.clone(), || fd.as_ref().clone());
                     }
                 }
                 // Incremental — the full-snapshot refresh here was O(N²), see
@@ -1857,7 +1857,7 @@ pub(super) fn inline_instantiation_items(
                                                             is_signed: is_type_signed(data_type),
                                                             is_real: false,
                                                             direction: None,
-                                                            value: val_v,
+                                                            value: val_v.into(),
                                                             type_name: None,
                                                         },
                                                     );
@@ -2425,7 +2425,7 @@ pub(super) fn inline_instantiation_items(
                             is_signed: val.is_signed,
                             is_real: val.is_real,
                             direction: None,
-                            value: val.clone(),
+                            value: val.clone().into(),
                             type_name: None,
                         },
                     );
@@ -2973,7 +2973,7 @@ pub(super) fn inline_instantiation_items(
                                                 is_real,
                                                 ansi_port_net_type(port),
                                             )
-                                        }),
+                                        }).into(),
                                         type_name: port
                                             .data_type
                                             .as_ref()
@@ -3089,7 +3089,7 @@ pub(super) fn inline_instantiation_items(
                                             width: base_width,
                                             is_signed: false,
                                             direction: None,
-                                            value: v,
+                                            value: v.into(),
                                             type_name: None,
                                             is_real: false,
                                         },
@@ -3123,7 +3123,7 @@ pub(super) fn inline_instantiation_items(
                                         width: base_width,
                                         is_signed: false,
                                         direction: None,
-                                        value: sv,
+                                        value: sv.into(),
                                         type_name: None,
                                         is_real: false,
                                     },
@@ -3516,7 +3516,7 @@ pub(super) fn inline_instantiation_items(
                                             width,
                                             port_is_real,
                                             port_decl_net_type(pd),
-                                        ),
+                                        ).into(),
                                         is_real: port_is_real,
                                         type_name: scope_local_type_name(
                                             get_type_name(&pd.data_type),
@@ -3773,7 +3773,7 @@ pub(super) fn inline_instantiation_items(
                                         // twin (§6.6.7).
                                         is_real: net_is_real,
                                         direction: None,
-                                        value: init_value,
+                                        value: init_value.into(),
                                         type_name: scope_local_type_name(
                                             get_type_name(&nd.data_type),
                                             &sub_typedef_names_all,
@@ -3858,7 +3858,7 @@ pub(super) fn inline_instantiation_items(
                                             is_signed: false,
                                             is_real: false,
                                             direction: None,
-                                            value: v,
+                                            value: v.into(),
                                             type_name: None,
                                         },
                                     );
@@ -4318,7 +4318,7 @@ pub(super) fn inline_instantiation_items(
                                             width,
                                             decl_is_real,
                                             None,
-                                        );
+                                        ).into();
                                     }
                                     if is_type_two_state_resolved(
                                         &dd.data_type,
@@ -4926,7 +4926,7 @@ pub(super) fn inline_instantiation_items(
                                                     v.is_signed = is_signed;
                                                 }
                                                 v
-                                            },
+.into()                                            },
                                             is_real: is_type_real_resolved(
                                                 &dd.data_type,
                                                 &elab.typedef_types,
@@ -5037,7 +5037,7 @@ pub(super) fn inline_instantiation_items(
                                         if let Some(asig) = elab.signals.get_mut(&an) {
                                             asig.width = fw;
                                             asig.type_name = ftn;
-                                            asig.value = Value::all_z(fw);
+                                            asig.value = Value::all_z(fw).into();
                                         }
                                         elab.var_decl_types.insert(an.clone(), dt.clone());
                                         for i in lo..=hi {
@@ -5058,9 +5058,9 @@ pub(super) fn inline_instantiation_items(
                                             }
                                             asig.value = if freal {
                                                 Value::from_f64(0.0)
-                                            } else {
+.into()                                            } else {
                                                 Value::all_z(fw)
-                                            };
+.into()                                            };
                                         }
                                     }
                                     // §6.6.8: the interconnect ARRAY's
@@ -5131,9 +5131,9 @@ pub(super) fn inline_instantiation_items(
                                 dst.is_signed = src.is_signed;
                                 dst.type_name = src.type_name.clone();
                                 if dst.is_real {
-                                    dst.value = Value::from_f64(0.0);
+                                    dst.value = Value::from_f64(0.0).into();
                                 } else {
-                                    dst.value = Value::zero(src.width.max(1));
+                                    dst.value = Value::zero(src.width.max(1)).into();
                                 }
                             }
                         }
@@ -5174,13 +5174,13 @@ pub(super) fn inline_instantiation_items(
                         for (sub_expr, parent_elem) in pairs {
                             match prepared_sub.port_directions.get(port_name) {
                                 Some(PortDirection::Input) | Some(PortDirection::Inout) => {
-                                    elab.continuous_assigns.push(ContinuousAssignment {
-                                        lhs: sub_expr,
-                                        rhs: parent_elem,
-                                        delay: 0,
-                                        rhs_parent_scoped: true,
-                                        extras: None,
-                                    });
+                                    elab.continuous_assigns.push(
+                                        ContinuousAssignment::plain_scoped(
+                                            sub_expr,
+                                            parent_elem,
+                                            true,
+                                        ),
+                                    );
                                 }
                                 Some(PortDirection::Output) => {
                                     elab.continuous_assigns.push(ContinuousAssignment::plain(
@@ -5302,7 +5302,7 @@ pub(super) fn inline_instantiation_items(
                     {
                         elab.net_delays.remove(&sub_sig_name);
                     }
-                    let sub_expr = make_ident_expr(&sub_sig_name);
+                    let plain_parent = ContinuousAssignment::plain_ident_name(parent_expr);
                     match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                             // §23.3.3.6: a port connection is an implicit
@@ -5324,37 +5324,23 @@ pub(super) fn inline_instantiation_items(
                                 prepared_sub.port_directions.get(port_name),
                                 Some(PortDirection::Inout)
                             );
-                            let mut rhs = parent_expr.clone();
-                            let fw = elab
-                                .signals
-                                .get(&sub_sig_name)
-                                .map(|s| s.width)
-                                .unwrap_or(0);
-                            let is_real_port = elab
-                                .signals
-                                .get(&sub_sig_name)
-                                .map(|s| s.is_real)
-                                .unwrap_or(false);
-                            if is_inout && !is_real_port && fw > 0 {
-                                if let Some(aw) = port_conn_width(parent_expr, elab) {
-                                    if aw > 0 && aw < fw {
-                                        let span = parent_expr.span;
-                                        let zfill = Expression::new(
-                                            ExprKind::Number(
-                                                crate::ast::expr::NumberLiteral::Integer {
-                                                    size: Some(fw - aw),
-                                                    signed: false,
-                                                    base: crate::ast::expr::NumberBase::Binary,
-                                                    value: "z".to_string(),
-                                                    cached_val: crate::ast::cache::LiteralCache::new(None),
-                                                },
-                                            ),
-                                            span,
-                                        );
-                                        rhs = Expression::new(
-                                            ExprKind::Concatenation(vec![zfill, rhs]),
-                                            span,
-                                        );
+                            let mut zfill_width: Option<u32> = None;
+                            if is_inout {
+                                let fw = elab
+                                    .signals
+                                    .get(&sub_sig_name)
+                                    .map(|s| s.width)
+                                    .unwrap_or(0);
+                                let is_real_port = elab
+                                    .signals
+                                    .get(&sub_sig_name)
+                                    .map(|s| s.is_real)
+                                    .unwrap_or(false);
+                                if !is_real_port && fw > 0 {
+                                    if let Some(aw) = port_conn_width(parent_expr, elab) {
+                                        if aw > 0 && aw < fw {
+                                            zfill_width = Some(fw - aw);
+                                        }
                                     }
                                 }
                             }
@@ -5362,28 +5348,71 @@ pub(super) fn inline_instantiation_items(
                                 input_connects
                                     .push((port_name.clone(), elab.continuous_assigns.len()));
                             }
-                            elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: sub_expr,
-                                rhs,
-                                delay: 0,
-                                rhs_parent_scoped: true,
-                                extras: None,
-                            });
+                            if zfill_width.is_none()
+                                && let Some(parent_name) = plain_parent
+                            {
+                                elab.continuous_assigns.push(ContinuousAssignment::plain_link(
+                                    sub_sig_name.as_str(),
+                                    parent_name,
+                                    true,
+                                ));
+                            } else {
+                                let sub_expr = make_ident_expr(&sub_sig_name);
+                                let mut rhs = parent_expr.clone();
+                                if let Some(zw) = zfill_width {
+                                    let span = parent_expr.span;
+                                    let zfill = Expression::new(
+                                        ExprKind::Number(
+                                            crate::ast::expr::NumberLiteral::Integer {
+                                                size: Some(zw),
+                                                signed: false,
+                                                base: crate::ast::expr::NumberBase::Binary,
+                                                value: "z".to_string(),
+                                                cached_val: crate::ast::cache::LiteralCache::new(
+                                                    None,
+                                                ),
+                                            },
+                                        ),
+                                        span,
+                                    );
+                                    rhs = Expression::new(
+                                        ExprKind::Concatenation(vec![zfill, rhs]),
+                                        span,
+                                    );
+                                }
+                                elab.continuous_assigns.push(ContinuousAssignment::plain_scoped(
+                                    sub_expr, rhs, true,
+                                ));
+                            }
                         }
                         Some(PortDirection::Output) => {
-                            elab.continuous_assigns.push(ContinuousAssignment::plain(
-                                parent_expr.clone(),
-                                sub_expr,
-                            ));
+                            if let Some(parent_name) = plain_parent {
+                                elab.continuous_assigns.push(ContinuousAssignment::plain_link(
+                                    parent_name,
+                                    sub_sig_name.as_str(),
+                                    false,
+                                ));
+                            } else {
+                                elab.continuous_assigns.push(ContinuousAssignment::plain(
+                                    parent_expr.clone(),
+                                    make_ident_expr(&sub_sig_name),
+                                ));
+                            }
                         }
                         _ => {
-                            elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: sub_expr,
-                                rhs: parent_expr.clone(),
-                                delay: 0,
-                                rhs_parent_scoped: true,
-                                extras: None,
-                            });
+                            if let Some(parent_name) = plain_parent {
+                                elab.continuous_assigns.push(ContinuousAssignment::plain_link(
+                                    sub_sig_name.as_str(),
+                                    parent_name,
+                                    true,
+                                ));
+                            } else {
+                                elab.continuous_assigns.push(ContinuousAssignment::plain_scoped(
+                                    make_ident_expr(&sub_sig_name),
+                                    parent_expr.clone(),
+                                    true,
+                                ));
+                            }
                         }
                     }
                 }
@@ -5889,10 +5918,10 @@ pub(super) fn inline_instantiation_items(
                                         pname,
                                     )
                                     && elab.continuous_assigns.get(*idx).is_some_and(|ca| {
-                                        ca.delay == 0
+                                        ca.delay() == 0
                                             && ca.delay_fall().is_none()
                                             && ca.delay_off().is_none()
-                                            && ident_flat_name(&ca.lhs).as_deref()
+                                            && ca.lhs_ident_name().as_deref()
                                                 == Some(formal.as_str())
                                     });
                                 if elidable {
@@ -6258,7 +6287,7 @@ pub(super) fn inline_instantiation_items(
                     .effective_items
                     .iter()
                     .filter_map(|item| match item {
-                        ModuleItem::ClassDeclaration(c) => Some(c),
+                        ModuleItem::ClassDeclaration(c) => Some(c.as_ref()),
                         _ => None,
                     })
                     .collect();
@@ -6268,7 +6297,7 @@ pub(super) fn inline_instantiation_items(
                     .zip(prepared_sub.body_sources.iter())
                 {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
-                        let mut new_fd = fd.clone();
+                        let mut new_fd = fd.as_ref().clone();
                         new_fd.name.name.name = cat2(&inst_prefix, &fd.name.name.name);
                         // Return-type width can also use a module parameter.
                         new_fd.return_type = scope_local_typeref(&rewrite_data_type_genvar(
@@ -6297,13 +6326,13 @@ pub(super) fn inline_instantiation_items(
                             }
                             for p in &mut new_fd.ports {
                                 if let Some(def) = &p.default {
-                                    p.default = Some(rewrite_expr(
+                                    p.default = Some(Box::new(rewrite_expr(
                                         def,
                                         &inst_prefix,
                                         &rewrite_port_map,
                                         &fn_locals,
                                         &sub_interface_map,
-                                    ));
+                                    )));
                                 }
                             }
                         }
@@ -6408,7 +6437,7 @@ pub(super) fn inline_instantiation_items(
                         register_instance_dpi_export(e, &inst_prefix, elab);
                     }
                     if let ModuleItem::TaskDeclaration(td) = sub_item {
-                        let mut new_td = td.clone();
+                        let mut new_td = td.as_ref().clone();
                         new_td.name.name.name = cat2(&inst_prefix, &td.name.name.name);
                         for p in &mut new_td.ports {
                             bake_formal_type(p);
@@ -6424,13 +6453,13 @@ pub(super) fn inline_instantiation_items(
                             }
                             for p in &mut new_td.ports {
                                 if let Some(def) = &p.default {
-                                    p.default = Some(rewrite_expr(
+                                    p.default = Some(Box::new(rewrite_expr(
                                         def,
                                         &inst_prefix,
                                         &rewrite_port_map,
                                         &task_locals,
                                         &sub_interface_map,
-                                    ));
+                                    )));
                                 }
                             }
                         }
@@ -6504,7 +6533,7 @@ pub(super) fn inline_instantiation_items(
                             cg_locals.remove(&p.name.name);
                             cg_ports.remove(&p.name.name);
                         }
-                        let mut new_cg = cg.clone();
+                        let mut new_cg = cg.as_ref().clone();
                         new_cg.for_each_expr_mut(&mut |e| {
                             *e = rewrite_expr(
                                 e,
@@ -6545,7 +6574,7 @@ pub(super) fn inline_instantiation_items(
                                 _ => cat2(&inst_prefix, &name),
                             }
                         };
-                        let mut new_cd = cd.clone();
+                        let mut new_cd = cd.as_ref().clone();
                         new_cd.name.name = cat2(&inst_prefix, &cd.name.name);
                         if let Some(clk) = &cd.clock_signal {
                             new_cd.clock_signal = Some(crate::ast::Identifier {
@@ -6645,10 +6674,10 @@ pub(super) fn inline_instantiation_items(
                             // delay, so a parameter they name (`and #(D)`)
                             // resolves per instance at materialize time.
                             // Passing None ran every inlined gate undelayed.
-                            let delay_rc = gi.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                            let delay_rc = gi.delay.as_deref().map(|d| std::rc::Rc::new(d.clone()));
                             let delay_fall_rc =
-                                gi.delay_fall.as_ref().map(|d| std::rc::Rc::new(d.clone()));
-                            let delay_off_rc = gi.delay_off.as_ref().cloned().map(std::rc::Rc::new);
+                                gi.delay_fall.as_deref().map(|d| std::rc::Rc::new(d.clone()));
+                            let delay_off_rc = gi.delay_off.as_deref().cloned().map(std::rc::Rc::new);
                             for (lhs_rc, rhs_rc) in pairs {
                                 // §28.4: mark the driven net gate-driven, as
                                 // `gate_inst_to_assigns` does at the top level,
@@ -6687,9 +6716,9 @@ pub(super) fn inline_instantiation_items(
                             let rc =
                                 |d: Option<&Expression>| d.map(|d| std::rc::Rc::new(d.clone()));
                             let (delay_rc, delay_fall_rc, delay_off_rc) = (
-                                rc(nd.delay.as_deref()),
-                                rc(nd.delay_fall.as_deref()),
-                                rc(nd.delay_off.as_deref()),
+                                rc(nd.delay()),
+                                rc(nd.delay_fall()),
+                                rc(nd.delay_off()),
                             );
                             for (lhs_rc, rhs_rc) in inits {
                                 elab.pending_cont_assign.push(PendingContAssign::new(
@@ -6699,7 +6728,7 @@ pub(super) fn inline_instantiation_items(
                                     std::rc::Rc::clone(&pend_ctx),
                                     // §6.7: `wire (weak0, weak1) w = v;`
                                     // drives with the declaration's strength.
-                                    nd.strength.clone(),
+                                    nd.strength().map(str::to_string),
                                     delay_rc.clone(),
                                     delay_fall_rc.clone(),
                                     delay_off_rc.clone(),

@@ -49,8 +49,10 @@ pub(super) fn struct_array_copy_parts(
     elab: &ElaboratedModule,
     ca: &ContinuousAssignment,
 ) -> Option<Vec<ContinuousAssignment>> {
-    let (lhs_path, lhs_dims, lhs_su) = struct_array_side(elab, &ca.lhs)?;
-    let (rhs_path, rhs_dims, rhs_su) = struct_array_side(elab, &ca.rhs)?;
+    let ca_lhs = ca.lhs_expr();
+    let ca_rhs = ca.rhs_expr();
+    let (lhs_path, lhs_dims, lhs_su) = struct_array_side(elab, &ca_lhs)?;
+    let (rhs_path, rhs_dims, rhs_su) = struct_array_side(elab, &ca_rhs)?;
     let lhs_base = lhs_path.split('[').next().unwrap_or(&lhs_path);
     // §6.22.2 / §7.6: both sides name the same element type (one
     // declaration, whatever spelling reached it: `S` through an import and
@@ -92,10 +94,12 @@ pub(super) fn struct_array_copy_parts(
         lhs_indices
             .into_iter()
             .zip(rhs_indices)
-            .map(|(lhs_indices, rhs_indices)| ContinuousAssignment {
-                lhs: lhs_indices.into_iter().fold(ca.lhs.clone(), index_expr),
-                rhs: rhs_indices.into_iter().fold(ca.rhs.clone(), index_expr),
-                ..ca.clone()
+            .map(|(lhs_indices, rhs_indices)| {
+                ContinuousAssignment::with_same_metadata(
+                    lhs_indices.into_iter().fold(ca_lhs.clone().into_owned(), index_expr),
+                    rhs_indices.into_iter().fold(ca_rhs.clone().into_owned(), index_expr),
+                    ca,
+                )
             })
             .collect(),
     )
@@ -215,7 +219,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     let mut out: Vec<ContinuousAssignment> = Vec::new();
     let has_fixed_arrays = !elab.unpacked_decl_dims.is_empty();
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        if let Some((base, su)) = struct_target(elab, &ca.lhs) {
+        if let Some((base, su)) = struct_target(elab, &ca.lhs_expr()) {
             expand_struct_driver(elab, &ca, &base, &su, &mut out);
             continue;
         }
@@ -229,7 +233,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
             continue;
         };
         for part in parts {
-            match struct_target(elab, &part.lhs) {
+            match struct_target(elab, &part.lhs_expr()) {
                 Some((base, su)) => expand_struct_driver(elab, &part, &base, &su, &mut out),
                 None => out.push(part),
             }
@@ -431,7 +435,7 @@ fn qualify_nettype_pattern_types(
                                 && key != k.name
                             {
                                 let dt = DataType::TypeReference {
-                                    name: TypeName {
+                                    name: Box::new(TypeName {
                                         scopes: Vec::new(),
                                         name: Identifier {
                                             name: key,
@@ -439,7 +443,7 @@ fn qualify_nettype_pattern_types(
                                         },
                                         span: k.span,
                                         bound: Default::default(),
-                                    },
+                                    }),
                                     dimensions: Vec::new(),
                                     type_args: Vec::new(),
                                     span: k.span,
@@ -874,15 +878,16 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     };
     for ca in std::mem::take(&mut elab.continuous_assigns) {
         let scope = ca.origin().map_or("", |(_, s)| s.as_ref());
-        let Some(lhs_name) = driver_net(elab, &ca.lhs, scope).filter(|n| net_resolver.contains_key(n))
+        let Some(lhs_name) = driver_net(elab, &ca.lhs_expr(), scope).filter(|n| net_resolver.contains_key(n))
         else {
             // §6.6.7, §23.3.3: a port connection of a resolver-less
             // unpacked-struct net arrives member by member (`n.V = u.p.V`).
             // It joins the two nets for the one-driver count, as the
             // whole-net link below does, and stays an ordinary assignment.
-            let joined = ident_flat_name(&ca.lhs)
+            let joined = ca
+                .lhs_ident_name()
                 .and_then(|l| net_member(&l))
-                .zip(ident_flat_name(&ca.rhs).and_then(|r| net_member(&r)))
+                .zip(ca.rhs_ident_name().and_then(|r| net_member(&r)))
                 .filter(|((ln, lm), (rn, rm))| {
                     lm == rm
                         && ln != rn
@@ -893,7 +898,8 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 if let (Some(&a), Some(&b)) = (net_id.get(&ln), net_id.get(&rn)) {
                     dsu.union(a, b);
                 }
-            } else if let Some((net, m)) = ident_flat_name(&ca.lhs)
+            } else if let Some((net, m)) = ca
+                .lhs_ident_name()
                 .and_then(|l| net_member(&l))
                 .filter(|(net, _)| net_resolver[net].is_empty())
             {
@@ -919,7 +925,12 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         // assignment is not a merge even though both ends are nettype nets.
         // An element select on the RHS (`u.i = a[0]`) is likewise a directional
         // read of the element, whose own fold writes the element's storage.
-        if let Some(rhs_name) = ca.origin().is_none().then(|| driver_net(elab, &ca.rhs, scope)).flatten() {
+        if let Some(rhs_name) = ca
+            .origin()
+            .is_none()
+            .then(|| driver_net(elab, &ca.rhs_expr(), scope))
+            .flatten()
+        {
             if net_resolver.contains_key(&rhs_name) && rhs_name != lhs_name {
                 if let (Some(&a), Some(&b)) = (net_id.get(&lhs_name), net_id.get(&rhs_name)) {
                     dsu.union(a, b);
@@ -927,8 +938,9 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 continue;
             }
         }
+        let ca_delay = ca.delay();
         if let std::collections::hash_map::Entry::Vacant(entry) = delays.entry(lhs_name.clone()) {
-            entry.insert(ca.delay);
+            entry.insert(ca_delay);
             order.push(lhs_name.clone());
         }
         let scope = ca
@@ -938,7 +950,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         real_drivers
             .entry(lhs_name)
             .or_default()
-            .push((ca.rhs, ca.delay, scope));
+            .push((ca.into_full().rhs, ca_delay, scope));
     }
 
     // Choose a deterministic representative name for each component:
@@ -1134,13 +1146,18 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         // §7.2, §7.4: an unpacked array member has no storage
                         // of its own; each element is its own leaf, and gets
                         // that element of the resolved value (§6.6.7).
-                        let template = ContinuousAssignment {
-                            lhs: mlhs.clone(),
-                            rhs: mrhs.clone(),
+                        let template = ContinuousAssignment::with_extras(
+                            mlhs.clone(),
+                            mrhs.clone(),
                             delay,
-                            rhs_parent_scoped: true,
-                            extras: None,
-                        };
+                            true,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
                         emit_member_elem_assigns(
                             mlhs,
                             mrhs,
@@ -1158,25 +1175,35 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         );
                         continue;
                     }
-                    kept.push(ContinuousAssignment {
-                        lhs: mlhs,
-                        rhs: mrhs,
+                    kept.push(ContinuousAssignment::with_extras(
+                        mlhs,
+                        mrhs,
                         delay,
-                        rhs_parent_scoped: true,
-                        extras: None,
-                    });
+                        true,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ));
                 }
             }
             None => {
-                kept.push(ContinuousAssignment {
+                kept.push(ContinuousAssignment::with_extras(
                     // §6.6.8: an element name (`a[0]`) must emit a real
                     // Index LHS, not a flat ident literally named `a[0]`.
-                    lhs: net_expr(elab, lhs),
+                    net_expr(elab, lhs),
                     rhs,
                     delay,
-                    rhs_parent_scoped: true,
-                    extras: None,
-                })
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
             }
         }
     };
@@ -1408,12 +1435,12 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     if !member_drivers.is_empty() && !comp_members.is_empty() {
         let mut kept_lhs: HashSet<String> = HashSet::default();
         for ca in &kept {
-            if let Some(lhs) = ident_flat_name(&ca.lhs) {
+            if let Some(lhs) = ca.lhs_ident_name() {
                 if let Some((net, m)) = net_member(&lhs) {
                     let head = m.split(['.', '[']).next().unwrap_or(&m);
                     kept_lhs.insert(format!("{net}.{head}"));
                 } else {
-                    kept_lhs.insert(lhs);
+                    kept_lhs.insert(lhs.into_owned());
                 }
             }
         }
@@ -1636,10 +1663,13 @@ pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
             )
     }
     fn ca_needs_vpi_stage(ca: &ContinuousAssignment, elab: &ElaboratedModule) -> bool {
-        if ca.origin().is_none() || cont_assign_has_own_delay(ca) || !rhs_needs_vpi_stage(&ca.rhs) {
+        let Some(f) = ca.as_full() else {
+            return false;
+        };
+        if ca.origin().is_none() || cont_assign_has_own_delay(ca) || !rhs_needs_vpi_stage(&f.rhs) {
             return false;
         }
-        whole_net_ident_name_scoped(&ca.lhs, elab).is_some_and(|name| {
+        whole_net_ident_name_scoped(&f.lhs, elab).is_some_and(|name| {
             is_net_name(elab, &name) && elab.signals.contains_key(name.as_str())
         })
     }
@@ -1676,13 +1706,14 @@ pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
     elab.continuous_assigns = Vec::with_capacity(old.len() + staged_count);
     for mut ca in old {
         let signal = ca_needs_vpi_stage(&ca, elab)
-            .then(|| whole_net_ident_name_scoped(&ca.lhs, elab))
+            .then(|| whole_net_ident_name_scoped(&ca.lhs_expr(), elab))
             .flatten()
             .and_then(|name| elab.signals.get(name.as_str()))
             .cloned();
         if let Some(mut signal) = signal {
             // Keep strength on the contribution consumed by the resolver.
-            let rhs = match &mut ca.rhs {
+            let f = ca.make_full_mut();
+            let rhs = match &mut f.rhs {
                 Expression {
                     kind: ExprKind::SystemCall { name, args },
                     ..
@@ -1710,9 +1741,11 @@ pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
                 // again would call that type's resolution function twice.
                 signal.type_name = None;
                 elab.signals.insert(stage.clone(), signal);
-                let mut producer = ca.clone();
-                producer.lhs = make_ident_expr(&stage);
-                producer.rhs = value;
+                let producer = ContinuousAssignment::with_same_metadata(
+                    make_ident_expr(&stage),
+                    value,
+                    &ca,
+                );
                 ca.set_origin(None);
                 elab.continuous_assigns.push(producer);
             }

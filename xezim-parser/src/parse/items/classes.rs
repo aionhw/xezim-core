@@ -359,25 +359,25 @@ impl<'a> Parser<'a> {
                 if is_pure || is_extern {
                     let func = self.parse_function_prototype();
                     if is_pure {
-                        ClassItem::Method(ClassMethod {
+                        ClassItem::Method(Box::new(ClassMethod {
                             qualifiers,
                             kind: ClassMethodKind::PureVirtual(func),
                             span: self.span_from(start),
-                        })
+                        }))
                     } else {
-                        ClassItem::Method(ClassMethod {
+                        ClassItem::Method(Box::new(ClassMethod {
                             qualifiers,
                             kind: ClassMethodKind::Extern(func),
                             span: self.span_from(start),
-                        })
+                        }))
                     }
                 } else {
                     let func = self.parse_function_declaration();
-                    ClassItem::Method(ClassMethod {
+                    ClassItem::Method(Box::new(ClassMethod {
                         qualifiers,
                         kind: ClassMethodKind::Function(func),
                         span: self.span_from(start),
-                    })
+                    }))
                 }
             }
             TokenKind::KwTask => {
@@ -385,18 +385,18 @@ impl<'a> Parser<'a> {
                 let is_extern = qualifiers.contains(&ClassQualifier::Extern);
                 if is_pure || is_extern {
                     let task = self.parse_task_prototype();
-                    ClassItem::Method(ClassMethod {
+                    ClassItem::Method(Box::new(ClassMethod {
                         qualifiers,
                         kind: ClassMethodKind::Task(task),
                         span: self.span_from(start),
-                    })
+                    }))
                 } else {
                     let task = self.parse_task_declaration();
-                    ClassItem::Method(ClassMethod {
+                    ClassItem::Method(Box::new(ClassMethod {
                         qualifiers,
                         kind: ClassMethodKind::Task(task),
                         span: self.span_from(start),
-                    })
+                    }))
                 }
             }
             TokenKind::KwConstraint => {
@@ -426,14 +426,16 @@ impl<'a> Parser<'a> {
                     span: self.span_from(start),
                 }))
             }
-            TokenKind::KwTypedef => ClassItem::Typedef(self.parse_typedef_declaration()),
+            TokenKind::KwTypedef => ClassItem::Typedef(Box::new(self.parse_typedef_declaration())),
             TokenKind::KwParameter | TokenKind::KwLocalparam => {
                 let pd = self.parse_parameter_declaration();
                 self.expect(TokenKind::Semicolon);
                 ClassItem::Parameter(pd)
             }
-            TokenKind::KwClass => ClassItem::Class(self.parse_class_declaration()),
-            TokenKind::KwCovergroup => ClassItem::Covergroup(self.parse_covergroup_declaration()),
+            TokenKind::KwClass => ClassItem::Class(Box::new(self.parse_class_declaration())),
+            TokenKind::KwCovergroup => {
+                ClassItem::Covergroup(Box::new(self.parse_covergroup_declaration()))
+            }
             TokenKind::KwImport => ClassItem::Import(self.parse_import_declaration()),
             _ if self.is_data_type_keyword()
                 || self.at(TokenKind::Identifier)

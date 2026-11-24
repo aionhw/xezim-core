@@ -313,6 +313,9 @@ impl<V> SharedNameMap<V> {
     pub fn keys(&self) -> Keys<'_, V> {
         Keys(self.0.keys())
     }
+    pub fn shared_keys(&self) -> hash_map::Keys<'_, SharedName, V> {
+        self.0.keys()
+    }
     pub fn shared_key<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<&SharedName>
     where
         SharedName: Borrow<Q>,

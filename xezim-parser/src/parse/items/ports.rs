@@ -404,11 +404,8 @@ impl<'a> Parser<'a> {
                 } else {
                     ModuleItem::NetDeclaration(NetDeclaration {
                         net_type: net_type.unwrap_or(NetType::Wire),
-                        strength: None,
                         data_type,
-                        delay: None,
-                        delay_fall: None,
-                        delay_off: None,
+                        extras: None,
                         declarators: vec![NetDeclarator {
                             decl: crate::ast::binding::Bound::UNSET,
                             name: v.name,
@@ -510,8 +507,8 @@ impl<'a> Parser<'a> {
                 None
             };
             Some(DataType::Interface {
-                name: if_name,
-                modport,
+                name: Box::new(if_name),
+                modport: modport.map(Box::new),
                 type_args: Vec::new(),
                 span: self.span_from(start),
             })
@@ -525,11 +522,11 @@ impl<'a> Parser<'a> {
                 None
             };
             Some(DataType::Interface {
-                name: crate::ast::Identifier {
+                name: Box::new(crate::ast::Identifier {
                     name: "interface".to_string(),
                     span: self.span_from(start),
-                },
-                modport,
+                }),
+                modport: modport.map(Box::new),
                 type_args: Vec::new(),
                 span: self.span_from(start),
             })
@@ -547,8 +544,8 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::Dot);
             let mp_name = self.parse_identifier();
             Some(DataType::Interface {
-                name: if_name,
-                modport: Some(mp_name),
+                name: Box::new(if_name),
+                modport: Some(Box::new(mp_name)),
                 type_args: Vec::new(),
                 span: self.span_from(start),
             })
@@ -615,7 +612,7 @@ impl<'a> Parser<'a> {
         let name = self.parse_identifier();
         dimensions.extend(self.parse_unpacked_dimensions());
         let default = if self.eat(TokenKind::Assign).is_some() {
-            Some(self.parse_expression())
+            Some(Box::new(self.parse_expression()))
         } else {
             None
         };

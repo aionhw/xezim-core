@@ -314,7 +314,8 @@ pub use value::Value;
 ///         serialization merged with upstream driver-transition and scope fixes (#721).
 /// \x71 retains edge and condition metadata on module paths for SDF matching.
 /// \x72 drops elaboration-only `decl_sites` from compiled artifacts (#721).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x72";
+/// \x73 stores compact `SignalValue` and `ContinuousAssignment::PlainLink` encodings (#721).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x73";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1617,8 +1618,8 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 ast::Description::Package(p) => Some(&p.name.name),
                 // File-scope classes, for the file:line of their methods in
                 // code coverage.
-                ast::Description::Class(c)
-                | ast::Description::PackageItem(ast::decl::PackageItem::Class(c)) => {
+                ast::Description::Class(c) => Some(&c.name.name),
+                ast::Description::PackageItem(ast::decl::PackageItem::Class(c)) => {
                     Some(&c.name.name)
                 }
                 _ => None,
@@ -2595,23 +2596,23 @@ fn parse_and_elaborate(
                 definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Let(l)) => {
-                top_level_lets.push(l);
+                top_level_lets.push(*l);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Function(mut f)) => {
                 let (u, p) = untimed_scope_exp(module_timescales.get("$unit").copied());
                 elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
-                top_level_functions.push(f);
+                top_level_functions.push(*f);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Task(mut t)) => {
                 let (u, p) = untimed_scope_exp(module_timescales.get("$unit").copied());
                 elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
-                top_level_tasks.push(t);
+                top_level_tasks.push(*t);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
-                top_level_nettypes.push(n);
+                top_level_nettypes.push(*n);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::DPIImport(di)) => {
-                top_level_dpi_imports.push(di);
+                top_level_dpi_imports.push(*di);
             }
             ast::Description::DPIImport(di) => {
                 top_level_dpi_imports.push(di);
@@ -2620,7 +2621,7 @@ fn parse_and_elaborate(
                 top_level_dpi_exports.push(e);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::DPIExport(e)) => {
-                top_level_dpi_exports.push(e);
+                top_level_dpi_exports.push(*e);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Parameter(p)) => {
                 top_level_params.push(p);
@@ -2634,7 +2635,7 @@ fn parse_and_elaborate(
                 top_level_nets.push(n);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Covergroup(cg)) => {
-                top_level_covergroups.push(cg);
+                top_level_covergroups.push(*cg);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Property(pd)) => {
                 top_level_assertion_decls.push(ast::decl::ModuleItem::PropertyDeclaration(pd));
@@ -3110,7 +3111,7 @@ fn parse_and_elaborate(
                     if let Some(items) = subst_body(&f.items, &f.ports) {
                         f.items = items.into();
                     }
-                    items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
+                    items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(Box::new(f)));
                 }
                 for t in top_level_tasks.iter().rev() {
                     if needed_unit_subs.as_ref().is_some_and(|needed| {
@@ -3122,10 +3123,13 @@ fn parse_and_elaborate(
                     if let Some(items) = subst_body(&t.items, &t.ports) {
                         t.items = items.into();
                     }
-                    items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t));
+                    items.insert(0, ast::decl::ModuleItem::TaskDeclaration(Box::new(t)));
                 }
                 for n in top_level_nettypes.iter().rev() {
-                    items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+                    items.insert(
+                        0,
+                        ast::decl::ModuleItem::NettypeDeclaration(Box::new(n.clone())),
+                    );
                 }
                 for di in top_level_dpi_imports.iter().rev() {
                     let name = unit_subroutine_usage::dpi_import_name(di);
@@ -3181,7 +3185,10 @@ fn parse_and_elaborate(
                             if x.name.name == cg.name.name)
                     });
                     if !own {
-                        items.insert(0, ast::decl::ModuleItem::CovergroupDeclaration(cg.clone()));
+                        items.insert(
+                            0,
+                            ast::decl::ModuleItem::CovergroupDeclaration(Box::new(cg.clone())),
+                        );
                     }
                 }
                 // §3.12.1: keep shadowed constants under their qualified
@@ -3924,9 +3931,10 @@ fn parse_and_elaborate(
             // two tops a net's resolution function never ran and the
             // one-driver rule was never checked.
             for n in top_level_nettypes.iter().rev() {
-                wrapper
-                    .items
-                    .insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
+                wrapper.items.insert(
+                    0,
+                    ast::decl::ModuleItem::NettypeDeclaration(Box::new(n.clone())),
+                );
             }
             let wrapper_name = wrapper.name.name.clone();
             definitions.insert(
@@ -4028,7 +4036,7 @@ fn parse_and_elaborate(
             top_level_functions
                 .iter()
                 .cloned()
-                .map(ast::decl::ModuleItem::FunctionDeclaration),
+                .map(|f| ast::decl::ModuleItem::FunctionDeclaration(Box::new(f))),
         );
         elaborate::elaborate_module_with_defs(
             elaborate::Definition::Module(&unit),

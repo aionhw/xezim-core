@@ -29,14 +29,14 @@ pub enum DataType {
     Enum(EnumType),
     Void(Span),
     TypeReference {
-        name: TypeName,
+        name: Box<TypeName>,
         dimensions: Vec<PackedDimension>,
         type_args: Vec<expr::Expression>,
         span: Span,
     },
     Interface {
-        name: Identifier,
-        modport: Option<Identifier>,
+        name: Box<Identifier>,
+        modport: Option<Box<Identifier>>,
         type_args: Vec<expr::Expression>,
         span: Span,
     },

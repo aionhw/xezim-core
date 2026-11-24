@@ -449,15 +449,13 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
         ModuleItem::NetDeclaration(nd) => {
             let mut new_nd = nd.clone();
             new_nd.data_type = gen_type(&nd.data_type);
-            for d in [
-                &mut new_nd.delay,
-                &mut new_nd.delay_fall,
-                &mut new_nd.delay_off,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                **d = gen_expr(d);
+            if let Some(ex) = new_nd.extras.as_deref_mut() {
+                for d in [&mut ex.delay, &mut ex.delay_fall, &mut ex.delay_off]
+                    .into_iter()
+                    .flatten()
+                {
+                    **d = gen_expr(d);
+                }
             }
             for d in &mut new_nd.declarators {
                 gen_rename(d.decl, &mut d.name.name);
@@ -533,26 +531,28 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             }
             ModuleItem::ModuleInstantiation(new_mi)
         }
-        ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(AlwaysConstruct {
+        ModuleItem::AlwaysConstruct(ac) => ModuleItem::AlwaysConstruct(Box::new(AlwaysConstruct {
             kind: ac.kind,
             stmt: gen_stmt(&ac.stmt),
             span: ac.span,
             gen_scope: ac.gen_scope.clone(),
-        }),
-        ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
-            stmt: gen_stmt(&ic.stmt),
-            span: ic.span,
-            gen_scope: ic.gen_scope.clone(),
-        }),
+        })),
+        ModuleItem::InitialConstruct(ic) => {
+            ModuleItem::InitialConstruct(Box::new(InitialConstruct {
+                stmt: gen_stmt(&ic.stmt),
+                span: ic.span,
+                gen_scope: ic.gen_scope.clone(),
+            }))
+        }
         // §27.4/§16.14.1: assertion predicates and actions refer to this
         // iteration's declarations, just like initial/always bodies. Keeping
         // the item unchanged bound a shadowed counter to the parent module.
         ModuleItem::AssertionItem(a) => {
-            let st = Statement::new(StatementKind::Assertion(a.clone()), a.span);
+            let st = Statement::new(StatementKind::Assertion(a.as_ref().clone()), a.span);
             let StatementKind::Assertion(a) = gen_stmt(&st).kind else {
                 unreachable!()
             };
-            ModuleItem::AssertionItem(a)
+            ModuleItem::AssertionItem(Box::new(a))
         }
         // §23.9 / §27.6: a block's function or task is renamed with its data
         // (`g.f`); its return type and formals may read the block's
@@ -635,12 +635,12 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
                     direct: arm.direct,
                 })
                 .collect();
-            ModuleItem::GenerateCase(GenerateCase {
+            ModuleItem::GenerateCase(Box::new(GenerateCase {
                 selector: gen_expr(&gc.selector),
                 arms: new_arms,
                 implicit_name: gc.implicit_name.clone(),
                 span: gc.span,
-            })
+            }))
         }
         ModuleItem::GenerateFor(gf) => {
             // Inner generate-for: its own iteration loop renames further.
@@ -693,7 +693,7 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
         ModuleItem::FinalConstruct(fc) => fc.stmt = gen_stmt(&fc.stmt),
         ModuleItem::GateInstantiation(g) => {
             for d in [&mut g.delay, &mut g.delay_fall, &mut g.delay_off].into_iter().flatten() {
-                *d = gen_expr(d);
+                **d = gen_expr(d);
             }
             for t in g.instances.iter_mut().flat_map(|i| i.terminals.iter_mut()) {
                 *t = gen_expr(t);
@@ -710,7 +710,7 @@ fn rename_item_refs(item: &ModuleItem) -> ModuleItem {
         ModuleItem::LetDeclaration(l) => {
             if let PortList::Ansi(ps) = &mut l.ports {
                 for p in ps.iter_mut() {
-                    p.default = p.default.as_ref().map(gen_expr);
+                    p.default = p.default.as_deref().map(|e| Box::new(gen_expr(e)));
                 }
             }
             l.expr = gen_expr(&l.expr);
@@ -853,7 +853,7 @@ fn rename_subroutine_ports(ports: &mut [FunctionPort]) {
     for p in ports {
         p.data_type = gen_type(&p.data_type);
         p.dimensions = gen_dims(&p.dimensions);
-        p.default = p.default.as_ref().map(gen_expr);
+        p.default = p.default.as_deref().map(|e| Box::new(gen_expr(e)));
     }
 }
 
@@ -1298,14 +1298,14 @@ pub(super) fn assertion_item_in_gen_scope(item: &mut ModuleItem, scope: &str) {
     if let ModuleItem::AssertionItem(a) = item {
         let span = a.span;
         let stmt = crate::ast::stmt::Statement::new(
-            crate::ast::stmt::StatementKind::Assertion(a.clone()),
+            crate::ast::stmt::StatementKind::Assertion(a.as_ref().clone()),
             span,
         );
-        *item = ModuleItem::InitialConstruct(crate::ast::decl::InitialConstruct {
+        *item = ModuleItem::InitialConstruct(Box::new(crate::ast::decl::InitialConstruct {
             stmt,
             span,
             gen_scope: scope.to_string(),
-        });
+        }));
     }
 }
 

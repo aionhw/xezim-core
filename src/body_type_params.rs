@@ -19,7 +19,7 @@ pub(crate) fn normalize(descriptions: &mut [Description]) {
                     if let PackageItem::Parameter(pd) = &item
                         && let Some(aliases) = aliases(pd)
                     {
-                        items.extend(aliases.into_iter().map(PackageItem::Typedef));
+                        items.extend(aliases.into_iter().map(|t| PackageItem::Typedef(Box::new(t))));
                         continue;
                     }
                     if let PackageItem::Class(c) = &mut item {
@@ -59,7 +59,7 @@ fn class(c: &mut ClassDeclaration) {
         if let ClassItem::Parameter(pd) = &item
             && let Some(aliases) = aliases(pd)
         {
-            items.extend(aliases.into_iter().map(ClassItem::Typedef));
+            items.extend(aliases.into_iter().map(|t| ClassItem::Typedef(Box::new(t))));
             continue;
         }
         if let ClassItem::Class(c) = &mut item {

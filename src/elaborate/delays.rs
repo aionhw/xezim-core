@@ -570,11 +570,13 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
             }
             // `wire #2 w = a;` — a net declaration delay likewise.
             ModuleItem::NetDeclaration(nd) => {
-                for d in [&mut nd.delay, &mut nd.delay_fall, &mut nd.delay_off]
-                    .into_iter()
-                    .flatten()
-                {
-                    rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                if let Some(ex) = nd.extras.as_deref_mut() {
+                    for d in [&mut ex.delay, &mut ex.delay_fall, &mut ex.delay_off]
+                        .into_iter()
+                        .flatten()
+                    {
+                        rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                    }
                 }
             }
             // `buf #(4) g(y, a);` — gate delays likewise count timeunits.
@@ -787,7 +789,7 @@ pub(super) fn net_declaration_driver(
     init: &Expression,
     elab: &mut ElaboratedModule,
 ) -> Expression {
-    let Some(strength) = &nd.strength else {
+    let Some(strength) = nd.strength() else {
         return init.clone();
     };
     let mut s1 = String::new();
@@ -829,7 +831,7 @@ pub(super) fn net_decl_assign_delay(
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,
 ) -> (u64, Option<u64>, Option<u64>, Option<DelayExpressions>) {
-    cont_assign_delays([nd.delay.as_deref(), nd.delay_fall.as_deref(), nd.delay_off.as_deref()], params)
+    cont_assign_delays([nd.delay(), nd.delay_fall(), nd.delay_off()], params)
 }
 
 /// §6.7.1 / §10.3.3: the NET delay of `decl` (declared by `nd`) as (rise,
@@ -847,7 +849,7 @@ pub(super) fn net_delay_of(
     nd: &crate::ast::decl::NetDeclaration,
     params: &HashMap<String, Value>,
 ) -> Option<(u64, Option<u64>, Option<u64>, Option<DelayExpressions>)> {
-    nd.delay.as_ref()?;
+    nd.delay()?;
     if decl.init.is_some() || !decl.dimensions.is_empty() {
         return None;
     }

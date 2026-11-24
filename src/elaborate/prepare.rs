@@ -917,7 +917,7 @@ pub(super) fn prepare_module_items(
                 // used to fall to `Other` and vanish: no site, no failure, ever.
                 ModuleItem::AssertionItem(a) => BodySource::Initial(
                     std::rc::Rc::new(crate::ast::stmt::Statement::new(
-                        crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                        crate::ast::stmt::StatementKind::Assertion(a.as_ref().clone()),
                         a.span,
                     )),
                     String::new(),

@@ -489,7 +489,7 @@ pub(super) fn hoist_package_params(
         for item in &p.items {
             if let crate::ast::decl::PackageItem::Let(l) = item {
                 elab.lets
-                    .insert(format!("{}::{}", p.name.name, l.name.name), l.clone());
+                    .insert(format!("{}::{}", p.name.name, l.name.name), l.as_ref().clone());
             }
         }
     }
@@ -502,9 +502,11 @@ pub(super) fn hoist_package_params(
                 continue;
             }
             elab.functions
-                .insert_if_absent_with(f.name.name.name.clone(), || f.clone());
-            elab.functions
-                .insert(format!("{}::{}", p.name.name, f.name.name.name), f.clone());
+                .insert_if_absent_with(f.name.name.name.clone(), || f.as_ref().clone());
+            elab.functions.insert(
+                format!("{}::{}", p.name.name, f.name.name.name),
+                f.as_ref().clone(),
+            );
             elab.pkg_subr_owner
                 .entry(f.name.name.name.clone())
                 .or_insert_with(|| p.name.name.clone());
@@ -547,7 +549,7 @@ pub(super) fn hoist_package_params(
                 }
                 let key = f.name.name.name.clone();
                 fn_overlay.push((key.clone(), elab.functions.get(&key).cloned()));
-                elab.functions.insert(key, f.clone());
+                elab.functions.insert(key, f.as_ref().clone());
             }
             // Sequential bare visibility of this package's OWN params while
             // its inits are evaluated (`LOG2(SZ)` — the formal binds the bare

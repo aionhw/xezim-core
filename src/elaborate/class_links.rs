@@ -10,7 +10,7 @@ pub fn null_init_class_handles(elab: &mut ElaboratedModule) {
     for sig in elab.signals.values_mut() {
         if let Some(tn) = &sig.type_name {
             if cls_names.contains(tn.as_str()) {
-                sig.value = Value::zero(sig.width);
+                sig.value = Value::zero(sig.width).into();
             }
         }
     }
@@ -109,7 +109,7 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
                             attach(
                                 scope,
                                 f.name.name.name.clone(),
-                                ClassMethodKind::Function(f.clone()),
+                                ClassMethodKind::Function(f.as_ref().clone()),
                                 f.span,
                             );
                         }
@@ -124,7 +124,7 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
                             attach(
                                 scope,
                                 t.name.name.name.clone(),
-                                ClassMethodKind::Task(t.clone()),
+                                ClassMethodKind::Task(t.as_ref().clone()),
                                 t.span,
                             );
                         }
@@ -229,7 +229,7 @@ where
                 attach(
                     scope,
                     f.name.name.name.clone(),
-                    ClassMethodKind::Function(f.clone()),
+                    ClassMethodKind::Function(f.as_ref().clone()),
                     f.span,
                 );
             }
@@ -244,7 +244,7 @@ where
                 attach(
                     scope,
                     t.name.name.name.clone(),
-                    ClassMethodKind::Task(t.clone()),
+                    ClassMethodKind::Task(t.as_ref().clone()),
                     t.span,
                 );
             }

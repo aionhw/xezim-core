@@ -71,7 +71,7 @@ pub(super) fn elaborate_items(
                                     width,
                                     is_real,
                                     pd.net_type,
-                                );
+                                ).into();
                             }
                             if !elab.port_order.contains(&decl.name.name) {
                                 elab.port_order.push(decl.name.name.clone());
@@ -109,7 +109,7 @@ pub(super) fn elaborate_items(
                             width,
                             is_real,
                             port_decl_net_type(pd),
-                        ),
+                        ).into(),
                         is_real,
                         type_name: get_type_name(&pd.data_type).map(SharedName::from),
                     };
@@ -149,7 +149,7 @@ pub(super) fn elaborate_items(
                         width,
                         is_signed,
                         direction: None,
-                        value: init_value,
+                        value: init_value.into(),
                         is_real,
                         type_name: get_type_name(&nd.data_type).map(SharedName::from),
                     };
@@ -678,7 +678,7 @@ pub(super) fn elaborate_items(
                                         is_signed: false,
                                         is_real: false,
                                         direction: None,
-                                        value: Value::from_u64(init_items.len() as u64, 32),
+                                        value: Value::from_u64(init_items.len() as u64, 32).into(),
                                         type_name: None,
                                     };
                                     signals_insert_traced(
@@ -741,7 +741,7 @@ pub(super) fn elaborate_items(
                             is_signed,
                             is_real,
                             direction: None,
-                            value: init_val,
+                            value: init_val.into(),
                             type_name: get_type_name(&dd.data_type).map(SharedName::from),
                         };
                         signals_insert_traced(
@@ -945,7 +945,7 @@ pub(super) fn elaborate_items(
                                         width: 1,
                                         is_signed: false,
                                         direction: None,
-                                        value: pv,
+                                        value: pv.into(),
                                         is_real: false,
                                         type_name: get_type_name(data_type).map(SharedName::from),
                                     },
@@ -1002,7 +1002,7 @@ pub(super) fn elaborate_items(
                                     width,
                                     is_signed: signed,
                                     direction: None,
-                                    value: val,
+                                    value: val.into(),
                                     is_real,
                                     type_name: get_type_name(data_type).map(SharedName::from),
                                 },
@@ -1097,7 +1097,7 @@ pub(super) fn elaborate_items(
             ModuleItem::AssertionItem(a) => {
                 elab.initial_blocks.push(InitialBlock {
                     stmt: crate::ast::stmt::Statement::new(
-                        crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                        crate::ast::stmt::StatementKind::Assertion(a.as_ref().clone()),
                         a.span,
                     ),
                     scope: String::new(),
@@ -1129,7 +1129,7 @@ pub(super) fn elaborate_items(
                                 width: 1,
                                 is_signed: false,
                                 direction: None,
-                                value: Value::new(1),
+                                value: Value::new(1).into(),
                                 type_name: Some(inst.module_name.name.as_str().into()),
                                 is_real: false,
                             },
@@ -1218,7 +1218,7 @@ pub(super) fn elaborate_items(
                         existing.is_default = true;
                     } else {
                         elab.clocking_blocks
-                            .insert(cd.name.name.clone(), cd.clone());
+                            .insert(cd.name.name.clone(), cd.as_ref().clone());
                     }
                     continue;
                 }
@@ -1230,7 +1230,7 @@ pub(super) fn elaborate_items(
                     .clocking_blocks
                     .get(&cd.name.name)
                     .is_some_and(|p| p.is_default && p.clock_signal.is_none());
-                let mut cd_owned = cd.clone();
+                let mut cd_owned = cd.as_ref().clone();
                 if was_default {
                     cd_owned.is_default = true;
                 }
@@ -1238,7 +1238,7 @@ pub(super) fn elaborate_items(
                 elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::LetDeclaration(ld) => {
-                elab.lets.insert(ld.name.name.clone(), ld.clone());
+                elab.lets.insert(ld.name.name.clone(), ld.as_ref().clone());
             }
             ModuleItem::SequenceDeclaration(sd) => {
                 if let Some(body) = &sd.body {
@@ -1447,7 +1447,8 @@ pub(super) fn elaborate_items(
                 // Same scope filter as above: out-of-class method definitions
                 // must not override free functions.
                 if fd.name.scopes.is_empty() {
-                    elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                    elab.functions
+                        .insert(fd.name.name.name.clone(), fd.as_ref().clone());
                 }
             }
             ModuleItem::TaskDeclaration(td) => {
@@ -1505,7 +1506,8 @@ pub(super) fn elaborate_items(
                 // Same scope filter: don't let out-of-class method definitions
                 // override free tasks in the module namespace.
                 if td.name.scopes.is_empty() {
-                    elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                    elab.tasks
+                        .insert(td.name.name.name.clone(), td.as_ref().clone());
                 }
             }
             ModuleItem::ImportDeclaration(imp) => {

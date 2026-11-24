@@ -265,9 +265,10 @@ pub(super) fn expand_struct_driver(
     out: &mut Vec<ContinuousAssignment>,
 ) {
     let start = out.len();
+    let ca_rhs = ca.rhs_expr();
     emit_struct_member_assigns(
         &make_ident_expr(base),
-        &ca.rhs,
+        &ca_rhs,
         su,
         ca,
         &elab.typedef_types,
@@ -277,7 +278,7 @@ pub(super) fn expand_struct_driver(
         out,
         0,
     );
-    if ca.delay == 0 || out.len() - start < 2 || ca.delay_fall().is_some() || ca.delay_off().is_some() {
+    if ca.delay() == 0 || out.len() - start < 2 || ca.delay_fall().is_some() || ca.delay_off().is_some() {
         return;
     }
     fn leaf_name(e: &Expression, elab: &ElaboratedModule) -> Option<String> {
@@ -296,7 +297,7 @@ pub(super) fn expand_struct_driver(
     let defaults: Option<Vec<_>> = out[start..]
         .iter()
         .map(|leaf| {
-            let name = leaf_name(&leaf.lhs, elab)?;
+            let name = leaf_name(&leaf.lhs_expr(), elab)?;
             if let Some(sig) = elab.signals.get(&name) {
                 return (!sig.is_real && sig.width > 0).then(|| sig.value.resize(sig.width));
             }
@@ -335,7 +336,7 @@ pub(super) fn expand_struct_driver(
     };
     let initial = Value::concat(&defaults);
     let width = initial.width;
-    let span = ca.lhs.span;
+    let span = ca.as_full().map_or(Span::dummy(), |f| f.lhs.span);
     let mut seq = start;
     let stage = loop {
         let name = format!("{base}$structdelay{seq}");
@@ -354,7 +355,7 @@ pub(super) fn expand_struct_driver(
             is_real: false,
             type_name: None,
             direction: None,
-            value: initial,
+            value: initial.into(),
         },
     );
     let mut parts = Vec::with_capacity(defaults.len());
@@ -371,20 +372,23 @@ pub(super) fn expand_struct_driver(
             span,
         );
         hi = lo;
-        let rhs = std::mem::replace(&mut leaf.rhs, slice);
+        let leaf_full = leaf.make_full_mut();
+        let rhs = std::mem::replace(&mut leaf_full.rhs, slice);
         parts.push(make_syscall(
             "$__xz_size_cast",
             vec![int_literal(i64::from(initial.width), span), rhs],
             span,
         ));
-        leaf.delay = 0;
+        leaf.set_delay(0);
         leaf.set_delay_exprs(None);
         leaf.set_origin(None);
         leaf.set_delay_select(None);
     }
-    let mut delayed = ca.clone();
-    delayed.lhs = make_ident_expr(&stage);
-    delayed.rhs = Expression::new(ExprKind::Concatenation(parts), span);
+    let delayed = ContinuousAssignment::with_same_metadata(
+        make_ident_expr(&stage),
+        Expression::new(ExprKind::Concatenation(parts), span),
+        ca,
+    );
     out.push(delayed);
 }
 
@@ -394,7 +398,10 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
     }
     let mut expanded: Vec<ContinuousAssignment> = Vec::new();
     for ca in std::mem::take(&mut elab.continuous_assigns) {
-        let members = simple_lhs_name(&ca.lhs)
+        let members = match &ca {
+            ContinuousAssignment::PlainLink { lhs, .. } => Some(lhs.to_string()),
+            ContinuousAssignment::Full(f) => simple_lhs_name(&f.lhs),
+        }
             .and_then(|n| {
                 let tn = elab.signals.get(&n).and_then(|s| s.type_name.clone())?;
                 Some((n, tn))
@@ -539,7 +546,7 @@ pub(super) fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &st
             is_signed: false,
             is_real: false,
             direction: None,
-            value: Value::new(w),
+            value: Value::new(w).into(),
             type_name: None,
         });
         if let Some(fields) =

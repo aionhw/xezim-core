@@ -648,7 +648,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                         is_signed: enum_signed,
                         is_real: false,
                         direction: None,
-                        value: v,
+                        value: v.into(),
                         type_name: Some(td.name.name.as_str().into()),
                     },
                 );

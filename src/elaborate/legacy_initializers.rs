@@ -50,7 +50,7 @@ fn initial_assignment(name: &Identifier, value: Expression) -> ModuleItem {
         ident.span = value.span;
         ident.path[0].name.span = value.span;
     }
-    ModuleItem::InitialConstruct(InitialConstruct {
+    ModuleItem::InitialConstruct(Box::new(InitialConstruct {
         stmt: Statement::new(
             StatementKind::BlockingAssign {
                 lvalue,
@@ -60,7 +60,7 @@ fn initial_assignment(name: &Identifier, value: Expression) -> ModuleItem {
         ),
         span: name.span,
         gen_scope: String::new(),
-    })
+    }))
 }
 
 fn lower_module(module: &mut crate::ast::module::ModuleDeclaration) {
@@ -78,7 +78,7 @@ fn lower_module(module: &mut crate::ast::module::ModuleDeclaration) {
                     && port.data_type.as_ref().is_some_and(legacy_variable_type);
             }
             if output && variable && let Some(value) = port.default.take() {
-                port_initials.push(initial_assignment(&port.name, value));
+                port_initials.push(initial_assignment(&port.name, *value));
             }
         }
     }

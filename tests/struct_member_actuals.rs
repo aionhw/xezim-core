@@ -46,7 +46,7 @@ module top; wrapper w(); endmodule
     let connections: Vec<_> = model
         .continuous_assigns
         .iter()
-        .filter_map(|ca| Some((name(&ca.lhs)?, name(&ca.rhs)?)))
+        .filter_map(|ca| Some((name(&ca.lhs_expr())?, name(&ca.rhs_expr())?)))
         .collect();
     for (actual, formal) in [("w.w.in.deep", "w.a.o"), ("w.arr[1].in.deep", "w.b.o")] {
         for member in ["r", "n"] {
@@ -79,11 +79,12 @@ endmodule
     let connections: Vec<_> = model
         .continuous_assigns
         .iter()
-        .filter(|ca| name(&ca.rhs).as_deref() == Some("u.o"))
+        .filter(|ca| name(&ca.rhs_expr()).as_deref() == Some("u.o"))
         .collect();
     assert_eq!(connections.len(), 1);
-    let ExprKind::MemberAccess { expr, member } = &connections[0].lhs.kind else {
-        panic!("runtime member select was lost: {:?}", connections[0].lhs);
+    let lhs0 = connections[0].lhs_expr();
+    let ExprKind::MemberAccess { expr, member } = &lhs0.kind else {
+        panic!("runtime member select was lost: {:?}", lhs0);
     };
     assert_eq!(member.name, "in");
     let ExprKind::Index { expr: base, index } = &expr.kind else {
@@ -99,6 +100,6 @@ endmodule
         !model
             .continuous_assigns
             .iter()
-            .any(|ca| { matches!(name(&ca.rhs).as_deref(), Some("u.o.a" | "u.o.b")) })
+            .any(|ca| { matches!(name(&ca.rhs_expr()).as_deref(), Some("u.o.a" | "u.o.b")) })
     );
 }

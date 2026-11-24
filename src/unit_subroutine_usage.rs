@@ -177,7 +177,7 @@ impl Usage {
             for v in &n.declarators {
                 let refs = usage.references(&(
                     &n.data_type,
-                    (&n.delay, &n.delay_fall, &n.delay_off),
+                    (n.delay(), n.delay_fall(), n.delay_off()),
                     v,
                 ));
                 usage.deps.entry(v.name.name.clone()).or_default().extend(refs);

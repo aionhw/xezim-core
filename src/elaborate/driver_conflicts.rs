@@ -222,7 +222,14 @@ pub(super) fn validate_driver_conflicts(
     let mut next = 0usize;
     for ca in &elab.continuous_assigns {
         let mut spans = Vec::new();
-        lvalue_write_spans(&ca.lhs, elab, &mut spans);
+        match ca {
+            ContinuousAssignment::PlainLink { lhs, .. } => {
+                if is_var(lhs.as_str()) {
+                    spans.push((lhs.to_string(), None));
+                }
+            }
+            ContinuousAssignment::Full(f) => lvalue_write_spans(&f.lhs, elab, &mut spans),
+        }
         for (n, sp) in spans {
             if is_var(&n) {
                 writers

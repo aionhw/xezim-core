@@ -223,9 +223,11 @@ fn a_continuous_assign_calls_the_blocks_function() {
         .continuous_assigns
         .iter()
         .map(|ca| {
+            let rhs = ca.rhs_expr().into_owned();
+            let span = rhs.span;
             let st = xezim_core::ast::stmt::Statement::new(
-                xezim_core::ast::stmt::StatementKind::Expr(ca.rhs.clone()),
-                ca.rhs.span,
+                xezim_core::ast::stmt::StatementKind::Expr(rhs),
+                span,
             );
             call_names(std::slice::from_ref(&st))
         })

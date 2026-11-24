@@ -48,8 +48,11 @@ fn enum_body_dimensions_keep_base_alias_width() {
     m.materialize_pending();
     assert_eq!(m.typedefs["E"], 8);
     for name in ["a", "c.a"] {
-        assert_eq!(m.signals[name].value, xezim_core::Value::all_z(8));
+        assert_eq!(m.signals[name].value.to_value(), xezim_core::Value::all_z(8));
     }
     assert!(!m.nets.contains("g.a.value"));
-    assert_eq!(m.signals["g.a.value"].value, xezim_core::Value::all_x(8));
+    assert_eq!(
+        m.signals["g.a.value"].value.to_value(),
+        xezim_core::Value::all_x(8)
+    );
 }

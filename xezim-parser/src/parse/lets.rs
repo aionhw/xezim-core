@@ -242,7 +242,7 @@ impl<'a> Parser<'a> {
                 data_type,
                 name: pname,
                 dimensions,
-                default,
+                default: default.map(Box::new),
                 span: self.span_from(start),
             });
             if self.eat(TokenKind::Comma).is_none() {

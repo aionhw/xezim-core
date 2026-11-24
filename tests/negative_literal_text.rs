@@ -48,12 +48,13 @@ endmodule
     .expect("elaborate");
     let mut seen = 0;
     for ca in &design.continuous_assigns {
+        let Some(f) = ca.as_full() else { continue };
         if let ExprKind::Number(NumberLiteral::Integer {
             size,
             value,
             signed,
             ..
-        }) = &ca.rhs.kind
+        }) = &f.rhs.kind
             && value.starts_with('-')
         {
             // The text alone, as a loaded design reads it.

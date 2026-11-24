@@ -207,8 +207,8 @@ pub(super) fn port_decl_is_plain(sub_mod: &Definition, items: &[ModuleItem], pna
                             d.name.name == pname
                                 && (!d.dimensions.is_empty()
                                     || d.init.is_some()
-                                    || nd.delay.is_some()
-                                    || nd.strength.is_some()
+                                    || nd.delay().is_some()
+                                    || nd.strength().is_some()
                                     || !plain_net(Some(nd.net_type))
                                     || !plain_type(Some(&nd.data_type)))
                         }) {

@@ -43,9 +43,9 @@ module top; ifc i(); dut d(); assign i.arr = d.src; endmodule
         panic!("expected one continuous assign");
     };
     let parts = xezim_core::elaborate::whole_array_assign_parts_dir(
-        &assign.lhs,
-        &assign.rhs,
-        assign.delay,
+        &assign.lhs_expr(),
+        &assign.rhs_expr(),
+        assign.delay(),
         &design.arrays,
         Some(&design.descending_arrays),
         Some(&design.unpacked_decl_dims),
@@ -53,7 +53,7 @@ module top; ifc i(); dut d(); assign i.arr = d.src; endmodule
     .expect("expanded per element");
     let pairs: Vec<_> = parts
         .iter()
-        .map(|a| (element(&a.lhs), element(&a.rhs)))
+        .map(|a| (element(&a.lhs_expr()), element(&a.rhs_expr())))
         .collect();
     assert_eq!(
         pairs,

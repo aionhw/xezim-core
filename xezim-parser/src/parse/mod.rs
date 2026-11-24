@@ -539,7 +539,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwClass => Some(Description::Class(self.parse_class_declaration())),
             // §19.3: a covergroup declared at file ($unit) scope.
             TokenKind::KwCovergroup => Some(Description::PackageItem(PackageItem::Covergroup(
-                self.parse_covergroup_declaration(),
+                Box::new(self.parse_covergroup_declaration()),
             ))),
             TokenKind::KwChecker => {
                 if let Some(ModuleItem::CheckerDeclaration(c)) = self.parse_module_item() {

@@ -18,16 +18,7 @@ fn elab(src: &str) -> ElaboratedModule {
 }
 
 fn lhs_name(ca: &ContinuousAssignment) -> String {
-    use xezim_core::ast::expr::ExprKind;
-    match &ca.lhs.kind {
-        ExprKind::Ident(h) => h
-            .path
-            .iter()
-            .map(|s| s.name.name.as_str())
-            .collect::<Vec<_>>()
-            .join("."),
-        _ => String::new(),
-    }
+    ca.lhs_ident_name().map(|s| s.into_owned()).unwrap_or_default()
 }
 
 fn assign_to<'a>(m: &'a ElaboratedModule, name: &str) -> &'a ContinuousAssignment {
@@ -66,14 +57,14 @@ module top;
 endmodule
 "#,
     );
-    assert_eq!(assign_to(&m, "u1.g").delay, 3);
-    assert_eq!(assign_to(&m, "u2.g").delay, 5);
-    assert_eq!(assign_to(&m, "u1.w2").delay, 2);
-    assert_eq!(assign_to(&m, "u2.w2").delay, 4);
+    assert_eq!(assign_to(&m, "u1.g").delay(), 3);
+    assert_eq!(assign_to(&m, "u2.g").delay(), 5);
+    assert_eq!(assign_to(&m, "u1.w2").delay(), 2);
+    assert_eq!(assign_to(&m, "u2.w2").delay(), 4);
     let n1 = assign_to(&m, "u1.n");
-    assert_eq!((n1.delay, n1.delay_fall()), (1, Some(3)));
+    assert_eq!((n1.delay(), n1.delay_fall()), (1, Some(3)));
     let n2 = assign_to(&m, "u2.n");
-    assert_eq!((n2.delay, n2.delay_fall()), (1, Some(5)));
+    assert_eq!((n2.delay(), n2.delay_fall()), (1, Some(5)));
     // §28.4: the gate outputs are gate-driven, as at the top level.
     for n in ["u1.g", "u1.n", "u2.g", "u2.n"] {
         assert!(m.gate_driven_nets.contains(n), "{n} not gate-driven");
@@ -152,7 +143,7 @@ endmodule
     );
     for (target, arity) in [("out", 1), ("u.c", 3), ("u.init_net", 1), ("u.g", 1)] {
         let ca = assign_to(&m, target);
-        assert_ne!(ca.delay, 0, "{target} must use the delayed driver path");
+        assert_ne!(ca.delay(), 0, "{target} must use the delayed driver path");
         let args = ca.delay_exprs().expect("runtime operands");
         assert_eq!(args.iter().flatten().count(), arity, "{target}");
     }

@@ -95,7 +95,7 @@ endmodule
     );
     let int = |n: &str| {
         let v = &m.signals.get(n).expect(n).value;
-        assert!(!v.is_real, "{n} holds a real");
+        assert!(!v.is_real(), "{n} holds a real");
         v.to_u64().expect(n)
     };
     assert_eq!(int("t_big"), 9_200_000_000_000);
@@ -106,7 +106,7 @@ endmodule
     assert_eq!(int("v_real"), 1_000_000_000_000);
     assert_eq!(int("i_real"), 4);
     assert_eq!(int("g.g_time"), 9_200_000_000_000);
-    assert!(m.signals.get("r_keep").expect("r_keep").value.is_real);
+    assert!(m.signals.get("r_keep").expect("r_keep").value.is_real());
     assert_eq!(m.signals.get("r_keep").expect("r_keep").value.to_f64(), 2.5);
     assert_eq!(m.signals.get("rt").expect("rt").value.to_f64(), 25.0);
 }

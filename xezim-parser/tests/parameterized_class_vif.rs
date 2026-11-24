@@ -91,7 +91,7 @@ fn class_vif_type_preserves_parameters_modport_and_qualifiers() {
                             modport,
                             type_args,
                             ..
-                        } => (name, modport.as_ref(), type_args),
+                        } => (name.as_ref(), modport.as_deref(), type_args),
                         DataType::TypeReference {
                             name, type_args, ..
                         } if keyword == "virtual" && modport.is_empty() => {

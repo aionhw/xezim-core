@@ -205,7 +205,7 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
                 is_signed: signed,
                 is_real: false,
                 direction: None,
-                value: Value::new(w),
+                value: Value::new(w).into(),
                 type_name: None,
             });
             if let Some(fields) =
@@ -235,9 +235,9 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
                 direction: None,
                 value: if real {
                     Value::from_f64(0.0)
-                } else {
+.into()                } else {
                     Value::new(w)
-                },
+.into()                },
                 type_name: if shortreal {
                     Some("shortreal".into())
                 } else {
@@ -528,13 +528,11 @@ pub(super) fn emit_struct_member_assigns(
 ) {
     // Bounded against a malformed self-referential typedef.
     if depth > 16 {
-        out.push(ContinuousAssignment {
-            lhs: lhs_base.clone(),
-            rhs: rhs.clone(),
-            delay: ca.delay,
-            rhs_parent_scoped: ca.rhs_parent_scoped,
-            extras: ca.extras.clone(),
-        });
+        out.push(ContinuousAssignment::with_same_metadata(
+            lhs_base.clone(),
+            rhs.clone(),
+            ca,
+        ));
         return;
     }
     // Flat (member, declared type, unpacked dims) list in declaration order —
@@ -651,13 +649,7 @@ pub(super) fn emit_member_elem_assigns(
                     depth + 1,
                 );
             }
-            _ => out.push(ContinuousAssignment {
-                lhs,
-                rhs,
-                delay: ca.delay,
-                rhs_parent_scoped: ca.rhs_parent_scoped,
-                extras: ca.extras.clone(),
-            }),
+            _ => out.push(ContinuousAssignment::with_same_metadata(lhs, rhs, ca)),
         }
     };
     let lists = if mdims.is_empty() {
@@ -779,7 +771,7 @@ fn scoped_type_key_of_expr(
                     return None;
                 }
                 return Some(DataType::TypeReference {
-                    name: TypeName {
+                    name: Box::new(TypeName {
                         scopes: Vec::new(),
                         name: Identifier {
                             name: key.to_string(),
@@ -787,7 +779,7 @@ fn scoped_type_key_of_expr(
                         },
                         span: expr.span,
                         bound: Default::default(),
-                    },
+                    }),
                     dimensions: Vec::new(),
                     type_args: Vec::new(),
                     span: expr.span,
@@ -815,7 +807,7 @@ fn scoped_type_key_of_expr(
         return None;
     }
     Some(DataType::TypeReference {
-        name: tn,
+        name: Box::new(tn),
         dimensions: Vec::new(),
         type_args: Vec::new(),
         span: expr.span,
@@ -887,12 +879,12 @@ pub(super) fn pattern_item_type_key<'a>(
             let span = k.span;
             Some((
                 DataType::TypeReference {
-                    name: TypeName {
+                    name: Box::new(TypeName {
                         scopes: Vec::new(),
                         name: Identifier { name: key, span },
                         span,
                         bound: Default::default(),
-                    },
+                    }),
                     dimensions: Vec::new(),
                     type_args: Vec::new(),
                     span,

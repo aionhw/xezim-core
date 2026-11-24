@@ -6804,6 +6804,98 @@ impl Value {
         }
     }
 
+    /// Create a value with all bits set to 1.
+    #[inline]
+    pub fn all_ones(width: u32) -> Self {
+        let width = Self::cap_width(width);
+        if width <= 64 {
+            Self {
+                storage: ValueStorage::Inline {
+                    val_bits: Self::mask(width),
+                    xz_bits: 0,
+                },
+                width,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            }
+        } else {
+            Self {
+                storage: ValueStorage::Wide(Box::new(WidePlanes::filled(width, LogicBit::One))),
+                width,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            }
+        }
+    }
+
+    /// Return the single bit value when every bit of this non-real, non-fill
+    /// integral value is identical (`0`, `1`, `X`, or `Z`), enabling compact
+    /// zero-allocation storage for wide default-initialized signals (#721).
+    pub fn uniform_bit(&self) -> Option<LogicBit> {
+        if self.is_real || self.is_fill || self.width == 0 || self.width != Self::cap_width(self.width) {
+            return None;
+        }
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if self.width > 64 {
+                    return None;
+                }
+                let mask = Self::mask(self.width);
+                match (*val_bits, *xz_bits) {
+                    (0, 0) => Some(LogicBit::Zero),
+                    (v, 0) if v == mask => Some(LogicBit::One),
+                    (0, x) if x == mask => Some(LogicBit::X),
+                    (v, x) if v == mask && x == mask => Some(LogicBit::Z),
+                    _ => None,
+                }
+            }
+            ValueStorage::Wide(planes) => {
+                if planes.nbits != self.width
+                    || planes.val.is_empty()
+                    || planes.val.len() != planes.xz.len()
+                    || planes.val.len() != WidePlanes::nwords(self.width)
+                {
+                    return None;
+                }
+                let last = planes.val.len() - 1;
+                let rem = self.width % 64;
+                let top_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
+                let (bit, v_word, x_word) = if last == 0 {
+                    match (planes.val[0], planes.xz[0]) {
+                        (0, 0) => (LogicBit::Zero, 0, 0),
+                        (v, 0) if v == top_mask => (LogicBit::One, u64::MAX, 0),
+                        (0, x) if x == top_mask => (LogicBit::X, 0, u64::MAX),
+                        (v, x) if v == top_mask && x == top_mask => {
+                            (LogicBit::Z, u64::MAX, u64::MAX)
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    match (planes.val[0], planes.xz[0]) {
+                        (0, 0) => (LogicBit::Zero, 0, 0),
+                        (u64::MAX, 0) => (LogicBit::One, u64::MAX, 0),
+                        (0, u64::MAX) => (LogicBit::X, 0, u64::MAX),
+                        (u64::MAX, u64::MAX) => (LogicBit::Z, u64::MAX, u64::MAX),
+                        _ => return None,
+                    }
+                };
+                for i in 1..last {
+                    if planes.val[i] != v_word || planes.xz[i] != x_word {
+                        return None;
+                    }
+                }
+                if planes.val[last] != (v_word & top_mask)
+                    || planes.xz[last] != (x_word & top_mask)
+                {
+                    return None;
+                }
+                Some(bit)
+            }
+        }
+    }
+
     /// Create a value with all bits set to Z
     #[inline]
     pub fn all_z(width: u32) -> Self {

@@ -68,37 +68,37 @@ pub enum ModuleItem {
     DataDeclaration(DataDeclaration),
     ParameterDeclaration(ParameterDeclaration),
     LocalparamDeclaration(ParameterDeclaration),
-    TypedefDeclaration(TypedefDeclaration),
-    AlwaysConstruct(AlwaysConstruct),
-    InitialConstruct(InitialConstruct),
-    FinalConstruct(FinalConstruct),
+    TypedefDeclaration(Box<TypedefDeclaration>),
+    AlwaysConstruct(Box<AlwaysConstruct>),
+    InitialConstruct(Box<InitialConstruct>),
+    FinalConstruct(Box<FinalConstruct>),
     ContinuousAssign(ContinuousAssign),
     ModuleInstantiation(ModuleInstantiation),
     GateInstantiation(GateInstantiation),
     GenerateRegion(GenerateRegion),
     /// Generate-if: condition + then-items, and a chain of (condition, items) for else-if/else
-    GenerateIf(GenerateIf),
+    GenerateIf(Box<GenerateIf>),
     GenerateFor(Box<GenerateFor>),
     /// Generate-case: case (constant_expr) values: items ... endcase
     /// Each arm matches one or more case values; an arm with empty `values`
     /// is the `default` arm. Used to pick between alternative module
     /// instantiations based on a parameter / genvar.
-    GenerateCase(GenerateCase),
+    GenerateCase(Box<GenerateCase>),
     GenvarDeclaration(GenvarDeclaration),
-    FunctionDeclaration(FunctionDeclaration),
-    TaskDeclaration(TaskDeclaration),
+    FunctionDeclaration(Box<FunctionDeclaration>),
+    TaskDeclaration(Box<TaskDeclaration>),
     ImportDeclaration(ImportDeclaration),
     TimeunitsDecl(TimeunitsDeclaration),
-    ClassDeclaration(ClassDeclaration),
-    AssertionItem(super::stmt::AssertionStatement),
+    ClassDeclaration(Box<ClassDeclaration>),
+    AssertionItem(Box<super::stmt::AssertionStatement>),
     ModportDeclaration(ModportDeclaration),
-    PropertyDeclaration(PropertyDeclaration),
-    SequenceDeclaration(SequenceDeclaration),
-    CovergroupDeclaration(CovergroupDeclaration),
-    ClockingDeclaration(ClockingDeclaration),
-    CheckerDeclaration(CheckerDeclaration),
-    LetDeclaration(LetDeclaration),
-    NettypeDeclaration(NettypeDeclaration),
+    PropertyDeclaration(Box<PropertyDeclaration>),
+    SequenceDeclaration(Box<SequenceDeclaration>),
+    CovergroupDeclaration(Box<CovergroupDeclaration>),
+    ClockingDeclaration(Box<ClockingDeclaration>),
+    CheckerDeclaration(Box<CheckerDeclaration>),
+    LetDeclaration(Box<LetDeclaration>),
+    NettypeDeclaration(Box<NettypeDeclaration>),
     SpecifyBlock(SpecifyBlock),
     DPIImport(Box<DPIImport>),
     DPIExport(Box<DPIExport>),
@@ -117,7 +117,7 @@ pub enum ModuleItem {
     /// (rather than at compilation-unit scope). Treated by elaboration the
     /// same way as a top-level bind: the wrapped instantiation is appended
     /// to every instance of `target`.
-    Bind(BindDirective),
+    Bind(Box<BindDirective>),
     /// Deprecated hierarchical parameter override `defparam path.p = e, ...;`
     /// (LRM §23.10.1). Each entry is `(target_path, value)`; the target path's
     /// LAST segment is the parameter name and the leading segments are the
@@ -201,7 +201,7 @@ impl LetDeclaration {
                         !matches!(dt, DataType::Implicit { signing: None, dimensions, .. }
                             if dimensions.is_empty())
                     });
-                    (&p.name, ty, p.default.as_ref())
+                    (&p.name, ty, p.default.as_deref())
                 })
                 .collect(),
         }
@@ -997,16 +997,16 @@ pub struct GateInstantiation {
     /// the delay spec). Counts the enclosing module's timeunit until the
     /// elaborator pre-scales it to ticks.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub delay: Option<Expression>,
+    pub delay: Option<Box<Expression>>,
     /// §28.11 `#(rise, fall)` — the FALL delay (second expression), applied to
     /// 1→0 output transitions. `None` when the spec gave a single delay, in
     /// which case the rise value governs both edges. A third (turn-off) value
     /// is carried separately for primitives that allow delay3.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub delay_fall: Option<Expression>,
+    pub delay_fall: Option<Box<Expression>>,
     /// §28.11: optional turn-off delay of a delay3 primitive.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub delay_off: Option<Expression>,
+    pub delay_off: Option<Box<Expression>>,
     pub instances: Vec<GateInstance>,
     pub span: Span,
 }
@@ -1067,8 +1067,19 @@ pub struct PortDeclaration {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NetDeclaration {
     pub net_type: NetType,
-    pub strength: Option<String>,
     pub data_type: DataType,
+    /// Rare drive-strength and net-delay specs, boxed so plain `wire` items
+    /// pay 8 B instead of 48 B inline (#721).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub extras: Option<Box<NetDeclExtras>>,
+    pub declarators: Vec<NetDeclarator>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NetDeclExtras {
+    pub strength: Option<String>,
     /// §6.7.1 net delay: `#d` / first of `#(rise, fall[, turnoff])`.
     pub delay: Option<Box<Expression>>,
     /// Second delay of the pair/triple form: applied to a transition to 0.
@@ -1077,8 +1088,47 @@ pub struct NetDeclaration {
     /// Third delay: applied to a transition to z.
     #[cfg_attr(feature = "serde", serde(default))]
     pub delay_off: Option<Box<Expression>>,
-    pub declarators: Vec<NetDeclarator>,
-    pub span: Span,
+}
+
+impl NetDeclaration {
+    pub fn strength(&self) -> Option<&str> {
+        self.extras.as_deref().and_then(|e| e.strength.as_deref())
+    }
+    pub fn delay(&self) -> Option<&Expression> {
+        self.extras.as_deref().and_then(|e| e.delay.as_deref())
+    }
+    pub fn delay_fall(&self) -> Option<&Expression> {
+        self.extras.as_deref().and_then(|e| e.delay_fall.as_deref())
+    }
+    pub fn delay_off(&self) -> Option<&Expression> {
+        self.extras.as_deref().and_then(|e| e.delay_off.as_deref())
+    }
+    pub fn delay_mut(&mut self) -> Option<&mut Expression> {
+        self.extras.as_deref_mut().and_then(|e| e.delay.as_deref_mut())
+    }
+    pub fn delay_fall_mut(&mut self) -> Option<&mut Expression> {
+        self.extras.as_deref_mut().and_then(|e| e.delay_fall.as_deref_mut())
+    }
+    pub fn delay_off_mut(&mut self) -> Option<&mut Expression> {
+        self.extras.as_deref_mut().and_then(|e| e.delay_off.as_deref_mut())
+    }
+    pub fn make_extras(
+        strength: Option<String>,
+        delay: Option<Box<Expression>>,
+        delay_fall: Option<Box<Expression>>,
+        delay_off: Option<Box<Expression>>,
+    ) -> Option<Box<NetDeclExtras>> {
+        if strength.is_none() && delay.is_none() && delay_fall.is_none() && delay_off.is_none() {
+            None
+        } else {
+            Some(Box::new(NetDeclExtras {
+                strength,
+                delay,
+                delay_fall,
+                delay_off,
+            }))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1461,7 +1511,7 @@ pub struct FunctionPort {
     pub data_type: DataType,
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
-    pub default: Option<Expression>,
+    pub default: Option<Box<Expression>>,
     pub span: Span,
 }
 
@@ -1537,19 +1587,19 @@ pub enum ClassItem {
     /// Property: class member variable
     Property(ClassProperty),
     /// Method: function or task
-    Method(ClassMethod),
+    Method(Box<ClassMethod>),
     /// Constraint declaration. Shared: a copy of the class (one per instance
     /// of the module declaring it, §8.3; one per specialization, §8.25)
     /// holds the same block until a rewriter takes it with `Arc::make_mut`.
     Constraint(std::sync::Arc<ClassConstraint>),
     /// Typedef inside class
-    Typedef(TypedefDeclaration),
+    Typedef(Box<TypedefDeclaration>),
     /// Parameter/localparam inside class
     Parameter(ParameterDeclaration),
     /// Class inside class (nested)
-    Class(ClassDeclaration),
+    Class(Box<ClassDeclaration>),
     /// Covergroup inside class
-    Covergroup(CovergroupDeclaration),
+    Covergroup(Box<CovergroupDeclaration>),
     /// Import statement
     Import(ImportDeclaration),
     /// Empty item (stray semicolons)
@@ -1723,22 +1773,22 @@ pub enum MethodSpecifier {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PackageItem {
     Parameter(ParameterDeclaration),
-    Typedef(TypedefDeclaration),
-    Function(FunctionDeclaration),
-    Task(TaskDeclaration),
+    Typedef(Box<TypedefDeclaration>),
+    Function(Box<FunctionDeclaration>),
+    Task(Box<TaskDeclaration>),
     Import(ImportDeclaration),
-    DPIImport(DPIImport),
-    DPIExport(DPIExport),
+    DPIImport(Box<DPIImport>),
+    DPIExport(Box<DPIExport>),
     Data(DataDeclaration),
-    Class(ClassDeclaration),
-    Checker(CheckerDeclaration),
-    Let(LetDeclaration),
-    Nettype(NettypeDeclaration),
+    Class(Box<ClassDeclaration>),
+    Checker(Box<CheckerDeclaration>),
+    Let(Box<LetDeclaration>),
+    Nettype(Box<NettypeDeclaration>),
     /// §26.2: package_item includes concurrent_assertion_item_declaration,
     /// so a package may declare named properties/sequences (hoisted into
     /// importing modules like package subroutines are).
-    Property(PropertyDeclaration),
-    Sequence(SequenceDeclaration),
+    Property(Box<PropertyDeclaration>),
+    Sequence(Box<SequenceDeclaration>),
     /// Placeholder for package items that the parser consumed but does not
     /// model (e.g. non-DPI `export pkg::*;` re-exports). Lets
     /// `parse_package_declaration`'s item loop consume them without falling
@@ -1757,7 +1807,7 @@ pub enum PackageItem {
     /// §19.3 a covergroup declared in a package, or at file scope (then
     /// carried as `Description::PackageItem`). Appended last for bincode
     /// index stability.
-    Covergroup(CovergroupDeclaration),
+    Covergroup(Box<CovergroupDeclaration>),
     /// IEEE 1800 §6.7: a net declaration at compilation-unit ($unit) / file
     /// scope, e.g. `wire x2[2];`. Distinct from `Data` (a variable): a net's
     /// name must enter the same hoisted symbol table so in-module references

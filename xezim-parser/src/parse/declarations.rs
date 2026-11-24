@@ -649,7 +649,7 @@ impl<'a> Parser<'a> {
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let default = if self.eat(TokenKind::Assign).is_some() {
-                Some(self.parse_expression())
+                Some(Box::new(self.parse_expression()))
             } else {
                 None
             };
@@ -1240,19 +1240,19 @@ impl<'a> Parser<'a> {
                 }
                 let name = self.parse_identifier();
                 let data_type = DataType::TypeReference {
-                    name: TypeName {
+                    name: Box::new(TypeName {
                         scopes: Vec::new(),
                         name: iface_name,
                         span: self.span_from(start),
                         bound: Default::default(),
-                    },
+                    }),
                     dimensions: Vec::new(),
                     type_args: Vec::new(),
                     span: self.span_from(start),
                 };
                 let dimensions = self.parse_unpacked_dimensions();
                 let default = if self.eat(TokenKind::Assign).is_some() {
-                    Some(self.parse_expression())
+                    Some(Box::new(self.parse_expression()))
                 } else {
                     None
                 };
@@ -1293,7 +1293,7 @@ impl<'a> Parser<'a> {
                     span: self.span_from(start),
                 });
                 let default = if self.eat(TokenKind::Assign).is_some() {
-                    Some(self.parse_expression())
+                    Some(Box::new(self.parse_expression()))
                 } else {
                     None
                 };
@@ -1367,7 +1367,7 @@ impl<'a> Parser<'a> {
                         span: self.span_from(start),
                     });
                     let default = if self.eat(TokenKind::Assign).is_some() {
-                        Some(self.parse_expression())
+                        Some(Box::new(self.parse_expression()))
                     } else {
                         None
                     };
@@ -1416,7 +1416,7 @@ impl<'a> Parser<'a> {
             };
             let dimensions = self.parse_unpacked_dimensions();
             let default = if self.eat(TokenKind::Assign).is_some() {
-                Some(self.parse_expression())
+                Some(Box::new(self.parse_expression()))
             } else {
                 None
             };
@@ -1448,19 +1448,23 @@ impl<'a> Parser<'a> {
             TokenKind::KwLocalparam => {
                 Some(PackageItem::Parameter(self.parse_parameter_decl_stmt()))
             }
-            TokenKind::KwTypedef => Some(PackageItem::Typedef(self.parse_typedef_declaration())),
-            TokenKind::KwFunction => Some(PackageItem::Function(self.parse_function_declaration())),
-            TokenKind::KwTask => Some(PackageItem::Task(self.parse_task_declaration())),
+            TokenKind::KwTypedef => {
+                Some(PackageItem::Typedef(Box::new(self.parse_typedef_declaration())))
+            }
+            TokenKind::KwFunction => {
+                Some(PackageItem::Function(Box::new(self.parse_function_declaration())))
+            }
+            TokenKind::KwTask => Some(PackageItem::Task(Box::new(self.parse_task_declaration()))),
             TokenKind::KwImport => {
                 if self.peek_kind() == TokenKind::StringLiteral {
-                    Some(PackageItem::DPIImport(self.parse_dpi_import()))
+                    Some(PackageItem::DPIImport(Box::new(self.parse_dpi_import())))
                 } else {
                     Some(PackageItem::Import(self.parse_import_declaration()))
                 }
             }
             TokenKind::KwExport => {
                 if self.peek_kind() == TokenKind::StringLiteral {
-                    Some(PackageItem::DPIExport(self.parse_dpi_export()))
+                    Some(PackageItem::DPIExport(Box::new(self.parse_dpi_export())))
                 } else {
                     // §26.6 `export P::*;` / `export P::sym;` / `export *::*;`
                     // — modeled so a wildcard import only re-exposes nested
@@ -1507,12 +1511,16 @@ impl<'a> Parser<'a> {
             }
             // §8.26: `interface class …` inside a package is a class.
             TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass => {
-                Some(PackageItem::Class(self.parse_class_declaration()))
+                Some(PackageItem::Class(Box::new(self.parse_class_declaration())))
             }
-            TokenKind::KwClass => Some(PackageItem::Class(self.parse_class_declaration())),
+            TokenKind::KwClass => {
+                Some(PackageItem::Class(Box::new(self.parse_class_declaration())))
+            }
             // §19.3: a covergroup declared in a package.
             TokenKind::KwCovergroup => {
-                Some(PackageItem::Covergroup(self.parse_covergroup_declaration()))
+                Some(PackageItem::Covergroup(Box::new(
+                    self.parse_covergroup_declaration(),
+                )))
             }
             TokenKind::KwChecker => {
                 if let Some(ModuleItem::CheckerDeclaration(c)) = self.parse_module_item() {
@@ -1549,9 +1557,9 @@ impl<'a> Parser<'a> {
             TokenKind::KwExtern => {
                 self.bump();
                 if self.at(TokenKind::KwFunction) {
-                    Some(PackageItem::Function(self.parse_function_prototype()))
+                    Some(PackageItem::Function(Box::new(self.parse_function_prototype())))
                 } else if self.at(TokenKind::KwTask) {
-                    Some(PackageItem::Task(self.parse_task_prototype()))
+                    Some(PackageItem::Task(Box::new(self.parse_task_prototype())))
                 } else {
                     // Could be extern module etc, but UVM uses it for methods
                     self.parse_package_item()
@@ -1559,14 +1567,14 @@ impl<'a> Parser<'a> {
             }
             TokenKind::KwVirtual => {
                 if self.peek_kind() == TokenKind::KwClass {
-                    Some(PackageItem::Class(self.parse_class_declaration()))
+                    Some(PackageItem::Class(Box::new(self.parse_class_declaration())))
                 } else if self.peek_kind() == TokenKind::KwFunction {
                     let func = self.parse_function_declaration();
                     // Mark as virtual if we had the keyword (though PackageItem doesn't track it)
-                    Some(PackageItem::Function(func))
+                    Some(PackageItem::Function(Box::new(func)))
                 } else if self.peek_kind() == TokenKind::KwTask {
                     let task = self.parse_task_declaration();
-                    Some(PackageItem::Task(task))
+                    Some(PackageItem::Task(Box::new(task)))
                 } else {
                     // §25.9 / §26.2: a package may own a virtual-interface
                     // variable; its instance binding is assigned at runtime.

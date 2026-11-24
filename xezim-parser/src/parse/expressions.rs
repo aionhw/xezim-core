@@ -1158,7 +1158,7 @@ impl<'a> Parser<'a> {
         links.reverse();
         let name = links.pop().expect("a scoped name has a leaf");
         let ty = DataType::TypeReference {
-            name: TypeName {
+            name: Box::new(TypeName {
                 scopes: links
                     .into_iter()
                     .map(|name| TypeScope {
@@ -1169,7 +1169,7 @@ impl<'a> Parser<'a> {
                 name,
                 span: ty_expr.span,
                 bound: Default::default(),
-            },
+            }),
             dimensions: Vec::new(),
             type_args: Vec::new(),
             span: ty_expr.span,

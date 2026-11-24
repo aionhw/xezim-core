@@ -739,6 +739,18 @@ pub fn tree_of(def: &str) -> Option<Rc<ScopeTree>> {
     DESIGN_TREES.with(|t| t.borrow().get(def).cloned())
 }
 
+/// Release the thread-local definition scope trees and design-name index kept
+/// from the last elaboration. Safe once elaboration (and any library adoption
+/// or post-elaboration bind test queries) is complete (#721).
+pub fn clear() {
+    DESIGN_TREES.with(|t| {
+        let mut map = t.borrow_mut();
+        map.clear();
+        map.shrink_to_fit();
+    });
+    DESIGN_NAMES.with(|n| *n.borrow_mut() = Rc::default());
+}
+
 /// The tree of one description that is a definition. Trees of nested
 /// definitions go to `others`.
 pub(crate) fn build_one(d: &mut Description, others: &mut Vec<ScopeTree>) -> Option<ScopeTree> {

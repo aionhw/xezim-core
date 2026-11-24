@@ -57,7 +57,7 @@ fn unpacked_struct_port_is_member_wise() {
     let targets: Vec<String> = model
         .continuous_assigns
         .iter()
-        .filter_map(|ca| target(&ca.lhs))
+        .filter_map(|ca| target(&ca.lhs_expr()))
         .collect();
     for leaf in ["u.o.a", "u.o.b"] {
         assert!(

@@ -141,7 +141,7 @@ endmodule
     let assigns: Vec<(String, String)> = m
         .continuous_assigns
         .iter()
-        .map(|ca| (text(&ca.lhs), text(&ca.rhs)))
+        .map(|ca| (text(&ca.lhs_expr()), text(&ca.rhs_expr())))
         .collect();
     let body: Vec<&String> = assigns
         .iter()

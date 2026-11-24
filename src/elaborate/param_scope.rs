@@ -890,7 +890,7 @@ module top; localparam int X = pkg::A + pkg::f(); endmodule
             .iter()
             .filter_map(|description| match description {
                 Description::PackageItem(crate::ast::decl::PackageItem::Let(decl)) => {
-                    Some((decl.name.name.clone(), decl.clone()))
+                    Some((decl.name.name.clone(), decl.as_ref().clone()))
                 }
                 _ => None,
             })

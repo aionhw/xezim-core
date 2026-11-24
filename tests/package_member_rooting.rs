@@ -51,9 +51,9 @@ fn rhs_names(m: &ElaboratedModule, lhs: &str) -> Vec<(bool, String)> {
     let ca = m
         .continuous_assigns
         .iter()
-        .find(|ca| matches!(names(&ca.lhs).as_slice(), [(_, n)] if n == lhs))
+        .find(|ca| matches!(names(&ca.lhs_expr()).as_slice(), [(_, n)] if n == lhs))
         .unwrap_or_else(|| panic!("no continuous assign drives {lhs}"));
-    names(&ca.rhs)
+    names(&ca.rhs_expr())
 }
 
 fn n(rooted: bool, name: &str) -> (bool, String) {

@@ -262,12 +262,12 @@ impl<'a> Parser<'a> {
             let type_args = self.parse_type_args_hash(start);
             let dimensions = self.parse_packed_dimensions();
             let dt = DataType::TypeReference {
-                name: TypeName {
+                name: Box::new(TypeName {
                     scopes,
                     name: second_name,
                     span: self.span_from(start),
                     bound: Default::default(),
-                },
+                }),
                 dimensions,
                 type_args,
                 span: self.span_from(start),
@@ -305,8 +305,8 @@ impl<'a> Parser<'a> {
             self.bump(); // .
             let modport = self.parse_identifier();
             let dt = DataType::Interface {
-                name: first_name.clone(),
-                modport: Some(modport),
+                name: Box::new(first_name.clone()),
+                modport: Some(Box::new(modport)),
                 type_args: Vec::new(),
                 span: self.span_from(start),
             };
@@ -379,12 +379,12 @@ impl<'a> Parser<'a> {
             }
             let dimensions = self.parse_packed_dimensions();
             let dt = DataType::TypeReference {
-                name: TypeName {
+                name: Box::new(TypeName {
                     scopes,
                     name: tn_name,
                     span: self.span_from(start),
                     bound: Default::default(),
-                },
+                }),
                 dimensions,
                 type_args: Vec::new(),
                 span: self.span_from(start),
@@ -416,12 +416,12 @@ impl<'a> Parser<'a> {
                 None => Vec::new(),
             };
             let dt = DataType::TypeReference {
-                name: TypeName {
+                name: Box::new(TypeName {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
                     bound: Default::default(),
-                },
+                }),
                 dimensions,
                 type_args,
                 span: self.span_from(start),
@@ -518,12 +518,12 @@ impl<'a> Parser<'a> {
                     None => Vec::new(),
                 };
                 let dt = DataType::TypeReference {
-                    name: TypeName {
+                    name: Box::new(TypeName {
                         scopes: Vec::new(),
                         name: first_name,
                         span: self.span_from(start),
                         bound: Default::default(),
-                    },
+                    }),
                     dimensions: Vec::new(),
                     type_args,
                     span: self.span_from(start),
@@ -551,12 +551,12 @@ impl<'a> Parser<'a> {
             }
         } else {
             let dt = DataType::TypeReference {
-                name: TypeName {
+                name: Box::new(TypeName {
                     scopes: Vec::new(),
                     name: first_name,
                     span: self.span_from(start),
                     bound: Default::default(),
-                },
+                }),
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
                 span: self.span_from(start),

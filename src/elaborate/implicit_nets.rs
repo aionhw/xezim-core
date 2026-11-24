@@ -124,7 +124,7 @@ pub(super) fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
                 width: 1,
                 is_signed: false,
                 direction: None,
-                value: Value::new(1),
+                value: Value::new(1).into(),
                 is_real: false,
                 type_name: None,
             },
@@ -376,7 +376,7 @@ pub(super) fn declare_block_port_implicit_nets(
                     width: 1,
                     is_signed: false,
                     direction: None,
-                    value: Value::new(1),
+                    value: Value::new(1).into(),
                     is_real: false,
                     type_name: None,
                 },
@@ -403,8 +403,16 @@ pub(super) fn create_implicit_nets(
     let mut implicit_names = Vec::new();
     let mut lhs_names = Vec::new();
     for ca in &elab.continuous_assigns {
-        collect_assign_net_names(&ca.lhs, &mut lhs_names);
-        collect_assign_net_names(&ca.rhs, &mut implicit_names);
+        match ca {
+            ContinuousAssignment::PlainLink { lhs, rhs, .. } => {
+                lhs_names.push(lhs.to_string());
+                implicit_names.push(rhs.to_string());
+            }
+            ContinuousAssignment::Full(f) => {
+                collect_assign_net_names(&f.lhs, &mut lhs_names);
+                collect_assign_net_names(&f.rhs, &mut implicit_names);
+            }
+        }
     }
     implicit_names.extend(lhs_names.iter().cloned());
     let lhs_names: HashSet<String> = lhs_names.into_iter().collect();
@@ -466,7 +474,7 @@ pub(super) fn create_implicit_nets(
                     width: 1,
                     is_signed: false,
                     direction: None,
-                    value: Value::new(1),
+                    value: Value::new(1).into(),
                     is_real: false,
                     type_name: None,
                 },
@@ -536,9 +544,9 @@ pub(super) fn create_implicit_nets(
                     direction: None,
                     value: if is_real {
                         Value::from_f64(0.0)
-                    } else {
+.into()                    } else {
                         Value::new(width.max(1))
-                    },
+.into()                    },
                     is_real,
                     type_name: Some(nt.as_str().into()),
                 },
@@ -577,7 +585,7 @@ pub(super) fn create_implicit_nets(
                 width: 1,
                 is_signed: false,
                 direction: None,
-                value: Value::new(1),
+                value: Value::new(1).into(),
                 is_real: false,
                 type_name: None,
             },

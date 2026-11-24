@@ -5,16 +5,19 @@ use std::mem::size_of;
 use xezim_core::{
     ElaboratedModule,
     ast::{
-        Identifier, Span,
+        Description, Identifier, Span,
         cache::{LiteralCache, NameCache, SignalCache, WidthCache},
+        decl::{ClassItem, GateInstantiation, ModuleItem, NetDeclaration, PackageItem},
         expr::{
             ExprKind, Expression, HierPathSegment, HierRoot, HierarchicalIdentifier, NumberLiteral,
         },
+        module::AnsiPort,
         stmt::Statement,
+        types::DataType,
     },
     elaborate::{
-        ContinuousAssignment, ElabInstance, PendingContAssign, Signal, set_vpi_net_drivers,
-        vpi_net_drivers,
+        ContinuousAssignment, ElabInstance, InputPortActual, PendingContAssign, Signal,
+        SignalValue, set_vpi_net_drivers, vpi_net_drivers,
     },
 };
 
@@ -93,7 +96,47 @@ fn core_ast_and_elaboration_object_sizes_stay_compact() {
         size_of::<Statement>()
     );
     assert!(
-        size_of::<ContinuousAssignment>() <= 168,
+        size_of::<DataType>() <= 72,
+        "DataType grew to {} B",
+        size_of::<DataType>()
+    );
+    assert!(
+        size_of::<GateInstantiation>() <= 64,
+        "GateInstantiation grew to {} B",
+        size_of::<GateInstantiation>()
+    );
+    assert!(
+        size_of::<NetDeclaration>() <= 120,
+        "NetDeclaration grew to {} B",
+        size_of::<NetDeclaration>()
+    );
+    assert!(
+        size_of::<AnsiPort>() <= 176,
+        "AnsiPort grew to {} B",
+        size_of::<AnsiPort>()
+    );
+    assert!(
+        size_of::<ModuleItem>() <= 120,
+        "ModuleItem grew to {} B",
+        size_of::<ModuleItem>()
+    );
+    assert!(
+        size_of::<PackageItem>() <= 120,
+        "PackageItem grew to {} B",
+        size_of::<PackageItem>()
+    );
+    assert!(
+        size_of::<ClassItem>() <= 128,
+        "ClassItem grew to {} B",
+        size_of::<ClassItem>()
+    );
+    assert!(
+        size_of::<Description>() <= 288,
+        "Description grew to {} B",
+        size_of::<Description>()
+    );
+    assert!(
+        size_of::<ContinuousAssignment>() <= 24,
         "ContinuousAssignment grew to {} B",
         size_of::<ContinuousAssignment>()
     );
@@ -103,9 +146,19 @@ fn core_ast_and_elaboration_object_sizes_stay_compact() {
         size_of::<PendingContAssign>()
     );
     assert!(
-        size_of::<Signal>() <= 56,
+        size_of::<SignalValue>() <= 8,
+        "SignalValue grew to {} B",
+        size_of::<SignalValue>()
+    );
+    assert!(
+        size_of::<Signal>() <= 32,
         "Signal grew to {} B",
         size_of::<Signal>()
+    );
+    assert!(
+        size_of::<InputPortActual>() <= 32,
+        "InputPortActual grew to {} B",
+        size_of::<InputPortActual>()
     );
     assert!(
         size_of::<ElabInstance>() <= 32,
@@ -119,6 +172,7 @@ fn instance_and_signal_metadata_share_allocations_across_instances() {
     let src = r#"
 typedef logic [7:0] byte_t;
 module leaf(input byte_t a, output byte_t y);
+  byte_t r;
   byte_t mem [0:3];
   assign y = a;
 endmodule
@@ -159,13 +213,14 @@ endmodule
     assert_eq!(d0.as_slice(), &[(0, 3)]);
     assert!(d0.ptr_eq(d1));
 
-    // Synthesized port-connection continuous assigns carry no boxed extras.
+    // Synthesized plain port-connection continuous assigns use compact PlainLink
+    // (no Full box, no Expression ASTs, no ContinuousAssignExtras).
     assert!(!m.continuous_assigns.is_empty());
     assert!(
         m.continuous_assigns
             .iter()
-            .all(|ca| ca.origin().is_none() && ca.extras.is_none()),
-        "synthesized port connections must not allocate ContinuousAssignExtras"
+            .all(|ca| ca.is_plain_link() && ca.origin().is_none() && ca.extras().is_none()),
+        "synthesized plain port connections must use ContinuousAssignment::PlainLink"
     );
     // Undelayed deferred continuous assigns carry no boxed extras.
     assert!(!m.pending_cont_assign.is_empty());
@@ -177,6 +232,17 @@ endmodule
     assert!(
         m.decl_sites.is_empty(),
         "decl_sites must be cleared after elaboration"
+    );
+    // DeclTypeMap shares its SharedName keys with signals (no duplicate Strings).
+    let sig_key = m.signals.shared_key("u0.r").expect("u0.r signal key");
+    let dt_key = m
+        .var_decl_types
+        .as_map()
+        .shared_key("u0.r")
+        .expect("u0.r decl_type key");
+    assert!(
+        sig_key.ptr_eq(dt_key),
+        "var_decl_types should share SharedName keys with signals"
     );
 }
 
@@ -201,7 +267,7 @@ endmodule
 
     let delayed = decoded
         .iter()
-        .find(|ca| ca.delay == 2)
+        .find(|ca| ca.delay() == 2)
         .expect("delayed assign");
     assert_eq!(delayed.delay_fall(), Some(5));
     assert_eq!(delayed.delay_off(), Some(7));
@@ -209,12 +275,31 @@ endmodule
 
     let plain = decoded
         .iter()
-        .find(|ca| ca.delay == 0)
+        .find(|ca| ca.delay() == 0)
         .expect("undelayed source assign");
     assert!(plain.origin().is_some());
     assert!(
-        plain.extras.as_deref().is_some_and(|e| e.delays.is_none()),
+        plain.extras().is_some_and(|e| e.delays.is_none()),
         "undelayed source assign must not allocate ContinuousAssignDelays"
+    );
+
+    // Compact PlainLink also round-trips through bincode slice and streaming reader.
+    let link = ContinuousAssignment::plain_link("u0.a", "d0", true);
+    assert!(link.is_plain_link());
+    let link_bytes = bincode::serde::encode_to_vec(&link, cfg).expect("encode PlainLink");
+    let (link_back, _): (ContinuousAssignment, _) =
+        bincode::serde::decode_from_slice(&link_bytes, cfg).expect("decode PlainLink");
+    assert_eq!(
+        link_back.as_plain_link().map(|(l, r, s)| (l.as_str(), r.as_str(), s)),
+        Some(("u0.a", "d0", true))
+    );
+    let mut link_reader = std::io::Cursor::new(&link_bytes);
+    let link_streamed: ContinuousAssignment =
+        bincode::serde::decode_from_std_read(&mut link_reader, cfg)
+            .expect("decode PlainLink reader");
+    assert_eq!(
+        link_streamed.as_plain_link().map(|(l, r, s)| (l.as_str(), r.as_str(), s)),
+        Some(("u0.a", "d0", true))
     );
 
     for root in [HierRoot::Root, HierRoot::Unit, HierRoot::Local] {
@@ -338,4 +423,47 @@ endmodule
     assert_eq!(decoded.continuous_assigns.len(), m.continuous_assigns.len());
     assert_eq!(decoded.functions.len(), m.functions.len());
     assert_eq!(decoded.tasks.len(), m.tasks.len());
+}
+
+#[test]
+fn signal_value_round_trips_uniform_wide_and_custom_values() {
+    use xezim_core::value::Value;
+    let cfg = xezim_core::xez_bincode_config();
+    let mut wide_signed_x = Value::all_x(256);
+    wide_signed_x.is_signed = true;
+    let mut wide_ones = Value::all_ones(130);
+    wide_ones.is_signed = false;
+    let mut mixed_wide = Value::zero(130);
+    mixed_wide.set_bit(0, xezim_core::value::LogicBit::One);
+    mixed_wide.set_bit(129, xezim_core::value::LogicBit::X);
+    let cases = vec![
+        Value::zero(1),
+        Value::zero(32),
+        Value::zero(256),
+        Value::all_ones(1),
+        Value::all_ones(64),
+        wide_ones,
+        Value::all_x(1),
+        Value::all_x(64),
+        wide_signed_x,
+        Value::all_z(8),
+        Value::all_z(512),
+        Value::from_u64(0xdead_beef, 32),
+        Value::from_f64(3.25),
+        mixed_wide,
+    ];
+    for orig in cases {
+        let sv = SignalValue::from_value(orig.clone());
+        assert_eq!(sv.width(), orig.width);
+        assert_eq!(sv.is_signed(), orig.is_signed);
+        assert_eq!(sv.is_real(), orig.is_real);
+        assert_eq!(sv.has_xz(), orig.has_xz());
+        assert_eq!(sv.to_value(), orig);
+        let cloned = sv.clone();
+        assert_eq!(cloned.to_value(), orig);
+        let encoded = bincode::serde::encode_to_vec(&sv, cfg).expect("encode SignalValue");
+        let (decoded, _): (SignalValue, _) =
+            bincode::serde::decode_from_slice(&encoded, cfg).expect("decode SignalValue");
+        assert_eq!(decoded.to_value(), orig);
+    }
 }

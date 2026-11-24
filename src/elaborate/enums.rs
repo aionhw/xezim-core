@@ -189,7 +189,7 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
                     is_signed: false,
                     is_real: false,
                     direction: None,
-                    value: v,
+                    value: v.into(),
                     type_name: None,
                 });
             }

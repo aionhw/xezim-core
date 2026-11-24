@@ -58,21 +58,23 @@ fn resolved_members_use_leaf_paths() {
     let model = design();
     let mut leaf_targets = 0;
     for ca in &model.continuous_assigns {
-        let xezim_core::ast::expr::ExprKind::Ident(h) = &ca.lhs.kind else {
+        let lhs = ca.lhs_expr();
+        let xezim_core::ast::expr::ExprKind::Ident(h) = &lhs.kind else {
             assert!(
                 !matches!(
-                    ca.lhs.kind,
+                    lhs.kind,
                     xezim_core::ast::expr::ExprKind::MemberAccess { .. }
                 ),
                 "member-access target: {:?}",
-                ca.lhs
+                lhs
             );
             continue;
         };
         let name: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
         if matches!(name.last(), Some(&("V" | "I" | "R"))) {
             leaf_targets += 1;
-            assert!(!has_member_access(&ca.rhs), "member access in {:?}", ca.rhs);
+            let rhs = ca.rhs_expr();
+            assert!(!has_member_access(&rhs), "member access in {:?}", rhs);
         }
     }
     assert!(leaf_targets >= 3, "no leaf-path member assigns");

@@ -1042,7 +1042,7 @@ pub(super) fn check_module_use_before_decl(
                 match it {
                     ModuleItem::NetDeclaration(d) => {
                         self.ty(&d.data_type, scope);
-                        for e in [&d.delay, &d.delay_fall, &d.delay_off]
+                        for e in [d.delay(), d.delay_fall(), d.delay_off()]
                             .into_iter()
                             .flatten()
                         {

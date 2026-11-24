@@ -592,6 +592,360 @@ fn type_trace_tls_refresh(at: &str, map: &HashMap<String, u32>) {
     }
 }
 
+/// Compact initial value for a [`Signal`] (aionhw/xezim#721).
+///
+/// Uniform integral values (all-`0`, all-`1`, all-`X`, or all-`Z`, of any
+/// width up to `u32::MAX`) pack into a single 8-byte tagged pointer on 64-bit
+/// targets with zero heap allocation — eliminating both the 32-byte inline
+/// `Value` overhead on every signal and `WidePlanes` heap buffers on >64-bit
+/// default-initialized buses. Non-uniform, real, fill, and zero-width values
+/// box a `Value` on the heap.
+#[cfg(target_pointer_width = "64")]
+pub struct SignalValue(*mut Value);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::align_of::<Value>() >= 2 && std::mem::size_of::<SignalValue>() == 8);
+
+#[cfg(target_pointer_width = "64")]
+unsafe impl Send for SignalValue {}
+#[cfg(target_pointer_width = "64")]
+unsafe impl Sync for SignalValue {}
+
+#[cfg(not(target_pointer_width = "64"))]
+pub enum SignalValue {
+    Uniform {
+        bit: crate::value::LogicBit,
+        is_signed: bool,
+        width: u32,
+    },
+    Boxed(Box<Value>),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SignalValueWire {
+    Uniform {
+        bit: crate::value::LogicBit,
+        is_signed: bool,
+        width: u32,
+    },
+    Custom(Value),
+}
+
+impl SignalValue {
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    fn encode_inline(bit: crate::value::LogicBit, width: u32, is_signed: bool) -> *mut Value {
+        let bits: usize = 1
+            | ((bit.to_code() as usize) << 1)
+            | ((is_signed as usize) << 3)
+            | ((width as usize) << 4);
+        std::ptr::without_provenance_mut(bits)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    fn decode_inline(&self) -> Option<(crate::value::LogicBit, u32, bool)> {
+        let addr = self.0.addr();
+        if addr & 1 != 0 {
+            let bit = crate::value::LogicBit::from_code(((addr >> 1) & 0b11) as u8);
+            let is_signed = ((addr >> 3) & 1) != 0;
+            let width = (addr >> 4) as u32;
+            Some((bit, width, is_signed))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    fn boxed_ref(&self) -> Option<&Value> {
+        if self.0.addr() & 1 == 0 {
+            // SAFETY: Non-tagged pointer was allocated via `Box::into_raw` and
+            // remains valid until `Drop`.
+            Some(unsafe { &*self.0 })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn uniform(bit: crate::value::LogicBit, width: u32, is_signed: bool) -> Self {
+        #[cfg(target_pointer_width = "64")]
+        {
+            Self(Self::encode_inline(bit, width, is_signed))
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            Self::Uniform {
+                bit,
+                is_signed,
+                width,
+            }
+        }
+    }
+
+    pub fn from_value(v: Value) -> Self {
+        if let Some(bit) = v.uniform_bit() {
+            return Self::uniform(bit, v.width, v.is_signed);
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            Self(Box::into_raw(Box::new(v)))
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            Self::Boxed(Box::new(v))
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        #[cfg(target_pointer_width = "64")]
+        {
+            if let Some((bit, width, is_signed)) = self.decode_inline() {
+                let mut v = match bit {
+                    crate::value::LogicBit::Zero => Value::zero(width),
+                    crate::value::LogicBit::One => Value::all_ones(width),
+                    crate::value::LogicBit::X => Value::all_x(width),
+                    crate::value::LogicBit::Z => Value::all_z(width),
+                };
+                v.is_signed = is_signed;
+                v
+            } else {
+                self.boxed_ref().expect("boxed SignalValue").clone()
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            match self {
+                Self::Uniform {
+                    bit,
+                    is_signed,
+                    width,
+                } => {
+                    let mut v = match bit {
+                        crate::value::LogicBit::Zero => Value::zero(*width),
+                        crate::value::LogicBit::One => Value::all_ones(*width),
+                        crate::value::LogicBit::X => Value::all_x(*width),
+                        crate::value::LogicBit::Z => Value::all_z(*width),
+                    };
+                    v.is_signed = *is_signed;
+                    v
+                }
+                Self::Boxed(v) => (**v).clone(),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn width(&self) -> u32 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            match self.decode_inline() {
+                Some((_, width, _)) => width,
+                None => self.boxed_ref().expect("boxed SignalValue").width,
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            match self {
+                Self::Uniform { width, .. } => *width,
+                Self::Boxed(v) => v.width,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn is_signed(&self) -> bool {
+        #[cfg(target_pointer_width = "64")]
+        {
+            match self.decode_inline() {
+                Some((_, _, is_signed)) => is_signed,
+                None => self.boxed_ref().expect("boxed SignalValue").is_signed,
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            match self {
+                Self::Uniform { is_signed, .. } => *is_signed,
+                Self::Boxed(v) => v.is_signed,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn is_real(&self) -> bool {
+        #[cfg(target_pointer_width = "64")]
+        {
+            self.boxed_ref().is_some_and(|v| v.is_real)
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            matches!(self, Self::Boxed(v) if v.is_real)
+        }
+    }
+
+    #[inline]
+    pub fn has_xz(&self) -> bool {
+        #[cfg(target_pointer_width = "64")]
+        {
+            match self.decode_inline() {
+                Some((bit, _, _)) => {
+                    matches!(bit, crate::value::LogicBit::X | crate::value::LogicBit::Z)
+                }
+                None => self.boxed_ref().expect("boxed SignalValue").has_xz(),
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            match self {
+                Self::Uniform { bit, .. } => {
+                    matches!(bit, crate::value::LogicBit::X | crate::value::LogicBit::Z)
+                }
+                Self::Boxed(v) => v.has_xz(),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set_signed(&mut self, signed: bool) {
+        #[cfg(target_pointer_width = "64")]
+        {
+            if let Some((bit, width, _)) = self.decode_inline() {
+                self.0 = Self::encode_inline(bit, width, signed);
+            } else {
+                // SAFETY: Non-tagged pointer is uniquely owned by `&mut self`.
+                unsafe { (*self.0).is_signed = signed };
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            match self {
+                Self::Uniform { is_signed, .. } => *is_signed = signed,
+                Self::Boxed(v) => v.is_signed = signed,
+            }
+        }
+    }
+
+    pub fn to_u64(&self) -> Option<u64> {
+        self.to_value().to_u64()
+    }
+
+    pub fn to_f64(&self) -> f64 {
+        self.to_value().to_f64()
+    }
+
+    pub fn to_bin_string(&self) -> String {
+        self.to_value().to_bin_string()
+    }
+
+    pub fn resize(&self, width: u32) -> Value {
+        self.to_value().resize(width)
+    }
+}
+
+impl From<Value> for SignalValue {
+    #[inline]
+    fn from(v: Value) -> Self {
+        Self::from_value(v)
+    }
+}
+
+impl Clone for SignalValue {
+    fn clone(&self) -> Self {
+        #[cfg(target_pointer_width = "64")]
+        {
+            if self.0.addr() & 1 != 0 {
+                Self(self.0)
+            } else {
+                Self(Box::into_raw(Box::new(
+                    self.boxed_ref().expect("boxed SignalValue").clone(),
+                )))
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            match self {
+                Self::Uniform {
+                    bit,
+                    is_signed,
+                    width,
+                } => Self::Uniform {
+                    bit: *bit,
+                    is_signed: *is_signed,
+                    width: *width,
+                },
+                Self::Boxed(v) => Self::Boxed(v.clone()),
+            }
+        }
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl Drop for SignalValue {
+    fn drop(&mut self) {
+        if self.0.addr() & 1 == 0 {
+            // SAFETY: Non-tagged pointer was allocated via `Box::into_raw` and
+            // is owned exclusively here.
+            unsafe { drop(Box::from_raw(self.0)) };
+        }
+    }
+}
+
+impl std::fmt::Debug for SignalValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_value().fmt(f)
+    }
+}
+
+impl PartialEq for SignalValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_value() == other.to_value()
+    }
+}
+
+impl Eq for SignalValue {}
+
+impl serde::Serialize for SignalValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[cfg(target_pointer_width = "64")]
+        let wire = match self.decode_inline() {
+            Some((bit, width, is_signed)) => SignalValueWire::Uniform {
+                bit,
+                is_signed,
+                width,
+            },
+            None => SignalValueWire::Custom(self.boxed_ref().expect("boxed SignalValue").clone()),
+        };
+        #[cfg(not(target_pointer_width = "64"))]
+        let wire = match self {
+            Self::Uniform {
+                bit,
+                is_signed,
+                width,
+            } => SignalValueWire::Uniform {
+                bit: *bit,
+                is_signed: *is_signed,
+                width: *width,
+            },
+            Self::Boxed(v) => SignalValueWire::Custom((**v).clone()),
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SignalValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match SignalValueWire::deserialize(deserializer)? {
+            SignalValueWire::Uniform {
+                bit,
+                is_signed,
+                width,
+            } => Ok(Self::uniform(bit, width, is_signed)),
+            SignalValueWire::Custom(v) => Ok(Self::from_value(v)),
+        }
+    }
+}
+
 /// A resolved signal in the simulation model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Signal {
@@ -601,7 +955,7 @@ pub struct Signal {
     pub is_real: bool,
     pub is_const: bool,
     pub direction: Option<PortDirection>,
-    pub value: Value,
+    pub value: SignalValue,
     /// Name of the data type (e.g. class name).
     pub type_name: Option<SharedName>,
 }
@@ -682,9 +1036,10 @@ impl ContinuousAssignExtras {
     }
 }
 
-/// A continuous assignment: assign lhs = rhs.
+/// Full continuous assignment payload for assignments with complex expressions,
+/// delays, drive strengths, or source-origin metadata.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ContinuousAssignment {
+pub struct FullContinuousAssignment {
     pub lhs: Expression,
     pub rhs: Expression,
     /// Delay in ticks (rise delay of the `#(rise, fall[, turnoff])` form).
@@ -700,25 +1055,231 @@ pub struct ContinuousAssignment {
     pub extras: Option<Box<ContinuousAssignExtras>>,
 }
 
-impl ContinuousAssignment {
-    pub fn plain(lhs: Expression, rhs: Expression) -> Self {
-        Self {
-            lhs,
-            rhs,
-            delay: 0,
-            rhs_parent_scoped: false,
-            extras: None,
+impl FullContinuousAssignment {
+    fn delays(&self) -> Option<&ContinuousAssignDelays> {
+        self.extras.as_deref().and_then(|e| e.delays.as_deref())
+    }
+
+    fn delays_mut(&mut self) -> &mut ContinuousAssignDelays {
+        self.extras
+            .get_or_insert_with(|| Box::new(ContinuousAssignExtras::default()))
+            .delays
+            .get_or_insert_with(|| Box::new(ContinuousAssignDelays::default()))
+    }
+
+    fn prune_extras(&mut self) {
+        if let Some(extras) = self.extras.as_deref_mut() {
+            if extras
+                .delays
+                .as_deref()
+                .is_some_and(ContinuousAssignDelays::is_empty)
+            {
+                extras.delays = None;
+            }
+            if extras.is_empty() {
+                self.extras = None;
+            }
         }
     }
 
+    pub fn delay_fall(&self) -> Option<u64> {
+        self.delays().and_then(|d| d.delay_fall)
+    }
+
+    pub fn delay_off(&self) -> Option<u64> {
+        self.delays().and_then(|d| d.delay_off)
+    }
+
+    pub fn gate_delay_fall(&self) -> Option<u64> {
+        self.delays().and_then(|d| d.gate_delay_fall)
+    }
+
+    pub fn delay_exprs(&self) -> Option<&DelayExpressions> {
+        self.delays().and_then(|d| d.delay_exprs.as_ref())
+    }
+
+    pub fn delay_select(&self) -> Option<(u32, u32, bool)> {
+        self.delays().and_then(|d| d.delay_select)
+    }
+
+    pub fn origin(&self) -> Option<&(crate::ast::Span, std::sync::Arc<str>)> {
+        self.extras.as_deref().and_then(|e| e.origin.as_ref())
+    }
+
+    pub fn take_origin(&mut self) -> Option<(crate::ast::Span, std::sync::Arc<str>)> {
+        let taken = self.extras.as_deref_mut().and_then(|e| e.origin.take());
+        if taken.is_some() {
+            self.prune_extras();
+        }
+        taken
+    }
+
+    pub fn take_delay_exprs(&mut self) -> Option<DelayExpressions> {
+        let taken = self
+            .extras
+            .as_deref_mut()
+            .and_then(|e| e.delays.as_deref_mut())
+            .and_then(|d| d.delay_exprs.take());
+        if taken.is_some() {
+            self.prune_extras();
+        }
+        taken
+    }
+
+    pub fn set_delay_fall(&mut self, value: Option<u64>) {
+        if value.is_some() {
+            self.delays_mut().delay_fall = value;
+        } else if let Some(d) = self
+            .extras
+            .as_deref_mut()
+            .and_then(|e| e.delays.as_deref_mut())
+        {
+            d.delay_fall = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn set_delay_off(&mut self, value: Option<u64>) {
+        if value.is_some() {
+            self.delays_mut().delay_off = value;
+        } else if let Some(d) = self
+            .extras
+            .as_deref_mut()
+            .and_then(|e| e.delays.as_deref_mut())
+        {
+            d.delay_off = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn set_delay_exprs(&mut self, value: Option<DelayExpressions>) {
+        if value.is_some() {
+            self.delays_mut().delay_exprs = value;
+        } else if let Some(d) = self
+            .extras
+            .as_deref_mut()
+            .and_then(|e| e.delays.as_deref_mut())
+        {
+            d.delay_exprs = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn set_origin(&mut self, value: Option<(crate::ast::Span, std::sync::Arc<str>)>) {
+        if value.is_some() {
+            self.extras
+                .get_or_insert_with(|| Box::new(ContinuousAssignExtras::default()))
+                .origin = value;
+        } else if let Some(extras) = self.extras.as_deref_mut() {
+            extras.origin = None;
+            self.prune_extras();
+        }
+    }
+
+    pub fn inherit_driver_metadata(&mut self, driver: &Self) {
+        self.set_delay_fall(driver.delay_fall());
+        self.set_delay_off(driver.delay_off());
+        self.set_delay_exprs(driver.delay_exprs().cloned());
+        self.set_origin(driver.origin().cloned());
+        self.rhs_parent_scoped = driver.rhs_parent_scoped;
+    }
+}
+
+/// A continuous assignment: `assign lhs = rhs`.
+///
+/// Plain zero-delay whole-signal copies with no origin or delay extras (most
+/// synthesized directional port connections) store two interned `SharedName`s
+/// in 24 bytes with zero `Expression` heap allocations; everything else boxes
+/// a [`FullContinuousAssignment`] (aionhw/xezim#721).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ContinuousAssignment {
+    PlainLink {
+        lhs: SharedName,
+        rhs: SharedName,
+        rhs_parent_scoped: bool,
+    },
+    Full(Box<FullContinuousAssignment>),
+}
+
+impl ContinuousAssignment {
+    #[inline]
+    pub fn plain_ident_name(expr: &Expression) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                Some(h.path[0].name.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn plain_link(
+        lhs: impl Into<SharedName>,
+        rhs: impl Into<SharedName>,
+        rhs_parent_scoped: bool,
+    ) -> Self {
+        Self::PlainLink {
+            lhs: lhs.into(),
+            rhs: rhs.into(),
+            rhs_parent_scoped,
+        }
+    }
+
+    pub fn plain(lhs: Expression, rhs: Expression) -> Self {
+        Self::plain_scoped(lhs, rhs, false)
+    }
+
+    pub fn with_same_metadata(lhs: Expression, rhs: Expression, template: &Self) -> Self {
+        match template {
+            Self::PlainLink {
+                rhs_parent_scoped, ..
+            } => Self::plain_scoped(lhs, rhs, *rhs_parent_scoped),
+            Self::Full(f) => {
+                if f.delay == 0 && f.extras.is_none() {
+                    Self::plain_scoped(lhs, rhs, f.rhs_parent_scoped)
+                } else {
+                    Self::Full(Box::new(FullContinuousAssignment {
+                        lhs,
+                        rhs,
+                        delay: f.delay,
+                        rhs_parent_scoped: f.rhs_parent_scoped,
+                        extras: f.extras.clone(),
+                    }))
+                }
+            }
+        }
+    }
+
+    pub fn plain_scoped(lhs: Expression, rhs: Expression, rhs_parent_scoped: bool) -> Self {
+        if let (Some(l), Some(r)) = (Self::plain_ident_name(&lhs), Self::plain_ident_name(&rhs)) {
+            return Self::PlainLink {
+                lhs: l.into(),
+                rhs: r.into(),
+                rhs_parent_scoped,
+            };
+        }
+        Self::Full(Box::new(FullContinuousAssignment {
+            lhs,
+            rhs,
+            delay: 0,
+            rhs_parent_scoped,
+            extras: None,
+        }))
+    }
+
     pub fn with_delay(lhs: Expression, rhs: Expression, delay: u64) -> Self {
-        Self {
+        if delay == 0 {
+            return Self::plain(lhs, rhs);
+        }
+        Self::Full(Box::new(FullContinuousAssignment {
             lhs,
             rhs,
             delay,
             rhs_parent_scoped: false,
             extras: None,
-        }
+        }))
     }
 
     pub fn with_extras(
@@ -754,35 +1315,154 @@ impl ContinuousAssignment {
         } else {
             None
         };
-        Self {
+        if delay == 0 && extras.is_none() {
+            return Self::plain_scoped(lhs, rhs, rhs_parent_scoped);
+        }
+        Self::Full(Box::new(FullContinuousAssignment {
             lhs,
             rhs,
             delay,
             rhs_parent_scoped,
             extras,
+        }))
+    }
+
+    #[inline]
+    pub fn as_plain_link(&self) -> Option<(&SharedName, &SharedName, bool)> {
+        match self {
+            Self::PlainLink {
+                lhs,
+                rhs,
+                rhs_parent_scoped,
+            } => Some((lhs, rhs, *rhs_parent_scoped)),
+            Self::Full(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_full(&self) -> Option<&FullContinuousAssignment> {
+        match self {
+            Self::Full(f) => Some(f),
+            Self::PlainLink { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_plain_link(&self) -> bool {
+        matches!(self, Self::PlainLink { .. })
+    }
+
+    #[inline]
+    pub fn delay(&self) -> u64 {
+        match self {
+            Self::PlainLink { .. } => 0,
+            Self::Full(f) => f.delay,
+        }
+    }
+
+    #[inline]
+    pub fn rhs_parent_scoped(&self) -> bool {
+        match self {
+            Self::PlainLink {
+                rhs_parent_scoped, ..
+            } => *rhs_parent_scoped,
+            Self::Full(f) => f.rhs_parent_scoped,
+        }
+    }
+
+    #[inline]
+    pub fn extras(&self) -> Option<&ContinuousAssignExtras> {
+        match self {
+            Self::PlainLink { .. } => None,
+            Self::Full(f) => f.extras.as_deref(),
+        }
+    }
+
+    pub fn lhs_ident_name(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self {
+            Self::PlainLink { lhs, .. } => Some(std::borrow::Cow::Borrowed(lhs.as_str())),
+            Self::Full(f) => ident_flat_name(&f.lhs).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    pub fn rhs_ident_name(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self {
+            Self::PlainLink { rhs, .. } => Some(std::borrow::Cow::Borrowed(rhs.as_str())),
+            Self::Full(f) => ident_flat_name(&f.rhs).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    pub fn lhs_expr(&self) -> std::borrow::Cow<'_, Expression> {
+        match self {
+            Self::PlainLink { lhs, .. } => std::borrow::Cow::Owned(make_ident_expr(lhs.as_str())),
+            Self::Full(f) => std::borrow::Cow::Borrowed(&f.lhs),
+        }
+    }
+
+    pub fn rhs_expr(&self) -> std::borrow::Cow<'_, Expression> {
+        match self {
+            Self::PlainLink { rhs, .. } => std::borrow::Cow::Owned(make_ident_expr(rhs.as_str())),
+            Self::Full(f) => std::borrow::Cow::Borrowed(&f.rhs),
+        }
+    }
+
+    pub fn make_full_mut(&mut self) -> &mut FullContinuousAssignment {
+        if let Self::PlainLink {
+            lhs,
+            rhs,
+            rhs_parent_scoped,
+        } = self
+        {
+            let full = Box::new(FullContinuousAssignment {
+                lhs: make_ident_expr(lhs.as_str()),
+                rhs: make_ident_expr(rhs.as_str()),
+                delay: 0,
+                rhs_parent_scoped: *rhs_parent_scoped,
+                extras: None,
+            });
+            *self = Self::Full(full);
+        }
+        match self {
+            Self::Full(f) => f,
+            Self::PlainLink { .. } => unreachable!(),
+        }
+    }
+
+    pub fn into_full(self) -> FullContinuousAssignment {
+        match self {
+            Self::Full(f) => *f,
+            Self::PlainLink {
+                lhs,
+                rhs,
+                rhs_parent_scoped,
+            } => FullContinuousAssignment {
+                lhs: make_ident_expr(lhs.as_str()),
+                rhs: make_ident_expr(rhs.as_str()),
+                delay: 0,
+                rhs_parent_scoped,
+                extras: None,
+            },
+        }
+    }
+
+    pub fn set_delay(&mut self, value: u64) {
+        if value == 0 && self.is_plain_link() {
+            return;
+        }
+        self.make_full_mut().delay = value;
+    }
+
+    pub fn set_rhs_parent_scoped(&mut self, value: bool) {
+        match self {
+            Self::PlainLink {
+                rhs_parent_scoped, ..
+            } => *rhs_parent_scoped = value,
+            Self::Full(f) => f.rhs_parent_scoped = value,
         }
     }
 
     fn delays(&self) -> Option<&ContinuousAssignDelays> {
-        self.extras.as_deref().and_then(|e| e.delays.as_deref())
-    }
-
-    fn delays_mut(&mut self) -> &mut ContinuousAssignDelays {
-        self.extras
-            .get_or_insert_with(|| Box::new(ContinuousAssignExtras::default()))
-            .delays
-            .get_or_insert_with(|| Box::new(ContinuousAssignDelays::default()))
-    }
-
-    fn prune_extras(&mut self) {
-        if let Some(extras) = self.extras.as_deref_mut() {
-            if extras.delays.as_deref().is_some_and(ContinuousAssignDelays::is_empty) {
-                extras.delays = None;
-            }
-            if extras.is_empty() {
-                self.extras = None;
-            }
-        }
+        self.extras().and_then(|e| e.delays.as_deref())
     }
 
     pub fn delay_fall(&self) -> Option<u64> {
@@ -806,94 +1486,91 @@ impl ContinuousAssignment {
     }
 
     pub fn origin(&self) -> Option<&(crate::ast::Span, std::sync::Arc<str>)> {
-        self.extras.as_deref().and_then(|e| e.origin.as_ref())
+        self.extras().and_then(|e| e.origin.as_ref())
     }
 
     pub fn set_delay_fall(&mut self, value: Option<u64>) {
-        if value.is_some() {
-            self.delays_mut().delay_fall = value;
-        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
-            d.delay_fall = None;
-            self.prune_extras();
+        if value.is_none() && self.is_plain_link() {
+            return;
         }
+        self.make_full_mut().set_delay_fall(value);
     }
 
     pub fn set_delay_off(&mut self, value: Option<u64>) {
-        if value.is_some() {
-            self.delays_mut().delay_off = value;
-        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
-            d.delay_off = None;
-            self.prune_extras();
+        if value.is_none() && self.is_plain_link() {
+            return;
         }
+        self.make_full_mut().set_delay_off(value);
     }
 
     pub fn set_gate_delay_fall(&mut self, value: Option<u64>) {
         if value.is_some() {
-            self.delays_mut().gate_delay_fall = value;
-        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
+            self.make_full_mut().delays_mut().gate_delay_fall = value;
+        } else if let Self::Full(f) = self
+            && let Some(d) = f.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut())
+        {
             d.gate_delay_fall = None;
-            self.prune_extras();
+            f.prune_extras();
         }
     }
 
     pub fn set_delay_exprs(&mut self, value: Option<DelayExpressions>) {
-        if value.is_some() {
-            self.delays_mut().delay_exprs = value;
-        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
-            d.delay_exprs = None;
-            self.prune_extras();
+        if value.is_none() && self.is_plain_link() {
+            return;
         }
+        self.make_full_mut().set_delay_exprs(value);
     }
 
     pub fn take_delay_exprs(&mut self) -> Option<DelayExpressions> {
-        let taken = self
-            .extras
-            .as_deref_mut()
-            .and_then(|e| e.delays.as_deref_mut())
-            .and_then(|d| d.delay_exprs.take());
-        if taken.is_some() {
-            self.prune_extras();
+        match self {
+            Self::PlainLink { .. } => None,
+            Self::Full(f) => f.take_delay_exprs(),
         }
-        taken
     }
 
     pub fn set_delay_select(&mut self, value: Option<(u32, u32, bool)>) {
         if value.is_some() {
-            self.delays_mut().delay_select = value;
-        } else if let Some(d) = self.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut()) {
+            self.make_full_mut().delays_mut().delay_select = value;
+        } else if let Self::Full(f) = self
+            && let Some(d) = f.extras.as_deref_mut().and_then(|e| e.delays.as_deref_mut())
+        {
             d.delay_select = None;
-            self.prune_extras();
+            f.prune_extras();
         }
     }
 
     pub fn set_origin(&mut self, value: Option<(crate::ast::Span, std::sync::Arc<str>)>) {
-        if value.is_some() {
-            self.extras
-                .get_or_insert_with(|| Box::new(ContinuousAssignExtras::default()))
-                .origin = value;
-        } else if let Some(extras) = self.extras.as_deref_mut() {
-            extras.origin = None;
-            self.prune_extras();
+        if value.is_none() && self.is_plain_link() {
+            return;
         }
+        self.make_full_mut().set_origin(value);
     }
 
     pub fn take_origin(&mut self) -> Option<(crate::ast::Span, std::sync::Arc<str>)> {
-        let taken = self.extras.as_deref_mut().and_then(|e| e.origin.take());
-        if taken.is_some() {
-            self.prune_extras();
+        match self {
+            Self::PlainLink { .. } => None,
+            Self::Full(f) => f.take_origin(),
         }
-        taken
     }
 }
 
 impl ContinuousAssignment {
     /// Keep the original driver context on each unpacked array element.
     pub fn inherit_driver_metadata(&mut self, driver: &Self) {
-        self.set_delay_fall(driver.delay_fall());
-        self.set_delay_off(driver.delay_off());
-        self.set_delay_exprs(driver.delay_exprs().cloned());
-        self.set_origin(driver.origin().cloned());
-        self.rhs_parent_scoped = driver.rhs_parent_scoped;
+        match driver {
+            Self::PlainLink {
+                rhs_parent_scoped, ..
+            } => {
+                self.set_rhs_parent_scoped(*rhs_parent_scoped);
+            }
+            Self::Full(d) => {
+                self.set_delay_fall(d.delay_fall());
+                self.set_delay_off(d.delay_off());
+                self.set_delay_exprs(d.delay_exprs().cloned());
+                self.set_origin(d.origin().cloned());
+                self.set_rhs_parent_scoped(d.rhs_parent_scoped);
+            }
+        }
     }
 }
 
@@ -1054,7 +1731,7 @@ impl InitialBlock {
 /// serialized form is the `(formal, actual, two_state)` tuple either way.
 #[derive(Debug, Clone)]
 pub struct InputPortActual {
-    formal: String,
+    formal: SharedName,
     actual: InputActualExpr,
     two_state: bool,
 }
@@ -1065,15 +1742,15 @@ enum InputActualExpr {
     /// The entry of `ports` for the port name `formal[name_start..]`.
     Shared {
         ports: Rc<HashMap<String, Expression>>,
-        name_start: usize,
+        name_start: u32,
     },
 }
 
 impl InputPortActual {
     /// An actual that belongs to this record alone.
-    pub fn owned(formal: String, actual: Expression, two_state: bool) -> Self {
+    pub fn owned(formal: impl Into<SharedName>, actual: Expression, two_state: bool) -> Self {
         InputPortActual {
-            formal,
+            formal: formal.into(),
             actual: InputActualExpr::Owned(Box::new(actual)),
             two_state,
         }
@@ -1082,29 +1759,35 @@ impl InputPortActual {
     /// The actual `ports` holds for the port name `formal[name_start..]`.
     /// The entry must exist.
     fn shared(
-        formal: String,
+        formal: impl Into<SharedName>,
         name_start: usize,
         ports: Rc<HashMap<String, Expression>>,
         two_state: bool,
     ) -> Self {
-        debug_assert!(ports.contains_key(&formal[name_start..]));
+        let formal = formal.into();
+        debug_assert!(ports.contains_key(&formal.as_str()[name_start..]));
         InputPortActual {
             formal,
-            actual: InputActualExpr::Shared { ports, name_start },
+            actual: InputActualExpr::Shared {
+                ports,
+                name_start: u32::try_from(name_start).expect("port path exceeds u32"),
+            },
             two_state,
         }
     }
 
     /// The port's hierarchical name (`u.v.port`).
     pub fn formal(&self) -> &str {
-        &self.formal
+        self.formal.as_str()
     }
 
     /// The connected expression, in the parent's scope.
     pub fn actual(&self) -> &Expression {
         match &self.actual {
             InputActualExpr::Owned(actual) => actual,
-            InputActualExpr::Shared { ports, name_start } => &ports[&self.formal[*name_start..]],
+            InputActualExpr::Shared { ports, name_start } => {
+                &ports[&self.formal.as_str()[*name_start as usize..]]
+            }
         }
     }
 
@@ -3228,12 +3911,15 @@ impl ElaboratedModule {
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.
-            match self.whole_array_driver_parts(&ca.lhs, &ca.rhs, ca.delay, &self.unpacked_decl_dims)
+            let lhs = ca.lhs_expr();
+            let rhs = ca.rhs_expr();
+            let delay = ca.delay();
+            match self.whole_array_driver_parts(&lhs, &rhs, delay, &self.unpacked_decl_dims)
             .or_else(|| {
                 slice_array_assign_parts(
-                    &ca.lhs,
-                    &ca.rhs,
-                    ca.delay,
+                    &lhs,
+                    &rhs,
+                    delay,
                     &self.arrays,
                     Some(&self.descending_arrays),
                     Some(&self.unpacked_decl_dims),
@@ -3242,7 +3928,7 @@ impl ElaboratedModule {
             })
             .or_else(|| {
                 self.with_unpacked_array_tables(|t| {
-                    concat_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, t)
+                    concat_array_assign_parts(&lhs, &rhs, delay, t)
                 })
             }) {
                 Some(parts) => {
@@ -3420,10 +4106,10 @@ fn is_clock_passthrough_cell(def: &Definition) -> bool {
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
-                let shaped = nd.delay.is_some()
-                    || nd.delay_fall.is_some()
-                    || nd.delay_off.is_some()
-                    || nd.strength.is_some()
+                let shaped = nd.delay().is_some()
+                    || nd.delay_fall().is_some()
+                    || nd.delay_off().is_some()
+                    || nd.strength().is_some()
                     || !plain_net(Some(&nd.net_type));
                 if nd.declarators.iter().any(|d| {
                     clock_port(&d.name.name)
@@ -3759,7 +4445,7 @@ mod logged_map_tests {
         fn alias(name: &str) -> DataType {
             let span = Span::new(0, 0);
             DataType::TypeReference {
-                name: crate::ast::types::TypeName {
+                name: Box::new(crate::ast::types::TypeName {
                     scopes: Vec::new(),
                     name: Identifier {
                         name: name.into(),
@@ -3767,7 +4453,7 @@ mod logged_map_tests {
                     },
                     span,
                     bound: Default::default(),
-                },
+                }),
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
                 span,

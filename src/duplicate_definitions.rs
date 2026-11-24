@@ -78,7 +78,7 @@ impl DuplicateDefinitions {
         let mut diags = Vec::new();
         for d in descriptions {
             match d {
-                Description::Class(c) | Description::PackageItem(PackageItem::Class(c)) => {
+                Description::Class(c) => {
                     note(
                         &mut self.unit,
                         "class",
@@ -91,7 +91,23 @@ impl DuplicateDefinitions {
                     );
                     nested(c, &ft, &mut diags);
                 }
-                Description::TypedefDecl(t) | Description::PackageItem(PackageItem::Typedef(t)) => {
+                Description::PackageItem(PackageItem::Class(c)) => {
+                    note(
+                        &mut self.unit,
+                        "class",
+                        &c.name,
+                        Some("the compilation unit"),
+                        "§3.13, §8.3",
+                        None,
+                        &ft,
+                        &mut diags,
+                    );
+                    nested(c, &ft, &mut diags);
+                }
+                Description::TypedefDecl(t) => {
+                    note_typedef(&mut self.unit, t, "the compilation unit", &ft, &mut diags);
+                }
+                Description::PackageItem(PackageItem::Typedef(t)) => {
                     note_typedef(&mut self.unit, t, "the compilation unit", &ft, &mut diags);
                 }
                 Description::Package(p) => {

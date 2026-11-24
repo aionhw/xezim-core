@@ -754,7 +754,7 @@ pub(super) fn process_import(
                                                 is_signed: signed,
                                                 is_real,
                                                 direction: None,
-                                                value: v,
+                                                value: v.into(),
                                                 type_name: get_type_name(data_type).map(SharedName::from),
                                             },
                                         );
@@ -848,7 +848,7 @@ pub(super) fn process_import(
                                                     is_signed: false,
                                                     is_real: false,
                                                     direction: None,
-                                                    value: v,
+                                                    value: v.into(),
                                                     type_name: Some(td.name.name.as_str().into()),
                                                 },
                                             );
@@ -876,9 +876,12 @@ pub(super) fn process_import(
                             if &fd.name.name.name == sym_name
                                 && fd.name.scopes.is_empty() =>
                         {
-                            elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                             elab.functions
-                                .insert(format!("{}::{}", pkg_name, fd.name.name.name), fd.clone());
+                                .insert(fd.name.name.name.clone(), fd.as_ref().clone());
+                            elab.functions.insert(
+                                format!("{}::{}", pkg_name, fd.name.name.name),
+                                fd.as_ref().clone(),
+                            );
                             elab.pkg_subr_owner
                                 .insert(fd.name.name.name.clone(), pkg_name.clone());
                             elab.func_decl_scope
@@ -889,9 +892,12 @@ pub(super) fn process_import(
                             if &td.name.name.name == sym_name
                                 && td.name.scopes.is_empty() =>
                         {
-                            elab.tasks.insert(td.name.name.name.clone(), td.clone());
                             elab.tasks
-                                .insert(format!("{}::{}", pkg_name, td.name.name.name), td.clone());
+                                .insert(td.name.name.name.clone(), td.as_ref().clone());
+                            elab.tasks.insert(
+                                format!("{}::{}", pkg_name, td.name.name.name),
+                                td.as_ref().clone(),
+                            );
                             elab.pkg_subr_owner
                                 .insert(td.name.name.name.clone(), pkg_name.clone());
                             elab.func_decl_scope
@@ -909,36 +915,47 @@ pub(super) fn process_import(
                         // §26.3 / §11.13: a let is a package item, so
                         // `import P::my_let;` names it.
                         PackageItem::Let(l) if &l.name.name == sym_name => {
-                            elab.lets.insert(l.name.name.clone(), l.clone());
+                            elab.lets.insert(l.name.name.clone(), l.as_ref().clone());
                             found = true;
                         }
                         // §16.8, §16.12, §26.3: so are a named sequence and
                         // property; the import binds the bare name to this
                         // package's declaration.
-                        PackageItem::Property(PropertyDeclaration {
-                            name,
-                            ports,
-                            port_defaults,
-                            body,
-                            ..
-                        })
-                        | PackageItem::Sequence(SequenceDeclaration {
-                            name,
-                            ports,
-                            port_defaults,
-                            body,
-                            ..
-                        }) if &name.name == sym_name => {
-                            if let Some(body) = body {
-                                elab.property_decls.insert(name.name.clone(), Rc::new(body.clone()));
-                                if !ports.is_empty() {
+                        PackageItem::Property(prop) if &prop.name.name == sym_name => {
+                            if let Some(body) = &prop.body {
+                                elab.property_decls
+                                    .insert(prop.name.name.clone(), Rc::new(body.clone()));
+                                if !prop.ports.is_empty() {
                                     let names: Vec<String> =
-                                        ports.iter().map(|p| p.name.clone()).collect();
-                                    elab.property_params.insert(name.name.clone(), names);
+                                        prop.ports.iter().map(|p| p.name.clone()).collect();
+                                    elab.property_params.insert(prop.name.name.clone(), names);
                                 }
-                                register_sva_port_defaults(elab, &name.name, port_defaults);
+                                register_sva_port_defaults(
+                                    elab,
+                                    &prop.name.name,
+                                    &prop.port_defaults,
+                                );
                             } else {
-                                elab.sequences.insert(name.name.clone());
+                                elab.sequences.insert(prop.name.name.clone());
+                            }
+                            found = true;
+                        }
+                        PackageItem::Sequence(seq) if &seq.name.name == sym_name => {
+                            if let Some(body) = &seq.body {
+                                elab.property_decls
+                                    .insert(seq.name.name.clone(), Rc::new(body.clone()));
+                                if !seq.ports.is_empty() {
+                                    let names: Vec<String> =
+                                        seq.ports.iter().map(|p| p.name.clone()).collect();
+                                    elab.property_params.insert(seq.name.name.clone(), names);
+                                }
+                                register_sva_port_defaults(
+                                    elab,
+                                    &seq.name.name,
+                                    &seq.port_defaults,
+                                );
+                            } else {
+                                elab.sequences.insert(seq.name.name.clone());
                             }
                             found = true;
                         }
@@ -1031,7 +1048,7 @@ pub(super) fn process_import(
                                             is_signed,
                                             is_real,
                                             direction: None,
-                                            value: v,
+                                            value: v.into(),
                                             type_name: get_type_name(&dd.data_type).map(SharedName::from),
                                         },
                                     );
@@ -1129,8 +1146,10 @@ pub(super) fn process_import(
                     if let PackageItem::Function(fd) = pi
                         && fd.name.scopes.is_empty()
                     {
-                        elab.functions
-                            .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
+                        elab.functions.insert_if_absent_with(
+                            fd.name.name.name.clone(),
+                            || fd.as_ref().clone(),
+                        );
                     }
                 }
                 set_funcs_tls(&elab.functions);
@@ -1264,7 +1283,7 @@ pub(super) fn process_import(
                                                 is_signed: signed,
                                                 is_real,
                                                 direction: None,
-                                                value: v,
+                                                value: v.into(),
                                                 type_name: get_type_name(data_type).map(SharedName::from),
                                             },
                                         );
@@ -1296,18 +1315,24 @@ pub(super) fn process_import(
                         PackageItem::Function(fd) if fd.name.scopes.is_empty() && !inline_only => {
                             elab.func_decl_scope
                                 .insert(fd.name.name.name.clone(), pkg_name.clone());
-                            elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                             elab.functions
-                                .insert(format!("{}::{}", pkg_name, fd.name.name.name), fd.clone());
+                                .insert(fd.name.name.name.clone(), fd.as_ref().clone());
+                            elab.functions.insert(
+                                format!("{}::{}", pkg_name, fd.name.name.name),
+                                fd.as_ref().clone(),
+                            );
                             elab.pkg_subr_owner
                                 .insert(fd.name.name.name.clone(), pkg_name.clone());
                         }
                         PackageItem::Task(td) if td.name.scopes.is_empty() && !inline_only => {
                             elab.func_decl_scope
                                 .insert(td.name.name.name.clone(), pkg_name.clone());
-                            elab.tasks.insert(td.name.name.name.clone(), td.clone());
                             elab.tasks
-                                .insert(format!("{}::{}", pkg_name, td.name.name.name), td.clone());
+                                .insert(td.name.name.name.clone(), td.as_ref().clone());
+                            elab.tasks.insert(
+                                format!("{}::{}", pkg_name, td.name.name.name),
+                                td.as_ref().clone(),
+                            );
                             elab.pkg_subr_owner
                                 .insert(td.name.name.name.clone(), pkg_name.clone());
                         }
@@ -1321,7 +1346,7 @@ pub(super) fn process_import(
                         // `let` visible by its bare name, as the explicit
                         // import above does.
                         PackageItem::Let(l) if !inline_only => {
-                            elab.lets.insert(l.name.name.clone(), l.clone());
+                            elab.lets.insert(l.name.name.clone(), l.as_ref().clone());
                         }
                         PackageItem::Class(c) if !inline_only => {
                             register_class_enum_members(c, elab);
@@ -1488,7 +1513,7 @@ pub(super) fn process_import(
                                         is_signed,
                                         is_real,
                                         direction: None,
-                                        value: v,
+                                        value: v.into(),
                                         type_name: tn.map(SharedName::from),
                                     },
                                 );

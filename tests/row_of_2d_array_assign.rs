@@ -47,9 +47,9 @@ endmodule
     };
     let parts = |a: &xezim_core::elaborate::ContinuousAssignment| {
         xezim_core::elaborate::whole_array_row_assign_parts(
-            &a.lhs,
-            &a.rhs,
-            a.delay,
+            &a.lhs_expr(),
+            &a.rhs_expr(),
+            a.delay(),
             &design.arrays,
             &design.arrays_2d,
             &design.parameters,
@@ -61,7 +61,7 @@ endmodule
     let pairs: Vec<_> = parts(assign)
         .expect("expanded per element")
         .iter()
-        .map(|a| (element(&a.lhs).unwrap(), element(&a.rhs).unwrap()))
+        .map(|a| (element(&a.lhs_expr()).unwrap(), element(&a.rhs_expr()).unwrap()))
         .collect();
     assert_eq!(
         pairs,
@@ -87,9 +87,9 @@ endmodule
     );
     let assign = &design.continuous_assigns[0];
     let parts = xezim_core::elaborate::whole_array_row_assign_parts(
-        &assign.lhs,
-        &assign.rhs,
-        assign.delay,
+        &assign.lhs_expr(),
+        &assign.rhs_expr(),
+        assign.delay(),
         &design.arrays,
         &design.arrays_2d,
         &design.parameters,
@@ -98,7 +98,8 @@ endmodule
     )
     .expect("row expands");
     for part in parts {
-        let ExprKind::Index { expr, .. } = &part.rhs.kind else {
+        let rhs = part.rhs_expr();
+        let ExprKind::Index { expr, .. } = &rhs.kind else {
             panic!("column select")
         };
         let ExprKind::Index { index, .. } = &expr.kind else {
