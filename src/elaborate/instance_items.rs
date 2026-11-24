@@ -942,6 +942,16 @@ pub(super) fn inline_instantiation_items(
                                 if let Some(ParamValue::Expr(v)) = value {
                                     if let Some(FlatSlot::Data(data_type, a)) = flat_slots.get(i) {
                                         let data_type: &DataType = data_type;
+                                        let v = &prebind_bits_of_signals(
+                                            v,
+                                            &elab.signals,
+                                            scoped_eval_params,
+                                            prefix,
+                                            &elab.typedefs,
+                                            &elab.typedef_types,
+                                            &elab.packed_struct_fields,
+                                            &elab.arrays,
+                                        );
                                         // §13.4.3: const-fn calls, as in the
                                         // Named branch.
                                         let subbed_ov;
