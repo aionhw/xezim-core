@@ -371,22 +371,32 @@ impl<'a> Parser<'a> {
 
     fn parse_specify_path_inner(&mut self, sp_start: u32) -> Option<SpecifyPath> {
         let mut cond = None;
+        let mut cond_text = None;
         let mut ifnone = false;
         if self.eat(TokenKind::KwIf).is_some() {
             self.eat(TokenKind::LParen)?;
+            let start = self.pos;
             cond = Some(self.parse_expression());
+            cond_text = Some(
+                (start..self.pos)
+                    .filter_map(|i| self.tokens.get(i))
+                    .map(|t| self.tokens.text(t))
+                    .collect::<String>(),
+            );
             self.eat(TokenKind::RParen)?;
         } else if self.eat(TokenKind::KwIfnone).is_some() {
             ifnone = true;
         }
         self.eat(TokenKind::LParen)?;
-        let edge = matches!(
+        let edge = if matches!(
             self.current_kind(),
             TokenKind::KwPosedge | TokenKind::KwNegedge | TokenKind::KwEdge
-        );
-        if edge {
-            self.bump();
-        }
+        ) {
+            let token = self.bump();
+            Some(self.token_text(token).into_owned())
+        } else {
+            None
+        };
         let srcs = self.parse_specify_terminals()?;
         // Parallel `=>` or full `*>` connection with optional polarity (a
         // per-net delay model needs neither). The lexer splits `+=>` into
@@ -437,6 +447,8 @@ impl<'a> Parser<'a> {
             srcs,
             dsts,
             cond,
+            cond_text,
+            edge,
             ifnone,
             delays,
             span: self.span_from(sp_start),

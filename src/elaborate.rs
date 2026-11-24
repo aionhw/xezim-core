@@ -968,6 +968,9 @@ pub struct ModulePath {
     pub srcs: Vec<String>,
     /// §30.4.4 condition in the flat namespace; `None` = always enabled.
     pub cond: Option<Expression>,
+    /// Unqualified condition and input edge for SDF path matching.
+    pub cond_text: Option<String>,
+    pub edge: Option<String>,
     /// §30.4.4.3 `ifnone`: enabled only while no conditional path from the
     /// same input is.
     pub ifnone: bool,

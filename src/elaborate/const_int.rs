@@ -747,17 +747,21 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                 }
             }
             "$clog2" => {
-                let val = const_eval_i64_with_params_env(args.first()?, params)?;
-                if val <= 1 {
-                    Some(0)
+                let arg = args.first()?;
+                let empty = HashMap::default();
+                let value = match params {
+                    Some(p) => eval_const_expr_val_env(arg, p),
+                    None => eval_const_expr_val(arg, &empty),
+                };
+                if !value.has_xz() && !value.is_real {
+                    Some(i64::from(value.clog2_unsigned()))
                 } else {
-                    let mut res = 0;
-                    let mut tmp = val - 1;
-                    while tmp > 0 {
-                        tmp >>= 1;
-                        res += 1;
-                    }
-                    Some(res)
+                    let narrow = const_eval_i64_with_params_env(arg, params)?;
+                    Some(if narrow <= 1 {
+                        0
+                    } else {
+                        i64::from(64 - (narrow - 1).leading_zeros())
+                    })
                 }
             }
             "$unsigned" | "$signed" => const_eval_i64_with_params_env(args.first()?, params),

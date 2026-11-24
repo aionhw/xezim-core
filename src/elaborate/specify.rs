@@ -124,6 +124,8 @@ pub(super) fn elaborate_module_paths(
                 delays,
                 srcs: srcs.clone(),
                 cond: cond.clone(),
+                cond_text: p.cond_text.clone(),
+                edge: p.edge.clone(),
                 ifnone: p.ifnone,
             });
         }

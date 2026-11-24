@@ -12,7 +12,7 @@
 //!   - TIMESCALE
 //!   - CELL/INSTANCE hierarchy
 
-use std::collections::HashMap;
+use crate::hasher::HashMap;
 
 /// A parsed SDF delay file.
 #[derive(Debug, Clone)]
@@ -34,19 +34,20 @@ pub struct SdfCell {
 /// A single delay specification.
 #[derive(Debug, Clone)]
 pub enum SdfDelay {
-    /// IOPATH: input_port → output_port with rise/fall delays
+    /// IOPATH: one input and output, with an output transition delay list.
     IoPath {
-        input: String,
+        input: SdfTimingPort,
         output: String,
-        rise: DelayTriple,
-        fall: DelayTriple,
+        values: Vec<DelayTriple>,
+        increment: bool,
+        ifnone: bool,
     },
-    /// INTERCONNECT: source → destination wire delay
+    /// INTERCONNECT: source → destination wire delay.
     Interconnect {
         source: String,
         dest: String,
-        rise: DelayTriple,
-        fall: DelayTriple,
+        values: Vec<DelayTriple>,
+        increment: bool,
     },
     /// TIMINGCHECK entry (`SETUP`, `HOLD`, `SETUPHOLD`, ...) with its ports
     /// in SDF order and its limit values; an empty `()` value is `None`.
@@ -81,28 +82,20 @@ pub struct SdfTimingLimit {
 /// A min:typ:max delay triple. Values in SDF timescale units.
 #[derive(Debug, Clone, Copy)]
 pub struct DelayTriple {
-    pub min: f64,
-    pub typ: f64,
-    pub max: f64,
+    pub min: Option<f64>,
+    pub typ: Option<f64>,
+    pub max: Option<f64>,
 }
 
 impl DelayTriple {
-    pub fn zero() -> Self {
-        Self {
-            min: 0.0,
-            typ: 0.0,
-            max: 0.0,
-        }
-    }
     pub fn single(v: f64) -> Self {
         Self {
-            min: v,
-            typ: v,
-            max: v,
+            min: Some(v),
+            typ: Some(v),
+            max: Some(v),
         }
     }
 }
-
 /// Which delay value to use from the min:typ:max triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelaySelect {
@@ -112,7 +105,7 @@ pub enum DelaySelect {
 }
 
 impl DelaySelect {
-    pub fn pick(&self, triple: &DelayTriple) -> f64 {
+    pub fn pick(&self, triple: &DelayTriple) -> Option<f64> {
         match self {
             DelaySelect::Min => triple.min,
             DelaySelect::Typ => triple.typ,
@@ -127,17 +120,20 @@ impl DelaySelect {
 pub struct SdfAnnotation {
     /// Map from output signal name → delay in simulation time units (integer).
     pub signal_delays: HashMap<String, u64>,
-    /// Detailed per-pin delays: (instance.output) → Vec<(input_pin, rise_delay, fall_delay)>
+    /// Detailed per-pin delays keyed by destination.
     pub pin_delays: HashMap<String, Vec<PinDelay>>,
+    /// Interconnect entries keyed by receiving terminal.
+    pub interconnect_delays: HashMap<String, Vec<PinDelay>>,
     /// TIMINGCHECK limits, applied to the matching specify timing checks.
     pub timing_limits: Vec<SdfTimingLimit>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PinDelay {
-    pub input_pin: String,
-    pub rise: u64, // delay in sim time units
-    pub fall: u64,
+    pub input: SdfTimingPort,
+    pub values: Vec<Option<i64>>,
+    pub increment: bool,
+    pub ifnone: bool,
 }
 
 impl Default for SdfAnnotation {
@@ -149,8 +145,9 @@ impl Default for SdfAnnotation {
 impl SdfAnnotation {
     pub fn new() -> Self {
         Self {
-            signal_delays: HashMap::new(),
-            pin_delays: HashMap::new(),
+            signal_delays: HashMap::default(),
+            pin_delays: HashMap::default(),
+            interconnect_delays: HashMap::default(),
             timing_limits: Vec::new(),
         }
     }
@@ -174,11 +171,16 @@ pub fn parse_sdf(content: &str) -> Result<SdfFile, String> {
 struct SdfParser<'a> {
     input: &'a str,
     pos: usize,
+    divider: char,
 }
 
 impl<'a> SdfParser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            divider: '.',
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -319,8 +321,17 @@ impl<'a> SdfParser<'a> {
                             file.design = self.read_quoted_string()?;
                             self.expect_char(')')?;
                         }
-                        "DATE" | "VENDOR" | "PROGRAM" | "VERSION" | "DIVIDER" | "VOLTAGE"
-                        | "PROCESS" | "TEMPERATURE" => {
+                        "DIVIDER" => {
+                            let divider = self.read_token();
+                            self.divider = match divider.as_str() {
+                                "/" => '/',
+                                "." => '.',
+                                _ => return Err(format!("SDF: invalid DIVIDER '{divider}'")),
+                            };
+                            self.expect_char(')')?;
+                        }
+                        "DATE" | "VENDOR" | "PROGRAM" | "VERSION" | "VOLTAGE" | "PROCESS"
+                        | "TEMPERATURE" => {
                             // Skip value
                             self.skip_to_close_paren();
                         }
@@ -329,9 +340,7 @@ impl<'a> SdfParser<'a> {
                             self.expect_char(')')?;
                         }
                         "CELL" => {
-                            if let Ok(cell) = self.parse_cell() {
-                                file.cells.push(cell);
-                            }
+                            file.cells.push(self.parse_cell()?);
                         }
                         _ => {
                             self.skip_to_close_paren();
@@ -409,7 +418,7 @@ impl<'a> SdfParser<'a> {
                             if self.peek() == Some(')') {
                                 self.pos += 1;
                             } else {
-                                cell.instance = self.read_token();
+                                cell.instance = self.read_path();
                                 self.expect_char(')')?;
                             }
                         }
@@ -447,7 +456,7 @@ impl<'a> SdfParser<'a> {
                     let kw = self.read_token();
                     match kw.as_str() {
                         "ABSOLUTE" | "INCREMENT" => {
-                            self.parse_delay_entries(cell)?;
+                            self.parse_delay_entries(cell, kw == "INCREMENT")?;
                         }
                         _ => {
                             self.skip_to_close_paren();
@@ -462,7 +471,7 @@ impl<'a> SdfParser<'a> {
         }
     }
 
-    fn parse_delay_entries(&mut self, cell: &mut SdfCell) -> Result<(), String> {
+    fn parse_delay_entries(&mut self, cell: &mut SdfCell, increment: bool) -> Result<(), String> {
         loop {
             self.skip_ws();
             match self.peek() {
@@ -474,30 +483,44 @@ impl<'a> SdfParser<'a> {
                     self.pos += 1;
                     let kw = self.read_token();
                     match kw.as_str() {
-                        "IOPATH" => {
-                            let input = self.read_token();
-                            let output = self.read_token();
-                            let rise = self.parse_delay_value()?;
-                            let fall = self.parse_delay_value()?;
-                            self.expect_char(')')?;
+                        "IOPATH" | "COND" | "CONDELSE" => {
+                            let mut cond = None;
+                            if kw == "COND" || kw == "CONDELSE" {
+                                if kw == "COND" {
+                                    cond = Some(self.read_iopath_condition()?);
+                                }
+                                self.expect_char('(')?;
+                                if self.read_token() != "IOPATH" {
+                                    return Err(format!(
+                                        "SDF: expected IOPATH at pos {}",
+                                        self.pos
+                                    ));
+                                }
+                            }
+                            let mut input = self.parse_timing_port()?;
+                            input.cond = cond;
+                            let output = self.read_path();
+                            let values = self.parse_delay_list()?;
+                            if kw != "IOPATH" {
+                                self.expect_char(')')?;
+                            }
                             cell.delays.push(SdfDelay::IoPath {
                                 input,
                                 output,
-                                rise,
-                                fall,
+                                values,
+                                increment,
+                                ifnone: kw == "CONDELSE",
                             });
                         }
                         "INTERCONNECT" => {
-                            let source = self.read_token();
-                            let dest = self.read_token();
-                            let rise = self.parse_delay_value()?;
-                            let fall = self.parse_delay_value()?;
-                            self.expect_char(')')?;
+                            let source = self.read_path();
+                            let dest = self.read_path();
+                            let values = self.parse_delay_list()?;
                             cell.delays.push(SdfDelay::Interconnect {
                                 source,
                                 dest,
-                                rise,
-                                fall,
+                                values,
+                                increment,
                             });
                         }
                         _ => {
@@ -511,6 +534,76 @@ impl<'a> SdfParser<'a> {
                 }
             }
         }
+    }
+
+    fn read_path(&mut self) -> String {
+        let token = self.read_token();
+        if self.divider == '.' {
+            token
+        } else {
+            let mut escaped = false;
+            token
+                .chars()
+                .filter_map(|c| {
+                    if escaped {
+                        escaped = false;
+                        Some(c)
+                    } else if c == '\\' {
+                        escaped = true;
+                        None
+                    } else {
+                        Some(if c == self.divider { '.' } else { c })
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn read_iopath_condition(&mut self) -> Result<String, String> {
+        self.skip_ws();
+        if self.peek() == Some('"') {
+            self.read_quoted_string()?;
+            self.skip_ws();
+        }
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c == '(' {
+                let save = self.pos;
+                self.pos += 1;
+                if self.read_token() == "IOPATH" {
+                    self.pos = save;
+                    return Ok(self.input[start..save].trim().to_owned());
+                }
+                self.pos = save + 1;
+                self.skip_to_close_paren();
+            } else if c == ')' {
+                break;
+            } else {
+                self.pos += c.len_utf8();
+            }
+        }
+        Err(format!("SDF: COND without IOPATH at pos {start}"))
+    }
+
+    fn parse_delay_list(&mut self) -> Result<Vec<DelayTriple>, String> {
+        let mut values = Vec::new();
+        self.skip_ws();
+        while self.peek().is_some_and(|c| c != ')') {
+            let start = self.pos;
+            values.push(self.parse_delay_value()?);
+            if self.pos == start {
+                return Err(format!("SDF: expected delay at pos {start}"));
+            }
+            self.skip_ws();
+        }
+        self.expect_char(')')?;
+        if !matches!(values.len(), 1 | 2 | 3 | 6 | 12) {
+            return Err(format!(
+                "SDF: invalid delay list of {} values",
+                values.len()
+            ));
+        }
+        Ok(values)
     }
 
     /// `(TIMINGCHECK tchk ...)`: each check's ports and values; trailing
@@ -636,22 +729,17 @@ impl<'a> SdfParser<'a> {
         self.pos += 1; // skip (
         self.skip_ws();
 
-        if self.peek() == Some(')') {
-            // Empty parens = zero delay
-            self.pos += 1;
-            return Ok(DelayTriple::zero());
-        }
-
-        let first = self.read_number();
+        let read_part = |p: &mut Self| {
+            p.skip_ws();
+            (!matches!(p.peek(), Some(':' | ')') | None)).then(|| p.read_number())
+        };
+        let first = read_part(self);
         self.skip_ws();
         if self.peek() == Some(':') {
-            // min:typ:max
             self.pos += 1;
-            let typ = self.read_number();
-            self.skip_ws();
+            let typ = read_part(self);
             self.expect_char(':')?;
-            let max = self.read_number();
-            self.skip_ws();
+            let max = read_part(self);
             self.expect_char(')')?;
             Ok(DelayTriple {
                 min: first,
@@ -659,9 +747,12 @@ impl<'a> SdfParser<'a> {
                 max,
             })
         } else if self.peek() == Some(')') {
-            // Single value
             self.pos += 1;
-            Ok(DelayTriple::single(first))
+            Ok(DelayTriple {
+                min: first,
+                typ: first,
+                max: first,
+            })
         } else {
             Err(format!(
                 "SDF: unexpected char in delay value at pos {}",
@@ -682,50 +773,65 @@ pub fn annotate_sdf(sdf: &SdfFile, sim_timescale: f64, delay_select: DelaySelect
     let mut annotation = SdfAnnotation::new();
     let scale = sdf.timescale / sim_timescale;
 
+    let ticks = |values: &[DelayTriple]| {
+        values
+            .iter()
+            .map(|v| delay_select.pick(v).map(|n| (n * scale).round() as i64))
+            .collect::<Vec<_>>()
+    };
+    let name = |scope: &str, terminal: &str| {
+        if scope.is_empty() {
+            terminal.to_owned()
+        } else {
+            format!("{scope}.{terminal}")
+        }
+    };
     for cell in &sdf.cells {
         for delay in &cell.delays {
             match delay {
                 SdfDelay::IoPath {
                     input,
                     output,
-                    rise,
-                    fall,
+                    values,
+                    increment,
+                    ifnone,
                 } => {
-                    let out_signal = format!("{}.{}", cell.instance, output);
-                    let in_pin = format!("{}.{}", cell.instance, input);
-                    let rise_ticks = (delay_select.pick(rise) * scale).round() as u64;
-                    let fall_ticks = (delay_select.pick(fall) * scale).round() as u64;
-                    let max_delay = rise_ticks.max(fall_ticks);
-
-                    // Store max delay for the output signal (used by settle)
-                    let existing = annotation
-                        .signal_delays
-                        .entry(out_signal.clone())
-                        .or_insert(0);
-                    *existing = (*existing).max(max_delay);
-
-                    // Store per-pin delay
+                    let dst = name(&cell.instance, output);
+                    let mut input = input.clone();
+                    input.port = name(&cell.instance, &input.port);
                     annotation
                         .pin_delays
-                        .entry(out_signal)
+                        .entry(dst)
                         .or_default()
                         .push(PinDelay {
-                            input_pin: in_pin,
-                            rise: rise_ticks,
-                            fall: fall_ticks,
+                            input,
+                            values: ticks(values),
+                            increment: *increment,
+                            ifnone: *ifnone,
                         });
                 }
                 SdfDelay::Interconnect {
-                    source: _,
+                    source,
                     dest,
-                    rise,
-                    fall,
+                    values,
+                    increment,
                 } => {
-                    let rise_ticks = (delay_select.pick(rise) * scale).round() as u64;
-                    let fall_ticks = (delay_select.pick(fall) * scale).round() as u64;
-                    let max_delay = rise_ticks.max(fall_ticks);
-                    let existing = annotation.signal_delays.entry(dest.clone()).or_insert(0);
-                    *existing = (*existing).max(max_delay);
+                    let dst = name(&cell.instance, dest);
+                    let input = SdfTimingPort {
+                        port: name(&cell.instance, source),
+                        edge: None,
+                        cond: None,
+                    };
+                    annotation
+                        .interconnect_delays
+                        .entry(dst)
+                        .or_default()
+                        .push(PinDelay {
+                            input,
+                            values: ticks(values),
+                            increment: *increment,
+                            ifnone: false,
+                        });
                 }
                 SdfDelay::TimingCheck {
                     kind,
@@ -739,7 +845,10 @@ pub fn annotate_sdf(sdf: &SdfFile, sim_timescale: f64, delay_select: DelaySelect
                         ports: ports.clone(),
                         limits: values
                             .iter()
-                            .map(|v| v.map(|t| (delay_select.pick(&t) * scale).round() as i64))
+                            .map(|v| {
+                                v.and_then(|t| delay_select.pick(&t))
+                                    .map(|n| (n * scale).round() as i64)
+                            })
                             .collect(),
                     });
                 }
@@ -747,6 +856,14 @@ pub fn annotate_sdf(sdf: &SdfFile, sim_timescale: f64, delay_select: DelaySelect
         }
     }
 
+    for table in [&annotation.pin_delays, &annotation.interconnect_delays] {
+        for (net, paths) in table {
+            if let Some(value) = paths.iter().flat_map(|p| p.values.iter().flatten()).max() {
+                let old = annotation.signal_delays.entry(net.clone()).or_default();
+                *old = (*old).max((*value).max(0) as u64);
+            }
+        }
+    }
     annotation
 }
 
@@ -782,14 +899,14 @@ mod tests {
         if let SdfDelay::IoPath {
             input,
             output,
-            rise,
-            fall,
+            values,
+            ..
         } = &sdf.cells[0].delays[0]
         {
-            assert_eq!(input, "A");
+            assert_eq!(input.port, "A");
             assert_eq!(output, "Y");
-            assert!((rise.typ - 0.1).abs() < 1e-9);
-            assert!((fall.typ - 0.08).abs() < 1e-9);
+            assert!((values[0].typ.unwrap() - 0.1).abs() < 1e-9);
+            assert!((values[1].typ.unwrap() - 0.08).abs() < 1e-9);
         } else {
             panic!("expected IoPath");
         }

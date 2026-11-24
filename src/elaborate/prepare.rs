@@ -845,6 +845,19 @@ pub(super) fn prepare_module_items(
     let mut sampled_ports = std::collections::HashSet::new();
     prepare_body_operands(&effective_items, &mut sampled_ports);
     sampled_ports.retain(|n| port_directions.get(n) == Some(&PortDirection::Input));
+    // §30.4 and §32.4.4: paths see transitions at the cell's terminals.
+    // Keep their port connections so back-annotated wire delays can delay
+    // one receiver without changing the driver or the other receivers.
+    if effective_items
+        .iter()
+        .any(|item| matches!(item, ModuleItem::SpecifyBlock(sb) if !sb.paths.is_empty()))
+    {
+        sampled_ports.extend(
+            port_directions
+                .iter()
+                .filter_map(|(name, dir)| (*dir == PortDirection::Input).then(|| name.clone())),
+        );
+    }
 
     // §9.2.1/§9.2.2 (#721): pending processes own the shared source body.
     // Run name/driver analysis and literal prefill before moving it out of

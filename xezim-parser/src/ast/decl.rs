@@ -526,6 +526,10 @@ pub struct SpecifyPath {
     pub dsts: Vec<Identifier>,
     /// §30.4.4 `if (cond)` of a state-dependent path.
     pub cond: Option<Expression>,
+    /// The condition's unqualified source text, for SDF path matching.
+    pub cond_text: Option<String>,
+    /// Edge of an edge-sensitive path, for SDF path matching.
+    pub edge: Option<String>,
     /// §30.4.4.3 `ifnone`.
     pub ifnone: bool,
     /// §30.5.1 delay list: 1, 2, 3, 6 or 12 values, each already the

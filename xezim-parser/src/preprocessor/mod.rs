@@ -1754,8 +1754,10 @@ impl Preprocessor {
 
             // `timescale: parse it so the value is available downstream,
             // but emit no SV tokens (drop to a blank line). LRM §22.7.
-            if let Some(rest) = trimmed.strip_prefix("`timescale") {
-                let rest = rest.trim_start();
+            if Self::is_directive(trimmed, "timescale") {
+                // §22.5.1: directive operands can contain text macros.
+                let rest = self.expand_macros(trimmed["`timescale".len()..].trim_start());
+                let mut parsed = false;
                 if let Some(slash) = rest.find('/') {
                     let unit_str = rest[..slash].trim();
                     let prec_str = rest[slash + 1..]
@@ -1773,7 +1775,11 @@ impl Preprocessor {
                         // A directive in THIS file: modules that follow it here
                         // have an own-file timescale (not merely inherited).
                         self.current_file_ts = true;
+                        parsed = true;
                     }
+                }
+                if !parsed {
+                    self.warn_here("invalid `timescale directive (IEEE 1800-2023 §22.7)");
                 }
                 output.push('\n');
                 continue;

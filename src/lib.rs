@@ -312,7 +312,8 @@ pub use value::Value;
 ///         `HierarchicalIdentifier::root` as `HierRoot`.
 /// \x70 compact `Span` (`u32`, `u32`), compact AST caches, and streaming pending-body
 ///         serialization merged with upstream driver-transition and scope fixes (#721).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x70";
+/// \x71 retains edge and condition metadata on module paths for SDF matching.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x71";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

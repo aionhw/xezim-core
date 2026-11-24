@@ -1204,6 +1204,7 @@ impl<'a> Parser<'a> {
             'x' | 'X' => Some('x'),
             'z' | 'Z' => Some('x'),
             '?' => Some('?'),
+            'b' | 'B' => Some('b'),
             _ => None,
         }
     }

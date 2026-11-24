@@ -1963,6 +1963,38 @@ impl Value {
         }
     }
 
+    /// §20.8.1: the ceiling of log2 of this unsigned bit pattern.
+    pub fn clog2_unsigned(&self) -> u32 {
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let v = val_bits & !xz_bits;
+                if v <= 1 {
+                    0
+                } else {
+                    64 - (v - 1).leading_zeros()
+                }
+            }
+            ValueStorage::Wide(bits) => {
+                let mut highest = None;
+                for (i, (&v, &x)) in bits.val.iter().zip(&bits.xz).enumerate().rev() {
+                    let v = v & !x;
+                    if v == 0 {
+                        continue;
+                    }
+                    if let Some(width) = highest {
+                        return width;
+                    }
+                    let width = i as u32 * 64 + (64 - v.leading_zeros());
+                    if !v.is_power_of_two() {
+                        return width;
+                    }
+                    highest = Some(width);
+                }
+                highest.map_or(0, |width| width - 1)
+            }
+        }
+    }
+
     /// §11.5.1 select index: `None` when any bit is x or z (such an index
     /// selects nothing: reads give x, writes are discarded), otherwise the
     /// value as a signed or unsigned integer per its own type. `to_u64` and

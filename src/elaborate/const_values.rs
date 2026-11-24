@@ -414,18 +414,9 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
         ExprKind::SystemCall { name, args } if name == "$clog2" => {
             if let Some(arg) = args.first() {
                 let v = eval_const_expr_val_inner(arg, params, types);
-                let val = v.to_u64().unwrap_or(0);
-                if val <= 1 {
-                    Value::from_u64(0, 32)
-                } else {
-                    let mut res = 0;
-                    let mut tmp = val - 1;
-                    while tmp > 0 {
-                        tmp >>= 1;
-                        res += 1;
-                    }
-                    Value::from_u64(res, 32)
-                }
+                let mut result = Value::from_u64(u64::from(v.clog2_unsigned()), 32);
+                result.is_signed = true;
+                result
             } else {
                 Value::zero(32)
             }
