@@ -1593,11 +1593,11 @@ impl<'a> Binder<'a> {
                 }
                 self.stmt(body);
             }
-            StatementKind::ForeachTail { loop_var, body, .. } => {
-                if let Some(v) = loop_var {
+            StatementKind::ForeachTail(ft) => {
+                if let Some(v) = &ft.loop_var {
                     self.hide(v, Hide::Loop);
                 }
-                self.stmt(body);
+                self.stmt(&mut ft.body);
             }
             StatementKind::While { condition, body } => {
                 self.expr(condition);

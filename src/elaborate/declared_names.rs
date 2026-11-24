@@ -364,19 +364,14 @@ pub(super) fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<St
             }
             collect_stmt_declared_names(body, out);
         }
-        K::ForeachTail {
-            loop_var,
-            body,
-            keys,
-            ..
-        } => {
-            if let Some(v) = loop_var {
+        K::ForeachTail(ft) => {
+            if let Some(v) = &ft.loop_var {
                 out.insert(v.clone());
             }
-            for k in keys {
+            for k in &ft.keys {
                 out.insert(k.clone());
             }
-            collect_stmt_declared_names(body, out);
+            collect_stmt_declared_names(&ft.body, out);
         }
         K::If {
             condition,

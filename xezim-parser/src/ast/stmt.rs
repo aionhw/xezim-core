@@ -82,35 +82,9 @@ pub enum StatementKind {
         body: Box<Statement>,
     },
     /// INTERNAL (not parsed): continuation sentinel for a `foreach` whose
-    /// body can block (suspend). Mirrors how `while`/`for` re-append
-    /// themselves so a process blocked at a timing control inside the loop
-    /// body resumes at the NEXT iteration (IEEE 1800-2023 §9.4.3: a blocked
-    /// process shall continue at the point of suspension) instead of
-    /// restarting the whole `foreach` from index 0. Carries the materialized
-    /// key list (frozen at loop entry) and the next index to execute.
-    /// `var_scope` is the array's instance prefix, for aliased loop vars in
-    /// submodule foreach bodies. `fe_auto_len` truncates `auto_loop_vars`.
-    ForeachTail {
-        loop_var: Option<String>,
-        var_scope: Option<String>,
-        body: Box<Statement>,
-        keys: Vec<String>,
-        is_str: bool,
-        idx: usize,
-        fe_auto_len: usize,
-        /// When set, `idx` is bounds-checked against the LIVE queue/dynamic-
-        /// array size on every iteration resume (not the frozen `keys.len()`).
-        /// IEEE 1800-2023 §12.7.3 leaves queue-during-foreach modification
-        /// unspecified, but UVM routinely shrinks `arb_sequence_q` mid-loop;
-        /// a frozen key list would then access deleted indices (QUEUEDEL).
-        live_size_name: Option<String>,
-        /// (key_width, key_signed) — the AA index type, so signed/narrowed
-        /// keys round-trip through the tail continuation without a failed
-        /// u64 parse clobbering them to 0. Appended last (serde default) so
-        /// the serialized field order stays a prefix of older layouts.
-        #[cfg_attr(feature = "serde", serde(default))]
-        key_type: (u32, bool),
-    },
+    /// body can block (suspend). Boxed so this runtime-only continuation never
+    /// inflates parsed or elaborated `Statement` nodes (aionhw/xezim#721).
+    ForeachTail(Box<ForeachTailData>),
     While {
         condition: Expression,
         body: Box<Statement>,
@@ -231,6 +205,27 @@ pub enum StatementKind {
         data_type: DataType,
         declarators: Vec<VarDeclarator>,
     },
+}
+
+/// Runtime continuation payload for [`StatementKind::ForeachTail`].
+/// Mirrors how `while`/`for` re-append themselves so a process blocked at a
+/// timing control inside a `foreach` resumes at the next iteration (§9.4.3).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ForeachTailData {
+    pub loop_var: Option<String>,
+    pub var_scope: Option<String>,
+    pub body: Box<Statement>,
+    pub keys: Vec<String>,
+    pub is_str: bool,
+    pub idx: usize,
+    pub fe_auto_len: usize,
+    /// When set, `idx` is bounds-checked against the live queue/dynamic-array
+    /// size on every iteration resume rather than the frozen `keys.len()`.
+    pub live_size_name: Option<String>,
+    /// `(key_width, key_signed)` for associative-array index types.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub key_type: (u32, bool),
 }
 
 #[derive(Debug, Clone)]

@@ -6057,17 +6057,18 @@ pub(super) fn inline_instantiation_items(
                 // §6.6.7, §10.3.1: a nettype net's initializer drives the net
                 // like a net declaration assignment, in the instance's scope.
                 for (name, init_expr) in nettype_decl_inits.drain(..) {
-                    elab.pending_cont_assign.push(PendingContAssign {
-                        lhs_source: std::rc::Rc::new(make_ident_expr(&name)),
-                        lhs_is_net_initializer: true,
-                        origin_span: Some(init_expr.span),
-                        rhs_source: std::rc::Rc::new(init_expr),
-                        ctx: std::rc::Rc::clone(&pend_ctx),
-                        strength: None,
-                        delay_source: None,
-                        delay_fall_source: None,
-                        delay_off_source: None,
-                    });
+                    let span = init_expr.span;
+                    elab.pending_cont_assign.push(PendingContAssign::new(
+                        std::rc::Rc::new(make_ident_expr(&name)),
+                        true,
+                        std::rc::Rc::new(init_expr),
+                        std::rc::Rc::clone(&pend_ctx),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(span),
+                    ));
                 }
 
                 crate::oom_trace::checkpoint(
@@ -6612,17 +6613,17 @@ pub(super) fn inline_instantiation_items(
                             .map(|d| std::rc::Rc::new(d.clone()));
                         if let BodySource::ContAssign(pairs) = body_src {
                             for (lhs_rc, rhs_rc) in pairs {
-                                elab.pending_cont_assign.push(PendingContAssign {
-                                    lhs_source: std::rc::Rc::clone(lhs_rc),
-                                    lhs_is_net_initializer: false,
-                                    rhs_source: std::rc::Rc::clone(rhs_rc),
-                                    ctx: std::rc::Rc::clone(&pend_ctx),
-                                    strength: ca_item.strength.clone(),
-                                    delay_source: delay_rc.clone(),
-                                    delay_fall_source: delay_fall_rc.clone(),
-                                    delay_off_source: delay_off_rc.clone(),
-                                    origin_span: Some(ca_item.span),
-                                });
+                                elab.pending_cont_assign.push(PendingContAssign::new(
+                                    std::rc::Rc::clone(lhs_rc),
+                                    false,
+                                    std::rc::Rc::clone(rhs_rc),
+                                    std::rc::Rc::clone(&pend_ctx),
+                                    ca_item.strength.clone(),
+                                    delay_rc.clone(),
+                                    delay_fall_rc.clone(),
+                                    delay_off_rc.clone(),
+                                    Some(ca_item.span),
+                                ));
                             }
                         }
                     }
@@ -6662,17 +6663,17 @@ pub(super) fn inline_instantiation_items(
                                 if let Some(n) = ident_flat_name(&lhs) {
                                     elab.gate_driven_nets.insert(n);
                                 }
-                                elab.pending_cont_assign.push(PendingContAssign {
-                                    lhs_source: std::rc::Rc::clone(lhs_rc),
-                                    lhs_is_net_initializer: false,
-                                    rhs_source: std::rc::Rc::clone(rhs_rc),
-                                    ctx: std::rc::Rc::clone(&pend_ctx),
-                                    strength: None,
-                                    delay_source: delay_rc.clone(),
-                                    delay_fall_source: delay_fall_rc.clone(),
-                                    delay_off_source: delay_off_rc.clone(),
-                                    origin_span: None,
-                                });
+                                elab.pending_cont_assign.push(PendingContAssign::new(
+                                    std::rc::Rc::clone(lhs_rc),
+                                    false,
+                                    std::rc::Rc::clone(rhs_rc),
+                                    std::rc::Rc::clone(&pend_ctx),
+                                    None,
+                                    delay_rc.clone(),
+                                    delay_fall_rc.clone(),
+                                    delay_off_rc.clone(),
+                                    None,
+                                ));
                             }
                         }
                     }
@@ -6691,19 +6692,19 @@ pub(super) fn inline_instantiation_items(
                                 rc(nd.delay_off.as_deref()),
                             );
                             for (lhs_rc, rhs_rc) in inits {
-                                elab.pending_cont_assign.push(PendingContAssign {
-                                    lhs_source: std::rc::Rc::clone(lhs_rc),
-                                    lhs_is_net_initializer: true,
-                                    rhs_source: std::rc::Rc::clone(rhs_rc),
-                                    ctx: std::rc::Rc::clone(&pend_ctx),
+                                elab.pending_cont_assign.push(PendingContAssign::new(
+                                    std::rc::Rc::clone(lhs_rc),
+                                    true,
+                                    std::rc::Rc::clone(rhs_rc),
+                                    std::rc::Rc::clone(&pend_ctx),
                                     // §6.7: `wire (weak0, weak1) w = v;`
                                     // drives with the declaration's strength.
-                                    strength: nd.strength.clone(),
-                                    delay_source: delay_rc.clone(),
-                                    delay_fall_source: delay_fall_rc.clone(),
-                                    delay_off_source: delay_off_rc.clone(),
-                                    origin_span: Some(rhs_rc.span),
-                                });
+                                    nd.strength.clone(),
+                                    delay_rc.clone(),
+                                    delay_fall_rc.clone(),
+                                    delay_off_rc.clone(),
+                                    Some(rhs_rc.span),
+                                ));
                             }
                         }
                     }

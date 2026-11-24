@@ -1151,11 +1151,11 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     if elab
         .pending_cont_assign
         .iter()
-        .any(|p| p.strength.is_some())
+        .any(|p| p.strength().is_some())
     {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for p in pending {
-            if p.strength.is_some() {
+            if p.strength().is_some() {
                 let ca = p.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {

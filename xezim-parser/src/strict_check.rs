@@ -473,7 +473,7 @@ fn check_decl_order_list(stmts: &[Statement], out: &mut Vec<Diagnostic>) {
             StatementKind::Null
             | StatementKind::ScopePop
             | StatementKind::LoopStep
-            | StatementKind::ForeachTail { .. }
+            | StatementKind::ForeachTail(_)
             | StatementKind::ForeverTail { .. } => {}
             _ => seen_stmt = true,
         }

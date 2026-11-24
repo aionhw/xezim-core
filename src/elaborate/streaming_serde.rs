@@ -284,7 +284,7 @@ impl Serialize for ElaboratedModule {
             modules_without_timescale,
             enum_members,
             package_enum_members,
-            decl_sites,
+            decl_sites: _,
             foreign_package_names,
             foreign_displaced,
             two_state_signals,
@@ -317,7 +317,7 @@ impl Serialize for ElaboratedModule {
             source_line_maps: _,
         } = self;
 
-        let mut st = serializer.serialize_struct("ElaboratedModule", 119)?;
+        let mut st = serializer.serialize_struct("ElaboratedModule", 118)?;
         st.serialize_field("name", name)?;
         st.serialize_field("tick_s", tick_s)?;
         st.serialize_field("signals", signals)?;
@@ -459,7 +459,6 @@ impl Serialize for ElaboratedModule {
         st.serialize_field("modules_without_timescale", modules_without_timescale)?;
         st.serialize_field("enum_members", enum_members)?;
         st.serialize_field("package_enum_members", package_enum_members)?;
-        st.serialize_field("decl_sites", decl_sites)?;
         st.serialize_field("foreign_package_names", foreign_package_names)?;
         st.serialize_field("foreign_displaced", foreign_displaced)?;
         st.serialize_field("two_state_signals", two_state_signals)?;

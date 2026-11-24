@@ -1,8 +1,7 @@
 //! Thread-safe, nonsemantic AST caches. IEEE 1800-2023 §13.3/§13.4 bodies
 //! may be shared, but widths and resolved names remain scope-dependent.
 
-use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScopeCacheMode {
@@ -123,25 +122,82 @@ macro_rules! option_cache {
 option_cache!(WidthCache, AtomicU32, u32, u32);
 option_cache!(SignalCache, AtomicU32, u32, usize);
 
-#[derive(Debug, Default, Clone)]
-pub struct LiteralCache(OnceLock<Arc<(u64, u64, u32)>>);
+pub struct LiteralCache(AtomicPtr<(u64, u64, u32)>);
+
+impl std::fmt::Debug for LiteralCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LiteralCache").field(&self.get()).finish()
+    }
+}
+
+// SAFETY: Once a non-null pointer is published via Release CAS it is never
+// mutated and is only freed in Drop with `&mut self`.
+unsafe impl Sync for LiteralCache {}
 
 impl LiteralCache {
     pub fn new(value: Option<(u64, u64, u32)>) -> Self {
-        let cache = Self::default();
-        cache.set(value);
-        cache
+        let ptr = match value {
+            Some(v) => Box::into_raw(Box::new(v)),
+            None => std::ptr::null_mut(),
+        };
+        Self(AtomicPtr::new(ptr))
     }
 
     pub fn get(&self) -> Option<(u64, u64, u32)> {
-        self.0.get().map(|arc| **arc)
+        let ptr = self.0.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: Published with Release and immutable until Drop.
+            Some(unsafe { *ptr })
+        }
     }
 
     pub fn set(&self, value: Option<(u64, u64, u32)>) {
-        if let Some(value) = value {
-            if let Err(value) = self.0.set(Arc::new(value)) {
-                debug_assert_eq!(self.0.get().map(|arc| **arc), Some(*value));
+        let Some(value) = value else {
+            return;
+        };
+        let existing = self.0.load(Ordering::Acquire);
+        if !existing.is_null() {
+            debug_assert_eq!(unsafe { *existing }, value);
+            return;
+        }
+        let raw = Box::into_raw(Box::new(value));
+        match self.0.compare_exchange(
+            std::ptr::null_mut(),
+            raw,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(current) => {
+                // SAFETY: `raw` was just allocated by us and never published.
+                unsafe { drop(Box::from_raw(raw)) };
+                debug_assert!(!current.is_null());
+                debug_assert_eq!(unsafe { *current }, value);
             }
+        }
+    }
+}
+
+impl Default for LiteralCache {
+    fn default() -> Self {
+        Self(AtomicPtr::new(std::ptr::null_mut()))
+    }
+}
+
+impl Clone for LiteralCache {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl Drop for LiteralCache {
+    fn drop(&mut self) {
+        let ptr = *self.0.get_mut();
+        if !ptr.is_null() {
+            // SAFETY: Allocated via Box::into_raw and owned exclusively here.
+            unsafe { drop(Box::from_raw(ptr)) };
         }
     }
 }
@@ -152,46 +208,76 @@ struct NameSlot {
     disabled: AtomicBool,
 }
 
-#[derive(Debug)]
-pub struct NameCache(OnceLock<Option<Box<NameSlot>>>);
+pub struct NameCache(AtomicPtr<NameSlot>);
+
+impl std::fmt::Debug for NameCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NameCache").field(&self.get()).finish()
+    }
+}
+
+// SAFETY: Published `NameSlot` pointers are never deallocated until Drop
+// (`&mut self`), `value` is immutable, and `disabled` is atomic.
+unsafe impl Send for NameCache {}
+unsafe impl Sync for NameCache {}
 
 impl NameCache {
+    const DISABLED: *mut NameSlot = std::ptr::without_provenance_mut(1);
+
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn disabled_lock() -> OnceLock<Option<Box<NameSlot>>> {
-        let lock = OnceLock::new();
-        let _ = lock.set(None);
-        lock
+    fn disabled_ptr() -> AtomicPtr<NameSlot> {
+        AtomicPtr::new(Self::DISABLED)
     }
 
     pub fn get(&self) -> Option<&String> {
-        match self.0.get()? {
-            Some(slot) if !slot.disabled.load(Ordering::Relaxed) => Some(&slot.value),
-            _ => None,
+        let ptr = self.0.load(Ordering::Acquire);
+        if ptr.is_null() || ptr == Self::DISABLED {
+            return None;
         }
+        // SAFETY: Non-null, non-DISABLED pointer was published with Release
+        // and stays live until Drop.
+        let slot = unsafe { &*ptr };
+        (!slot.disabled.load(Ordering::Relaxed)).then_some(&slot.value)
     }
 
     pub fn set(&self, value: String) -> Result<(), String> {
-        if self.0.get().is_some() {
+        if !self.0.load(Ordering::Acquire).is_null() {
             return Err(value);
         }
-        let slot = Box::new(NameSlot {
+        let raw = Box::into_raw(Box::new(NameSlot {
             value,
             disabled: AtomicBool::new(false),
-        });
-        match self.0.set(Some(slot)) {
-            Ok(()) => Ok(()),
-            Err(Some(slot)) => Err(slot.value),
-            Err(None) => unreachable!(),
+        }));
+        match self.0.compare_exchange(
+            std::ptr::null_mut(),
+            raw,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // SAFETY: `raw` was just allocated by us and never published.
+                let slot = unsafe { Box::from_raw(raw) };
+                Err(slot.value)
+            }
         }
     }
 
     pub fn disable(&self) {
-        if self.0.set(None).is_err() {
-            if let Some(Some(slot)) = self.0.get() {
-                slot.disabled.store(true, Ordering::Relaxed);
+        match self.0.compare_exchange(
+            std::ptr::null_mut(),
+            Self::DISABLED,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(ptr) if ptr == Self::DISABLED => {}
+            Err(ptr) => {
+                // SAFETY: Non-null, non-DISABLED pointer stays live for `&self`.
+                unsafe { (*ptr).disabled.store(true, Ordering::Relaxed) };
             }
         }
     }
@@ -200,9 +286,9 @@ impl NameCache {
 impl Default for NameCache {
     fn default() -> Self {
         if scope_caches_disabled() {
-            Self(Self::disabled_lock())
+            Self(Self::disabled_ptr())
         } else {
-            Self(OnceLock::new())
+            Self(AtomicPtr::new(std::ptr::null_mut()))
         }
     }
 }
@@ -210,23 +296,38 @@ impl Default for NameCache {
 impl Clone for NameCache {
     fn clone(&self) -> Self {
         match scope_cache_mode() {
-            ScopeCacheMode::Disabled => Self(Self::disabled_lock()),
-            ScopeCacheMode::Fresh => Self(OnceLock::new()),
-            ScopeCacheMode::Preserve => match self.0.get() {
-                None => Self(OnceLock::new()),
-                Some(None) => Self(Self::disabled_lock()),
-                Some(Some(slot)) if slot.disabled.load(Ordering::Relaxed) => {
-                    Self(Self::disabled_lock())
+            ScopeCacheMode::Disabled => Self(Self::disabled_ptr()),
+            ScopeCacheMode::Fresh => Self(AtomicPtr::new(std::ptr::null_mut())),
+            ScopeCacheMode::Preserve => {
+                let ptr = self.0.load(Ordering::Acquire);
+                if ptr.is_null() {
+                    Self(AtomicPtr::new(std::ptr::null_mut()))
+                } else if ptr == Self::DISABLED {
+                    Self(Self::disabled_ptr())
+                } else {
+                    // SAFETY: Non-null, non-DISABLED pointer stays live for `&self`.
+                    let slot = unsafe { &*ptr };
+                    if slot.disabled.load(Ordering::Relaxed) {
+                        Self(Self::disabled_ptr())
+                    } else {
+                        let raw = Box::into_raw(Box::new(NameSlot {
+                            value: slot.value.clone(),
+                            disabled: AtomicBool::new(false),
+                        }));
+                        Self(AtomicPtr::new(raw))
+                    }
                 }
-                Some(Some(slot)) => {
-                    let lock = OnceLock::new();
-                    let _ = lock.set(Some(Box::new(NameSlot {
-                        value: slot.value.clone(),
-                        disabled: AtomicBool::new(false),
-                    })));
-                    Self(lock)
-                }
-            },
+            }
+        }
+    }
+}
+
+impl Drop for NameCache {
+    fn drop(&mut self) {
+        let ptr = *self.0.get_mut();
+        if !ptr.is_null() && ptr != Self::DISABLED {
+            // SAFETY: Allocated via Box::into_raw and owned exclusively here.
+            unsafe { drop(Box::from_raw(ptr)) };
         }
     }
 }

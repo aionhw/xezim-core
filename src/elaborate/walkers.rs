@@ -72,8 +72,8 @@ pub fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
             f(array);
             for_each_stmt_expr(body, f);
         }
-        K::ForeachTail { body, .. }
-        | K::Forever { body }
+        K::ForeachTail(ft) => for_each_stmt_expr(&ft.body, f),
+        K::Forever { body }
         | K::ForeverTail { body }
         | K::RsAction { body } => for_each_stmt_expr(body, f),
         K::While { condition, body } | K::DoWhile { body, condition } => {
@@ -316,8 +316,8 @@ fn collect_write_targets(
                 }
                 walk(body, out);
             }
+            K::ForeachTail(ft) => walk(&ft.body, out),
             K::Foreach { body, .. }
-            | K::ForeachTail { body, .. }
             | K::Forever { body }
             | K::ForeverTail { body }
             | K::RsAction { body }

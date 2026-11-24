@@ -245,7 +245,7 @@ fn stmt_rejection(stmt: &Statement) -> Option<RootRejection> {
                 StatementKind::LoopStep => "identity.reject.stmt.loop_step",
                 StatementKind::DisableFork => "identity.reject.stmt.disable_fork",
                 StatementKind::Foreach { .. } => "identity.reject.stmt.foreach",
-                StatementKind::ForeachTail { .. } => "identity.reject.stmt.foreach_tail",
+                StatementKind::ForeachTail(_) => "identity.reject.stmt.foreach_tail",
                 StatementKind::DoWhile { .. } => "identity.reject.stmt.do_while",
                 StatementKind::Forever { .. } => "identity.reject.stmt.forever",
                 StatementKind::ForeverTail { .. } => "identity.reject.stmt.forever_tail",

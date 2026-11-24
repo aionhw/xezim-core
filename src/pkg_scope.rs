@@ -2699,8 +2699,8 @@ impl Rw<'_> {
                 self.expr(count);
                 self.stmt(body);
             }
-            StatementKind::ForeachTail { body, .. }
-            | StatementKind::Forever { body }
+            StatementKind::ForeachTail(ft) => self.stmt(&mut ft.body),
+            StatementKind::Forever { body }
             | StatementKind::ForeverTail { body }
             | StatementKind::RsAction { body } => self.stmt(body),
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {

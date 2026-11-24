@@ -1321,9 +1321,9 @@ fn callable_body_names_scopes(items: &[Statement]) -> bool {
             K::WaitOrder { pass, fail, .. } => {
                 [pass, fail].into_iter().flatten().any(|st| nested(st))
             }
+            K::ForeachTail(ft) => nested(&ft.body),
             K::For { body, .. }
             | K::Foreach { body, .. }
-            | K::ForeachTail { body, .. }
             | K::Forever { body }
             | K::ForeverTail { body }
             | K::RsAction { body }
@@ -1375,6 +1375,23 @@ pub struct PendingInitial {
     pub gen_scope: String,
 }
 
+/// Rare drive-strength and delay expressions for a [`PendingContAssign`],
+/// boxed so plain undelayed deferred assignments pay only an 8-byte `None`
+/// pointer (aionhw/xezim#721).
+#[derive(Debug, Clone)]
+pub struct PendingContAssignExtras {
+    /// §10.3.1 / §21.2.1.5 drive strength (`(weak0, weak1)`, …) of the
+    /// source `assign`; wrapped into the `$__weak`/`$__pull`/… marker at
+    /// materialize time.
+    pub strength: Option<String>,
+    /// `assign #N ...` delay expression, unevaluated so parameters resolve
+    /// per-instance at materialize time.
+    pub delay_source: Option<std::rc::Rc<Expression>>,
+    /// §10.3.3 fall / turn-off delays of the `#(rise, fall[, turnoff])` form.
+    pub delay_fall_source: Option<std::rc::Rc<Expression>>,
+    pub delay_off_source: Option<std::rc::Rc<Expression>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingContAssign {
     pub lhs_source: std::rc::Rc<Expression>,
@@ -1382,24 +1399,71 @@ pub struct PendingContAssign {
     pub lhs_is_net_initializer: bool,
     pub rhs_source: std::rc::Rc<Expression>,
     pub ctx: std::rc::Rc<RewriteCtx>,
-    /// §10.3.1 / §21.2.1.5 drive strength (`(weak0, weak1)`, …) of the
-    /// source `assign`; wrapped into the `$__weak`/`$__pull`/… marker at
-    /// materialize time, exactly as the top-module path does. Dropping it
-    /// left an inlined sub-module driver with no strength marker, so it was
-    /// folded as STRONG against the net's other drivers (#1063).
-    pub strength: Option<String>,
-    /// `assign #N ...` delay expression, unevaluated: parameters it names
-    /// resolve per-instance, so it is rewritten with `ctx` and evaluated at
-    /// materialize time against the flattened parameter table. Dropping it
-    /// (the old behavior) silently ran every inlined delayed assign with
-    /// zero delay — a `#3` clock echo inside a DUT tracked undelayed.
-    pub delay_source: Option<std::rc::Rc<Expression>>,
-    /// §10.3.3 fall / turn-off delays of the `#(rise, fall[, turnoff])` form.
-    pub delay_fall_source: Option<std::rc::Rc<Expression>>,
-    pub delay_off_source: Option<std::rc::Rc<Expression>>,
+    /// Optional strength and delay source expressions.
+    pub extras: Option<Box<PendingContAssignExtras>>,
     /// Span of the source statement for an `assign` or a net declaration
     /// assignment; see `ContinuousAssignment::origin`.
     pub origin_span: Option<crate::ast::Span>,
+}
+
+impl PendingContAssign {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        lhs_source: std::rc::Rc<Expression>,
+        lhs_is_net_initializer: bool,
+        rhs_source: std::rc::Rc<Expression>,
+        ctx: std::rc::Rc<RewriteCtx>,
+        strength: Option<String>,
+        delay_source: Option<std::rc::Rc<Expression>>,
+        delay_fall_source: Option<std::rc::Rc<Expression>>,
+        delay_off_source: Option<std::rc::Rc<Expression>>,
+        origin_span: Option<crate::ast::Span>,
+    ) -> Self {
+        let extras = if strength.is_some()
+            || delay_source.is_some()
+            || delay_fall_source.is_some()
+            || delay_off_source.is_some()
+        {
+            Some(Box::new(PendingContAssignExtras {
+                strength,
+                delay_source,
+                delay_fall_source,
+                delay_off_source,
+            }))
+        } else {
+            None
+        };
+        Self {
+            lhs_source,
+            lhs_is_net_initializer,
+            rhs_source,
+            ctx,
+            extras,
+            origin_span,
+        }
+    }
+
+    pub fn strength(&self) -> Option<&str> {
+        self.extras.as_deref().and_then(|e| e.strength.as_deref())
+    }
+
+    pub fn delay_source(&self) -> Option<&Expression> {
+        self.extras
+            .as_deref()
+            .and_then(|e| e.delay_source.as_deref())
+    }
+
+    pub fn delay_fall_source(&self) -> Option<&Expression> {
+        self.extras
+            .as_deref()
+            .and_then(|e| e.delay_fall_source.as_deref())
+    }
+
+    pub fn delay_off_source(&self) -> Option<&Expression> {
+        self.extras
+            .as_deref()
+            .and_then(|e| e.delay_off_source.as_deref())
+    }
 }
 
 impl PendingAlways {
@@ -1562,7 +1626,7 @@ impl PendingContAssign {
         // marker and `resolve_multi_driver_nets` folded it as STRONG, so a
         // `(weak0, weak1)` pull lost to—and fought—the net's real driver
         // (#1063).
-        let mut rhs = match self.strength.as_deref().and_then(strength_marker) {
+        let mut rhs = match self.strength().and_then(strength_marker) {
             Some((marker, code)) => make_syscall(
                 marker,
                 vec![rhs.clone(), strength_code_literal(code, rhs.span)],
@@ -1577,12 +1641,12 @@ impl PendingContAssign {
             self.ctx.upward.borrow().packages.contains(n)
         });
         let operands = [
-            &self.delay_source,
-            &self.delay_fall_source,
-            &self.delay_off_source,
+            self.delay_source(),
+            self.delay_fall_source(),
+            self.delay_off_source(),
         ]
         .map(|src| {
-            src.as_deref().map(|d| {
+            src.map(|d| {
                 rewrite_expr(
                     d,
                     &self.ctx.prefix,
@@ -2483,7 +2547,9 @@ pub struct ElaboratedModule {
     /// ("parameter", "enum member of state_e", "imported from pkg p") because
     /// the surprise in these errors is usually not WHERE the first declaration
     /// is but WHAT it is.
-    #[serde(default)]
+    /// Transient elaboration bookkeeping (cleared at the end of elaboration
+    /// and omitted from compiled artifacts, aionhw/xezim#721).
+    #[serde(skip)]
     pub decl_sites: HashMap<String, (Span, String, bool)>,
     /// §26.3: names declared in packages this module does NOT import (see
     /// `compute_foreign_package_names`). A local declaration of one of these

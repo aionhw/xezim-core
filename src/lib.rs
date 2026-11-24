@@ -313,7 +313,8 @@ pub use value::Value;
 /// \x70 compact `Span` (`u32`, `u32`), compact AST caches, and streaming pending-body
 ///         serialization merged with upstream driver-transition and scope fixes (#721).
 /// \x71 retains edge and condition metadata on module paths for SDF matching.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x71";
+/// \x72 drops elaboration-only `decl_sites` from compiled artifacts (#721).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x72";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -4231,6 +4232,9 @@ fn parse_and_elaborate(
     // Instance-scoped class handles (an interface's `proxy` handle) are only
     // known after inlining; the root pass above never saw them.
     elaborate::null_init_class_handles(&mut elab);
+    // `decl_sites` is only needed for elaboration-time diagnostics; release it
+    // before artifact writing or simulator initialization (#721).
+    elab.decl_sites = crate::hasher::HashMap::default();
     if std::env::var("XEZIM_ELAB_STATS").is_ok() {
         eprintln!(
             "[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",

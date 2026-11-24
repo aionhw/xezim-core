@@ -627,8 +627,8 @@ pub(super) fn check_module_use_before_decl(
                     }
                     self.stmt(body, &inner);
                 }
-                K::ForeachTail { body, .. }
-                | K::Forever { body }
+                K::ForeachTail(ft) => self.stmt(&ft.body, scope),
+                K::Forever { body }
                 | K::ForeverTail { body }
                 | K::RsAction { body } => self.stmt(body, scope),
                 K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => self.stmts(stmts, scope),
