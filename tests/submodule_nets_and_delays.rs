@@ -71,9 +71,9 @@ endmodule
     assert_eq!(assign_to(&m, "u1.w2").delay, 2);
     assert_eq!(assign_to(&m, "u2.w2").delay, 4);
     let n1 = assign_to(&m, "u1.n");
-    assert_eq!((n1.delay, n1.delay_fall), (1, Some(3)));
+    assert_eq!((n1.delay, n1.delay_fall()), (1, Some(3)));
     let n2 = assign_to(&m, "u2.n");
-    assert_eq!((n2.delay, n2.delay_fall), (1, Some(5)));
+    assert_eq!((n2.delay, n2.delay_fall()), (1, Some(5)));
     // §28.4: the gate outputs are gate-driven, as at the top level.
     for n in ["u1.g", "u1.n", "u2.g", "u2.n"] {
         assert!(m.gate_driven_nets.contains(n), "{n} not gate-driven");
@@ -153,7 +153,7 @@ endmodule
     for (target, arity) in [("out", 1), ("u.c", 3), ("u.init_net", 1), ("u.g", 1)] {
         let ca = assign_to(&m, target);
         assert_ne!(ca.delay, 0, "{target} must use the delayed driver path");
-        let args = ca.delay_exprs.as_ref().expect("runtime operands");
+        let args = ca.delay_exprs().expect("runtime operands");
         assert_eq!(args.iter().flatten().count(), arity, "{target}");
     }
 }
@@ -178,9 +178,9 @@ endmodule
 "#,
     );
     let stage = assign_to(&m, "u.y");
-    assert!(stage.delay_exprs.is_some());
-    assert!(stage.origin.is_none(), "the stage derives its scope from u.y");
+    assert!(stage.delay_exprs().is_some());
+    assert!(stage.origin().is_none(), "the stage derives its scope from u.y");
     let driver = assign_to(&m, "u.y$netdrv");
-    assert!(driver.delay_exprs.is_none());
-    assert_eq!(driver.origin.as_ref().unwrap().1.as_ref(), "");
+    assert!(driver.delay_exprs().is_none());
+    assert_eq!(driver.origin().unwrap().1.as_ref(), "");
 }

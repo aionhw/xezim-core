@@ -50,7 +50,7 @@ fn source(bound: bool) -> String {
 }
 
 fn instance_paths(m: &xezim_core::ElaboratedModule) -> Vec<String> {
-    m.instances.iter().map(|i| i.path.clone()).collect()
+    m.instances.iter().map(|i| i.path.to_string()).collect()
 }
 
 fn initial_scopes(m: &xezim_core::ElaboratedModule) -> Vec<String> {

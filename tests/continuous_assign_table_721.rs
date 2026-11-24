@@ -60,7 +60,7 @@ fn the_table_keeps_the_instances_in_order() {
     let scopes: Vec<&str> = m
         .continuous_assigns
         .iter()
-        .filter_map(|ca| ca.origin.as_ref().map(|(_, scope)| &**scope))
+        .filter_map(|ca| ca.origin().map(|(_, scope)| &**scope))
         .filter(|scope| !scope.is_empty())
         .collect();
     assert_eq!(scopes.len(), 1100);

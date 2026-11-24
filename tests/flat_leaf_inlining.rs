@@ -45,7 +45,7 @@ fn instances_of(model: &ElaboratedModule, definition: &str) -> Vec<String> {
         .instances
         .iter()
         .filter(|i| i.def_name == definition)
-        .map(|i| i.path.clone())
+        .map(|i| i.path.to_string())
         .collect();
     paths.sort();
     paths

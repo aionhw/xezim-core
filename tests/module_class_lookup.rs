@@ -78,7 +78,10 @@ fn module_and_unit_classes_keep_separate_entries() {
 #[test]
 fn module_type_parameter_binding_survives_instance_elaboration() {
     let m = elaborate("class base; int x=5; endclass module worker #(parameter type T=base); T value; endmodule module top; worker u(); endmodule").unwrap();
-    assert_eq!(m.signals["u.value"].type_name.as_deref(), Some("u.T"));
+    assert_eq!(
+        m.signals["u.value"].type_name.as_deref().map(String::as_str),
+        Some("u.T")
+    );
     let xezim_core::ast::types::DataType::TypeReference { name, .. } = &m.typedef_types["u.T"]
     else {
         panic!("class type binding lost")

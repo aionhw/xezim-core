@@ -23,7 +23,7 @@ fn instances_of(m: &xezim_core::ElaboratedModule, def: &str) -> Vec<String> {
         .instances
         .iter()
         .filter(|i| i.def_name == def)
-        .map(|i| i.path.clone())
+        .map(|i| i.path.to_string())
         .collect();
     paths.sort();
     paths

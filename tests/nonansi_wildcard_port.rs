@@ -39,7 +39,7 @@ module top;
 endmodule
 "#,
     );
-    let alias = |formal: &str| m.port_aliases.get(formal).map(String::as_str);
+    let alias = |formal: &str| m.port_aliases.get(formal).map(|s| s.as_str());
     assert_eq!(alias("tied.clk"), Some("clk"));
     assert_eq!(alias("tied.rst"), Some("rst"));
     assert_eq!(alias("tied.din"), Some("din"));
@@ -151,5 +151,5 @@ endmodule
 "#,
     );
     assert_eq!(placeholder_aliases(&m, "u."), Vec::<&String>::new());
-    assert_eq!(m.port_aliases.get("u.a").map(String::as_str), Some("a"));
+    assert_eq!(m.port_aliases.get("u.a").map(|s| s.as_str()), Some("a"));
 }
