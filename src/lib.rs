@@ -408,82 +408,91 @@ fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
 /// If compression statistics are enabled via `set_compression_stats(true)`,
 /// prints the compression ratio after writing.
 pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<(), String> {
+    let _oom_trace = oom_trace::session();
+    let _oom_write = oom_trace::scope("write compiled artifact", path, "", "");
+    oom_trace::model("write.artifact.begin", elab, None);
     use std::io::Write;
 
-    if artifact_uncompressed() {
+    let result = if artifact_uncompressed() {
         let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
         let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
         w.write_all(XEZIM_BYTECODE_MAGIC)
             .map_err(|e| format!("write '{}': {}", path, e))?;
         bincode::serde::encode_into_std_write(elab, &mut w, xez_bincode_config())
             .map_err(|e| format!("serialize: {}", e))?;
-        return w.flush().map_err(|e| format!("flush '{}': {}", path, e));
-    }
-
-    let level = get_zstd_level();
-    let stats_enabled = compression_stats_enabled();
-
-    let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
-    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-    w.write_all(XEZIM_BYTECODE_MAGIC)
-        .map_err(|e| format!("write '{}': {}", path, e))?;
-
-    // Create a wrapper to count bytes written
-    let enc = zstd::stream::Encoder::new(w, level).map_err(|e| format!("zstd init: {}", e))?;
-
-    // We need to measure uncompressed size for statistics
-    // Unfortunately zstd::Encoder doesn't expose this directly, so we'll
-    // serialize to a separate buffer first to measure, then compress
-    if stats_enabled {
-        // First, serialize to measure uncompressed size
-        let mut uncompressed = Vec::new();
-        bincode::serde::encode_into_std_write(elab, &mut uncompressed, xez_bincode_config())
-            .map_err(|e| format!("serialize: {}", e))?;
-        let uncompressed_size = uncompressed.len();
-
-        // Now compress and write
-        let f2 = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
-        let mut w2 = std::io::BufWriter::with_capacity(1 << 20, f2);
-        w2.write_all(XEZIM_BYTECODE_MAGIC)
-            .map_err(|e| format!("write '{}': {}", path, e))?;
-        let mut enc2 =
-            zstd::stream::Encoder::new(w2, level).map_err(|e| format!("zstd init: {}", e))?;
-        enc2.write_all(&uncompressed)
-            .map_err(|e| format!("zstd write: {}", e))?;
-        let mut w2 = enc2.finish().map_err(|e| format!("zstd finish: {}", e))?;
-        w2.flush().map_err(|e| format!("flush '{}': {}", path, e))?;
-
-        // Get compressed size
-        let compressed_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-        let ratio = if uncompressed_size > 0 {
-            compressed_size as f64 / uncompressed_size as f64
-        } else {
-            1.0
-        };
-
-        eprintln!(
-            "[CACHE][COMPRESS] {}: {} bytes -> {} bytes ({:.2}× ratio, level {})",
-            path,
-            uncompressed_size,
-            compressed_size,
-            1.0 / ratio,
-            level
-        );
-
-        Ok(())
-    } else {
-        // Standard path without statistics. bincode writes field by field;
-        // batch those writes before they reach the compressor.
-        let mut buffered = std::io::BufWriter::with_capacity(1 << 20, enc);
-        bincode::serde::encode_into_std_write(elab, &mut buffered, xez_bincode_config())
-            .map_err(|e| format!("serialize: {}", e))?;
-        let enc = buffered
-            .into_inner()
-            .map_err(|e| format!("flush '{}': {}", path, e))?;
-        let mut w = enc.finish().map_err(|e| format!("zstd finish: {}", e))?;
         w.flush().map_err(|e| format!("flush '{}': {}", path, e))
+    } else {
+        let level = get_zstd_level();
+        let stats_enabled = compression_stats_enabled();
+
+        let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        w.write_all(XEZIM_BYTECODE_MAGIC)
+            .map_err(|e| format!("write '{}': {}", path, e))?;
+
+        // Create a wrapper to count bytes written
+        let enc = zstd::stream::Encoder::new(w, level).map_err(|e| format!("zstd init: {}", e))?;
+
+        // We need to measure uncompressed size for statistics
+        // Unfortunately zstd::Encoder doesn't expose this directly, so we'll
+        // serialize to a separate buffer first to measure, then compress
+        if stats_enabled {
+            // First, serialize to measure uncompressed size
+            let mut uncompressed = Vec::new();
+            bincode::serde::encode_into_std_write(elab, &mut uncompressed, xez_bincode_config())
+                .map_err(|e| format!("serialize: {}", e))?;
+            let uncompressed_size = uncompressed.len();
+
+            // Now compress and write
+            let f2 =
+                std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
+            let mut w2 = std::io::BufWriter::with_capacity(1 << 20, f2);
+            w2.write_all(XEZIM_BYTECODE_MAGIC)
+                .map_err(|e| format!("write '{}': {}", path, e))?;
+            let mut enc2 =
+                zstd::stream::Encoder::new(w2, level).map_err(|e| format!("zstd init: {}", e))?;
+            enc2.write_all(&uncompressed)
+                .map_err(|e| format!("zstd write: {}", e))?;
+            let mut w2 = enc2.finish().map_err(|e| format!("zstd finish: {}", e))?;
+            w2.flush().map_err(|e| format!("flush '{}': {}", path, e))?;
+
+            // Get compressed size
+            let compressed_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+            let ratio = if uncompressed_size > 0 {
+                compressed_size as f64 / uncompressed_size as f64
+            } else {
+                1.0
+            };
+
+            eprintln!(
+                "[CACHE][COMPRESS] {}: {} bytes -> {} bytes ({:.2}× ratio, level {})",
+                path,
+                uncompressed_size,
+                compressed_size,
+                1.0 / ratio,
+                level
+            );
+
+            Ok(())
+        } else {
+            // Standard path without statistics. bincode writes field by field;
+            // batch those writes before they reach the compressor.
+            let mut buffered = std::io::BufWriter::with_capacity(1 << 20, enc);
+            bincode::serde::encode_into_std_write(elab, &mut buffered, xez_bincode_config())
+                .map_err(|e| format!("serialize: {}", e))?;
+            let enc = buffered
+                .into_inner()
+                .map_err(|e| format!("flush '{}': {}", path, e))?;
+            let mut w = enc.finish().map_err(|e| format!("zstd finish: {}", e))?;
+            w.flush().map_err(|e| format!("flush '{}': {}", path, e))
+        }
+    };
+    if result.is_ok() && oom_trace::enabled() {
+        let artifact_bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+        oom_trace::checkpoint("write.artifact.done", &[("artifact_bytes", artifact_bytes)]);
     }
+    result
 }
 
 /// Read a compiled artifact from a file. Returns Ok(Some(elab)) if the file is
@@ -4137,6 +4146,7 @@ fn parse_and_elaborate(
     elaborate::stage_vpi_net_drivers(&mut elab);
     elaborate::resolve_user_nettype_drivers(&mut elab)?;
     elab_phase("switches and nettype drivers", &mut phase_t);
+    oom_trace::model("switches and nettype drivers.model", &elab, None);
     // §7.2.2: a whole-struct continuous assign that arrived through inlining
     // still needs splitting into per-member assigns.
     elaborate::expand_unpacked_struct_assigns(&mut elab);
@@ -4152,6 +4162,7 @@ fn parse_and_elaborate(
     // §6.6.1: a net with several continuous drivers resolves them all.
     elaborate::resolve_multi_driver_nets(&mut elab);
     elab_phase("net delays and multi-driver nets", &mut phase_t);
+    oom_trace::model("net delays and multi-driver nets.model", &elab, None);
     // Link `function ClassName::m(); ...` out-of-class bodies into their
     // classes — must run after inline_instantiations repopulates classes.
     elaborate::link_extern_methods(&mut elab, &def_refs);

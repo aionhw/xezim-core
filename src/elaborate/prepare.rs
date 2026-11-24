@@ -931,6 +931,23 @@ pub(super) fn prepare_module_items(
         prepared = share_equal_prepared(cache, param_scope::def_key(&source_def), prepared);
         cache.prepared.insert(key, Rc::clone(&prepared));
     }
+    if crate::oom_trace::enabled() {
+        let inst_items = prepared
+            .effective_items
+            .iter()
+            .filter(|item| matches!(item, ModuleItem::ModuleInstantiation(_)))
+            .count();
+        crate::oom_trace::checkpoint(
+            "prepare.body.built",
+            &[
+                ("effective_items", prepared.effective_items.len()),
+                ("inst_items", inst_items),
+                ("body_sources", prepared.body_sources.len()),
+                ("local_names", prepared.local_names.len()),
+                ("prepared_bodies", cache.prepared.len()),
+            ],
+        );
+    }
     prepared
 }
 

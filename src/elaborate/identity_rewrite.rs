@@ -96,13 +96,23 @@ pub(super) fn trace_root_rejection(stmt: &Statement) {
     let rejection = context_rejection(stmt.span)
         .or_else(|| stmt_rejection(stmt))
         .unwrap_or_else(|| rejection("identity.reject.not_reproduced", stmt.span, 0));
+    let (root_start, root_end, rej_start, rej_end) = if crate::oom_trace::redacted() {
+        (0, 0, 0, 0)
+    } else {
+        (
+            stmt.span.start as usize,
+            stmt.span.end as usize,
+            rejection.span.start as usize,
+            rejection.span.end as usize,
+        )
+    };
     crate::oom_trace::checkpoint(
         rejection.phase,
         &[
-            ("root_span_start", stmt.span.start as usize),
-            ("root_span_end", stmt.span.end as usize),
-            ("span_start", rejection.span.start as usize),
-            ("span_end", rejection.span.end as usize),
+            ("root_span_start", root_start),
+            ("root_span_end", root_end),
+            ("span_start", rej_start),
+            ("span_end", rej_end),
             ("detail", rejection.detail),
         ],
     );
