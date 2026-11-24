@@ -114,3 +114,174 @@ fn periodic_samples_survive_process_kill() {
     assert!(!records(&path).iter().any(|r| r["event"] == "finish"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn redacted_trace_strips_proprietary_paths_names_and_preserves_counts() {
+    if std::env::var_os("OOM_TRACE_TEST_WORKER").is_some() {
+        let artifact = std::env::var("OOM_TRACE_TEST_ARTIFACT").unwrap();
+        let src = r#"
+module SecretProprietaryLeafCell(input logic [7:0] secret_in, output logic [7:0] secret_out);
+  logic [7:0] secret_reg;
+  assign secret_out = secret_in ^ secret_reg;
+  always @* secret_reg = secret_in;
+endmodule
+module SecretProprietaryTopMod;
+  logic [7:0] secret_bus;
+  genvar secret_idx;
+  generate for (secret_idx = 0; secret_idx < 4; secret_idx = secret_idx + 1) begin : secret_gen_loop
+    logic [7:0] secret_wire;
+    SecretProprietaryLeafCell u_secret_bank(.secret_in(secret_bus), .secret_out(secret_wire));
+  end endgenerate
+endmodule
+"#;
+        let _session = xezim_core::oom_trace::session();
+        let (_, elab) = xezim_core::parse_and_elaborate_multi(
+            &[src.to_string()],
+            Some("SecretProprietaryTopMod"),
+            &[],
+            &["/corp/confidential_proj/rtl/SecretProprietaryFile.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate");
+        xezim_core::write_compiled(&elab, &artifact).expect("write artifact");
+        return;
+    }
+
+    let dir = directory("redact");
+    let trace_path = dir.join("trace.jsonl");
+    let artifact_path = dir.join("secret_customer_design.xez");
+    let mut cmd = command(
+        "redacted_trace_strips_proprietary_paths_names_and_preserves_counts",
+        &trace_path,
+    );
+    cmd.env("XEZIM_OOM_TRACE_REDACT", "1")
+        .env("OOM_TRACE_TEST_ARTIFACT", &artifact_path);
+    assert!(cmd.status().unwrap().success());
+
+    let raw = std::fs::read_to_string(&trace_path).unwrap();
+    let lower = raw.to_ascii_lowercase();
+    for forbidden in [
+        "secret",
+        "proprietary",
+        "confidential",
+        "customer",
+        "corp",
+        ".sv",
+        ".xez",
+        "u_secret",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "redacted trace leaked '{forbidden}'"
+        );
+    }
+
+    let recs = records(&trace_path);
+    assert!(!recs.is_empty());
+    assert!(recs.iter().all(|r| r["redacted"] == true));
+
+    // All 4 instances of the same leaf module share one opaque `def#N` alias.
+    let leaf_defs: std::collections::HashSet<&str> = recs
+        .iter()
+        .filter(|r| r["event"] == "enter" && r["phase"] == "inline instance")
+        .filter_map(|r| r["definition"].as_str())
+        .collect();
+    assert_eq!(
+        leaf_defs.len(),
+        1,
+        "expected 1 leaf def alias: {leaf_defs:?}"
+    );
+    let leaf_def = *leaf_defs.iter().next().unwrap();
+    assert!(
+        leaf_def.starts_with("def#"),
+        "unexpected def alias: {leaf_def}"
+    );
+
+    // Enriched structural counts are preserved without proprietary names.
+    assert!(
+        recs.iter().any(|r| r["phase"] == "prepare.body.built"),
+        "expected prepare.body.built checkpoint"
+    );
+    assert!(
+        recs.iter().any(|r| r["phase"] == "write.artifact.done"),
+        "expected write.artifact.done checkpoint"
+    );
+    let elab_done = recs
+        .iter()
+        .find(|r| r["phase"] == "elaboration complete")
+        .expect("elaboration complete checkpoint");
+    let count_names: std::collections::HashSet<&str> = elab_done["counts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|pair| pair[0].as_str())
+        .collect();
+    for expected in [
+        "signals",
+        "signals_cap",
+        "continuous_assigns",
+        "continuous_assigns_cap",
+        "pending_assigns",
+        "var_decl_types",
+        "property_decls",
+        "packed_full_dims",
+    ] {
+        assert!(count_names.contains(expected), "missing count '{expected}'");
+    }
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn min_delta_kib_suppresses_noisy_instance_records_while_keeping_phases() {
+    if std::env::var_os("OOM_TRACE_TEST_WORKER").is_some() {
+        let src = r#"
+module leaf(input logic a, output logic y);
+  assign y = a;
+endmodule
+module top;
+  logic a;
+  genvar i;
+  generate for (i = 0; i < 16; i = i + 1) begin : g
+    logic y;
+    leaf u(.a(a), .y(y));
+  end endgenerate
+endmodule
+"#;
+        let _session = xezim_core::oom_trace::session();
+        let _ = xezim_core::parse_and_elaborate_multi(
+            &[src.to_string()],
+            Some("top"),
+            &[],
+            &["t.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate");
+        return;
+    }
+
+    let dir = directory("delta");
+    let trace_path = dir.join("trace.jsonl");
+    let mut cmd = command(
+        "min_delta_kib_suppresses_noisy_instance_records_while_keeping_phases",
+        &trace_path,
+    );
+    cmd.env("XEZIM_OOM_TRACE_REDACT", "1")
+        .env("XEZIM_OOM_TRACE_MIN_DELTA_KIB", "1048576");
+    assert!(cmd.status().unwrap().success());
+
+    let recs = records(&trace_path);
+    let inst_records = recs
+        .iter()
+        .filter(|r| r["phase"] == "instance complete")
+        .count();
+    assert!(
+        inst_records < 16,
+        "expected delta filter to suppress per-instance records, got {inst_records}"
+    );
+    assert!(recs.iter().any(|r| r["event"] == "start"));
+    assert!(recs.iter().any(|r| r["event"] == "finish"));
+    assert!(recs.iter().any(|r| r["phase"] == "prepare.body.built"));
+    assert!(recs.iter().any(|r| r["phase"] == "elaboration complete"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
