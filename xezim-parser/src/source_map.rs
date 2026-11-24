@@ -241,12 +241,12 @@ impl LineMap {
     /// Resolve `span` (a byte range of the preprocessed `text` this map was
     /// built for) to the original source position.
     pub fn locate(&self, text: &str, span: Span) -> Option<Location> {
-        let start = span.start.min(text.len());
+        let start = (span.start as usize).min(text.len());
         let (out_line, line_start, line_end) = self.line_at(text, start);
         let o = self.origin(out_line)?;
         let file = self.files.get(o.file as usize)?;
         let out_col = text[line_start..start].chars().count() as u32;
-        let end = span.end.clamp(start, line_end);
+        let end = (span.end as usize).clamp(start, line_end);
         let len = text[start..end].chars().count().max(1) as u32;
         let mut loc = Location {
             file: file.path.clone(),
@@ -397,7 +397,7 @@ mod line_start_tests {
             let end = (start + 3..=text.len())
                 .find(|&e| text.is_char_boundary(e))
                 .unwrap_or(text.len());
-            let span = Span::new(start, end);
+            let span = Span::from_usize(start, end);
             assert_eq!(
                 indexed.locate(&text, span),
                 scanned.locate(&text, span),

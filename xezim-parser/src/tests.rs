@@ -292,7 +292,7 @@ fn test_modport_method_prototypes() {
     let result = parse(&source);
     assert!(!result.errors.is_empty());
     assert!(
-        result.errors[0].span.start <= source.find("n; endinterface").unwrap() + 1,
+        result.errors[0].span.start as usize <= source.find("n; endinterface").unwrap() + 1,
         "{:?}",
         result.errors[0]
     );

@@ -243,8 +243,8 @@ pub fn resolve_type_width_env<P: ParamLookup>(
                     "dims {} at {}",
                     dims_desc,
                     published_span_location(Span::new(
-                        first_span.unwrap_or(0) as usize,
-                        first_span.unwrap_or(0) as usize
+                        first_span.unwrap_or(0),
+                        first_span.unwrap_or(0),
                     ))
                 ));
             }

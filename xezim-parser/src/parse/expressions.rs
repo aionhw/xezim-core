@@ -225,7 +225,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a bracketed value range for set membership (§11.4.13).
-    fn parse_inside_range(&mut self, start: usize) -> Expression {
+    fn parse_inside_range(&mut self, start: u32) -> Expression {
         let (lo, hi) = self.parse_value_range_bounds(start);
         Expression::new(
             ExprKind::Range(Box::new(lo), Box::new(hi)),
@@ -235,7 +235,7 @@ impl<'a> Parser<'a> {
 
     /// The bounds of a bracketed `value_range` (A.6.7): `[lo : hi]`, or in
     /// 1800-2023 a tolerance range `[A +/- B]` / `[A +%- B]` (§11.4.13).
-    pub(super) fn parse_value_range_bounds(&mut self, start: usize) -> (Expression, Expression) {
+    pub(super) fn parse_value_range_bounds(&mut self, start: u32) -> (Expression, Expression) {
         // Plain ranges use the full expression grammar in both language modes.
         let tolerance_enabled = crate::is_sv2023() && self.range_has_tolerance();
         self.expect(TokenKind::LBracket);
@@ -2598,7 +2598,7 @@ impl<'a> Parser<'a> {
     /// mandatory even when the parenthesized identifier list is omitted. The
     /// list names the variables to randomize; the AST has no field for it, so
     /// it is consumed and dropped (the way attribute instances are).
-    fn parse_randomize_with(&mut self, call: Expression, start: usize) -> Expression {
+    fn parse_randomize_with(&mut self, call: Expression, start: u32) -> Expression {
         if self.eat(TokenKind::LParen).is_some() {
             if !self.at(TokenKind::RParen) {
                 self.parse_identifier();
@@ -2728,7 +2728,7 @@ impl<'a> Parser<'a> {
     /// parenthesized expression is never a min:typ:max triple.
     /// An assignment-operator tail after a parenthesised operand: `(a = b)`,
     /// `(a += 1)`; `inner` unchanged when no assignment operator follows.
-    fn parse_paren_assign_tail(&mut self, inner: Expression, start: usize) -> Expression {
+    fn parse_paren_assign_tail(&mut self, inner: Expression, start: u32) -> Expression {
         if self.at_any(&[
             TokenKind::Assign,
             TokenKind::PlusAssign,
@@ -3087,7 +3087,7 @@ impl<'a> Parser<'a> {
         count
     }
 
-    fn parse_sva_delay_range(&mut self, start: usize) -> Expression {
+    fn parse_sva_delay_range(&mut self, start: u32) -> Expression {
         let mk_num = |this: &Self, v: &str| {
             Expression::new(
                 ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {

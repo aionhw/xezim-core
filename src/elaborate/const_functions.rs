@@ -1306,7 +1306,7 @@ thread_local! {
     /// (name, span start, span end) of each `$unit` function. They are
     /// injected into every module's items, where they look like the
     /// module's own; see `set_unit_function_sites`.
-    pub(super) static UNIT_FUNCTION_SITES: std::cell::RefCell<HashSet<(String, usize, usize)>> =
+    pub(super) static UNIT_FUNCTION_SITES: std::cell::RefCell<HashSet<(String, u32, u32)>> =
         std::cell::RefCell::new(HashSet::default());
     /// The `$unit` typedefs' declared types, taken once they are all
     /// registered. The shared typedef table is overwritten by an instance's
@@ -1386,7 +1386,7 @@ fn const_fn_local_typedef(name: &str, elab: &ElaboratedModule) -> Option<DataTyp
 /// Record the `$unit` functions of the design being elaborated (name and
 /// declaration span), so an injected copy in a module is not taken for a
 /// function the module declares itself.
-pub(crate) fn set_unit_function_sites(sites: HashSet<(String, usize, usize)>) {
+pub(crate) fn set_unit_function_sites(sites: HashSet<(String, u32, u32)>) {
     UNIT_FUNCTION_SITES.with(|c| *c.borrow_mut() = sites);
 }
 

@@ -216,7 +216,7 @@ impl<'a> Parser<'a> {
         if toks.is_empty() {
             return None;
         }
-        let end = stream.span(toks[toks.len() - 1]).end;
+        let end = stream.span(toks[toks.len() - 1]).end as usize;
         let sub = stream.sub_stream_with_eof(toks, end);
         let mut p = super::Parser::new_sub(sub);
         let e = p.parse_expression();
@@ -369,7 +369,7 @@ impl<'a> Parser<'a> {
         p
     }
 
-    fn parse_specify_path_inner(&mut self, sp_start: usize) -> Option<SpecifyPath> {
+    fn parse_specify_path_inner(&mut self, sp_start: u32) -> Option<SpecifyPath> {
         let mut cond = None;
         let mut ifnone = false;
         if self.eat(TokenKind::KwIf).is_some() {

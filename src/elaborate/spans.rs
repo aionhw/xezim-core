@@ -104,13 +104,13 @@ fn library_span_locate(owner: &str, span: Span) -> Option<Option<SpanLoc>> {
         let lib = c.borrow();
         let i = *lib.def_file.get(owner)? as usize;
         let (file, text, map) = lib.files.get(i)?;
-        if span.start >= text.len() {
+        if span.start as usize >= text.len() {
             return Some(None);
         }
         if let Some(loc) = map.as_ref().and_then(|m| m.locate(text, span)) {
             return Some(Some(SpanLoc::Mapped(loc)));
         }
-        let line = 1 + text.as_bytes()[..span.start]
+        let line = 1 + text.as_bytes()[..span.start as usize]
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
@@ -256,13 +256,13 @@ fn span_locate_owned(
      -> Option<SpanLoc> {
         let mut hit: Option<usize> = None;
         if let Some(p) = preferred {
-            if texts.get(p).is_some_and(|t| span.start < t.len()) {
+            if texts.get(p).is_some_and(|t| (span.start as usize) < t.len()) {
                 hit = Some(p);
             }
         }
         if hit.is_none() {
             for (i, t) in texts.iter().enumerate() {
-                if span.start < t.len() {
+                if (span.start as usize) < t.len() {
                     if hit.is_some() {
                         return None; // ambiguous across files
                     }
@@ -278,7 +278,7 @@ fn span_locate_owned(
         {
             return Some(SpanLoc::Mapped(loc));
         }
-        let line = 1 + texts[i].as_bytes()[..span.start]
+        let line = 1 + texts[i].as_bytes()[..span.start as usize]
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
@@ -306,7 +306,11 @@ fn span_locate_owned(
 pub(super) fn published_span_location(span: Span) -> String {
     let found = ELAB_SOURCES_TLS.with(|c| {
         let b = c.borrow();
-        let mut fits = b.0.iter().enumerate().filter(|(_, t)| span.start < t.len());
+        let mut fits = b
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| (span.start as usize) < t.len());
         let (i, text) = fits.next()?;
         if fits.next().is_some() {
             return None;

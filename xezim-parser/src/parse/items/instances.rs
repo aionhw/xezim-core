@@ -107,7 +107,11 @@ impl<'a> Parser<'a> {
                 // default specialization, so its type-parameter property was
                 // no virtual interface.
                 DataType::Interface { span, .. } => {
-                    let slice = self.tokens.source().get(span.start..span.end).unwrap_or("");
+                    let slice = self
+                        .tokens
+                        .source()
+                        .get(span.start as usize..span.end as usize)
+                        .unwrap_or("");
                     let sub = crate::lexer::Lexer::new(slice).tokenize();
                     let toks: Vec<String> = sub
                         .iter()

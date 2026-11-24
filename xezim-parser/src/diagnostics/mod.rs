@@ -180,7 +180,7 @@ pub fn locate(
     if let Some(loc) = map.and_then(|m| m.locate(text, span)) {
         return loc;
     }
-    let start = span.start.min(text.len());
+    let start = (span.start as usize).min(text.len());
     let line_start = text[..start].rfind('\n').map_or(0, |p| p + 1);
     let line_end = text[start..].find('\n').map_or(text.len(), |p| start + p);
     let line = 1 + text.as_bytes()[..start]
@@ -188,7 +188,7 @@ pub fn locate(
         .filter(|&&b| b == b'\n')
         .count() as u32;
     let col = 1 + text[line_start..start].chars().count() as u32;
-    let end = span.end.clamp(start, line_end);
+    let end = (span.end as usize).clamp(start, line_end);
     Location {
         file: if file.is_empty() {
             "<input>".to_string()

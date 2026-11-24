@@ -26,10 +26,10 @@ pub(super) fn inline_instantiation_items(
     for item in items {
         let item_floor = *items_end;
         *items_end = (*items_end).max(match item {
-            ModuleItem::InitialConstruct(ic) => ic.span.end,
-            ModuleItem::AlwaysConstruct(ac) => ac.span.end,
-            ModuleItem::AssertionItem(a) => a.span.end,
-            ModuleItem::ModuleInstantiation(mi) => mi.span.end,
+            ModuleItem::InitialConstruct(ic) => ic.span.end as usize,
+            ModuleItem::AlwaysConstruct(ac) => ac.span.end as usize,
+            ModuleItem::AssertionItem(a) => a.span.end as usize,
+            ModuleItem::ModuleInstantiation(mi) => mi.span.end as usize,
             _ => 0,
         });
         if let ModuleItem::ModuleInstantiation(inst) = item {
@@ -6872,7 +6872,7 @@ pub(super) fn inline_instantiation_items(
                     path: inst_prefix.trim_end_matches('.').into(),
                     def_name: sub_mod_name.as_str().into(),
                     parent: prefix.trim_end_matches('.').into(),
-                    src_pos: hi.span.start.max(item_floor),
+                    src_pos: (hi.span.start as usize).max(item_floor),
                 });
                 elab.upward_scopes.borrow_mut().add_instance(
                     prefix.trim_end_matches('.'),
@@ -6881,7 +6881,7 @@ pub(super) fn inline_instantiation_items(
                 );
                 // Keep later items strictly after this one: bound
                 // instantiations carry spans from elsewhere.
-                *items_end = (*items_end).max(hi.span.start.max(item_floor) + 1);
+                *items_end = (*items_end).max((hi.span.start as usize).max(item_floor) + 1);
 
                 // Recurse into sub-module instantiations
                 iprof_since("subitem_loop", __td);

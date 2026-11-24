@@ -324,7 +324,7 @@ impl<'a> Parser<'a> {
     /// "expected identifier, found Hash".
     pub(super) fn parse_type_args_hash(
         &mut self,
-        start: usize,
+        start: u32,
     ) -> Vec<crate::ast::expr::Expression> {
         let mut type_args: Vec<crate::ast::expr::Expression> = Vec::new();
         if self.eat(TokenKind::Hash).is_some() {
@@ -445,7 +445,7 @@ impl<'a> Parser<'a> {
     /// `P#(bit [5:0]) x;` already produces — since the leaf keyword alone
     /// names a 1-bit type and every property typed by the parameter came
     /// out the default type's width.
-    fn parse_type_keyword_arg(&mut self, start: usize) -> crate::ast::expr::Expression {
+    fn parse_type_keyword_arg(&mut self, start: u32) -> crate::ast::expr::Expression {
         let tok_text = self.current_text().into_owned();
         let tsp = self.current_span();
         let dt = self.parse_data_type();

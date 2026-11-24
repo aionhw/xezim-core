@@ -164,13 +164,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(super) fn span_from(&self, start: usize) -> Span {
+    pub(super) fn span_from(&self, start: u32) -> Span {
         let end = if self.pos > 0 {
             self.tokens.span_at(self.pos - 1).end
         } else {
             start
         };
-        Span::new(start, end)
+        Span { start, end }
     }
 
     pub(super) fn error(&mut self, msg: impl Into<String>) {

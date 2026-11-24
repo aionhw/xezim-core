@@ -1,8 +1,8 @@
 //! Thread-safe, nonsemantic AST caches. IEEE 1800-2023 §13.3/§13.4 bodies
 //! may be shared, but widths and resolved names remain scope-dependent.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScopeCacheMode {
@@ -120,11 +120,11 @@ macro_rules! option_cache {
     };
 }
 
-option_cache!(WidthCache, AtomicU64, u64, u32);
-option_cache!(SignalCache, AtomicUsize, usize, usize);
+option_cache!(WidthCache, AtomicU32, u32, u32);
+option_cache!(SignalCache, AtomicU32, u32, usize);
 
 #[derive(Debug, Default, Clone)]
-pub struct LiteralCache(OnceLock<(u64, u64, u32)>);
+pub struct LiteralCache(OnceLock<Arc<(u64, u64, u32)>>);
 
 impl LiteralCache {
     pub fn new(value: Option<(u64, u64, u32)>) -> Self {
@@ -134,73 +134,99 @@ impl LiteralCache {
     }
 
     pub fn get(&self) -> Option<(u64, u64, u32)> {
-        self.0.get().copied()
+        self.0.get().map(|arc| **arc)
     }
 
     pub fn set(&self, value: Option<(u64, u64, u32)>) {
         if let Some(value) = value {
-            if let Err(value) = self.0.set(value) {
-                debug_assert_eq!(self.0.get(), Some(&value));
+            if let Err(value) = self.0.set(Arc::new(value)) {
+                debug_assert_eq!(self.0.get().map(|arc| **arc), Some(*value));
             }
         }
     }
 }
 
 #[derive(Debug)]
-pub struct NameCache {
-    // Parsed/shared bodies usually never memoize a scope-specific name.
-    // Keep the empty cell small without changing publication or ownership.
-    value: OnceLock<Box<String>>,
+struct NameSlot {
+    value: String,
     disabled: AtomicBool,
 }
+
+#[derive(Debug)]
+pub struct NameCache(OnceLock<Option<Box<NameSlot>>>);
 
 impl NameCache {
     pub fn new() -> Self {
         Self::default()
     }
 
+    fn disabled_lock() -> OnceLock<Option<Box<NameSlot>>> {
+        let lock = OnceLock::new();
+        let _ = lock.set(None);
+        lock
+    }
+
     pub fn get(&self) -> Option<&String> {
-        if self.disabled.load(Ordering::Relaxed) {
-            None
-        } else {
-            self.value.get().map(Box::as_ref)
+        match self.0.get()? {
+            Some(slot) if !slot.disabled.load(Ordering::Relaxed) => Some(&slot.value),
+            _ => None,
         }
     }
 
     pub fn set(&self, value: String) -> Result<(), String> {
-        if self.disabled.load(Ordering::Relaxed) {
-            Err(value)
-        } else {
-            self.value.set(Box::new(value)).map_err(|value| *value)
+        if self.0.get().is_some() {
+            return Err(value);
+        }
+        let slot = Box::new(NameSlot {
+            value,
+            disabled: AtomicBool::new(false),
+        });
+        match self.0.set(Some(slot)) {
+            Ok(()) => Ok(()),
+            Err(Some(slot)) => Err(slot.value),
+            Err(None) => unreachable!(),
         }
     }
 
     pub fn disable(&self) {
-        self.disabled.store(true, Ordering::Relaxed);
+        if self.0.set(None).is_err() {
+            if let Some(Some(slot)) = self.0.get() {
+                slot.disabled.store(true, Ordering::Relaxed);
+            }
+        }
     }
 }
 
 impl Default for NameCache {
     fn default() -> Self {
-        Self {
-            value: OnceLock::new(),
-            disabled: AtomicBool::new(scope_caches_disabled()),
+        if scope_caches_disabled() {
+            Self(Self::disabled_lock())
+        } else {
+            Self(OnceLock::new())
         }
     }
 }
 
 impl Clone for NameCache {
     fn clone(&self) -> Self {
-        let mode = scope_cache_mode();
-        let disabled = mode == ScopeCacheMode::Disabled
-            || (mode == ScopeCacheMode::Preserve && self.disabled.load(Ordering::Relaxed));
-        Self {
-            value: if disabled || mode == ScopeCacheMode::Fresh {
-                OnceLock::new()
-            } else {
-                self.value.clone()
+        match scope_cache_mode() {
+            ScopeCacheMode::Disabled => Self(Self::disabled_lock()),
+            ScopeCacheMode::Fresh => Self(OnceLock::new()),
+            ScopeCacheMode::Preserve => match self.0.get() {
+                None => Self(OnceLock::new()),
+                Some(None) => Self(Self::disabled_lock()),
+                Some(Some(slot)) if slot.disabled.load(Ordering::Relaxed) => {
+                    Self(Self::disabled_lock())
+                }
+                Some(Some(slot)) => {
+                    let lock = OnceLock::new();
+                    let _ = lock.set(Some(Box::new(NameSlot {
+                        value: slot.value.clone(),
+                        disabled: AtomicBool::new(false),
+                    })));
+                    Self(lock)
+                }
             },
-            disabled: AtomicBool::new(disabled),
         }
     }
 }

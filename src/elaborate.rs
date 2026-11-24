@@ -98,6 +98,7 @@ mod semantic_checks;
 mod spans;
 mod specify;
 mod stmt_rewrite;
+mod streaming_serde;
 mod type_param_subst;
 mod type_props;
 mod type_queries;
@@ -1387,6 +1388,11 @@ pub struct PendingContAssign {
 impl PendingAlways {
     /// Run the rewrite once and produce the owned AlwaysBlock. Drops self.
     pub fn materialize(self) -> AlwaysBlock {
+        self.materialize_ref()
+    }
+
+    /// Borrowed materializer used by streaming artifact serialization (#721).
+    pub fn materialize_ref(&self) -> AlwaysBlock {
         if pend_dbg_enabled() {
             eprintln!(
                 "[PEND-MAT] prefix={:?} keys={:?}",
@@ -1470,6 +1476,11 @@ impl PendingInitial {
     }
 
     pub fn materialize(self) -> InitialBlock {
+        self.materialize_ref()
+    }
+
+    /// Borrowed materializer used by streaming artifact serialization (#721).
+    pub fn materialize_ref(&self) -> InitialBlock {
         set_type_bind_tls(&self.ctx);
         let stmt = rewrite_stmt(
             &self.source,
@@ -1508,13 +1519,18 @@ impl PendingContAssign {
     }
 
     pub fn materialize(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
+        self.materialize_ref(params)
+    }
+
+    /// Borrowed materializer used by streaming artifact serialization (#721).
+    pub fn materialize_ref(&self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         set_type_bind_tls(&self.ctx);
         let out = self.materialize_inner(params);
         clear_type_bind_tls();
         out
     }
 
-    fn materialize_inner(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
+    fn materialize_inner(&self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         let lhs = self.materialize_lhs();
         let rhs = rewrite_expr(
             &self.rhs_source,
@@ -1543,9 +1559,21 @@ impl PendingContAssign {
         root_mark_hier_ca_rhs(&self.lhs_source, &mut rhs, &|_| false, &|n| {
             self.ctx.upward.borrow().packages.contains(n)
         });
-        let operands = [self.delay_source, self.delay_fall_source, self.delay_off_source].map(|src| {
-            src.map(|d| rewrite_expr(&d, &self.ctx.prefix, &self.ctx.port_map,
-                &self.ctx.local_names, &self.ctx.interface_map))
+        let operands = [
+            &self.delay_source,
+            &self.delay_fall_source,
+            &self.delay_off_source,
+        ]
+        .map(|src| {
+            src.as_deref().map(|d| {
+                rewrite_expr(
+                    d,
+                    &self.ctx.prefix,
+                    &self.ctx.port_map,
+                    &self.ctx.local_names,
+                    &self.ctx.interface_map,
+                )
+            })
         });
         let (delay, delay_fall, delay_off, delay_exprs) =
             cont_assign_delays(operands.each_ref().map(Option::as_ref), params);
@@ -1955,7 +1983,12 @@ pub struct ElabInstance {
 }
 
 /// Elaborated module ready for simulation.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `serde::Serialize` is implemented in [`streaming_serde`] so deferred
+/// `pending_*` blocks, continuous assignments, and callable bodies stream
+/// directly into `.xez` artifacts one element at a time without requiring
+/// bulk `materialize_pending()` in memory (aionhw/xezim#721).
+#[derive(Debug, serde::Deserialize)]
 pub struct ElaboratedModule {
     pub name: String,
     /// Global simulation tick in seconds — the finest `timescale` precision

@@ -722,10 +722,10 @@ pub(super) fn inline_bound_items(
     if scope.was_flat_leaf {
         for item in source_def.items() {
             scope.items_end = scope.items_end.max(match item {
-                ModuleItem::InitialConstruct(ic) => ic.span.end,
-                ModuleItem::AlwaysConstruct(ac) => ac.span.end,
-                ModuleItem::AssertionItem(a) => a.span.end,
-                ModuleItem::ModuleInstantiation(mi) => mi.span.end,
+                ModuleItem::InitialConstruct(ic) => ic.span.end as usize,
+                ModuleItem::AlwaysConstruct(ac) => ac.span.end as usize,
+                ModuleItem::AssertionItem(a) => a.span.end as usize,
+                ModuleItem::ModuleInstantiation(mi) => mi.span.end as usize,
                 _ => 0,
             });
             if let ModuleItem::Defparam(assigns) = item {

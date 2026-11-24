@@ -132,7 +132,7 @@ impl<'a> Parser<'a> {
         &mut self,
         ld: &LetDeclaration,
         name: &Identifier,
-        start: usize,
+        start: u32,
     ) -> Expression {
         let args = if self.at(TokenKind::LParen) {
             self.parse_call_args()

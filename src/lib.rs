@@ -308,7 +308,9 @@ pub use value::Value;
 ///         `property_params` omits portless declarations.
 /// \x6E boxes rare `ContinuousAssignment` origin and multi-delay metadata (#721) and encodes
 ///         `HierarchicalIdentifier::root` as `HierRoot`.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6E";
+///   v111: compact `Span` (`u32`, `u32`), compact AST caches, and streaming
+///         pending-body serialization (aionhw/xezim#721).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6F";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1229,8 +1231,7 @@ pub fn render_parse_diagnostics(
     file: &str,
 ) -> Vec<String> {
     const SHOWN: usize = 20;
-    let mut seen: std::collections::HashSet<(usize, usize, &str)> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(u32, u32, &str)> = std::collections::HashSet::new();
     let unique: Vec<&diagnostics::Diagnostic> = diags
         .iter()
         .filter(|d| d.severity == severity)

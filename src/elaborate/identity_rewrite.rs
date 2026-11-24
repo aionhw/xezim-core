@@ -21,15 +21,69 @@ use crate::ast::Span;
 pub(super) fn can_preserve_root_stmt(stmt: &Statement) -> bool {
     // Even a currently empty specialization/rename is an explicit rewrite
     // context. Exclude it rather than infer that its current tables are inert.
-    let root_context = GEN_RENAME_TLS.with(|frames| frames.borrow().is_empty())
+    let root_context = is_root_context();
+    root_context && identity_stmt(stmt)
+}
+
+fn is_root_context() -> bool {
+    GEN_RENAME_TLS.with(|frames| frames.borrow().is_empty())
         && TYPE_BIND_WIDTHS_TLS.with(|bindings| bindings.borrow().is_none())
         && TYPE_BIND_QUERIES_TLS.with(|bindings| bindings.borrow().is_none())
         && TYPE_BIND_TYPES_TLS.with(|bindings| bindings.borrow().is_none())
         && PKG_FLATTEN_ONLY.with(|packages| packages.borrow().is_none())
         // An ordinary index rewrite consumes this transient flag. Starting
         // clear also preserves that state when retaining the expression.
-        && MODPORT_SUBST_FLAG.with(|flag| !flag.get());
-    root_context && identity_stmt(stmt)
+        && MODPORT_SUBST_FLAG.with(|flag| !flag.get())
+}
+
+/// Whether the final root rewrite is an identity for a continuous-assignment
+/// operand when `prefix`, `port_map` and `interface_map` are all empty.
+///
+/// Accepts plain `identity_expr` operands as well as already-flattened
+/// single-segment signal names (e.g. `g[0].u.in0` from inlined port links)
+/// present in `signals`, where `rewrite_expr_impl` hits `local_names.contains`
+/// with an empty prefix and returns an identical identifier.
+pub(super) fn can_preserve_root_cont_assign_expr(
+    expr: &Expression,
+    signals: &crate::shared_names::SharedNameMap<super::Signal>,
+) -> bool {
+    is_root_context() && identity_cont_assign_expr(expr, signals)
+}
+
+fn identity_cont_assign_expr(
+    expr: &Expression,
+    signals: &crate::shared_names::SharedNameMap<super::Signal>,
+) -> bool {
+    if expr.cached_width.get().is_some() {
+        return false;
+    }
+    match &expr.kind {
+        ExprKind::Ident(name) => {
+            if name.root.is_some()
+                || name.bound.is_upward()
+                || name.cached_signal_id.get().is_some()
+                || name.cached_resolved_name.get().is_some()
+            {
+                return false;
+            }
+            match name.path.as_slice() {
+                [segment] if segment.selects.is_empty() => {
+                    let s = segment.name.name.as_str();
+                    !s.starts_with("$unit::")
+                        && (signals.contains_key(s) || !s.contains(['.', ':', '$']))
+                }
+                [segment] => {
+                    let s = segment.name.name.as_str();
+                    !s.starts_with("$unit::") && signals.contains_key(s)
+                }
+                _ => false,
+            }
+        }
+        ExprKind::Index { expr: base, index } => {
+            identity_cont_assign_expr(base, signals) && identity_cont_assign_expr(index, signals)
+        }
+        _ => identity_expr(expr),
+    }
 }
 
 /// Report the first failed identity gate, in predicate order, without
@@ -45,10 +99,10 @@ pub(super) fn trace_root_rejection(stmt: &Statement) {
     crate::oom_trace::checkpoint(
         rejection.phase,
         &[
-            ("root_span_start", stmt.span.start),
-            ("root_span_end", stmt.span.end),
-            ("span_start", rejection.span.start),
-            ("span_end", rejection.span.end),
+            ("root_span_start", stmt.span.start as usize),
+            ("root_span_end", stmt.span.end as usize),
+            ("span_start", rejection.span.start as usize),
+            ("span_end", rejection.span.end as usize),
             ("detail", rejection.detail),
         ],
     );

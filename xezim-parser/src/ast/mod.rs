@@ -10,18 +10,28 @@ pub mod stmt;
 pub mod types;
 
 /// A span of source text identified by byte offsets.
+///
+/// Stored as `u32` offsets (supporting up to 4 GiB of preprocessed source per
+/// file) so every AST node and token pays 8 bytes instead of 16
+/// (aionhw/xezim#721).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Span {
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Self {
+    pub const fn new(start: u32, end: u32) -> Self {
         Self { start, end }
     }
-    pub fn dummy() -> Self {
+    pub fn from_usize(start: usize, end: usize) -> Self {
+        Self {
+            start: start.min(u32::MAX as usize) as u32,
+            end: end.min(u32::MAX as usize) as u32,
+        }
+    }
+    pub const fn dummy() -> Self {
         Self { start: 0, end: 0 }
     }
 }

@@ -756,6 +756,39 @@ fn make_multi_index_expr(name: &str, idx: &[i64]) -> Expression {
     e
 }
 
+/// Pure expansion of a whole-array, slice, or concat unpacked-array continuous
+/// assign into element assignments, preserving any runtime delay expressions.
+pub(super) fn expanded_array_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    delay_exprs: Option<&DelayExpressions>,
+    elab: &ElaboratedModule,
+) -> Option<Vec<ContinuousAssignment>> {
+    let mut parts = elab
+        .whole_array_driver_parts(lhs, rhs, delay, &elab.unpacked_decl_dims)
+        .or_else(|| {
+            slice_array_assign_parts(
+                lhs,
+                rhs,
+                delay,
+                &elab.arrays,
+                Some(&elab.descending_arrays),
+                Some(&elab.unpacked_decl_dims),
+                &elab.parameters,
+            )
+        })
+        .or_else(|| {
+            elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t))
+        })?;
+    if let Some(de) = delay_exprs {
+        for part in &mut parts {
+            part.set_delay_exprs(Some(de.clone()));
+        }
+    }
+    Some(parts)
+}
+
 /// Push the expansion of a whole-array continuous assign, returning true when
 /// it consumed the assignment.
 pub(super) fn expand_whole_array_assign(
@@ -765,26 +798,8 @@ pub(super) fn expand_whole_array_assign(
     delay_exprs: &Option<DelayExpressions>,
     elab: &mut ElaboratedModule,
 ) -> bool {
-    match elab.whole_array_driver_parts(lhs, rhs, delay, &elab.unpacked_decl_dims)
-    .or_else(|| {
-        slice_array_assign_parts(
-            lhs,
-            rhs,
-            delay,
-            &elab.arrays,
-            Some(&elab.descending_arrays),
-            Some(&elab.unpacked_decl_dims),
-            &elab.parameters,
-        )
-    })
-    .or_else(|| elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t)))
-    {
-        Some(mut parts) => {
-            if delay_exprs.is_some() {
-                for part in &mut parts {
-                    part.set_delay_exprs(delay_exprs.clone());
-                }
-            }
+    match expanded_array_assign_parts(lhs, rhs, delay, delay_exprs.as_ref(), elab) {
+        Some(parts) => {
             elab.continuous_assigns.extend(parts);
             true
         }

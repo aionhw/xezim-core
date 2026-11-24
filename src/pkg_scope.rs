@@ -2473,7 +2473,7 @@ impl Rw<'_> {
                         }
                     }
                     for (span, named) in edits.into_iter().rev() {
-                        args_text.replace_range(span.start..span.end, &named);
+                        args_text.replace_range(span.start as usize..span.end as usize, &named);
                     }
                 }
             }

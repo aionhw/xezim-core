@@ -966,7 +966,7 @@ impl<'a> Parser<'a> {
     /// Declarations and prototypes (`extern`, `pure virtual`, DPI imports and
     /// exports) share this, so a return type accepted on a body-ful function
     /// is accepted on its prototype too (#284).
-    fn parse_function_return_type(&mut self, start: usize) -> DataType {
+    fn parse_function_return_type(&mut self, start: u32) -> DataType {
         // §25.9: `virtual` at the RETURN-TYPE position can only start a
         // virtual-interface type (`function automatic virtual bus_if #(4).drv
         // get(...)`) — a virtual METHOD's keyword sits BEFORE `function` and

@@ -28,7 +28,7 @@ fn compact_syntax_list<T>(mut items: Vec<T>) -> Vec<T> {
 
 pub struct Parser<'a> {
     // §22.8 directive transitions in source order, consumed outside the grammar.
-    default_net_pulls: Vec<(usize, Option<crate::ast::types::NetType>)>,
+    default_net_pulls: Vec<(u32, Option<crate::ast::types::NetType>)>,
     tokens: TokenStream<'a>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
     /// keeping where it stands and whether it names a pull (tri0/tri1).
     fn take_default_net_pulls(
         mut tokens: TokenStream<'a>,
-    ) -> (TokenStream<'a>, Vec<(usize, Option<crate::ast::types::NetType>)>) {
+    ) -> (TokenStream<'a>, Vec<(u32, Option<crate::ast::types::NetType>)>) {
         let is_directive = |tokens: &TokenStream<'a>, tok: Token| {
             tok.kind == TokenKind::Directive && tokens.text(tok) == "`default_nettype"
         };

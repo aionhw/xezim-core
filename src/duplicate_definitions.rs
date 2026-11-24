@@ -165,7 +165,7 @@ impl DuplicateDefinitions {
 /// Normalize a typedef declaration's source text by tokenizing (ignoring
 /// whitespace and comments).
 fn normalize_typedef(text: &str, span: Span) -> Option<String> {
-    let slice = text.get(span.start..span.end)?;
+    let slice = text.get(span.start as usize..span.end as usize)?;
     let tokens = Lexer::new(slice).tokenize();
     let mut out = String::new();
     for tok in &tokens {

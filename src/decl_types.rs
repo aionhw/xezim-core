@@ -310,7 +310,7 @@ mod tests {
                 value: text.to_string(),
                 cached_val: Default::default(),
             }),
-            Span::new(at, at + text.len()),
+            Span::from_usize(at, at + text.len()),
         )
     }
 
@@ -321,9 +321,9 @@ mod tests {
             dimensions: vec![PackedDimension::Range {
                 left: Box::new(number(msb, at + 7)),
                 right: Box::new(number("0", at + 10)),
-                span: Span::new(at + 6, at + 12),
+                span: Span::from_usize(at + 6, at + 12),
             }],
-            span: Span::new(at, at + 12),
+            span: Span::from_usize(at, at + 12),
         }
     }
 

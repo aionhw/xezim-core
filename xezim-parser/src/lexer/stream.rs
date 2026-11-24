@@ -138,7 +138,7 @@ impl<'a> TokenStream<'a> {
         let end = tok
             .inline_end()
             .unwrap_or_else(|| self.long_end(start as u32));
-        Span::new(start, end)
+        Span::from_usize(start, end)
     }
 
     #[inline]
@@ -158,6 +158,7 @@ impl<'a> TokenStream<'a> {
     #[inline]
     pub fn text(&self, tok: Token) -> Cow<'a, str> {
         let Span { start, end } = self.span(tok);
+        let (start, end) = (start as usize, end as usize);
         let raw: Cow<'a, str> = match self.source.get(start..end) {
             Some(s) => Cow::Borrowed(s),
             None => String::from_utf8_lossy(&self.source.as_bytes()[start..end]),
@@ -211,7 +212,7 @@ impl<'a> TokenStream<'a> {
         let mut out = TokenStream::new(self.source);
         for &tok in toks {
             let sp = self.span(tok);
-            out.push_token(tok.kind, sp.start, sp.end);
+            out.push_token(tok.kind, sp.start as usize, sp.end as usize);
         }
         out.push_token(TokenKind::Eof, eof_offset, eof_offset);
         out.finish();

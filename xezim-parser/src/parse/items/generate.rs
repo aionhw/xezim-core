@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> Parser<'a> {
-    pub(super) fn parse_generate_if(&mut self, start: usize) -> ModuleItem {
+    pub(super) fn parse_generate_if(&mut self, start: u32) -> ModuleItem {
         let mut branches = Vec::new();
         let mut branch_labels = Vec::new();
         let mut branch_direct = Vec::new();
@@ -41,7 +41,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub(super) fn parse_generate_case(&mut self, start: usize) -> ModuleItem {
+    pub(super) fn parse_generate_case(&mut self, start: u32) -> ModuleItem {
         // case (selector)
         self.bump(); // consume `case`
         self.expect(TokenKind::LParen);

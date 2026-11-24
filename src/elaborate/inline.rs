@@ -1269,6 +1269,10 @@ fn inline_instantiations_inner(
         drop(bs);
     }
     crate::oom_trace::model("inline.top.ready", elab, Some(cache.prepared.len()));
+    // Release prepared module bodies (including top-level expanded generate
+    // loops) before post-inline passes allocate local name sets or validate
+    // bodies (aionhw/xezim#721).
+    drop(cache);
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
@@ -1332,12 +1336,6 @@ fn inline_instantiations_inner(
         elab.materialize_pending();
     }
 
-    let local_names = elab
-        .signals
-        .keys()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    crate::oom_trace::model("inline.local_names.ready", elab, Some(cache.prepared.len()));
     let port_map = HashMap::default();
     let mut interface_map = HashMap::default();
     for name in top_interface_names {
@@ -1348,7 +1346,20 @@ fn inline_instantiations_inner(
     // §9.3/§23.6: an identity rewrite may retain shared root syntax.
     // Instances, interfaces, specialization and populated contextual
     // caches still take the complete rewrite and invalidation path.
+    // Build `local_names` lazily so designs whose root blocks and assigns
+    // preserve identity avoid cloning every flattened signal name (#721).
     let root_identity = prefix.is_empty() && port_map.is_empty() && interface_map.is_empty();
+    let local_names_cell: std::cell::OnceCell<std::collections::HashSet<String>> =
+        std::cell::OnceCell::new();
+    let signals = &elab.signals;
+    let get_local_names = || {
+        local_names_cell.get_or_init(|| {
+            signals
+                .keys()
+                .map(|k| k.as_str().to_string())
+                .collect::<std::collections::HashSet<_>>()
+        })
+    };
     let rewrite_root = |stmt: &Statement| {
         if root_identity && identity_rewrite::can_preserve_root_stmt(stmt) {
             stmt.clone()
@@ -1356,7 +1367,7 @@ fn inline_instantiations_inner(
             if root_identity && crate::oom_trace::enabled() {
                 identity_rewrite::trace_root_rejection(stmt);
             }
-            rewrite_stmt(stmt, prefix, &port_map, &local_names, &interface_map)
+            rewrite_stmt(stmt, prefix, &port_map, get_local_names(), &interface_map)
         }
     };
     for (index, block) in elab.always_blocks.iter_mut().enumerate() {
@@ -1369,14 +1380,34 @@ fn inline_instantiations_inner(
         block.stmt = rewrite_root(&block.stmt);
     }
     for assign in &mut elab.continuous_assigns {
-        assign.lhs = rewrite_expr(&assign.lhs, prefix, &port_map, &local_names, &interface_map);
-        assign.rhs = rewrite_expr(&assign.rhs, prefix, &port_map, &local_names, &interface_map);
+        if !(root_identity
+            && identity_rewrite::can_preserve_root_cont_assign_expr(&assign.lhs, signals))
+        {
+            assign.lhs = rewrite_expr(
+                &assign.lhs,
+                prefix,
+                &port_map,
+                get_local_names(),
+                &interface_map,
+            );
+        }
+        if !(root_identity
+            && identity_rewrite::can_preserve_root_cont_assign_expr(&assign.rhs, signals))
+        {
+            assign.rhs = rewrite_expr(
+                &assign.rhs,
+                prefix,
+                &port_map,
+                get_local_names(),
+                &interface_map,
+            );
+        }
     }
-    drop(local_names);
-    crate::oom_trace::model("inline.root_rewrites.ready", elab, Some(cache.prepared.len()));
+    drop(local_names_cell);
+    crate::oom_trace::model("inline.root_rewrites.ready", elab, Some(0));
 
     validate_inlined_bodies(elab, definitions)?;
-    crate::oom_trace::model("inline.validation.ready", elab, Some(cache.prepared.len()));
+    crate::oom_trace::model("inline.validation.ready", elab, Some(0));
 
     // §8.2: reject illegal `local`/`protected` member access at compile time
     // (the reference simulators report `Illegal access to local/protected
