@@ -23,6 +23,7 @@ pub(super) fn inline_instantiation_items(
         || source_def.params().iter().any(|p| matches!(&p.kind, ParameterKind::Data { assignments, .. }
             if assignments.iter().any(|a| !a.dimensions.is_empty())));
     let nonlexical_params: std::cell::OnceCell<HashMap<String, Value>> = std::cell::OnceCell::new();
+    let wildcard_interfaces = std::cell::OnceCell::new();
     for item in items {
         let item_floor = *items_end;
         *items_end = (*items_end).max(match item {
@@ -495,9 +496,47 @@ pub(super) fn inline_instantiation_items(
                                     interface_map,
                                 );
                                 if is_if_port {
+                                    let sibling_ifaces = wildcard_interfaces.get_or_init(|| {
+                                        items.iter()
+                                            .filter_map(|item| match item {
+                                                ModuleItem::ModuleInstantiation(inst)
+                                                    if matches!(definitions.get(&inst.module_name.name), Some(Definition::Interface(_))) => Some(inst),
+                                                _ => None,
+                                            })
+                                            .flat_map(|inst| inst.instances.iter().map(|i| i.name.name.as_str()))
+                                            .collect::<std::collections::HashSet<_>>()
+                                    });
+                                    let mut scope = hi.name.name.rsplit_once('.').map_or("", |(scope, _)| scope);
+                                    let sibling = loop {
+                                        let candidate = if scope.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            format!("{scope}.{name}")
+                                        };
+                                        if sibling_ifaces.contains(candidate.as_str()) {
+                                            break Some(cat2(prefix, &candidate));
+                                        }
+                                        if scope.is_empty() {
+                                            break None;
+                                        }
+                                        scope = scope.rsplit_once('.').map_or("", |(outer, _)| outer);
+                                    };
+                                    let parent_is_port = match source_def.ports() {
+                                        PortList::Ansi(ports) => ports.iter().any(|p| p.name.name == name
+                                            && p.data_type.as_ref().is_some_and(|dt| is_interface_type(dt, definitions))),
+                                        PortList::NonAnsi(ports) => ports.iter().any(|p| p.name == name),
+                                        PortList::Empty => false,
+                                    };
+                                    if sv_parser::strict_checks()
+                                        && sibling.is_none()
+                                        && !parent_is_port
+                                        && !interface_map.contains_key(&name)
+                                    {
+                                        continue;
+                                    }
                                     sub_interface_map.insert(
                                         name,
-                                        whole_net_ident_name(&actual).unwrap_or(parent_name),
+                                        sibling.unwrap_or_else(|| whole_net_ident_name(&actual).unwrap_or(parent_name)),
                                     );
                                 } else {
                                     port_map.insert(name, actual);
@@ -558,6 +597,36 @@ pub(super) fn inline_instantiation_items(
                                 }
                             }
                         }
+                    }
+                }
+
+                // §25.3: an instantiated interface port needs an actual.
+                // The synthetic multi-top wrapper treats its children as
+                // roots, which may declare interface ports of their own.
+                if sv_parser::strict_checks()
+                    && !sub_iface_ports.is_empty()
+                    && source_def.name() != crate::MULTI_TOP_WRAPPER
+                    && let PortList::Ansi(ports) = sub_mod.ports()
+                {
+                    for (index, port) in ports.iter().enumerate() {
+                        let name = &port.name.name;
+                        if !sub_iface_ports.contains(name) {
+                            continue;
+                        }
+                        let actual = hi.connections.iter().enumerate().find_map(|(pos, c)| match c {
+                            PortConnection::Named { name: n, expr, implicit } if n.name == *name => {
+                                Some(expr.is_some() || *implicit)
+                            }
+                            PortConnection::Ordered(e) if pos == index => Some(e.is_some()),
+                            _ => None,
+                        });
+                        if actual.unwrap_or_else(|| sub_interface_map.contains_key(name)) {
+                            continue;
+                        }
+                        let path = inst_prefix.trim_end_matches('.');
+                        return Err(span_error_of(elab, hi.span, source_def.name(), &format!(
+                            "interface port '{name}' of instance '{path}' (module '{sub_mod_name}') is not connected. Connect it to an interface instance or an interface port (IEEE 1800-2023 §25.3, §23.3.3)"
+                        )));
                     }
                 }
 
