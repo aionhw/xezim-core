@@ -12,7 +12,10 @@ use xezim_core::{
         },
         stmt::Statement,
     },
-    elaborate::{ContinuousAssignment, ElabInstance, Signal, set_vpi_net_drivers, vpi_net_drivers},
+    elaborate::{
+        ContinuousAssignment, ElabInstance, PendingContAssign, Signal, set_vpi_net_drivers,
+        vpi_net_drivers,
+    },
 };
 
 fn elaborate(src: &str) -> ElaboratedModule {
@@ -45,12 +48,12 @@ fn core_ast_and_elaboration_object_sizes_stay_compact() {
         size_of::<SignalCache>()
     );
     assert!(
-        size_of::<NameCache>() <= 16,
+        size_of::<NameCache>() <= 8,
         "NameCache grew to {} B",
         size_of::<NameCache>()
     );
     assert!(
-        size_of::<LiteralCache>() <= 16,
+        size_of::<LiteralCache>() <= 8,
         "LiteralCache grew to {} B",
         size_of::<LiteralCache>()
     );
@@ -65,34 +68,39 @@ fn core_ast_and_elaboration_object_sizes_stay_compact() {
         size_of::<HierPathSegment>()
     );
     assert!(
-        size_of::<NumberLiteral>() <= 56,
+        size_of::<NumberLiteral>() <= 48,
         "NumberLiteral grew to {} B",
         size_of::<NumberLiteral>()
     );
     assert!(
-        size_of::<HierarchicalIdentifier>() <= 64,
+        size_of::<HierarchicalIdentifier>() <= 56,
         "HierarchicalIdentifier grew to {} B",
         size_of::<HierarchicalIdentifier>()
     );
     assert!(
-        size_of::<ExprKind>() <= 64,
+        size_of::<ExprKind>() <= 56,
         "ExprKind grew to {} B",
         size_of::<ExprKind>()
     );
     assert!(
-        size_of::<Expression>() <= 80,
+        size_of::<Expression>() <= 72,
         "Expression grew to {} B",
         size_of::<Expression>()
     );
     assert!(
-        size_of::<Statement>() <= 192,
+        size_of::<Statement>() <= 168,
         "Statement grew to {} B",
         size_of::<Statement>()
     );
     assert!(
-        size_of::<ContinuousAssignment>() <= 184,
+        size_of::<ContinuousAssignment>() <= 168,
         "ContinuousAssignment grew to {} B",
         size_of::<ContinuousAssignment>()
+    );
+    assert!(
+        size_of::<PendingContAssign>() <= 48,
+        "PendingContAssign grew to {} B",
+        size_of::<PendingContAssign>()
     );
     assert!(
         size_of::<Signal>() <= 56,
@@ -158,6 +166,17 @@ endmodule
             .iter()
             .all(|ca| ca.origin().is_none() && ca.extras.is_none()),
         "synthesized port connections must not allocate ContinuousAssignExtras"
+    );
+    // Undelayed deferred continuous assigns carry no boxed extras.
+    assert!(!m.pending_cont_assign.is_empty());
+    assert!(
+        m.pending_cont_assign.iter().all(|p| p.extras.is_none()),
+        "plain deferred continuous assigns must not allocate PendingContAssignExtras"
+    );
+    // Elaboration-only decl_sites are released before returning.
+    assert!(
+        m.decl_sites.is_empty(),
+        "decl_sites must be cleared after elaboration"
     );
 }
 
