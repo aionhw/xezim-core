@@ -271,10 +271,9 @@ pub fn concat_array_assign_parts(
                     rhs_elems.push(item.clone());
                 }
             }
-            ExprKind::Concatenation(_)
-            | ExprKind::Replication { .. }
-            | ExprKind::AssignmentPattern(_)
-            | ExprKind::MemberAccess { .. } => return None,
+            ExprKind::AssignmentPattern(_) | ExprKind::MemberAccess { .. } => return None,
+            // §10.10.3: nested braces are a self-determined concatenation
+            // evaluated as one element, just like other scalar expressions.
             _ => rhs_elems.push(item.clone()),
         }
     }
@@ -757,14 +756,12 @@ fn make_multi_index_expr(name: &str, idx: &[i64]) -> Expression {
 }
 
 /// Pure expansion of a whole-array, slice, or concat unpacked-array continuous
-/// assign into element assignments, preserving any runtime delay expressions.
+/// assign into element assignments, preserving all driver metadata.
 pub(super) fn expanded_array_assign_parts(
-    lhs: &Expression,
-    rhs: &Expression,
-    delay: u64,
-    delay_exprs: Option<&DelayExpressions>,
+    driver: &ContinuousAssignment,
     elab: &ElaboratedModule,
 ) -> Option<Vec<ContinuousAssignment>> {
+    let (lhs, rhs, delay) = (&driver.lhs, &driver.rhs, driver.delay);
     let mut parts = elab
         .whole_array_driver_parts(lhs, rhs, delay, &elab.unpacked_decl_dims)
         .or_else(|| {
@@ -781,10 +778,8 @@ pub(super) fn expanded_array_assign_parts(
         .or_else(|| {
             elab.with_unpacked_array_tables(|t| concat_array_assign_parts(lhs, rhs, delay, t))
         })?;
-    if let Some(de) = delay_exprs {
-        for part in &mut parts {
-            part.set_delay_exprs(Some(de.clone()));
-        }
+    for part in &mut parts {
+        part.inherit_driver_metadata(driver);
     }
     Some(parts)
 }
@@ -792,13 +787,10 @@ pub(super) fn expanded_array_assign_parts(
 /// Push the expansion of a whole-array continuous assign, returning true when
 /// it consumed the assignment.
 pub(super) fn expand_whole_array_assign(
-    lhs: &Expression,
-    rhs: &Expression,
-    delay: u64,
-    delay_exprs: &Option<DelayExpressions>,
+    driver: &ContinuousAssignment,
     elab: &mut ElaboratedModule,
 ) -> bool {
-    match expanded_array_assign_parts(lhs, rhs, delay, delay_exprs.as_ref(), elab) {
+    match expanded_array_assign_parts(driver, elab) {
         Some(parts) => {
             elab.continuous_assigns.extend(parts);
             true

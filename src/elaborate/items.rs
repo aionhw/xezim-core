@@ -1050,19 +1050,20 @@ pub(super) fn elaborate_items(
                         &|n| elab.struct_members.contains_key(n),
                         &|n| elab.packages.contains(n),
                     );
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment::with_extras(
-                            lhs.clone(),
-                            rhs_final,
-                            delay,
-                            false,
-                            delay_fall,
-                            delay_off,
-                            None,
-                            delay_exprs.clone(),
-                            None,
-                            Some((ca.span, top_origin_scope())),
-                        ));
+                    let driver = ContinuousAssignment::with_extras(
+                        lhs.clone(),
+                        rhs_final,
+                        delay,
+                        false,
+                        delay_fall,
+                        delay_off,
+                        None,
+                        delay_exprs.clone(),
+                        None,
+                        Some((ca.span, top_origin_scope())),
+                    );
+                    if !expand_whole_array_assign(&driver, elab) {
+                        elab.continuous_assigns.push(driver);
                     }
                 }
             }

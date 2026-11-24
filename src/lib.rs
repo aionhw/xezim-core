@@ -303,14 +303,16 @@ pub use value::Value;
 ///         keeps a nettype declaration's delay (§6.6.7, §10.3.1, §10.3.3, §27.2), declares a
 ///         variable for a nettype name the module's own type hides (§26.5) and lowers tolerance
 ///         range bounds to `$__xz_tolerance` (§11.4.13).
-/// \x6D stores sparse SVA metadata (#721): `sequences` holds only bodyless sequence/property and
+/// \x6D preserves driver transitions for unpacked arrays, unit constant precedence, and
+///         the widths and visibility of scoped package constants (§10.3.3, §26.3).
+/// \x6E stores sparse SVA metadata (#721): `sequences` holds only bodyless sequence/property and
 ///         checker names (declarations with bodies live in `property_decls`), and
 ///         `property_params` omits portless declarations.
-/// \x6E boxes rare `ContinuousAssignment` origin and multi-delay metadata (#721) and encodes
+/// \x6F boxes rare `ContinuousAssignment` origin and multi-delay metadata (#721) and encodes
 ///         `HierarchicalIdentifier::root` as `HierRoot`.
-///   v111: compact `Span` (`u32`, `u32`), compact AST caches, and streaming
-///         pending-body serialization (aionhw/xezim#721).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x6F";
+/// \x70 compact `Span` (`u32`, `u32`), compact AST caches, and streaming pending-body
+///         serialization merged with upstream driver-transition and scope fixes (#721).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x70";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1512,7 +1514,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
             ],
         );
         let mut parser = sv_parser::parse::Parser::new(tokens);
-        let source_ast = parser.parse_source_text();
+        let mut source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
         drop(parser);
 
@@ -1630,6 +1632,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 ("preprocessed_bytes", preprocessed.len()),
             ],
         );
+        elaborate::lower_verilog_2005_initializers(source_path.as_deref(), &mut source_ast.descriptions);
         all_descriptions.extend(source_ast.descriptions);
         preprocessed_texts.push(preprocessed);
         line_maps.push(line_map);
@@ -3466,12 +3469,33 @@ fn parse_and_elaborate(
                 static PKG_SCOPE: std::cell::RefCell<Option<(String, crate::hasher::HashSet<String>)>> =
                     const { std::cell::RefCell::new(None) };
             }
+            // A package-qualified name can still be unavailable in this partial
+            // table. Defer the expression to typed elaboration (§6.18, §26.3)
+            // before an unknown operand becomes a literal typedef bound.
+            fn early_integer(expr: &ast::expr::Expression, table: &PTable) -> Option<i64> {
+                use ast::expr::ExprKind;
+                let mut bound = true;
+                elaborate::for_each_sub_expr(expr, &mut |node| match &node.kind {
+                    ExprKind::Ident(h) => {
+                        bound &= h.root.is_none()
+                            && matches!(h.path.as_slice(), [seg]
+                                if seg.selects.is_empty() && table.contains_key(&seg.name.name));
+                    }
+                    ExprKind::MemberAccess { .. } => bound = false,
+                    _ => {}
+                });
+                if bound {
+                    elaborate::const_eval_i64_with_params(expr, Some(table))
+                } else {
+                    None
+                }
+            }
             fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
                 if matches!(e.kind, ast::expr::ExprKind::Number(_)) {
                     return;
                 }
                 if !table.is_empty()
-                    && let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table))
+                    && let Some(v) = early_integer(e, table)
                     && v >= 0
                 {
                     *e = ast::expr::Expression::new(
@@ -3641,7 +3665,7 @@ fn parse_and_elaborate(
                         table.remove(&a.name.name);
                         if let Some(init) = &a.init {
                             if let Some(v) =
-                                elaborate::const_eval_i64_with_params(init, Some(table))
+                                early_integer(init, table)
                                 && holds_unchanged(data_type, v, table)
                             {
                                 let mut val = Value::from_u64(v as u64, 32);
@@ -4095,6 +4119,9 @@ fn parse_and_elaborate(
         }
     }
     elab_phase("inline instantiations", &mut phase_t);
+    // §26.3: a bare `$unit` enum member that a package also declares reads
+    // the `$unit` value at run time, not the last package registered.
+    elaborate::reassert_unit_enum_members(&mut elab);
     // Re-register any compilation-unit-scope CLASS whose name a module
     // clobbered in `definitions`/`def_refs` (§3.13 class/module name-space
     // coexistence). `inline_instantiations` could not see it because the
@@ -5029,7 +5056,7 @@ fn resolve_library_modules(
             eprintln!("{}", e);
         }
         let preprocessed_cleanly = pp.errors().is_empty();
-        let result = sv_parser::parse(&preprocessed);
+        let mut result = sv_parser::parse(&preprocessed);
         // Spans index the re-parsed text; it is the preprocessed text again
         // (nothing is left to expand), so the map applies to it.
         let line_map = line_map.filter(|_| result.source_text == preprocessed);
@@ -5134,6 +5161,7 @@ fn resolve_library_modules(
                 _ => None,
             })
             .collect();
+        elaborate::lower_verilog_2005_initializers(Some(&path), &mut result.source.descriptions);
         let file_index = lib_sources.files.len() as u32;
         let mut defined: Vec<String> = Vec::new();
         for desc in result.source.descriptions {

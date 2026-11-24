@@ -74,6 +74,9 @@ mod gates;
 mod gen_renames;
 mod generate;
 mod hier_names;
+mod legacy_initializers;
+pub use legacy_initializers::{set_verilog_2005_initializers, verilog_2005_initializers};
+pub(crate) use legacy_initializers::lower_verilog_2005_initializers;
 mod ident_checks;
 mod implicit_nets;
 mod imports;
@@ -880,6 +883,17 @@ impl ContinuousAssignment {
             self.prune_extras();
         }
         taken
+    }
+}
+
+impl ContinuousAssignment {
+    /// Keep the original driver context on each unpacked array element.
+    pub fn inherit_driver_metadata(&mut self, driver: &Self) {
+        self.set_delay_fall(driver.delay_fall());
+        self.set_delay_off(driver.delay_off());
+        self.set_delay_exprs(driver.delay_exprs().cloned());
+        self.set_origin(driver.origin().cloned());
+        self.rhs_parent_scoped = driver.rhs_parent_scoped;
     }
 }
 
@@ -2012,6 +2026,11 @@ pub struct ElaboratedModule {
     /// an explicit packed range (`output [7:0] x;`).
     #[serde(skip)]
     pub ranged_port_widths: HashMap<String, u32>,
+    /// Transient (§26.3, §6.19): the bare-name parameter and signal entries
+    /// of each `$unit` enum member that a package also declares, as the
+    /// `$unit` typedefs registered them (`reassert_unit_enum_members`).
+    #[serde(skip)]
+    pub unit_member_slots: Vec<(String, Value, Signal)>,
     /// Transient (§26.3): bare type entries `rebind_imported_typedefs` hid
     /// for the scope being prepared, because an import of that scope binds
     /// the name as a constant: name, width, type, unpacked dimensions and
@@ -2925,6 +2944,7 @@ impl ElaboratedModule {
             decl_sites: HashMap::default(),
             foreign_package_names: HashSet::default(),
             foreign_displaced: HashSet::default(),
+            unit_member_slots: Vec::new(),
             two_state_signals: Default::default(),
             z_init_signals: HashSet::default(),
             pending_always: Vec::new(),
@@ -3106,7 +3126,7 @@ impl ElaboratedModule {
             // needs the same per-element expansion — otherwise an array OUTPUT
             // PORT driven that way never propagates and the parent's array
             // stays x for the whole run.
-            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, &ca.delay_exprs().cloned(), self) {
+            if !expand_whole_array_assign(&ca, self) {
                 self.continuous_assigns.push(ca);
             }
         }
@@ -3157,7 +3177,8 @@ impl ElaboratedModule {
                 })
             }) {
                 Some(parts) => {
-                    for e in parts {
+                    for mut e in parts {
+                        e.inherit_driver_metadata(&ca);
                         f(e);
                     }
                 }

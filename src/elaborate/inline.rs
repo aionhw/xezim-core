@@ -330,17 +330,6 @@ fn inline_instantiations_inner(
                         .copied()
                         .unwrap_or(32)
                         .max(1);
-                    // §6.19 wide base: the (u64, width) table truncates past
-                    // 64 bits, so ALSO park the full Value under the
-                    // qualified spelling in `parameters` — the runtime's
-                    // qualified lookup consults it first for wide members.
-                    if w > 64 {
-                        if let DataType::Enum(et) = &td.data_type {
-                            for (m, v) in wide_enum_value_map(et, w, &elab.parameters) {
-                                elab.set_param(line!(), format!("{}::{}", name, m), v);
-                            }
-                        }
-                    }
                     let slot = elab.package_enum_members.entry(name.clone()).or_default();
                     for (m, v) in members {
                         slot.insert(m, (v, w));

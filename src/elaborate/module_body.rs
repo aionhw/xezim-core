@@ -266,6 +266,19 @@ pub fn elaborate_module_with_defs(
         // wrong generate branch. Then the struct parameters themselves.
         hoist_package_params(defs, &mut elab);
         hoist_package_struct_params(defs, &mut elab);
+        // §6.19, §26.3: a `$unit` enum member initialized from a package
+        // parameter that this hoist has just settled (`A = p::K`, with
+        // `localparam int K = E;` and `E` a member of `p`'s enum) read the
+        // parameter's first-pass value, 0. Register the `$unit` enums once
+        // more, then record the entries of their members that a package also
+        // declares, which `reassert_unit_enum_members` puts back once
+        // instances are inlined.
+        for td in ordered_typedefs(defs) {
+            if matches!(td.data_type, DataType::Enum(_)) {
+                process_typedef(td, &mut elab);
+            }
+        }
+        elab.unit_member_slots = contested_unit_member_slots(defs, &elab);
     }
 
     crate::oom_trace::checkpoint("elaborate.global_definitions.ready", &[("functions", elab.functions.len())]);
@@ -1178,6 +1191,17 @@ pub fn elaborate_module_with_defs(
             };
             for assign in assignments {
                 let name = assign.name.name.as_str();
+                // A package's flattened constant can already occupy this
+                // slot. Seed the local value before any dependent bounds or
+                // generate conditions read it (§26.3).
+                if elab.local_decl_displaces(name)
+                    && !param_overrides.contains_key(name)
+                    && elab.parameters.contains_key(name)
+                {
+                    elab.remove_param(name);
+                    elab.signals.remove(name);
+                    elab.decl_sites.remove(name);
+                }
                 // Already bound => instantiation override; leave it alone.
                 if elab.parameters.contains_key(name) {
                     continue;
@@ -1250,7 +1274,7 @@ pub fn elaborate_module_with_defs(
                     .is_none()
             {
                 check_enum_member_duplicates(td, &elab)?;
-                process_typedef(td, &mut elab);
+                process_local_typedef(td, &mut elab);
             }
         }
     }
@@ -3931,7 +3955,7 @@ pub fn elaborate_module_with_defs(
                         )
                     });
                 }
-                process_typedef(td, &mut elab);
+                process_local_typedef(td, &mut elab);
             }
             ModuleItem::TimeunitsDecl(td) => {
                 if let Some(u) = &td.unit {
@@ -4231,19 +4255,20 @@ pub fn elaborate_module_with_defs(
                         &|n| elab.struct_members.contains_key(n),
                         &|n| elab.packages.contains(n),
                     );
-                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &delay_exprs, &mut elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment::with_extras(
-                            lhs.clone(),
-                            rhs_final,
-                            delay,
-                            false,
-                            delay_fall,
-                            delay_off,
-                            None,
-                            delay_exprs.clone(),
-                            None,
-                            Some((ca.span, top_origin_scope())),
-                        ));
+                    let driver = ContinuousAssignment::with_extras(
+                        lhs.clone(),
+                        rhs_final,
+                        delay,
+                        false,
+                        delay_fall,
+                        delay_off,
+                        None,
+                        delay_exprs.clone(),
+                        None,
+                        Some((ca.span, top_origin_scope())),
+                    );
+                    if !expand_whole_array_assign(&driver, &mut elab) {
+                        elab.continuous_assigns.push(driver);
                     }
                 }
             }

@@ -1655,13 +1655,7 @@ pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
                 })
             {
                 let ca = p.materialize(&elab.parameters);
-                if !expand_whole_array_assign(
-                    &ca.lhs,
-                    &ca.rhs,
-                    ca.delay,
-                    &ca.delay_exprs().cloned(),
-                    elab,
-                ) {
+                if !expand_whole_array_assign(&ca, elab) {
                     elab.continuous_assigns.push(ca);
                 }
             } else {

@@ -17,9 +17,8 @@ pub fn register_scoped_typedef_alias(
     // Members are hoisted under their bare name only (last package wins), so
     // `f_pkg::ADD` in a constant context — a declaration initializer, a
     // localparam, the inliner's spelling of a member two packages both
-    // declare — read `a_pkg::ADD`'s value. Members wider than 64 bits are
-    // parked by the inliner's package pass (`wide_enum_value_map`).
-    if matches!(td.data_type, DataType::Enum(_)) {
+    // declare — read `a_pkg::ADD`'s value.
+    if let DataType::Enum(et) = &td.data_type {
         if let Some(members) = elab.enum_members.get(&td.name.name).cloned() {
             // §18.3 / §26.3 (#862): qualified struct member types retain
             // their own enum domain when packages share a typedef name.
@@ -30,10 +29,24 @@ pub fn register_scoped_typedef_alias(
                 .copied()
                 .unwrap_or(32)
                 .max(1);
-            if w <= 64 {
-                for (m, v) in members {
-                    alias_pkg_param(elab, pkg, &m, &Value::from_u64(v, w));
-                }
+            let signed = is_type_signed_resolved(&td.data_type, &elab.typedef_types);
+            let mut displaced = None;
+            for (m, ordinal) in members {
+                // §6.19: preserve the typed member, including its X/Z bits.
+                // A displaced bare name belongs to the importing scope. Get
+                // that member from the enum declaration itself.
+                let bare = elab
+                    .parameters
+                    .get(&m)
+                    .filter(|_| !elab.local_decl_displaces(&m));
+                let mut value = bare.cloned().unwrap_or_else(|| {
+                    displaced
+                        .get_or_insert_with(|| wide_enum_value_map(et, w, &elab.parameters))
+                        .remove(&m)
+                        .unwrap_or_else(|| Value::from_u64(ordinal, w))
+                });
+                value.is_signed = signed;
+                alias_pkg_param(elab, pkg, &m, &value);
             }
         }
     }
@@ -429,6 +442,94 @@ pub(super) fn check_enum_member_duplicates(
     Ok(())
 }
 
+thread_local! {
+    /// True while `process_local_typedef` registers a typedef that the scope
+    /// being elaborated declares itself.
+    static LOCAL_TYPEDEF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `process_typedef` for a typedef the elaborated scope declares itself. Its
+/// enum members ARE the local declarations that `local_decl_displaces`
+/// names, so they are registered under their bare names; only a package's
+/// same-named members give way to them (§26.3, §6.19). Without this a
+/// module's own `typedef enum {.., EEW8} EEW_e;` registered no `EEW8` of its
+/// own when an un-imported package also declared one, and `EEW8` read the
+/// package's value.
+pub(super) fn process_local_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    let prev = LOCAL_TYPEDEF.with(|c| c.replace(true));
+    process_typedef(td, elab);
+    LOCAL_TYPEDEF.with(|c| c.set(prev));
+}
+
+/// §26.3, §3.12.1, §6.19: the bare-name entries of the `$unit` enum members
+/// that a package also declares, as the `$unit` enums just registered them.
+pub(super) fn contested_unit_member_slots(
+    defs: &HashMap<String, Definition>,
+    elab: &ElaboratedModule,
+) -> Vec<(String, Value, Signal)> {
+    if !crate::pkg_scope::any_member_qualified() {
+        return Vec::new();
+    }
+    let mut slots = Vec::new();
+    for td in ordered_typedefs(defs) {
+        let DataType::Enum(et) = &td.data_type else {
+            continue;
+        };
+        for member in &et.members {
+            for nm in enum_member_names(member, &elab.parameters) {
+                if !crate::pkg_scope::member_is_qualified(&nm) {
+                    continue;
+                }
+                if let (Some(v), Some(sig)) =
+                    (elab.parameters.get(&nm), elab.signals.get(nm.as_str()))
+                {
+                    slots.push((nm.clone(), v.clone(), sig.clone()));
+                }
+            }
+        }
+    }
+    slots
+}
+
+/// §26.3, §3.12.1, §6.19: put each `$unit` enum member that a package also
+/// declares back under its bare name once the design is elaborated.
+///
+/// Every package registers its enum members under their bare names,
+/// imported or not, and the last registration wins; the package
+/// registration that runs while instances are inlined comes after the
+/// `$unit` typedefs. `pkg_scope` has already spelled each run-time reference
+/// to a package's member `pkg::NAME` wherever the package's declaration is
+/// the one in scope, so a bare run-time reference that is left names the
+/// `$unit` member. Only those members' parameter and signal entries are put
+/// back, from `unit_member_slots`; the typedef tables, other members and a
+/// member the top module declares itself (which displaces the `$unit` one as
+/// it does a package's) are left as they are. Constant contexts were
+/// evaluated during elaboration and keep what they read then. Without this,
+/// the testbench package's `EEW8 = 8` replaced the RTL's `$unit` `EEW8 = 2`,
+/// which a 3-bit `EEW_e` truncates to `EEW_NONE`.
+pub fn reassert_unit_enum_members(elab: &mut ElaboratedModule) {
+    for (nm, v, sig) in std::mem::take(&mut elab.unit_member_slots) {
+        if elab.local_decl_displaces(&nm) {
+            continue;
+        }
+        elab.set_param(line!(), nm.clone(), v);
+        signals_insert_traced(&mut elab.signals, line!(), nm, sig);
+    }
+}
+
+/// The names one enum member declaration declares (`A[2]` declares `A0`,
+/// `A1`; §6.19).
+pub(super) fn enum_member_names(
+    member: &EnumMember,
+    params: &HashMap<String, Value>,
+) -> Vec<String> {
+    expand_enum_member(member, 0, params)
+        .0
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // A later package may reuse a bare typedef name with scalar geometry.
     // Do not carry an earlier declaration's packed element stride into it.
@@ -499,8 +600,10 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                 //
                 // The member still joins `members_ordered`, so it stays
                 // reachable the only way §26.3 allows once shadowed: qualified
-                // as `pkg::NAME`.
-                if elab.local_decl_displaces(&nm) {
+                // as `pkg::NAME`. A typedef of the scope itself
+                // (`process_local_typedef`) is that local declaration, so its
+                // members are registered.
+                if !LOCAL_TYPEDEF.with(|c| c.get()) && elab.local_decl_displaces(&nm) {
                     members_ordered.push((nm.clone(), val));
                     continue;
                 }

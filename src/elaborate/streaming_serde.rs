@@ -96,9 +96,7 @@ impl Serialize for StreamingContAssigns<'_> {
         for p in &elab.pending_cont_assign {
             if pending_ca_may_expand_array(p, elab) {
                 let ca = p.materialize_ref(&elab.parameters);
-                if let Some(parts) =
-                    expanded_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, ca.delay_exprs(), elab)
-                {
+                if let Some(parts) = expanded_array_assign_parts(&ca, elab) {
                     total += parts.len();
                     continue;
                 }
@@ -112,8 +110,7 @@ impl Serialize for StreamingContAssigns<'_> {
         for p in &elab.pending_cont_assign {
             let ca = p.materialize_ref(&elab.parameters);
             if pending_ca_may_expand_array(p, elab)
-                && let Some(parts) =
-                    expanded_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, ca.delay_exprs(), elab)
+                && let Some(parts) = expanded_array_assign_parts(&ca, elab)
             {
                 for part in &parts {
                     seq.serialize_element(part)?;
@@ -186,6 +183,7 @@ impl Serialize for ElaboratedModule {
             typed_decls: _,
             completed_ports: _,
             ranged_port_widths: _,
+            unit_member_slots: _,
             hidden_bare_types: _,
             wildcard_shadowed,
             port_order,
