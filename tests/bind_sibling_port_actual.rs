@@ -80,7 +80,7 @@ fn actual_for(m: &ElaboratedModule, port: &str) -> String {
         .port_aliases
         .iter()
         .find(|(k, _)| k.ends_with(port))
-        .map(|(_, v)| v.clone())
+        .map(|(_, v)| v.to_string())
     {
         hits.push(alias);
     }
@@ -99,7 +99,7 @@ fn unroot(actual: &str) -> &str {
 }
 
 fn instance_paths(m: &ElaboratedModule) -> Vec<String> {
-    m.instances.iter().map(|i| i.path.clone()).collect()
+    m.instances.iter().map(|i| i.path.to_string()).collect()
 }
 
 fn path_of(e: &Expression) -> String {
