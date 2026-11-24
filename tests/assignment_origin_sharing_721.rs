@@ -104,7 +104,10 @@ fn each_assignment_keeps_the_span_of_its_statement() {
     distinct.dedup();
     assert_eq!(distinct.len(), 4);
     // A net declaration assignment records its initializer.
-    let texts: Vec<&str> = distinct.iter().map(|(s, e)| &SRC[*s..*e]).collect();
+    let texts: Vec<&str> = distinct
+        .iter()
+        .map(|(s, e)| &SRC[*s as usize..*e as usize])
+        .collect();
     assert!(texts.contains(&"~pulse"), "{texts:?}");
     for text in texts.iter().filter(|t| **t != "~pulse") {
         assert!(text.starts_with("assign ") && text.contains('='), "{text}");

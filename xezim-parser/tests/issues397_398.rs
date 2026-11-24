@@ -47,10 +47,13 @@ fn unit_instances_remain_invalid_but_module_instances_parse() {
 
 fn assert_base_span(source: &str, expression: &Expression, target: &str) {
     let start = source.find(target).unwrap();
-    assert_eq!(&source[expression.span.start..expression.span.end], target);
+    assert_eq!(
+        &source[expression.span.start as usize..expression.span.end as usize],
+        target
+    );
     let mut node = expression;
     loop {
-        assert_eq!(node.span.start, start, "{target}: {node:?}");
+        assert_eq!(node.span.start as usize, start, "{target}: {node:?}");
         node = match &node.kind {
             ExprKind::MemberAccess { expr, .. }
             | ExprKind::Index { expr, .. }
@@ -119,7 +122,7 @@ fn macro_columns_cover_each_expansion_and_the_following_text() {
         for token in ["logic", "data"] {
             let start = text.find(token).unwrap();
             let location = map
-                .locate(&text, Span::new(start, start + token.len()))
+                .locate(&text, Span::from_usize(start, start + token.len()))
                 .unwrap();
             assert_eq!(location.line, 6, "{line}: {location:?}");
             assert_eq!(
@@ -142,7 +145,7 @@ fn each_macro_body_points_at_its_own_invocation() {
     for (body, name) in [("8", "W"), ("127", "BIG")] {
         let start = text.find(body).unwrap();
         let location = map
-            .locate(&text, Span::new(start, start + body.len()))
+            .locate(&text, Span::from_usize(start, start + body.len()))
             .unwrap();
         assert_eq!(location.line, 4);
         assert_eq!(
@@ -165,7 +168,7 @@ fn object_macros_keep_their_arguments_and_repeated_suffix_in_source() {
         let map = pp.take_line_map().unwrap();
         let start = text.rfind(token).unwrap();
         let location = map
-            .locate(&text, Span::new(start, start + token.len()))
+            .locate(&text, Span::from_usize(start, start + token.len()))
             .unwrap();
         assert_eq!(location.line, 3);
         assert_eq!(

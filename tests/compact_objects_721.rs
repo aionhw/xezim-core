@@ -5,7 +5,11 @@ use std::mem::size_of;
 use xezim_core::{
     ElaboratedModule,
     ast::{
-        expr::{ExprKind, Expression, HierRoot, HierarchicalIdentifier},
+        Identifier, Span,
+        cache::{LiteralCache, NameCache, SignalCache, WidthCache},
+        expr::{
+            ExprKind, Expression, HierPathSegment, HierRoot, HierarchicalIdentifier, NumberLiteral,
+        },
         stmt::Statement,
     },
     elaborate::{ContinuousAssignment, ElabInstance, Signal, set_vpi_net_drivers, vpi_net_drivers},
@@ -26,27 +30,67 @@ fn elaborate(src: &str) -> ElaboratedModule {
 #[test]
 fn core_ast_and_elaboration_object_sizes_stay_compact() {
     assert!(
-        size_of::<HierarchicalIdentifier>() <= 80,
+        size_of::<Span>() <= 8,
+        "Span grew to {} B",
+        size_of::<Span>()
+    );
+    assert!(
+        size_of::<WidthCache>() <= 4,
+        "WidthCache grew to {} B",
+        size_of::<WidthCache>()
+    );
+    assert!(
+        size_of::<SignalCache>() <= 4,
+        "SignalCache grew to {} B",
+        size_of::<SignalCache>()
+    );
+    assert!(
+        size_of::<NameCache>() <= 16,
+        "NameCache grew to {} B",
+        size_of::<NameCache>()
+    );
+    assert!(
+        size_of::<LiteralCache>() <= 16,
+        "LiteralCache grew to {} B",
+        size_of::<LiteralCache>()
+    );
+    assert!(
+        size_of::<Identifier>() <= 32,
+        "Identifier grew to {} B",
+        size_of::<Identifier>()
+    );
+    assert!(
+        size_of::<HierPathSegment>() <= 56,
+        "HierPathSegment grew to {} B",
+        size_of::<HierPathSegment>()
+    );
+    assert!(
+        size_of::<NumberLiteral>() <= 56,
+        "NumberLiteral grew to {} B",
+        size_of::<NumberLiteral>()
+    );
+    assert!(
+        size_of::<HierarchicalIdentifier>() <= 64,
         "HierarchicalIdentifier grew to {} B",
         size_of::<HierarchicalIdentifier>()
     );
     assert!(
-        size_of::<ExprKind>() <= 80,
+        size_of::<ExprKind>() <= 64,
         "ExprKind grew to {} B",
         size_of::<ExprKind>()
     );
     assert!(
-        size_of::<Expression>() <= 104,
+        size_of::<Expression>() <= 80,
         "Expression grew to {} B",
         size_of::<Expression>()
     );
     assert!(
-        size_of::<Statement>() <= 240,
+        size_of::<Statement>() <= 192,
         "Statement grew to {} B",
         size_of::<Statement>()
     );
     assert!(
-        size_of::<ContinuousAssignment>() <= 232,
+        size_of::<ContinuousAssignment>() <= 184,
         "ContinuousAssignment grew to {} B",
         size_of::<ContinuousAssignment>()
     );
@@ -203,4 +247,76 @@ endmodule
         m.signals.keys().any(|k| k.contains("$vpidrv")),
         "expected a $vpidrv stage signal for complex net driver"
     );
+}
+
+#[test]
+fn streaming_serialize_matches_materialized_bincode_byte_for_byte() {
+    let src = r#"
+module leaf(input logic [7:0] a, output logic [7:0] y);
+  logic [7:0] r;
+  logic [7:0] src_arr [0:1];
+  logic [7:0] dst_arr [0:1];
+  function automatic logic [7:0] bump(input logic [7:0] x);
+    return x + r;
+  endfunction
+  task automatic poke(input logic [7:0] v);
+    r = v;
+  endtask
+  assign y = bump(a);
+  assign dst_arr = src_arr;
+  always @* r = a;
+  initial poke(8'h5a);
+endmodule
+module top;
+  logic [7:0] a0, a1, y0, y1;
+  leaf u0(.a(a0), .y(y0));
+  leaf u1(.a(a1), .y(y1));
+endmodule
+"#;
+    let mut m = elaborate(src);
+    assert!(!m.pending_always.is_empty(), "expected lazy pending_always");
+    assert!(
+        !m.pending_initial.is_empty(),
+        "expected lazy pending_initial"
+    );
+    assert!(
+        !m.pending_cont_assign.is_empty(),
+        "expected lazy pending_cont_assign"
+    );
+    assert!(
+        !m.deferred_function_bodies.is_empty(),
+        "expected lazy deferred_function_bodies"
+    );
+    assert!(
+        !m.deferred_task_bodies.is_empty(),
+        "expected lazy deferred_task_bodies"
+    );
+
+    let cfg = xezim_core::xez_bincode_config();
+    let streamed = bincode::serde::encode_to_vec(&m, cfg).expect("stream serialize lazy elab");
+    // Streaming serialization must not mutate or eagerly materialize `m`.
+    assert!(!m.pending_always.is_empty());
+    assert!(!m.pending_cont_assign.is_empty());
+
+    m.materialize_pending();
+    assert!(m.pending_always.is_empty());
+    assert!(m.pending_initial.is_empty());
+    assert!(m.pending_cont_assign.is_empty());
+    assert!(m.deferred_function_bodies.is_empty());
+    assert!(m.deferred_task_bodies.is_empty());
+
+    let eager = bincode::serde::encode_to_vec(&m, cfg).expect("serialize materialized elab");
+    assert_eq!(
+        streamed, eager,
+        "streaming ElaboratedModule serialization must match materialized output byte-for-byte"
+    );
+
+    let mut cursor = std::io::Cursor::new(&streamed);
+    let decoded: ElaboratedModule =
+        bincode::serde::decode_from_std_read(&mut cursor, cfg).expect("decode streamed elab");
+    assert_eq!(decoded.always_blocks.len(), m.always_blocks.len());
+    assert_eq!(decoded.initial_blocks.len(), m.initial_blocks.len());
+    assert_eq!(decoded.continuous_assigns.len(), m.continuous_assigns.len());
+    assert_eq!(decoded.functions.len(), m.functions.len());
+    assert_eq!(decoded.tasks.len(), m.tasks.len());
 }

@@ -58,7 +58,7 @@ fn multi_chunk_stream_exact_capacity_and_iteration() {
 fn escaped_identifiers_based_literals_and_spaced_casts() {
     let src = "\\my-id \\a.b 2 'd 1 12 'sh 3 {2\n  'd1} (w) ' (v)";
     let tokens = Lexer::new(src).tokenize();
-    let pairs: Vec<(TokenKind, String, (usize, usize))> = tokens
+    let pairs: Vec<(TokenKind, String, (u32, u32))> = tokens
         .iter()
         .filter(|t| t.kind != TokenKind::Eof)
         .map(|t| {
@@ -91,7 +91,10 @@ fn begin_keywords_directive_text_and_span() {
     assert_eq!(dir.kind, TokenKind::Directive);
     assert_eq!(tokens.text(dir), "`begin_keywords");
     let dir_sp = tokens.span(dir);
-    assert_eq!(&src[dir_sp.start..dir_sp.end], "`begin_keywords \"1364-2001\"");
+    assert_eq!(
+        &src[dir_sp.start as usize..dir_sp.end as usize],
+        "`begin_keywords \"1364-2001\""
+    );
 
     assert_eq!(tokens[1].kind, TokenKind::KwReg);
     assert_eq!(tokens[2].kind, TokenKind::Identifier);
@@ -148,7 +151,7 @@ fn non_ascii_unknown_and_trailing_backslash_unclosed_string() {
         .iter()
         .find(|t| t.kind == TokenKind::StringLiteral)
         .expect("string literal");
-    assert_eq!(tokens2.span(str_tok).end, trailing_bs.len());
+    assert_eq!(tokens2.span(str_tok).end as usize, trailing_bs.len());
     assert_eq!(tokens2.text(str_tok), "\"abc\\");
 }
 

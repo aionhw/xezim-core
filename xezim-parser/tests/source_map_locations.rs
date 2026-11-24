@@ -45,7 +45,7 @@ fn locate_token(path: &str, needle: &str) -> String {
     let at = text
         .find(needle)
         .unwrap_or_else(|| panic!("{needle:?} not in:\n{text}"));
-    map.location_string(&text, Span::new(at, at + needle.len()))
+    map.location_string(&text, Span::from_usize(at, at + needle.len()))
         .expect("mapped")
 }
 
@@ -247,7 +247,7 @@ endmodule
     let mut off = 0;
     for line in text.split_inclusive('\n') {
         assert!(
-            map.locate(&text, Span::new(off, off)).is_some(),
+            map.locate(&text, Span::from_usize(off, off)).is_some(),
             "unmapped line at {off}:\n{text}"
         );
         off += line.len();

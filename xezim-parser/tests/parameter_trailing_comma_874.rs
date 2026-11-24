@@ -21,7 +21,7 @@ fn rejected(source: &str) {
             )
         });
     assert_eq!(
-        source.get(diagnostic.span.start..diagnostic.span.end),
+        source.get(diagnostic.span.start as usize..diagnostic.span.end as usize),
         Some(","),
         "the diagnostic must identify the separator: {source}"
     );
