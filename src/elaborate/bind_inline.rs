@@ -612,6 +612,91 @@ pub(super) fn create_target_implicit_nets(
     iprof_since("implicit_net_scan", __ta);
 }
 
+/// §23.11: register the instances a `bind` creates as child names of its
+/// target's scope.
+///
+/// `prepare_module_items` makes every child instance name a LOCAL name of the
+/// module that declares it (§23.6), and the inlining rewrite prefixes a local
+/// head with the instance path (`expr_rewrite`'s `local_names` arm). A bind
+/// adds its instances after the target's body was prepared, so their names were
+/// missing from that set: a bound port actual naming a SIBLING bound instance —
+/// `bind tb.dut mon u_mon(); bind tb.dut leaf u(.v(u_mon.arr[0]));` — was left
+/// unprefixed, and once the actual was rooted it named a phantom top-level
+/// `u_mon` instead of `dut.u_mon`. The connection then drove the formal from a
+/// signal nothing writes, and the port kept its x. A whole-net actual hid this
+/// (`port_aliases` folds the leftover name away), which is why only the
+/// select / array-element form showed.
+///
+/// Mirrors the child-instance arm of `prepare_module_items`, including the
+/// instance-array base name (`m[0]` is referenced as `m[0]`, whose head segment
+/// is the array name `m`).
+fn register_bound_instance_names<S: std::hash::BuildHasher>(
+    bound: &[ModuleItem],
+    local_names: &mut std::collections::HashSet<String, S>,
+) {
+    for item in bound {
+        let ModuleItem::ModuleInstantiation(mi) = item else {
+            continue;
+        };
+        for hi in &mi.instances {
+            if local_names.contains(&hi.name.name) {
+                continue;
+            }
+            local_names.insert(hi.name.name.clone());
+            if let Some((base, _)) = hi.name.name.split_once('[') {
+                local_names.insert(base.to_string());
+            }
+        }
+    }
+}
+
+/// The same, over the `Rc` the target scope keeps: the shared set is copied only
+/// when a name is actually missing, so a design whose binds add nothing new pays
+/// nothing.
+fn add_bound_instance_names<S: std::hash::BuildHasher + Clone>(
+    bound: &[ModuleItem],
+    local_names: &mut Rc<std::collections::HashSet<String, S>>,
+) {
+    let novel = bound.iter().any(|item| match item {
+        ModuleItem::ModuleInstantiation(mi) => mi
+            .instances
+            .iter()
+            .any(|hi| !local_names.contains(&hi.name.name)),
+        _ => false,
+    });
+    if !novel {
+        return;
+    }
+    register_bound_instance_names(bound, Rc::make_mut(local_names));
+}
+
+/// §23.11 / §23.8: record the bound instances as children of the target scope
+/// BEFORE any of them is inlined.
+///
+/// A bound connection that names a sibling bound instance (`u_mon.arr[0]`) is
+/// resolved by the upward scope search (`upward_scope_rewrite`), which walks the
+/// ancestor scopes of the instance being inlined looking for a child of that
+/// name. Children are recorded by `add_instance` as they are inlined, and the
+/// bound ones are appended after the written items, so a bound instance inlined
+/// before its sibling never finds it: the name is left for the runtime, which
+/// roots it at `$root` and reads `x`. Registering the whole set up front makes
+/// the bound instances visible to each other exactly as written instances are.
+fn register_bound_instance_scopes(elab: &mut ElaboratedModule, prefix: &str, items: &[ModuleItem]) {
+    let parent = prefix.trim_end_matches('.');
+    for item in items {
+        if let ModuleItem::ModuleInstantiation(mi) = item {
+            for hi in &mi.instances {
+                let path = format!("{prefix}{}", hi.name.name);
+                let mut scopes = elab.upward_scopes.borrow_mut();
+                if scopes.child_named(parent, &hi.name.name).is_some() {
+                    continue; // already recorded, by `add_parent` or by us
+                }
+                scopes.add_instance(parent, &path, &mi.module_name.name);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inline_bound_items(
     elab: &mut ElaboratedModule,
@@ -746,7 +831,6 @@ pub(super) fn inline_bound_items(
 
     let mut bound: Vec<ModuleItem> = directives
         .iter()
-        .rev()
         .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
         .collect();
     let has_arrays = has_instance_arrays(&bound);
@@ -794,6 +878,16 @@ pub(super) fn inline_bound_items(
         }
         create_target_implicit_nets(elab, source_def, &prefix, cands);
     }
+    // §23.11: the bound instances are children of THIS scope, so their names must
+    // be local names of it before any of them is inlined — a bound connection
+    // that names a sibling bound instance is rewritten through this set.
+    add_bound_instance_names(
+        &bound,
+        scope
+            .local_names
+            .get_or_insert_with(|| Rc::new(std::collections::HashSet::default())),
+    );
+    register_bound_instance_scopes(elab, &prefix, &bound);
 
     register_modport_expressions(&bound, &prefix, definitions);
     let mut sibling_inst_names: std::collections::HashSet<String> = {
@@ -1048,7 +1142,6 @@ pub(super) fn inline_module_items(
         let prepared = Rc::make_mut(&mut prepared_source);
         let mut bound: Vec<ModuleItem> = binds
             .iter()
-            .rev()
             .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
             .collect();
         // §23.11, §23.3.2: a bound array of instances is expanded like one
@@ -1077,6 +1170,12 @@ pub(super) fn inline_module_items(
         if !cands.is_empty() {
             Rc::make_mut(&mut prepared.local_names).extend(cands);
         }
+        // §23.11: the bound instances are children of this scope, so their names
+        // must be local names of it before any of them is inlined — a bound
+        // connection that names a sibling bound instance is rewritten through
+        // this set (see `register_bound_instance_names`).
+        add_bound_instance_names(&bound, &mut prepared.local_names);
+        register_bound_instance_scopes(elab, prefix, &bound);
         prepared.effective_items.extend(bound);
     }
     // §23.10: names of THIS module's own sub-instances. A port connection
