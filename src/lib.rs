@@ -5013,6 +5013,10 @@ fn resolve_library_modules(
     // Per entry of `lib_sources.files`: its file, and whether it preprocessed
     // without errors (see `preprocess_adopted_lib`).
     let mut indexed: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    fn library_unit_name(file: u32) -> String {
+        format!("$__xz_lib_unit_{file}")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn index_library_file(
         path: std::path::PathBuf,
@@ -5145,54 +5149,108 @@ fn resolve_library_modules(
             }
             parse_issue_files.push(path.clone());
         }
-        // §3.12.1 / §33.3: a library file is its own compilation unit, so a
-        // subroutine declared at ITS top level (typically an `include`d
-        // simulation-helper header) is visible, unqualified, to every module
-        // in that file. The primary-file path injects `$unit` subroutines into
-        // every module; mirror that here for the file's own modules — before
-        // this they were dropped on adoption, and a call to one was reported
-        // as an undeclared identifier.
-        let unit_subs: Vec<ast::decl::ModuleItem> = result
-            .source
-            .descriptions
-            .iter()
-            .filter_map(|d| match d {
-                ast::Description::PackageItem(ast::decl::PackageItem::Function(f)) => {
-                    Some(ast::decl::ModuleItem::FunctionDeclaration(f.clone()))
-                }
-                ast::Description::PackageItem(ast::decl::PackageItem::Task(t)) => {
-                    Some(ast::decl::ModuleItem::TaskDeclaration(t.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        elaborate::lower_verilog_2005_initializers(Some(&path), &mut result.source.descriptions);
+        // §3.12.1: a library file has its own compilation unit. Put its
+        // types and constants in a private scope, then import it into the
+        // definitions from that file so ANSI ports and bodies see the same
+        // declarations. Only adoption publishes the scope.
         let file_index = lib_sources.files.len() as u32;
+        let has_unit_types = result.source.descriptions.iter().any(|desc| {
+            matches!(desc,
+                ast::Description::TypedefDecl(_)
+                    | ast::Description::PackageItem(
+                        ast::decl::PackageItem::Typedef(_) | ast::decl::PackageItem::Parameter(_)
+                    ))
+        });
+        let unit_subroutines = || -> Vec<ast::decl::ModuleItem> {
+            result
+                .source
+                .descriptions
+                .iter()
+                .filter_map(|desc| match desc {
+                    ast::Description::PackageItem(ast::decl::PackageItem::Function(f)) => {
+                        Some(ast::decl::ModuleItem::FunctionDeclaration(f.clone()))
+                    }
+                    ast::Description::PackageItem(ast::decl::PackageItem::Task(t)) => {
+                        Some(ast::decl::ModuleItem::TaskDeclaration(t.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut unit_package = None;
+        let unit_items = if has_unit_types {
+            use ast::decl::{ImportDeclaration, ImportItem, ModuleItem, PackageItem};
+            let span = ast::Span::dummy();
+            let name = ast::Identifier {
+                name: library_unit_name(file_index),
+                span,
+            };
+            let items = result
+                .source
+                .descriptions
+                .iter()
+                .filter_map(|desc| match desc {
+                    ast::Description::TypedefDecl(td) => Some(PackageItem::Typedef(td.clone())),
+                    ast::Description::ImportDecl(import) => Some(PackageItem::Import(import.clone())),
+                    ast::Description::PackageItem(
+                        item @ (PackageItem::Typedef(_)
+                        | PackageItem::Parameter(_)
+                        | PackageItem::Function(_)
+                        | PackageItem::Task(_)
+                        | PackageItem::Import(_)),
+                    ) => Some(item.clone()),
+                    _ => None,
+                })
+                .collect();
+            unit_package = Some(ast::module::PackageDeclaration {
+                attrs: vec![],
+                lifetime: None,
+                name: name.clone(),
+                items,
+                endlabel: None,
+                span,
+            });
+            vec![ModuleItem::ImportDeclaration(ImportDeclaration {
+                items: vec![ImportItem {
+                    package: name,
+                    item: None,
+                    span,
+                }],
+                span,
+            })]
+        } else {
+            unit_subroutines()
+        };
+        elaborate::lower_verilog_2005_initializers(Some(&path), &mut result.source.descriptions);
         let mut defined: Vec<String> = Vec::new();
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(mut m) => {
                     let name = m.name.name.clone();
                     if !lib.contains_key(&name) {
-                        for sub in unit_subs.iter().rev() {
-                            m.items.insert(0, sub.clone());
-                        }
+                        m.items.splice(..0, unit_items.iter().cloned());
                         lib.insert(name.clone(), SourceDefinition::Module(Rc::new(m)));
                         defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "module"));
                     }
                 }
-                ast::Description::Interface(i) => {
+                ast::Description::Interface(mut i) => {
                     let name = i.name.name.clone();
                     if !lib.contains_key(&name) {
+                        if has_unit_types {
+                            i.items.splice(..0, unit_items.iter().cloned());
+                        }
                         lib.insert(name.clone(), SourceDefinition::Interface(Rc::new(i)));
                         defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "interface"));
                     }
                 }
-                ast::Description::Program(p) => {
+                ast::Description::Program(mut p) => {
                     let name = p.name.name.clone();
                     if !lib.contains_key(&name) {
+                        if has_unit_types {
+                            p.items.splice(..0, unit_items.iter().cloned());
+                        }
                         lib.insert(name.clone(), SourceDefinition::Program(Rc::new(p)));
                         defined.push(name.clone());
                         lib_origins.insert(name, (path.clone(), explicit_v, "program"));
@@ -5235,6 +5293,11 @@ fn resolve_library_modules(
             }
         }
         if !defined.is_empty() {
+            if let Some(package) = unit_package {
+                let name = package.name.name.clone();
+                lib.insert(name.clone(), SourceDefinition::Package(Rc::new(package)));
+                defined.push(name);
+            }
             for name in defined {
                 lib_sources.def_file.insert(name, file_index);
             }
@@ -5386,6 +5449,16 @@ fn resolve_library_modules(
             instantiations(def, &mut more);
             let mut more: Vec<String> = more.into_iter().collect();
             more.sort_unstable_by(|a, b| b.cmp(a));
+            if let Some(&file) = lib_sources.def_file.get(&name) {
+                let unit = library_unit_name(file);
+                if let Some(decl @ SourceDefinition::Package(_)) = lib.get(&unit)
+                    && adopted.insert(unit.clone())
+                {
+                    let mut decl = decl.clone();
+                    scope_tree::adopt(&mut decl);
+                    definitions.insert(unit, decl);
+                }
+            }
             let mut def = def.clone();
             scope_tree::adopt(&mut def);
             definitions.insert(name.clone(), def);

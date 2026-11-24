@@ -32,7 +32,7 @@ pub fn audit_enabled() -> bool {
 }
 
 /// What a name resolves to beyond the current definition's tree.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DesignNames {
     /// §26.2: names each package declares, and the packages it exports from.
     packages: HashMap<String, HashSet<String>>,
@@ -54,7 +54,7 @@ pub struct DesignNames {
     tops: HashSet<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ClassNames {
     base: Option<String>,
     members: HashSet<String>,
@@ -91,29 +91,7 @@ impl DesignNames {
             };
             n.definitions.extend(def.map(|i| i.name.clone()));
             match d {
-                Description::Package(p) => {
-                    let mut names = HashSet::default();
-                    let mut exports = Vec::new();
-                    let mut imports = Vec::new();
-                    for item in &p.items {
-                        if let PackageItem::Import(i) = item {
-                            imports.extend(i.items.iter().map(|it| it.package.name.clone()));
-                        }
-                        if let PackageItem::Export(e) = item {
-                            exports.extend(e.items.iter().map(|i| {
-                                (
-                                    i.package.name.clone(),
-                                    i.item.as_ref().map(|n| n.name.clone()),
-                                )
-                            }));
-                        }
-                        package_item_names(item, &mut names);
-                        n.classes_in_package_item(item);
-                    }
-                    n.packages.insert(p.name.name.clone(), names);
-                    n.exports.insert(p.name.name.clone(), exports);
-                    n.imports.insert(p.name.name.clone(), imports);
-                }
+                Description::Package(p) => n.register_package(p),
                 Description::Module(m) => n.classes_in_items(&m.items),
                 Description::Interface(m) => n.classes_in_items(&m.items),
                 Description::Program(m) => n.classes_in_items(&m.items),
@@ -141,6 +119,31 @@ impl DesignNames {
             }
         }
         n
+    }
+
+    pub(crate) fn register_package(&mut self, p: &crate::ast::module::PackageDeclaration) {
+        self.definitions.insert(p.name.name.clone());
+        let mut names = HashSet::default();
+        let mut exports = Vec::new();
+        let mut imports = Vec::new();
+        for item in &p.items {
+            if let PackageItem::Import(i) = item {
+                imports.extend(i.items.iter().map(|it| it.package.name.clone()));
+            }
+            if let PackageItem::Export(e) = item {
+                exports.extend(e.items.iter().map(|i| {
+                    (
+                        i.package.name.clone(),
+                        i.item.as_ref().map(|n| n.name.clone()),
+                    )
+                }));
+            }
+            package_item_names(item, &mut names);
+            self.classes_in_package_item(item);
+        }
+        self.packages.insert(p.name.name.clone(), names);
+        self.exports.insert(p.name.name.clone(), exports);
+        self.imports.insert(p.name.name.clone(), imports);
     }
 
     fn unit_import(&mut self, i: &ImportDeclaration) {
