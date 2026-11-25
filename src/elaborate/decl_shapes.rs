@@ -85,7 +85,7 @@ impl DeclShapeDataType {
         }
     }
 
-    fn into_data_type(self) -> DataType {
+    fn to_data_type(&self) -> DataType {
         match self {
             Self::IntegerVector {
                 kind,
@@ -93,39 +93,42 @@ impl DeclShapeDataType {
                 dimensions,
                 span,
             } => DataType::IntegerVector {
-                kind,
-                signing,
-                dimensions,
-                span,
+                kind: *kind,
+                signing: *signing,
+                dimensions: dimensions.clone(),
+                span: *span,
             },
             Self::IntegerAtom {
                 kind,
                 signing,
                 span,
             } => DataType::IntegerAtom {
-                kind,
-                signing,
-                span,
+                kind: *kind,
+                signing: *signing,
+                span: *span,
             },
-            Self::Real { kind, span } => DataType::Real { kind, span },
+            Self::Real { kind, span } => DataType::Real {
+                kind: *kind,
+                span: *span,
+            },
             Self::Implicit {
                 signing,
                 dimensions,
                 span,
             } => DataType::Implicit {
-                signing,
-                dimensions,
-                span,
+                signing: *signing,
+                dimensions: dimensions.clone(),
+                span: *span,
             },
-            Self::Other(dt) => *dt,
+            Self::Other(dt) => (**dt).clone(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct StoredDeclShape {
-    data_type: DeclShapeDataType,
-    unpacked: Vec<UnpackedDimension>,
+    data_type: std::rc::Rc<DeclShapeDataType>,
+    unpacked: Option<Box<Vec<UnpackedDimension>>>,
     by_type_param: bool,
     param: bool,
 }
@@ -137,9 +140,23 @@ impl StoredDeclShape {
         by_type_param: bool,
         param: bool,
     ) -> Self {
+        Self::with_shared(
+            std::rc::Rc::new(DeclShapeDataType::new(dt)),
+            unpacked,
+            by_type_param,
+            param,
+        )
+    }
+
+    fn with_shared(
+        data_type: std::rc::Rc<DeclShapeDataType>,
+        unpacked: &[UnpackedDimension],
+        by_type_param: bool,
+        param: bool,
+    ) -> Self {
         Self {
-            data_type: DeclShapeDataType::new(dt),
-            unpacked: unpacked.to_vec(),
+            data_type,
+            unpacked: (!unpacked.is_empty()).then(|| Box::new(unpacked.to_vec())),
             by_type_param,
             param,
         }
@@ -147,8 +164,8 @@ impl StoredDeclShape {
 
     fn into_decl_shape(self) -> DeclShape {
         DeclShape {
-            data_type: self.data_type.into_data_type(),
-            unpacked: self.unpacked,
+            data_type: self.data_type.to_data_type(),
+            unpacked: self.unpacked.map_or_else(Vec::new, |u| *u),
             by_type_param: self.by_type_param,
             param: self.param,
         }
@@ -204,7 +221,11 @@ mod decl_shape_storage_tests {
             assert!(!shape.by_type_param);
             assert!(!shape.param);
         }
-        assert!(std::mem::size_of::<StoredDeclShape>() < std::mem::size_of::<DeclShape>());
+        assert!(
+            std::mem::size_of::<StoredDeclShape>() <= 24,
+            "StoredDeclShape grew to {} B",
+            std::mem::size_of::<StoredDeclShape>()
+        );
     }
 
     #[test]
@@ -665,6 +686,10 @@ fn decl_shape_is_fixed(dt: &DataType, dims: &[UnpackedDimension]) -> bool {
     )
 }
 
+pub(super) fn clear_decl_shapes_cache() {
+    DECL_SHAPES_CACHE.with(|c| *c.borrow_mut() = HashMap::default());
+}
+
 /// Install the declared shapes of a module's ports and body declarations for
 /// the lifetime of the returned guard. The table depends only on the
 /// definition's source, so it is built once per definition per design (the
@@ -779,28 +804,42 @@ fn collect_decl_shapes(
         }
     }
     // A non-ANSI port is declared twice (direction, then type); the first
-    // spelling that carries the shape wins.
-    let mut add_decl = |dt: &DataType, name: &Identifier, dims: &[UnpackedDimension]| {
-        if decl_shape_is_fixed(dt, dims) {
-            m.entry(name.name.clone())
-                .or_insert_with(|| StoredDeclShape::new(dt, dims, by_type_param(dt), false));
+    // spelling that carries the shape wins. Share one `Rc<DeclShapeDataType>`
+    // across all declarators of a single declaration statement (#721).
+    let mut add_decl = |dt: &DataType,
+                        shared: &mut Option<std::rc::Rc<DeclShapeDataType>>,
+                        btp: bool,
+                        name: &Identifier,
+                        dims: &[UnpackedDimension]| {
+        if decl_shape_is_fixed(dt, dims) && !m.contains_key(&name.name) {
+            let s = shared.get_or_insert_with(|| std::rc::Rc::new(DeclShapeDataType::new(dt)));
+            m.insert(
+                name.name.clone(),
+                StoredDeclShape::with_shared(std::rc::Rc::clone(s), dims, btp, false),
+            );
         }
     };
     for item in scope_items(items) {
         match item {
-            ModuleItem::DataDeclaration(dd) => {
+            ModuleItem::DataDeclaration(dd) if decl_shape_is_fixed(&dd.data_type, &[]) => {
+                let mut shared = None;
+                let btp = by_type_param(&dd.data_type);
                 for d in &dd.declarators {
-                    add_decl(&dd.data_type, &d.name, &d.dimensions);
+                    add_decl(&dd.data_type, &mut shared, btp, &d.name, &d.dimensions);
                 }
             }
-            ModuleItem::NetDeclaration(nd) => {
+            ModuleItem::NetDeclaration(nd) if decl_shape_is_fixed(&nd.data_type, &[]) => {
+                let mut shared = None;
+                let btp = by_type_param(&nd.data_type);
                 for d in &nd.declarators {
-                    add_decl(&nd.data_type, &d.name, &d.dimensions);
+                    add_decl(&nd.data_type, &mut shared, btp, &d.name, &d.dimensions);
                 }
             }
-            ModuleItem::PortDeclaration(pd) => {
+            ModuleItem::PortDeclaration(pd) if decl_shape_is_fixed(&pd.data_type, &[]) => {
+                let mut shared = None;
+                let btp = by_type_param(&pd.data_type);
                 for d in &pd.declarators {
-                    add_decl(&pd.data_type, &d.name, &d.dimensions);
+                    add_decl(&pd.data_type, &mut shared, btp, &d.name, &d.dimensions);
                 }
             }
             _ => {}
@@ -824,11 +863,16 @@ fn collect_decl_shapes(
         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
             continue;
         }
+        let mut shared: Option<std::rc::Rc<DeclShapeDataType>> = None;
+        let btp = by_type_param(data_type);
         for a in assignments {
-            if decl_shape_is_fixed(data_type, &a.dimensions) {
-                m.entry(a.name.name.clone()).or_insert_with(|| {
-                    StoredDeclShape::new(data_type, &a.dimensions, by_type_param(data_type), true)
-                });
+            if decl_shape_is_fixed(data_type, &a.dimensions) && !m.contains_key(&a.name.name) {
+                let s = shared
+                    .get_or_insert_with(|| std::rc::Rc::new(DeclShapeDataType::new(data_type)));
+                m.insert(
+                    a.name.name.clone(),
+                    StoredDeclShape::with_shared(std::rc::Rc::clone(s), &a.dimensions, btp, true),
+                );
             }
         }
     }

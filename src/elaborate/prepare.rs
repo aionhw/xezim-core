@@ -521,6 +521,267 @@ pub(super) fn ai_expand_instance_arrays(
     }
 }
 
+/// Lightweight root-module preparation for `inline_module_items` when
+/// `prefix.is_empty()`. The top module's own signals, assigns, and processes
+/// were already elaborated by `elaborate_module_with_defs`, and the top module
+/// is never instantiated again as a child, so it skips `body_sources`,
+/// `body_driven_ports`, `sampled_ports`, and `cache.prepared` — and borrows
+/// `source_def.items()` directly without cloning `ModuleItem`s when the top
+/// module has no generate constructs, instance arrays, or root binds (#721).
+pub(super) struct RootPreparedItems<'a> {
+    pub(super) interface_array_bounds: Vec<(String, (i64, i64))>,
+    pub(super) effective_items: std::borrow::Cow<'a, [ModuleItem]>,
+    pub(super) local_typedefs: std::collections::HashSet<String>,
+    pub(super) local_names: std::rc::Rc<std::collections::HashSet<String>>,
+}
+
+pub(super) fn prepare_root_module_items<'a>(
+    source_def: Definition<'a>,
+    definitions: &HashMap<String, Definition>,
+    local_params: &HashMap<String, Value>,
+    typedef_widths: &HashMap<String, u32>,
+    has_root_binds: bool,
+) -> RootPreparedItems<'a> {
+    let raw_items: &'a [ModuleItem] = match source_def {
+        Definition::Module(m) => &m.items,
+        Definition::Interface(i) => &i.items,
+        Definition::Program(p) => &p.items,
+        _ => &[],
+    };
+    let has_generates = raw_items.iter().any(|item| {
+        matches!(
+            item,
+            ModuleItem::GenerateRegion(_)
+                | ModuleItem::GenerateIf(_)
+                | ModuleItem::GenerateCase(_)
+                | ModuleItem::GenerateFor(_)
+        )
+    });
+    let mut interface_array_bounds = Vec::new();
+    let mut effective_items: std::borrow::Cow<'a, [ModuleItem]> =
+        if !has_generates && !has_instance_arrays(raw_items) && !has_root_binds {
+            std::borrow::Cow::Borrowed(raw_items)
+        } else {
+            let mut items = collect_effective_items(raw_items, local_params);
+            if has_instance_arrays(&items) {
+                for item in &items {
+                    if let ModuleItem::ModuleInstantiation(inst) = item
+                        && matches!(
+                            definitions.get(&inst.module_name.name),
+                            Some(Definition::Interface(_))
+                        )
+                    {
+                        for element in &inst.instances {
+                            if let Some(bounds) =
+                                declared_unpacked_dims(&element.dimensions, local_params)
+                                && let [dim] = bounds.as_slice()
+                            {
+                                interface_array_bounds.push((element.name.name.clone(), *dim));
+                            }
+                        }
+                    }
+                }
+                let shapes = ai_scope_shapes(&items, source_def, local_params, typedef_widths);
+                ai_expand_instance_arrays(
+                    &mut items,
+                    &shapes,
+                    definitions,
+                    local_params,
+                    typedef_widths,
+                );
+            }
+            std::borrow::Cow::Owned(items)
+        };
+
+    let local_typedefs: std::collections::HashSet<String> = effective_items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::TypedefDeclaration(td) => Some(td.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut local_names = std::collections::HashSet::default();
+    for p_decl in source_def.params() {
+        if let ParameterKind::Data { assignments, .. } = &p_decl.kind {
+            for assign in assignments {
+                local_names.insert(assign.name.name.clone());
+            }
+        }
+    }
+    match source_def.ports() {
+        PortList::Ansi(ports) => {
+            for port in ports {
+                local_names.insert(port.name.name.clone());
+            }
+        }
+        PortList::NonAnsi(names) => {
+            for name in names {
+                local_names.insert(name.name.clone());
+            }
+        }
+        PortList::Empty => {}
+    }
+    for item in effective_items.as_ref() {
+        match item {
+            ModuleItem::NetDeclaration(nd) => {
+                for decl in &nd.declarators {
+                    local_names.insert(decl.name.name.clone());
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for decl in &dd.declarators {
+                    local_names.insert(decl.name.name.clone());
+                }
+            }
+            ModuleItem::PortDeclaration(pd) => {
+                for decl in &pd.declarators {
+                    local_names.insert(decl.name.name.clone());
+                }
+            }
+            ModuleItem::FunctionDeclaration(fd) => {
+                local_names.insert(fd.name.name.name.clone());
+            }
+            ModuleItem::TaskDeclaration(td) => {
+                local_names.insert(td.name.name.name.clone());
+            }
+            ModuleItem::AlwaysConstruct(ac) => collect_block_labels(&ac.stmt, &mut local_names),
+            ModuleItem::InitialConstruct(ic) => collect_block_labels(&ic.stmt, &mut local_names),
+            ModuleItem::PropertyDeclaration(pd) => {
+                local_names.insert(pd.name.name.clone());
+            }
+            ModuleItem::ClockingDeclaration(cd) => {
+                local_names.insert(cd.name.name.clone());
+            }
+            ModuleItem::SequenceDeclaration(sd) => {
+                local_names.insert(sd.name.name.clone());
+            }
+            ModuleItem::TypedefDeclaration(td) => {
+                local_names.insert(td.name.name.clone());
+                if let DataType::Enum(et) = &td.data_type {
+                    for m in &et.members {
+                        local_names.insert(m.name.name.clone());
+                    }
+                }
+            }
+            ModuleItem::ModuleInstantiation(inst) => {
+                for hi in &inst.instances {
+                    local_names.insert(hi.name.name.clone());
+                    if let Some((base, _)) = hi.name.name.split_once('[') {
+                        local_names.insert(base.to_string());
+                    }
+                }
+                let mut cand = Vec::new();
+                for hi in &inst.instances {
+                    for conn in &hi.connections {
+                        match conn {
+                            PortConnection::Ordered(Some(e))
+                            | PortConnection::Named { expr: Some(e), .. } => {
+                                collect_implicit_net_candidates(e, &mut cand);
+                            }
+                            PortConnection::NamedIdent { actual, bound, .. } => {
+                                collect_implicit_net_ident(&actual.name, *bound, &mut cand);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for c in cand {
+                    local_names.insert(c);
+                }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                let mut cand = Vec::new();
+                for gi_inst in &gi.instances {
+                    for term in &gi_inst.terminals {
+                        collect_implicit_net_candidates(term, &mut cand);
+                    }
+                }
+                for c in cand {
+                    local_names.insert(c);
+                }
+            }
+            ModuleItem::SpecifyBlock(sb) => {
+                for (delayed, source) in &sb.delayed_nets {
+                    local_names.insert(delayed.clone());
+                    local_names.insert(source.clone());
+                }
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for assign in assignments {
+                        local_names.insert(assign.name.name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let gen_heads: Vec<String> = local_names
+        .iter()
+        .filter_map(|n| {
+            let (head, _) = n.split_once('.')?;
+            let base = head.split_once('[').map_or(head, |(b, _)| b);
+            (!base.is_empty() && !base.starts_with('\\')).then(|| base.to_string())
+        })
+        .collect();
+    local_names.extend(gen_heads);
+    {
+        let mut implicit: Vec<String> = Vec::new();
+        for item in effective_items.as_ref() {
+            match item {
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (lhs, _) in &ca.assignments {
+                        collect_implicit_net_candidates(lhs, &mut implicit);
+                    }
+                }
+                ModuleItem::GateInstantiation(gi) => {
+                    for (lhs, _) in gate_inst_to_assign_pairs(gi) {
+                        collect_implicit_net_candidates(&lhs, &mut implicit);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for name in implicit {
+            if !local_names.contains(&name) {
+                local_names.insert(name);
+            }
+        }
+    }
+
+    // When `effective_items` is owned (expanded from generate loops) and there
+    // are no root binds needing `ai_scope_shapes` over root declarations, drop
+    // already-elaborated declarations/assigns before recursing into children.
+    // Keep process/assertion items in place so `inline_instantiation_items`
+    // advances `items_end` (`ElabInstance::src_pos`) in exact source order.
+    if !has_root_binds {
+        if let std::borrow::Cow::Owned(ref mut items) = effective_items {
+            items.retain(|item| {
+                matches!(
+                    item,
+                    ModuleItem::ModuleInstantiation(_)
+                        | ModuleItem::InitialConstruct(_)
+                        | ModuleItem::AlwaysConstruct(_)
+                        | ModuleItem::AssertionItem(_)
+                        | ModuleItem::Bind(_)
+                        | ModuleItem::Defparam(_)
+                        | ModuleItem::ParameterDeclaration(_)
+                        | ModuleItem::LocalparamDeclaration(_)
+                )
+            });
+            items.shrink_to_fit();
+        }
+    }
+
+    RootPreparedItems {
+        interface_array_bounds,
+        effective_items,
+        local_typedefs,
+        local_names: std::rc::Rc::new(local_names),
+    }
+}
+
 pub(super) fn prepare_module_items(
     source_def: Definition,
     definitions: &HashMap<String, Definition>,

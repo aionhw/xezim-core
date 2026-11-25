@@ -3233,7 +3233,7 @@ pub struct ElaboratedModule {
     /// Transient elaboration bookkeeping (cleared at the end of elaboration
     /// and omitted from compiled artifacts, aionhw/xezim#721).
     #[serde(skip)]
-    pub decl_sites: HashMap<String, (Span, std::borrow::Cow<'static, str>, bool)>,
+    pub decl_sites: SharedNameMap<(Span, std::borrow::Cow<'static, str>, bool)>,
     /// Duplicate instance-name guard during hierarchy expansion. Uses
     /// `SharedName` so each entry shares its allocation with `ElabInstance.path`
     /// instead of allocating per-instance strings in `decl_sites` (#721).
@@ -3707,7 +3707,7 @@ impl ElaboratedModule {
             modules_without_timescale: Vec::new(),
             enum_members: HashMap::default(),
             package_enum_members: HashMap::default(),
-            decl_sites: HashMap::default(),
+            decl_sites: SharedNameMap::default(),
             seen_instance_paths: HashSet::default(),
             foreign_package_names: HashSet::default(),
             foreign_displaced: HashSet::default(),

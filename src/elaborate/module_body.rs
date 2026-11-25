@@ -11,6 +11,7 @@ pub fn elaborate_module_with_defs(
     PACKED_WIDTH_ERROR.with(|slot| slot.take());
     let _oom_trace = crate::oom_trace::session();
     let _oom_definition = crate::oom_trace::definition(module, "elaborate module", module.name());
+    let _top_decl_types = crate::decl_types::top_decl_types_scope();
     let mut elab = ElaboratedModule::new(module.name().to_string());
     // §6.5/§10: within a scope a net/variable must be DECLARED before it is
     // referenced (implicit nets §6.10 are the only exception, and they do not
@@ -1688,9 +1689,11 @@ pub fn elaborate_module_with_defs(
                     // branch, so `x[0][0].lanes[0]` on a typedef'd wire read
                     // one bit of the wrong field while the identical variable
                     // declaration worked.
-                    elab.var_decl_types
-                        .entry(decl.name.name.clone())
-                        .or_insert_with(|| nd.data_type.clone());
+                    if !elab.var_decl_types.contains_key(&decl.name.name) {
+                        let shared_dt = crate::decl_types::intern_top_decl_type(&nd.data_type);
+                        elab.var_decl_types
+                            .insert_shared(decl.name.name.clone(), shared_dt);
+                    }
                     // §7.2.1: a packed-struct-typed NET needs its field layout
                     // registered in `packed_struct_fields` so member reads/writes
                     // (`word2.high`, `assign word2.high = ...`) slice into the
@@ -2081,8 +2084,9 @@ pub fn elaborate_module_with_defs(
                         }
                         // A reg/logic completion makes the port a variable, not a net.
                         unregister_net_type(&mut elab, &decl.name.name);
+                        let shared_dt = crate::decl_types::intern_top_decl_type(&dd.data_type);
                         elab.var_decl_types
-                            .insert(decl.name.name.clone(), dd.data_type.clone());
+                            .insert_shared(decl.name.name.clone(), shared_dt);
                         continue;
                     }
                     if (elab.signals.contains_key(&decl.name.name)
@@ -2180,8 +2184,9 @@ pub fn elaborate_module_with_defs(
                         // `uvm_seed_map uvm_random_seed_table_lookup [string]`
                         // then `uvm_create_random_seed` reads
                         // `seed_map.seed_table` through null at t=0.
+                        let shared_dt = crate::decl_types::intern_top_decl_type(&dd.data_type);
                         elab.var_decl_types
-                            .insert(decl.name.name.clone(), dd.data_type.clone());
+                            .insert_shared(decl.name.name.clone(), shared_dt);
                         // §7.8.2: an AA index is narrowed to the declared key
                         // type. Record the key width + signedness so the runtime
                         // can narrow a wider index expression before keying
@@ -2742,8 +2747,9 @@ pub fn elaborate_module_with_defs(
                         if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
+                        let shared_dt = crate::decl_types::intern_top_decl_type(&dd.data_type);
                         elab.var_decl_types
-                            .insert(decl.name.name.clone(), dd.data_type.clone());
+                            .insert_shared(decl.name.name.clone(), shared_dt);
                         if let DataType::TypeReference { name, .. } = &dd.data_type {
                             elab.array_elem_class
                                 .insert(decl.name.name.clone(), name.name.name.clone());
@@ -2827,8 +2833,9 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         // Element type, for the type-directed `%p` renderer.
+                        let shared_dt = crate::decl_types::intern_top_decl_type(&dd.data_type);
                         elab.var_decl_types
-                            .insert(decl.name.name.clone(), dd.data_type.clone());
+                            .insert_shared(decl.name.name.clone(), shared_dt);
                         // An UNPACKED struct element keeps each member in its own
                         // signal (recursively: nested unpacked members expand, nested
                         // packed members get a signal + slice layout). Without this
@@ -3342,8 +3349,9 @@ pub fn elaborate_module_with_defs(
                         // dimensions (`rec_t arr[N]`, `rec_t m[int]`): those are
                         // ARRAYS of structs, and `%p` must print them as an
                         // element list, not as a single struct.
+                        let shared_dt = crate::decl_types::intern_top_decl_type(&dd.data_type);
                         elab.var_decl_types
-                            .insert(decl.name.name.clone(), dd.data_type.clone());
+                            .insert_shared(decl.name.name.clone(), shared_dt);
                         if decl.dimensions.is_empty() {
                             if let DataType::Struct(su) = dt_resolved {
                                 let names: Vec<String> = su
@@ -4658,7 +4666,7 @@ pub fn elaborate_module_with_defs(
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
     // or port connections that are not explicitly declared become implicit 1-bit wires.
     let mut port_conn_nets: Vec<String> = Vec::new();
-    collect_port_connection_net_candidates(module.items(), &mut port_conn_nets);
+    collect_port_connection_net_candidates_undeclared(module.items(), &elab, &mut port_conn_nets);
     // §6.6.8 coercion: which of those actuals connect to a nettype formal.
     let mut nettype_actuals: HashMap<String, String> = HashMap::default();
     collect_nettype_port_actuals(

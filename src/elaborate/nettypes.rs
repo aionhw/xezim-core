@@ -1674,16 +1674,39 @@ pub(crate) fn stage_vpi_net_drivers(elab: &mut ElaboratedModule) {
         })
     }
     // Materialize only pending assignments that actually target a declared net
-    // with a source origin, keeping non-net and synthetic pending assigns lazy
-    // instead of duplicating the entire continuous_assigns table (#721).
-    if !elab.pending_cont_assign.is_empty() {
+    // with a source origin and a RHS that needs VPI staging. Check first
+    // before taking `pending_cont_assign` so designs with no stageable pending
+    // net drivers allocate zero temporary buffers (#721).
+    fn pending_might_stage(p: &PendingContAssign, elab: &ElaboratedModule) -> bool {
+        if p.origin_span.is_none()
+            || p.delay_source().is_some()
+            || p.delay_fall_source().is_some()
+            || p.delay_off_source().is_some()
+        {
+            return false;
+        }
+        let rhs_may_stage = rhs_needs_vpi_stage(&p.rhs_source)
+            || match &p.rhs_source.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => p
+                    .ctx
+                    .port_map
+                    .get(&h.path[0].name.name)
+                    .is_some_and(rhs_needs_vpi_stage),
+                _ => false,
+            };
+        rhs_may_stage
+            && whole_net_ident_name_scoped(&p.materialize_lhs(), elab).is_some_and(|name| {
+                is_net_name(elab, &name) && elab.signals.contains_key(name.as_str())
+            })
+    }
+    if elab
+        .pending_cont_assign
+        .iter()
+        .any(|p| pending_might_stage(p, elab))
+    {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for p in pending {
-            if p.origin_span.is_some()
-                && whole_net_ident_name_scoped(&p.materialize_lhs(), elab).is_some_and(|name| {
-                    is_net_name(elab, &name) && elab.signals.contains_key(name.as_str())
-                })
-            {
+            if pending_might_stage(&p, elab) {
                 let ca = p.materialize(&elab.parameters);
                 if !expand_whole_array_assign(&ca, elab) {
                     elab.continuous_assigns.push(ca);
