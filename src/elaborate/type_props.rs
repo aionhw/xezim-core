@@ -573,6 +573,45 @@ pub fn is_type_real_resolved(dt: &DataType, typedef_types: &HashMap<String, Data
     is_type_real(cur)
 }
 
+pub fn is_type_shortreal_resolved(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> bool {
+    let mut cur = dt;
+    for _ in 0..64 {
+        if matches!(
+            cur,
+            DataType::Real {
+                kind: crate::ast::types::RealType::ShortReal,
+                ..
+            }
+        ) {
+            return true;
+        }
+        if matches!(cur, DataType::Real { .. }) {
+            return false;
+        }
+        let DataType::TypeReference { name, .. } = cur else {
+            break;
+        };
+        let key = &name.name.name;
+        let inner = lookup_scoped_type(name, typedef_types);
+        match inner {
+            Some(next) if !matches!(next, DataType::TypeReference { name: n, .. } if &n.name.name == key) => {
+                cur = next
+            }
+            _ => break,
+        }
+    }
+    matches!(
+        cur,
+        DataType::Real {
+            kind: crate::ast::types::RealType::ShortReal,
+            ..
+        }
+    )
+}
+
 /// `is_type_signed` that resolves a typedef reference (`typedef logic signed
 /// [7:0] t; t v;`) against the typedef table so `v` inherits the underlying
 /// type's signedness. Without this a signed typedef var read as unsigned,

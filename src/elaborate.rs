@@ -2819,6 +2819,10 @@ pub struct ElaboratedModule {
     /// max-time exit) and before any VCD/coverage flush.
     #[serde(default)]
     pub final_blocks: Vec<InitialBlock>,
+    /// True while elaborating the top-level items (or generate blocks) of an
+    /// `automatic` module, interface, or program (§6.21). Not serialized.
+    #[serde(skip)]
+    pub(crate) default_automatic: bool,
     /// Static/package-scope variable initializers. Scheduled at time 0 ahead of
     /// any `initial` block (and the lazy-prefix `pending_initial`), so package
     /// globals (e.g. riscv-dv's `supported_isa[$] = {...}`) are populated before
@@ -3628,6 +3632,7 @@ impl ElaboratedModule {
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
             final_blocks: Vec::new(),
+            default_automatic: false,
             static_init_blocks: Vec::new(),
             program_initial_blocks: Vec::new(),
             parameters: HashMap::default(),
@@ -4005,6 +4010,19 @@ impl<'a> Definition<'a> {
             Definition::Package(p) => &p.name.name,
             Definition::Typedef(t) => &t.name.name,
             Definition::Udp(u) => &u.name.name,
+        }
+    }
+
+    pub fn lifetime(&self) -> Option<crate::ast::types::Lifetime> {
+        match self {
+            Definition::Module(m) => m.lifetime,
+            Definition::Interface(i) => i.lifetime,
+            Definition::Program(p) => p.lifetime,
+            Definition::Package(p) => p.lifetime,
+            Definition::Class(_)
+            | Definition::Covergroup(_)
+            | Definition::Typedef(_)
+            | Definition::Udp(_) => None,
         }
     }
 

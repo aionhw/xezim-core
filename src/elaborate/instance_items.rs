@@ -160,7 +160,11 @@ pub(super) fn inline_instantiation_items(
                                     .iter()
                                     .map(|it| rewrite_module_item_subst(it, &subst))
                                     .collect();
-                                elaborate_items(&rewritten, elab, Some(definitions))?;
+                                let prev_default_auto = elab.default_automatic;
+                                elab.default_automatic = false;
+                                let checker_res = elaborate_items(&rewritten, elab, Some(definitions));
+                                elab.default_automatic = prev_default_auto;
+                                checker_res?;
                             }
                         }
                         continue;

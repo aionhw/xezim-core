@@ -14,6 +14,7 @@ pub fn elaborate_module_with_defs(
     let _top_decl_types = crate::decl_types::top_decl_types_scope();
     let mut elab = ElaboratedModule::new(module.name().to_string());
     elab.default_net_type = module.default_net_type();
+    elab.default_automatic = matches!(module.lifetime(), Some(Lifetime::Automatic));
     // §6.5/§10: within a scope a net/variable must be DECLARED before it is
     // referenced (implicit nets §6.10 are the only exception, and they do not
     // apply to a name declared LATER). Check every data expression, including
@@ -343,7 +344,13 @@ pub fn elaborate_module_with_defs(
             && fd.name.scopes.is_empty()
         {
             elab.functions
-                .insert_if_absent_with(fd.name.name.name.clone(), || fd.as_ref().clone());
+                .insert_if_absent_with(fd.name.name.name.clone(), || {
+                    let mut owned = fd.as_ref().clone();
+                    if elab.default_automatic {
+                        stmt_rewrite::stamp_automatic_function(&mut owned);
+                    }
+                    owned
+                });
         }
     }
     crate::oom_trace::checkpoint("elaborate.functions.registered", &[("functions", elab.functions.len())]);
@@ -1283,8 +1290,7 @@ pub fn elaborate_module_with_defs(
 
     // §6.21: subroutines default to the enclosing scope's lifetime.
     use crate::ast::types::Lifetime;
-    let sub_default_static =
-        !matches!(module, Definition::Module(m) if m.lifetime == Some(Lifetime::Automatic));
+    let sub_default_static = !elab.default_automatic;
     if let Some(defs) = all_defs {
         for def in defs.values() {
             let Definition::Package(pkg) = def else {
@@ -4098,8 +4104,11 @@ pub fn elaborate_module_with_defs(
                 // silently overrides same-named free functions, so a bare call
                 // dispatches the class body without `this` binding.
                 if fd.name.scopes.is_empty() {
-                    elab.functions
-                        .insert(fd.name.name.name.clone(), fd.as_ref().clone());
+                    let mut owned = fd.as_ref().clone();
+                    if elab.default_automatic {
+                        stmt_rewrite::stamp_automatic_function(&mut owned);
+                    }
+                    elab.functions.insert(fd.name.name.name.clone(), owned);
                 }
             }
             ModuleItem::TaskDeclaration(td) => {
@@ -4192,8 +4201,11 @@ pub fn elaborate_module_with_defs(
                         ));
                     }
                     elab.note_decl_site(&td.name.name.name, td.name.name.span, "task", true);
-                    elab.tasks
-                        .insert(td.name.name.name.clone(), td.as_ref().clone());
+                    let mut owned = td.as_ref().clone();
+                    if elab.default_automatic {
+                        stmt_rewrite::stamp_automatic_task(&mut owned);
+                    }
+                    elab.tasks.insert(td.name.name.name.clone(), owned);
                 }
             }
             ModuleItem::AliasDecl(terms) => {
@@ -4298,9 +4310,13 @@ pub fn elaborate_module_with_defs(
                 if pend_dbg_enabled() {
                     eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
                 }
+                let mut stmt = ac.stmt.clone();
+                if elab.default_automatic {
+                    stmt_rewrite::stamp_automatic_var_decls(&mut stmt);
+                }
                 elab.always_blocks.push(AlwaysBlock {
                     kind: ac.kind,
-                    stmt: ac.stmt.clone(),
+                    stmt,
                     scope: ac.gen_scope.clone(),
                 });
             }
@@ -4309,8 +4325,12 @@ pub fn elaborate_module_with_defs(
                     eprintln!("[xezim][elab] elaborate_items: pushing initial (top-level path)");
                 }
                 // §21.2.1.7: include generate block scope in the instance path for %m.
+                let mut stmt = ic.stmt.clone();
+                if elab.default_automatic {
+                    stmt_rewrite::stamp_automatic_var_decls(&mut stmt);
+                }
                 elab.initial_blocks.push(InitialBlock {
-                    stmt: ic.stmt.clone(),
+                    stmt,
                     scope: ic.gen_scope.clone(),
                 });
             }
@@ -4342,8 +4362,12 @@ pub fn elaborate_module_with_defs(
                             .to_string(),
                     );
                 }
+                let mut stmt = fc.stmt.clone();
+                if elab.default_automatic {
+                    stmt_rewrite::stamp_automatic_var_decls(&mut stmt);
+                }
                 elab.final_blocks.push(InitialBlock {
-                    stmt: fc.stmt.clone(),
+                    stmt,
                     scope: String::new(),
                 });
             }

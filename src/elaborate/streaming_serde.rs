@@ -319,6 +319,7 @@ impl Serialize for ElaboratedModule {
             src_file_of_module,
             source_orig_lines,
             source_line_maps: _,
+            default_automatic: _,
         } = self;
 
         let mut st = serializer.serialize_struct("ElaboratedModule", 120)?;

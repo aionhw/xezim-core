@@ -1077,9 +1077,13 @@ pub(super) fn elaborate_items(
                 if pend_dbg_enabled() {
                     eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
                 }
+                let mut stmt = ac.stmt.clone();
+                if elab.default_automatic {
+                    stmt_rewrite::stamp_automatic_var_decls(&mut stmt);
+                }
                 elab.always_blocks.push(AlwaysBlock {
                     kind: ac.kind,
-                    stmt: ac.stmt.clone(),
+                    stmt,
                     scope: ac.gen_scope.clone(),
                 });
             }
@@ -1088,8 +1092,12 @@ pub(super) fn elaborate_items(
                     eprintln!("[xezim][elab] @2453 pushing initial (other path)");
                 }
                 // §21.2.1.7: include generate block scope in the instance path for %m.
+                let mut stmt = ic.stmt.clone();
+                if elab.default_automatic {
+                    stmt_rewrite::stamp_automatic_var_decls(&mut stmt);
+                }
                 elab.initial_blocks.push(InitialBlock {
-                    stmt: ic.stmt.clone(),
+                    stmt,
                     scope: ic.gen_scope.clone(),
                 });
             }
@@ -1113,8 +1121,12 @@ pub(super) fn elaborate_items(
                             .to_string(),
                     );
                 }
+                let mut stmt = fc.stmt.clone();
+                if elab.default_automatic {
+                    stmt_rewrite::stamp_automatic_var_decls(&mut stmt);
+                }
                 elab.final_blocks.push(InitialBlock {
-                    stmt: fc.stmt.clone(),
+                    stmt,
                     scope: String::new(),
                 });
             }
@@ -1456,8 +1468,11 @@ pub(super) fn elaborate_items(
                 // Same scope filter as above: out-of-class method definitions
                 // must not override free functions.
                 if fd.name.scopes.is_empty() {
-                    elab.functions
-                        .insert(fd.name.name.name.clone(), fd.as_ref().clone());
+                    let mut owned = fd.as_ref().clone();
+                    if elab.default_automatic {
+                        stmt_rewrite::stamp_automatic_function(&mut owned);
+                    }
+                    elab.functions.insert(fd.name.name.name.clone(), owned);
                 }
             }
             ModuleItem::TaskDeclaration(td) => {
@@ -1515,8 +1530,11 @@ pub(super) fn elaborate_items(
                 // Same scope filter: don't let out-of-class method definitions
                 // override free tasks in the module namespace.
                 if td.name.scopes.is_empty() {
-                    elab.tasks
-                        .insert(td.name.name.name.clone(), td.as_ref().clone());
+                    let mut owned = td.as_ref().clone();
+                    if elab.default_automatic {
+                        stmt_rewrite::stamp_automatic_task(&mut owned);
+                    }
+                    elab.tasks.insert(td.name.name.name.clone(), owned);
                 }
             }
             ModuleItem::ImportDeclaration(imp) => {

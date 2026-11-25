@@ -974,3 +974,185 @@ fn rewrite_event_control(
         other => other.clone(),
     }
 }
+
+fn stmt_has_unstamped_var_decl(stmt: &Statement) -> bool {
+    match &stmt.kind {
+        StatementKind::VarDecl { lifetime, .. } => lifetime.is_none(),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().any(stmt_has_unstamped_var_decl)
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            stmt_has_unstamped_var_decl(then_stmt)
+                || else_stmt.as_deref().is_some_and(stmt_has_unstamped_var_decl)
+        }
+        StatementKind::Case { items, .. } => items.iter().any(|it| stmt_has_unstamped_var_decl(&it.stmt)),
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body }
+        | StatementKind::ForeverTail { body }
+        | StatementKind::RsAction { body } => stmt_has_unstamped_var_decl(body),
+        StatementKind::ForeachTail(ft) => stmt_has_unstamped_var_decl(&ft.body),
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            stmt_has_unstamped_var_decl(stmt)
+        }
+        StatementKind::RandCase { items } => {
+            items.iter().any(|(_, s)| stmt_has_unstamped_var_decl(s))
+        }
+        StatementKind::WaitOrder { pass, fail, .. } => {
+            pass.as_deref().is_some_and(stmt_has_unstamped_var_decl)
+                || fail.as_deref().is_some_and(stmt_has_unstamped_var_decl)
+        }
+        StatementKind::Assertion(a) => {
+            a.action.as_deref().is_some_and(stmt_has_unstamped_var_decl)
+                || a.else_action.as_deref().is_some_and(stmt_has_unstamped_var_decl)
+        }
+        StatementKind::Null
+        | StatementKind::ScopePop
+        | StatementKind::LoopStep
+        | StatementKind::DisableFork
+        | StatementKind::Expr(_)
+        | StatementKind::BlockingAssign { .. }
+        | StatementKind::NonblockingAssign { .. }
+        | StatementKind::EventTrigger { .. }
+        | StatementKind::WaitFork
+        | StatementKind::Disable { .. }
+        | StatementKind::Return(_)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::ProceduralContinuous(_)
+        | StatementKind::Typedef(_)
+        | StatementKind::Coverpoint { .. }
+        | StatementKind::Cross { .. }
+        | StatementKind::RsReturn { .. }
+        | StatementKind::ParamDecl { .. } => false,
+    }
+}
+
+/// §6.21: inside an `automatic` module/interface/program, unannotated locals in
+/// procedural blocks and subroutines default to `automatic` lifetime.
+pub(super) fn stamp_automatic_var_decls(stmt: &mut Statement) {
+    if !stmt_has_unstamped_var_decl(stmt) {
+        return;
+    }
+    match &mut stmt.kind {
+        StatementKind::VarDecl { lifetime, .. } => {
+            if lifetime.is_none() {
+                *lifetime = Some(crate::ast::types::Lifetime::Automatic);
+            }
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts.iter_mut() {
+                stamp_automatic_var_decls(s);
+            }
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            stamp_automatic_var_decls(then_stmt);
+            if let Some(e) = else_stmt {
+                stamp_automatic_var_decls(e);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                stamp_automatic_var_decls(&mut it.stmt);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body }
+        | StatementKind::ForeverTail { body }
+        | StatementKind::RsAction { body } => stamp_automatic_var_decls(body),
+        StatementKind::ForeachTail(ft) => stamp_automatic_var_decls(&mut ft.body),
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            stamp_automatic_var_decls(stmt);
+        }
+        StatementKind::RandCase { items } => {
+            for (_, s) in items {
+                stamp_automatic_var_decls(s);
+            }
+        }
+        StatementKind::WaitOrder { pass, fail, .. } => {
+            if let Some(p) = pass {
+                stamp_automatic_var_decls(p);
+            }
+            if let Some(f) = fail {
+                stamp_automatic_var_decls(f);
+            }
+        }
+        StatementKind::Assertion(a) => {
+            if let Some(act) = &mut a.action {
+                stamp_automatic_var_decls(act);
+            }
+            if let Some(eact) = &mut a.else_action {
+                stamp_automatic_var_decls(eact);
+            }
+        }
+        StatementKind::Null
+        | StatementKind::ScopePop
+        | StatementKind::LoopStep
+        | StatementKind::DisableFork
+        | StatementKind::Expr(_)
+        | StatementKind::BlockingAssign { .. }
+        | StatementKind::NonblockingAssign { .. }
+        | StatementKind::EventTrigger { .. }
+        | StatementKind::WaitFork
+        | StatementKind::Disable { .. }
+        | StatementKind::Return(_)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::ProceduralContinuous(_)
+        | StatementKind::Typedef(_)
+        | StatementKind::Coverpoint { .. }
+        | StatementKind::Cross { .. }
+        | StatementKind::RsReturn { .. }
+        | StatementKind::ParamDecl { .. } => {}
+    }
+}
+
+pub(super) fn stamp_automatic_function(fd: &mut crate::ast::decl::FunctionDeclaration) {
+    if fd.lifetime.is_none() {
+        fd.lifetime = Some(crate::ast::types::Lifetime::Automatic);
+    }
+    if fd.items.iter().any(stmt_has_unstamped_var_decl) {
+        for s in fd.items.iter_mut() {
+            stamp_automatic_var_decls(s);
+        }
+    }
+}
+
+pub(super) fn stamp_automatic_task(td: &mut crate::ast::decl::TaskDeclaration) {
+    if td.lifetime.is_none() {
+        td.lifetime = Some(crate::ast::types::Lifetime::Automatic);
+    }
+    if td.items.iter().any(stmt_has_unstamped_var_decl) {
+        for s in td.items.iter_mut() {
+            stamp_automatic_var_decls(s);
+        }
+    }
+}
+
+pub(super) fn stamp_automatic_items(items: &mut [ModuleItem]) {
+    for item in items {
+        match item {
+            ModuleItem::AlwaysConstruct(ac) => stamp_automatic_var_decls(&mut ac.stmt),
+            ModuleItem::InitialConstruct(ic) => stamp_automatic_var_decls(&mut ic.stmt),
+            ModuleItem::FinalConstruct(fc) => stamp_automatic_var_decls(&mut fc.stmt),
+            ModuleItem::FunctionDeclaration(fd) => stamp_automatic_function(fd),
+            ModuleItem::TaskDeclaration(td) => stamp_automatic_task(td),
+            _ => {}
+        }
+    }
+}

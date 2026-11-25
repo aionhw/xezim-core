@@ -557,12 +557,16 @@ pub(super) fn prepare_root_module_items<'a>(
                 | ModuleItem::GenerateFor(_)
         )
     });
+    let is_auto = matches!(source_def.lifetime(), Some(Lifetime::Automatic));
     let mut interface_array_bounds = Vec::new();
     let mut effective_items: std::borrow::Cow<'a, [ModuleItem]> =
-        if !has_generates && !has_instance_arrays(raw_items) && !has_root_binds {
+        if !has_generates && !has_instance_arrays(raw_items) && !has_root_binds && !is_auto {
             std::borrow::Cow::Borrowed(raw_items)
         } else {
             let mut items = collect_effective_items(raw_items, local_params);
+            if is_auto {
+                stamp_automatic_items(&mut items);
+            }
             if has_instance_arrays(&items) {
                 for item in &items {
                     if let ModuleItem::ModuleInstantiation(inst) = item
@@ -829,6 +833,9 @@ pub(super) fn prepare_module_items(
     }
 
     let mut effective_items = collect_effective_items(source_def.items(), local_params);
+    if matches!(source_def.lifetime(), Some(Lifetime::Automatic)) {
+        stamp_automatic_items(&mut effective_items);
+    }
     // §6.18: a generate block's typedef is the module's under its block key.
     let local_typedefs: std::collections::HashSet<String> = effective_items
         .iter()
