@@ -2227,6 +2227,17 @@ fn parse_and_elaborate(
     scope_tree::build_design(&mut all_descriptions);
     oom_trace::checkpoint("prepare.scope_tree.ready", &[]);
     let cli = module_timescale_cli();
+    let lib_cli = library_cli_cell().lock().unwrap().clone();
+    elaborate::set_elab_library_sources(Default::default());
+    clear_adopted_libs();
+    // §3.14, §22.7: discover adopted library definitions before choosing the
+    // global precision. An unused library definition must not refine the tick.
+    let (mut library_defs, library_timescales) =
+        if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
+            resolve_library_modules(&all_descriptions, include_dirs, lib_macros, &lib_cli)?
+        } else {
+            Default::default()
+        };
     // Deterministic: `module_timescale_exp` is filled by walking this map,
     // and its serialized order follows the order entries are inserted in.
     let mut eff_ts: crate::hasher::HashMap<String, (f64, f64)> = crate::hasher::HashMap::default();
@@ -2350,6 +2361,43 @@ fn parse_and_elaborate(
                     (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)),
                 );
             }
+        }
+    }
+    for (name, def) in &library_defs {
+        let items = match def {
+            SourceDefinition::Module(m) => &m.items,
+            SourceDefinition::Interface(i) => &i.items,
+            SourceDefinition::Program(p) => &p.items,
+            _ => continue,
+        };
+        let named = cli.named.get(name).copied();
+        if named.is_some() {
+            named_matched.insert(name.clone());
+        }
+        let directive = library_timescales.get(name).copied();
+        let mut unit = None;
+        let mut precision = None;
+        for item in items {
+            if let ast::decl::ModuleItem::TimeunitsDecl(td) = item {
+                if let Some(value) = &td.unit {
+                    unit = Some(elaborate::time_literal_to_exp(value));
+                }
+                if let Some(value) = &td.precision {
+                    precision = Some(elaborate::time_literal_to_exp(value));
+                }
+            }
+        }
+        let explicit = directive.is_some() || unit.is_some() || precision.is_some();
+        let effective = cli.force.or_else(|| {
+            if explicit {
+                let (du, dp) = directive.unwrap_or((-9, -9));
+                Some((unit.unwrap_or(du), precision.unwrap_or(dp)))
+            } else {
+                named.or(cli.global)
+            }
+        });
+        if let Some((u, p)) = effective {
+            eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
         }
     }
     // §3.14.2.2 — a design that MIXES timed and untimed modules is a common
@@ -2968,7 +3016,6 @@ fn parse_and_elaborate(
     // may contain hierarchical references into these definitions that this
     // scan cannot see yet. Keep all candidates until those sources can be
     // included in the dependency scan as well.
-    let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         needed_unit_params.extend(unit_param_usage.references(&top_level_params));
         needed_unit_assertions.extend(unit_assertion_usage.references(&top_level_assertion_decls));
@@ -3429,58 +3476,38 @@ fn parse_and_elaborate(
     // as the top and run. An include dir is a search path, not a compile list.
     let explicit_def_names: std::collections::HashSet<String> =
         definitions.keys().cloned().collect();
-    // A previous elaboration's library files on this thread must not locate
-    // this design's spans.
-    elaborate::set_elab_library_sources(Default::default());
-    // Nor may the library files it adopted, or the texts they were
-    // preprocessed to, reach this design's `--dump-merged-sv` or VPI model:
-    // both records are process-wide.
-    clear_adopted_libs();
-    if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
-        resolve_library_modules(
-            &mut definitions,
-            include_dirs,
-            lib_macros,
-            &lib_cli,
-            &top_level_binds,
-        )?;
+    if !library_defs.is_empty() {
+        for (name, def) in &mut library_defs {
+            let (items, params) = match def {
+                SourceDefinition::Module(m) => {
+                    let m = Rc::make_mut(m);
+                    (&mut m.items, &mut m.params)
+                }
+                SourceDefinition::Interface(i) => {
+                    let i = Rc::make_mut(i);
+                    (&mut i.items, &mut i.params)
+                }
+                SourceDefinition::Program(p) => {
+                    let p = Rc::make_mut(p);
+                    (&mut p.items, &mut p.params)
+                }
+                _ => continue,
+            };
+            if let Some(&(unit_s, prec_s)) = eff_ts.get(name) {
+                elaborate::rewrite_module_delays_pub(items, unit_s, prec_s, tick_s);
+                elaborate::scope_time_param_ports_pub(params, unit_s, prec_s);
+            }
+        }
+        for (name, def) in library_defs {
+            if !definitions.contains_key(&name)
+                || matches!(definitions.get(&name), Some(SourceDefinition::Typedef(t)) if t.forward)
+            {
+                definitions.insert(name, def);
+            }
+        }
         let lib_hits = apply_param_overrides(&mut definitions, Some(&explicit_def_names))?;
         for (h, n) in param_override_hits.iter_mut().zip(lib_hits) {
             *h += n;
-        }
-
-        // A `-v`/`-y` library module is adopted AFTER the primary-source delay
-        // rewrite (above), so it never received a timescale — its `#delay`s
-        // stayed raw tick-unit values while the same module compiled as a
-        // primary source would be scaled. Apply `--module-timescale` (named,
-        // else global) to each newly-adopted library module so its delays scale
-        // consistently. Library modules with no CLI timescale keep tick units
-        // (their own `` `timescale `` directive is a separate, not-yet-captured
-        // path).
-        if cli.global.is_some() || !cli.named.is_empty() {
-            let lib_names: Vec<String> = definitions
-                .keys()
-                .filter(|n| !explicit_def_names.contains(*n))
-                .cloned()
-                .collect();
-            for name in lib_names {
-                let ts = cli.named.get(&name).copied().or(cli.global);
-                let Some((u, p)) = ts else { continue };
-                let unit_s = elaborate::exp_to_secs(u);
-                let prec_s = elaborate::exp_to_secs(p);
-                if let Some(SourceDefinition::Module(rc)) = definitions.get_mut(&name) {
-                    let m = Rc::make_mut(rc);
-                    elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, prec_s, tick_s);
-                    elaborate::scope_time_param_ports_pub(&mut m.params, unit_s, prec_s);
-                    module_timescale_exp.insert(
-                        name.clone(),
-                        (
-                            elaborate::secs_to_exp(unit_s),
-                            elaborate::secs_to_exp(elaborate::exp_to_secs(p)),
-                        ),
-                    );
-                }
-            }
         }
     }
 
@@ -5042,12 +5069,16 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
 }
 
 fn resolve_library_modules(
-    definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
+    primary: &[ast::Description],
     include_dirs: &[String],
     mut lib_macros: LibraryMacros,
     lib_cli: &LibraryCli,
-    unit_binds: &[ast::decl::BindDirective],
-) -> Result<(), String> {
+) -> Result<(
+    crate::hasher::HashMap<String, SourceDefinition>,
+    crate::hasher::HashMap<String, (i32, i32)>,
+), String> {
+    let mut definitions = crate::hasher::HashMap::default();
+    let mut timescales = crate::hasher::HashMap::default();
     fn collect_sv_files(
         dir: &std::path::Path,
         exts: &[String],
@@ -5150,6 +5181,7 @@ fn resolve_library_modules(
         lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
         lib_sources: &mut elaborate::LibrarySources,
         indexed: &mut Vec<(std::path::PathBuf, bool)>,
+        timescales: &mut crate::hasher::HashMap<String, (i32, i32)>,
     ) {
         let source = match read_library_file(&path) {
             Ok(s) => s,
@@ -5420,6 +5452,9 @@ fn resolve_library_modules(
                 defined.push(name);
             }
             for name in defined {
+                if let Some(&(u, p)) = pp.module_timescales.get(&name) {
+                    timescales.insert(name.clone(), (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)));
+                }
                 lib_sources.def_file.insert(name, file_index);
             }
             lib_sources
@@ -5443,6 +5478,7 @@ fn resolve_library_modules(
             &mut lib_origins,
             &mut lib_sources,
             &mut indexed,
+            &mut timescales,
         );
     }
 
@@ -5460,30 +5496,48 @@ fn resolve_library_modules(
     // Adopt only library modules that satisfy an unresolved instantiation
     // reachable from the explicitly-compiled design, transitively (a pulled-in
     // library module may itself instantiate further library modules).
+    let mut known = std::collections::HashSet::new();
+    let mut forward_types = std::collections::HashSet::new();
+    let mut referrers = std::collections::HashMap::<String, std::collections::BTreeSet<String>>::new();
     let mut seed = std::collections::HashSet::new();
-    seed.extend(
-        unit_binds
-            .iter()
-            .map(|b| b.instantiation.module_name.name.clone()),
-    );
-    // Instantiated-name -> referring definition names. This is what turns an
-    // opaque "module 'X' not found" into an actionable note: it names WHICH
-    // module's body references X, so a user can check whether that reference
-    // even elaborates (a reference inside a dead `generate`/parameter branch
-    // is collected by this TEXTUAL scan but never needed at runtime — a
-    // commercial elaborator would report nothing for it).
-    let mut referrers: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
-        std::collections::HashMap::new();
-    for (def_name, def) in definitions.iter() {
-        let mut names = std::collections::HashSet::new();
-        instantiations(def, &mut names);
-        for n in &names {
-            referrers
-                .entry(n.clone())
-                .or_default()
-                .insert(def_name.clone());
+    for desc in primary {
+        let (name, items) = match desc {
+            ast::Description::Module(m) => (&m.name.name, m.items.as_slice()),
+            ast::Description::Interface(i) => (&i.name.name, i.items.as_slice()),
+            ast::Description::Program(p) => (&p.name.name, p.items.as_slice()),
+            ast::Description::Package(p) => (&p.name.name, &[][..]),
+            ast::Description::Class(c) => (&c.name.name, &[][..]),
+            ast::Description::Udp(u) => (&u.name.name, &[][..]),
+            ast::Description::TypedefDecl(t) => {
+                if t.forward {
+                    forward_types.insert(t.name.name.clone());
+                } else {
+                    forward_types.remove(&t.name.name);
+                }
+                (&t.name.name, &[][..])
+            }
+            ast::Description::Bind(b) => {
+                seed.insert(b.instantiation.module_name.name.clone());
+                continue;
+            }
+            _ => continue,
+        };
+        known.insert(name.clone());
+        let mut nested = vec![(name.as_str(), items)];
+        while let Some((scope, items)) = nested.pop() {
+            let mut refs = std::collections::HashSet::new();
+            collect_instantiated_modules(items, &mut refs);
+            for n in &refs {
+                referrers.entry(n.clone()).or_default().insert(scope.to_owned());
+            }
+            seed.extend(refs);
+            for item in items {
+                if let ast::decl::ModuleItem::NestedModule(m) = item {
+                    known.insert(m.name.name.clone());
+                    nested.push((&m.name.name, &m.items));
+                }
+            }
         }
-        seed.extend(names);
     }
     // Resolved in a fixed order: library files are read, and under
     // `--carry-lib-macros` their macros defined (§22.5.1), in the order
@@ -5495,7 +5549,7 @@ fn resolve_library_modules(
     let mut adopted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut full_scan_done = false;
     while let Some(name) = work.pop() {
-        if definitions.contains_key(&name) {
+        if known.contains(&name) || definitions.contains_key(&name) {
             continue;
         }
         // Lazy `-y` resolution: try `<dir>/<name>.<ext>` first — the one
@@ -5526,6 +5580,7 @@ fn resolve_library_modules(
                     &mut lib_origins,
                     &mut lib_sources,
                     &mut indexed,
+                    &mut timescales,
                 );
             }
             if !lib.contains_key(&name) && !full_scan_done {
@@ -5544,6 +5599,7 @@ fn resolve_library_modules(
                         &mut lib_origins,
                         &mut lib_sources,
                         &mut indexed,
+                        &mut timescales,
                     );
                 }
             }
@@ -5586,7 +5642,7 @@ fn resolve_library_modules(
             adopted.insert(name.clone());
             for n in more {
                 referrers.entry(n.clone()).or_default().insert(name.clone());
-                if !definitions.contains_key(&n) {
+                if !known.contains(&n) && !definitions.contains_key(&n) {
                     work.push(n);
                 }
             }
@@ -5687,11 +5743,7 @@ fn resolve_library_modules(
     // unresolved module ever pulled in. If any remain unfilled and unscanned
     // candidates exist, do the full scan now — old behavior, but only paid
     // when this actually matters.
-    if !pending.is_empty()
-        && definitions
-            .values()
-            .any(|d| matches!(d, SourceDefinition::Typedef(e) if e.forward))
-    {
+    if !pending.is_empty() && !forward_types.is_empty() {
         for path in std::mem::take(&mut pending) {
             index_library_file(
                 path,
@@ -5706,6 +5758,7 @@ fn resolve_library_modules(
                 &mut lib_origins,
                 &mut lib_sources,
                 &mut indexed,
+                &mut timescales,
             );
         }
     }
@@ -5771,7 +5824,8 @@ fn resolve_library_modules(
         g.extend(adopted_texts.into_iter().map(|(p, (_, t))| (p, t)));
     }
     elaborate::set_elab_library_sources(lib_sources);
-    Ok(())
+    timescales.retain(|name, _| adopted.contains(name));
+    Ok((definitions, timescales))
 }
 
 /// Set the log file for simulation output. Placeholder.

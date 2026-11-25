@@ -1095,8 +1095,32 @@ impl<'a> Parser<'a> {
                 } else if self.at(TokenKind::Leq) {
                     // Nonblocking assignment: lvalue <= rvalue
                     self.bump();
-                    self.skip_intra_assignment_timing(); // §9.4.5
-                    let rvalue = self.parse_expression();
+                    // §9.4.5: library and include text can reach the parser
+                    // without the simulator's source-level delay rewrite.
+                    // Keep the same marker shape for scaling and scheduling.
+                    let delay = if self.eat(TokenKind::Hash).is_some() {
+                        Some(if self.eat(TokenKind::LParen).is_some() {
+                            let first = self.parse_expression();
+                            let delay = self.parse_mintypmax_rest(first);
+                            self.expect(TokenKind::RParen);
+                            delay
+                        } else {
+                            self.parse_delay_value()
+                        })
+                    } else {
+                        self.skip_intra_assignment_timing();
+                        None
+                    };
+                    let mut rvalue = self.parse_expression();
+                    if let Some(delay) = delay {
+                        rvalue = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$__xz_intra_delay".to_string(),
+                                args: vec![delay, rvalue],
+                            },
+                            self.span_from(start),
+                        );
+                    }
                     self.expect(TokenKind::Semicolon);
                     Statement::new(
                         StatementKind::NonblockingAssign {
