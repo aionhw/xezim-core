@@ -2759,6 +2759,10 @@ pub struct ElabInstance {
 #[derive(Debug, serde::Deserialize)]
 pub struct ElaboratedModule {
     pub name: String,
+    /// The default net type of the top definition (§22.8).
+    pub default_net_type: Option<NetType>,
+    /// Non-wire kinds and `none` for instantiated definitions (§37.3).
+    pub default_net_types: HashMap<String, Option<NetType>>,
     /// Global simulation tick in seconds — the finest `timescale` precision
     /// across the design (default 1e-9 = 1 ns when none is finer). Delays are
     /// pre-scaled to this unit at elaboration; the simulator counts ticks of it.
@@ -2803,6 +2807,8 @@ pub struct ElaboratedModule {
     /// resolution against each terminal's own drivers.
     #[serde(default)]
     pub tran_switches: Vec<TranSwitch>,
+    #[serde(skip)]
+    pending_switch_implicit_nets: Vec<(String, Option<NetType>)>,
     /// §29 User-Defined Primitive instances (flattened).
     #[serde(default)]
     pub udp_instances: Vec<UdpInstance>,
@@ -3606,6 +3612,8 @@ impl ElaboratedModule {
     pub fn new(name: String) -> Self {
         Self {
             name,
+            default_net_type: Some(NetType::Wire),
+            default_net_types: HashMap::default(),
             tick_s: default_tick_s(),
             signals: SharedNameMap::default(),
             typed_decls: HashMap::default(),
@@ -3615,6 +3623,7 @@ impl ElaboratedModule {
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
             tran_switches: Vec::new(),
+            pending_switch_implicit_nets: Vec::new(),
             udp_instances: Vec::new(),
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
@@ -3977,6 +3986,15 @@ pub enum Definition<'a> {
 }
 
 impl<'a> Definition<'a> {
+    pub fn default_net_type(self) -> Option<NetType> {
+        match self {
+            Self::Module(m) => m.default_net_type,
+            Self::Interface(i) => i.default_net_type,
+            Self::Program(p) => p.default_net_type,
+            _ => Some(NetType::Wire),
+        }
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Definition::Module(m) => &m.name.name,

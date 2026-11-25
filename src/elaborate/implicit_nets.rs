@@ -12,8 +12,11 @@ use super::*;
 /// follow-up pass, the cont-assign can't resolve its LHS signal_id and
 /// gets dropped silently — symptom: c910 wid_for_axi4's `create_en`
 /// stayed X forever, freezing the wid-tracking FIFO.
-pub(super) fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
-    let mut names_to_add: Vec<String> = Vec::new();
+pub(super) fn create_implicit_nets_for_pending(
+    elab: &mut ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+) -> Result<(), String> {
+    let mut names_to_add = Vec::new();
     for pending in &elab.pending_cont_assign {
         let prefix = &pending.ctx.prefix;
         let mut bare = Vec::new();
@@ -100,13 +103,17 @@ pub(super) fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
                 && !elab.parameters.contains_key(&prefixed)
                 && !elab.nets.contains(&prefixed)
             {
-                names_to_add.push(prefixed);
+                let kind = definitions
+                    .get(&pending.ctx.owner)
+                    .copied()
+                    .map_or(elab.default_net_type, Definition::default_net_type);
+                names_to_add.push((prefixed, require_implicit_net_kind(&name, kind)?));
             }
         }
     }
-    names_to_add.sort();
+    names_to_add.sort_by(|(a, _), (b, _)| a.cmp(b));
     names_to_add.dedup();
-    for name in names_to_add {
+    for (name, kind) in names_to_add {
         if crate::implicit_net_warn() {
             crate::elab_diag(format!(
                 "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
@@ -114,24 +121,9 @@ pub(super) fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
                 name
             ));
         }
-        signals_insert_traced(
-            &mut elab.signals,
-            line!(),
-            name.clone(),
-            Signal {
-                is_const: false,
-                name: name.clone().into(),
-                width: 1,
-                is_signed: false,
-                direction: None,
-                value: Value::new(1).into(),
-                is_real: false,
-                type_name: None,
-            },
-        );
-        elab.implicit_nets.insert(name.clone());
-        elab.nets.insert(name);
+        store_implicit_net(elab, name, kind);
     }
+    Ok(())
 }
 
 /// True when every identifier in `e` already has a value in `params`.
@@ -358,6 +350,38 @@ pub(super) fn collect_port_connection_net_candidates(items: &[ModuleItem], out: 
     }
 }
 
+pub(super) fn require_implicit_net_kind(
+    name: &str,
+    kind: Option<NetType>,
+) -> Result<NetType, String> {
+    kind.ok_or_else(|| {
+        format!(
+            "Implicit net '{}' under `default_nettype none (IEEE 1800-2023 §6.10)",
+            name,
+        )
+    })
+}
+
+pub(super) fn store_implicit_net(elab: &mut ElaboratedModule, name: String, kind: NetType) {
+    signals_insert_traced(
+        &mut elab.signals,
+        line!(),
+        name.clone(),
+        Signal {
+            is_const: false,
+            name: name.as_str().into(),
+            width: 1,
+            is_signed: false,
+            direction: None,
+            value: default_net_value(kind, 1, false).into(),
+            is_real: false,
+            type_name: None,
+        },
+    );
+    register_net_type(elab, &name, kind, None);
+    elab.implicit_nets.insert(name);
+}
+
 pub(super) fn declare_block_port_implicit_net_name(
     name: &str,
     elab: &mut ElaboratedModule,
@@ -365,12 +389,7 @@ pub(super) fn declare_block_port_implicit_net_name(
     if elab.signals.contains_key(name) || elab.nets.contains(name) {
         return Ok(());
     }
-    if sv_parser::default_nettype_none_seen() {
-        return Err(format!(
-            "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
-            name
-        ));
-    }
+    let kind = require_implicit_net_kind(name, elab.default_net_type)?;
     if crate::implicit_net_warn() {
         crate::elab_diag(format!(
             "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
@@ -378,29 +397,10 @@ pub(super) fn declare_block_port_implicit_net_name(
             name
         ));
     }
-    signals_insert_traced(
-        &mut elab.signals,
-        line!(),
-        name.to_string(),
-        Signal {
-            is_const: false,
-            name: name.into(),
-            width: 1,
-            is_signed: false,
-            direction: None,
-            value: Value::new(1).into(),
-            is_real: false,
-            type_name: None,
-        },
-    );
-    elab.implicit_nets.insert(name.to_string());
-    elab.nets.insert(name.to_string());
+    store_implicit_net(elab, name.to_string(), kind);
     Ok(())
 }
 
-/// §6.10, §27: a port actual of an instance in a generate block that is an
-/// implicit net of the block (renamed `g[0].n`) is a scalar net of that key.
-/// Module-level port actuals are `create_implicit_nets`'.
 pub(super) fn declare_block_port_implicit_nets(
     e: &Expression,
     elab: &mut ElaboratedModule,
@@ -450,7 +450,6 @@ pub(super) fn create_implicit_nets(
     // wired to each other directly).
     implicit_names.sort();
     implicit_names.dedup();
-    let none_active = sv_parser::default_nettype_none_seen();
     for name in implicit_names {
         if !elab.signals.contains_key(&name) && !elab.parameters.contains_key(&name) {
             // An UNPACKED collection (array/queue/assoc/dynamic) is a genuine
@@ -477,12 +476,11 @@ pub(super) fn create_implicit_nets(
             if declared_collection && !lhs_names.contains(&name) {
                 continue;
             }
-            if none_active && !declared_collection {
-                return Err(format!(
-                    "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
-                    name
-                ));
-            }
+            let kind = if declared_collection {
+                NetType::Wire
+            } else {
+                require_implicit_net_kind(&name, elab.default_net_type)?
+            };
             if !declared_collection && crate::implicit_net_warn() {
                 crate::elab_diag(format!(
                     "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
@@ -490,23 +488,7 @@ pub(super) fn create_implicit_nets(
                     name
                 ));
             }
-            signals_insert_traced(
-                &mut elab.signals,
-                line!(),
-                name.clone(),
-                Signal {
-                    is_const: false,
-                    name: name.clone().into(),
-                    width: 1,
-                    is_signed: false,
-                    direction: None,
-                    value: Value::new(1).into(),
-                    is_real: false,
-                    type_name: None,
-                },
-            );
-            elab.implicit_nets.insert(name.clone());
-            elab.nets.insert(name);
+            store_implicit_net(elab, name, kind);
         }
     }
 
@@ -532,12 +514,7 @@ pub(super) fn create_implicit_nets(
         {
             continue;
         }
-        if none_active {
-            return Err(format!(
-                "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
-                name
-            ));
-        }
+        let kind = require_implicit_net_kind(&name, elab.default_net_type)?;
         // §6.6.8: an implicit net connected to a port of a USER-DEFINED
         // NETTYPE takes that nettype, rather than the §6.10 scalar default —
         // the "nets are automatically coerced" rule that lets an analog node be
@@ -601,23 +578,7 @@ pub(super) fn create_implicit_nets(
                 name
             ));
         }
-        signals_insert_traced(
-            &mut elab.signals,
-            line!(),
-            name.clone(),
-            Signal {
-                is_const: false,
-                name: name.clone().into(),
-                width: 1,
-                is_signed: false,
-                direction: None,
-                value: Value::new(1).into(),
-                is_real: false,
-                type_name: None,
-            },
-        );
-        elab.implicit_nets.insert(name.clone());
-        elab.nets.insert(name);
+        store_implicit_net(elab, name, kind);
     }
     Ok(())
 }

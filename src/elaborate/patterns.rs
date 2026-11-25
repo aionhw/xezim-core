@@ -234,10 +234,18 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
                 is_real: real,
                 direction: None,
                 value: if real {
-                    Value::from_f64(0.0)
-.into()                } else {
-                    Value::new(w)
-.into()                },
+                    Value::from_f64(0.0).into()
+                } else if matches!(
+                    &resolved,
+                    DataType::Simple {
+                        kind: SimpleType::Chandle,
+                        ..
+                    }
+                ) {
+                    Value::zero(w).into()
+                } else {
+                    Value::new(w).into()
+                },
                 type_name: if shortreal {
                     Some("shortreal".into())
                 } else {

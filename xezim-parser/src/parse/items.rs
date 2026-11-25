@@ -276,6 +276,67 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// §6.10 and §23.2.2.1: a non-ANSI direction clause takes the
+    /// default kind only when the port has no separate declaration.
+    fn apply_nonansi_default_net_type(
+        &mut self,
+        ports: &PortList,
+        items: &mut Vec<ModuleItem>,
+        start: u32,
+    ) {
+        if !matches!(ports, PortList::NonAnsi(_)) {
+            return;
+        }
+        let kind = self.default_net_type_at(start);
+        if kind == Some(NetType::Wire) {
+            return;
+        }
+        let mut explicit = std::collections::HashSet::new();
+        for item in items.iter() {
+            match item {
+                ModuleItem::NetDeclaration(d) => {
+                    explicit.extend(d.declarators.iter().map(|d| d.name.name.clone()));
+                }
+                ModuleItem::DataDeclaration(d) => {
+                    explicit.extend(d.declarators.iter().map(|d| d.name.name.clone()));
+                }
+                _ => {}
+            }
+        }
+        let mut index = 0;
+        while index < items.len() {
+            if let ModuleItem::PortDeclaration(pd) = &mut items[index]
+                && pd.net_type.is_none()
+                && matches!(pd.data_type, DataType::Implicit { .. })
+            {
+                if let Some(kind) = kind {
+                    let mut inferred = pd.clone();
+                    inferred
+                        .declarators
+                        .retain(|d| !explicit.contains(&d.name.name));
+                    if inferred.declarators.len() == pd.declarators.len() {
+                        pd.net_type = Some(kind);
+                    } else if !inferred.declarators.is_empty() {
+                        pd.declarators.retain(|d| explicit.contains(&d.name.name));
+                        inferred.net_type = Some(kind);
+                        items.insert(index + 1, ModuleItem::PortDeclaration(inferred));
+                        index += 1;
+                    }
+                } else {
+                    for d in &pd.declarators {
+                        if !explicit.contains(&d.name.name) {
+                            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                                format!("port '{}' requires an explicit declaration under `default_nettype none (IEEE 1800-2023 §6.10)", d.name.name),
+                                d.name.span,
+                            ));
+                        }
+                    }
+                }
+            }
+            index += 1;
+        }
+    }
+
     pub(super) fn parse_module_declaration(&mut self) -> ModuleDeclaration {
         let start = self.current_span().start;
         let outer_loops = std::mem::take(&mut self.plain_loop_vars);
@@ -303,6 +364,7 @@ impl<'a> Parser<'a> {
             prefixed.extend(items);
             items = prefixed;
         }
+        self.apply_nonansi_default_net_type(&ports, &mut items, start);
         self.lower_port_expressions(&ports, &mut items, port_exprs);
         default_subroutine_lifetime(&mut items, lifetime);
 
@@ -313,6 +375,7 @@ impl<'a> Parser<'a> {
         self.check_param_specparams(&params, &items);
 
         ModuleDeclaration {
+            default_net_type: self.default_net_type_at(start),
             lexical_parent: None,
             attrs: Vec::new(),
             kind,
@@ -348,6 +411,7 @@ impl<'a> Parser<'a> {
             prefixed.extend(items);
             items = prefixed;
         }
+        self.apply_nonansi_default_net_type(&ports, &mut items, start);
         self.lower_port_expressions(&ports, &mut items, port_exprs);
         default_subroutine_lifetime(&mut items, lifetime);
 
@@ -357,6 +421,7 @@ impl<'a> Parser<'a> {
         self.check_generate_loop_vars(&loops, &items);
 
         InterfaceDeclaration {
+            default_net_type: self.default_net_type_at(start),
             attrs: Vec::new(),
             lifetime,
             name,
@@ -390,6 +455,7 @@ impl<'a> Parser<'a> {
             prefixed.extend(items);
             items = prefixed;
         }
+        self.apply_nonansi_default_net_type(&ports, &mut items, start);
         self.lower_port_expressions(&ports, &mut items, port_exprs);
         default_subroutine_lifetime(&mut items, lifetime);
 
@@ -399,6 +465,7 @@ impl<'a> Parser<'a> {
         self.check_generate_loop_vars(&loops, &items);
 
         ProgramDeclaration {
+            default_net_type: self.default_net_type_at(start),
             attrs: Vec::new(),
             lifetime,
             name,

@@ -178,6 +178,8 @@ impl Serialize for ElaboratedModule {
         // `#[derive(Deserialize)]` field order.
         let ElaboratedModule {
             name,
+            default_net_type,
+            default_net_types,
             tick_s,
             signals,
             typed_decls: _,
@@ -189,6 +191,7 @@ impl Serialize for ElaboratedModule {
             port_order,
             continuous_assigns,
             tran_switches,
+            pending_switch_implicit_nets: _,
             udp_instances,
             always_blocks,
             initial_blocks,
@@ -318,8 +321,10 @@ impl Serialize for ElaboratedModule {
             source_line_maps: _,
         } = self;
 
-        let mut st = serializer.serialize_struct("ElaboratedModule", 118)?;
+        let mut st = serializer.serialize_struct("ElaboratedModule", 120)?;
         st.serialize_field("name", name)?;
+        st.serialize_field("default_net_type", default_net_type)?;
+        st.serialize_field("default_net_types", default_net_types)?;
         st.serialize_field("tick_s", tick_s)?;
         st.serialize_field("signals", signals)?;
         st.serialize_field("wildcard_shadowed", wildcard_shadowed)?;

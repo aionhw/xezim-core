@@ -723,21 +723,7 @@ impl<'a> Parser<'a> {
                     }
                     _ => None,
                 };
-                // §6.8: `var name;` with no explicit type — implicit `logic`.
-                let data_type = if var_kw
-                    && self.at(TokenKind::Identifier)
-                    && matches!(
-                        self.peek_kind(),
-                        TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign
-                    ) {
-                    DataType::Implicit {
-                        signing: None,
-                        dimensions: Vec::new(),
-                        span: self.span_from(start),
-                    }
-                } else {
-                    self.parse_data_type()
-                };
+                let data_type = self.parse_var_data_type(var_kw, start);
                 let mut declarators = Vec::new();
                 loop {
                     let ds = self.current_span().start;

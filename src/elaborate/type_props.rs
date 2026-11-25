@@ -739,10 +739,9 @@ pub(super) fn default_value_for_type_resolved(
     typedef_types: &HashMap<String, DataType>,
 ) -> Value {
     let resolved = resolve_typedef_chain(dt, typedef_types);
-    // §7.2.1, §6.8: a packed struct whose members are all 2-state starts at
-    // 0, also when a member reaches its type through a typedef
-    // (`s_t [1:0] e;`), which `default_value_for_type` does not resolve.
-    if matches!(resolved, DataType::Struct(su) if su.packed)
+    // §6.8, §6.19.2: a packed struct or enum may reach a two-state
+    // member or base through a typedef.
+    if matches!(resolved, DataType::Struct(_) | DataType::Enum(_))
         && is_type_two_state_resolved(resolved, typedef_types)
     {
         return Value::zero(width);

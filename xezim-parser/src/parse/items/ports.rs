@@ -65,8 +65,19 @@ impl<'a> Parser<'a> {
                     && (!matches!(port.direction, Some(PortDirection::Output))
                         || matches!(&port.data_type, None | Some(DataType::Implicit { .. })))
                 {
-                    let n = self.default_net_pulls.partition_point(|(pos, _)| *pos <= port.span.start);
-                    port.net_type = n.checked_sub(1).and_then(|i| self.default_net_pulls[i].1);
+                    let kind = self.default_net_type_at(port.span.start);
+                    // Bare interface ports have no direction and may name a
+                    // type resolved later by elaboration.
+                    if kind.is_none() && port.direction.is_some() {
+                        self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                            format!(
+                                "port '{}' requires an explicit net or variable kind under `default_nettype none (IEEE 1800-2023 §23.2.2.3)",
+                                port.name.name,
+                            ),
+                            port.span,
+                        ));
+                    }
+                    port.net_type = kind.filter(|nt| *nt != NetType::Wire);
                 }
                 // §23.2.2.4: only an input port takes a default value; an
                 // inout is a net.

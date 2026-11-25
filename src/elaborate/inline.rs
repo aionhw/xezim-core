@@ -1286,7 +1286,19 @@ fn inline_instantiations_inner(
     // signal_id, so create_en stayed X and the wid-tracking FIFO froze
     // → c910 memcpy hang. Scan pending_cont_assign now and create
     // implicit 1-bit wires for any prefixed names that don't yet exist.
-    create_implicit_nets_for_pending(elab);
+    create_implicit_nets_for_pending(elab, definitions)?;
+    for (name, kind) in std::mem::take(&mut elab.pending_switch_implicit_nets) {
+        if !elab.signals.contains_key(&name)
+            && !elab.nets.contains(&name)
+            && !elab.parameters.contains_key(&name)
+            && !elab.var_decl_types.contains_key(&name)
+            && !elab.interfaces.contains(&name)
+            && !elab.arrays.contains_key(&name)
+        {
+            let kind = require_implicit_net_kind(&name, kind)?;
+            store_implicit_net(elab, name, kind);
+        }
+    }
 
     // Identify interface instances at top level (declared or bound directly to top)
     let mut top_interface_names = HashSet::default();

@@ -1782,6 +1782,7 @@ pub fn is_delay_stage_net(name: &str) -> bool {
 pub(super) fn record_tran_switches<F>(
     gi: &GateInstantiation,
     elab: &mut ElaboratedModule,
+    default_net_type: Option<NetType>,
     map: F,
 ) -> bool
 where
@@ -1816,9 +1817,27 @@ where
         } else {
             None
         };
+        let a = map(&inst.terminals[0]);
+        let b = map(&inst.terminals[1]);
+        for (original, mapped) in inst
+            .terminals
+            .iter()
+            .zip([&a, &b].into_iter().chain(ctl.iter()))
+        {
+            if let ExprKind::Ident(h) = &original.kind
+                && h.root.is_none()
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && h.bound != Bound::NO_TARGET
+                && let Some(name) = ident_flat_name(mapped)
+            {
+                elab.pending_switch_implicit_nets
+                    .push((name, default_net_type));
+            }
+        }
         elab.tran_switches.push(TranSwitch {
-            a: map(&inst.terminals[0]),
-            b: map(&inst.terminals[1]),
+            a,
+            b,
             ctl,
             active_high,
         });

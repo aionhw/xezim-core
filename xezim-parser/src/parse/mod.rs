@@ -28,7 +28,7 @@ fn compact_syntax_list<T>(mut items: Vec<T>) -> Vec<T> {
 
 pub struct Parser<'a> {
     // §22.8 directive transitions in source order, consumed outside the grammar.
-    default_net_pulls: Vec<(u32, Option<crate::ast::types::NetType>)>,
+    default_net_types: Vec<(u32, Option<crate::ast::types::NetType>)>,
     tokens: TokenStream<'a>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
@@ -161,15 +161,15 @@ impl<'a> Parser<'a> {
     pub fn new(tokens: TokenStream<'a>) -> Self {
         crate::record_reference_census(&tokens);
         let tokens = Self::join_one_step(tokens);
-        let (tokens, default_net_pulls) = Self::take_default_net_pulls(tokens);
+        let (tokens, default_net_types) = Self::take_default_net_types(tokens);
         let mut parser = Self::new_sub(tokens);
-        parser.default_net_pulls = default_net_pulls;
+        parser.default_net_types = default_net_types;
         parser
     }
 
     /// Drop each `` `default_nettype `` directive and its net type token,
-    /// keeping where it stands and whether it names a pull (tri0/tri1).
-    fn take_default_net_pulls(
+    /// retaining the net kind and source position for each declaration.
+    fn take_default_net_types(
         mut tokens: TokenStream<'a>,
     ) -> (TokenStream<'a>, Vec<(u32, Option<crate::ast::types::NetType>)>) {
         let is_directive = |tokens: &TokenStream<'a>, tok: Token| {
@@ -178,7 +178,7 @@ impl<'a> Parser<'a> {
         if !tokens.iter().any(|tok| is_directive(&tokens, tok)) {
             return (tokens, Vec::new());
         }
-        let mut default_net_pulls = Vec::new();
+        let mut default_net_types = Vec::new();
         let long_ends = tokens.take_long_ends();
         let mut out = TokenStream::with_long_ends(tokens.source(), long_ends);
         let mut after_directive = false;
@@ -187,16 +187,25 @@ impl<'a> Parser<'a> {
             let tok = tokens[i];
             if after_directive {
                 after_directive = false;
+                use crate::ast::types::NetType;
                 let net = match tok.kind {
-                    TokenKind::KwTri0 => Some(crate::ast::types::NetType::Tri0),
-                    TokenKind::KwTri1 => Some(crate::ast::types::NetType::Tri1),
+                    TokenKind::KwTri => Some(NetType::Tri),
+                    TokenKind::KwTri0 => Some(NetType::Tri0),
+                    TokenKind::KwTri1 => Some(NetType::Tri1),
+                    TokenKind::KwWand => Some(NetType::Wand),
+                    TokenKind::KwWor => Some(NetType::Wor),
+                    TokenKind::KwTriand => Some(NetType::TriAnd),
+                    TokenKind::KwTrior => Some(NetType::TriOr),
+                    TokenKind::KwTrireg => Some(NetType::TriReg),
+                    TokenKind::KwUwire => Some(NetType::Uwire),
                     TokenKind::Eof => {
                         out.push_raw(tok);
                         continue;
                     }
-                    _ => None,
+                    _ if tokens.text(tok) == "none" => None,
+                    _ => Some(NetType::Wire),
                 };
-                default_net_pulls.push((tokens.span(tok).start, net));
+                default_net_types.push((tokens.span(tok).start, net));
                 continue;
             }
             after_directive = is_directive(&tokens, tok);
@@ -205,12 +214,22 @@ impl<'a> Parser<'a> {
             }
         }
         out.finish();
-        (out, default_net_pulls)
+        (out, default_net_types)
+    }
+
+    fn default_net_type_at(&self, offset: u32) -> Option<crate::ast::types::NetType> {
+        let n = self
+            .default_net_types
+            .partition_point(|(pos, _)| *pos <= offset);
+        n.checked_sub(1)
+            .map_or(Some(crate::ast::types::NetType::Wire), |i| {
+                self.default_net_types[i].1
+            })
     }
 
     pub(super) fn new_sub(tokens: TokenStream<'a>) -> Self {
         Self {
-            default_net_pulls: Vec::new(),
+            default_net_types: Vec::new(),
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
@@ -989,6 +1008,7 @@ impl<'a> Parser<'a> {
                     fail_span,
                 ));
             Description::Module(crate::ast::module::ModuleDeclaration {
+                default_net_type: self.default_net_type_at(span.start),
                 lexical_parent: None,
                 attrs: Vec::new(),
                 kind: crate::ast::module::ModuleKind::Module,

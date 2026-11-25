@@ -444,20 +444,8 @@ impl<'a> Parser<'a> {
                     && self.at(TokenKind::KwType)
                     && self.peek_kind() == TokenKind::LParen) =>
             {
-                let dt = if self.at(TokenKind::KwVar) {
-                    self.bump();
-                    if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
-                        self.parse_data_type()
-                    } else {
-                        DataType::Implicit {
-                            signing: None,
-                            dimensions: Vec::new(),
-                            span: self.span_from(start),
-                        }
-                    }
-                } else {
-                    self.parse_data_type()
-                };
+                let var_kw = self.eat(TokenKind::KwVar).is_some();
+                let dt = self.parse_var_data_type(var_kw, start);
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
                 ClassItem::Property(ClassProperty {

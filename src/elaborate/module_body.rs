@@ -12,6 +12,7 @@ pub fn elaborate_module_with_defs(
     let _oom_trace = crate::oom_trace::session();
     let _oom_definition = crate::oom_trace::definition(module, "elaborate module", module.name());
     let mut elab = ElaboratedModule::new(module.name().to_string());
+    elab.default_net_type = module.default_net_type();
     // §6.5/§10: within a scope a net/variable must be DECLARED before it is
     // referenced (implicit nets §6.10 are the only exception, and they do not
     // apply to a name declared LATER). Check every data expression, including

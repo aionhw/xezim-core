@@ -440,7 +440,7 @@ pub(super) fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Exp
 
 pub(super) fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
     // §28.8 bidirectional switches: record, don't lower to an assign.
-    if record_tran_switches(gi, elab, |e| e.clone()) {
+    if record_tran_switches(gi, elab, elab.default_net_type, |e| e.clone()) {
         return;
     }
     // Gate delay (`buf #(4)`) — pre-scaled to ticks by the module-delay
@@ -494,7 +494,8 @@ pub(super) fn lower_udp_instances(
     prefix: &str,
     local_names: &std::collections::HashSet<String>,
     interface_map: &HashMap<String, String>,
-) {
+    default_net_type: Option<NetType>,
+) -> Result<(), String> {
     use crate::ast::decl::PortConnection;
     let n_ports = udp.ports.len();
     // Instance delay: `#(d)` or `#(rise, fall)` before the instance — scalar
@@ -587,7 +588,7 @@ pub(super) fn lower_udp_instances(
         // (e.g. a vendor cell's `udp_mux2 I1 (n1, ...)` feeding
         // `udp_dff I0 (n0, n1, ...)`) — without this, both instances were
         // DROPPED as unresolved and the cell went dead.
-        if hi.dimensions.is_empty() && !sv_parser::default_nettype_none_seen() {
+        if hi.dimensions.is_empty() {
             // (instance arrays excluded: their terminals are vectors that get
             // bit-selected per element — a 1-bit implicit net would be wrong)
             for t in &terms {
@@ -603,6 +604,7 @@ pub(super) fn lower_udp_instances(
                             && !elab.signals.contains_key(&name)
                             && !elab.parameters.contains_key(&name)
                         {
+                            let kind = require_implicit_net_kind(&name, default_net_type)?;
                             if crate::implicit_net_warn() {
                                 crate::elab_diag(format!(
                                     "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
@@ -610,23 +612,7 @@ pub(super) fn lower_udp_instances(
                                     name, inst_path
                                 ));
                             }
-                            signals_insert_traced(
-                                &mut elab.signals,
-                                line!(),
-                                name.clone(),
-                                Signal {
-                                    is_const: false,
-                                    name: name.clone().into(),
-                                    width: 1,
-                                    is_signed: false,
-                                    direction: None,
-                                    value: Value::new(1).into(),
-                                    is_real: false,
-                                    type_name: None,
-                                },
-                            );
-                            elab.implicit_nets.insert(name.clone());
-                            elab.nets.insert(name);
+                            store_implicit_net(elab, name, kind);
                         }
                     }
                 }
@@ -709,6 +695,7 @@ pub(super) fn lower_udp_instances(
             }
         }
     }
+    Ok(())
 }
 
 /// A plain decimal integer-literal expression (for synthesized bit-selects).

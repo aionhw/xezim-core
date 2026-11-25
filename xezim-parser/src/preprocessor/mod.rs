@@ -73,7 +73,7 @@ pub struct Preprocessor {
     /// §22.9: pull direction of the ACTIVE `unconnected_drive region
     /// (Some(true)=pull1, Some(false)=pull0), None outside a region.
     unconnected_pull: Option<bool>,
-    default_net_pull: Option<bool>,
+    default_net_type: &'static str,
     /// Macro-expansion-time strict errors (bad argument counts). Interior
     /// mutability because `expand_macros*` run behind `&self`; drained into
     /// `errors` after each line is expanded.
@@ -348,7 +348,7 @@ impl Preprocessor {
             errors: Vec::new(),
             design_element_depth: 0,
             unconnected_pull: None,
-            default_net_pull: None,
+            default_net_type: "wire",
             expansion_errors: std::cell::RefCell::new(Vec::new()),
             undefined_seen: std::cell::RefCell::new(Vec::new()),
             undefined_used: std::cell::RefCell::new(Vec::new()),
@@ -1248,6 +1248,16 @@ impl Preprocessor {
                     continue;
                 }
                 if !in_str && c == b'`' {
+                    if i > seg
+                        && !line[seg..i].trim().is_empty()
+                        && directive_word(&line[i..], "`default_nettype")
+                    {
+                        out.push_str(&line[seg..i]);
+                        out.push('\n');
+                        pos.push((ln, col_of(seg)));
+                        seg = i;
+                        break;
+                    }
                     if let Some((dir_len, takes_name)) = Self::conditional_directive_len(&line[i..])
                     {
                         let mut j = i + dir_len;
@@ -1337,8 +1347,10 @@ impl Preprocessor {
         let mut last_src: i64 = -1;
         // Origin for lines emitted on behalf of the current source line.
         let mut here = fixed.unwrap_or(LineOrigin::plain(self.cur_file_idx, 1, 0));
-        if starts_file && let Some(pull) = self.default_net_pull {
-            output.push_str(if pull { "`default_nettype tri1\n" } else { "`default_nettype tri0\n" });
+        if starts_file && self.default_net_type != "wire" {
+            output.push_str("`default_nettype ");
+            output.push_str(self.default_net_type);
+            output.push('\n');
             sink.fill(&output, here);
         }
         let mut joined: Vec<usize> = Vec::new();
@@ -1676,24 +1688,43 @@ impl Preprocessor {
                 continue;
             }
             if directive_word(trimmed, "`default_nettype") {
-                let rest = trimmed.trim_start_matches("`default_nettype").trim();
-                if rest.starts_with("none") {
-                    crate::set_default_nettype_none_seen(true);
+                if crate::strict_checks() && self.design_element_depth > 0 {
+                    self.push_error_here(
+                        "`default_nettype is illegal inside a design element (IEEE 1800-2023 §22.8)".into(),
+                    );
                 }
-                let pull = match rest.split_whitespace().next() {
-                    Some("tri0") => Some(false),
-                    Some("tri1") => Some(true),
-                    _ => None,
-                };
-                if pull.is_some() || self.default_net_pull.is_some() {
-                    output.push_str(match pull {
-                        Some(true) => "`default_nettype tri1",
-                        Some(false) => "`default_nettype tri0",
-                        None => "`default_nettype wire",
-                    });
+                let expanded = self.expand_macros(trimmed["`default_nettype".len()..].trim_start());
+                self.flush_expansion_diagnostics();
+                let mut words = expanded.trim_start().splitn(2, char::is_whitespace);
+                let word = words.next().unwrap_or_default();
+                let valid = [
+                    "wire", "tri", "tri0", "tri1", "wand", "triand", "wor", "trior", "trireg",
+                    "uwire", "none",
+                ];
+                if let Some(kind) = valid.into_iter().find(|&kind| kind == word) {
+                    self.default_net_type = kind;
+                    if kind == "none" {
+                        crate::set_default_nettype_none_seen(true);
+                    }
+                    output.push_str("`default_nettype ");
+                    output.push_str(kind);
+                    output.push('\n');
+                    sink.fill(&output, here);
+                    if let Some(tail) = words.next().map(str::trim_start).filter(|t| !t.is_empty())
+                    {
+                        if crate::strict_checks() {
+                            Self::update_design_depth(tail, &mut self.design_element_depth);
+                        }
+                        self.note_design_elements(tail);
+                        output.push_str(tail);
+                        output.push('\n');
+                    }
+                } else {
+                    self.push_error_here(format!(
+                        "invalid `default_nettype value '{word}' (IEEE 1800-2023 §22.8)"
+                    ));
+                    output.push('\n');
                 }
-                self.default_net_pull = pull;
-                output.push('\n');
                 continue;
             }
             // IEEE 1800-2023 §22.14: `begin_keywords "<version>" pushes a
@@ -1885,7 +1916,8 @@ impl Preprocessor {
                 // §22.3: `\`resetall` resets all compiler directives to their
                 // defaults, including clearing the active `\`timescale`, so a
                 // module declared after it has no explicit source-level timescale.
-                if self.default_net_pull.take().is_some() {
+                if self.default_net_type != "wire" {
+                    self.default_net_type = "wire";
                     output.push_str("`default_nettype wire");
                 }
                 self.timescale = None;

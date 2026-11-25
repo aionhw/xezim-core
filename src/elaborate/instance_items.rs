@@ -61,7 +61,8 @@ pub(super) fn inline_instantiation_items(
                     prefix,
                     parent_local_names,
                     interface_map,
-                );
+                    source_def.default_net_type(),
+                )?;
                 continue;
             }
             // §23.3.2: only a primitive instance may omit its name.
@@ -278,7 +279,7 @@ pub(super) fn inline_instantiation_items(
                             .collect();
                         collect_port_connection_net_candidates(&bound, &mut cands);
                     }
-                    create_target_implicit_nets(elab, sub_mod, &inst_prefix, cands);
+                    create_target_implicit_nets(elab, sub_mod, &inst_prefix, cands)?;
                 }
 
                 iprof_since("ck1_after_implnet", __th);
@@ -6760,7 +6761,7 @@ pub(super) fn inline_instantiation_items(
                     if let ModuleItem::GateInstantiation(gi) = sub_item {
                         // §28.8 switches produce no assign pairs; record them
                         // with terminals rewritten into this instance's scope.
-                        record_tran_switches(gi, elab, |e| {
+                        record_tran_switches(gi, elab, sub_mod.default_net_type(), |e| {
                             rewrite_expr(
                                 e,
                                 &pend_ctx.prefix,
@@ -6999,6 +7000,13 @@ pub(super) fn inline_instantiation_items(
                 // Record the instance before descending. Inlining is about to
                 // dissolve this module into the parent, so this is the only
                 // place the (path, definition) pair still exists.
+                let default_net_type = sub_mod.default_net_type();
+                if default_net_type != Some(NetType::Wire)
+                    && !elab.default_net_types.contains_key(sub_mod_name)
+                {
+                    elab.default_net_types
+                        .insert(sub_mod_name.clone(), default_net_type);
+                }
                 elab.instances.push(ElabInstance {
                     path: inst_path_shared,
                     def_name: sub_mod_name.as_str().into(),

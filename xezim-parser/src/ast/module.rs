@@ -15,6 +15,8 @@ pub enum ModuleKind {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ModuleDeclaration {
+    /// The active `default_nettype (§22.8). `None` forbids implicit nets.
+    pub default_net_type: Option<NetType>,
     /// Enclosing module when a nested definition is hoisted (§23.4).
     #[cfg_attr(feature = "serde", serde(default))]
     pub lexical_parent: Option<String>,
@@ -32,6 +34,8 @@ pub struct ModuleDeclaration {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InterfaceDeclaration {
+    /// The active `default_nettype (§22.8). `None` forbids implicit nets.
+    pub default_net_type: Option<NetType>,
     pub attrs: Vec<AttributeInstance>,
     pub lifetime: Option<Lifetime>,
     pub name: Identifier,
@@ -45,6 +49,8 @@ pub struct InterfaceDeclaration {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProgramDeclaration {
+    /// The active `default_nettype (§22.8). `None` forbids implicit nets.
+    pub default_net_type: Option<NetType>,
     pub attrs: Vec<AttributeInstance>,
     pub lifetime: Option<Lifetime>,
     pub name: Identifier,

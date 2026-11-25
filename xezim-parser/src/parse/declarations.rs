@@ -441,22 +441,7 @@ impl<'a> Parser<'a> {
         let const_kw = self.eat(TokenKind::KwConst).is_some();
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         let lifetime = self.parse_optional_lifetime();
-        // §6.8: `var name;` — the `var` keyword with no explicit type means the
-        // identifier is the declarator (implicit `logic`), not a type name.
-        let data_type = if var_kw
-            && self.at(TokenKind::Identifier)
-            && matches!(
-                self.peek_kind(),
-                TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign
-            ) {
-            DataType::Implicit {
-                signing: None,
-                dimensions: Vec::new(),
-                span: self.span_from(start),
-            }
-        } else {
-            self.parse_data_type()
-        };
+        let data_type = self.parse_var_data_type(var_kw, start);
         let declarators = self.parse_var_declarator_list();
         self.expect(TokenKind::Semicolon);
         DataDeclaration {
@@ -467,6 +452,29 @@ impl<'a> Parser<'a> {
             data_type,
             declarators,
             span: self.span_from(start),
+        }
+    }
+
+    /// §6.8: after `var`, a name followed only by unpacked dimensions
+    /// and a declaration delimiter is a declarator of implicit logic.
+    pub(super) fn parse_var_data_type(&mut self, var_kw: bool, start: u32) -> DataType {
+        if var_kw
+            && matches!(
+                self.current_kind(),
+                TokenKind::Identifier | TokenKind::EscapedIdentifier
+            )
+            && (matches!(
+                self.peek_kind(),
+                TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign
+            ) || (self.peek_kind() == TokenKind::LBracket && !self.dims_then_identifier(1)))
+        {
+            DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+            }
+        } else {
+            self.parse_data_type()
         }
     }
 

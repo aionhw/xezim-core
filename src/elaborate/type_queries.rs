@@ -923,6 +923,7 @@ pub fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> O
         ExprKind::SystemCall { name, args } => match name.as_str() {
             "$signed" | "$unsigned" => w(args.first()?),
             "$clog2" | "$bits" | "$size" | "$countones" => Some(32),
+            name if is_cast_call(name) => const_cast_bits(e, params),
             _ => None,
         },
         // §11.4.13: `inside` is one bit.

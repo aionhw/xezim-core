@@ -520,9 +520,9 @@ pub(super) fn create_target_implicit_nets(
     target_def: Definition,
     inst_prefix: &str,
     mut cands: Vec<String>,
-) {
+) -> Result<(), String> {
     if cands.is_empty() {
-        return;
+        return Ok(());
     }
     let __ta = iprof_now();
     let target_port_names: std::collections::HashSet<String> = match target_def.ports() {
@@ -606,6 +606,7 @@ pub(super) fn create_target_implicit_nets(
         if target_declares.contains(&name) {
             continue;
         }
+        let kind = require_implicit_net_kind(&scoped, target_def.default_net_type())?;
         if crate::implicit_net_warn() {
             crate::elab_diag(format!(
                 "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
@@ -613,25 +614,10 @@ pub(super) fn create_target_implicit_nets(
                 scoped
             ));
         }
-        signals_insert_traced(
-            &mut elab.signals,
-            line!(),
-            scoped.clone(),
-            Signal {
-                is_const: false,
-                name: scoped.clone().into(),
-                width: 1,
-                is_signed: false,
-                direction: None,
-                value: Value::new(1).into(),
-                is_real: false,
-                type_name: None,
-            },
-        );
-        elab.implicit_nets.insert(scoped.clone());
-        elab.nets.insert(scoped);
+        store_implicit_net(elab, scoped, kind);
     }
     iprof_since("implicit_net_scan", __ta);
+    Ok(())
 }
 
 /// §23.11: register the instances a `bind` creates as child names of its
@@ -899,7 +885,7 @@ pub(super) fn inline_bound_items(
         if cands.iter().any(|n| !local_names.contains(n)) {
             Rc::make_mut(local_names).extend(cands.iter().cloned());
         }
-        create_target_implicit_nets(elab, source_def, &prefix, cands);
+        create_target_implicit_nets(elab, source_def, &prefix, cands)?;
     }
     // §23.11: the bound instances are children of THIS scope, so their names must
     // be local names of it before any of them is inlined — a bound connection

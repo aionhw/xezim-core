@@ -196,6 +196,19 @@ impl<'a> Parser<'a> {
                         span: self.span_from(start),
                     }
                 };
+                let dt = match dt {
+                    DataType::Implicit {
+                        signing,
+                        dimensions,
+                        span,
+                    } if has_var => DataType::IntegerVector {
+                        kind: IntegerVectorType::Logic,
+                        signing,
+                        dimensions,
+                        span,
+                    },
+                    _ => dt,
+                };
                 let wreal_span = self.span_from(start);
                 let dt = match nt {
                     Some(n) => self.wreal_data_type(n, dt, wreal_span),

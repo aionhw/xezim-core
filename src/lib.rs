@@ -317,7 +317,8 @@ pub use value::Value;
 /// \x73 stores compact `SignalValue` and `ContinuousAssignment::PlainLink` encodings (#721).
 /// \x74 preserves the bound expressions of parameter-sized static class arrays (§8.25).
 /// \x75 retains bounded class queue declarations (§7.10, §8.25).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x75";
+/// \x76 retains a design definition's default net type (§22.8).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x76";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1315,6 +1316,7 @@ fn new_design_preprocessor(
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
 ) -> preprocessor::Preprocessor {
+    sv_parser::set_default_nettype_none_seen(false);
     let mut pp = preprocessor::Preprocessor::new();
     for dir in include_dirs {
         pp.add_include_dir(std::path::PathBuf::from(dir));
@@ -2723,6 +2725,7 @@ fn parse_and_elaborate(
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
                 let m = ast::module::ModuleDeclaration {
+                    default_net_type: Some(ast::types::NetType::Wire),
                     lexical_parent: None,
                     attrs: Vec::new(),
                     kind: ast::module::ModuleKind::Module,
@@ -5054,6 +5057,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         })
         .collect();
     ast::module::ModuleDeclaration {
+        default_net_type: Some(ast::types::NetType::Wire),
         lexical_parent: None,
         attrs: vec![],
         kind: ast::module::ModuleKind::Module,

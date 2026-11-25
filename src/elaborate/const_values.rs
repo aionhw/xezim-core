@@ -687,13 +687,7 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
             // `5'(3'd7 + 3'd6)` is 13, not the 3-bit-wrapped 5.
             let v = eval_const_expr_val_with_ctx(&args[1], params, Some(n), types);
             if v.is_real {
-                let f = v.to_f64();
-                let r = if f >= 0.0 {
-                    (f + 0.5).floor()
-                } else {
-                    (f - 0.5).ceil()
-                };
-                Value::from_u64((r as i64) as u64, 64).resize(n)
+                Value::from_real_wrapped(v.to_f64(), n)
             } else {
                 v.resize(n)
             }
@@ -726,8 +720,12 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     .or_else(|| param_fallback_get(&nm).and_then(|v| v.to_u64()))
                 {
                     let w = (w.max(1)) as u32;
-                    let mut out =
-                        eval_const_expr_val_with_ctx(&args[1], params, Some(w), types).resize(w);
+                    let v = eval_const_expr_val_with_ctx(&args[1], params, Some(w), types);
+                    let mut out = if v.is_real {
+                        Value::from_real_wrapped(v.to_f64(), w)
+                    } else {
+                        v.resize(w)
+                    };
                     out.is_signed = false;
                     return out;
                 }
@@ -737,11 +735,13 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                 if let Some((w, signed)) = const_typedef_cast_target(&nm, scoped.as_deref(), params)
                 {
                     let v = eval_const_expr_val_with_ctx(&args[1], params, Some(w), types);
-                    if !v.is_real {
-                        let mut out = v.resize(w);
-                        out.is_signed = signed;
-                        return out;
-                    }
+                    let mut out = if v.is_real {
+                        Value::from_real_wrapped(v.to_f64(), w)
+                    } else {
+                        v.resize(w)
+                    };
+                    out.is_signed = signed;
+                    return out;
                 }
                 // A typedef whose declared type is not known here: only an
                 // operator expression can observe a context, and the width
@@ -790,14 +790,7 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     eval_const_expr_val_inner(&args[1], params, types)
                 };
                 let mut out = if v.is_real {
-                    // §6.24.1: real-to-int conversion ROUNDS (away from zero).
-                    let f = v.to_f64();
-                    let r = if f >= 0.0 {
-                        (f + 0.5).floor()
-                    } else {
-                        (f - 0.5).ceil()
-                    };
-                    Value::from_u64((r as i64) as u64, 64).resize(w)
+                    Value::from_real_wrapped(v.to_f64(), w)
                 } else {
                     v.resize(w)
                 };
