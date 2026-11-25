@@ -1019,6 +1019,7 @@ fn elaborate_class_in_scope(
     let mut assoc_key_decl_types: HashMap<String, DataType> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut queue_property_names = HashSet::default();
+    let mut queue_property_bounds = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut param_sized_props: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
@@ -1043,8 +1044,10 @@ fn elaborate_class_in_scope(
     let mut local_typedef_dims: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     for item in &c.items {
         if let ClassItem::Typedef(td) = item {
-            if !td.dimensions.is_empty() {
-                local_typedef_dims.insert(td.name.name.clone(), td.dimensions.clone());
+            let mut dims = td.dimensions.clone();
+            dims.extend(typedef_row_dims(&td.data_type, &local_typedef_dims));
+            if !dims.is_empty() {
+                local_typedef_dims.insert(td.name.name.clone(), dims);
             }
         }
     }
@@ -1132,6 +1135,18 @@ fn elaborate_class_in_scope(
                     ) {
                         queue_property_names.insert(decl.name.name.clone());
                     }
+                    if let Some(UnpackedDimension::Queue { max_size: Some(bound), .. }) =
+                        effective_dims.first()
+                    {
+                        let bound = if range_refs_class_header_param(c, bound, bound) {
+                            (**bound).clone()
+                        } else {
+                            const_eval_i64_with_params(bound, Some(const_scope))
+                                .map(|value| make_i64_literal(value, bound.span))
+                                .unwrap_or_else(|| (**bound).clone())
+                        };
+                        queue_property_bounds.insert(decl.name.name.clone(), bound);
+                    }
                     // `mem[N]` parses as an ASSOCIATIVE dimension keyed by
                     // "type N" (a bare identifier before `]` reads as a type).
                     // When `N` is a known constant and NOT a typedef, rewrite
@@ -1201,6 +1216,22 @@ fn elaborate_class_in_scope(
                     // Static member collections share one global store; route
                     // them out of the per-instance maps.
                     if is_static {
+                        // §8.25: a fixed static array is registered at the
+                        // default shape, then its declaring specialization
+                        // evaluates the original bounds for its own store.
+                        let spec_fixed = binds_values
+                            && match effective_dims.as_slice() {
+                            [UnpackedDimension::Expression { expr, .. }] => {
+                                const_eval_i64_with_params(expr, None).is_none()
+                            }
+                            [UnpackedDimension::Range { left, right, .. }] => {
+                                const_eval_i64_with_params(left, None).is_none()
+                                    || const_eval_i64_with_params(right, None).is_none()
+                            }
+                            _ => false,
+                        };
+                        let fixed_params = if spec_fixed { class_params } else { unpacked_params };
+                        let count_before = static_fixed_arrays.len();
                         // Second field is `is_associative` (NOT key-is-string).
                         match effective_dims.first() {
                             Some(UnpackedDimension::Associative {
@@ -1282,7 +1313,7 @@ fn elaborate_class_in_scope(
                             // shared global store, the same way the
                             // queue/assoc statics above get one.
                             Some(UnpackedDimension::Expression { expr, .. }) => {
-                                if let Some(n) = const_eval_i64_with_params(expr, unpacked_params) {
+                                if let Some(n) = const_eval_i64_with_params(expr, fixed_params) {
                                     if n > 0 {
                                         static_fixed_arrays.push((
                                             decl.name.name.clone(),
@@ -1295,8 +1326,8 @@ fn elaborate_class_in_scope(
                             }
                             Some(UnpackedDimension::Range { left, right, .. }) => {
                                 if let (Some(l), Some(r)) = (
-                                    const_eval_i64_with_params(left, unpacked_params),
-                                    const_eval_i64_with_params(right, unpacked_params),
+                                    const_eval_i64_with_params(left, fixed_params),
+                                    const_eval_i64_with_params(right, fixed_params),
                                 ) {
                                     static_fixed_arrays.push((
                                         decl.name.name.clone(),
@@ -1311,6 +1342,10 @@ fn elaborate_class_in_scope(
                                 }
                             }
                             _ => {}
+                        }
+                        if spec_fixed && static_fixed_arrays.len() != count_before {
+                            param_sized_props
+                                .insert(decl.name.name.clone(), effective_dims.clone());
                         }
                     }
                     // A typedef'd key (`k12_t`) resolves through the class's
@@ -2130,6 +2165,7 @@ fn elaborate_class_in_scope(
         assoc_key_decl_types,
         queue_properties,
         queue_property_names,
+        queue_property_bounds,
         property_inits,
         static_collections,
         static_assoc_key_types,
