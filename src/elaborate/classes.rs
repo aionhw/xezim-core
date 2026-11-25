@@ -1201,6 +1201,22 @@ fn elaborate_class_in_scope(
                     // Static member collections share one global store; route
                     // them out of the per-instance maps.
                     if is_static {
+                        // §8.25: a fixed static array is registered at the
+                        // default shape, then its declaring specialization
+                        // evaluates the original bounds for its own store.
+                        let spec_fixed = binds_values
+                            && match effective_dims.as_slice() {
+                            [UnpackedDimension::Expression { expr, .. }] => {
+                                const_eval_i64_with_params(expr, None).is_none()
+                            }
+                            [UnpackedDimension::Range { left, right, .. }] => {
+                                const_eval_i64_with_params(left, None).is_none()
+                                    || const_eval_i64_with_params(right, None).is_none()
+                            }
+                            _ => false,
+                        };
+                        let fixed_params = if spec_fixed { class_params } else { unpacked_params };
+                        let count_before = static_fixed_arrays.len();
                         // Second field is `is_associative` (NOT key-is-string).
                         match effective_dims.first() {
                             Some(UnpackedDimension::Associative {
@@ -1282,7 +1298,7 @@ fn elaborate_class_in_scope(
                             // shared global store, the same way the
                             // queue/assoc statics above get one.
                             Some(UnpackedDimension::Expression { expr, .. }) => {
-                                if let Some(n) = const_eval_i64_with_params(expr, unpacked_params) {
+                                if let Some(n) = const_eval_i64_with_params(expr, fixed_params) {
                                     if n > 0 {
                                         static_fixed_arrays.push((
                                             decl.name.name.clone(),
@@ -1295,8 +1311,8 @@ fn elaborate_class_in_scope(
                             }
                             Some(UnpackedDimension::Range { left, right, .. }) => {
                                 if let (Some(l), Some(r)) = (
-                                    const_eval_i64_with_params(left, unpacked_params),
-                                    const_eval_i64_with_params(right, unpacked_params),
+                                    const_eval_i64_with_params(left, fixed_params),
+                                    const_eval_i64_with_params(right, fixed_params),
                                 ) {
                                     static_fixed_arrays.push((
                                         decl.name.name.clone(),
@@ -1311,6 +1327,10 @@ fn elaborate_class_in_scope(
                                 }
                             }
                             _ => {}
+                        }
+                        if spec_fixed && static_fixed_arrays.len() != count_before {
+                            param_sized_props
+                                .insert(decl.name.name.clone(), effective_dims.clone());
                         }
                     }
                     // A typedef'd key (`k12_t`) resolves through the class's

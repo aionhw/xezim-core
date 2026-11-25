@@ -315,7 +315,8 @@ pub use value::Value;
 /// \x71 retains edge and condition metadata on module paths for SDF matching.
 /// \x72 drops elaboration-only `decl_sites` from compiled artifacts (#721).
 /// \x73 stores compact `SignalValue` and `ContinuousAssignment::PlainLink` encodings (#721).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x73";
+/// \x74 preserves the bound expressions of parameter-sized static class arrays (§8.25).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x74";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
