@@ -11,6 +11,26 @@ pub fn generate_for_start(gf: &GenerateFor, params: &HashMap<String, Value>) -> 
         .unwrap_or(gf.init_val)
 }
 
+/// §27.4: the genvar's next value after iteration `i`, with the genvar
+/// set to `i` in `params`: `i++`, `i--`, or the folded `i = <expr>`.
+pub(super) fn generate_for_next(gf: &GenerateFor, i: i64, params: &HashMap<String, Value>) -> i64 {
+    match &gf.incr.kind {
+        ExprKind::Unary {
+            op: UnaryOp::PostIncr | UnaryOp::PreIncr,
+            ..
+        } => i + 1,
+        ExprKind::Unary {
+            op: UnaryOp::PostDecr | UnaryOp::PreDecr,
+            ..
+        } => i - 1,
+        _ => {
+            // Try to evaluate as expression (e.g. i = i + 1 expanded by parser)
+            let new_val = eval_const_expr(&gf.incr, params) as i64;
+            if new_val == i { i + 1 } else { new_val }
+        }
+    }
+}
+
 /// §27.5: a generate-if/-case condition may be a user constant-function call
 /// (`if (has_neighbor(r, dir))`). `is_const_expr` rejects a Call and
 /// `eval_const_expr` reads one as 0, so fold the calls to literals first —
@@ -209,38 +229,7 @@ pub(super) fn elaborate_generate_for(
             );
         }
         iter_count += 1;
-        // Evaluate increment: handle i++, i=i+1, etc.
-        match &gf.incr.kind {
-            ExprKind::Unary {
-                op: UnaryOp::PostIncr,
-                ..
-            }
-            | ExprKind::Unary {
-                op: UnaryOp::PreIncr,
-                ..
-            } => {
-                i += 1;
-            }
-            ExprKind::Unary {
-                op: UnaryOp::PostDecr,
-                ..
-            }
-            | ExprKind::Unary {
-                op: UnaryOp::PreDecr,
-                ..
-            } => {
-                i -= 1;
-            }
-            _ => {
-                // Try to evaluate as expression (e.g. i = i + 1 expanded by parser)
-                let new_val = eval_const_expr(&gf.incr, &elab.parameters) as i64;
-                if new_val == i {
-                    i += 1;
-                } else {
-                    i = new_val;
-                }
-            }
-        }
+        i = generate_for_next(gf, i, &elab.parameters);
     }
     elab.remove_param(var);
     if hit_cap {
