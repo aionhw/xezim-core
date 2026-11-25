@@ -2548,6 +2548,10 @@ pub struct ElaboratedClass {
     pub queue_properties: HashMap<String, (u32, Option<u32>)>,
     /// §7.10: queue declarations among queue/dynamic-array properties.
     pub queue_property_names: HashSet<String>,
+    /// §7.10 and §8.25: the declared upper index of each bounded queue,
+    /// evaluated in the declaring class with its actual value parameters.
+    #[serde(default)]
+    pub queue_property_bounds: HashMap<String, Expression>,
     /// Initializer expressions for scalar properties (`int x = EXPR;`). Held so
     /// they can be re-evaluated at instantiation against the live parameter
     /// table — `elaborate_class` runs before package params are bound, so a

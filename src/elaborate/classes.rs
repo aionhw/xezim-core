@@ -1019,6 +1019,7 @@ fn elaborate_class_in_scope(
     let mut assoc_key_decl_types: HashMap<String, DataType> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut queue_property_names = HashSet::default();
+    let mut queue_property_bounds = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut param_sized_props: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
@@ -1043,8 +1044,10 @@ fn elaborate_class_in_scope(
     let mut local_typedef_dims: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     for item in &c.items {
         if let ClassItem::Typedef(td) = item {
-            if !td.dimensions.is_empty() {
-                local_typedef_dims.insert(td.name.name.clone(), td.dimensions.clone());
+            let mut dims = td.dimensions.clone();
+            dims.extend(typedef_row_dims(&td.data_type, &local_typedef_dims));
+            if !dims.is_empty() {
+                local_typedef_dims.insert(td.name.name.clone(), dims);
             }
         }
     }
@@ -1131,6 +1134,18 @@ fn elaborate_class_in_scope(
                         Some(UnpackedDimension::Queue { .. })
                     ) {
                         queue_property_names.insert(decl.name.name.clone());
+                    }
+                    if let Some(UnpackedDimension::Queue { max_size: Some(bound), .. }) =
+                        effective_dims.first()
+                    {
+                        let bound = if range_refs_class_header_param(c, bound, bound) {
+                            (**bound).clone()
+                        } else {
+                            const_eval_i64_with_params(bound, Some(const_scope))
+                                .map(|value| make_i64_literal(value, bound.span))
+                                .unwrap_or_else(|| (**bound).clone())
+                        };
+                        queue_property_bounds.insert(decl.name.name.clone(), bound);
                     }
                     // `mem[N]` parses as an ASSOCIATIVE dimension keyed by
                     // "type N" (a bare identifier before `]` reads as a type).
@@ -2150,6 +2165,7 @@ fn elaborate_class_in_scope(
         assoc_key_decl_types,
         queue_properties,
         queue_property_names,
+        queue_property_bounds,
         property_inits,
         static_collections,
         static_assoc_key_types,
