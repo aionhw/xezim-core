@@ -152,6 +152,35 @@ pub fn anon_enum_members_ordered(
     }
 }
 
+/// Resolve every member of `et` in declaration order to `(name, low64, Value)`
+/// preserving name-sequence ranges, 4-state X/Z literals, wide >64-bit values,
+/// and base signedness (`enum_signed`).
+pub fn enum_members_values(
+    et: &crate::ast::types::EnumType,
+    base_width: u32,
+    enum_signed: bool,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> Vec<(String, u64, Value)> {
+    let mut next_val: u64 = 0;
+    let wide_vals = (base_width > 64).then(|| wide_enum_value_map(et, base_width, params));
+    let mut out = Vec::with_capacity(et.members.len());
+    for member in &et.members {
+        let (entries, nv) = expand_enum_member(member, next_val, params);
+        next_val = nv;
+        for (nm, val) in entries {
+            let mut v = enum_member_4state(member, val, base_width, params);
+            if let Some(w) = wide_vals.as_ref().and_then(|m| m.get(&nm)) {
+                v = w.clone();
+            }
+            if !v.is_real {
+                v.is_signed = enum_signed;
+            }
+            out.push((nm, val, v));
+        }
+    }
+    out
+}
+
 pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModule) {
     // §6.19: an enum declared INSIDE a struct member's type installs its
     // members in the scope enclosing the STRUCT — `struct packed { enum
@@ -163,36 +192,26 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
         return;
     }
     if let DataType::Enum(et) = dt {
+        let enum_signed = is_type_signed_resolved(dt, &elab.typedef_types);
         let base_width = et
             .base_type
             .as_ref()
             .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
             .unwrap_or(32);
-        let mut next_val: u64 = 0;
-        let wide_vals =
-            (base_width > 64).then(|| wide_enum_value_map(et, base_width, &elab.parameters));
-        for member in &et.members {
-            let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
-            next_val = nv;
-            for (nm, val) in entries {
-                let mut v = enum_member_4state(member, val, base_width, &elab.parameters);
-                if let Some(w) = wide_vals.as_ref().and_then(|m| m.get(&nm)) {
-                    v = w.clone();
-                }
-                elab.parameters
-                    .entry(nm.clone())
-                    .or_insert_with(|| v.clone());
-                elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
-                    is_const: false,
-                    name: nm.clone().into(),
-                    width: base_width,
-                    is_signed: false,
-                    is_real: false,
-                    direction: None,
-                    value: v.into(),
-                    type_name: None,
-                });
-            }
+        for (nm, _val, v) in enum_members_values(et, base_width, enum_signed, &elab.parameters) {
+            elab.parameters
+                .entry(nm.clone())
+                .or_insert_with(|| v.clone());
+            elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
+                is_const: false,
+                name: nm.clone().into(),
+                width: base_width,
+                is_signed: enum_signed,
+                is_real: false,
+                direction: None,
+                value: v.into(),
+                type_name: None,
+            });
         }
     }
 }

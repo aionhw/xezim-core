@@ -95,6 +95,26 @@ fn walk_class_typedefs(
                             .insert(key.clone(), td.dimensions.clone());
                     }
                 }
+                if let DataType::Enum(et) = dt {
+                    let enum_signed = is_type_signed_resolved(dt, &elab.typedef_types);
+                    let base_width = et
+                        .base_type
+                        .as_ref()
+                        .map(|bt| resolve_type_width(bt, Some(params), Some(&elab.typedefs)))
+                        .unwrap_or(32);
+                    let resolved = enums::enum_members_values(et, base_width, enum_signed, params);
+                    let ordered: Vec<(String, u64)> = resolved
+                        .iter()
+                        .map(|(nm, val, _)| (nm.clone(), *val))
+                        .collect();
+                    for pfx in prefixes {
+                        elab.enum_members
+                            .insert(format!("{}::{}", pfx, td.name.name), ordered.clone());
+                        for (nm, _, v) in &resolved {
+                            elab.set_param(line!(), format!("{}::{}", pfx, nm), v.clone());
+                        }
+                    }
+                }
             }
             ClassItem::Class(sub) => {
                 let nested: Vec<String> = prefixes

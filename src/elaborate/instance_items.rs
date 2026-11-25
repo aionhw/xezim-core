@@ -3116,6 +3116,8 @@ pub(super) fn inline_instantiation_items(
                 for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
                         if let DataType::Enum(et) = &td.data_type {
+                            let enum_signed =
+                                is_type_signed_resolved(&td.data_type, &elab.typedef_types);
                             let base_width = et
                                 .base_type
                                 .as_ref()
@@ -3127,9 +3129,6 @@ pub(super) fn inline_instantiation_items(
                                     )
                                 })
                                 .unwrap_or(32);
-                            let mut next_val: u64 = 0;
-                            let wide_vals = (base_width > 64)
-                                .then(|| wide_enum_value_map(et, base_width, &sub_merged_params));
                             // §6.19.6: the member LIST of this instance's enum,
                             // for `.name()/.first()/.num()` on its variables.
                             // Submodule enums never reach `process_typedef`, so
@@ -3138,19 +3137,13 @@ pub(super) fn inline_instantiation_items(
                             // by-value scan (a sibling's `PB` for our `SB`),
                             // and `.num()` read 0.
                             let mut inst_members: Vec<(String, u64)> = Vec::new();
-                            for member in &et.members {
-                                let val = if let Some(init) = &member.init {
-                                    eval_const_expr(init, &sub_merged_params)
-                                } else {
-                                    next_val
-                                };
-                                next_val = val.wrapping_add(1);
-                                inst_members.push((member.name.name.clone(), val));
-                                let v = wide_vals
-                                    .as_ref()
-                                    .and_then(|m| m.get(&member.name.name))
-                                    .cloned()
-                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
+                            for (nm, val, v) in enums::enum_members_values(
+                                et,
+                                base_width,
+                                enum_signed,
+                                &sub_merged_params,
+                            ) {
+                                inst_members.push((nm.clone(), val));
                                 // Don't clobber an already-registered member
                                 // with a DIFFERENT value: xezim's parameter
                                 // namespace is flat, but per LRM §22.1.4 +
@@ -3165,24 +3158,27 @@ pub(super) fn inline_instantiation_items(
                                 // `prefetch_state_e::IDLE`=0 / `rvvi_c_e::IDLE`=0,
                                 // and every other module's `case` arm that
                                 // references IDLE matches the wrong arm.
-                                let prior = elab.parameters.get(&member.name.name).cloned();
+                                let prior = elab.parameters.get(&nm).cloned();
                                 let should_insert = match &prior {
                                     None => true,
+                                    Some(p) if v.has_xz() || p.has_xz() => {
+                                        p.width == v.width && p.case_eq(&v).to_u64() == Some(1)
+                                    }
                                     Some(p) => p.to_u64() == Some(val),
                                 };
                                 if should_insert {
-                                    elab.set_param(line!(), member.name.name.clone(), v.clone());
+                                    elab.set_param(line!(), nm.clone(), v.clone());
                                     signals_insert_traced(
                                         &mut elab.signals,
                                         line!(),
-                                        member.name.name.clone(),
+                                        nm.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: member.name.name.clone().into(),
+                                            name: nm.clone().into(),
                                             width: base_width,
-                                            is_signed: false,
+                                            is_signed: enum_signed,
                                             direction: None,
-                                            value: v.into(),
+                                            value: v.clone().into(),
                                             type_name: None,
                                             is_real: false,
                                         },
@@ -3199,13 +3195,8 @@ pub(super) fn inline_instantiation_items(
                                 // so the scoped entry wins where it matters
                                 // and the bare slot stays the design-wide
                                 // §23.6 fallback.
-                                let sc = cat2(&inst_prefix, &member.name.name);
-                                let sv = wide_vals
-                                    .as_ref()
-                                    .and_then(|m| m.get(&member.name.name))
-                                    .cloned()
-                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
-                                elab.set_param(line!(), sc.clone(), sv.clone());
+                                let sc = cat2(&inst_prefix, &nm);
+                                elab.set_param(line!(), sc.clone(), v.clone());
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3214,9 +3205,9 @@ pub(super) fn inline_instantiation_items(
                                         is_const: false,
                                         name: sc.into(),
                                         width: base_width,
-                                        is_signed: false,
+                                        is_signed: enum_signed,
                                         direction: None,
-                                        value: sv.into(),
+                                        value: v.into(),
                                         type_name: None,
                                         is_real: false,
                                     },
