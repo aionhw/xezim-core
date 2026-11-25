@@ -724,6 +724,7 @@ impl<'a> Parser<'a> {
                 // §8.8: `Class::new` typed-constructor reference.
                 let member = if self.at(TokenKind::KwNew) {
                     let tok = self.bump();
+                    self.diagnose_constructor_argument(self.token_span(tok));
                     crate::ast::Identifier {
                         name: "new".to_string(),
                         span: self.token_span(tok),
@@ -2021,6 +2022,7 @@ impl<'a> Parser<'a> {
             // new expression: new(args) or new[size] or just new
             TokenKind::KwNew => {
                 let tok = self.bump();
+                self.diagnose_constructor_argument(self.token_span(tok));
                 let name_id = Identifier {
                     name: self.token_text(tok).into_owned(),
                     span: self.token_span(tok),
@@ -2623,6 +2625,15 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn diagnose_constructor_argument(&mut self, span: Span) {
+        if self.in_call_argument && crate::strict_checks() {
+            self.diagnostics.push(Diagnostic::error(
+                "'new' is not permitted in a call argument (IEEE 1800 §8.7)",
+                span,
+            ));
+        }
+    }
+
     pub(super) fn parse_call_args(&mut self) -> Vec<Expression> {
         self.parse_call_args_inner(false)
     }
@@ -2634,6 +2645,7 @@ impl<'a> Parser<'a> {
             self.bump();
             return args;
         }
+        let previous = std::mem::replace(&mut self.in_call_argument, true);
         loop {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                 break;
@@ -2717,6 +2729,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RParen);
+        self.in_call_argument = previous;
         compact_syntax_list(args)
     }
 
@@ -2914,6 +2927,7 @@ impl<'a> Parser<'a> {
                 // keyword but names the constructor here.
                 let member = if self.at(TokenKind::KwNew) {
                     let tok = self.bump();
+                    self.diagnose_constructor_argument(self.token_span(tok));
                     crate::ast::Identifier {
                         name: "new".to_string(),
                         span: self.token_span(tok),

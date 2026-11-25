@@ -46,6 +46,8 @@ pub struct Parser<'a> {
     /// operators. Outside this context `or` stays an event-list separator
     /// (`@(a or b)`) and `and` a gate primitive, so the flag is essential.
     in_sva_seq: bool,
+    /// An argument takes an expression, not a class or array constructor.
+    in_call_argument: bool,
     /// §16.7: the next primary is a `##` cycle-delay count, a constant
     /// primary: a name followed by `(` there is the count, and the
     /// parenthesis starts the next sequence (`##N (x)`), not a call.
@@ -236,6 +238,7 @@ impl<'a> Parser<'a> {
             pending_pattern_bindings: Vec::new(),
             plain_loop_vars: Vec::new(),
             in_sva_seq: false,
+            in_call_argument: false,
             sva_delay_count: false,
             prototype_ports: false,
             cross_items: Vec::new(),

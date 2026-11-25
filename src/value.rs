@@ -914,6 +914,14 @@ impl Value {
         }
     }
 
+    /// §20.5: convert the whole integral operand to real. Real operands
+    /// first round to an integer value, including a positive zero.
+    pub fn itor(&self) -> Value {
+        let value = self.to_f64();
+        let integral = if self.is_real { value.round() } else { value };
+        Value::from_f64(if integral == 0.0 { 0.0 } else { integral })
+    }
+
     /// §6.12.2: an integral value wider than 64 bits converted to real,
     /// rounded to nearest; x and z bits read as 0. The top 64 significant
     /// bits with a sticky bit for the rest round exactly as the whole value.

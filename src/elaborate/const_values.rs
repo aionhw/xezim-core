@@ -637,12 +637,14 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
             ) && args.len() == 1 =>
         {
             let v = eval_const_expr_val_inner(&args[0], params, types);
+            if name == "$itor" {
+                return v.itor();
+            }
             let f = v.to_f64();
             match name.as_str() {
                 // $rtoi TRUNCATES toward zero (unlike an assignment to int,
                 // which rounds).
                 "$rtoi" => Value::rtoi(f),
-                "$itor" => Value::from_f64(f),
                 "$realtobits" => Value::from_u64(f.to_bits(), 64),
                 "$bitstoreal" => Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0))),
                 "$shortrealtobits" => Value::from_u64((f as f32).to_bits() as u64, 32),
