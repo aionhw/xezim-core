@@ -1718,15 +1718,27 @@ fn elaborate_class_in_scope(
                     if let Some(init) = &decl.init {
                         property_inits.insert(decl.name.name.clone(), init.as_ref().clone());
                     }
+                    let is_string_prop = matches!(
+                        &p.data_type,
+                        DataType::Simple {
+                            kind: SimpleType::String,
+                            ..
+                        }
+                    );
                     let mut v = if let Some(init) = &decl.init {
-                        let mut val =
-                            eval_init_for_target(init, &HashMap::default(), width, is_real);
+                        let mut val = if is_string_prop {
+                            eval_const_expr_val(init, &HashMap::default()).sv_string_strip_nul()
+                        } else {
+                            eval_init_for_target(init, &HashMap::default(), width, is_real)
+                        };
                         if is_real {
                             val = Value::from_f64(val.to_f64());
                         }
                         val
                     } else if is_real {
                         Value::from_f64(0.0)
+                    } else if is_string_prop {
+                        Value::zero(0)
                     } else if is_named_type {
                         Value::zero(width)
                     } else {

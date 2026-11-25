@@ -1459,8 +1459,7 @@ pub(super) fn inline_instantiation_items(
                                                                 matches!(s, Signing::Signed);
                                                         }
                                                     } else if is_string_data_type(data_type) {
-                                                        val =
-                                                            Value::from_string(&val.to_sv_string());
+                                                        val = val.sv_string_strip_nul();
                                                     } else {
                                                         // §5.7.1/§10.9: a DECLARED
                                                         // shape sizes the init —

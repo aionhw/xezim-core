@@ -792,6 +792,15 @@ pub(super) fn default_value_for_type(dt: &DataType, width: u32) -> Value {
     if is_type_real(dt) {
         return Value::from_f64(0.0);
     }
+    if matches!(
+        dt,
+        DataType::Simple {
+            kind: SimpleType::String,
+            ..
+        }
+    ) {
+        return Value::zero(0);
+    }
     // LRM §6.20.3: `chandle` defaults to null. Module-scope `chandle h;`
     // without explicit init must read as 0 so `if (h == null)` works.
     // Class handles via TypeReference are handled at runtime via the

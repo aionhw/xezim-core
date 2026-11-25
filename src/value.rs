@@ -861,6 +861,13 @@ impl Value {
             latin1 = s.chars().map(|c| (c as u32) as u8).collect();
             &latin1
         };
+        Self::from_bytes(bytes)
+    }
+
+    /// Construct a packed SystemVerilog string `Value` directly from raw
+    /// bytes (big-endian, MSB = byte 0). An empty slice returns `Value::zero(0)`
+    /// with zero heap allocations.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
         let width = (bytes.len() * 8) as u32;
         if width <= 64 {
             let mut val_bits = 0u64;
@@ -894,6 +901,16 @@ impl Value {
                 is_fill: false,
             }
         }
+    }
+
+    /// Construct a `string` `Value` from `bytes` with all `\0` bytes removed
+    /// (§6.16). Allocates only when `bytes` actually contains a NUL byte.
+    pub fn from_bytes_strip_nul(bytes: &[u8]) -> Self {
+        if !bytes.contains(&0) {
+            return Self::from_bytes(bytes);
+        }
+        let stripped: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
+        Self::from_bytes(&stripped)
     }
 
     /// Extract f64 from a real-typed value.
@@ -5999,6 +6016,128 @@ impl Value {
         s
     }
 
+    #[inline]
+    fn sv_byte_at(&self, bi: usize) -> u8 {
+        let num_bytes = self.width.div_ceil(8) as usize;
+        if bi >= num_bytes {
+            return 0;
+        }
+        let w = core::cmp::min(8, self.width as usize - bi * 8);
+        let mask = if w == 8 { 0xffu64 } else { (1u64 << w) - 1 };
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let lo = bi * 8;
+                let v = (val_bits >> lo) & mask;
+                let x = (xz_bits >> lo) & mask;
+                ((v & !x) & 0xff) as u8
+            }
+            ValueStorage::Wide(planes) => {
+                let word = bi / 8;
+                let shift = (bi % 8) * 8;
+                let v = (planes.val[word] >> shift) & mask;
+                let x = (planes.xz[word] >> shift) & mask;
+                ((v & !x) & 0xff) as u8
+            }
+        }
+    }
+
+    #[inline]
+    fn sv_content_byte_range(&self) -> usize {
+        let num_bytes = self.width.div_ceil(8) as usize;
+        for bi in (0..num_bytes).rev() {
+            if self.sv_byte_at(bi) != 0 {
+                return bi + 1;
+            }
+        }
+        0
+    }
+
+    /// Zero-allocation byte length of a SystemVerilog string `Value`
+    /// (identical to `self.sv_string_bytes().len()`).
+    #[inline]
+    pub fn sv_string_len(&self) -> usize {
+        self.sv_content_byte_range()
+    }
+
+    /// Zero-allocation character read at index `idx` (`0` = leftmost byte);
+    /// returns `0` when out of bounds.
+    #[inline]
+    pub fn sv_string_getc(&self, idx: usize) -> u8 {
+        let len = self.sv_content_byte_range();
+        if idx >= len {
+            0
+        } else {
+            self.sv_byte_at(len - 1 - idx)
+        }
+    }
+
+    /// Zero-allocation lexicographic byte comparison matching `Simulator::sv_strcmp`.
+    pub fn sv_string_cmp(&self, other: &Self, icase: bool) -> i64 {
+        let la = self.sv_content_byte_range();
+        let lb = other.sv_content_byte_range();
+        let n = la.min(lb);
+        for i in 0..n {
+            let mut ba = self.sv_byte_at(la - 1 - i);
+            let mut bb = other.sv_byte_at(lb - 1 - i);
+            if icase {
+                ba = ba.to_ascii_lowercase();
+                bb = bb.to_ascii_lowercase();
+            }
+            if ba != bb {
+                return i64::from(ba) - i64::from(bb);
+            }
+        }
+        match la.cmp(&lb) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    /// Inclusive substring `[start..=end]` as a string `Value`, or empty `""`
+    /// (`Value::zero(0)`) if `start > end` or `end >= len`.
+    pub fn sv_string_slice(&self, start: usize, end: usize) -> Self {
+        let len = self.sv_content_byte_range();
+        if len == 0 || start > end || end >= len {
+            return Self::zero(0);
+        }
+        if !self.has_xz() && self.width as usize == len * 8 {
+            let mut r = self.range_select((len - 1 - start) * 8 + 7, (len - 1 - end) * 8);
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = Vec::with_capacity(end - start + 1);
+        for idx in start..=end {
+            out.push(self.sv_byte_at(len - 1 - idx));
+        }
+        Self::from_bytes(&out)
+    }
+
+    /// Convert a literal or integral `Value` to `string` by stripping all
+    /// NUL (`\0`) bytes (§6.16). Zero-allocates when clean and NUL-free.
+    pub fn sv_string_strip_nul(&self) -> Self {
+        let len = self.sv_content_byte_range();
+        if len == 0 {
+            return Self::zero(0);
+        }
+        if !self.has_xz()
+            && self.width as usize == len * 8
+            && (0..len).all(|bi| self.sv_byte_at(bi) != 0)
+        {
+            let mut r = self.clone();
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = Vec::with_capacity(len);
+        for bi in (0..len).rev() {
+            let b = self.sv_byte_at(bi);
+            if b != 0 {
+                out.push(b);
+            }
+        }
+        Self::from_bytes(&out)
+    }
+
     /// The value's bytes as string content, big-endian (MSB first), with the
     /// LEADING NUL bytes introduced by widening trimmed. Zero bytes at or
     /// below the first nonzero byte are kept: they are genuine content —
@@ -7016,6 +7155,58 @@ mod packed_string_tests {
         let value = Value::from_string(text);
         assert_eq!(value.width, text.chars().count() as u32 * 8);
         assert_eq!(value.to_sv_string(), text.trim_start_matches('\0'));
+    }
+
+    #[test]
+    fn zero_alloc_string_helpers_and_nul_strip() {
+        // Inline and wide values, leading/embedded/trailing NULs, >=0x80 bytes, all-X
+        let empty = Value::zero(0);
+        assert_eq!(empty.sv_string_len(), 0);
+        assert_eq!(empty.sv_string_getc(0), 0);
+        assert_eq!(empty.sv_string_slice(0, 0), Value::zero(0));
+        assert_eq!(empty.sv_string_strip_nul(), Value::zero(0));
+
+        let placeholder_x = Value::new(1024);
+        assert_eq!(placeholder_x.sv_string_len(), 0);
+        assert_eq!(placeholder_x.sv_string_getc(0), 0);
+        assert_eq!(placeholder_x.sv_string_slice(0, 0), Value::zero(0));
+        assert_eq!(placeholder_x.sv_string_strip_nul(), Value::zero(0));
+
+        let short_trailing = Value::from_bytes(&[0x02, 0x42, 0x41, 0x00]);
+        assert_eq!(short_trailing.sv_string_len(), 4);
+        assert_eq!(short_trailing.sv_string_getc(0), 0x02);
+        assert_eq!(short_trailing.sv_string_getc(3), 0x00);
+        assert_eq!(short_trailing.sv_string_getc(4), 0);
+        assert_eq!(
+            short_trailing.sv_string_strip_nul(),
+            Value::from_bytes(&[0x02, 0x42, 0x41])
+        );
+
+        let wide = Value::from_bytes(b"\0\0hello\0\xffworld\0");
+        assert_eq!(wide.sv_string_len(), 13);
+        assert_eq!(wide.sv_string_getc(0), b'h');
+        assert_eq!(wide.sv_string_getc(5), 0);
+        assert_eq!(wide.sv_string_getc(6), 0xff);
+        assert_eq!(wide.sv_string_getc(12), 0);
+        assert_eq!(wide.sv_string_slice(0, 4), Value::from_bytes(b"hello"));
+        assert_eq!(
+            wide.sv_string_slice(6, 11),
+            Value::from_bytes(b"\xffworld")
+        );
+        assert_eq!(wide.sv_string_slice(5, 3), Value::zero(0));
+        assert_eq!(wide.sv_string_slice(0, 13), Value::zero(0));
+        assert_eq!(
+            wide.sv_string_strip_nul(),
+            Value::from_bytes(b"hello\xffworld")
+        );
+
+        let a = Value::from_bytes(b"Abc");
+        let b = Value::from_bytes(b"abc");
+        let c = Value::from_bytes(b"abcd");
+        assert!(a.sv_string_cmp(&b, false) < 0);
+        assert_eq!(a.sv_string_cmp(&b, true), 0);
+        assert_eq!(b.sv_string_cmp(&c, false), -1);
+        assert_eq!(c.sv_string_cmp(&b, false), 1);
     }
 }
 

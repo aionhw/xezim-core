@@ -3029,7 +3029,7 @@ pub fn elaborate_module_with_defs(
                                 // "echo_SAFE_" prefix while the identical
                                 // procedural assignment was correct).
                                 let is_string_decl = matches!(
-                                    &dd.data_type,
+                                    resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
                                     DataType::Simple {
                                         kind: SimpleType::String,
                                         ..
@@ -3037,6 +3037,7 @@ pub fn elaborate_module_with_defs(
                                 );
                                 let mut rv = if is_string_decl {
                                     eval_const_expr_val(init_expr, &elab.parameters)
+                                        .sv_string_strip_nul()
                                 } else {
                                     eval_init_for_target(init_expr, &elab.parameters, w, is_real)
                                 };

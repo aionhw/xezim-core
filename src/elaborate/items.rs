@@ -720,8 +720,19 @@ pub(super) fn elaborate_items(
                             .as_deref()
                             .filter(|_| decl_driver.is_none() && procedural_init.is_none())
                         {
-                            let mut rv =
-                                eval_init_for_target(init_expr, &elab.parameters, width, is_real);
+                            let is_string_decl = matches!(
+                                resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
+                                DataType::Simple {
+                                    kind: SimpleType::String,
+                                    ..
+                                }
+                            );
+                            let mut rv = if is_string_decl {
+                                eval_const_expr_val(init_expr, &elab.parameters)
+                                    .sv_string_strip_nul()
+                            } else {
+                                eval_init_for_target(init_expr, &elab.parameters, width, is_real)
+                            };
                             if !is_real {
                                 rv.is_signed = is_signed;
                             }
