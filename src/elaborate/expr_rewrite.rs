@@ -1,5 +1,23 @@
 use super::*;
 
+/// Internal key prefix for split parameter member paths. A dotted escaped
+/// identifier is a single name and retains its ordinary key in the map.
+pub(super) const PARAM_MEMBER_KEY_PREFIX: char = '\0';
+
+fn param_member_replacement<'a>(
+    port_map: &'a HashMap<String, Expression>,
+    path: impl Iterator<Item = impl AsRef<str>>,
+) -> Option<&'a Expression> {
+    let mut key = String::from(PARAM_MEMBER_KEY_PREFIX);
+    for (i, part) in path.enumerate() {
+        if i != 0 {
+            key.push('.');
+        }
+        key.push_str(part.as_ref());
+    }
+    port_map.get(&key)
+}
+
 pub(super) fn rewrite_expr_impl(
     expr: &Expression,
     prefix: &str,
@@ -104,16 +122,16 @@ pub(super) fn rewrite_expr_impl(
             // parameter, mapped under its dotted spelling. Substitute the
             // member's constant whole; substituting the head alone left the
             // struct's literal with a dangling `.VLEN`.
-            if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
-                let dotted = hier
-                    .path
-                    .iter()
-                    .map(|s| s.name.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                if let Some(mapped) = port_map.get(dotted.as_str()) {
-                    return mapped.clone();
-                }
+            if prefix.is_empty()
+                && !port_map.is_empty()
+                && hier.path.len() >= 2
+                && hier.path.iter().all(|s| s.selects.is_empty())
+                && let Some(mapped) = param_member_replacement(
+                    port_map,
+                    hier.path.iter().map(|s| s.name.name.as_str()),
+                )
+            {
+                return mapped.clone();
             }
             // §23.9, §27.6: a name bound to a declaration of the generate
             // block being renamed takes the declaration's key. A whole name
@@ -573,21 +591,18 @@ pub(super) fn rewrite_expr_impl(
             // §6.20.2: `Cfg.VLEN` as member access on a packed-struct
             // parameter — the member is mapped under its dotted spelling
             // (see the Ident arm); take it whole.
-            if let ExprKind::Ident(h) = &base.kind
+            if prefix.is_empty()
+                && !port_map.is_empty()
+                && let ExprKind::Ident(h) = &base.kind
                 && h.root.is_none()
                 && h.path.iter().all(|s| s.selects.is_empty())
+                && let Some(mapped) = param_member_replacement(
+                    port_map,
+                    h.path.iter().map(|s| s.name.name.as_str())
+                        .chain(std::iter::once(member.name.as_str())),
+                )
             {
-                let mut dotted = h
-                    .path
-                    .iter()
-                    .map(|s| s.name.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                dotted.push('.');
-                dotted.push_str(&member.name);
-                if let Some(mapped) = port_map.get(dotted.as_str()) {
-                    return mapped.clone();
-                }
+                return mapped.clone();
             }
             let rewritten_base =
                 rewrite_expr_impl(base, prefix, port_map, local_names, interface_map);
