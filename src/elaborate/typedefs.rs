@@ -633,7 +633,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                 elab.note_decl_site(
                     &nm,
                     member.name.span,
-                    &format!("enum member of '{}'", td.name.name),
+                    format!("enum member of '{}'", td.name.name),
                     false,
                 );
                 elab.set_param(line!(), nm.clone(), v.clone());

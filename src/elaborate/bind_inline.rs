@@ -138,10 +138,12 @@ pub(super) fn bind_inlined_import_params(
     Ok(())
 }
 
-/// Acyclic, portless module-type binds in compilation-unit scope are known
-/// before the first hierarchy walk (§23.11). Attach those while visiting
-/// their targets. The regular resolver is still needed when instance names
-/// can take precedence, or a bound connection can affect its host.
+/// Acyclic module-type binds in compilation-unit scope are known before the
+/// first hierarchy walk (§23.11). Attach those while visiting their targets so
+/// designs with standard compilation-unit binds do not trigger a full second
+/// elaboration pass (#721). The regular resolver is still used when instance
+/// names can take precedence, local binds or defparams exist, or a cycle must
+/// be diagnosed.
 pub(super) fn unit_module_binds(
     unit_binds: &[BindDirective],
     definitions: &HashMap<String, Definition>,
@@ -155,32 +157,18 @@ pub(super) fn unit_module_binds(
         let target = &bind.target_module.name;
         let inst = &bind.instantiation;
         let bound = &inst.module_name.name;
-        let Some(Definition::Module(module)) = definitions.get(bound) else {
-            return None;
-        };
         if !bind.target_path.is_empty()
             || !bind.extra_paths.is_empty()
             || !bind.gen_scope.is_empty()
-            || !matches!(definitions.get(target), Some(Definition::Module(_)))
+            || !matches!(
+                definitions.get(target),
+                Some(Definition::Module(_) | Definition::Interface(_) | Definition::Program(_))
+            )
+            || !matches!(
+                definitions.get(bound),
+                Some(Definition::Module(_) | Definition::Interface(_) | Definition::Program(_))
+            )
             || checker_decls.contains_key(bound)
-            || inst.params.is_some()
-            || !module.params.is_empty()
-            || module.ports.get(0).is_some()
-            || inst
-                .instances
-                .iter()
-                .any(|i| !i.dimensions.is_empty() || !i.connections.is_empty())
-            || module.items.iter().any(|item| {
-                matches!(
-                    item,
-                    ModuleItem::ModuleInstantiation(_)
-                        | ModuleItem::GenerateRegion(_)
-                        | ModuleItem::GenerateFor(_)
-                        | ModuleItem::GenerateIf(_)
-                        | ModuleItem::GenerateCase(_)
-                        | ModuleItem::NestedModule(_)
-                )
-            })
         {
             return None;
         }
@@ -227,6 +215,34 @@ pub(super) fn unit_module_binds(
     {
         return None;
     }
+    // Verify the combined instantiation + bind dependency graph over bound
+    // modules is acyclic so cyclic binds stay on the fixed-point diagnostic path.
+    fn reaches_pending<'a>(
+        def_name: &'a str,
+        definitions: &'a HashMap<String, Definition<'a>>,
+        pending: &HashSet<&str>,
+        visited: &mut HashSet<&'a str>,
+    ) -> bool {
+        if pending.contains(def_name) {
+            return true;
+        }
+        if !visited.insert(def_name) {
+            return false;
+        }
+        let Some(def) = definitions.get(def_name) else {
+            return false;
+        };
+        let mut children = std::collections::HashSet::new();
+        crate::collect_instantiated_modules(def.items(), &mut children);
+        for child in children {
+            if let Some((key, _)) = definitions.get_key_value(&child)
+                && reaches_pending(key.as_str(), definitions, pending, visited)
+            {
+                return true;
+            }
+        }
+        false
+    }
     // Eliminate leaves of the binding graph. Cycles stay on the existing
     // fixed-point path with its nonconvergence diagnostic.
     let mut pending: HashSet<&str> = binds.keys().map(String::as_str).collect();
@@ -238,9 +254,15 @@ pub(super) fn unit_module_binds(
             .iter()
             .copied()
             .filter(|target| {
-                binds[*target]
-                    .iter()
-                    .all(|b| !pending.contains(b.instantiation.module_name.name.as_str()))
+                binds[*target].iter().all(|b| {
+                    let mut visited = HashSet::default();
+                    !reaches_pending(
+                        b.instantiation.module_name.name.as_str(),
+                        definitions,
+                        &pending,
+                        &mut visited,
+                    )
+                })
             })
             .collect();
         if leaves.is_empty() {

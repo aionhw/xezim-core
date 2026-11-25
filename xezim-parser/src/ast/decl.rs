@@ -1330,17 +1330,107 @@ pub struct HierarchicalInstance {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PortConnection {
-    Ordered(Option<Expression>),
+    Ordered(Option<Box<Expression>>),
     /// `.name(expr)`, `.name()` (explicitly unconnected) or `.name` (implicit
     /// connection to a same-named net). `implicit` is true only for the last,
     /// parenthesis-free form (§23.3.2.2), which requires a matching net; the
     /// `.name()` form is an explicit no-connect and imposes no such requirement.
     Named {
         name: Identifier,
-        expr: Option<Expression>,
+        expr: Option<Box<Expression>>,
         implicit: bool,
     },
+    /// Compact specialization of explicit `.name(ident)` where the actual is a
+    /// bare single-segment unindexed identifier with no scope root. Eliminates
+    /// both the boxed `Expression` and the `Vec<HierPathSegment>` heap
+    /// allocation on the overwhelming majority of netlist port connections.
+    NamedIdent {
+        name: Identifier,
+        actual: Identifier,
+        #[cfg_attr(feature = "serde", serde(skip))]
+        bound: super::binding::Bound,
+    },
     Wildcard,
+}
+
+impl PortConnection {
+    /// Construct a named port connection, automatically packing a bare
+    /// single-segment unindexed identifier actual into `NamedIdent`.
+    pub fn make_named(name: Identifier, expr: Option<Expression>, implicit: bool) -> Self {
+        if !implicit {
+            if let Some(expr) = expr {
+                let is_bare_ident = matches!(
+                    &expr.kind,
+                    super::expr::ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                );
+                if is_bare_ident {
+                    if let super::expr::ExprKind::Ident(mut h) = expr.kind {
+                        let actual = h.path.pop().unwrap().name;
+                        return Self::NamedIdent {
+                            name,
+                            actual,
+                            bound: h.bound,
+                        };
+                    }
+                }
+                return Self::Named {
+                    name,
+                    expr: Some(Box::new(expr)),
+                    implicit: false,
+                };
+            }
+        }
+        Self::Named {
+            name,
+            expr: expr.map(Box::new),
+            implicit,
+        }
+    }
+
+    /// Materialize a `NamedIdent`'s bare actual identifier as an `Expression`.
+    pub fn ident_expr(actual: &Identifier, bound: super::binding::Bound) -> Expression {
+        Expression::new(
+            super::expr::ExprKind::Ident(super::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![super::expr::HierPathSegment {
+                    name: actual.clone(),
+                    selects: Vec::new(),
+                }],
+                span: actual.span,
+                cached_signal_id: Default::default(),
+                cached_resolved_name: Default::default(),
+                bound,
+            }),
+            actual.span,
+        )
+    }
+
+    #[inline]
+    pub fn named_port(&self) -> Option<&Identifier> {
+        match self {
+            Self::Named { name, .. } | Self::NamedIdent { name, .. } => Some(name),
+            Self::Ordered(_) | Self::Wildcard => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_named(&self) -> bool {
+        matches!(self, Self::Named { .. } | Self::NamedIdent { .. })
+    }
+
+    /// Clone the actual expression if present (`NamedIdent` materializes an
+    /// `ExprKind::Ident`). Returns `None` for `.name`, `.name()`, empty
+    /// positional slots, and `.*`.
+    pub fn actual_expr_cloned(&self) -> Option<Expression> {
+        match self {
+            Self::Ordered(e) | Self::Named { expr: e, .. } => e.as_deref().cloned(),
+            Self::NamedIdent { actual, bound, .. } => Some(Self::ident_expr(actual, *bound)),
+            Self::Wildcard => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

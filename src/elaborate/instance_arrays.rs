@@ -839,11 +839,15 @@ fn ai_slice_conn(
 ) -> crate::ast::decl::PortConnection {
     use crate::ast::decl::PortConnection as PC;
     let unpacked_shapes = cx.unpacked;
-    let expr = match conn {
-        PC::Ordered(Some(e)) => e,
-        PC::Named { expr: Some(e), .. } => e,
+    let expr: std::borrow::Cow<'_, Expression> = match conn {
+        PC::Ordered(Some(e)) => std::borrow::Cow::Borrowed(e),
+        PC::Named { expr: Some(e), .. } => std::borrow::Cow::Borrowed(e),
+        PC::NamedIdent { actual, bound, .. } => {
+            std::borrow::Cow::Owned(PC::ident_expr(actual, *bound))
+        }
         _ => return conn.clone(),
     };
+    let expr = expr.as_ref();
     // §23.3.3.5: when an instance array's actual has one more unpacked
     // dimension than the formal, consume that leading dimension across the
     // instances. Example: a formal `A[0:2]`, actual `bus[0:3][0:2]`, and four
@@ -874,11 +878,16 @@ fn ai_slice_conn(
                     indices.reverse();
                     let sliced = ai_append_indices(expr.clone(), &indices);
                     return match conn {
-                        PC::Ordered(_) => PC::Ordered(Some(sliced)),
+                        PC::Ordered(_) => PC::Ordered(Some(Box::new(sliced))),
                         PC::Named { name, implicit, .. } => PC::Named {
                             name: name.clone(),
-                            expr: Some(sliced),
+                            expr: Some(Box::new(sliced)),
                             implicit: *implicit,
+                        },
+                        PC::NamedIdent { name, .. } => PC::Named {
+                            name: name.clone(),
+                            expr: Some(Box::new(sliced)),
+                            implicit: false,
                         },
                         _ => conn.clone(),
                     };
@@ -892,11 +901,16 @@ fn ai_slice_conn(
     }
     let sliced = ai_slice_expr(expr, p * k, p, cx);
     match conn {
-        PC::Ordered(_) => PC::Ordered(Some(sliced)),
+        PC::Ordered(_) => PC::Ordered(Some(Box::new(sliced))),
         PC::Named { name, implicit, .. } => PC::Named {
             name: name.clone(),
-            expr: Some(sliced),
+            expr: Some(Box::new(sliced)),
             implicit: *implicit,
+        },
+        PC::NamedIdent { name, .. } => PC::Named {
+            name: name.clone(),
+            expr: Some(Box::new(sliced)),
+            implicit: false,
         },
         _ => conn.clone(),
     }
@@ -956,12 +970,12 @@ pub(super) fn ai_expand_instances(
                     // so it may be reordered or sparse — look its index up in
                     // the declared port list (falling back to list position for
                     // NonAnsi / unknown ports).
-                    let port_idx = match conn {
-                        crate::ast::decl::PortConnection::Named { name, .. } => port_names
+                    let port_idx = match conn.named_port() {
+                        Some(name) => port_names
                             .iter()
                             .position(|pn| pn == &name.name)
                             .unwrap_or(pi),
-                        _ => pi,
+                        None => pi,
                     };
                     let p = port_widths.get(port_idx).copied().unwrap_or(1).max(1);
                     ai_slice_conn(

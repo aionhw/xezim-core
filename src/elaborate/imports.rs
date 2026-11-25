@@ -640,7 +640,7 @@ pub(super) fn process_import(
                                             elab.note_decl_site(
                                                 &assign.name.name,
                                                 assign.name.span,
-                                                &format!("imported from package '{}'", pkg_name),
+                                                format!("imported from package '{}'", pkg_name),
                                                 false,
                                             );
                                             found = true;
@@ -726,7 +726,7 @@ pub(super) fn process_import(
                                         elab.note_decl_site(
                                             &assign.name.name,
                                             assign.name.span,
-                                            &format!("imported from package '{}'", pkg_name),
+                                            format!("imported from package '{}'", pkg_name),
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
@@ -832,7 +832,7 @@ pub(super) fn process_import(
                                             elab.note_decl_site(
                                                 &nm,
                                                 member.name.span,
-                                                &format!("imported from package '{}'", pkg_name),
+                                                format!("imported from package '{}'", pkg_name),
                                                 false,
                                             );
                                             imported_params.insert(nm.clone());
@@ -1179,7 +1179,7 @@ pub(super) fn process_import(
                                         elab.note_decl_site(
                                             &assign.name.name,
                                             assign.name.span,
-                                            &format!("imported from package '{}'", pkg_name),
+                                            format!("imported from package '{}'", pkg_name),
                                             false,
                                         );
                                         continue;
@@ -1255,7 +1255,7 @@ pub(super) fn process_import(
                                         elab.note_decl_site(
                                             &assign.name.name,
                                             assign.name.span,
-                                            &format!("imported from package '{}'", pkg_name),
+                                            format!("imported from package '{}'", pkg_name),
                                             false,
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);

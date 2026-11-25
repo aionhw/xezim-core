@@ -156,7 +156,7 @@ pub(crate) fn settle(
                 if name == root && d.scope == tree.root {
                     continue;
                 }
-                if let Some(t) = targets.get_mut(&d.name) {
+                if let Some(t) = targets.get_mut(d.name.as_str()) {
                     t.contested = true;
                 }
             }

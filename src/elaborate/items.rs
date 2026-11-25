@@ -1136,10 +1136,17 @@ pub(super) fn elaborate_items(
                         );
                     }
                     for c in &hi.connections {
-                        if let PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) = c
-                        {
-                            declare_block_port_implicit_nets(e, elab)?;
+                        match c {
+                            PortConnection::Named { expr: Some(e), .. }
+                            | PortConnection::Ordered(Some(e)) => {
+                                declare_block_port_implicit_nets(e, elab)?;
+                            }
+                            PortConnection::NamedIdent { actual, bound, .. }
+                                if bound.is_block_implicit_net() =>
+                            {
+                                declare_block_port_implicit_net_name(&actual.name, elab)?;
+                            }
+                            _ => {}
                         }
                     }
                 }

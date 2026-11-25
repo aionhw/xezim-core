@@ -149,17 +149,7 @@ pub(super) fn inline_instantiation_items(
                                 let mut subst: HashMap<String, Expression> = HashMap::default();
                                 for (i, fname) in formals.iter().enumerate() {
                                     if let Some(conn) = hi.connections.get(i) {
-                                        let actual_opt = match conn {
-                                            crate::ast::decl::PortConnection::Ordered(e) => {
-                                                e.clone()
-                                            }
-                                            crate::ast::decl::PortConnection::Named {
-                                                expr,
-                                                ..
-                                            } => expr.clone(),
-                                            _ => None,
-                                        };
-                                        if let Some(e) = actual_opt {
+                                        if let Some(e) = conn.actual_expr_cloned() {
                                             subst.insert(fname.clone(), e);
                                         }
                                     }
@@ -213,19 +203,16 @@ pub(super) fn inline_instantiation_items(
                 // §3.3/§23.3.2: one instance name per scope. Accepting a
                 // duplicate elaborated BOTH instances and applied the second
                 // #() override to each (the override map is name-keyed) —
-                // silent parameter cross-contamination. decl_sites keeps
-                // first-seen spans, so the collision check is one lookup.
-                {
-                    let key = format!("\u{2}inst:{}", inst_prefix);
-                    if elab.decl_sites.contains_key(&key) {
-                        return Err(format!(
-                            "duplicate instance name '{}' in the same scope \
-                             (IEEE 1800-2017 \u{a7}23.3.2); a second #() override \
-                             would silently apply to both instances",
-                            inst_name
-                        ));
-                    }
-                    elab.note_decl_site(&key, hi.name.span, "instance", true);
+                // silent parameter cross-contamination. Share one `SharedName`
+                // between the collision set and `ElabInstance.path` (#721).
+                let inst_path_shared: SharedName = inst_prefix.trim_end_matches('.').into();
+                if !elab.seen_instance_paths.insert(inst_path_shared.clone()) {
+                    return Err(format!(
+                        "duplicate instance name '{}' in the same scope \
+                         (IEEE 1800-2017 \u{a7}23.3.2); a second #() override \
+                         would silently apply to both instances",
+                        inst_name
+                    ));
                 }
                 // §6.8: child-module declaration initializers that are NOT
                 // constant expressions are deferred to an initial-block
@@ -280,7 +267,11 @@ pub(super) fn inline_instantiation_items(
                     collect_port_connection_net_candidates(sub_mod.items(), &mut cands);
                     // §23.11: a bound instance is as if present at the end of
                     // this instance, so its connections name nets here too.
-                    if let Some(binds) = elab.resolved_binds.get(inst_prefix.trim_end_matches('.')) {
+                    if let Some(binds) = elab
+                        .resolved_binds
+                        .get(inst_prefix.trim_end_matches('.'))
+                        .or_else(|| cache.unit_module_binds.get(sub_mod_name))
+                    {
                         let bound: Vec<ModuleItem> = binds
                             .iter()
                             .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
@@ -326,22 +317,41 @@ pub(super) fn inline_instantiation_items(
                         .connections
                         .iter()
                         .any(|c| matches!(c, PortConnection::Wildcard));
-                    let has_named = hi
-                        .connections
-                        .iter()
-                        .any(|c| matches!(c, PortConnection::Named { .. }));
+                    let has_named = hi.connections.iter().any(|c| c.is_named());
                     if has_wildcard || has_named {
                         let mut explicit: std::collections::HashSet<String> =
                             std::collections::HashSet::default();
                         for conn in &hi.connections {
-                            if let PortConnection::Named {
-                                name,
-                                expr,
-                                implicit,
-                            } = conn
+                            let (name, expr_cow, implicit): (
+                                &crate::ast::Identifier,
+                                Option<std::borrow::Cow<'_, Expression>>,
+                                bool,
+                            ) = match conn {
+                                PortConnection::Named {
+                                    name,
+                                    expr,
+                                    implicit,
+                                } => (
+                                    name,
+                                    expr.as_deref().map(std::borrow::Cow::Borrowed),
+                                    *implicit,
+                                ),
+                                PortConnection::NamedIdent {
+                                    name,
+                                    actual,
+                                    bound,
+                                } => (
+                                    name,
+                                    Some(std::borrow::Cow::Owned(PortConnection::ident_expr(
+                                        actual, *bound,
+                                    ))),
+                                    false,
+                                ),
+                                _ => continue,
+                            };
                             {
                                 explicit.insert(name.name.clone());
-                                if let Some(e) = expr {
+                                if let Some(e) = expr_cow.as_deref() {
                                     let mut rewritten_e = rewrite_expr(
                                         e,
                                         prefix,
@@ -402,7 +412,7 @@ pub(super) fn inline_instantiation_items(
                                     } else {
                                         port_map.insert(name.name.clone(), rewritten_e);
                                     }
-                                } else if *implicit {
+                                } else if implicit {
                                     // `.p` — connect to the same-named parent net.
                                     // §23.3.2: the implicitly-connected actual is the
                                     // same-named net IN THE PARENT SCOPE — which may
@@ -616,6 +626,9 @@ pub(super) fn inline_instantiation_items(
                         let actual = hi.connections.iter().enumerate().find_map(|(pos, c)| match c {
                             PortConnection::Named { name: n, expr, implicit } if n.name == *name => {
                                 Some(expr.is_some() || *implicit)
+                            }
+                            PortConnection::NamedIdent { name: n, .. } if n.name == *name => {
+                                Some(true)
                             }
                             PortConnection::Ordered(e) if pos == index => Some(e.is_some()),
                             _ => None,
@@ -5952,19 +5965,20 @@ pub(super) fn inline_instantiation_items(
                                 )
                             ) && !elab.checker_decls.contains_key(name)
                         };
-                        let bind_blocks_elision = match bind_state.as_deref_mut() {
-                            Some(bs)
-                                if bs.filter.has_non_plain_bind
-                                    && bs.filter.matches(
-                                        inst_prefix.trim_end_matches('.'),
-                                        sub_mod_name,
-                                    ) =>
-                            {
-                                bs.kept_bound_ports = true;
-                                true
-                            }
-                            _ => false,
-                        };
+                        let bind_blocks_elision = cache.unit_module_binds.contains_key(sub_mod_name)
+                            || match bind_state.as_deref_mut() {
+                                Some(bs)
+                                    if bs.filter.has_non_plain_bind
+                                        && bs.filter.matches(
+                                            inst_prefix.trim_end_matches('.'),
+                                            sub_mod_name,
+                                        ) =>
+                                {
+                                    bs.kept_bound_ports = true;
+                                    true
+                                }
+                                _ => false,
+                            };
                         if !bind_blocks_elision
                             && !port_elision_blocked_by_items(
                                 &prepared_sub.effective_items,
@@ -6978,7 +6992,7 @@ pub(super) fn inline_instantiation_items(
                 // dissolve this module into the parent, so this is the only
                 // place the (path, definition) pair still exists.
                 elab.instances.push(ElabInstance {
-                    path: inst_prefix.trim_end_matches('.').into(),
+                    path: inst_path_shared,
                     def_name: sub_mod_name.as_str().into(),
                     parent: prefix.trim_end_matches('.').into(),
                     src_pos: (hi.span.start as usize).max(item_floor),

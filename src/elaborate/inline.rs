@@ -1160,9 +1160,16 @@ fn inline_instantiations_inner(
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     root_defparams.extend(upward_defparams(&module_name, definitions));
     // §23.10/§26.3: the snapshot is held once; each scope takes from it only
-    // the entries its definition can name (#740).
+    // the entries its definition can name (#740). Include single-pass
+    // `unit_module_binds` so parameterized bound instantiations see all
+    // parameters they reference.
+    let scope_binds = if !cache.unit_module_binds.is_empty() {
+        &cache.unit_module_binds
+    } else {
+        &elab.resolved_binds
+    };
     let param_scope =
-        param_scope::ParamScope::new(&top_params, definitions, &elab.resolved_binds, &elab.lets);
+        param_scope::ParamScope::new(&top_params, definitions, scope_binds, &elab.lets);
     let mut top_scope = param_scope.top_scope(top_def, definitions);
     let mut bind_state = bind_driver.as_ref().and_then(|(unit_binds, _)| {
         BindTargetFilter::collect(
@@ -1372,13 +1379,13 @@ fn inline_instantiations_inner(
     }
     for assign in &mut elab.continuous_assigns {
         match assign {
-            ContinuousAssignment::PlainLink { lhs, rhs, .. } if root_identity => {
-                if !signals.contains_key(lhs.as_str()) || !signals.contains_key(rhs.as_str()) {
-                    let f = assign.make_full_mut();
-                    f.lhs = rewrite_expr(&f.lhs, prefix, &port_map, get_local_names(), &interface_map);
-                    f.rhs = rewrite_expr(&f.rhs, prefix, &port_map, get_local_names(), &interface_map);
-                }
-            }
+            ContinuousAssignment::PlainLink { lhs, rhs, .. }
+                if prefix.is_empty()
+                    && port_map.is_empty()
+                    && signals.contains_key(lhs.as_str())
+                    && signals.contains_key(rhs.as_str())
+                    && !interface_map.contains_key(lhs.as_str())
+                    && !interface_map.contains_key(rhs.as_str()) => {}
             _ => {
                 let f = assign.make_full_mut();
                 if !(root_identity

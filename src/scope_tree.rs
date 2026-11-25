@@ -19,6 +19,7 @@ use crate::ast::types::DataType;
 use crate::ast::{Identifier, Span};
 use crate::elaborate::bind::{self, DesignNames};
 use crate::hasher::HashMap;
+use crate::shared_names::SharedName;
 use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,7 @@ pub(crate) fn class_type_name(dt: &DataType) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct Decl {
     pub kind: DeclKind,
-    pub name: String,
+    pub name: SharedName,
     pub span: Span,
     pub scope: ScopeId,
 }
@@ -58,7 +59,7 @@ pub struct Scope {
     /// Path segment from the parent: the label or `genblk<n>`; None at the root.
     pub seg: Option<String>,
     pub decls: Vec<DeclId>,
-    pub by_name: HashMap<String, DeclId>,
+    pub by_name: HashMap<SharedName, DeclId>,
     /// §26.3: packages of `import p::*` in this scope.
     pub wildcard_imports: Vec<String>,
     /// §26.3: name to package for `import p::name` in this scope.
@@ -250,15 +251,16 @@ impl Builder<'_> {
             return;
         }
         let id = DeclId(self.tree.decls.len() as u32);
+        let shared = SharedName::from(name);
         self.tree.decls.push(Decl {
             kind,
-            name: name.to_string(),
+            name: shared.clone(),
             span,
             scope: s,
         });
         let scope = &mut self.tree.scopes[s.0 as usize];
         scope.decls.push(id);
-        scope.by_name.insert(name.to_string(), id);
+        scope.by_name.insert(shared, id);
     }
 
     /// A data declaration, with the class its type may name.
@@ -689,10 +691,15 @@ fn implicit_net_uses<'i>(items: &'i [ModuleItem], out: &mut Vec<(&'i str, Span)>
             ModuleItem::ContinuousAssign(c) => c.assignments.iter().for_each(|(l, _)| bare(l, out)),
             ModuleItem::ModuleInstantiation(m) => {
                 for c in m.instances.iter().flat_map(|i| &i.connections) {
-                    if let PortConnection::Named { expr: Some(e), .. }
-                    | PortConnection::Ordered(Some(e)) = c
-                    {
-                        bare(e, out);
+                    match c {
+                        PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) => bare(e, out),
+                        PortConnection::NamedIdent { actual, .. }
+                            if !actual.name.contains("::") =>
+                        {
+                            out.push((actual.name.as_str(), actual.span))
+                        }
+                        _ => {}
                     }
                 }
             }

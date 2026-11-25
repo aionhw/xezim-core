@@ -677,6 +677,32 @@ impl<'a> Binder<'a> {
         self.callee = false;
     }
 
+    fn head_ident(&mut self, id: &Identifier, bound: &mut Bound) {
+        let outcome = if *bound == Bound::NO_TARGET {
+            Outcome::None(Hide::Qualified)
+        } else {
+            self.resolve(&id.name, true)
+        };
+        let resolved = match outcome {
+            Outcome::Decl(d) => {
+                let decl = &self.tree.decls[d.0 as usize];
+                match decl.kind == DeclKind::ImplicitNet && decl.scope != self.tree.root {
+                    true => Bound::block_implicit_net(d),
+                    false => Bound::decl(d),
+                }
+            }
+            _ => outcome.bound(),
+        };
+        if bound.external_type_index().is_none() {
+            *bound = self.note_type_declaration_order(resolved, id.span);
+        }
+        if self.mentions.is_some() {
+            let name = id.name.clone();
+            self.note(id.span, &name, outcome);
+        }
+        self.callee = false;
+    }
+
     /// §9.6.2, §23.9: a `disable` target, resolved from where it is written.
     /// A task (or, ill-formed, a function) gets `bound`, its declaration. A
     /// path through generate blocks to a task becomes one segment, the task's
@@ -915,10 +941,15 @@ impl<'a> Binder<'a> {
                     i.decl = self.own_decl(&i.name.name);
                     self.with_pos("instance-dim", |b| b.unpacked(&mut i.dimensions));
                     for c in &mut i.connections {
-                        if let PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) = c
-                        {
-                            self.with_pos("port", |b| b.expr(e));
+                        match c {
+                            PortConnection::Named { expr: Some(e), .. }
+                            | PortConnection::Ordered(Some(e)) => {
+                                self.with_pos("port", |b| b.expr(e));
+                            }
+                            PortConnection::NamedIdent { actual, bound, .. } => {
+                                self.with_pos("port", |b| b.head_ident(actual, bound));
+                            }
+                            _ => {}
                         }
                     }
                 }

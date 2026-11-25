@@ -7,7 +7,9 @@ use xezim_core::{
     ast::{
         Description, Identifier, Span,
         cache::{LiteralCache, NameCache, SignalCache, WidthCache},
-        decl::{ClassItem, GateInstantiation, ModuleItem, NetDeclaration, PackageItem},
+        decl::{
+            ClassItem, GateInstantiation, ModuleItem, NetDeclaration, PackageItem, PortConnection,
+        },
         expr::{
             ExprKind, Expression, HierPathSegment, HierRoot, HierarchicalIdentifier, NumberLiteral,
         },
@@ -89,6 +91,11 @@ fn core_ast_and_elaboration_object_sizes_stay_compact() {
         size_of::<Expression>() <= 72,
         "Expression grew to {} B",
         size_of::<Expression>()
+    );
+    assert!(
+        size_of::<PortConnection>() <= 72,
+        "PortConnection grew to {} B",
+        size_of::<PortConnection>()
     );
     assert!(
         size_of::<Statement>() <= 168,
@@ -466,4 +473,46 @@ fn signal_value_round_trips_uniform_wide_and_custom_values() {
             bincode::serde::decode_from_slice(&encoded, cfg).expect("decode SignalValue");
         assert_eq!(decoded.to_value(), orig);
     }
+}
+
+#[test]
+fn plain_links_stay_compact_with_top_interface_and_ported_unit_bind() {
+    let src = r#"
+interface bus_if;
+  logic [7:0] data;
+endinterface
+module leaf #(parameter int W = 8) (input logic [W-1:0] a, output logic [W-1:0] y);
+  assign y = a;
+endmodule
+module chk #(parameter int W = 8) (input logic [W-1:0] a, input logic [W-1:0] y);
+  wire [W-1:0] diff;
+  assign diff = a ^ y;
+endmodule
+bind leaf chk #(.W(W)) u_chk (.a(a), .y(y));
+module top;
+  bus_if bif();
+  logic [7:0] d0, q0, d1, q1;
+  leaf u0(.a(d0), .y(q0));
+  leaf u1(.a(d1), .y(q1));
+endmodule
+"#;
+    let m = elaborate(src);
+    assert!(
+        m.instances.iter().any(|i| i.path.as_str() == "u0.u_chk"),
+        "ported unit bind must attach u0.u_chk"
+    );
+    assert!(
+        m.instances.iter().any(|i| i.path.as_str() == "u1.u_chk"),
+        "ported unit bind must attach u1.u_chk"
+    );
+    let plain_count = m
+        .continuous_assigns
+        .iter()
+        .filter(|ca| ca.is_plain_link())
+        .count();
+    assert!(
+        plain_count >= 4,
+        "plain port links must stay compact even when top instantiates an interface (got {plain_count})"
+    );
+    assert!(m.decl_sites.is_empty());
 }

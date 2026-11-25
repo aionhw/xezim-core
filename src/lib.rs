@@ -1273,10 +1273,24 @@ pub fn render_parse_diagnostics(
 /// (for its own diagnostics) can hand the result to
 /// `parse_and_elaborate_multi_preprocessed` instead of paying for a second,
 /// identical pass.
+/// Compact content fingerprint (`(byte_len, fnv1a_64)`) for a raw source text
+/// so `PreprocessedSources` can verify cache reuse without retaining a second
+/// full copy of every source file in memory (#721).
+fn source_fingerprint(src: &str) -> (usize, u64) {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in src.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (src.len(), h)
+}
+
 pub struct PreprocessedSources {
-    /// The inputs the texts were produced from; a consumer checks these
-    /// before reusing the texts.
-    pub sources: Vec<String>,
+    /// Content fingerprints of the raw inputs the texts were produced from; a
+    /// consumer checks these before reusing the texts.
+    pub source_fingerprints: Vec<(usize, u64)>,
+    /// Line counts of the raw pre-preprocessing sources (parallel to `texts`).
+    pub source_orig_lines: Vec<u32>,
     pub source_files: Vec<String>,
     pub include_dirs: Vec<String>,
     pub defines: Vec<(String, Option<String>)>,
@@ -1342,7 +1356,8 @@ pub fn preprocess_design(
         line_maps.push(pp.take_line_map());
     }
     PreprocessedSources {
-        sources: sources.to_vec(),
+        source_fingerprints: sources.iter().map(|s| source_fingerprint(s)).collect(),
+        source_orig_lines: sources.iter().map(|s| s.lines().count() as u32).collect(),
         source_files: source_files.to_vec(),
         include_dirs: include_dirs.to_vec(),
         defines: defines.to_vec(),
@@ -1370,10 +1385,15 @@ impl PreprocessedSources {
     ) -> bool {
         self.errors.is_empty()
             && self.texts.len() == sources.len()
+            && self.source_fingerprints.len() == sources.len()
             && self.source_files == source_files
             && self.include_dirs == include_dirs
             && self.defines == defines
-            && self.sources == sources
+            && self
+                .source_fingerprints
+                .iter()
+                .zip(sources.iter())
+                .all(|(&fp, s)| fp == source_fingerprint(s))
     }
 }
 
@@ -1400,6 +1420,32 @@ pub fn parse_and_elaborate_multi(
     )
 }
 
+/// Parse and elaborate directly from a completed [`PreprocessedSources`],
+/// allowing callers (such as `--compile`) to drop the raw source buffers before
+/// lexing, parsing, and hierarchy expansion (#721).
+pub fn parse_and_elaborate_preprocessed_owned(
+    pre: PreprocessedSources,
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+) -> Result<
+    (
+        crate::hasher::HashMap<String, SourceDefinition>,
+        elaborate::ElaboratedModule,
+    ),
+    String,
+> {
+    let source_files = pre.source_files.clone();
+    parse_and_elaborate_multi_inner(
+        None,
+        top_module_name,
+        include_dirs,
+        &source_files,
+        defines,
+        Some(pre),
+    )
+}
+
 /// `parse_and_elaborate_multi` reusing an earlier `preprocess_design` pass
 /// over the same inputs (checked with `PreprocessedSources::matches`; a
 /// mismatch preprocesses afresh).
@@ -1417,9 +1463,33 @@ pub fn parse_and_elaborate_multi_preprocessed(
     ),
     String,
 > {
+    let pre = pre.filter(|p| p.matches(sources, source_files, include_dirs, defines));
+    parse_and_elaborate_multi_inner(
+        Some(sources),
+        top_module_name,
+        include_dirs,
+        source_files,
+        defines,
+        pre,
+    )
+}
+
+fn parse_and_elaborate_multi_inner(
+    sources: Option<&[String]>,
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    source_files: &[String],
+    defines: &[(String, Option<String>)],
+    mut pre: Option<PreprocessedSources>,
+) -> Result<
+    (
+        crate::hasher::HashMap<String, SourceDefinition>,
+        elaborate::ElaboratedModule,
+    ),
+    String,
+> {
     let _oom_trace = oom_trace::session();
     let _census_session = sv_parser::census_session();
-    let mut pre = pre.filter(|p| p.matches(sources, source_files, include_dirs, defines));
     if let Some(p) = pre.as_ref() {
         if p.default_nettype_none {
             sv_parser::set_default_nettype_none_seen(true);
@@ -1428,6 +1498,15 @@ pub fn parse_and_elaborate_multi_preprocessed(
             sv_parser::record_unconnected_drive(name, *pull1);
         }
     }
+    let file_count = pre
+        .as_ref()
+        .map_or_else(|| sources.map_or(0, |s| s.len()), |p| p.texts.len());
+    let pre_orig_lines = pre
+        .as_mut()
+        .map(|p| std::mem::take(&mut p.source_orig_lines));
+    let pre_raw_lens: Option<Vec<usize>> = pre
+        .as_ref()
+        .map(|p| p.source_fingerprints.iter().map(|&(len, _)| len).collect());
     let mut pre_files = pre.as_mut().map(|p| {
         (
             std::mem::take(&mut p.texts).into_iter(),
@@ -1440,11 +1519,11 @@ pub fn parse_and_elaborate_multi_preprocessed(
     // `Span` is a byte offset into ITS file's preprocessed text, so these
     // are what runtime diagnostics need to turn a span into `file:line`
     // (see `ElaboratedModule::source_texts`).
-    let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
+    let mut preprocessed_texts: Vec<String> = Vec::with_capacity(file_count);
     // Line map of each preprocessed text back to the original files, for
     // `file:line:col` diagnostics through `include`s and macros.
     let mut line_maps: Vec<Option<sv_parser::source_map::LineMap>> =
-        Vec::with_capacity(sources.len());
+        Vec::with_capacity(file_count);
     // Which file defined each module/interface/program, by name. Captured
     // HERE — the only point where a description's originating file is still
     // known — and handed to runtime diagnostics via
@@ -1454,7 +1533,11 @@ pub fn parse_and_elaborate_multi_preprocessed(
     let mut pp = new_design_preprocessor(include_dirs, defines);
     let mut duplicate_definitions = duplicate_definitions::DuplicateDefinitions::default();
 
-    for (i, source) in sources.iter().enumerate() {
+    for i in 0..file_count {
+        let source_bytes = sources
+            .and_then(|s| s.get(i).map(String::len))
+            .or_else(|| pre_raw_lens.as_ref().and_then(|lens| lens.get(i).copied()))
+            .unwrap_or(0);
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
         let label = source_files
             .get(i)
@@ -1462,12 +1545,12 @@ pub fn parse_and_elaborate_multi_preprocessed(
             .unwrap_or("<unnamed>");
         let _oom_source = oom_trace::scope("preprocess", label, "", "");
         if compile_verbose() {
-            eprintln!("[compile] ({}/{}) parsing {}", i + 1, sources.len(), label);
+            eprintln!("[compile] ({}/{}) parsing {}", i + 1, file_count, label);
         } else {
             progress_status(&format!(
                 "[compile] parsing {}/{}: {}",
                 i + 1,
-                sources.len(),
+                file_count,
                 label.rsplit('/').next().unwrap_or(label)
             ));
         }
@@ -1480,6 +1563,10 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 maps.next().unwrap_or_default(),
             ),
             None => {
+                let source = sources
+                    .and_then(|s| s.get(i))
+                    .map(String::as_str)
+                    .unwrap_or("");
                 pp.begin_top_level_file();
                 let text = pp.preprocess_file(source, source_path.as_deref());
                 (text, pp.take_line_map())
@@ -1496,7 +1583,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 "Preprocessing failed in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
-                sources.len(),
+                file_count,
                 pp.errors().join("\n")
             ));
         }
@@ -1504,7 +1591,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
         oom_trace::checkpoint(
             "lex",
             &[
-                ("source_bytes", source.len()),
+                ("source_bytes", source_bytes),
                 ("preprocessed_bytes", preprocessed.len()),
             ],
         );
@@ -1537,7 +1624,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 "Parse errors in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
-                sources.len(),
+                file_count,
                 errs.join("\n")
             ));
         }
@@ -1575,7 +1662,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 "Strict check failed in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
-                sources.len(),
+                file_count,
                 errs.join("\n")
             ));
         }
@@ -1599,7 +1686,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 "Duplicate definition in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
-                sources.len(),
+                file_count,
                 dup.errors.join("\n")
             ));
         }
@@ -1737,7 +1824,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
     if !compile_verbose() {
         progress_status(&format!(
             "[compile] elaborating design ({} files parsed, {} definitions)...",
-            sources.len(),
+            file_count,
             all_descriptions.len()
         ));
     }
@@ -1760,7 +1847,12 @@ pub fn parse_and_elaborate_multi_preprocessed(
     elab.src_file_of_module = src_file_of_module;
     // Captured from the RAW sources — the only place the pre-preprocessing
     // line counts are still known.
-    elab.source_orig_lines = sources.iter().map(|s| s.lines().count() as u32).collect();
+    elab.source_orig_lines = match pre_orig_lines {
+        Some(lines) => lines,
+        None => sources
+            .map(|s| s.iter().map(|t| t.lines().count() as u32).collect())
+            .unwrap_or_default(),
+    };
     elab.source_orig_lines.extend(extra_orig_lines);
     Ok((defs, elab))
 }
@@ -4098,13 +4190,23 @@ fn parse_and_elaborate(
                 target
             ));
         }
+        drop(bind_resolver);
     } else {
+        // Release the Pass-1 bind index before rebuilding so it does not stay
+        // resident across the second expansion pass (#721).
+        drop(bind_resolver);
         for pass in 0..64 {
             let binds = std::mem::take(&mut elab.resolved_binds);
             let timescales = std::mem::take(&mut elab.module_timescale_exp);
             let without_timescale = std::mem::take(&mut elab.modules_without_timescale);
             let unit = elab.timeunit_exp;
             let precision = elab.timeprecision_exp;
+            // Drop the previous elaborated design and return freed pages to the
+            // OS BEFORE starting the replacement elaboration so Pass 1 and Pass
+            // 2 never overlap in RAM (#721).
+            drop(elab);
+            release_free_memory();
+            oom_trace::checkpoint("bind_rebuild.memory_released", &[]);
             elab = elaborate::elaborate_module_with_defs(
                 elab_def,
                 &params,
@@ -4240,9 +4342,11 @@ fn parse_and_elaborate(
     // Instance-scoped class handles (an interface's `proxy` handle) are only
     // known after inlining; the root pass above never saw them.
     elaborate::null_init_class_handles(&mut elab);
-    // `decl_sites` is only needed for elaboration-time diagnostics; release it
-    // before artifact writing or simulator initialization (#721).
+    // `decl_sites` and `seen_instance_paths` are only needed during
+    // elaboration; release them before artifact writing or simulator
+    // initialization (#721).
     elab.decl_sites = crate::hasher::HashMap::default();
+    elab.seen_instance_paths = crate::hasher::HashSet::default();
     if std::env::var("XEZIM_ELAB_STATS").is_ok() {
         eprintln!(
             "[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",
@@ -4436,10 +4540,10 @@ fn collect_bind_ancestors<'a>(scope: &'a str) -> Vec<&'a str> {
     ancestors
 }
 
-fn find_lexical_bind_target(
+fn find_lexical_bind_target<T: std::borrow::Borrow<str> + Eq + std::hash::Hash>(
     ancestors: &[&str],
     target_module: &str,
-    host_paths: &crate::hasher::HashSet<String>,
+    host_paths: &crate::hasher::HashSet<T>,
 ) -> Option<String> {
     ancestors
         .iter()
@@ -4449,13 +4553,13 @@ fn find_lexical_bind_target(
         .find(|candidate| host_paths.contains(candidate.as_str()))
 }
 
-fn eval_bind_path_target(
+fn eval_bind_path_target<T: std::borrow::Borrow<str> + Eq + std::hash::Hash>(
     path: &[ast::expr::HierPathSegment],
     target_module_name: &str,
     top_name: &str,
     unit_scope: bool,
     ancestors: &[&str],
-    host_paths: &crate::hasher::HashSet<String>,
+    host_paths: &crate::hasher::HashSet<T>,
     constants: &mut BindConstants<'_>,
 ) -> Result<Option<String>, String> {
     let mut joined = String::new();
@@ -4507,8 +4611,11 @@ fn eval_bind_path_target(
 struct IncrementalBindResolver<'a> {
     unit_binds: &'a [ast::decl::BindDirective],
     unit_params: &'a crate::hasher::HashMap<String, Value>,
-    host_paths: crate::hasher::HashSet<String>,
-    hosts_of: crate::hasher::HashMap<String, Vec<String>>,
+    host_paths: crate::hasher::HashSet<crate::shared_names::SharedName>,
+    hosts_of: crate::hasher::HashMap<
+        crate::shared_names::SharedName,
+        Vec<crate::shared_names::SharedName>,
+    >,
     indexed_instances: usize,
     top_indexed: bool,
     scanned_bind_sites: usize,
@@ -4547,20 +4654,24 @@ impl<'a> IncrementalBindResolver<'a> {
             crate::hasher::HashMap::default();
         if !self.top_indexed {
             self.top_indexed = true;
-            self.host_paths.insert(String::new());
-            let list = self.hosts_of.entry(elab.name.clone()).or_default();
+            let empty = crate::shared_names::SharedName::from("");
+            self.host_paths.insert(empty.clone());
+            let list = self
+                .hosts_of
+                .entry(crate::shared_names::SharedName::from(elab.name.as_str()))
+                .or_default();
             new_hosts_start
                 .entry(elab.name.as_str())
                 .or_insert(list.len());
-            list.push(String::new());
+            list.push(empty);
         }
         for inst in &elab.instances[self.indexed_instances..] {
-            self.host_paths.insert(inst.path.to_string());
-            let list = self.hosts_of.entry(inst.def_name.to_string()).or_default();
+            self.host_paths.insert(inst.path.clone());
+            let list = self.hosts_of.entry(inst.def_name.clone()).or_default();
             new_hosts_start
                 .entry(inst.def_name.as_str())
                 .or_insert(list.len());
-            list.push(inst.path.to_string());
+            list.push(inst.path.clone());
         }
         self.indexed_instances = elab.instances.len();
 
@@ -4632,7 +4743,7 @@ impl<'a> IncrementalBindResolver<'a> {
                         } else {
                             all_hosts.len()
                         };
-                        targets.extend(all_hosts[start..].iter().cloned());
+                        targets.extend(all_hosts[start..].iter().map(|p| p.to_string()));
                     }
                 } else {
                     let mut total_paths = 0usize;
@@ -4753,12 +4864,12 @@ fn resolve_instance_binds(
     }
     // A target names an instance by path or a module by name: index both
     // once, so selecting a target is a lookup rather than a scan.
-    let mut host_paths = crate::hasher::HashSet::default();
+    let mut host_paths: crate::hasher::HashSet<&str> = crate::hasher::HashSet::default();
     let mut hosts_of = crate::hasher::HashMap::<&str, Vec<&str>>::default();
-    host_paths.insert(String::new());
+    host_paths.insert("");
     hosts_of.entry(elab.name.as_str()).or_default().push("");
     for i in &elab.instances {
-        host_paths.insert(i.path.to_string());
+        host_paths.insert(i.path.as_str());
         hosts_of
             .entry(i.def_name.as_str())
             .or_default()

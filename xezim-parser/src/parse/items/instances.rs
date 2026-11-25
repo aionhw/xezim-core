@@ -624,25 +624,41 @@ impl<'a> Parser<'a> {
                     conns.push(PortConnection::Wildcard);
                 } else {
                     let nm = self.parse_identifier();
-                    let (ex, had_parens) = if self.eat(TokenKind::LParen).is_some() {
-                        let e = if !self.at(TokenKind::RParen) {
-                            Some(self.parse_port_actual())
+                    if self.eat(TokenKind::LParen).is_some() {
+                        if self.let_live == 0
+                            && self.rs_values.is_empty()
+                            && (self.at(TokenKind::Identifier)
+                                || self.at(TokenKind::EscapedIdentifier))
+                            && self.peek_kind() == TokenKind::RParen
+                        {
+                            let actual = self.parse_identifier();
+                            self.bump(); // RParen
+                            conns.push(PortConnection::NamedIdent {
+                                name: nm,
+                                actual,
+                                bound: crate::ast::binding::Bound::UNSET,
+                            });
                         } else {
-                            None
-                        };
-                        self.expect(TokenKind::RParen);
-                        (e, true)
+                            let e = if !self.at(TokenKind::RParen) {
+                                Some(self.parse_port_actual())
+                            } else {
+                                None
+                            };
+                            self.expect(TokenKind::RParen);
+                            conns.push(PortConnection::make_named(nm, e, false));
+                        }
                     } else {
-                        (None, false)
-                    };
-                    conns.push(PortConnection::Named {
-                        name: nm,
-                        expr: ex,
-                        implicit: !had_parens,
-                    });
+                        conns.push(PortConnection::Named {
+                            name: nm,
+                            expr: None,
+                            implicit: true,
+                        });
+                    }
                 }
             } else {
-                conns.push(PortConnection::Ordered(Some(self.parse_port_actual())));
+                conns.push(PortConnection::Ordered(Some(Box::new(
+                    self.parse_port_actual(),
+                ))));
             }
             if self.eat(TokenKind::Comma).is_none() {
                 break;

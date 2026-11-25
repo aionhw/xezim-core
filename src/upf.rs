@@ -949,13 +949,19 @@ impl<'a> Design<'a> {
                     if *implicit {
                         return Some(port.to_string());
                     }
-                    (name.name.clone(), expr.as_ref()?)
+                    (name.name.clone(), expr.as_deref()?)
+                }
+                PortConnection::NamedIdent { name, actual, .. } => {
+                    if name.name != port {
+                        continue;
+                    }
+                    return Some(actual.name.clone());
                 }
                 PortConnection::Ordered(e) => {
                     if order.get(idx).map(|s| s.as_str()) != Some(port) {
                         continue;
                     }
-                    (port.to_string(), e.as_ref()?)
+                    (port.to_string(), e.as_deref()?)
                 }
             };
             let _ = pname;

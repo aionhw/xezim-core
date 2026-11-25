@@ -155,12 +155,18 @@ fn collect_body_driven_names(
                 for inst in &mi.instances {
                     for (i, conn) in inst.connections.iter().enumerate() {
                         let (dir, expr) = match conn {
+                            PortConnection::NamedIdent { name, actual, .. } => {
+                                if !matches!(named_dir(&name.name), Some(PortDirection::Input)) {
+                                    out.insert(actual.name.clone());
+                                }
+                                continue;
+                            }
                             PortConnection::Named { name, expr, .. } => {
-                                (named_dir(&name.name), expr.as_ref())
+                                (named_dir(&name.name), expr.as_deref())
                             }
                             PortConnection::Ordered(e) => (
                                 dirs.as_ref().and_then(|d| d.get(i).copied().flatten()),
-                                e.as_ref(),
+                                e.as_deref(),
                             ),
                             // `.*` binds same-named nets; an output among them
                             // drives its net, and the names are not listed
@@ -736,6 +742,9 @@ pub(super) fn prepare_module_items(
                             PortConnection::Ordered(Some(e))
                             | PortConnection::Named { expr: Some(e), .. } => {
                                 collect_implicit_net_candidates(e, &mut cand);
+                            }
+                            PortConnection::NamedIdent { actual, bound, .. } => {
+                                collect_implicit_net_ident(&actual.name, *bound, &mut cand);
                             }
                             _ => {}
                         }

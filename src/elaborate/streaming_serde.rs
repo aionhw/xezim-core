@@ -285,6 +285,7 @@ impl Serialize for ElaboratedModule {
             enum_members,
             package_enum_members,
             decl_sites: _,
+            seen_instance_paths: _,
             foreign_package_names,
             foreign_displaced,
             two_state_signals,

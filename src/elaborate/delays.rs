@@ -383,10 +383,10 @@ pub fn scope_time_decl_inits(items: &mut [ModuleItem], unit_exp: i32, prec_exp: 
                 for conn in inst.instances.iter_mut().flat_map(|i| &mut i.connections) {
                     let actual = match conn {
                         PortConnection::Ordered(expr) | PortConnection::Named { expr, .. } => expr,
-                        PortConnection::Wildcard => continue,
+                        PortConnection::NamedIdent { .. } | PortConnection::Wildcard => continue,
                     };
                     if let Some(actual) = actual {
-                        let mut literal = &*actual;
+                        let mut literal = &**actual;
                         while let ExprKind::Paren(inner) = &literal.kind {
                             literal = inner;
                         }

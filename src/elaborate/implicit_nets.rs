@@ -279,24 +279,41 @@ pub(super) fn collect_nettype_port_actuals(
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &inst.instances {
                     for (idx, c) in hi.connections.iter().enumerate() {
-                        let (expr, pname) = match c {
-                            PortConnection::Ordered(Some(e)) => (e, None),
+                        let (bare_name, pname) = match c {
+                            PortConnection::NamedIdent {
+                                name,
+                                actual,
+                                bound,
+                            } => {
+                                let mut bare = Vec::new();
+                                collect_implicit_net_ident(&actual.name, *bound, &mut bare);
+                                let Some(n) = bare.pop() else { continue };
+                                (n, Some(name.name.as_str()))
+                            }
+                            PortConnection::Ordered(Some(e)) => {
+                                let mut bare = Vec::new();
+                                collect_implicit_net_candidates(e, &mut bare);
+                                if bare.len() != 1 {
+                                    continue;
+                                }
+                                (bare.pop().unwrap(), None)
+                            }
                             PortConnection::Named {
                                 name,
                                 expr: Some(e),
                                 implicit: false,
-                            } => (e, Some(name.name.as_str())),
+                            } => {
+                                let mut bare = Vec::new();
+                                collect_implicit_net_candidates(e, &mut bare);
+                                if bare.len() != 1 {
+                                    continue;
+                                }
+                                (bare.pop().unwrap(), Some(name.name.as_str()))
+                            }
                             _ => continue,
                         };
-                        let mut bare = Vec::new();
-                        collect_implicit_net_candidates(expr, &mut bare);
-                        // Only a WHOLE-net actual coerces; a concatenation or
-                        // select of undeclared names is not a nettype value.
-                        if bare.len() != 1 {
-                            continue;
-                        }
                         if let Some(nt) = port_nettype(&inst.module_name.name, pname, idx) {
-                            out.entry(bare.pop().unwrap()).or_insert(nt);
+                            out.entry(bare_name).or_insert(nt);
                         }
                     }
                 }
@@ -327,6 +344,9 @@ pub(super) fn collect_port_connection_net_candidates(items: &[ModuleItem], out: 
                                 implicit: false,
                                 ..
                             } => collect_implicit_net_candidates(e, out),
+                            PortConnection::NamedIdent { actual, bound, .. } => {
+                                collect_implicit_net_ident(&actual.name, *bound, out)
+                            }
                             _ => {}
                         }
                     }
@@ -336,6 +356,46 @@ pub(super) fn collect_port_connection_net_candidates(items: &[ModuleItem], out: 
             _ => {}
         }
     }
+}
+
+pub(super) fn declare_block_port_implicit_net_name(
+    name: &str,
+    elab: &mut ElaboratedModule,
+) -> Result<(), String> {
+    if elab.signals.contains_key(name) || elab.nets.contains(name) {
+        return Ok(());
+    }
+    if sv_parser::default_nettype_none_seen() {
+        return Err(format!(
+            "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
+            name
+        ));
+    }
+    if crate::implicit_net_warn() {
+        crate::elab_diag(format!(
+            "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+             (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+            name
+        ));
+    }
+    signals_insert_traced(
+        &mut elab.signals,
+        line!(),
+        name.to_string(),
+        Signal {
+            is_const: false,
+            name: name.into(),
+            width: 1,
+            is_signed: false,
+            direction: None,
+            value: Value::new(1).into(),
+            is_real: false,
+            type_name: None,
+        },
+    );
+    elab.implicit_nets.insert(name.to_string());
+    elab.nets.insert(name.to_string());
+    Ok(())
 }
 
 /// §6.10, §27: a port actual of an instance in a generate block that is an
@@ -349,41 +409,7 @@ pub(super) fn declare_block_port_implicit_nets(
         ExprKind::Ident(h)
             if h.root.is_none() && h.path.len() == 1 && h.bound.is_block_implicit_net() =>
         {
-            let name = &h.path[0].name.name;
-            if elab.signals.contains_key(name) || elab.nets.contains(name) {
-                return Ok(());
-            }
-            if sv_parser::default_nettype_none_seen() {
-                return Err(format!(
-                    "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
-                    name
-                ));
-            }
-            if crate::implicit_net_warn() {
-                crate::elab_diag(format!(
-                    "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-                     (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
-                    name
-                ));
-            }
-            signals_insert_traced(
-                &mut elab.signals,
-                line!(),
-                name.clone(),
-                Signal {
-                    is_const: false,
-                    name: name.clone().into(),
-                    width: 1,
-                    is_signed: false,
-                    direction: None,
-                    value: Value::new(1).into(),
-                    is_real: false,
-                    type_name: None,
-                },
-            );
-            elab.implicit_nets.insert(name.clone());
-            elab.nets.insert(name.clone());
-            Ok(())
+            declare_block_port_implicit_net_name(&h.path[0].name.name, elab)
         }
         ExprKind::Concatenation(parts) => {
             for p in parts {
@@ -609,20 +635,23 @@ pub(super) fn create_implicit_nets(
 /// `.i(op == SYS_CSR)`) is no candidate. As one it joined the inlined
 /// module's local names, so every use of it in the module took the instance
 /// path (`m.l.SYS_CSR`), which names nothing, and read x.
+pub(super) fn collect_implicit_net_ident(name: &str, bound: Bound, out: &mut Vec<String>) {
+    // §3.12.1: a name the compilation unit declares is declared; the
+    // hierarchy root holds its storage.
+    let unit = match crate::sv_parser::strip_unit_scope_name(name) {
+        Some(plain) => unit_storage::declares(plain),
+        None => bound.as_decl().is_none() && unit_storage::declares(name),
+    };
+    if unit || bound == Bound::NO_TARGET {
+        return;
+    }
+    out.push(name.to_string());
+}
+
 pub(super) fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
-            // §3.12.1: a name the compilation unit declares is declared; the
-            // hierarchy root holds its storage.
-            let name = hier.path[0].name.name.as_str();
-            let unit = match crate::sv_parser::strip_unit_scope_name(name) {
-                Some(plain) => unit_storage::declares(plain),
-                None => hier.bound.as_decl().is_none() && unit_storage::declares(name),
-            };
-            if unit || hier.bound == Bound::NO_TARGET {
-                return;
-            }
-            out.push(hier.path[0].name.name.clone());
+            collect_implicit_net_ident(&hier.path[0].name.name, hier.bound, out);
         }
         ExprKind::MemberAccess { .. } => {}
         ExprKind::Unary { operand, .. } => collect_implicit_net_candidates(operand, out),

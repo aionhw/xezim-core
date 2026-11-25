@@ -414,7 +414,7 @@ fn output_port_actuals(sub: &Definition, conns: &[PortConnection]) -> Vec<Expres
         match c {
             PortConnection::Ordered(Some(e)) => {
                 if port_names.get(i).is_some_and(|n| is_output(n)) {
-                    out.push(e.clone());
+                    out.push((**e).clone());
                 }
             }
             PortConnection::Named {
@@ -427,9 +427,19 @@ fn output_port_actuals(sub: &Definition, conns: &[PortConnection]) -> Vec<Expres
                     continue;
                 }
                 match expr {
-                    Some(e) => out.push(e.clone()),
+                    Some(e) => out.push((**e).clone()),
                     None if *implicit => out.push(make_ident_expr(&name.name)),
                     None => {}
+                }
+            }
+            PortConnection::NamedIdent {
+                name,
+                actual,
+                bound,
+            } => {
+                named.insert(name.name.as_str());
+                if is_output(&name.name) {
+                    out.push(PortConnection::ident_expr(actual, *bound));
                 }
             }
             _ => {}

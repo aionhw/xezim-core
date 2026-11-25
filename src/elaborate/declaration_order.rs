@@ -1020,6 +1020,9 @@ pub(super) fn check_module_use_before_decl(
                     match c {
                         PortConnection::Ordered(Some(e))
                         | PortConnection::Named { expr: Some(e), .. } => self.expr(e, scope),
+                        PortConnection::NamedIdent { actual, .. } => {
+                            self.name(&actual.name, scope)
+                        }
                         PortConnection::Named {
                             name,
                             expr: None,

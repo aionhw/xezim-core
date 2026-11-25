@@ -3233,7 +3233,12 @@ pub struct ElaboratedModule {
     /// Transient elaboration bookkeeping (cleared at the end of elaboration
     /// and omitted from compiled artifacts, aionhw/xezim#721).
     #[serde(skip)]
-    pub decl_sites: HashMap<String, (Span, String, bool)>,
+    pub decl_sites: HashMap<String, (Span, std::borrow::Cow<'static, str>, bool)>,
+    /// Duplicate instance-name guard during hierarchy expansion. Uses
+    /// `SharedName` so each entry shares its allocation with `ElabInstance.path`
+    /// instead of allocating per-instance strings in `decl_sites` (#721).
+    #[serde(skip)]
+    pub(crate) seen_instance_paths: HashSet<SharedName>,
     /// §26.3: names declared in packages this module does NOT import (see
     /// `compute_foreign_package_names`). A local declaration of one of these
     /// is legal and must win — they are only visible at all because package
@@ -3474,8 +3479,10 @@ impl ElaboratedModule {
             // with. This one supersedes it, so overwrite rather than remove:
             // callers record their site at inconsistent points relative to
             // this check, and some never do.
-            self.decl_sites
-                .insert(name.to_string(), (span, kind.to_string(), true));
+            self.decl_sites.insert(
+                name.to_string(),
+                (span, std::borrow::Cow::Owned(kind.to_string()), true),
+            );
         }
         claimed
     }
@@ -3490,8 +3497,15 @@ impl ElaboratedModule {
     /// "prefer this module's file" hint: for a declaration that came from
     /// somewhere else (a package's enum member, an imported parameter) the
     /// hint would confidently name the wrong file.
-    pub fn note_decl_site(&mut self, name: &str, span: Span, kind: &str, own_scope: bool) {
-        if own_scope && kind == "parameter/localparam" {
+    pub fn note_decl_site(
+        &mut self,
+        name: &str,
+        span: Span,
+        kind: impl Into<std::borrow::Cow<'static, str>>,
+        own_scope: bool,
+    ) {
+        let kind: std::borrow::Cow<'static, str> = kind.into();
+        if own_scope && kind.as_ref() == "parameter/localparam" {
             self.declared_parameters.insert(name.to_string());
         }
         if span.start == 0 && span.end == 0 {
@@ -3499,7 +3513,7 @@ impl ElaboratedModule {
         }
         self.decl_sites
             .entry(name.to_string())
-            .or_insert_with(|| (span, kind.to_string(), own_scope));
+            .or_insert_with(|| (span, kind, own_scope));
     }
 
     /// §23.2.2.1: a non-ANSI port declared without a net or variable type may
@@ -3694,6 +3708,7 @@ impl ElaboratedModule {
             enum_members: HashMap::default(),
             package_enum_members: HashMap::default(),
             decl_sites: HashMap::default(),
+            seen_instance_paths: HashSet::default(),
             foreign_package_names: HashSet::default(),
             foreign_displaced: HashSet::default(),
             unit_member_slots: Vec::new(),

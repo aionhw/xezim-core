@@ -120,10 +120,17 @@ pub(super) fn visit_renamed_decls(
                 for hi in &mi.instances {
                     visit(&hi.name.name, hi.decl, DeclKind::Instance);
                     for c in &hi.connections {
-                        if let PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) = c
-                        {
-                            visit_block_implicit_nets(e, visit);
+                        match c {
+                            PortConnection::Named { expr: Some(e), .. }
+                            | PortConnection::Ordered(Some(e)) => {
+                                visit_block_implicit_nets(e, visit);
+                            }
+                            PortConnection::NamedIdent { actual, bound, .. }
+                                if bound.is_block_implicit_net() =>
+                            {
+                                visit(&actual.name, *bound, DeclKind::ImplicitNet);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -524,7 +531,15 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
                 for conn in &mut hi.connections {
                     match conn {
                         PortConnection::Named { expr: Some(e), .. }
-                        | PortConnection::Ordered(Some(e)) => *e = gen_expr(e),
+                        | PortConnection::Ordered(Some(e)) => **e = gen_expr(e),
+                        PortConnection::NamedIdent {
+                            name,
+                            actual,
+                            bound,
+                        } => {
+                            let rewritten = gen_expr(&PortConnection::ident_expr(actual, *bound));
+                            *conn = PortConnection::make_named(name.clone(), Some(rewritten), false);
+                        }
                         _ => {}
                     }
                 }

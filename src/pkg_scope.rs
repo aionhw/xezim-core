@@ -3228,11 +3228,80 @@ impl Rw<'_> {
             for c in &mut inst.connections {
                 match c {
                     PortConnection::Ordered(e) | PortConnection::Named { expr: e, .. } => {
-                        self.opt(e)
+                        self.opt_box(e)
                     }
+                    PortConnection::NamedIdent { .. } => self.named_ident_port(c),
                     PortConnection::Wildcard => {}
                 }
             }
+        }
+    }
+
+    fn named_ident_port(&mut self, c: &mut PortConnection) {
+        let PortConnection::NamedIdent { name, actual, .. } = c else {
+            return;
+        };
+        if !self.info.mangled_vars.is_empty() {
+            if let Some(m) = self.mangled_var(&actual.name) {
+                actual.name = m;
+            }
+        }
+        let n = actual.name.as_str();
+        if !self.value_shadowed(n) {
+            if let Some(rep) = self.inline_type(n) {
+                match &rep {
+                    DataType::TypeReference {
+                        name: tname,
+                        dimensions,
+                        type_args,
+                        ..
+                    } if tname.scopes.is_empty()
+                        && dimensions.is_empty()
+                        && type_args.is_empty() =>
+                    {
+                        actual.name = tname.name.name.clone();
+                    }
+                    _ => {
+                        let span = actual.span;
+                        let port_name = name.clone();
+                        let mut e = Expression::new(ExprKind::TypeLiteral(Box::new(rep)), span);
+                        self.inline_depth += 1;
+                        self.expr(&mut e);
+                        self.inline_depth -= 1;
+                        *c = PortConnection::Named {
+                            name: port_name,
+                            expr: Some(Box::new(e)),
+                            implicit: false,
+                        };
+                    }
+                }
+                return;
+            }
+        }
+        if (self.info.colliding.contains(n)
+            || self.info.class_colliding.contains(n)
+            || self.info.hiding.contains(n))
+            && !self.value_shadowed(n)
+        {
+            if let Res::To(m) = self.resolve(n) {
+                actual.name = m;
+            }
+        } else if let Some(p) = self.resolve_value_with_diagnostic(n) {
+            let span = actual.span;
+            let port_name = name.clone();
+            let member = actual.clone();
+            let e = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(ident_expr(p, span)),
+                    member,
+                },
+                span,
+            );
+            *c = PortConnection::Named {
+                name: port_name,
+                expr: Some(Box::new(e)),
+                implicit: false,
+            };
         }
     }
 
