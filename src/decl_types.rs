@@ -150,6 +150,9 @@ impl Entry<'_> {
     pub fn or_insert(self, ty: DataType) {
         self.0.or_insert_with(|| Rc::new(ty));
     }
+    pub fn or_insert_shared(self, ty: &Rc<DataType>) {
+        self.0.or_insert_with(|| Rc::clone(ty));
+    }
 }
 
 pub struct Iter<'a>(shared_names::Iter<'a, Rc<DataType>>);
@@ -293,6 +296,125 @@ impl DeclTypeInterner {
     fn shared_copy(ty: &DataType) -> Rc<DataType> {
         Rc::new(crate::ast::cache::without_scope_caches(|| ty.clone()))
     }
+}
+
+thread_local! {
+    static TOP_DECL_TYPES: std::cell::RefCell<Option<DeclTypeInterner>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct TopDeclTypesScope {
+    prev: Option<DeclTypeInterner>,
+}
+
+impl Drop for TopDeclTypesScope {
+    fn drop(&mut self) {
+        TOP_DECL_TYPES.with(|slot| *slot.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Start a scoped type interner for root-module and generate-block
+/// declarations so repeated `wire [7:0]` / `logic [7:0]` declarations share
+/// one `Rc<DataType>` instead of cloning the type tree per signal (#721).
+pub(crate) fn top_decl_types_scope() -> TopDeclTypesScope {
+    let prev = TOP_DECL_TYPES.with(|slot| slot.borrow_mut().replace(DeclTypeInterner::default()));
+    TopDeclTypesScope { prev }
+}
+
+/// Strip source spans from simple leaf/vector types before interning into
+/// `var_decl_types`, which never reports source locations (those live in
+/// `decl_sites`). Collapses thousands of identical `wire [7:0]` lines into one
+/// shared `Rc<DataType>`.
+fn canonicalize_simple_decl_type(ty: &DataType) -> Option<DataType> {
+    use crate::ast::{
+        Span,
+        expr::{ExprKind, Expression, NumberLiteral},
+        types::PackedDimension,
+    };
+    fn canon_const_expr(e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer {
+                size,
+                signed,
+                base,
+                value,
+                cached_val,
+            }) => Some(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: *size,
+                    signed: *signed,
+                    base: *base,
+                    value: value.clone(),
+                    cached_val: cached_val.clone(),
+                }),
+                Span::dummy(),
+            )),
+            _ => None,
+        }
+    }
+    fn canon_dims(dims: &[PackedDimension]) -> Option<Vec<PackedDimension>> {
+        let mut out = Vec::with_capacity(dims.len());
+        for d in dims {
+            match d {
+                PackedDimension::Range { left, right, .. } => out.push(PackedDimension::Range {
+                    left: Box::new(canon_const_expr(left)?),
+                    right: Box::new(canon_const_expr(right)?),
+                    span: Span::dummy(),
+                }),
+                PackedDimension::Unsized(_) => out.push(PackedDimension::Unsized(Span::dummy())),
+            }
+        }
+        Some(out)
+    }
+    match ty {
+        DataType::IntegerVector {
+            kind,
+            signing,
+            dimensions,
+            ..
+        } => Some(DataType::IntegerVector {
+            kind: *kind,
+            signing: *signing,
+            dimensions: canon_dims(dimensions)?,
+            span: Span::dummy(),
+        }),
+        DataType::Implicit {
+            signing,
+            dimensions,
+            ..
+        } => Some(DataType::Implicit {
+            signing: *signing,
+            dimensions: canon_dims(dimensions)?,
+            span: Span::dummy(),
+        }),
+        DataType::IntegerAtom { kind, signing, .. } => Some(DataType::IntegerAtom {
+            kind: *kind,
+            signing: *signing,
+            span: Span::dummy(),
+        }),
+        DataType::Real { kind, .. } => Some(DataType::Real {
+            kind: *kind,
+            span: Span::dummy(),
+        }),
+        _ => None,
+    }
+}
+
+/// Return a shared `Rc<DataType>` for a top-level or generate-block
+/// declaration, interning across the active `top_decl_types_scope` when present.
+pub(crate) fn intern_top_decl_type(ty: &DataType) -> Rc<DataType> {
+    TOP_DECL_TYPES.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(pool) = slot.as_mut() {
+            if let Some(canon) = canonicalize_simple_decl_type(ty) {
+                pool.intern(&canon, "")
+            } else {
+                pool.intern(ty, "")
+            }
+        } else {
+            Rc::new(ty.clone())
+        }
+    })
 }
 
 #[cfg(test)]

@@ -25,9 +25,16 @@ struct NameRegistry {
 
 impl NameRegistry {
     fn intern(&mut self, hash: u64, value: Cow<'_, str>) -> Arc<String> {
+        let into_compact = |v: Cow<'_, str>| -> String {
+            let mut s = v.into_owned();
+            if s.capacity() > s.len() + 8 {
+                s.shrink_to_fit();
+            }
+            s
+        };
         match self.primary.entry(hash) {
             hash_map::Entry::Vacant(entry) => {
-                let name = Arc::new(value.into_owned());
+                let name = Arc::new(into_compact(value));
                 entry.insert(Arc::downgrade(&name));
                 name
             }
@@ -59,7 +66,7 @@ impl NameRegistry {
                     }
                 }
                 // Borrowed inputs allocate only after every candidate misses.
-                let name = Arc::new(value.into_owned());
+                let name = Arc::new(into_compact(value));
                 let weak = Arc::downgrade(&name);
                 if primary.is_none() {
                     entry.insert(weak);
@@ -448,6 +455,12 @@ impl SharedNameSet {
         SharedName: Borrow<Q>,
     {
         self.0.contains(key)
+    }
+    pub fn shared_get<Q: ?Sized + Hash + Eq>(&self, key: &Q) -> Option<&SharedName>
+    where
+        SharedName: Borrow<Q>,
+    {
+        self.0.get(key)
     }
     pub fn remove<Q: ?Sized + Hash + Eq>(&mut self, key: &Q) -> bool
     where

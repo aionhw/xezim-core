@@ -1268,9 +1268,15 @@ fn inline_instantiations_inner(
     }
     crate::oom_trace::model("inline.top.ready", elab, Some(cache.prepared.len()));
     // Release prepared module bodies (including top-level expanded generate
-    // loops) before post-inline passes allocate local name sets or validate
-    // bodies (aionhw/xezim#721).
+    // loops), duplicate-instance tracking, and cached declaration shapes before
+    // post-inline passes allocate local name sets or validate bodies
+    // (aionhw/xezim#721).
     drop(cache);
+    elab.seen_instance_paths = HashSet::default();
+    clear_decl_shapes_cache();
+    if elab.signals.len() >= 16384 {
+        crate::release_free_memory();
+    }
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }

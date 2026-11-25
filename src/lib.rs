@@ -4377,7 +4377,7 @@ fn parse_and_elaborate(
     // `decl_sites` and `seen_instance_paths` are only needed during
     // elaboration; release them before artifact writing or simulator
     // initialization (#721).
-    elab.decl_sites = crate::hasher::HashMap::default();
+    elab.decl_sites = crate::shared_names::SharedNameMap::default();
     elab.seen_instance_paths = crate::hasher::HashSet::default();
     if std::env::var("XEZIM_ELAB_STATS").is_ok() {
         eprintln!(

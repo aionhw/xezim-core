@@ -1101,22 +1101,50 @@ pub(super) fn inline_module_items(
     // queries in its own constant expressions (generate conditions, widths,
     // the parameter overrides it passes to its children).
     let _decl_shapes = install_decl_shapes(source_def);
-    cache.prepared.enter_instance(prefix);
-    let mut prepared_source = prepare_module_items(
-        source_def,
-        definitions,
-        local_params,
-        &elab.typedefs,
-        cache,
-        param_scope,
-    );
-    for (name, bounds) in &prepared_source.interface_array_bounds {
-        elab.unpacked_decl_dims.insert(cat2(prefix, name), vec![*bounds]);
+    let has_binds = elab
+        .resolved_binds
+        .get(prefix.trim_end_matches('.'))
+        .is_some_and(|binds| !binds.is_empty());
+    let mut root_prepared: Option<RootPreparedItems<'_>> = None;
+    let mut cached_prepared: Option<Rc<PreparedModuleItems>> = None;
+    if prefix.is_empty() {
+        let root = prepare_root_module_items(
+            source_def,
+            definitions,
+            local_params,
+            &elab.typedefs,
+            has_binds,
+        );
+        for (name, bounds) in &root.interface_array_bounds {
+            elab.unpacked_decl_dims
+                .insert(cat2(prefix, name), vec![*bounds]);
+        }
+        root_prepared = Some(root);
+    } else {
+        cache.prepared.enter_instance(prefix);
+        let prepared_source = prepare_module_items(
+            source_def,
+            definitions,
+            local_params,
+            &elab.typedefs,
+            cache,
+            param_scope,
+        );
+        for (name, bounds) in &prepared_source.interface_array_bounds {
+            elab.unpacked_decl_dims
+                .insert(cat2(prefix, name), vec![*bounds]);
+        }
+        cached_prepared = Some(prepared_source);
     }
+    let effective_items_slice: &[ModuleItem] = match (&root_prepared, &cached_prepared) {
+        (Some(root), _) => root.effective_items.as_ref(),
+        (_, Some(prep)) => prep.effective_items.as_slice(),
+        _ => unreachable!(),
+    };
     // Keep declaration ownership after flattening (§26.3, §21.7.2.3).
     // Imported lookup aliases never enter this set.
     for pd in source_def.params().iter().chain(
-        prepared_source.effective_items.iter().filter_map(|item| match item {
+        effective_items_slice.iter().filter_map(|item| match item {
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
             _ => None,
         }),
@@ -1128,7 +1156,7 @@ pub(super) fn inline_module_items(
         }
     }
     // §23.11/§27: only active generate branches contribute declarations.
-    for item in &prepared_source.effective_items {
+    for item in effective_items_slice {
         if let ModuleItem::Bind(b) = item {
             elab.bind_sites.push((
                 format!("{}{}", prefix, b.gen_scope)
@@ -1148,22 +1176,22 @@ pub(super) fn inline_module_items(
                 )?;
             }
         }
-        let prepared = Rc::make_mut(&mut prepared_source);
         let mut bound: Vec<ModuleItem> = binds
             .iter()
             .rev()
             .map(|b| ModuleItem::ModuleInstantiation(b.instantiation.clone()))
             .collect();
+        let (eff_vec, local_names_rc) = if let Some(root) = root_prepared.as_mut() {
+            (root.effective_items.to_mut(), &mut root.local_names)
+        } else {
+            let prepared = Rc::make_mut(cached_prepared.as_mut().unwrap());
+            (&mut prepared.effective_items, &mut prepared.local_names)
+        };
         // §23.11, §23.3.2: a bound array of instances is expanded like one
         // written here; the body's items were expanded before the binds were
         // known, so the array's elements were never built.
         if has_instance_arrays(&bound) {
-            let shapes = ai_scope_shapes(
-                &prepared.effective_items,
-                source_def,
-                local_params,
-                &elab.typedefs,
-            );
+            let shapes = ai_scope_shapes(eff_vec, source_def, local_params, &elab.typedefs);
             ai_expand_instance_arrays(
                 &mut bound,
                 &shapes,
@@ -1178,16 +1206,33 @@ pub(super) fn inline_module_items(
         let mut cands = Vec::new();
         collect_port_connection_net_candidates(&bound, &mut cands);
         if !cands.is_empty() {
-            Rc::make_mut(&mut prepared.local_names).extend(cands);
+            Rc::make_mut(local_names_rc).extend(cands);
         }
         // §23.11: the bound instances are children of this scope, so their names
         // must be local names of it before any of them is inlined — a bound
         // connection that names a sibling bound instance is rewritten through
         // this set (see `register_bound_instance_names`).
-        add_bound_instance_names(&bound, &mut prepared.local_names);
+        add_bound_instance_names(&bound, local_names_rc);
         register_bound_instance_scopes(elab, prefix, &bound);
-        prepared.effective_items.extend(bound);
+        eff_vec.extend(bound);
     }
+    let (effective_items_slice, local_names_rc, local_typedefs_ref): (
+        &[ModuleItem],
+        &Rc<std::collections::HashSet<String>>,
+        &std::collections::HashSet<String>,
+    ) = match (&root_prepared, &cached_prepared) {
+        (Some(root), _) => (
+            root.effective_items.as_ref(),
+            &root.local_names,
+            &root.local_typedefs,
+        ),
+        (_, Some(prep)) => (
+            prep.effective_items.as_slice(),
+            &prep.local_names,
+            &prep.local_typedefs,
+        ),
+        _ => unreachable!(),
+    };
     // §23.10: names of THIS module's own sub-instances. A port connection
     // naming a SIBLING instance (`h_leaf lf(li.mp);` where `li` is the same
     // module's interface instance) is not in `local_names`, so the inlining
@@ -1195,8 +1240,7 @@ pub(super) fn inline_module_items(
     // phantom top-level name and, e.g., a whole-struct write through it
     // silently vanished for every NON-top instantiation of the module.
     register_modport_expressions(source_def.items(), prefix, definitions);
-    let sibling_inst_names: std::collections::HashSet<String> = prepared_source
-        .effective_items
+    let sibling_inst_names: std::collections::HashSet<String> = effective_items_slice
         .iter()
         .filter_map(|it| match it {
             ModuleItem::ModuleInstantiation(mi) => Some(mi),
@@ -1207,7 +1251,7 @@ pub(super) fn inline_module_items(
     // Collect defparams: those propagated in from a parent scope, plus this
     // module's own `defparam` items (RHS evaluated in THIS scope, §23.10.1).
     let mut defparams: Vec<PendingDefparam> = pending_defparams.to_vec();
-    for it in &prepared_source.effective_items {
+    for it in effective_items_slice {
         if let ModuleItem::Defparam(assigns) = it {
             for (lhs, rhs) in assigns {
                 if let Some(path) = defparam_path_segments(lhs) {
@@ -1235,11 +1279,11 @@ pub(super) fn inline_module_items(
         parent_port_map,
         &defparams,
         param_scope,
-        &prepared_source.local_names,
-        &prepared_source.local_typedefs,
+        local_names_rc,
+        local_typedefs_ref,
         &sibling_inst_names,
         &mut items_end,
-        &prepared_source.effective_items,
+        effective_items_slice,
         bind_state.as_deref_mut(),
     )?;
     if bind_state
@@ -1249,9 +1293,9 @@ pub(super) fn inline_module_items(
         Ok(ModuleInlineMeta {
             items_end,
             was_flat_leaf: false,
-            local_names: Some(Rc::clone(&prepared_source.local_names)),
-            local_typedefs: (!prepared_source.local_typedefs.is_empty())
-                .then(|| Box::new(prepared_source.local_typedefs.clone())),
+            local_names: Some(Rc::clone(local_names_rc)),
+            local_typedefs: (!local_typedefs_ref.is_empty())
+                .then(|| Box::new(local_typedefs_ref.clone())),
             defparams,
         })
     } else {

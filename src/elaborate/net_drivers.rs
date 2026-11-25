@@ -573,38 +573,97 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     if elab.nets.is_empty() {
         return;
     }
-    // Compute each materialized driver's net span, and the same for LAZY
-    // sub-module drivers without materializing them: a future instance whose
-    // body sits in `pending_cont_assign` (bit/part selects on `n` inside a
-    // child module) is invisible to a scan of `elab.continuous_assigns`, so
-    // an overlapping-select net driven only from a sub-module was never
-    // widened and its overlapping selects stayed per-bit (#1062).
+    // Pass 1: find only the nets that actually have at least one select driver
+    // (bit/part select or packed-struct member). A net with only whole-net
+    // drivers never widens, so designs without select drivers allocate nothing
+    // and large designs with a handful of select drivers avoid indexing all
+    // whole-net connections (#721).
+    let is_plain_ident_expr = |e: &Expression| {
+        matches!(
+            &e.kind,
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty()
+        )
+    };
+    let expr_is_select_driver = |lhs: &Expression, elab: &ElaboratedModule| match &lhs.kind {
+        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+            !elab.packed_struct_fields.is_empty() && packed_member_net_span(lhs, elab).is_some()
+        }
+        ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+            packed_member_net_span(lhs, elab).is_some()
+                || !matches!(&lhs.kind, ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()))
+        }
+        _ => true,
+    };
     let ca_driver_span = |ca: &ContinuousAssignment, elab: &ElaboratedModule| match ca {
         ContinuousAssignment::PlainLink { lhs, .. } => {
             if !elab.nets.contains(lhs.as_str()) {
                 return None;
             }
-            let w = elab.signals.get(lhs.as_str()).map(|s| s.width).filter(|&w| w > 0)?;
+            let w = elab
+                .signals
+                .get(lhs.as_str())
+                .map(|s| s.width)
+                .filter(|&w| w > 0)?;
             Some((alias_canonical(&elab.alias_canon, lhs.to_string()), 0, w - 1))
         }
         ContinuousAssignment::Full(f) => cont_assign_driver_span(&f.lhs, elab),
     };
-    let materialized_spans: Vec<Option<(String, u32, u32)>> = elab
-        .continuous_assigns
-        .iter()
-        .map(|ca| ca_driver_span(ca, elab))
-        .collect();
-    let mut pending_spans: Vec<Option<(String, u32, u32)>> =
-        Vec::with_capacity(elab.pending_cont_assign.len());
-    for p in &elab.pending_cont_assign {
-        let lhs = p.materialize_lhs();
-        pending_spans.push(cont_assign_driver_span(&lhs, elab));
+    let pending_might_be_select = |p: &PendingContAssign| -> bool {
+        if !elab.packed_struct_fields.is_empty() {
+            return true;
+        }
+        if !is_plain_ident_expr(&p.lhs_source) {
+            return true;
+        }
+        if p.lhs_is_net_initializer || p.ctx.port_map.is_empty() {
+            return false;
+        }
+        if let ExprKind::Ident(h) = &p.lhs_source.kind
+            && let Some(actual) = p.ctx.port_map.get(&h.path[0].name.name)
+        {
+            return !is_plain_ident_expr(actual);
+        }
+        false
+    };
+    let mut select_nets: HashSet<String> = HashSet::default();
+    for ca in &elab.continuous_assigns {
+        let ContinuousAssignment::Full(f) = ca else {
+            continue;
+        };
+        let is_select = match &f.lhs.kind {
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                !elab.packed_struct_fields.is_empty()
+                    && packed_member_net_span(&f.lhs, elab).is_some()
+                    || !matches!(&f.lhs.kind, ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()))
+            }
+            _ => true,
+        };
+        if is_select && let Some((n, _, _)) = cont_assign_driver_span(&f.lhs, elab) {
+            select_nets.insert(n);
+        }
     }
-    let mut by_net: HashMap<&str, Vec<(u32, u32, bool)>> = HashMap::default();
-    for (s, ca) in materialized_spans.iter().zip(&elab.continuous_assigns) {
-        if let Some((n, lo, hi)) = s {
-            // A member of a packed-struct net drives that part of the net,
-            // so it is a select driver like a bit-select (§7.2.1).
+    for p in &elab.pending_cont_assign {
+        if !pending_might_be_select(p) {
+            continue;
+        }
+        let lhs = p.materialize_lhs();
+        if expr_is_select_driver(&lhs, elab)
+            && let Some((n, _, _)) = cont_assign_driver_span(&lhs, elab)
+        {
+            select_nets.insert(n);
+        }
+    }
+    if select_nets.is_empty() {
+        return;
+    }
+
+    // Pass 2: collect all drivers (whole-net and select alike) only for nets
+    // in `select_nets` so overlaps with whole-net drivers are detected.
+    let mut by_net: HashMap<String, Vec<(u32, u32, bool)>> = HashMap::default();
+    for ca in &elab.continuous_assigns {
+        if let Some((n, lo, hi)) = ca_driver_span(ca, elab)
+            && select_nets.contains(&n)
+        {
             let is_select = match ca {
                 ContinuousAssignment::PlainLink { .. } => false,
                 ContinuousAssignment::Full(f) => match &f.lhs.kind {
@@ -614,17 +673,18 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
                     _ => true,
                 },
             };
-            by_net
-                .entry(n.as_str())
-                .or_default()
-                .push((*lo, *hi, is_select));
+            by_net.entry(n).or_default().push((lo, hi, is_select));
         }
     }
-    // Pending assigns count toward a net's driver roster (a select is
-    // always a select) even though we do not widen them here yet.
-    for s in &pending_spans {
-        if let Some((n, lo, hi)) = s {
-            by_net.entry(n.as_str()).or_default().push((*lo, *hi, true));
+    let mut pending_hits: Vec<(usize, String)> = Vec::new();
+    for (idx, p) in elab.pending_cont_assign.iter().enumerate() {
+        let lhs = p.materialize_lhs();
+        if let Some((n, lo, hi)) = cont_assign_driver_span(&lhs, elab)
+            && select_nets.contains(&n)
+        {
+            let is_select = expr_is_select_driver(&lhs, elab);
+            by_net.entry(n.clone()).or_default().push((lo, hi, is_select));
+            pending_hits.push((idx, n));
         }
     }
     // §6.6.5: every bit of a tri0 or tri1 net resolves against the net's
@@ -645,7 +705,7 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
                         .enumerate()
                         .any(|(i, a)| v[i + 1..].iter().any(|b| a.0 <= b.1 && b.0 <= a.1)))
         })
-        .map(|(n, _)| n.to_string())
+        .map(|(n, _)| n)
         .collect();
     if widen.is_empty() {
         return;
@@ -653,10 +713,15 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     // A pending driver on a widen net must join the materialized roster so
     // the widening below (and the whole-net fold that follows) sees every
     // driver of the net, not only the first select.
-    if !elab.pending_cont_assign.is_empty() {
+    let materialize_indices: HashSet<usize> = pending_hits
+        .into_iter()
+        .filter(|(_, n)| widen.contains(n))
+        .map(|(idx, _)| idx)
+        .collect();
+    if !materialize_indices.is_empty() {
         let mut pending = std::mem::take(&mut elab.pending_cont_assign);
-        for (p, s) in pending.drain(..).zip(pending_spans) {
-            if s.is_some_and(|(n, _, _)| widen.contains(&n)) {
+        for (idx, p) in pending.drain(..).enumerate() {
+            if materialize_indices.contains(&idx) {
                 elab.continuous_assigns
                     .push(p.materialize(&elab.parameters));
             } else {
@@ -1340,9 +1405,19 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     };
-    // Keyed by the flat name, borrowed from a single-segment lhs (every
-    // inlined connect), so counting costs no copy per assign.
-    let mut counts: HashMap<std::borrow::Cow<'_, str>, usize> = HashMap::default();
+    // Only declared nets take part in multi-driver resolution or undriven
+    // trireg initialization. Keying by `SharedName` borrowed from `elab.nets`
+    // avoids cloning any net name strings and skips non-net variables (#721).
+    let mut counts: HashMap<SharedName, u32> = HashMap::default();
+    let mut bump_net = |name: &str| {
+        if let Some(key) = elab.nets.shared_get(name) {
+            if let Some(c) = counts.get_mut(key) {
+                *c = c.saturating_add(1);
+            } else {
+                counts.insert(key.clone(), 1);
+            }
+        }
+    };
     for ca in &elab.continuous_assigns {
         if ca.rhs_parent_scoped()
             && let Some(f) = ca.lhs_ident_name()
@@ -1355,27 +1430,24 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         // §10.11: a driver of an alias member drives the group's canonical
         // net, so it is counted there.
         if let Some(c) = alias_lookup_ca(ca) {
-            *counts
-                .entry(std::borrow::Cow::Owned(c))
-                .or_insert(0) += 1;
+            bump_net(&c);
             continue;
         }
         if is_hier_port_drive(ca) {
             continue;
         }
-        let n = match ca {
-            ContinuousAssignment::PlainLink { lhs, .. } => {
-                Some(std::borrow::Cow::Borrowed(lhs.as_str()))
-            }
+        match ca {
+            ContinuousAssignment::PlainLink { lhs, .. } => bump_net(lhs.as_str()),
             ContinuousAssignment::Full(f) => match &f.lhs.kind {
                 ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                    Some(std::borrow::Cow::Borrowed(h.path[0].name.name.as_str()))
+                    bump_net(&h.path[0].name.name);
                 }
-                _ => ident_flat_name(&f.lhs).map(std::borrow::Cow::Owned),
+                _ => {
+                    if let Some(n) = ident_flat_name(&f.lhs) {
+                        bump_net(&n);
+                    }
+                }
             },
-        };
-        if let Some(n) = n {
-            *counts.entry(n).or_insert(0) += 1;
         }
     }
     // Sub-module bodies may still sit in the LAZY pending list; two
@@ -1384,23 +1456,19 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // (read z). Resolve each pending assign's LHS name (cheap: one ident
     // rewrite), and MATERIALIZE only the entries that hit a multi-driven
     // net so they join the fold; everything else stays lazy.
-    let pending_lhs: Vec<Option<String>> = elab
-        .pending_cont_assign
-        .iter()
-        .map(|p| {
-            let lhs = p.materialize_lhs();
-            // §10.11: a driver of an alias member drives the group's
-            // canonical net.
-            match alias_lookup_lhs(&lhs) {
-                Some(c) => Some(c),
-                None => ident_flat_name(&lhs).map(|n| alias_lookup_name(&n).unwrap_or(n)),
-            }
-        })
-        .collect();
-    for n in pending_lhs.iter().flatten() {
-        *counts
-            .entry(std::borrow::Cow::Owned(n.clone()))
-            .or_insert(0) += 1;
+    let pending_lhs_name = |p: &PendingContAssign| -> Option<String> {
+        let lhs = p.materialize_lhs();
+        // §10.11: a driver of an alias member drives the group's
+        // canonical net.
+        match alias_lookup_lhs(&lhs) {
+            Some(c) => Some(c),
+            None => ident_flat_name(&lhs).map(|n| alias_lookup_name(&n).unwrap_or(n)),
+        }
+    };
+    for p in &elab.pending_cont_assign {
+        if let Some(n) = pending_lhs_name(p) {
+            bump_net(&n);
+        }
     }
     // A tri0/tri1 net needs the fold even with a SINGLE driver, because the
     // implicit pull is a second (weak) driver: `strong` alone would leave the
@@ -1409,47 +1477,33 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // initial value instead (see the net-declaration sites).
     let mut multi: HashSet<String> = counts
         .iter()
-        .filter(|(n, c)| **c > 1 && elab.nets.contains(n.as_ref()))
+        .filter(|(_, c)| **c > 1)
         .map(|(n, _)| n.to_string())
         .collect();
-    for (n, c) in &counts {
-        if *c >= 1
-            && elab.nets.contains(n.as_ref())
-            && matches!(
-                elab.resolved_net_kinds.get(n.as_ref()),
-                Some(ResolvedNetKind::Tri0)
-                    | Some(ResolvedNetKind::Tri1)
-                    | Some(ResolvedNetKind::ChargeStorage)
-            )
-        {
-            // A WHOLE-NET port connection (`.p(w)`) is one physical net, and
-            // after substitution the sub-module's drivers land on the ACTUAL
-            // (`w`), leaving the leftover formal `u_diff.p` as a pure reader
-            // driven only by its connection assign. If it is itself tri0/tri1
-            // it joined `multi` here and folded a SECOND time — for a
-            // same-named actual (`u_same.p` vs `p`) that second fold read the
-            // actual it was also writing, a cycle that settled to x and made
-            // `@(p)` inside hang (#1060). The actual carries the merged kind
-            // (see the `port_aliases` insertion), so the leftover must NOT
-            // pull-fold independently. A VARIABLE actual (`.p(r)`) is not
-            // part of the net: the port keeps its own pull, and reads 1
-            // while the variable holds z. An OUTPUT formal is the real SOURCE
-            // (its driver is not substituted), so it keeps folding. A
-            // leftover with >1 driver still folds via the `count > 1` rule
-            // above.
-            if *c == 1
-                && elab
-                    .port_aliases
-                    .get(n.as_ref())
-                    .is_some_and(|actual| elab.nets.contains(actual.as_str()))
+    if !elab.resolved_net_kinds.is_empty() {
+        for (n, c) in &counts {
+            if *c >= 1
                 && matches!(
-                    elab.signals.get(n.as_ref()).map(|s| s.direction),
-                    Some(Some(PortDirection::Inout | PortDirection::Input))
+                    elab.resolved_net_kinds.get(n.as_str()),
+                    Some(ResolvedNetKind::Tri0)
+                        | Some(ResolvedNetKind::Tri1)
+                        | Some(ResolvedNetKind::ChargeStorage)
                 )
             {
-                continue;
+                if *c == 1
+                    && elab
+                        .port_aliases
+                        .get(n.as_str())
+                        .is_some_and(|actual| elab.nets.contains(actual.as_str()))
+                    && matches!(
+                        elab.signals.get(n.as_str()).map(|s| s.direction),
+                        Some(Some(PortDirection::Inout | PortDirection::Input))
+                    )
+                {
+                    continue;
+                }
+                multi.insert(n.to_string());
             }
-            multi.insert(n.to_string());
         }
     }
     // §6.6.4: a trireg's charge starts unknown once something drives it,
@@ -1486,13 +1540,10 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     for n in &multi {
         elab.strength_drivers.remove(n);
     }
-    if pending_lhs
-        .iter()
-        .any(|n| n.as_ref().is_some_and(|n| multi.contains(n)))
-    {
+    if !elab.pending_cont_assign.is_empty() {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
-        for (p, name) in pending.into_iter().zip(pending_lhs) {
-            if name.is_some_and(|n| multi.contains(&n)) {
+        for p in pending {
+            if pending_lhs_name(&p).is_some_and(|n| multi.contains(&n)) {
                 let ca = p.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {

@@ -382,6 +382,57 @@ pub(super) fn store_implicit_net(elab: &mut ElaboratedModule, name: String, kind
     elab.implicit_nets.insert(name);
 }
 
+/// Like [`collect_port_connection_net_candidates`], but skips names already
+/// declared in `elab.signals` or `elab.parameters` so explicitly declared
+/// netlists allocate zero temporary candidate strings (#721).
+pub(super) fn collect_port_connection_net_candidates_undeclared(
+    items: &[ModuleItem],
+    elab: &ElaboratedModule,
+    out: &mut Vec<String>,
+) {
+    let mut tmp = Vec::new();
+    for item in items {
+        match item {
+            ModuleItem::ModuleInstantiation(inst) => {
+                for hi in &inst.instances {
+                    for c in &hi.connections {
+                        match c {
+                            PortConnection::NamedIdent { actual, bound, .. } => {
+                                if !elab.signals.contains_key(&actual.name)
+                                    && !elab.parameters.contains_key(&actual.name)
+                                {
+                                    collect_implicit_net_ident(&actual.name, *bound, out);
+                                }
+                            }
+                            PortConnection::Ordered(Some(e))
+                            | PortConnection::Named {
+                                expr: Some(e),
+                                implicit: false,
+                                ..
+                            } => {
+                                tmp.clear();
+                                collect_implicit_net_candidates(e, &mut tmp);
+                                for n in tmp.drain(..) {
+                                    if !elab.signals.contains_key(&n)
+                                        && !elab.parameters.contains_key(&n)
+                                    {
+                                        out.push(n);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            ModuleItem::GenerateRegion(g) => {
+                collect_port_connection_net_candidates_undeclared(&g.items, elab, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(super) fn declare_block_port_implicit_net_name(
     name: &str,
     elab: &mut ElaboratedModule,

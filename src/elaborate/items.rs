@@ -287,6 +287,7 @@ pub(super) fn elaborate_items(
                 }
                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                 let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                let shared_dd_type = crate::decl_types::intern_top_decl_type(&dd.data_type);
                 for decl in &dd.declarators {
                     // §6.18, §7.4.5: a variable of a dimensioned typedef takes
                     // the typedef's unpacked dimensions after its own, as the
@@ -513,7 +514,8 @@ pub(super) fn elaborate_items(
                                         }
                                         elab.arrays.insert(en, (0, 63, width));
                                     }
-                                    elab.var_decl_types.insert(name, dd.data_type.clone());
+                                    elab.var_decl_types
+                                        .insert_shared(name, std::rc::Rc::clone(&shared_dd_type));
                                     continue;
                                 }
                             }
@@ -538,7 +540,7 @@ pub(super) fn elaborate_items(
                         );
                         elab.var_decl_types
                             .entry(decl.name.name.clone())
-                            .or_insert_with(|| dd.data_type.clone());
+                            .or_insert_shared(&shared_dd_type);
                         if let Some(init_expr) = &decl.init {
                             elab.initial_blocks.push(InitialBlock {
                                 stmt: Statement::new(
@@ -569,7 +571,7 @@ pub(super) fn elaborate_items(
                         // `g.q[2].f` read x and `q[2] = '{5, 6}` stored a vector.
                         elab.var_decl_types
                             .entry(decl.name.name.clone())
-                            .or_insert_with(|| dd.data_type.clone());
+                            .or_insert_shared(&shared_dd_type);
                         if let DataType::Struct(su) =
                             resolve_typedef_chain(&dd.data_type, &elab.typedef_types)
                             && !su.packed
@@ -786,7 +788,7 @@ pub(super) fn elaborate_items(
                         // declaration worked.
                         elab.var_decl_types
                             .entry(decl.name.name.clone())
-                            .or_insert_with(|| dd.data_type.clone());
+                            .or_insert_shared(&shared_dd_type);
                         let chain2 =
                             resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone();
                         if let DataType::Struct(su) = &chain2 {
