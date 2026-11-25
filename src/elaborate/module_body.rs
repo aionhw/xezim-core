@@ -2810,7 +2810,7 @@ pub fn elaborate_module_with_defs(
                         // name-keyed machinery (trigger / `@` / `.triggered`)
                         // works on elements unchanged.
                         if matches!(
-                            &dd.data_type,
+                            resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
                             DataType::Simple {
                                 kind: SimpleType::Event,
                                 ..
@@ -3106,7 +3106,7 @@ pub fn elaborate_module_with_defs(
                             sig,
                         );
                         if matches!(
-                            &dd.data_type,
+                            resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
                             DataType::Simple {
                                 kind: SimpleType::Event,
                                 ..

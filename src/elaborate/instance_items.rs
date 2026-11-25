@@ -4733,7 +4733,7 @@ pub(super) fn inline_instantiation_items(
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     if matches!(
-                                        &dd.data_type,
+                                        resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
                                         DataType::Simple {
                                             kind: SimpleType::Event,
                                             ..
@@ -4966,7 +4966,7 @@ pub(super) fn inline_instantiation_items(
                                     // members x, while the same declaration at
                                     // top level worked.
                                     if matches!(
-                                        &dd.data_type,
+                                        resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
                                         DataType::Simple {
                                             kind: SimpleType::Event,
                                             ..
