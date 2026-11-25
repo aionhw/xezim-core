@@ -318,7 +318,8 @@ pub use value::Value;
 /// \x74 preserves the bound expressions of parameter-sized static class arrays (§8.25).
 /// \x75 retains bounded class queue declarations (§7.10, §8.25).
 /// \x76 retains a design definition's default net type (§22.8).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x76";
+/// \x77 retains primitive drive strengths and distinguishes supply and unresolved nets.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x77";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -4310,6 +4311,7 @@ fn parse_and_elaborate(
     elaborate::expand_whole_struct_continuous_assigns(&mut elab);
     elab_phase("whole-struct assign expansion", &mut phase_t);
     // §28.8: bidirectional switches need every terminal's drivers in hand.
+    elaborate::validate_uwire_drivers(&elab)?;
     elaborate::resolve_bidirectional_switches(&mut elab);
     // §6.6.7: fold user-defined nettype drivers — after inlining, so drivers
     // arriving from several instances through ports resolve together with any
@@ -5035,6 +5037,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         .iter()
         .map(|name| {
             ast::decl::ModuleItem::ModuleInstantiation(ModuleInstantiation {
+                strength: None,
                 module_name: ast::Identifier {
                     name: name.clone(),
                     span: ast::Span::dummy(),

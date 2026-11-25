@@ -72,6 +72,8 @@ enum WriterKind {
     Ff,
     /// `always`, `initial`, `final`.
     Other,
+    /// A declared initialization is procedural for the mixed-driver rule.
+    Initialization,
     /// §6.5, §23.3.3: the actual of an instance's OUTPUT port, which the
     /// port connection drives like a continuous assignment.
     Port,
@@ -275,6 +277,20 @@ pub(super) fn validate_driver_conflicts(
             }
         }
     }
+    for item in module.items() {
+        let ModuleItem::DataDeclaration(declaration) = item else {
+            continue;
+        };
+        for decl in &declaration.declarators {
+            if decl.init.is_some()
+                && is_var(&decl.name.name)
+                && let Some(entries) = writers.get_mut(&decl.name.name)
+            {
+                entries.push((next, WriterKind::Initialization, None));
+                next += 1;
+            }
+        }
+    }
     let mut add_process = |stmt: &Statement, kind: WriterKind, next: &mut usize| {
         let mut spans = Vec::new();
         collect_stmt_write_spans(stmt, elab, &mut spans);
@@ -338,7 +354,10 @@ pub(super) fn validate_driver_conflicts(
                             )
                         }
                     }
-                    (W::Continuous, _) | (_, W::Continuous) => {
+                    (W::Initialization, W::Port)
+                    | (W::Port, W::Initialization)
+                    | (W::Continuous, _)
+                    | (_, W::Continuous) => {
                         if sp.is_none() {
                             format!("Variable '{n}' has both continuous and procedural drivers")
                         } else {
@@ -348,6 +367,7 @@ pub(super) fn validate_driver_conflicts(
                             )
                         }
                     }
+                    (W::Initialization, _) | (_, W::Initialization) => continue,
                     (W::Comb, _) | (_, W::Comb) => format!(
                         "Variable '{}' is written by an always_comb or always_latch block and by another process (IEEE 1800-2017 §9.2.2.2)",
                         show(n, sp)
@@ -478,4 +498,86 @@ pub fn relax_driver_conflicts() -> bool {
             .as_deref()
             == Some("1")
     })
+}
+
+/// §6.6.2: unresolved nets permit one driver per bit.
+pub fn validate_uwire_drivers(elab: &ElaboratedModule) -> Result<(), String> {
+    let is_uwire = |name: &str| elab.resolved_net_kinds.get(name) == Some(&ResolvedNetKind::Uwire);
+    if !elab
+        .resolved_net_kinds
+        .values()
+        .any(|kind| *kind == ResolvedNetKind::Uwire)
+    {
+        return Ok(());
+    }
+    fn writes(
+        expr: &Expression,
+        elab: &ElaboratedModule,
+        spans: &mut Vec<(String, Option<(i64, i64)>)>,
+    ) {
+        match &expr.kind {
+            ExprKind::Concatenation(items) => {
+                for item in items {
+                    writes(item, elab, spans);
+                }
+            }
+            ExprKind::Paren(inner) => writes(inner, elab, spans),
+            _ => {
+                let begin = spans.len();
+                lvalue_write_spans(expr, elab, spans);
+                if spans.len() == begin {
+                    if let Some(name) = ident_flat_name(expr) {
+                        spans.push((name, None));
+                    }
+                }
+            }
+        }
+    }
+    let mut by_net: HashMap<String, Vec<Option<(i64, i64)>>> = HashMap::default();
+    let mut spans = Vec::new();
+    let mut add = |expr: &Expression| -> Result<(), String> {
+        writes(expr, elab, &mut spans);
+        for (name, span) in spans.drain(..) {
+            if !is_uwire(name.as_str()) {
+                continue;
+            }
+            let existing = by_net.entry(name.clone()).or_default();
+            if existing.iter().any(|other| match (other, span) {
+                (Some((l, r)), Some((a, b))) => *l <= b && a <= *r,
+                _ => true,
+            }) {
+                return Err(format!(
+                    "uwire net '{name}' has multiple drivers on the same bit (IEEE 1800 §6.6.2)"
+                ));
+            }
+            existing.push(span);
+        }
+        Ok(())
+    };
+    for assignment in &elab.continuous_assigns {
+        if let ContinuousAssignment::PlainLink { lhs, .. } = assignment {
+            if !is_uwire(lhs.as_str()) {
+                continue;
+            }
+        }
+        add(&assignment.lhs_expr())?;
+    }
+    for assignment in &elab.pending_cont_assign {
+        add(&assignment.materialize_lhs())?;
+    }
+    for udp in &elab.udp_instances {
+        add(&udp.output)?;
+    }
+    for switch in &elab.tran_switches {
+        for expr in [&switch.a, &switch.b] {
+            writes(expr, elab, &mut spans);
+            if let Some((name, _)) = spans.iter().find(|(name, _)| is_uwire(name.as_str())) {
+                return Err(format!(
+                    "uwire net '{name}' cannot connect to a bidirectional switch (IEEE 1800 §6.6.2)"
+                ));
+            }
+            spans.clear();
+        }
+    }
+    Ok(())
 }

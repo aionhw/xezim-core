@@ -868,9 +868,16 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
     }
     let mut staged: HashMap<String, usize> = HashMap::default();
     for i in 0..elab.udp_instances.len() {
-        let Some(net) = ident_flat_name(&elab.udp_instances[i].output)
-            .filter(|n| drivers.get(n).is_some_and(|&c| c > 1))
-        else {
+        let Some(net) = ident_flat_name(&elab.udp_instances[i].output).filter(|n| {
+            drivers.get(n).is_some_and(|&count| {
+                count > 1
+                    || elab.udp_instances[i].strength.is_some()
+                    || matches!(
+                        elab.resolved_net_kinds.get(n.as_str()),
+                        Some(ResolvedNetKind::Supply0 | ResolvedNetKind::Supply1)
+                    )
+            })
+        }) else {
             continue;
         };
         let k = staged.entry(net.clone()).or_insert(0);
@@ -884,10 +891,13 @@ fn stage_shared_udp_outputs(elab: &mut ElaboratedModule) {
         elab.signals.insert(stage.clone(), sig);
         let span = elab.udp_instances[i].output.span;
         elab.udp_instances[i].output = Expression::new(make_ident_expr(&stage).kind, span);
-        elab.continuous_assigns.push(ContinuousAssignment::plain(
-            make_ident_expr(&net),
-            make_ident_expr(&stage),
-        ));
+        let rhs = make_ident_expr(&stage);
+        let rhs = match elab.udp_instances[i].strength {
+            Some(strength) => drive_with_strength(rhs, strength),
+            None => rhs,
+        };
+        elab.continuous_assigns
+            .push(ContinuousAssignment::plain(make_ident_expr(&net), rhs));
     }
 }
 
@@ -1272,16 +1282,23 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     }
+    // The strength level a driver's marker gives it: 0 supply, 1 strong
+    // (unmarked), 2 pull, 3 weak.
+    let marker_level = |e: &Expression| match &e.kind {
+        ExprKind::SystemCall { name, .. } if name == "$__supply" => Some(0u8),
+        ExprKind::SystemCall { name, .. } if name == "$__drive" => Some(1),
+        ExprKind::SystemCall { name, .. } if name == "$__pull" => Some(2),
+        ExprKind::SystemCall { name, .. } if name == "$__weak" => Some(3),
+        _ => None,
+    };
     // §28.12: a driver with a strength inside an instance joins the roster
     // now, so its net records the strength for `%v` like a top-level one.
-    if elab
-        .pending_cont_assign
-        .iter()
-        .any(|p| p.strength().is_some())
-    {
+    let has_strength =
+        |p: &PendingContAssign| p.strength().is_some() || marker_level(&p.rhs_source).is_some();
+    if elab.pending_cont_assign.iter().any(has_strength) {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for p in pending {
-            if p.strength().is_some() {
+            if has_strength(&p) {
                 let ca = p.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {
@@ -1405,6 +1422,17 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     };
+    // §28.12 strength pair of a marked driver (see `strength_code`); an
+    // unmarked one is strong.
+    let marker_code = |e: &Expression| -> Option<u8> {
+        match &e.kind {
+            ExprKind::SystemCall { args, .. } if marker_level(e).is_some() => args
+                .get(1)
+                .and_then(|c| const_eval_i64_with_params(c, None))
+                .map(|c| c as u8),
+            _ => None,
+        }
+    };
     // Only declared nets take part in multi-driver resolution or undriven
     // trireg initialization. Keying by `SharedName` borrowed from `elab.nets`
     // avoids cloning any net name strings and skips non-net variables (#721).
@@ -1418,7 +1446,15 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     };
+    let mut explicit_strength = HashSet::default();
     for ca in &elab.continuous_assigns {
+        if let ContinuousAssignment::Full(assign) = ca
+            && marker_level(&assign.rhs).is_some()
+            && let Some(name) = driver_net(ca, is_hier_port_drive(ca))
+            && elab.nets.contains(&name)
+        {
+            explicit_strength.insert(name);
+        }
         if ca.rhs_parent_scoped()
             && let Some(f) = ca.lhs_ident_name()
             && merged_formals.contains(f.as_ref())
@@ -1475,11 +1511,13 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // bits that driver holds at z reading z instead of pulling. Nets with NO
     // driver never reach the fold at all and are handled by their declared
     // initial value instead (see the net-declaration sites).
-    let mut multi: HashSet<String> = counts
-        .iter()
-        .filter(|(_, c)| **c > 1)
-        .map(|(n, _)| n.to_string())
-        .collect();
+    let mut multi = explicit_strength;
+    multi.extend(
+        counts
+            .iter()
+            .filter(|(_, c)| **c > 1)
+            .map(|(n, _)| n.to_string()),
+    );
     if !elab.resolved_net_kinds.is_empty() {
         for (n, c) in &counts {
             if *c >= 1
@@ -1488,6 +1526,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                     Some(ResolvedNetKind::Tri0)
                         | Some(ResolvedNetKind::Tri1)
                         | Some(ResolvedNetKind::ChargeStorage)
+                        | Some(ResolvedNetKind::Supply0 | ResolvedNetKind::Supply1)
                 )
             {
                 if *c == 1
@@ -1609,26 +1648,6 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     }
     let mut folded: HashMap<String, Acc> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
-    // The strength level a driver's marker gives it: 0 supply, 1 strong
-    // (unmarked), 2 pull, 3 weak.
-    let marker_level = |e: &Expression| match &e.kind {
-        ExprKind::SystemCall { name, .. } if name == "$__supply" => Some(0u8),
-        ExprKind::SystemCall { name, .. } if name == "$__drive" => Some(1),
-        ExprKind::SystemCall { name, .. } if name == "$__pull" => Some(2),
-        ExprKind::SystemCall { name, .. } if name == "$__weak" => Some(3),
-        _ => None,
-    };
-    // §28.12 strength pair of a marked driver (see `strength_code`); an
-    // unmarked one is strong.
-    let marker_code = |e: &Expression| -> Option<u8> {
-        match &e.kind {
-            ExprKind::SystemCall { args, .. } if marker_level(e).is_some() => args
-                .get(1)
-                .and_then(|c| const_eval_i64_with_params(c, None))
-                .map(|c| c as u8),
-            _ => None,
-        }
-    };
     // Per folded net: its drivers with their strengths, and whether any
     // of them makes the strengths worth keeping for `%v`.
     let mut strength: HashMap<String, (Vec<StrengthDriver>, bool)> = HashMap::default();
@@ -1709,20 +1728,24 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         });
         // §28.4/§28.7: a tristate primitive with an unknown control drives
-        // `L`/`H` (its value or z), so it is resolved against the net's
-        // other drivers last, by `$__wres_tri` — on a plain wire only.
-        if !matches!(
-            elab.resolved_net_kinds.get(&name),
-            Some(ResolvedNetKind::Wand)
-                | Some(ResolvedNetKind::Wor)
-                | Some(ResolvedNetKind::RealSum)
-        ) {
+        // `L`/`H` (its value or z). Keep the control and the strength pair
+        // together so the resolver can distinguish unknown control from X data.
+        let marked = marker_level(&ca_full.rhs);
+        let code = marker_code(&ca_full.rhs).unwrap_or(6 * 8 + 6);
+        let drive = match &ca_full.rhs.kind {
+            ExprKind::SystemCall { args, .. } if marked.is_some() => {
+                args.first().unwrap_or(&ca_full.rhs)
+            }
+            _ => &ca_full.rhs,
+        };
+        let net_kind = elab.resolved_net_kinds.get(&name);
+        if net_kind != Some(&ResolvedNetKind::RealSum) {
             if ca_full.origin().is_none()
                 && let ExprKind::Conditional {
                     condition: ctl,
                     then_expr: data,
                     else_expr,
-                } = &ca_full.rhs.kind
+                } = &drive.kind
                 && matches!(
                     else_expr.kind,
                     ExprKind::Number(NumberLiteral::UnbasedUnsized('z'))
@@ -1733,17 +1756,15 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 e.0.push(StrengthDriver {
                     value: data.as_ref().clone(),
                     ctl: Some(ctl.as_ref().clone()),
-                    s0: 6,
-                    s1: 6,
+                    s0: code / 8,
+                    s1: code % 8,
                 });
                 e.1 = true;
                 continue;
             }
         }
         // Unwrap a strength marker into the raw value for its level's chain.
-        let marked = marker_level(&ca_full.rhs);
         let level = marked.unwrap_or(1);
-        let code = marker_code(&ca_full.rhs).unwrap_or(6 * 8 + 6);
         let rhs = if marked.is_some() {
             if let ExprKind::SystemCall { args, .. } = ca_full.rhs.kind {
                 args.into_iter().next().unwrap_or_else(|| make_z_expr(span))
@@ -1802,6 +1823,19 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // resolves against the strong chain — so a real driver still wins and only
     // undriven (z) bits take the pull.
     for (name, acc) in folded.iter_mut() {
+        if let Some(kind @ (ResolvedNetKind::Supply0 | ResolvedNetKind::Supply1)) =
+            elab.resolved_net_kinds.get(name)
+        {
+            let span = acc.lhs.span;
+            let entry = strength.entry(name.clone()).or_default();
+            entry.0.push(StrengthDriver {
+                value: make_fill_expr(*kind == ResolvedNetKind::Supply1, span),
+                ctl: None,
+                s0: 7,
+                s1: 7,
+            });
+            entry.1 = true;
+        }
         let pull_bit = match elab.resolved_net_kinds.get(name) {
             Some(ResolvedNetKind::Tri0) => Some(false),
             Some(ResolvedNetKind::Tri1) => Some(true),
@@ -1845,14 +1879,8 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         }
     }
     for (name, (drivers, keep)) in strength {
-        // Wired AND/OR and summed nets do not resolve by strength alone.
-        let wired = matches!(
-            elab.resolved_net_kinds.get(&name),
-            Some(ResolvedNetKind::Wand)
-                | Some(ResolvedNetKind::Wor)
-                | Some(ResolvedNetKind::RealSum)
-        );
-        if keep && !wired {
+        // Real sum has its own driver function.
+        if keep && elab.resolved_net_kinds.get(&name) != Some(&ResolvedNetKind::RealSum) {
             elab.strength_drivers.insert(name, drivers);
         }
     }
@@ -1893,7 +1921,12 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                         args.push(d.ctl.clone().unwrap_or_else(|| make_fill_expr(true, span)));
                         args.push(d.value.clone());
                     }
-                    make_syscall("$__sres", args, span)
+                    let operation = match elab.resolved_net_kinds.get(&name) {
+                        Some(ResolvedNetKind::Wand) => "$__sres_and",
+                        Some(ResolvedNetKind::Wor) => "$__sres_or",
+                        _ => "$__sres",
+                    };
+                    make_syscall(operation, args, span)
                 }
                 None => rhs,
             };

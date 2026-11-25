@@ -379,19 +379,7 @@ impl<'a> Parser<'a> {
                 // Optional drive_strength `(strong1, weak0)` (§10.3.1).
                 // Retained as a comma-joined keyword list so `%v` (§21.2.1.5)
                 // can report the driven strength; otherwise unmodelled.
-                let mut strength: Option<String> = None;
-                if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
-                    self.bump();
-                    let mut parts: Vec<String> = Vec::new();
-                    while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-                        let t = self.bump();
-                        if t.kind != TokenKind::Comma {
-                            parts.push(self.token_text(t).into_owned());
-                        }
-                    }
-                    self.expect(TokenKind::RParen);
-                    strength = Some(parts.join(","));
-                }
+                let strength = self.parse_drive_strength();
                 let mut delay_fall = None;
                 let mut delay_off = None;
                 let delay = if self.eat(TokenKind::Hash).is_some() {

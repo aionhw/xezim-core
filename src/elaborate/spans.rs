@@ -23,6 +23,9 @@ pub enum ResolvedNetKind {
     /// Kirchhoff's current law. Bitwise `$__wres` would instead call two
     /// drivers a conflict and yield x.
     RealSum,
+    Supply0,
+    Supply1,
+    Uwire,
 }
 
 impl ResolvedNetKind {
@@ -34,6 +37,9 @@ impl ResolvedNetKind {
             NetType::Tri1 => Some(Self::Tri1),
             NetType::TriReg => Some(Self::ChargeStorage),
             NetType::Wreal => Some(Self::RealSum),
+            NetType::Supply0 => Some(Self::Supply0),
+            NetType::Supply1 => Some(Self::Supply1),
+            NetType::Uwire => Some(Self::Uwire),
             _ => None,
         }
     }

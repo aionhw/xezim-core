@@ -56,8 +56,12 @@ pub(super) fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expressi
                     // and only falls back to the pull where the net is otherwise
                     // z. A lone pull driver evaluates to its value ($__pull is
                     // identity in the simulator).
-                    let code = strength_code_literal(5 * 8 + 5, net.span);
-                    let weak = make_syscall("$__pull", vec![lit, code], net.span);
+                    let weak = if let Some(strength) = gi.strength {
+                        drive_with_strength(lit, strength)
+                    } else {
+                        let code = strength_code_literal(5 * 8 + 5, net.span);
+                        make_syscall("$__pull", vec![lit, code], net.span)
+                    };
                     pairs.push((net.clone(), weak));
                 }
                 continue;
@@ -285,6 +289,13 @@ pub(super) fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expressi
             _ => {}
         }
     }
+    if let Some(strength) = gi.strength
+        && !matches!(gi.gate_type, GateType::Pullup | GateType::Pulldown)
+    {
+        for (_, rhs) in &mut pairs {
+            *rhs = drive_with_strength(rhs.clone(), strength);
+        }
+    }
     pairs
 }
 
@@ -409,6 +420,21 @@ fn strength_code(s: &str) -> u8 {
         }
     }
     s0 * 8 + s1
+}
+
+pub(super) fn drive_with_strength(
+    value: Expression,
+    strength: crate::ast::decl::PrimitiveStrength,
+) -> Expression {
+    let code = strength.code();
+    let marker = match (code / 8).max(code % 8) {
+        7 if code == 63 => "$__supply",
+        0..=3 => "$__weak",
+        4..=5 => "$__pull",
+        _ => "$__drive",
+    };
+    let span = value.span;
+    make_syscall(marker, vec![value, strength_code_literal(code, span)], span)
 }
 
 pub(super) fn strength_code_literal(code: u8, span: Span) -> Expression {
@@ -655,6 +681,7 @@ pub(super) fn lower_udp_instances(
         match arr_range {
             None => {
                 elab.udp_instances.push(UdpInstance {
+                    strength: inst.strength,
                     udp_name: udp.name.name.clone(),
                     inst_path,
                     output: terms[0].clone(),
@@ -680,6 +707,7 @@ pub(super) fn lower_udp_instances(
                         )
                     };
                     elab.udp_instances.push(UdpInstance {
+                        strength: inst.strength,
                         udp_name: udp.name.name.clone(),
                         inst_path: format!("{}[{}]", inst_path, idx),
                         output: sel(&terms[0]),

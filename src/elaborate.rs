@@ -1589,6 +1589,8 @@ fn top_origin_scope() -> std::sync::Arc<str> {
 /// continuous-assign LHS/RHS.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UdpInstance {
+    /// §29: explicit strength of this output driver.
+    pub strength: Option<crate::ast::decl::PrimitiveStrength>,
     /// Primitive (UDP) name, for diagnostics.
     pub udp_name: String,
     /// Full instance path (e.g. `top.u_dff`), for diagnostics.
