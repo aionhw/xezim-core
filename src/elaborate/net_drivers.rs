@@ -698,14 +698,37 @@ fn widen_overlapping_select_drivers(elab: &mut ElaboratedModule) {
     };
     let widen: HashSet<String> = by_net
         .into_iter()
-        .filter(|(n, v)| {
-            v.iter().any(|s| s.2)
-                && (pulled(n)
-                    || v.iter()
-                        .enumerate()
-                        .any(|(i, a)| v[i + 1..].iter().any(|b| a.0 <= b.1 && b.0 <= a.1)))
+        .filter_map(|(n, mut v)| {
+            if !v.iter().any(|s| s.2) {
+                return None;
+            }
+            if pulled(&n) {
+                return Some(n);
+            }
+            if v.len() < 2 {
+                return None;
+            }
+            let overlap = if v.iter().all(|s| s.0 <= s.1) {
+                v.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                let mut max_hi = v[0].1;
+                let mut found = false;
+                for s in &v[1..] {
+                    if s.0 <= max_hi {
+                        found = true;
+                        break;
+                    }
+                    if s.1 > max_hi {
+                        max_hi = s.1;
+                    }
+                }
+                found
+            } else {
+                v.iter()
+                    .enumerate()
+                    .any(|(i, a)| v[i + 1..].iter().any(|b| a.0 <= b.1 && b.0 <= a.1))
+            };
+            overlap.then_some(n)
         })
-        .map(|(n, _)| n)
         .collect();
     if widen.is_empty() {
         return;
