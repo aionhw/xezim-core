@@ -1589,8 +1589,22 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             }
         }
     };
+fn clear_elaboration_scratch_tables(elab: &mut ElaboratedModule) {
+    elab.alias_groups.clear();
+    elab.alias_groups.shrink_to_fit();
+    elab.alias_canon.clear();
+    elab.alias_canon.shrink_to_fit();
+    elab.net_port_merges.clear();
+    elab.net_port_merges.shrink_to_fit();
+    elab.struct_field_range_idents.clear();
+    elab.struct_field_range_idents.shrink_to_fit();
+    elab.const_decl_inits.clear();
+    elab.const_decl_inits.shrink_to_fit();
+}
+
     if multi.is_empty() {
         set_undriven_z(elab);
+        clear_elaboration_scratch_tables(elab);
         return;
     }
     // §28.12: the single-driver entries recorded above are per NET, so with
@@ -1837,7 +1851,16 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 },
                 span,
             ),
-            Some(acc) => make_syscall(fold_op, vec![acc, rhs], span),
+            Some(mut acc) => {
+                if let ExprKind::SystemCall { name, args } = &mut acc.kind
+                    && name == fold_op
+                {
+                    args.push(rhs);
+                    acc
+                } else {
+                    make_syscall(fold_op, vec![acc, rhs], span)
+                }
+            }
             None => rhs,
         });
     }
@@ -1975,6 +1998,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         }
     }
     set_undriven_z(elab);
+    clear_elaboration_scratch_tables(elab);
 }
 
 pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
@@ -2019,9 +2043,13 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
                     true
                 }
             });
-            let mut it = rhs.into_iter();
-            let first = it.next()?;
-            Some(it.fold(first, |acc, r| make_syscall("$__wres", vec![acc, r], span)))
+            if rhs.is_empty() {
+                None
+            } else if rhs.len() == 1 {
+                rhs.into_iter().next()
+            } else {
+                Some(make_syscall("$__wres", rhs, span))
+            }
         };
         let own_a = take_drivers(&na);
         let own_b = take_drivers(&nb);

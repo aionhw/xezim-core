@@ -4729,6 +4729,168 @@ impl Value {
         Value::from_u64(ones as u64, 1)
     }
 
+    #[inline(always)]
+    fn wire_resolve_word(av: u64, ax: u64, bv: u64, bx: u64) -> (u64, u64) {
+        let az = av & ax;
+        let bz = bv & bx;
+        let ov = (az & bv) | (bz & av) | ((av & !ax) & (bv & !bx));
+        let ox = (az & bx) | (bz & ax) | ((!az) & (!bz) & (ax | bx | (av ^ bv)));
+        (ov, ox)
+    }
+
+    #[inline(always)]
+    fn wired_logic_word(av: u64, ax: u64, bv: u64, bx: u64, is_and: bool) -> (u64, u64) {
+        let (rv, rx) = Self::wire_resolve_word(av, ax, bv, bx);
+        if is_and {
+            let ctrl = ((!av) & (!ax)) | ((!bv) & (!bx));
+            (rv & !ctrl, rx & !ctrl)
+        } else {
+            let ctrl = (av & (!ax)) | (bv & (!bx));
+            (rv | ctrl, rx & !ctrl)
+        }
+    }
+
+    #[inline(always)]
+    fn wire_resolve_pull_word(sv: u64, sx: u64, wv: u64, wx: u64) -> (u64, u64) {
+        let sz = sv & sx;
+        ((sz & wv) | ((!sz) & sv), (sz & wx) | ((!sz) & sx))
+    }
+
+    #[inline(always)]
+    fn tranif_uncertain_word(mv: u64, mx: u64, ov: u64, ox: u64) -> (u64, u64) {
+        let same = !(mv ^ ov) & !(mx ^ ox);
+        (same & mv, (same & mx) | !same)
+    }
+
+    #[inline(always)]
+    fn word_planes_zero_padded(&self, wi: usize, target_w: u32) -> (u64, u64) {
+        if self.is_fill && self.width > 0 {
+            let (v, x) = match self.get_bit(0) {
+                LogicBit::Zero => (0u64, 0u64),
+                LogicBit::One => (u64::MAX, 0u64),
+                LogicBit::X => (0u64, u64::MAX),
+                LogicBit::Z => (u64::MAX, u64::MAX),
+            };
+            let bits_left = (target_w as usize).saturating_sub(wi * 64);
+            let mask = if bits_left >= 64 {
+                u64::MAX
+            } else if bits_left == 0 {
+                0
+            } else {
+                (1u64 << bits_left) - 1
+            };
+            return (v & mask, x & mask);
+        }
+        let valid_bits = (self.width as usize).saturating_sub(wi * 64);
+        if valid_bits == 0 {
+            return (0, 0);
+        }
+        let mask = if valid_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid_bits) - 1
+        };
+        let (v, x) = match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if wi == 0 {
+                    (*val_bits, *xz_bits)
+                } else {
+                    (0, 0)
+                }
+            }
+            ValueStorage::Wide2State(val) => (val.get(wi).copied().unwrap_or(0), 0),
+            ValueStorage::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                (
+                    buf[..n].get(wi).copied().unwrap_or(0),
+                    buf[n..].get(wi).copied().unwrap_or(0),
+                )
+            }
+        };
+        (v & mask, x & mask)
+    }
+
+    #[inline]
+    fn binary_4state_word_op(
+        &self,
+        other: &Value,
+        op: impl Fn(u64, u64, u64, u64) -> (u64, u64),
+    ) -> Value {
+        let w = self.width.max(other.width).max(1);
+        if w <= 64 {
+            let (av, ax) = self.word_planes_zero_padded(0, w);
+            let (bv, bx) = other.word_planes_zero_padded(0, w);
+            let (rv, rx) = op(av, ax, bv, bx);
+            let mask = Self::mask(w);
+            return Value {
+                storage: ValueStorage::Inline {
+                    val_bits: rv & mask,
+                    xz_bits: rx & mask,
+                },
+                width: w,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            };
+        }
+        let nw = ValueStorage::wide_nwords(w);
+        let top = ValueStorage::top_word_mask(w);
+        let mut val = vec![0u64; nw];
+        let mut xz: Option<Vec<u64>> = None;
+        for (wi, vslot) in val.iter_mut().enumerate() {
+            let (av, ax) = self.word_planes_zero_padded(wi, w);
+            let (bv, bx) = other.word_planes_zero_padded(wi, w);
+            let (mut rv, mut rx) = op(av, ax, bv, bx);
+            if wi + 1 == nw {
+                rv &= top;
+                rx &= top;
+            }
+            *vslot = rv;
+            if rx != 0 {
+                let xbuf = xz.get_or_insert_with(|| vec![0u64; nw]);
+                xbuf[wi] = rx;
+            }
+        }
+        let storage = match xz {
+            None => ValueStorage::Wide2State(val.into_boxed_slice()),
+            Some(xbuf) => {
+                let mut combined = Vec::with_capacity(2 * nw);
+                combined.extend_from_slice(&val);
+                combined.extend_from_slice(&xbuf);
+                ValueStorage::Wide4State(combined.into_boxed_slice())
+            }
+        };
+        Value {
+            storage,
+            width: w,
+            is_signed: false,
+            is_real: false,
+            is_fill: false,
+        }
+    }
+
+    /// Word-parallel IEEE 1800 wired-net (`wire`/`tri`) resolution across two drivers.
+    pub fn wire_resolve(&self, other: &Value) -> Value {
+        self.binary_4state_word_op(other, Self::wire_resolve_word)
+    }
+
+    /// Word-parallel IEEE 1800 §6.6.2 wired-AND (`wand`) / wired-OR (`wor`) resolution.
+    pub fn wired_logic(&self, other: &Value, is_and: bool) -> Value {
+        self.binary_4state_word_op(other, |av, ax, bv, bx| {
+            Self::wired_logic_word(av, ax, bv, bx, is_and)
+        })
+    }
+
+    /// Word-parallel strong-over-weak resolution: `weak` fills only `z` bits of `self`.
+    pub fn wire_resolve_pull(&self, weak: &Value) -> Value {
+        self.binary_4state_word_op(weak, Self::wire_resolve_pull_word)
+    }
+
+    /// Word-parallel unknown-control switch resolution: agreeing bits pass, differing become `x`.
+    pub fn tranif_uncertain(&self, other: &Value) -> Value {
+        self.binary_4state_word_op(other, Self::tranif_uncertain_word)
+    }
+
     // === Concatenation ===
 
     /// `#[inline]`: `concat_refs` is generic (so it is codegen'd in the calling
@@ -8103,6 +8265,82 @@ mod ch6_wide_storage_tests {
         p117_4s.set_bit(127, LogicBit::Zero); // unchanged value bits
         p117_4s.set_bit(126, LogicBit::X);
         assert_eq!(p117_4s.clog2_unsigned(), 118);
+    }
+
+    #[test]
+    fn wire_resolve_ops_match_all_16_bit_pairs_inline_and_wide() {
+        fn ref_wire_resolve(a: LogicBit, b: LogicBit) -> LogicBit {
+            match (a, b) {
+                (LogicBit::Z, x) | (x, LogicBit::Z) => x,
+                (LogicBit::X, _) | (_, LogicBit::X) => LogicBit::X,
+                (x, y) if x == y => x,
+                _ => LogicBit::X,
+            }
+        }
+        fn ref_wired_logic(a: LogicBit, b: LogicBit, is_and: bool) -> LogicBit {
+            let ctrl = if is_and { LogicBit::Zero } else { LogicBit::One };
+            if a == ctrl || b == ctrl {
+                ctrl
+            } else {
+                ref_wire_resolve(a, b)
+            }
+        }
+        fn ref_pull(s: LogicBit, w: LogicBit) -> LogicBit {
+            if s == LogicBit::Z { w } else { s }
+        }
+        fn ref_tranif_unc(m: LogicBit, o: LogicBit) -> LogicBit {
+            if m == o { m } else { LogicBit::X }
+        }
+
+        let bits = [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z];
+        for (idx, &(a_w, b_w)) in [(16u32, 16u32), (4, 8), (16, 130), (160, 160), (160, 97)]
+            .iter()
+            .enumerate()
+        {
+            let mut a = Value::zero(a_w);
+            let mut b = Value::zero(b_w);
+            let w = a_w.max(b_w);
+            for i in 0..a_w as usize {
+                a.set_bit(i, bits[(i + idx) % 4]);
+            }
+            for i in 0..b_w as usize {
+                b.set_bit(i, bits[((i / 4) + i + idx * 3) % 4]);
+            }
+            // Inject an explicit all-16 pair slice starting at bit 0 where both exist
+            if a_w >= 16 && b_w >= 16 {
+                for p in 0..16 {
+                    a.set_bit(p, bits[p / 4]);
+                    b.set_bit(p, bits[p % 4]);
+                }
+            }
+            let r_wres = a.wire_resolve(&b);
+            let r_wand = a.wired_logic(&b, true);
+            let r_wor = a.wired_logic(&b, false);
+            let r_pull = a.wire_resolve_pull(&b);
+            let r_tran = a.tranif_uncertain(&b);
+            assert_eq!(r_wres.width, w);
+            for i in 0..w as usize {
+                let ab = a.get_bit(i);
+                let bb = b.get_bit(i);
+                assert_eq!(r_wres.get_bit(i), ref_wire_resolve(ab, bb));
+                assert_eq!(r_wand.get_bit(i), ref_wired_logic(ab, bb, true));
+                assert_eq!(r_wor.get_bit(i), ref_wired_logic(ab, bb, false));
+                assert_eq!(r_pull.get_bit(i), ref_pull(ab, bb));
+                assert_eq!(r_tran.get_bit(i), ref_tranif_unc(ab, bb));
+            }
+        }
+        // Wide 2-state wire resolution produces Wide2State without XZ plane
+        let w2_a = Value::from_words(&[0xdead_beef, 0xcafe_babe, 0x1234], 150);
+        let w2_b = w2_a.clone();
+        let resolved_same = w2_a.wire_resolve(&w2_b);
+        assert!(matches!(resolved_same.storage, ValueStorage::Wide2State(_)));
+        assert_eq!(resolved_same, w2_a);
+
+        // Fill 'z yields to driven wide value
+        let z_fill = Value::fill_of('z');
+        assert_eq!(w2_a.wire_resolve(&z_fill), w2_a);
+        assert_eq!(z_fill.wire_resolve(&w2_a), w2_a);
+        assert_eq!(z_fill.wire_resolve_pull(&w2_a), w2_a);
     }
 }
 
