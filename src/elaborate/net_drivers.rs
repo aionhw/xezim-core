@@ -2022,6 +2022,17 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
             .map(|r| r.to_string())
             .unwrap_or(n)
     };
+
+    struct ParsedSwitch {
+        na: String,
+        nb: String,
+        span: Span,
+        ctl: Option<Expression>,
+        active_high: bool,
+    }
+    let mut parsed: Vec<ParsedSwitch> = Vec::with_capacity(switches.len());
+    let mut all_terminals: HashSet<String> = HashSet::default();
+    let mut cond_terminals: HashSet<String> = HashSet::default();
     for sw in switches {
         let (Some(na), Some(nb)) = (
             ident_flat_name(&sw.a).map(&norm),
@@ -2029,36 +2040,190 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
         ) else {
             continue;
         };
-        let (term_a, term_b) = (make_ident_expr(&na), make_ident_expr(&nb));
-        let span = sw.a.span;
+        all_terminals.insert(na.clone());
+        all_terminals.insert(nb.clone());
+        if sw.ctl.is_some() {
+            cond_terminals.insert(na.clone());
+            cond_terminals.insert(nb.clone());
+        }
+        parsed.push(ParsedSwitch {
+            na,
+            nb,
+            span: sw.a.span,
+            ctl: sw.ctl,
+            active_high: sw.active_high,
+        });
+    }
+    if parsed.is_empty() {
+        return;
+    }
 
-        // Each terminal's OWN drivers, folded with the wired-net resolution.
-        let mut take_drivers = |name: &str| -> Option<Expression> {
-            let mut rhs: Vec<Expression> = Vec::new();
-            elab.continuous_assigns.retain(|ca| {
-                if ca.lhs_ident_name().map(|s| norm(s.into_owned())).as_deref() == Some(name) {
-                    rhs.push(ca.rhs_expr().into_owned());
-                    false
-                } else {
-                    true
-                }
-            });
-            if rhs.is_empty() {
-                None
-            } else if rhs.len() == 1 {
-                rhs.into_iter().next()
-            } else {
-                Some(make_syscall("$__wres", rhs, span))
+    // Extract every continuous driver targeting any switch terminal in ONE O(C)
+    // pass instead of scanning `continuous_assigns` twice per switch.
+    let mut drivers_by_lhs: HashMap<String, Vec<Expression>> = HashMap::default();
+    elab.continuous_assigns.retain(|ca| {
+        if let Some(lhs) = ca.lhs_ident_name() {
+            let key = norm(lhs.into_owned());
+            if all_terminals.contains(&key) {
+                drivers_by_lhs
+                    .entry(key)
+                    .or_default()
+                    .push(ca.rhs_expr().into_owned());
+                return false;
             }
-        };
-        let own_a = take_drivers(&na);
-        let own_b = take_drivers(&nb);
-        // A terminal with no driver of its own contributes high impedance.
-        let z = || make_z_expr(span);
-        let own_a = own_a.unwrap_or_else(z);
-        let own_b = own_b.unwrap_or_else(z);
+        }
+        true
+    });
 
-        let ctl = sw.ctl.clone().unwrap_or_else(|| {
+    // Build Union-Find over unconditional (`tran`/`rtran`) switches so pure
+    // unconditional switch networks collapse to O(N) connected-component nets
+    // instead of N quadratic `$__tranif` daisy chains.
+    struct Dsu {
+        parent: Vec<usize>,
+        size: Vec<usize>,
+    }
+    impl Dsu {
+        fn find(&mut self, mut x: usize) -> usize {
+            while self.parent[x] != x {
+                let p = self.parent[x];
+                self.parent[x] = self.parent[p];
+                x = p;
+            }
+            x
+        }
+        fn union(&mut self, a: usize, b: usize) {
+            let (mut ra, mut rb) = (self.find(a), self.find(b));
+            if ra == rb {
+                return;
+            }
+            if self.size[ra] < self.size[rb] {
+                std::mem::swap(&mut ra, &mut rb);
+            }
+            self.parent[rb] = ra;
+            self.size[ra] += self.size[rb];
+        }
+    }
+
+    let mut dsu_ids: HashMap<String, usize> = HashMap::default();
+    let mut dsu_names: Vec<String> = Vec::new();
+    let mut dsu_spans: Vec<Span> = Vec::new();
+    let mut dsu = Dsu {
+        parent: Vec::new(),
+        size: Vec::new(),
+    };
+    let mut get_dsu_id = |name: &str, span: Span, dsu: &mut Dsu| -> usize {
+        if let Some(&id) = dsu_ids.get(name) {
+            id
+        } else {
+            let id = dsu_names.len();
+            dsu_names.push(name.to_string());
+            dsu_spans.push(span);
+            dsu.parent.push(id);
+            dsu.size.push(1);
+            dsu_ids.insert(name.to_string(), id);
+            id
+        }
+    };
+    for sw in &parsed {
+        if sw.ctl.is_none() {
+            let ia = get_dsu_id(&sw.na, sw.span, &mut dsu);
+            let ib = get_dsu_id(&sw.nb, sw.span, &mut dsu);
+            dsu.union(ia, ib);
+        }
+    }
+
+    // Any unconditional component containing a conditional-switch terminal stays
+    // on the per-switch `$__tranif` path so control switching keeps full fidelity.
+    let mut cond_roots: HashSet<usize> = HashSet::default();
+    for t in &cond_terminals {
+        if let Some(&id) = dsu_ids.get(t) {
+            cond_roots.insert(dsu.find(id));
+        }
+    }
+
+    // Group pure unconditional components by root.
+    let mut comp_members: HashMap<usize, Vec<(usize, String)>> = HashMap::default();
+    for (id, name) in dsu_names.iter().enumerate() {
+        let root_id = dsu.find(id);
+        if !cond_roots.contains(&root_id) {
+            comp_members
+                .entry(root_id)
+                .or_default()
+                .push((id, name.clone()));
+        }
+    }
+    let mut roots: Vec<usize> = comp_members.keys().copied().collect();
+    roots.sort_unstable();
+    for r in roots {
+        let mut members = comp_members.remove(&r).unwrap();
+        let span = dsu_spans[members[0].0];
+        members.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut all_drivers: Vec<Expression> = Vec::new();
+        for &(_, ref name) in &members {
+            if let Some(ds) = drivers_by_lhs.remove(name) {
+                all_drivers.extend(ds);
+            }
+        }
+        let group_expr = match all_drivers.len() {
+            0 => make_z_expr(span),
+            1 => all_drivers.into_iter().next().unwrap(),
+            _ => make_syscall("$__wres", all_drivers, span),
+        };
+        let rep_idx = members
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, (_, name))| {
+                (
+                    elab.signals.get(name).map_or(1, |s| s.width),
+                    std::cmp::Reverse(name),
+                )
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let rep_name = &members[rep_idx].1;
+        elab.continuous_assigns
+            .push(ContinuousAssignment::plain_scoped(
+                make_ident_expr(rep_name),
+                group_expr,
+                true,
+            ));
+        for (idx, (_, name)) in members.iter().enumerate() {
+            if idx != rep_idx {
+                elab.continuous_assigns
+                    .push(ContinuousAssignment::plain_scoped(
+                        make_ident_expr(name),
+                        make_ident_expr(rep_name),
+                        true,
+                    ));
+            }
+        }
+    }
+
+    // Remaining switches (conditional switches and any unconditional switches
+    // connected to them) use O(1) driver-map lookups instead of Vec::retain.
+    let mut emitted_order: Vec<String> = Vec::new();
+    let mut emitted_seen: HashSet<String> = HashSet::default();
+    let take_drivers = |map: &mut HashMap<String, Vec<Expression>>, name: &str, span: Span| {
+        match map.remove(name) {
+            None => None,
+            Some(mut rhs) if rhs.len() == 1 => rhs.pop(),
+            Some(rhs) if rhs.is_empty() => None,
+            Some(rhs) => Some(make_syscall("$__wres", rhs, span)),
+        }
+    };
+    for sw in parsed {
+        let is_pure_uncond = sw.ctl.is_none()
+            && dsu_ids
+                .get(&sw.na)
+                .is_some_and(|&id| !cond_roots.contains(&dsu.find(id)));
+        if is_pure_uncond {
+            continue;
+        }
+        let span = sw.span;
+        let own_a = take_drivers(&mut drivers_by_lhs, &sw.na, span).unwrap_or_else(|| make_z_expr(span));
+        let own_b = take_drivers(&mut drivers_by_lhs, &sw.nb, span).unwrap_or_else(|| make_z_expr(span));
+
+        let ctl = sw.ctl.unwrap_or_else(|| {
             Expression::new(
                 ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('1')),
                 span,
@@ -2070,22 +2235,107 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
             )),
             span,
         );
+        let rhs_a = make_syscall(
+            "$__tranif",
+            vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
+            span,
+        );
+        let rhs_b = make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span);
+        if emitted_seen.insert(sw.na.clone()) {
+            emitted_order.push(sw.na.clone());
+        }
+        if emitted_seen.insert(sw.nb.clone()) {
+            emitted_order.push(sw.nb.clone());
+        }
+        drivers_by_lhs.entry(sw.na).or_default().push(rhs_a);
+        drivers_by_lhs.entry(sw.nb).or_default().push(rhs_b);
+    }
+    for lhs in emitted_order {
+        if let Some(rhss) = drivers_by_lhs.remove(&lhs) {
+            for rhs in rhss {
+                elab.continuous_assigns
+                    .push(ContinuousAssignment::plain_scoped(
+                        make_ident_expr(&lhs),
+                        rhs,
+                        true,
+                    ));
+            }
+        }
+    }
+}
 
-        elab.continuous_assigns
-            .push(ContinuousAssignment::plain_scoped(
-                term_a,
-                make_syscall(
-                    "$__tranif",
-                    vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
-                    span,
-                ),
-                true,
-            ));
-        elab.continuous_assigns
-            .push(ContinuousAssignment::plain_scoped(
-                term_b,
-                make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
-                true,
-            ));
+#[cfg(test)]
+mod tran_switch_dsu_tests {
+    use super::*;
+
+    #[test]
+    fn unconditional_tran_chain_collapses_via_dsu_without_tranif_syscalls() {
+        let mut elab = ElaboratedModule::new("top".into());
+        let span = Span::dummy();
+        let make_wire = |name: &str| crate::elaborate::Signal {
+            name: name.to_string().into(),
+            width: 1,
+            is_signed: false,
+            is_real: false,
+            is_const: false,
+            direction: None,
+            value: crate::elaborate::SignalValue::uniform(crate::value::LogicBit::Z, 1, false),
+            type_name: None,
+        };
+        for i in 0..8 {
+            let name = format!("n{i}");
+            elab.signals.insert(name.clone(), make_wire(&name));
+            elab.nets.insert(name);
+        }
+        elab.continuous_assigns.push(ContinuousAssignment::plain_scoped(
+            make_ident_expr("n0"),
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('1')),
+                span,
+            ),
+            false,
+        ));
+        for i in 0..7 {
+            elab.tran_switches.push(crate::elaborate::TranSwitch {
+                a: make_ident_expr(&format!("n{i}")),
+                b: make_ident_expr(&format!("n{}", i + 1)),
+                ctl: None,
+                active_high: true,
+            });
+        }
+        resolve_bidirectional_switches(&mut elab);
+        assert_eq!(elab.continuous_assigns.len(), 8);
+        let has_tranif = elab.continuous_assigns.iter().any(|ca| {
+            matches!(&ca.rhs_expr().kind, ExprKind::SystemCall { name, .. } if name == "$__tranif")
+        });
+        assert!(!has_tranif, "pure unconditional tran chain should collapse via DSU");
+
+        // Mixed unconditional + conditional chain preserves `$__tranif` handling.
+        let mut mixed = ElaboratedModule::new("top".into());
+        for name in ["a", "b", "c", "en"] {
+            mixed.signals.insert(name.to_string(), make_wire(name));
+            mixed.nets.insert(name.to_string());
+        }
+        mixed.tran_switches.push(crate::elaborate::TranSwitch {
+            a: make_ident_expr("a"),
+            b: make_ident_expr("b"),
+            ctl: None,
+            active_high: true,
+        });
+        mixed.tran_switches.push(crate::elaborate::TranSwitch {
+            a: make_ident_expr("b"),
+            b: make_ident_expr("c"),
+            ctl: Some(make_ident_expr("en")),
+            active_high: true,
+        });
+        resolve_bidirectional_switches(&mut mixed);
+        let tranif_count = mixed
+            .continuous_assigns
+            .iter()
+            .filter(|ca| {
+                matches!(&ca.rhs_expr().kind, ExprKind::SystemCall { name, .. } if name == "$__tranif")
+            })
+            .count();
+        assert!(tranif_count >= 2, "conditional island must keep $__tranif");
     }
 }

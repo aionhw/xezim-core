@@ -631,7 +631,24 @@ enum SignalValueWire {
     Custom(Value),
 }
 
+#[cfg(target_pointer_width = "64")]
+#[derive(Clone, Copy)]
+enum InlineSignal {
+    Uniform {
+        bit: crate::value::LogicBit,
+        width: u32,
+        is_signed: bool,
+    },
+    RealZero,
+    EmptyZeroWidth {
+        is_signed: bool,
+    },
+}
+
 impl SignalValue {
+    #[cfg(target_pointer_width = "64")]
+    const SPECIAL_INLINE_BIT: usize = 1usize << 36;
+
     #[cfg(target_pointer_width = "64")]
     #[inline]
     fn encode_inline(bit: crate::value::LogicBit, width: u32, is_signed: bool) -> *mut Value {
@@ -644,15 +661,38 @@ impl SignalValue {
 
     #[cfg(target_pointer_width = "64")]
     #[inline]
-    fn decode_inline(&self) -> Option<(crate::value::LogicBit, u32, bool)> {
+    fn encode_real_zero() -> *mut Value {
+        std::ptr::without_provenance_mut(1 | Self::SPECIAL_INLINE_BIT)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    fn encode_empty_zero_width(is_signed: bool) -> *mut Value {
+        let bits: usize = 1 | Self::SPECIAL_INLINE_BIT | (1usize << 1) | ((is_signed as usize) << 3);
+        std::ptr::without_provenance_mut(bits)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    fn decode_inline(&self) -> Option<InlineSignal> {
         let addr = self.0.addr();
-        if addr & 1 != 0 {
+        if addr & 1 == 0 {
+            return None;
+        }
+        if addr & Self::SPECIAL_INLINE_BIT == 0 {
             let bit = crate::value::LogicBit::from_code(((addr >> 1) & 0b11) as u8);
             let is_signed = ((addr >> 3) & 1) != 0;
-            let width = (addr >> 4) as u32;
-            Some((bit, width, is_signed))
+            let width = ((addr >> 4) & 0xFFFF_FFFF) as u32;
+            Some(InlineSignal::Uniform {
+                bit,
+                width,
+                is_signed,
+            })
+        } else if ((addr >> 1) & 0b11) == 0 {
+            Some(InlineSignal::RealZero)
         } else {
-            None
+            let is_signed = ((addr >> 3) & 1) != 0;
+            Some(InlineSignal::EmptyZeroWidth { is_signed })
         }
     }
 
@@ -685,6 +725,20 @@ impl SignalValue {
     }
 
     pub fn from_value(v: Value) -> Self {
+        #[cfg(target_pointer_width = "64")]
+        {
+            if v.is_real
+                && v.width == 64
+                && !v.is_signed
+                && !v.is_fill
+                && v.inline_bits() == Some((0, 0))
+            {
+                return Self(Self::encode_real_zero());
+            }
+            if v.width == 0 && !v.is_real && !v.is_fill && v.inline_bits() == Some((0, 0)) {
+                return Self(Self::encode_empty_zero_width(v.is_signed));
+            }
+        }
         if let Some(bit) = v.uniform_bit() {
             return Self::uniform(bit, v.width, v.is_signed);
         }
@@ -701,17 +755,28 @@ impl SignalValue {
     pub fn to_value(&self) -> Value {
         #[cfg(target_pointer_width = "64")]
         {
-            if let Some((bit, width, is_signed)) = self.decode_inline() {
-                let mut v = match bit {
-                    crate::value::LogicBit::Zero => Value::zero(width),
-                    crate::value::LogicBit::One => Value::all_ones(width),
-                    crate::value::LogicBit::X => Value::all_x(width),
-                    crate::value::LogicBit::Z => Value::all_z(width),
-                };
-                v.is_signed = is_signed;
-                v
-            } else {
-                self.boxed_ref().expect("boxed SignalValue").clone()
+            match self.decode_inline() {
+                Some(InlineSignal::Uniform {
+                    bit,
+                    width,
+                    is_signed,
+                }) => {
+                    let mut v = match bit {
+                        crate::value::LogicBit::Zero => Value::zero(width),
+                        crate::value::LogicBit::One => Value::all_ones(width),
+                        crate::value::LogicBit::X => Value::all_x(width),
+                        crate::value::LogicBit::Z => Value::all_z(width),
+                    };
+                    v.is_signed = is_signed;
+                    v
+                }
+                Some(InlineSignal::RealZero) => Value::from_f64(0.0),
+                Some(InlineSignal::EmptyZeroWidth { is_signed }) => {
+                    let mut v = Value::zero(0);
+                    v.is_signed = is_signed;
+                    v
+                }
+                None => self.boxed_ref().expect("boxed SignalValue").clone(),
             }
         }
         #[cfg(not(target_pointer_width = "64"))]
@@ -741,7 +806,9 @@ impl SignalValue {
         #[cfg(target_pointer_width = "64")]
         {
             match self.decode_inline() {
-                Some((_, width, _)) => width,
+                Some(InlineSignal::Uniform { width, .. }) => width,
+                Some(InlineSignal::RealZero) => 64,
+                Some(InlineSignal::EmptyZeroWidth { .. }) => 0,
                 None => self.boxed_ref().expect("boxed SignalValue").width,
             }
         }
@@ -759,7 +826,9 @@ impl SignalValue {
         #[cfg(target_pointer_width = "64")]
         {
             match self.decode_inline() {
-                Some((_, _, is_signed)) => is_signed,
+                Some(InlineSignal::Uniform { is_signed, .. })
+                | Some(InlineSignal::EmptyZeroWidth { is_signed }) => is_signed,
+                Some(InlineSignal::RealZero) => false,
                 None => self.boxed_ref().expect("boxed SignalValue").is_signed,
             }
         }
@@ -776,7 +845,11 @@ impl SignalValue {
     pub fn is_real(&self) -> bool {
         #[cfg(target_pointer_width = "64")]
         {
-            self.boxed_ref().is_some_and(|v| v.is_real)
+            match self.decode_inline() {
+                Some(InlineSignal::RealZero) => true,
+                Some(_) => false,
+                None => self.boxed_ref().expect("boxed SignalValue").is_real,
+            }
         }
         #[cfg(not(target_pointer_width = "64"))]
         {
@@ -789,9 +862,10 @@ impl SignalValue {
         #[cfg(target_pointer_width = "64")]
         {
             match self.decode_inline() {
-                Some((bit, _, _)) => {
+                Some(InlineSignal::Uniform { bit, .. }) => {
                     matches!(bit, crate::value::LogicBit::X | crate::value::LogicBit::Z)
                 }
+                Some(InlineSignal::RealZero | InlineSignal::EmptyZeroWidth { .. }) => false,
                 None => self.boxed_ref().expect("boxed SignalValue").has_xz(),
             }
         }
@@ -810,11 +884,24 @@ impl SignalValue {
     pub fn set_signed(&mut self, signed: bool) {
         #[cfg(target_pointer_width = "64")]
         {
-            if let Some((bit, width, _)) = self.decode_inline() {
-                self.0 = Self::encode_inline(bit, width, signed);
-            } else {
-                // SAFETY: Non-tagged pointer is uniquely owned by `&mut self`.
-                unsafe { (*self.0).is_signed = signed };
+            match self.decode_inline() {
+                Some(InlineSignal::Uniform { bit, width, .. }) => {
+                    self.0 = Self::encode_inline(bit, width, signed);
+                }
+                Some(InlineSignal::EmptyZeroWidth { .. }) => {
+                    self.0 = Self::encode_empty_zero_width(signed);
+                }
+                Some(InlineSignal::RealZero) => {
+                    if signed {
+                        let mut v = Value::from_f64(0.0);
+                        v.is_signed = true;
+                        self.0 = Box::into_raw(Box::new(v));
+                    }
+                }
+                None => {
+                    // SAFETY: Non-tagged pointer is uniquely owned by `&mut self`.
+                    unsafe { (*self.0).is_signed = signed };
+                }
             }
         }
         #[cfg(not(target_pointer_width = "64"))]
@@ -909,11 +996,18 @@ impl serde::Serialize for SignalValue {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[cfg(target_pointer_width = "64")]
         let wire = match self.decode_inline() {
-            Some((bit, width, is_signed)) => SignalValueWire::Uniform {
+            Some(InlineSignal::Uniform {
+                bit,
+                width,
+                is_signed,
+            }) => SignalValueWire::Uniform {
                 bit,
                 is_signed,
                 width,
             },
+            Some(InlineSignal::RealZero | InlineSignal::EmptyZeroWidth { .. }) => {
+                SignalValueWire::Custom(self.to_value())
+            }
             None => SignalValueWire::Custom(self.boxed_ref().expect("boxed SignalValue").clone()),
         };
         #[cfg(not(target_pointer_width = "64"))]
@@ -5003,5 +5097,50 @@ mod shared_map_tests {
         let widths = TYPEDEF_WIDTHS_TLS.with(|c| c.borrow().clone()).unwrap();
         assert!(Rc::ptr_eq(&widths, &elab.typedefs.shared_map()));
         reset_const_eval_snapshots();
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn inline_signal_value_covers_real_zero_and_empty_zero_width() {
+        let cfg = crate::xez_bincode_config();
+
+        // Positive zero real is inline (bit 0 set), -0.0 stays boxed.
+        let pz = SignalValue::from_value(Value::from_f64(0.0));
+        assert_ne!(pz.0.addr() & 1, 0);
+        assert!(pz.is_real());
+        assert_eq!(pz.width(), 64);
+        assert!(!pz.is_signed());
+        assert!(!pz.has_xz());
+        assert_eq!(pz.to_value(), Value::from_f64(0.0));
+        let pz_clone = pz.clone();
+        assert_eq!(pz_clone.to_value(), Value::from_f64(0.0));
+        let pz_bytes = bincode::serde::encode_to_vec(&pz, cfg).unwrap();
+        let (pz_back, _): (SignalValue, usize) =
+            bincode::serde::decode_from_slice(&pz_bytes, cfg).unwrap();
+        assert_eq!(pz_back.to_value(), Value::from_f64(0.0));
+        assert!(pz_back.is_real());
+
+        let nz = SignalValue::from_value(Value::from_f64(-0.0));
+        assert_eq!(nz.0.addr() & 1, 0);
+        assert_eq!(nz.to_value().to_f64().to_bits(), (-0.0f64).to_bits());
+
+        // Empty zero-width string/value is inline too.
+        let empty = SignalValue::from_value(Value::from_string(""));
+        assert_ne!(empty.0.addr() & 1, 0);
+        assert!(!empty.is_real());
+        assert_eq!(empty.width(), 0);
+        assert!(!empty.is_signed());
+        assert!(!empty.has_xz());
+        assert_eq!(empty.to_value(), Value::zero(0));
+        let mut signed_empty = empty.clone();
+        signed_empty.set_signed(true);
+        assert!(signed_empty.is_signed());
+        assert_eq!(signed_empty.width(), 0);
+        assert!(!signed_empty.is_real());
+        assert!(signed_empty.to_value().is_signed);
+        let emp_bytes = bincode::serde::encode_to_vec(&signed_empty, cfg).unwrap();
+        let (emp_back, _): (SignalValue, usize) =
+            bincode::serde::decode_from_slice(&emp_bytes, cfg).unwrap();
+        assert_eq!(emp_back, signed_empty);
     }
 }

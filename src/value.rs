@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 /// A single 4-state logic bit.
 ///
@@ -97,6 +98,10 @@ enum ValueStorage {
     /// Four-state wide storage (>64 bits): single heap allocation holding
     /// `val` in `[0..nwords]` followed by `xz` in `[nwords..2*nwords]`.
     Wide4State(Box<[u64]>),
+    /// Ref-counted big-endian two-state byte storage (>8 bytes / >64 bits),
+    /// matching SV string layout (`bytes[0]` MSB, `bytes[len - 1]` LSB).
+    /// Enables O(1) clone and zero-copy byte-slice reads across string ops.
+    Bytes(Arc<[u8]>),
 }
 
 impl std::hash::Hash for ValueStorage {
@@ -122,6 +127,19 @@ impl std::hash::Hash for ValueStorage {
                     xz.hash(state);
                 }
             }
+            Self::Bytes(bytes) => {
+                1u8.hash(state);
+                let n = Self::wide_nwords((bytes.len() * 8) as u32);
+                let mut stack = [0u64; 32];
+                if n <= stack.len() {
+                    for (wi, slot) in stack[..n].iter_mut().enumerate() {
+                        *slot = Self::bytes_word(bytes, wi);
+                    }
+                    stack[..n].hash(state);
+                } else {
+                    Self::bytes_to_words(bytes, (bytes.len() * 8) as u32).hash(state);
+                }
+            }
         }
     }
 }
@@ -135,6 +153,27 @@ impl Serialize for ZeroSeqSer {
             seq.serialize_element(&0u64)?;
         }
         seq.end()
+    }
+}
+
+enum ValPlaneSer<'a> {
+    Words(&'a [u64]),
+    Bytes(&'a [u8]),
+}
+impl Serialize for ValPlaneSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::Words(w) => w.serialize(serializer),
+            Self::Bytes(b) => {
+                use serde::ser::SerializeSeq;
+                let n = ValueStorage::wide_nwords((b.len() * 8) as u32);
+                let mut seq = serializer.serialize_seq(Some(n))?;
+                for wi in 0..n {
+                    seq.serialize_element(&ValueStorage::bytes_word(b, wi))?;
+                }
+                seq.end()
+            }
+        }
     }
 }
 
@@ -154,7 +193,7 @@ impl Serialize for XzPlaneSer<'_> {
 #[derive(Serialize)]
 #[serde(rename = "WidePlanes")]
 struct WidePlanesSer<'a> {
-    val: &'a [u64],
+    val: ValPlaneSer<'a>,
     xz: XzPlaneSer<'a>,
     nbits: u32,
 }
@@ -272,9 +311,83 @@ impl ValueStorage {
     }
 
     #[inline(always)]
+    fn bytes_word(bytes: &[u8], wi: usize) -> u64 {
+        let len = bytes.len();
+        let end = len.saturating_sub(wi * 8);
+        if end == 0 {
+            return 0;
+        }
+        let start = end.saturating_sub(8);
+        let chunk = &bytes[start..end];
+        if chunk.len() == 8 {
+            u64::from_be_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        } else {
+            let mut packed = [0u8; 8];
+            packed[8 - chunk.len()..].copy_from_slice(chunk);
+            u64::from_be_bytes(packed)
+        }
+    }
+
+    #[inline]
+    fn bytes_to_words(bytes: &[u8], width: u32) -> Box<[u64]> {
+        let n = Self::wide_nwords(width);
+        let mut val = vec![0u64; n].into_boxed_slice();
+        for (wi, slot) in val.iter_mut().enumerate() {
+            *slot = Self::bytes_word(bytes, wi);
+        }
+        val[n - 1] &= Self::top_word_mask(width);
+        val
+    }
+
+    #[inline(always)]
+    fn bytes_get_code(bytes: &[u8], i: usize) -> u8 {
+        let byte_idx_from_lsb = i / 8;
+        if byte_idx_from_lsb >= bytes.len() {
+            return 0;
+        }
+        (bytes[bytes.len() - 1 - byte_idx_from_lsb] >> (i % 8)) & 1
+    }
+
+    #[inline(always)]
+    fn bytes_get(bytes: &[u8], i: usize) -> LogicBit {
+        if Self::bytes_get_code(bytes, i) == 1 {
+            LogicBit::One
+        } else {
+            LogicBit::Zero
+        }
+    }
+
+    #[inline(always)]
+    fn bytes_slice64(bytes: &[u8], nbits: u32, pos: usize, n: usize) -> (u64, u64) {
+        let nb = nbits as usize;
+        if n == 0 || pos >= nb {
+            return (0, 0);
+        }
+        let n = n.min(64).min(nb - pos);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let (wi, off) = (pos / 64, pos % 64);
+        let v_lo = Self::bytes_word(bytes, wi) >> off;
+        let v_hi = if off > 0 {
+            Self::bytes_word(bytes, wi + 1) << (64 - off)
+        } else {
+            0
+        };
+        ((v_lo | v_hi) & mask, 0)
+    }
+
+    #[inline]
+    fn materialize_bytes_to_wide2(&mut self, width: u32) {
+        if let Self::Bytes(bytes) = self {
+            *self = Self::Wide2State(Self::bytes_to_words(bytes, width));
+        }
+    }
+
+    #[inline(always)]
     fn wide_planes(&self) -> Option<(&[u64], &[u64])> {
         match self {
-            Self::Inline { .. } => None,
+            Self::Inline { .. } | Self::Bytes(_) => None,
             Self::Wide2State(val) => Some((val, &[])),
             Self::Wide4State(buf) => Some(buf.split_at(buf.len() / 2)),
         }
@@ -282,8 +395,12 @@ impl ValueStorage {
 
     #[inline(always)]
     fn wide_planes_mut(&mut self) -> Option<(&mut [u64], Option<&mut [u64]>)> {
+        if let Self::Bytes(bytes) = self {
+            let width = (bytes.len() * 8) as u32;
+            *self = Self::Wide2State(Self::bytes_to_words(bytes, width));
+        }
         match self {
-            Self::Inline { .. } => None,
+            Self::Inline { .. } | Self::Bytes(_) => None,
             Self::Wide2State(val) => Some((val, None)),
             Self::Wide4State(buf) => {
                 let n = buf.len() / 2;
@@ -295,11 +412,22 @@ impl ValueStorage {
 
     #[inline]
     fn promote_to_4state(&mut self) {
-        if let Self::Wide2State(val) = self {
-            let n = val.len();
-            let mut buf = vec![0u64; 2 * n].into_boxed_slice();
-            buf[..n].copy_from_slice(val);
-            *self = Self::Wide4State(buf);
+        match self {
+            Self::Wide2State(val) => {
+                let n = val.len();
+                let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                buf[..n].copy_from_slice(val);
+                *self = Self::Wide4State(buf);
+            }
+            Self::Bytes(bytes) => {
+                let width = (bytes.len() * 8) as u32;
+                let words = Self::bytes_to_words(bytes, width);
+                let n = words.len();
+                let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                buf[..n].copy_from_slice(&words);
+                *self = Self::Wide4State(buf);
+            }
+            _ => {}
         }
     }
 
@@ -323,7 +451,7 @@ impl ValueStorage {
         let b = i % 64;
         let v = (bit as u8 & 1) as u64;
         let x = ((bit as u8 >> 1) & 1) as u64;
-        if x != 0 && matches!(self, Self::Wide2State(_)) {
+        if x != 0 && matches!(self, Self::Wide2State(_) | Self::Bytes(_)) {
             self.promote_to_4state();
         }
         if let Some((val, xz)) = self.wide_planes_mut() {
@@ -371,7 +499,7 @@ impl ValueStorage {
         let n = n.min(64).min(nb - pos);
         let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         let (v, x) = (v & mask, x & mask);
-        if x != 0 && matches!(self, Self::Wide2State(_)) {
+        if x != 0 && matches!(self, Self::Wide2State(_) | Self::Bytes(_)) {
             self.promote_to_4state();
         }
         let (wi, off) = (pos / 64, pos % 64);
@@ -443,19 +571,31 @@ fn gather_byte_lsbs(lanes: u64) -> u8 {
 
 #[inline(never)]
 fn storage_eq_slow(a: &ValueStorage, b: &ValueStorage) -> bool {
-    match (a.wide_planes(), b.wide_planes()) {
-        (Some((av, ax)), Some((bv, bx))) => {
-            if av != bv {
+    match (a, b) {
+        (ValueStorage::Bytes(ab), ValueStorage::Bytes(bb)) => Arc::ptr_eq(ab, bb) || ab == bb,
+        (ValueStorage::Bytes(ab), other) | (other, ValueStorage::Bytes(ab)) => {
+            let Some((ov, ox)) = other.wide_planes() else {
                 return false;
-            }
-            match (ax.is_empty(), bx.is_empty()) {
-                (true, true) => true,
-                (false, false) => ax == bx,
-                (true, false) => bx.iter().all(|&w| w == 0),
-                (false, true) => ax.iter().all(|&w| w == 0),
-            }
+            };
+            let nw = ValueStorage::wide_nwords((ab.len() * 8) as u32);
+            ov.len() == nw
+                && ox.iter().all(|&w| w == 0)
+                && (0..nw).all(|wi| ValueStorage::bytes_word(ab, wi) == ov[wi])
         }
-        _ => false,
+        _ => match (a.wide_planes(), b.wide_planes()) {
+            (Some((av, ax)), Some((bv, bx))) => {
+                if av != bv {
+                    return false;
+                }
+                match (ax.is_empty(), bx.is_empty()) {
+                    (true, true) => true,
+                    (false, false) => ax == bx,
+                    (true, false) => bx.iter().all(|&w| w == 0),
+                    (false, true) => ax.iter().all(|&w| w == 0),
+                }
+            }
+            _ => false,
+        },
     }
 }
 
@@ -517,7 +657,7 @@ impl Serialize for Value {
                 xz_bits: *xz_bits,
             },
             ValueStorage::Wide2State(val) => ValueStorageSer::Wide(WidePlanesSer {
-                val,
+                val: ValPlaneSer::Words(val),
                 xz: XzPlaneSer::Zeros(val.len()),
                 nbits: self.width,
             }),
@@ -525,11 +665,16 @@ impl Serialize for Value {
                 let n = buf.len() / 2;
                 let (val, xz) = buf.split_at(n);
                 ValueStorageSer::Wide(WidePlanesSer {
-                    val,
+                    val: ValPlaneSer::Words(val),
                     xz: XzPlaneSer::Words(xz),
                     nbits: self.width,
                 })
             }
+            ValueStorage::Bytes(bytes) => ValueStorageSer::Wide(WidePlanesSer {
+                val: ValPlaneSer::Bytes(bytes),
+                xz: XzPlaneSer::Zeros(ValueStorage::wide_nwords(self.width)),
+                nbits: self.width,
+            }),
         };
         ValueSer {
             storage,
@@ -586,11 +731,14 @@ impl Value {
         let wtag = unsafe { *(&w as *const Value as *const u8) };
         let w2 = Value::zero(100);
         let w2tag = unsafe { *(&w2 as *const Value as *const u8) };
+        let b = Value::from_bytes(&[b'A'; 16]);
+        let btag = unsafe { *(&b as *const Value as *const u8) };
         tag == 0
             && val == 0x1234_5678_9abc_def0
             && xz == 0x0f0f_0f0f_f0f0_f0f0
             && wtag != 0
             && w2tag != 0
+            && btag != 0
     }
 }
 
@@ -983,6 +1131,11 @@ impl Value {
                 let w1 = val.get(1).copied().unwrap_or(0) & !xz.get(1).copied().unwrap_or(0);
                 (w0 as u128) | ((w1 as u128) << 64)
             }
+            ValueStorage::Bytes(bytes) => {
+                let w0 = ValueStorage::bytes_word(bytes, 0);
+                let w1 = ValueStorage::bytes_word(bytes, 1);
+                (w0 as u128) | ((w1 as u128) << 64)
+            }
         }
     }
 
@@ -1050,16 +1203,10 @@ impl Value {
             }
         } else {
             // §6.16: the rightmost byte occupies the least-significant bits.
-            // Build the value plane directly without a temporary bit vector.
-            let n = ValueStorage::wide_nwords(width);
-            let mut val = vec![0u64; n].into_boxed_slice();
-            for (word, chunk) in val.iter_mut().zip(bytes.rchunks(8)) {
-                let mut packed = [0u8; 8];
-                packed[8 - chunk.len()..].copy_from_slice(chunk);
-                *word = u64::from_be_bytes(packed);
-            }
+            // Retain the big-endian byte slice under `Arc<[u8]>` for O(1)
+            // clones and zero-copy byte reads in string operations.
             Self {
-                storage: ValueStorage::Wide2State(val),
+                storage: ValueStorage::Bytes(Arc::from(bytes)),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -1085,6 +1232,9 @@ impl Value {
                 ValueStorage::Inline { val_bits, .. } => f64::from_bits(*val_bits),
                 _ => 0.0,
             }
+        } else if let ValueStorage::Bytes(bytes) = &self.storage {
+            let val = ValueStorage::bytes_to_words(bytes, self.width);
+            Self::wide_to_f64(&val, &[], self.width, self.is_signed)
         } else if let Some((val, xz)) = self.storage.wide_planes() {
             Self::wide_to_f64(val, xz, self.width, self.is_signed)
         } else {
@@ -1211,7 +1361,9 @@ impl Value {
     pub fn inline_planes(&self) -> Option<(u64, u64)> {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => Some((*val_bits, *xz_bits)),
-            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) => None,
+            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) | ValueStorage::Bytes(_) => {
+                None
+            }
         }
     }
 
@@ -1236,6 +1388,7 @@ impl Value {
                     buf[n..].first().copied().unwrap_or(0),
                 )
             }
+            ValueStorage::Bytes(bytes) => (ValueStorage::bytes_word(bytes, 0), 0),
         }
     }
 
@@ -1265,6 +1418,11 @@ impl Value {
                     (word(val, 0) | (word(val, 1) << 64)) & mask,
                     (word(xz, 0) | (word(xz, 1) << 64)) & mask,
                 )
+            }
+            ValueStorage::Bytes(bytes) => {
+                let w0 = ValueStorage::bytes_word(bytes, 0) as u128;
+                let w1 = ValueStorage::bytes_word(bytes, 1) as u128;
+                ((w0 | (w1 << 64)) & mask, 0)
             }
         }
     }
@@ -1507,6 +1665,7 @@ impl Value {
                 let (val, xz) = buf.split_at(buf.len() / 2);
                 ValueStorage::wide_extract64(val, xz, self.width, lo, w)
             }
+            ValueStorage::Bytes(bytes) => ValueStorage::bytes_slice64(bytes, self.width, lo, w),
         }
     }
 
@@ -1541,6 +1700,11 @@ impl Value {
                 v[1] = val.get(1).copied().unwrap_or(0);
                 true
             }
+            ValueStorage::Bytes(bytes) => {
+                v[0] = ValueStorage::bytes_word(bytes, 0);
+                v[1] = ValueStorage::bytes_word(bytes, 1);
+                true
+            }
         }
     }
 
@@ -1549,6 +1713,7 @@ impl Value {
     /// the storage kind. Returns true when the stored value CHANGED. Bits of
     /// `v` above the width must already be masked by the caller.
     pub fn set_words128(&mut self, v: [u64; 2]) -> bool {
+        self.storage.materialize_bytes_to_wide2(self.width);
         match &mut self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 let changed = *val_bits != v[0] || *xz_bits != 0;
@@ -1602,6 +1767,7 @@ impl Value {
                 }
                 changed
             }
+            ValueStorage::Bytes(_) => unreachable!(),
         }
     }
 
@@ -1652,6 +1818,12 @@ impl Value {
                 }
                 for (i, w) in v.iter_mut().enumerate() {
                     *w = val.get(i).copied().unwrap_or(0);
+                }
+                true
+            }
+            ValueStorage::Bytes(bytes) => {
+                for (i, w) in v.iter_mut().enumerate() {
+                    *w = ValueStorage::bytes_word(bytes, i);
                 }
                 true
             }
@@ -1708,6 +1880,26 @@ impl Value {
                         xz[wi] = 0;
                         changed = true;
                     }
+                }
+                changed
+            }
+            ValueStorage::Bytes(bytes) => {
+                let nb = self.width;
+                let n = ValueStorage::wide_nwords(nb);
+                let top = ValueStorage::top_word_mask(nb);
+                let mut changed = false;
+                for wi in 0..n {
+                    let mut want = v.get(wi).copied().unwrap_or(0);
+                    if wi + 1 == n {
+                        want &= top;
+                    }
+                    if ValueStorage::bytes_word(bytes, wi) != want {
+                        changed = true;
+                        break;
+                    }
+                }
+                if changed {
+                    self.storage = ValueStorage::wide_from_val_words(v, nb);
                 }
                 changed
             }
@@ -1881,7 +2073,7 @@ impl Value {
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
-            ValueStorage::Wide2State(_) => false,
+            ValueStorage::Wide2State(_) | ValueStorage::Bytes(_) => false,
             ValueStorage::Wide4State(buf) => {
                 let n = buf.len() / 2;
                 buf[n..].iter().any(|&w| w != 0)
@@ -1915,7 +2107,7 @@ impl Value {
                     is_fill: false,
                 }
             }
-            ValueStorage::Wide2State(_) => self.clone(),
+            ValueStorage::Wide2State(_) | ValueStorage::Bytes(_) => self.clone(),
             ValueStorage::Wide4State(buf) => {
                 let n = buf.len() / 2;
                 let (val, xz) = buf.split_at(n);
@@ -1945,7 +2137,7 @@ impl Value {
                 *val_bits &= !*xz_bits;
                 *xz_bits = 0;
             }
-            ValueStorage::Wide2State(_) => {}
+            ValueStorage::Wide2State(_) | ValueStorage::Bytes(_) => {}
             ValueStorage::Wide4State(buf) => {
                 let n = buf.len() / 2;
                 let (val, xz) = buf.split_at_mut(n);
@@ -2029,8 +2221,18 @@ impl Value {
             };
         }
 
-        let Some((sv_words, sx_words)) = self.storage.wide_planes() else {
-            return Value::zero(self.width);
+        let bytes_words;
+        let (sv_words, sx_words): (&[u64], &[u64]) = match &self.storage {
+            ValueStorage::Bytes(b) => {
+                bytes_words = ValueStorage::bytes_to_words(b, self.width);
+                (&bytes_words, &[])
+            }
+            _ => {
+                let Some(planes) = self.storage.wide_planes() else {
+                    return Value::zero(self.width);
+                };
+                planes
+            }
         };
         let has_xz = self.has_xz();
         let n = ValueStorage::wide_nwords(self.width);
@@ -2137,6 +2339,7 @@ impl Value {
                 let (val, xz) = buf.split_at(buf.len() / 2);
                 ValueStorage::wide_get(val, xz, i)
             }
+            ValueStorage::Bytes(bytes) => ValueStorage::bytes_get(bytes, i),
         }
     }
 
@@ -2160,6 +2363,7 @@ impl Value {
                 let (val, xz) = buf.split_at(buf.len() / 2);
                 ValueStorage::wide_get(val, xz, i) as u8
             }
+            ValueStorage::Bytes(bytes) => ValueStorage::bytes_get_code(bytes, i),
         }
     }
 
@@ -2207,6 +2411,15 @@ impl Value {
                 self.storage.wide_splice64(self.width, pos, v, x, n);
                 true
             }
+            ValueStorage::Bytes(bytes) => {
+                let (cv, cx) = ValueStorage::bytes_slice64(bytes, self.width, pos, n);
+                if cv == v && cx == x {
+                    return false;
+                }
+                self.storage.materialize_bytes_to_wide2(self.width);
+                self.storage.wide_splice64(self.width, pos, v, x, n);
+                true
+            }
         }
     }
 
@@ -2250,6 +2463,14 @@ impl Value {
                 self.storage.wide_set(i, bit);
                 true
             }
+            ValueStorage::Bytes(bytes) => {
+                if ValueStorage::bytes_get_code(bytes, i) == code {
+                    return false;
+                }
+                self.storage.materialize_bytes_to_wide2(self.width);
+                self.storage.wide_set(i, LogicBit::from_code(code));
+                true
+            }
         }
     }
 
@@ -2268,7 +2489,7 @@ impl Value {
                 *xz_bits = new_xz;
                 true
             }
-            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) => {
+            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) | ValueStorage::Bytes(_) => {
                 self.set_bit_code(0, code)
             }
         }
@@ -2303,7 +2524,7 @@ impl Value {
                     }
                 }
             }
-            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) => {
+            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) | ValueStorage::Bytes(_) => {
                 self.storage.wide_set(i, bit);
             }
         }
@@ -2325,7 +2546,16 @@ impl Value {
         if count == 0 {
             return false;
         }
-        match (&mut self.storage, source.storage.wide_planes()) {
+        self.storage.materialize_bytes_to_wide2(self.width);
+        let src_bytes_words;
+        let src_planes = match &source.storage {
+            ValueStorage::Bytes(b) => {
+                src_bytes_words = ValueStorage::bytes_to_words(b, source.width);
+                Some((&src_bytes_words[..], &[][..]))
+            }
+            _ => source.storage.wide_planes(),
+        };
+        match (&mut self.storage, src_planes) {
             (
                 ValueStorage::Inline {
                     val_bits: dst_v,
@@ -2401,7 +2631,7 @@ impl Value {
                             let (val, xz) = buf.split_at(buf.len() / 2);
                             ValueStorage::wide_extract64(val, xz, dst_w, dst_start + off, n)
                         }
-                        ValueStorage::Inline { .. } => unreachable!(),
+                        ValueStorage::Inline { .. } | ValueStorage::Bytes(_) => unreachable!(),
                     };
                     if sv != dv || sx != dx {
                         dst_wide.wide_splice64(dst_w, dst_start + off, sv, sx, n);
@@ -2435,7 +2665,7 @@ impl Value {
                             let (val, xz) = buf.split_at(buf.len() / 2);
                             ValueStorage::wide_extract64(val, xz, dst_w, dst_start + off, n)
                         }
-                        ValueStorage::Inline { .. } => unreachable!(),
+                        ValueStorage::Inline { .. } | ValueStorage::Bytes(_) => unreachable!(),
                     };
                     if sv != dv || sx != dx {
                         dst_wide.wide_splice64(dst_w, dst_start + off, sv, sx, n);
@@ -2458,6 +2688,7 @@ impl Value {
                 let result = val.first().copied().unwrap_or(0) & !xz.first().copied().unwrap_or(0);
                 Some(result)
             }
+            ValueStorage::Bytes(bytes) => Some(ValueStorage::bytes_word(bytes, 0)),
         }
     }
 
@@ -2494,6 +2725,29 @@ impl Value {
                 let mut highest = None;
                 for (i, (&v, &x)) in val.iter().zip(xz).enumerate().rev() {
                     let v = v & !x;
+                    if v == 0 {
+                        continue;
+                    }
+                    if let Some(width) = highest {
+                        return width;
+                    }
+                    let width = i as u32 * 64 + (64 - v.leading_zeros());
+                    if !v.is_power_of_two() {
+                        return width;
+                    }
+                    highest = Some(width);
+                }
+                highest.map_or(0, |width| width - 1)
+            }
+            ValueStorage::Bytes(bytes) => {
+                let nw = ValueStorage::wide_nwords(self.width);
+                let top = ValueStorage::top_word_mask(self.width);
+                let mut highest = None;
+                for i in (0..nw).rev() {
+                    let mut v = ValueStorage::bytes_word(bytes, i);
+                    if i + 1 == nw {
+                        v &= top;
+                    }
                     if v == 0 {
                         continue;
                     }
@@ -2755,6 +3009,13 @@ impl Value {
                     *o = val.get(i).copied().unwrap_or(0) & !xz.get(i).copied().unwrap_or(0);
                 }
             }
+            ValueStorage::Bytes(bytes) => {
+                let nw = ValueStorage::wide_nwords((bytes.len() * 8) as u32);
+                let copy_n = nw.min(n);
+                for (wi, o) in out[..copy_n].iter_mut().enumerate() {
+                    *o = ValueStorage::bytes_word(bytes, wi);
+                }
+            }
         }
         let sw = self.width.min(w) as usize;
         let neg = sext && sw > 0 && (out[(sw - 1) / 64] >> ((sw - 1) % 64)) & 1 == 1;
@@ -2913,6 +3174,7 @@ impl Value {
                     let (val, xz) = buf.split_at(buf.len() / 2);
                     val.get(i).copied().unwrap_or(0) & !xz.get(i).copied().unwrap_or(0)
                 }
+                ValueStorage::Bytes(bytes) => ValueStorage::bytes_word(bytes, i),
             }
         };
         let sign_of = |v: &Value| -> (bool, u64) {
@@ -3662,6 +3924,25 @@ impl Value {
                 };
                 Value {
                     storage,
+                    width: self.width,
+                    is_signed: self.is_signed,
+                    is_real: false,
+                    is_fill: false,
+                }
+            }
+            ValueStorage::Bytes(bytes) => {
+                let nw = ValueStorage::wide_nwords(self.width);
+                let top = ValueStorage::top_word_mask(self.width);
+                let mut out = Vec::with_capacity(nw);
+                for i in 0..nw {
+                    let mut nv = !ValueStorage::bytes_word(bytes, i);
+                    if i + 1 == nw {
+                        nv &= top;
+                    }
+                    out.push(nv);
+                }
+                Value {
+                    storage: ValueStorage::Wide2State(out.into_boxed_slice()),
                     width: self.width,
                     is_signed: self.is_signed,
                     is_real: false,
@@ -4569,6 +4850,7 @@ impl Value {
                     Some(false)
                 }
             }
+            ValueStorage::Bytes(bytes) => Some(bytes.iter().any(|&b| b != 0)),
             ValueStorage::Wide4State(buf) => {
                 let (val, xz) = buf.split_at(buf.len() / 2);
                 if val.iter().zip(xz).any(|(&v, &x)| (v & !x) != 0) {
@@ -4652,6 +4934,22 @@ impl Value {
                     Value::from_u64(1, 1)
                 }
             }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    Value::from_u64(bytes.iter().all(|&b| b == 0xff) as u64, 1)
+                } else {
+                    let words = ValueStorage::bytes_to_words(bytes, self.width);
+                    let n = ValueStorage::wide_nwords(self.width);
+                    let top = ValueStorage::top_word_mask(self.width);
+                    for (i, (v, _)) in Self::wide_words(&words, &[], self.width).enumerate() {
+                        let m = if i + 1 == n { top } else { u64::MAX };
+                        if !v & m != 0 {
+                            return Value::from_u64(0, 1);
+                        }
+                    }
+                    Value::from_u64(1, 1)
+                }
+            }
         }
     }
 
@@ -4691,6 +4989,19 @@ impl Value {
                     Value::from_u64(0, 1)
                 }
             }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    Value::from_u64(bytes.iter().any(|&b| b != 0) as u64, 1)
+                } else {
+                    let words = ValueStorage::bytes_to_words(bytes, self.width);
+                    for (v, _) in Self::wide_words(&words, &[], self.width) {
+                        if v != 0 {
+                            return Value::from_u64(1, 1);
+                        }
+                    }
+                    Value::from_u64(0, 1)
+                }
+            }
         }
     }
 
@@ -4712,6 +5023,15 @@ impl Value {
             ValueStorage::Wide4State(buf) => {
                 let (val, xz) = buf.split_at(buf.len() / 2);
                 Self::reduce_xor_wide(val, xz, self.width)
+            }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    let ones: u32 = bytes.iter().map(|b| b.count_ones()).sum();
+                    Value::from_u64((ones & 1) as u64, 1)
+                } else {
+                    let words = ValueStorage::bytes_to_words(bytes, self.width);
+                    Self::reduce_xor_wide(&words, &[], self.width)
+                }
             }
         }
     }
@@ -4806,6 +5126,7 @@ impl Value {
                     buf[n..].get(wi).copied().unwrap_or(0),
                 )
             }
+            ValueStorage::Bytes(bytes) => (ValueStorage::bytes_word(bytes, wi), 0),
         };
         (v & mask, x & mask)
     }
@@ -5001,6 +5322,15 @@ impl Value {
                         let n = (take - j).min(64);
                         let (v, x) = ValueStorage::wide_extract64(src_v, src_x, val.width, j, n);
                         storage.wide_splice64(capped as u32, len + j, v, x, n);
+                        j += n;
+                    }
+                }
+                ValueStorage::Bytes(bytes) => {
+                    let mut j = 0usize;
+                    while j < take {
+                        let n = (take - j).min(64);
+                        let (v, _) = ValueStorage::bytes_slice64(bytes, val.width, j, n);
+                        storage.wide_splice64(capped as u32, len + j, v, 0, n);
                         j += n;
                     }
                 }
@@ -6754,11 +7084,27 @@ impl Value {
                 let x = (xz[word] >> shift) & mask;
                 ((v & !x) & 0xff) as u8
             }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    bytes[bytes.len() - 1 - bi]
+                } else {
+                    let word = bi / 8;
+                    let shift = (bi % 8) * 8;
+                    let v = (ValueStorage::bytes_word(bytes, word) >> shift) & mask;
+                    (v & 0xff) as u8
+                }
+            }
         }
     }
 
     #[inline]
     fn sv_content_byte_range(&self) -> usize {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let skip = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            return bytes.len() - skip;
+        }
         let num_bytes = self.width.div_ceil(8) as usize;
         for bi in (0..num_bytes).rev() {
             if self.sv_byte_at(bi) != 0 {
@@ -6789,6 +7135,38 @@ impl Value {
 
     /// Zero-allocation lexicographic byte comparison matching `Simulator::sv_strcmp`.
     pub fn sv_string_cmp(&self, other: &Self, icase: bool) -> i64 {
+        if let (ValueStorage::Bytes(ab), ValueStorage::Bytes(bb)) = (&self.storage, &other.storage)
+            && self.width as usize == ab.len() * 8
+            && other.width as usize == bb.len() * 8
+        {
+            if Arc::ptr_eq(ab, bb) {
+                return 0;
+            }
+            let a_skip = ab.iter().position(|&b| b != 0).unwrap_or(ab.len());
+            let b_skip = bb.iter().position(|&b| b != 0).unwrap_or(bb.len());
+            let a = &ab[a_skip..];
+            let b = &bb[b_skip..];
+            if !icase {
+                for (&ba, &bb) in a.iter().zip(b.iter()) {
+                    if ba != bb {
+                        return i64::from(ba) - i64::from(bb);
+                    }
+                }
+            } else {
+                for (&ba, &bb) in a.iter().zip(b.iter()) {
+                    let ca = ba.to_ascii_lowercase();
+                    let cb = bb.to_ascii_lowercase();
+                    if ca != cb {
+                        return i64::from(ca) - i64::from(cb);
+                    }
+                }
+            }
+            return match a.len().cmp(&b.len()) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+        }
         let la = self.sv_content_byte_range();
         let lb = other.sv_content_byte_range();
         let n = la.min(lb);
@@ -6813,6 +7191,21 @@ impl Value {
     /// Inclusive substring `[start..=end]` as a string `Value`, or empty `""`
     /// (`Value::zero(0)`) if `start > end` or `end >= len`.
     pub fn sv_string_slice(&self, start: usize, end: usize) -> Self {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let skip = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            let content = &bytes[skip..];
+            if content.is_empty() || start > end || end >= content.len() {
+                return Self::zero(0);
+            }
+            if start == 0 && end + 1 == content.len() && skip == 0 {
+                let mut r = self.clone();
+                r.is_signed = false;
+                return r;
+            }
+            return Self::from_bytes(&content[start..=end]);
+        }
         let len = self.sv_content_byte_range();
         if len == 0 || start > end || end >= len {
             return Self::zero(0);
@@ -6832,6 +7225,17 @@ impl Value {
     /// Convert a literal or integral `Value` to `string` by stripping all
     /// NUL (`\0`) bytes (§6.16). Zero-allocates when clean and NUL-free.
     pub fn sv_string_strip_nul(&self) -> Self {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            if !bytes.contains(&0) {
+                let mut r = self.clone();
+                r.is_signed = false;
+                return r;
+            }
+            let stripped: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
+            return Self::from_bytes(&stripped);
+        }
         let len = self.sv_content_byte_range();
         if len == 0 {
             return Self::zero(0);
@@ -6854,12 +7258,30 @@ impl Value {
         Self::from_bytes(&out)
     }
 
+    /// Zero-copy borrow of big-endian string content bytes (leading widening
+    /// NULs trimmed) when backed by `ValueStorage::Bytes`.
+    pub fn sv_string_bytes_cow(&self) -> std::borrow::Cow<'_, [u8]> {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            return std::borrow::Cow::Borrowed(&bytes[start..]);
+        }
+        std::borrow::Cow::Owned(self.sv_string_bytes())
+    }
+
     /// The value's bytes as string content, big-endian (MSB first), with the
     /// LEADING NUL bytes introduced by widening trimmed. Zero bytes at or
     /// below the first nonzero byte are kept: they are genuine content —
     /// §21.2.1.4 unformatted `%u`/`%z` dumps end in alignment NULs that
     /// `len()`/`getc()` must observe.
     pub fn sv_string_bytes(&self) -> Vec<u8> {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            return bytes[start..].to_vec();
+        }
         let num_bytes = self.width.div_ceil(8) as usize;
         let mut out: Vec<u8> = Vec::with_capacity(num_bytes);
         let mut started = false;
@@ -6908,12 +7330,104 @@ impl Value {
     /// to one char (Latin-1, the inverse of `from_string`), so raw bytes
     /// above 0x7F survive a round-trip instead of becoming U+FFFD.
     pub fn to_sv_string(&self) -> String {
-        let bytes = self.sv_string_bytes();
+        let bytes = self.sv_string_bytes_cow();
         if bytes.is_ascii() {
             // ASCII is already valid UTF-8 with one byte per char.
-            return String::from_utf8(bytes).unwrap_or_default();
+            return match bytes {
+                std::borrow::Cow::Borrowed(sl) => {
+                    String::from_utf8_lossy(sl).into_owned()
+                }
+                std::borrow::Cow::Owned(v) => String::from_utf8(v).unwrap_or_default(),
+            };
         }
-        bytes.into_iter().map(|b| b as char).collect()
+        bytes.iter().map(|&b| b as char).collect()
+    }
+
+    /// §6.16.4/§6.16.5 `toupper`/`tolower` directly over SV string bytes
+    /// without building an intermediate `String`. Returns a ref-counted clone
+    /// when already normalized as `Bytes`.
+    pub fn sv_string_ascii_case(&self, upper: bool) -> Self {
+        let bytes = self.sv_string_bytes_cow();
+        let convert = |b: u8| if upper { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() };
+        if matches!(self.storage, ValueStorage::Bytes(_))
+            && bytes.len() * 8 == self.width as usize
+            && bytes.iter().all(|&b| convert(b) == b)
+        {
+            let mut r = self.clone();
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        out.extend(bytes.iter().map(|&b| convert(b)));
+        Self::from_bytes(&out)
+    }
+
+    /// §6.16.4 `s.putc(idx, ch)` returning the updated string `Value`
+    /// (`self.clone()` on out-of-range index or NUL `ch`).
+    pub fn sv_string_putc(&self, idx: i64, ch: u8) -> Self {
+        let bytes = self.sv_string_bytes_cow();
+        if idx < 0 || (idx as usize) >= bytes.len() || ch == 0 {
+            return self.clone();
+        }
+        let i = idx as usize;
+        if bytes[i] == ch
+            && matches!(self.storage, ValueStorage::Bytes(_))
+            && bytes.len() * 8 == self.width as usize
+        {
+            let mut r = self.clone();
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = bytes.into_owned();
+        out[i] = ch;
+        Self::from_bytes(&out)
+    }
+
+    /// In-place `putc` optimization: updates the `Arc<[u8]>` buffer directly
+    /// without allocating when uniquely owned (`Arc::get_mut`) and free of
+    /// leading widening NULs. Returns `true` if modified.
+    pub fn sv_string_putc_in_place(&mut self, idx: i64, ch: u8) -> bool {
+        if idx < 0 || ch == 0 {
+            return false;
+        }
+        let i = idx as usize;
+        if let ValueStorage::Bytes(ref mut arc) = self.storage
+            && self.width as usize == arc.len() * 8
+            && arc.first().copied() != Some(0)
+        {
+            if i >= arc.len() {
+                return false;
+            }
+            if arc[i] == ch {
+                self.is_signed = false;
+                return true;
+            }
+            if let Some(slice) = Arc::get_mut(arc) {
+                slice[i] = ch;
+                self.is_signed = false;
+                return true;
+            }
+        }
+        let next = self.sv_string_putc(idx, ch);
+        let len = self.sv_content_byte_range();
+        if i >= len {
+            return false;
+        }
+        *self = next;
+        true
+    }
+
+    /// Concatenate SV string parts into a single `string` `Value` using one
+    /// buffer allocation (`sv_string_bytes_cow` avoids per-operand `Vec<u8>`).
+    pub fn sv_string_concat_refs<'a, I>(parts: I) -> Self
+    where
+        I: IntoIterator<Item = &'a Value>,
+    {
+        let mut out: Vec<u8> = Vec::new();
+        for part in parts {
+            out.extend_from_slice(&part.sv_string_bytes_cow());
+        }
+        Self::from_bytes(&out)
     }
 
     /// Hex string representation
@@ -7244,6 +7758,21 @@ impl Value {
                     };
                 }
             }
+            ValueStorage::Bytes(bytes) => {
+                if index < self.width as usize {
+                    let bit = ValueStorage::bytes_get_code(bytes, index) as u64;
+                    return Value {
+                        storage: ValueStorage::Inline {
+                            val_bits: bit,
+                            xz_bits: 0,
+                        },
+                        width: 1,
+                        is_signed: false,
+                        is_real: false,
+                        is_fill: false,
+                    };
+                }
+            }
         }
         self.bit_select_slow(index)
     }
@@ -7400,6 +7929,9 @@ impl Value {
                     let (val, xz) = buf.split_at(buf.len() / 2);
                     ValueStorage::wide_extract64(val, xz, self.width, src_start + offset, count)
                 }
+                ValueStorage::Bytes(bytes) => {
+                    ValueStorage::bytes_slice64(bytes, self.width, src_start + offset, count)
+                }
             };
             result.splice_bits64(dst_start + offset, val_bits, xz_bits, count);
         }
@@ -7460,6 +7992,49 @@ impl Value {
         // c906 hello showed Wide→Inline range_select dominating after the
         // Inline→Inline fast path landed (set_bit fan-out was ~40% of
         // range_select self-time on its own).
+        if let ValueStorage::Bytes(bytes) = &self.storage {
+            if width <= 64 {
+                let (val_bits, xz_bits) =
+                    ValueStorage::bytes_slice64(bytes, self.width, lo, width);
+                return Value {
+                    storage: ValueStorage::Inline { val_bits, xz_bits },
+                    width: width as u32,
+                    is_signed: false,
+                    is_real: false,
+                    is_fill: false,
+                };
+            }
+            if lo % 8 == 0
+                && width % 8 == 0
+                && lo + width <= self.width as usize
+                && self.width as usize == bytes.len() * 8
+            {
+                let end_byte = bytes.len() - lo / 8;
+                let start_byte = bytes.len() - (lo + width) / 8;
+                return Self::from_bytes(&bytes[start_byte..end_byte]);
+            }
+            let n = ValueStorage::wide_nwords(width as u32);
+            let top = ValueStorage::top_word_mask(width as u32);
+            let (wi0, off) = (lo / 64, lo % 64);
+            let mut val = vec![0u64; n].into_boxed_slice();
+            for (wi, d) in val.iter_mut().enumerate() {
+                let lo64 = ValueStorage::bytes_word(bytes, wi0 + wi) >> off;
+                let hi64 = if off > 0 {
+                    ValueStorage::bytes_word(bytes, wi0 + wi + 1) << (64 - off)
+                } else {
+                    0
+                };
+                *d = lo64 | hi64;
+            }
+            val[n - 1] &= top;
+            return Value {
+                storage: ValueStorage::Wide2State(val),
+                width: width as u32,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            };
+        }
         if let Some((sv_p, sx_p)) = self.storage.wide_planes() {
             if width > 64 {
                 let n = ValueStorage::wide_nwords(width as u32);
@@ -7615,6 +8190,7 @@ impl Value {
                     self.storage = other.storage.clone();
                 }
             }
+            (ValueStorage::Bytes(sa), ValueStorage::Bytes(oa)) if Arc::ptr_eq(sa, oa) => {}
             _ => {
                 self.storage = other.storage.clone();
             }
@@ -7815,6 +8391,18 @@ impl Value {
                     return None;
                 }
                 Some(bit)
+            }
+            ValueStorage::Bytes(bytes) => {
+                if bytes.is_empty() || self.width as usize != bytes.len() * 8 {
+                    return None;
+                }
+                let b0 = bytes[0];
+                let bit = match b0 {
+                    0x00 => LogicBit::Zero,
+                    0xFF => LogicBit::One,
+                    _ => return None,
+                };
+                bytes.iter().all(|&b| b == b0).then_some(bit)
             }
         }
     }
@@ -8341,6 +8929,82 @@ mod ch6_wide_storage_tests {
         assert_eq!(w2_a.wire_resolve(&z_fill), w2_a);
         assert_eq!(z_fill.wire_resolve(&w2_a), w2_a);
         assert_eq!(z_fill.wire_resolve_pull(&w2_a), w2_a);
+    }
+
+    #[test]
+    fn bytes_storage_arc_string_ops_match_words_and_preserve_serde_hash_eq() {
+        let s = "Hello_World_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let v = Value::from_string(s);
+        assert!(matches!(v.storage, ValueStorage::Bytes(_)));
+        assert_eq!(v.width as usize, s.len() * 8);
+        assert_eq!(v.sv_string_len(), s.len());
+        assert_eq!(v.to_sv_string(), s);
+        assert_eq!(v.sv_string_bytes(), s.as_bytes());
+        assert!(matches!(v.sv_string_bytes_cow(), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(v.sv_string_getc(0), b'H');
+        assert_eq!(v.sv_string_getc(s.len() - 1), b'Z');
+        assert_eq!(v.sv_string_getc(s.len()), 0);
+
+        // Construct an explicit Wide2State equivalent and check Eq + Hash parity.
+        let n = ValueStorage::wide_nwords(v.width);
+        let mut words = vec![0u64; n];
+        assert!(v.words_if_clean(&mut words));
+        let w2 = Value::from_words(&words, v.width);
+        assert!(matches!(w2.storage, ValueStorage::Wide2State(_)));
+        assert_eq!(v, w2);
+        let hash_of = |x: &Value| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            x.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(&v), hash_of(&w2));
+
+        // Bincode round-trip parity (.xez wire format unchanged).
+        let cfg = crate::xez_bincode_config();
+        let b_bytes = bincode::serde::encode_to_vec(&v, cfg).unwrap();
+        let w_bytes = bincode::serde::encode_to_vec(&w2, cfg).unwrap();
+        assert_eq!(b_bytes, w_bytes);
+        let (back, _): (Value, usize) = bincode::serde::decode_from_slice(&b_bytes, cfg).unwrap();
+        assert_eq!(back, v);
+
+        // Zero-alloc ASCII case, concat, putc, slice, strip_nul.
+        let lower = v.sv_string_ascii_case(false);
+        assert_eq!(lower.to_sv_string(), s.to_ascii_lowercase());
+        assert_eq!(v.sv_string_ascii_case(false).sv_string_cmp(&lower, false), 0);
+        assert_eq!(v.sv_string_cmp(&lower, true), 0);
+        assert_eq!(v.sv_string_slice(6, 10).to_sv_string(), "World");
+        assert_eq!(v.sv_string_slice(0, 15).to_sv_string(), &s[..16]);
+
+        let cat = Value::sv_string_concat_refs([&v, &lower]);
+        assert!(matches!(cat.storage, ValueStorage::Bytes(_)));
+        assert_eq!(cat.to_sv_string(), format!("{s}{}", s.to_ascii_lowercase()));
+
+        let mut owned = Value::from_string(s);
+        assert!(owned.sv_string_putc_in_place(0, b'h'));
+        assert_eq!(owned.sv_string_getc(0), b'h');
+        assert_eq!(v.sv_string_getc(0), b'H');
+
+        // Mutations materialize cleanly without breaking Bytes invariants.
+        let mut x_mut = v.clone();
+        x_mut.set_bit(0, LogicBit::X);
+        assert!(x_mut.has_xz());
+        assert!(!v.has_xz());
+        assert_eq!(x_mut.get_bit(0), LogicBit::X);
+        assert_eq!(x_mut.to_two_state().has_xz(), false);
+
+        // Bitwise / reduction / range_select parity against Wide2State.
+        assert_eq!(v.bitwise_not(), w2.bitwise_not());
+        assert_eq!(v.reduce_and(), w2.reduce_and());
+        assert_eq!(v.reduce_or(), w2.reduce_or());
+        assert_eq!(v.reduce_xor(), w2.reduce_xor());
+        assert_eq!(v.range_select(79, 8), w2.range_select(79, 8));
+        assert_eq!(v.range_select(83, 5), w2.range_select(83, 5));
+        assert_eq!(v.bit_select(37), w2.bit_select(37));
+
+        // 8 bytes stay Inline.
+        let short = Value::from_string("12345678");
+        assert!(matches!(short.storage, ValueStorage::Inline { .. }));
     }
 }
 
