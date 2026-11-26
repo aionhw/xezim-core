@@ -987,12 +987,50 @@ pub struct ModportPort {
     pub expr: Option<super::expr::Expression>,
 }
 
+/// IEEE 1800 §28.12: output drive strengths for zero and one.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PrimitiveStrength(std::num::NonZeroU8);
+
+impl PrimitiveStrength {
+    pub(crate) fn from_text(spec: &str) -> Self {
+        let mut levels = [6, 6];
+        for token in spec.split(',') {
+            let Some((level, polarity)) = token.split_at_checked(token.len().saturating_sub(1))
+            else {
+                continue;
+            };
+            let polarity = match polarity {
+                "0" => 0,
+                "1" => 1,
+                _ => continue,
+            };
+            levels[polarity] = match level {
+                "highz" => 0,
+                "weak" => 3,
+                "pull" => 5,
+                "supply" => 7,
+                _ => 6,
+            };
+        }
+        Self(std::num::NonZeroU8::new(levels[0] * 8 + levels[1] + 1).expect("strength pair"))
+    }
+
+    /// One octal digit per polarity, zero first.
+    pub fn code(self) -> u8 {
+        self.0.get() - 1
+    }
+}
+
 /// Verilog gate-level primitive instantiation (IEEE 1800-2017 §28)
 /// e.g., `and and0 (out, in1, in2);`  `not not0 (out, in);`
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GateInstantiation {
     pub gate_type: GateType,
+    /// Explicit drive or pull strength, in source order.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub strength: Option<PrimitiveStrength>,
     /// `buf #(d) g(y, a);` — the gate's RISE delay (the first expression of
     /// the delay spec). Counts the enclosing module's timeunit until the
     /// elaborator pre-scales it to ticks.
@@ -1305,6 +1343,9 @@ pub struct ContinuousAssign {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ModuleInstantiation {
     pub module_name: Identifier,
+    /// Explicit output drive strength for UDP instantiations.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub strength: Option<PrimitiveStrength>,
     pub params: Option<Vec<ParamConnection>>,
     pub instances: Vec<HierarchicalInstance>,
     /// The scope of its definition's tree that holds it; `None` when not

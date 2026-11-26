@@ -1,23 +1,117 @@
 use super::*;
+use crate::ast::Span;
+use crate::diagnostics::Diagnostic;
 
 impl<'a> Parser<'a> {
+    /// Annex A.2.2.2: a drive strength has one value for each polarity.
+    /// A charge strength is a single size keyword.
+    fn parse_strength_group(&mut self) -> Option<(String, Span)> {
+        let (first, second, comma, span) = self.read_strength_group()?;
+        let charge = matches!(first.as_str(), "small" | "medium" | "large");
+        let valid = if charge {
+            second.is_none() && !comma
+        } else {
+            comma
+                && second.as_ref().is_some_and(|other| {
+                    Self::strength_polarity(&first)
+                        .zip(Self::strength_polarity(other))
+                        .is_some_and(|(a, b)| a != b)
+                        && !(first.starts_with("highz") && other.starts_with("highz"))
+                })
+        };
+        if !valid && crate::strict_checks() {
+            self.diagnostics.push(Diagnostic::error(
+                "invalid drive or charge strength (IEEE 1800 Annex A.2.2.2)",
+                span,
+            ));
+        }
+        let text = match second {
+            Some(second) => format!("{first},{second}"),
+            None => first,
+        };
+        Some((text, span))
+    }
+
+    fn strength_polarity(text: &str) -> Option<u8> {
+        let (level, polarity) = text.split_at(text.len().checked_sub(1)?);
+        match (level, polarity) {
+            ("supply" | "strong" | "pull" | "weak" | "highz", "0") => Some(0),
+            ("supply" | "strong" | "pull" | "weak" | "highz", "1") => Some(1),
+            _ => None,
+        }
+    }
+
+    fn read_strength_group(&mut self) -> Option<(String, Option<String>, bool, Span)> {
+        if !self.at(TokenKind::LParen) || !self.peek_kind().is_strength_keyword() {
+            return None;
+        }
+        let start = self.current_span().start;
+        self.bump();
+        let first = self.bump();
+        let first = self.token_text(first).into_owned();
+        let comma = self.eat(TokenKind::Comma).is_some();
+        let second = if self.current_kind().is_strength_keyword() {
+            let token = self.bump();
+            Some(self.token_text(token).into_owned())
+        } else {
+            None
+        };
+        self.expect(TokenKind::RParen);
+        Some((first, second, comma, self.span_from(start)))
+    }
+
+    pub(super) fn parse_drive_strength(&mut self) -> Option<String> {
+        let (strength, span) = self.parse_strength_group()?;
+        if matches!(strength.as_str(), "small" | "medium" | "large") && crate::strict_checks() {
+            self.diagnostics.push(Diagnostic::error(
+                "expected a drive strength pair (IEEE 1800 Annex A.2.2.2)",
+                span,
+            ));
+        }
+        Some(strength)
+    }
+
+    fn parse_pull_strength(&mut self, pullup: bool) -> Option<String> {
+        let (first, second, comma, span) = self.read_strength_group()?;
+        let first_polarity = Self::strength_polarity(&first);
+        let valid = !first.starts_with("highz")
+            && match &second {
+                Some(other) => {
+                    comma
+                        && !other.starts_with("highz")
+                        && first_polarity
+                            .zip(Self::strength_polarity(other))
+                            .is_some_and(|(a, b)| a != b)
+                }
+                None => !comma && first_polarity == Some(u8::from(pullup)),
+            };
+        if !valid && crate::strict_checks() {
+            self.diagnostics.push(Diagnostic::error(
+                "invalid pull primitive strength (IEEE 1800 §28.8)",
+                span,
+            ));
+        }
+        Some(match second {
+            Some(other) => format!("{first},{other}"),
+            None => first,
+        })
+    }
+
     pub(in crate::parse) fn parse_net_declaration(&mut self) -> NetDeclaration {
         let start = self.current_span().start;
         let net_type = self.parse_optional_net_type().unwrap_or(NetType::Wire);
         // §10.3.1: declaration assignments retain the same strength pair as
         // explicit continuous assignments, for resolution and `%v` reporting.
-        let mut strength = None;
-        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
-            self.bump();
-            let mut parts = Vec::new();
-            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-                let token = self.bump();
-                if token.kind != TokenKind::Comma {
-                    parts.push(self.token_text(token).into_owned());
-                }
-            }
-            self.expect(TokenKind::RParen);
-            strength = Some(parts.join(","));
+        let spec = self.parse_strength_group();
+        if let Some((strength, span)) = &spec
+            && matches!(strength.as_str(), "small" | "medium" | "large")
+            && net_type != NetType::TriReg
+            && crate::strict_checks()
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "charge strength requires a trireg declaration (IEEE 1800 §6.7)",
+                *span,
+            ));
         }
         // §6.9.2: optional `vectored` / `scalared` charge/drive qualifier
         // between the net type and the (optional) range — `tri1 vectored [15:0] a;`.
@@ -95,13 +189,23 @@ impl<'a> Parser<'a> {
             delay = self.parse_net_delay();
         }
         let declarators = self.parse_net_declarator_list();
+        if let Some((strength, span)) = &spec
+            && strength.contains(',')
+            && declarators.iter().any(|decl| decl.init.is_none())
+            && crate::strict_checks()
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "drive strength requires a net declaration assignment (IEEE 1800 §10.3.1)",
+                *span,
+            ));
+        }
         self.expect(TokenKind::Semicolon);
         let (delay, delay_fall, delay_off) = delay;
         NetDeclaration {
             net_type,
             data_type,
             extras: NetDeclaration::make_extras(
-                strength,
+                spec.map(|(strength, _)| strength),
                 delay.map(Box::new),
                 delay_fall.map(Box::new),
                 delay_off.map(Box::new),
@@ -198,16 +302,12 @@ impl<'a> Parser<'a> {
             _ => GateType::And,
         };
         self.bump();
-        // Optional drive_strength `(strong0, strong1)` / charge_strength
-        // `(small)` / pull strength `(pull1)` (§28.4). xezim doesn't model
-        // strengths; consume the group when it opens with a strength keyword.
-        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
-            self.bump(); // (
-            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-                self.bump();
+        let strength = match gate_type {
+            GateType::Pullup | GateType::Pulldown => {
+                self.parse_pull_strength(gate_type == GateType::Pullup)
             }
-            self.expect(TokenKind::RParen);
-        }
+            _ => self.parse_drive_strength(),
+        };
         // Optional `#(delay)` or `#delay` spec between the gate keyword and
         // the first instance: `buf #(D) name (...)`. §28.11: the list is
         // `(rise, fall, turn-off)` for a delay3 primitive.
@@ -276,6 +376,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Semicolon);
         GateInstantiation {
             gate_type,
+            strength: strength.as_deref().map(PrimitiveStrength::from_text),
             delay: delay.map(Box::new),
             delay_fall: delay_fall.map(Box::new),
             delay_off: delay_off.map(Box::new),

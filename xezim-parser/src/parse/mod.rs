@@ -407,6 +407,7 @@ impl<'a> Parser<'a> {
             self.bump();
             let span = self.span_from(start_byte);
             let instantiation = crate::ast::decl::ModuleInstantiation {
+                strength: None,
                 module_name: bind_mod,
                 params: bind_params,
                 instances,

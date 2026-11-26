@@ -326,17 +326,11 @@ impl<'a> Parser<'a> {
                 span: self.span_from(start),
             });
         }
-        // §29.3: `udp_identifier [drive_strength] [delay2] udp_instance`.
-        // A `(` opening with a strength keyword is the drive strength; xezim
-        // does not model strengths (as for gates, §28.4), so it is consumed.
-        // Taken for the terminal list, it read `(strong0, weak1)` as ports.
-        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
-            self.bump(); // (
-            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-                self.bump();
-            }
-            self.expect(TokenKind::RParen);
-        }
+        // A strength before the terminals belongs to a UDP instantiation (§29).
+        let strength = self
+            .parse_drive_strength()
+            .as_deref()
+            .map(PrimitiveStrength::from_text);
         let params = self.parse_instantiation_params();
 
         // §8.25.1: `Cls#(args)::td var;` — a parameterized class used as a
@@ -482,6 +476,7 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::Semicolon);
             return ModuleItem::ModuleInstantiation(ModuleInstantiation {
                 module_name: first_name,
+                strength,
                 params,
                 instances,
                 scope: None,
@@ -555,6 +550,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::Semicolon);
                 ModuleItem::ModuleInstantiation(ModuleInstantiation {
                     module_name: first_name,
+                    strength,
                     params,
                     instances,
                     scope: None,
