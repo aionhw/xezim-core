@@ -186,6 +186,7 @@ impl<'a> Parser<'a> {
                 match it {
                     ClassItem::Parameter(pd) => add_params(pd, &mut type_names),
                     ClassItem::Typedef(t) => type_names.push(t.name.name.clone()),
+                    ClassItem::Nettype(n) => type_names.push(n.name.name.clone()),
                     ClassItem::Constraint(c) if !pure_constraints.contains(&c.name.name) => {
                         constraints.push(c.name.name.clone())
                     }
@@ -427,6 +428,9 @@ impl<'a> Parser<'a> {
                 }))
             }
             TokenKind::KwTypedef => ClassItem::Typedef(Box::new(self.parse_typedef_declaration())),
+            TokenKind::KwNettype => {
+                ClassItem::Nettype(Box::new(self.parse_nettype_declaration()))
+            }
             TokenKind::KwParameter | TokenKind::KwLocalparam => {
                 let pd = self.parse_parameter_declaration();
                 self.expect(TokenKind::Semicolon);

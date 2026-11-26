@@ -418,7 +418,13 @@ impl<'a> Parser<'a> {
                                 sp,
                             ));
                         } else {
-                            type_args.push(self.parse_expression());
+                            let expr = self.parse_expression();
+                            let expr = if self.at(TokenKind::Colon) {
+                                self.parse_mintypmax_rest(expr)
+                            } else {
+                                expr
+                            };
+                            type_args.push(expr);
                         }
                         if self.eat(TokenKind::Comma).is_none() {
                             break;
@@ -426,6 +432,16 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(TokenKind::RParen);
+            } else if matches!(
+                self.current_kind(),
+                TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
+            ) || (self.at(TokenKind::Identifier)
+                && matches!(
+                    self.peek_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ))
+            {
+                type_args.push(self.parse_delay_value());
             }
         }
         type_args

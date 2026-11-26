@@ -13,6 +13,9 @@ pub(super) fn elaborate_items(
     for item in items {
         match item {
             ModuleItem::PortDeclaration(pd) => {
+                if let Some(nt) = pd.net_type {
+                    check_net_port_data_type(nt, &pd.data_type, pd.span, elab, None)?;
+                }
                 let port_modport_view = match &pd.data_type {
                     DataType::Interface {
                         name,
@@ -53,6 +56,9 @@ pub(super) fn elaborate_items(
                     }
                     // §23.2.2.1 non-ANSI split type/direction — merge (see the
                     // matching comment in the top-module elaboration path).
+                    let sig_type_name = declared_user_nettype(elab, &pd.data_type)
+                        .or_else(|| get_type_name(&pd.data_type))
+                        .map(SharedName::from);
                     if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_none() {
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
@@ -72,7 +78,7 @@ pub(super) fn elaborate_items(
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
-                                existing.type_name = get_type_name(&pd.data_type).map(SharedName::from);
+                                existing.type_name = sig_type_name;
                                 existing.value = default_port_value(
                                     Some(pd.direction),
                                     Some(&pd.data_type),
@@ -119,7 +125,9 @@ pub(super) fn elaborate_items(
                             port_decl_net_type(pd),
                         ).into(),
                         is_real,
-                        type_name: get_type_name(&pd.data_type).map(SharedName::from),
+                        type_name: declared_user_nettype(elab, &pd.data_type)
+                            .or_else(|| get_type_name(&pd.data_type))
+                            .map(SharedName::from),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(net_type) = port_decl_net_type(pd) {
@@ -362,6 +370,15 @@ pub(super) fn elaborate_items(
                     // several continuous drivers (§6.5).
                     let nettype_net = declared_user_nettype(elab, &dd.data_type).is_some();
                     if nettype_net {
+                        if let DataType::TypeReference { type_args, .. } = &dd.data_type
+                            && type_args.len() > 1
+                        {
+                            return Err(span_error(
+                                elab,
+                                dd.span,
+                                "user-defined nettype declaration permits at most a single delay value (IEEE 1800-2023 §6.6.7)",
+                            ));
+                        }
                         elab.nets.insert(decl.name.name.clone());
                         if let Some(d) = nettype_net_delay(dd, decl, &elab.parameters) {
                             elab.net_delays.insert(decl.name.name.clone(), d);
@@ -792,7 +809,9 @@ pub(super) fn elaborate_items(
                             is_real,
                             direction: None,
                             value: init_val.into(),
-                            type_name: get_type_name(&dd.data_type).map(SharedName::from),
+                            type_name: declared_user_nettype(elab, &dd.data_type)
+                                .or_else(|| get_type_name(&dd.data_type))
+                                .map(SharedName::from),
                         };
                         signals_insert_traced(
                             &mut elab.signals,

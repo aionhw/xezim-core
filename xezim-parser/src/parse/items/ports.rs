@@ -498,6 +498,10 @@ impl<'a> Parser<'a> {
         let start = self.current_span().start;
         let direction = self.parse_optional_direction();
         let net_type = self.parse_optional_net_type();
+        // §6.7.1: a net type keyword shall not be followed directly by `reg`.
+        if net_type.is_some() && self.at(TokenKind::KwReg) {
+            self.error("a net type keyword shall not be followed directly by 'reg' (IEEE 1800-2023 §6.7.1)");
+        }
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         // LRM §25.9: `virtual <iface_t> [.<modport>] <name>` — module
         // port form. Mirror `parse_function_ports` so a child module
@@ -615,6 +619,16 @@ impl<'a> Parser<'a> {
             (Some(nt), Some(dt)) => Some(self.wreal_data_type(nt, dt, wreal_span)),
             (_, dt) => dt,
         };
+        if matches!(net_type, Some(NetType::Interconnect)) {
+            if var_kw {
+                self.error("'interconnect' port cannot specify 'var' (IEEE 1800-2023 §6.7.1)");
+            }
+            if let Some(dt) = &data_type
+                && !matches!(dt, DataType::Implicit { .. })
+            {
+                self.error("'interconnect' net shall not specify an explicit data type (IEEE 1800-2023 §6.7.1)");
+            }
+        }
         let mut dimensions = if data_type.is_some() {
             self.parse_unpacked_dimensions()
         } else {

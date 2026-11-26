@@ -310,17 +310,25 @@ pub(super) fn is_net_name(elab: &ElaboratedModule, name: &str) -> bool {
 /// net of, by the nettype's registry key. A type name the module hides with
 /// its own typedef, class or type parameter names that declaration instead
 /// (§6.18, §26.3, §26.5), so the object is a variable.
+pub(super) fn nettype_decl_key(name: &crate::ast::types::TypeName) -> String {
+    if name.scopes.is_empty() {
+        name.name.name.clone()
+    } else {
+        let mut parts: Vec<&str> = name.scopes.iter().map(|s| s.name.name.as_str()).collect();
+        parts.push(name.name.name.as_str());
+        parts.join("::")
+    }
+}
+
 pub(super) fn declared_user_nettype(elab: &ElaboratedModule, dt: &DataType) -> Option<String> {
     let DataType::TypeReference { name, .. } = dt else {
         return None;
     };
     let bare = &name.name.name;
-    let key = match name.scopes.as_slice() {
-        [] if elab.shadowed_nettypes.contains(bare) => return None,
-        [] => bare.clone(),
-        [pkg] => format!("{}::{}", pkg.name.name, bare),
-        _ => return None,
-    };
+    if name.scopes.is_empty() && elab.shadowed_nettypes.contains(bare) {
+        return None;
+    }
+    let key = nettype_decl_key(name);
     elab.nettype_resolvers.contains_key(&key).then_some(key)
 }
 
@@ -331,7 +339,10 @@ pub(super) fn declared_user_nettype(elab: &ElaboratedModule, dt: &DataType) -> O
 pub(super) fn user_nettype_of(elab: &ElaboratedModule, name: &str) -> Option<String> {
     let tn = match elab.signals.get(name) {
         Some(s) => s.type_name.as_deref().cloned(),
-        None => elab.var_decl_types.get(name).and_then(get_type_name),
+        None => elab
+            .var_decl_types
+            .get(name)
+            .and_then(|dt| declared_user_nettype(elab, dt).or_else(|| get_type_name(dt))),
     }?;
     elab.nettype_resolvers.contains_key(&tn).then_some(tn)
 }

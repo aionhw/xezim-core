@@ -2775,6 +2775,9 @@ pub(super) fn inline_instantiation_items(
                             if prepared_sub.interface_ports.contains(&port.name.name) {
                                 continue;
                             }
+                            if let (Some(nt), Some(dt)) = (port.net_type, port.data_type.as_ref()) {
+                                check_net_port_data_type(nt, dt, port.span, elab, Some(sub_mod.name()))?;
+                            }
                             let port_spec = port.data_type.as_ref().and_then(|dt| {
                                 resolve_specialized_class_data_type(dt, &sub_merged_params, elab)
                             });
@@ -3066,6 +3069,26 @@ pub(super) fn inline_instantiation_items(
                                     }
                                     _ => None,
                                 };
+                                let port_type_name = port
+                                    .data_type
+                                    .as_ref()
+                                    .and_then(|dt| {
+                                        declared_user_nettype(elab, dt)
+                                            .or_else(|| get_type_name(dt))
+                                    })
+                                    .map(SharedName::from);
+                                let sig_val = init_val.unwrap_or_else(|| {
+                                    default_port_value(
+                                        port.direction,
+                                        eff_port_dt,
+                                        width,
+                                        is_real,
+                                        ansi_port_net_type(port),
+                                    )
+                                });
+                                let sig_signed = eff_port_dt
+                                    .map(|dt| is_type_signed_resolved(dt, &elab.typedef_types))
+                                    .unwrap_or(false);
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3074,25 +3097,11 @@ pub(super) fn inline_instantiation_items(
                                         is_const: false,
                                         name: sig_name.clone().into(),
                                         width,
-                                        is_signed: eff_port_dt
-                                            .map(|dt| is_type_signed_resolved(dt, &elab.typedef_types))
-                                            .unwrap_or(false),
+                                        is_signed: sig_signed,
                                         is_real,
                                         direction: port.direction,
-                                        value: init_val.unwrap_or_else(|| {
-                                            default_port_value(
-                                                port.direction,
-                                                eff_port_dt,
-                                                width,
-                                                is_real,
-                                                ansi_port_net_type(port),
-                                            )
-                                        }).into(),
-                                        type_name: port
-                                            .data_type
-                                            .as_ref()
-                                            .and_then(get_type_name)
-                                            .map(SharedName::from),
+                                        value: sig_val.into(),
+                                        type_name: port_type_name,
                                     },
                                 );
                             } else {
@@ -3479,6 +3488,15 @@ pub(super) fn inline_instantiation_items(
                 if let PortList::NonAnsi(_) = sub_mod.ports() {
                     for sub_item in &prepared_sub.effective_items {
                         if let ModuleItem::PortDeclaration(pd) = sub_item {
+                            if let Some(nt) = pd.net_type {
+                                check_net_port_data_type(
+                                    nt,
+                                    &pd.data_type,
+                                    pd.span,
+                                    elab,
+                                    Some(sub_mod.name()),
+                                )?;
+                            }
                             if is_interface_type(&pd.data_type, definitions) {
                                 continue;
                             }
@@ -3651,6 +3669,15 @@ pub(super) fn inline_instantiation_items(
                                 }
                                 let port_is_real =
                                     is_type_real_resolved(eff_pd_dt, &elab.typedef_types);
+                                let pd_type_name = declared_user_nettype(elab, eff_pd_dt)
+                                    .map(SharedName::from)
+                                    .or_else(|| {
+                                        scope_local_type_name(
+                                            get_type_name(eff_pd_dt),
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        )
+                                    });
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3669,11 +3696,7 @@ pub(super) fn inline_instantiation_items(
                                             port_decl_net_type(pd),
                                         ).into(),
                                         is_real: port_is_real,
-                                        type_name: scope_local_type_name(
-                                            get_type_name(eff_pd_dt),
-                                            &sub_typedef_names_all,
-                                            &inst_prefix,
-                                        ),
+                                        type_name: pd_type_name,
                                     },
                                 );
                                 if let Some(net_type) = port_decl_net_type(pd) {
@@ -3697,6 +3720,7 @@ pub(super) fn inline_instantiation_items(
                 for sub_item in &prepared_sub.effective_items {
                     match sub_item {
                         ModuleItem::NetDeclaration(nd) => {
+                            check_net_data_type_in(nd, elab, Some(sub_mod.name()))?;
                             let nd_spec = resolve_specialized_class_data_type(
                                 &nd.data_type,
                                 &sub_merged_params,
@@ -3929,6 +3953,17 @@ pub(super) fn inline_instantiation_items(
                                     );
                                 }
                                 let init_value = default_net_value(nd.net_type, width, net_is_real);
+                                let nd_is_signed =
+                                    is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
+                                let nd_type_name = declared_user_nettype(elab, &nd.data_type)
+                                    .map(SharedName::from)
+                                    .or_else(|| {
+                                        scope_local_type_name(
+                                            get_type_name(&nd.data_type),
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        )
+                                    });
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3937,7 +3972,7 @@ pub(super) fn inline_instantiation_items(
                                         is_const: false,
                                         name: sig_name.into(),
                                         width,
-                                        is_signed: is_type_signed_resolved(&nd.data_type, &elab.typedef_types),
+                                        is_signed: nd_is_signed,
                                         // Resolved through the typedef table so a
                                         // NETTYPE net declared in a submodule
                                         // (`rnet n;`) is real like its top-level
@@ -3945,11 +3980,7 @@ pub(super) fn inline_instantiation_items(
                                         is_real: net_is_real,
                                         direction: None,
                                         value: init_value.into(),
-                                        type_name: scope_local_type_name(
-                                            get_type_name(&nd.data_type),
-                                            &sub_typedef_names_all,
-                                            &inst_prefix,
-                                        ),
+                                        type_name: nd_type_name,
                                     },
                                 );
                             }
@@ -4475,6 +4506,15 @@ pub(super) fn inline_instantiation_items(
                                         !matches!(dd.data_type, DataType::Implicit { .. });
                                     let decl_is_real =
                                         is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                                    let dd_type_name = declared_user_nettype(elab, &dd.data_type)
+                                        .map(SharedName::from)
+                                        .or_else(|| {
+                                            scope_local_type_name(
+                                                get_type_name(&dd.data_type),
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                            )
+                                        });
                                     let existing = elab.signals.get_mut(&sig_name).unwrap();
                                     if explicit_type {
                                         if let Some(pats) = signal_trace_patterns() {
@@ -4494,11 +4534,7 @@ pub(super) fn inline_instantiation_items(
                                         existing.width = width;
                                         existing.is_signed = is_signed;
                                         existing.is_real = decl_is_real;
-                                        existing.type_name = scope_local_type_name(
-                                            get_type_name(&dd.data_type),
-                                            &sub_typedef_names_all,
-                                            &inst_prefix,
-                                        );
+                                        existing.type_name = dd_type_name;
                                         existing.value = default_port_value(
                                             existing.direction,
                                             Some(&dd.data_type),
@@ -4949,8 +4985,21 @@ pub(super) fn inline_instantiation_items(
                                     // joins the instance's net declaration
                                     // assignments once the rewrite context
                                     // exists.
-                                    let nettype_net = get_type_name(&dd.data_type)
-                                        .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
+                                    let nettype_net =
+                                        declared_user_nettype(elab, &dd.data_type).is_some();
+                                    if nettype_net {
+                                        if let DataType::TypeReference { type_args, .. } =
+                                            &dd.data_type
+                                            && type_args.len() > 1
+                                        {
+                                            return Err(span_error(
+                                                elab,
+                                                dd.span,
+                                                "user-defined nettype declaration permits at most a single delay value (IEEE 1800-2023 §6.6.7)",
+                                            ));
+                                        }
+                                        elab.nets.insert(sig_name.clone());
+                                    }
                                     if nettype_net && let Some(init_expr) = &decl.init {
                                         nettype_decl_inits.push((
                                             decl.name.name.clone(),
@@ -5094,6 +5143,20 @@ pub(super) fn inline_instantiation_items(
                                     ) {
                                         elab.two_state_signals.insert(sig_name.clone());
                                     }
+                                    let dd_sig_real = is_type_real_resolved(
+                                        &dd.data_type,
+                                        &elab.typedef_types,
+                                    );
+                                    let dd_sig_type_name =
+                                        declared_user_nettype(elab, &dd.data_type)
+                                            .map(SharedName::from)
+                                            .or_else(|| {
+                                                scope_local_type_name(
+                                                    get_type_name(&dd.data_type),
+                                                    &sub_typedef_names_all,
+                                                    &inst_prefix,
+                                                )
+                                            });
                                     signals_insert_traced(
                                         &mut elab.signals,
                                         line!(),
@@ -5114,15 +5177,8 @@ pub(super) fn inline_instantiation_items(
                                                 }
                                                 v
 .into()                                            },
-                                            is_real: is_type_real_resolved(
-                                                &dd.data_type,
-                                                &elab.typedef_types,
-                                            ),
-                                            type_name: scope_local_type_name(
-                                                get_type_name(&dd.data_type),
-                                                &sub_typedef_names_all,
-                                                &inst_prefix,
-                                            ),
+                                            is_real: dd_sig_real,
+                                            type_name: dd_sig_type_name,
                                         },
                                     );
                                 }
@@ -5207,7 +5263,63 @@ pub(super) fn inline_instantiation_items(
                                 // elements of an array shaped before, which
                                 // keeps its shape here.
                                 let element = whole_net_ident_name(parent_expr).is_none();
-                                if element && let Some(dt) = &struct_dt {
+                                let elem_key = element
+                                    .then(|| {
+                                        scope_indexed_flat_name_params(
+                                            parent_expr,
+                                            &elab.parameters,
+                                        )
+                                    })
+                                    .flatten();
+                                if let Some(ek) = elem_key {
+                                    let entry = elab
+                                        .interconnect_elem_types
+                                        .entry(ek.clone())
+                                        .or_insert_with(|| (fw, freal, ftn.clone()));
+                                    if entry.0 <= 1 && !entry.1 && entry.2.is_none()
+                                        && (fw > 1 || freal || ftn.is_some())
+                                    {
+                                        *entry = (fw, freal, ftn.clone());
+                                    }
+                                    if let Some((_, _, ew)) = elab.arrays.get_mut(&an)
+                                        && *ew < fw
+                                    {
+                                        *ew = fw;
+                                    }
+                                    if let Some(dt) = &struct_dt {
+                                        register_unpacked_aggregate(elab, &ek, dt);
+                                    }
+                                    let pfx = format!("{an}[");
+                                    let mut has_real = false;
+                                    let mut has_non_real = false;
+                                    for (k, (_, er, _)) in &elab.interconnect_elem_types {
+                                        if k.starts_with(&pfx) {
+                                            if *er {
+                                                has_real = true;
+                                            } else {
+                                                has_non_real = true;
+                                            }
+                                        }
+                                    }
+                                    if has_real && !has_non_real {
+                                        elab.var_decl_types.insert(
+                                            an.clone(),
+                                            DataType::Real {
+                                                kind: RealType::Real,
+                                                span: Span::new(0, 0),
+                                            },
+                                        );
+                                    } else if has_non_real {
+                                        elab.var_decl_types.insert(
+                                            an.clone(),
+                                            DataType::Implicit {
+                                                signing: None,
+                                                dimensions: Vec::new(),
+                                                span: Span::new(0, 0),
+                                            },
+                                        );
+                                    }
+                                } else if element && let Some(dt) = &struct_dt {
                                     let typeless = elab
                                         .signals
                                         .get(&an)
@@ -5322,6 +5434,21 @@ pub(super) fn inline_instantiation_items(
                                 } else {
                                     dst.value = Value::zero(src.width.max(1)).into();
                                 }
+                            }
+                        } else if let Some(ek) =
+                            scope_indexed_flat_name_params(parent_expr, &elab.parameters)
+                            && let Some((ew, er, etn)) =
+                                elab.interconnect_elem_types.get(&ek).cloned()
+                        {
+                            if let Some(dst) = elab.signals.get_mut(&sub_sig_name) {
+                                dst.width = ew;
+                                dst.is_real = er;
+                                dst.type_name = etn;
+                                dst.value = if er {
+                                    Value::from_f64(0.0).into()
+                                } else {
+                                    Value::zero(ew.max(1)).into()
+                                };
                             }
                         }
                     }

@@ -3181,6 +3181,11 @@ pub struct ElaboratedModule {
     /// placeholder (1-bit z) signal from the first definitely-typed formal.
     #[serde(default)]
     pub interconnect_nets: HashSet<String>,
+    /// §6.6.8: per-element shape `(width, is_real, type_name)` adopted by an
+    /// `interconnect` unpacked array element (`iBus[1]`) from the typed port
+    /// bound to it, keeping heterogeneous elements independent.
+    #[serde(default)]
+    pub interconnect_elem_types: HashMap<String, (u32, bool, Option<SharedName>)>,
     /// Elaboration-time diagnostics (implicit-net warnings, port-width lint,
     /// unresolved-module notes, width-underflow) captured during a cold run so
     /// a warm design-cache HIT — which skips elaboration — can replay them
@@ -3718,6 +3723,7 @@ impl ElaboratedModule {
             nets: Default::default(),
             implicit_nets: HashSet::default(),
             interconnect_nets: HashSet::default(),
+            interconnect_elem_types: HashMap::default(),
             elab_diagnostics: Vec::new(),
             instances: Vec::new(),
             upward_scopes: Rc::default(),

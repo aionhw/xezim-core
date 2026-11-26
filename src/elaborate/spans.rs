@@ -428,6 +428,9 @@ pub fn duplicate_decl_error(elab: &ElaboratedModule, name: &str, span: Span, kin
 /// silently misses those nets: their drivers are never gathered and their
 /// members never written, below the top level only.
 pub(super) fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
+    if let Some((_, _, Some(tn))) = elab.interconnect_elem_types.get(name) {
+        return Some(tn.to_string());
+    }
     if let Some(tn) = elab
         .signals
         .get(name)
@@ -435,5 +438,33 @@ pub(super) fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<
     {
         return Some(tn);
     }
-    elab.var_decl_types.get(name).and_then(get_type_name)
+    if let Some(dt) = elab.var_decl_types.get(name)
+        && let Some(tn) = declared_user_nettype(elab, dt).or_else(|| get_type_name(dt))
+    {
+        return Some(tn);
+    }
+    if name.ends_with(']') && !elab.signals.contains_key(name) {
+        let mut base = name;
+        let mut peeled_any = false;
+        while let Some(open) = base.rfind('[')
+            && base.ends_with(']')
+            && base[open + 1..base.len() - 1].parse::<i64>().is_ok()
+        {
+            base = &base[..open];
+            peeled_any = true;
+        }
+        if peeled_any && !elab.interconnect_nets.contains(base) {
+            if let Some(tn) = elab
+                .signals
+                .get(base)
+                .and_then(|sig| sig.type_name.as_deref().cloned())
+            {
+                return Some(tn);
+            }
+            if let Some(dt) = elab.var_decl_types.get(base) {
+                return declared_user_nettype(elab, dt).or_else(|| get_type_name(dt));
+            }
+        }
+    }
+    None
 }

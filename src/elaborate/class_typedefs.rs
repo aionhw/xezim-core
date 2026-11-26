@@ -45,10 +45,12 @@ pub fn register_class_scoped_typedef_aliases(
     }
     prefixes.push(c.name.name.clone());
     register_class_consts(c, &prefixes, elab);
-    if c.items
-        .iter()
-        .any(|i| matches!(i, ClassItem::Typedef(_) | ClassItem::Class(_)))
-    {
+    if c.items.iter().any(|i| {
+        matches!(
+            i,
+            ClassItem::Typedef(_) | ClassItem::Nettype(_) | ClassItem::Class(_)
+        )
+    }) {
         let params = class_const_scope(c, Some(&elab.parameters));
         walk_class_typedefs(c, &prefixes, &params, elab);
     }
@@ -133,6 +135,47 @@ fn walk_class_typedefs(
                         for (nm, _, v) in &resolved {
                             elab.set_param(line!(), format!("{}::{}", pfx, nm), v.clone());
                         }
+                    }
+                }
+            }
+            ClassItem::Nettype(nd) => {
+                let mut merged_td: HashMap<String, u32> =
+                    elab.typedefs.iter().map(|(k, &v)| (k.clone(), v)).collect();
+                merged_td.extend(local_td.iter().map(|(k, &v)| (k.clone(), v)));
+                let w = resolve_type_width(&nd.data_type, Some(params), Some(&merged_td));
+                local_td.insert(nd.name.name.clone(), w);
+                let mut resolved_dt = nd.data_type.clone();
+                if let DataType::TypeReference { name, .. } = &nd.data_type
+                    && name.scopes.is_empty()
+                {
+                    for pfx in prefixes {
+                        if let Some(target_dt) =
+                            elab.typedef_types.get(&format!("{}::{}", pfx, name.name.name))
+                        {
+                            resolved_dt = target_dt.clone();
+                            break;
+                        }
+                    }
+                }
+                if nd.name.name.contains("::") {
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:class_scope_alias",
+                        nd.name.name.clone(),
+                        w,
+                    );
+                    elab.typedef_types
+                        .insert(nd.name.name.clone(), resolved_dt.clone());
+                } else {
+                    for pfx in prefixes {
+                        let key = format!("{}::{}", pfx, nd.name.name);
+                        typedefs_insert_traced(
+                            &mut elab.typedefs,
+                            "insert:class_scope_alias",
+                            key.clone(),
+                            w,
+                        );
+                        elab.typedef_types.insert(key, resolved_dt.clone());
                     }
                 }
             }
@@ -1234,6 +1277,9 @@ fn resolve_specialized_class_dt_depth(
         DataType::TypeReference {
             name, dimensions, ..
         } if name.has_scope() => {
+            if declared_user_nettype(elab, dt).is_some() {
+                return None;
+            }
             specialized_class_scope_resolve_at(name, dimensions, caller_params, elab, depth)
         }
         DataType::Struct(su) => {

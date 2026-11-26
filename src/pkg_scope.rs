@@ -205,6 +205,9 @@ fn count_class_types(
             ClassItem::Typedef(td) if class_typedef_renamable(td, class_names) => {
                 *count.entry(td.name.name.clone()).or_default() += 1;
             }
+            ClassItem::Nettype(nd) => {
+                *count.entry(nd.name.name.clone()).or_default() += 1;
+            }
             ClassItem::Class(nc) => {
                 *count.entry(nc.name.name.clone()).or_default() += 1;
                 count_class_types(nc, class_names, count);
@@ -239,6 +242,9 @@ fn record_class(
         match it {
             ClassItem::Typedef(td) if class_typedef_renamable(td, class_names) => {
                 ci.types.insert(td.name.name.clone());
+            }
+            ClassItem::Nettype(nd) => {
+                ci.types.insert(nd.name.name.clone());
             }
             ClassItem::Class(nc) => {
                 ci.types.insert(nc.name.name.clone());
@@ -2075,6 +2081,31 @@ impl Rw<'_> {
         self.type_ident(&mut tn.scopes[0].name);
     }
 
+    fn rewrite_type_scopes(&mut self, scopes: &mut Vec<TypeScope>) {
+        for s in scopes.iter_mut() {
+            for a in &mut s.type_args {
+                self.expr(a);
+            }
+        }
+        if scopes.is_empty() {
+            return;
+        }
+        let first = scopes[0].name.name.clone();
+        if self.is_package(&first) && scopes.len() > 1 {
+            let next = scopes[1].name.name.clone();
+            if self.info.colliding.contains(&next)
+                && let Some(o) = self.info.owner(&first, &next, 0)
+            {
+                scopes.remove(0);
+                scopes[0].name.name = mangle(&o, &next);
+            }
+            return;
+        }
+        if !self.is_package(&first) {
+            self.type_ident(&mut scopes[0].name);
+        }
+    }
+
     /// Save the declaration key for the consumers that need type identity.
     /// Keep the existing storage spelling for layout and value lookup.
     fn external_type_binding(&mut self, name: &str) -> Bound {
@@ -3153,6 +3184,9 @@ impl Rw<'_> {
                     f.types.insert(td.name.name.clone());
                     enum_members(&td.data_type, &mut f.values);
                 }
+                ClassItem::Nettype(nd) => {
+                    f.types.insert(nd.name.name.clone());
+                }
                 ClassItem::Parameter(pd) => param_names(pd, &mut f.types, &mut f.values),
                 ClassItem::Class(nc) => {
                     f.types.insert(nc.name.name.clone());
@@ -3197,6 +3231,19 @@ impl Rw<'_> {
                     }
                     self.dtype(&mut td.data_type);
                     self.unpacked(&mut td.dimensions);
+                }
+                ClassItem::Nettype(nd) => {
+                    if self.info.class_colliding.contains(&nd.name.name)
+                        && self
+                            .info
+                            .classes
+                            .get(&named)
+                            .is_some_and(|ci| ci.types.contains(&nd.name.name))
+                    {
+                        nd.name.name = mangle(&named, &nd.name.name);
+                    }
+                    self.dtype(&mut nd.data_type);
+                    self.rewrite_type_scopes(&mut nd.resolver_scopes);
                 }
                 ClassItem::Parameter(pd) => self.param_decl(pd),
                 ClassItem::Class(nc) => {
@@ -3519,7 +3566,10 @@ impl Rw<'_> {
                 self.frames.pop();
             }
             ModuleItem::LetDeclaration(l) => self.expr(&mut l.expr),
-            ModuleItem::NettypeDeclaration(n) => self.dtype(&mut n.data_type),
+            ModuleItem::NettypeDeclaration(n) => {
+                self.dtype(&mut n.data_type);
+                self.rewrite_type_scopes(&mut n.resolver_scopes);
+            }
             ModuleItem::DPIImport(d) => self.dpi(&mut d.proto),
             ModuleItem::DPIExport(d) => self.dpi(&mut d.proto),
             ModuleItem::OutOfClassConstraint {
@@ -3647,6 +3697,7 @@ impl Rw<'_> {
                     n.name.name = m;
                 }
                 self.dtype(&mut n.data_type);
+                self.rewrite_type_scopes(&mut n.resolver_scopes);
             }
             PackageItem::Property(p) => {
                 p.items.iter_mut().for_each(|s| self.stmt(s));

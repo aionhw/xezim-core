@@ -457,6 +457,8 @@ fn let_subst(e: &mut Expression, map: &std::collections::HashMap<String, Express
 pub struct NettypeDeclaration {
     pub data_type: DataType,
     pub name: Identifier,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub resolver_scopes: Vec<super::types::TypeScope>,
     pub resolver: Option<Identifier>,
     pub span: Span,
 }
@@ -1746,6 +1748,8 @@ pub enum ClassItem {
     Constraint(std::sync::Arc<ClassConstraint>),
     /// Typedef inside class
     Typedef(Box<TypedefDeclaration>),
+    /// User-defined nettype inside class (§6.6.7)
+    Nettype(Box<NettypeDeclaration>),
     /// Parameter/localparam inside class
     Parameter(ParameterDeclaration),
     /// Class inside class (nested)

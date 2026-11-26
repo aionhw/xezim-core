@@ -446,14 +446,87 @@ pub fn is_type_signed(dt: &DataType) -> bool {
     }
 }
 
-/// Look up a §6.6.7 nettype resolution function — by bare name, or as a package
-/// member hoisted under a `pkg::name` key.
-pub(super) fn lookup_resolver<'a>(
+/// Result of looking up a §6.6.7 nettype resolution function — either a free /
+/// package function or a `static` class method (or an explicit error when the
+/// named class method is non-static).
+pub(super) enum ResolverLookup<'a> {
+    Found {
+        fd: &'a crate::ast::decl::FunctionDeclaration,
+        class_ctx: Option<&'a ElaboratedClass>,
+    },
+    NonStaticMethod {
+        class_name: String,
+        method_name: String,
+    },
+    Missing,
+}
+
+fn resolve_resolver_class<'a>(
+    elab: &'a ElaboratedModule,
+    scope: &str,
+) -> Option<&'a ElaboratedClass> {
+    let mut cur = scope.to_string();
+    for _ in 0..8 {
+        let base = cur.split_once('#').map_or(cur.as_str(), |(b, _)| b).trim();
+        if let Some(ec) = elab.classes.get(base) {
+            return Some(ec);
+        }
+        if let Some((_, leaf)) = base.rsplit_once("::")
+            && let Some(ec) = elab.classes.get(leaf)
+        {
+            return Some(ec);
+        }
+        match elab.typedef_types.get(base) {
+            Some(DataType::TypeReference { name, .. }) => {
+                let q = nettype_decl_key(name);
+                if let Some(ec) = elab.classes.get(&q).or_else(|| elab.classes.get(&name.name.name))
+                {
+                    return Some(ec);
+                }
+                if q != cur && elab.typedef_types.contains_key(&q) {
+                    cur = q;
+                } else if name.name.name != cur && elab.typedef_types.contains_key(&name.name.name) {
+                    cur = name.name.name.clone();
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+pub(super) fn lookup_resolver_full<'a>(
     elab: &'a ElaboratedModule,
     name: &str,
-) -> Option<&'a crate::ast::decl::FunctionDeclaration> {
+) -> ResolverLookup<'a> {
     if let Some(fd) = elab.functions.get(name) {
-        return Some(fd);
+        return ResolverLookup::Found { fd, class_ctx: None };
+    }
+    if let Some((scope, method)) = name.rsplit_once("::") {
+        if let Some(ec) = resolve_resolver_class(elab, scope)
+            && let Some(cm) = ec.methods.get(method)
+        {
+            let is_static = ec.static_methods.contains(method)
+                || cm.qualifiers.contains(&ClassQualifier::Static);
+            match &cm.kind {
+                ClassMethodKind::Function(fd) | ClassMethodKind::Extern(fd) => {
+                    if !is_static {
+                        return ResolverLookup::NonStaticMethod {
+                            class_name: ec.name.clone(),
+                            method_name: method.to_string(),
+                        };
+                    }
+                    return ResolverLookup::Found {
+                        fd,
+                        class_ctx: Some(ec),
+                    };
+                }
+                _ => {}
+            }
+        }
+        return ResolverLookup::Missing;
     }
     let suffix = format!("::{}", name);
     let mut keys: Vec<&String> = elab
@@ -462,7 +535,649 @@ pub(super) fn lookup_resolver<'a>(
         .filter(|k| k.ends_with(&suffix))
         .collect();
     keys.sort();
-    keys.first().and_then(|k| elab.functions.get(*k))
+    match keys.first().and_then(|k| elab.functions.get(*k)) {
+        Some(fd) => ResolverLookup::Found { fd, class_ctx: None },
+        None => ResolverLookup::Missing,
+    }
+}
+
+/// Look up a §6.6.7 nettype resolution function — by bare name, or as a package
+/// member hoisted under a `pkg::name` key, or as a class static method.
+pub(super) fn lookup_resolver<'a>(
+    elab: &'a ElaboratedModule,
+    name: &str,
+) -> Option<&'a crate::ast::decl::FunctionDeclaration> {
+    match lookup_resolver_full(elab, name) {
+        ResolverLookup::Found { fd, .. } => Some(fd),
+        _ => None,
+    }
+}
+
+fn has_illegal_nettype_dim(dims: &[UnpackedDimension]) -> bool {
+    dims.iter().any(|d| {
+        matches!(
+            d,
+            UnpackedDimension::Unsized(_)
+                | UnpackedDimension::Queue { .. }
+                | UnpackedDimension::Associative { .. }
+        )
+    })
+}
+
+/// §6.6.7(a)-(d): validate the data type of a user-defined `nettype`.
+pub(super) fn validate_nettype_data_type(
+    elab: &ElaboratedModule,
+    nt_name: &str,
+    dt: &DataType,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth >= 64 {
+        return Ok(());
+    }
+    match dt {
+        DataType::Simple { kind, .. } => Err(format!(
+            "illegal nettype '{}' data type '{}': string, chandle, and event are not permitted in a user-defined nettype (IEEE 1800-2023 §6.6.7)",
+            nt_name,
+            format!("{:?}", kind).to_lowercase()
+        )),
+        DataType::Void(_) => Err(format!(
+            "illegal nettype '{}' data type 'void' (IEEE 1800-2023 §6.6.7)",
+            nt_name
+        )),
+        DataType::Interface { .. } => Err(format!(
+            "illegal nettype '{}' data type 'virtual interface' (IEEE 1800-2023 §6.6.7)",
+            nt_name
+        )),
+        DataType::Struct(su) => {
+            for m in &su.members {
+                for d in &m.declarators {
+                    let eff_dims =
+                        struct_member_dims(&m.data_type, &d.dimensions, &elab.typedef_unpacked_dims);
+                    if has_illegal_nettype_dim(&d.dimensions) || has_illegal_nettype_dim(&eff_dims) {
+                        return Err(format!(
+                            "illegal nettype '{}' struct member '{}': dynamic, queue, and associative arrays are not permitted in a user-defined nettype (IEEE 1800-2023 §6.6.7)",
+                            nt_name, d.name.name
+                        ));
+                    }
+                }
+                validate_nettype_data_type(elab, nt_name, &m.data_type, visited, depth + 1)?;
+            }
+            Ok(())
+        }
+        DataType::Enum(e) => {
+            if let Some(bt) = &e.base_type {
+                validate_nettype_data_type(elab, nt_name, bt, visited, depth + 1)?;
+            }
+            Ok(())
+        }
+        DataType::TypeReference { name, .. } => {
+            let key = nettype_decl_key(name);
+            let bad_dims = lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                .or_else(|| elab.typedef_unpacked_dims.get(&key))
+                .or_else(|| elab.typedef_unpacked_dims.get(&name.name.name))
+                .is_some_and(|dims| has_illegal_nettype_dim(dims));
+            if bad_dims {
+                return Err(format!(
+                    "illegal nettype '{}' data type '{}': dynamic, queue, and associative arrays are not permitted in a user-defined nettype (IEEE 1800-2023 §6.6.7)",
+                    nt_name, key
+                ));
+            }
+            let inner = lookup_scoped_type(name, &elab.typedef_types)
+                .or_else(|| elab.typedef_types.get(&key))
+                .or_else(|| elab.typedef_types.get(&name.name.name));
+            if let Some(next) = inner
+                && !matches!(next, DataType::Void(_))
+            {
+                let self_ref = matches!(
+                    next,
+                    DataType::TypeReference { name: nn, .. }
+                        if nettype_decl_key(nn) == key || nn.name.name == key
+                );
+                if !self_ref && key != nt_name && visited.insert(key.clone()) {
+                    let res = validate_nettype_data_type(elab, nt_name, next, visited, depth + 1);
+                    visited.remove(&key);
+                    return res;
+                }
+                return Ok(());
+            }
+            if elab.classes.contains_key(&key) || elab.classes.contains_key(&name.name.name) {
+                return Err(format!(
+                    "illegal nettype '{}' data type '{}': class handles are not permitted in a user-defined nettype (IEEE 1800-2023 §6.6.7)",
+                    nt_name, key
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn unwrap_typedef_for_nettype<'a>(
+    elab: &'a ElaboratedModule,
+    mut dt: &'a DataType,
+    class_ctx: Option<&'a ElaboratedClass>,
+) -> &'a DataType {
+    for _ in 0..64 {
+        let DataType::TypeReference {
+            name, dimensions, ..
+        } = dt
+        else {
+            break;
+        };
+        if !dimensions.is_empty() {
+            break;
+        }
+        let key = nettype_decl_key(name);
+        let class_local = (name.scopes.is_empty()).then(|| {
+            class_ctx.and_then(|ec| {
+                let scoped = format!("{}::{}", ec.name, name.name.name);
+                ec.typedef_targets
+                    .get(&name.name.name)
+                    .or_else(|| ec.typedef_targets.get(&scoped))
+                    .or_else(|| {
+                        ec.typedef_targets.iter().find_map(|(k, v)| {
+                            (k.rsplit("::").next() == Some(name.name.name.as_str())).then_some(v)
+                        })
+                    })
+            })
+        }).flatten();
+        let next = class_local
+            .or_else(|| lookup_scoped_type(name, &elab.typedef_types))
+            .or_else(|| elab.typedef_types.get(&key));
+        match next {
+            Some(n)
+                if !matches!(n, DataType::Void(_))
+                    && !matches!(
+                        n,
+                        DataType::TypeReference { name: nn, dimensions: ndims, .. }
+                            if ndims.is_empty()
+                                && (nettype_decl_key(nn) == key || nn.name.name == name.name.name)
+                    ) =>
+            {
+                dt = n;
+            }
+            _ => break,
+        }
+    }
+    dt
+}
+
+fn resolve_const_integral_shape(
+    dt: &DataType,
+    elab: &ElaboratedModule,
+    class_ctx: Option<&ElaboratedClass>,
+) -> Option<(bool, bool, Option<u32>)> {
+    // Returns Some((is_2state, is_signed, const_width_or_None_if_polymorphic))
+    fn expr_refs_class_param(e: &Expression, ec: &ElaboratedClass) -> bool {
+        fn has_ident(e: &Expression, names: &HashSet<&str>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                    names.contains(h.path[0].name.name.as_str())
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    has_ident(left, names) || has_ident(right, names)
+                }
+                ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                    has_ident(operand, names)
+                }
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => has_ident(condition, names) || has_ident(then_expr, names) || has_ident(else_expr, names),
+                _ => false,
+            }
+        }
+        let names: HashSet<&str> = ec.param_defaults.iter().map(|(n, _)| n.as_str()).collect();
+        !names.is_empty() && has_ident(e, &names)
+    }
+    fn dims_const_evaluable(
+        dims: &[PackedDimension],
+        elab: &ElaboratedModule,
+        class_ctx: Option<&ElaboratedClass>,
+    ) -> bool {
+        dims.iter().all(|d| match d {
+            PackedDimension::Range { left, right, .. } => {
+                if let Some(ec) = class_ctx
+                    && (expr_refs_class_param(left, ec) || expr_refs_class_param(right, ec))
+                {
+                    return false;
+                }
+                const_eval_i64_with_params(left, Some(&elab.parameters)).is_some()
+                    && const_eval_i64_with_params(right, Some(&elab.parameters)).is_some()
+            }
+            PackedDimension::Unsized(_) => true,
+        })
+    }
+    let dt = unwrap_typedef_for_nettype(elab, dt, class_ctx);
+    match dt {
+        DataType::IntegerVector {
+            kind,
+            signing,
+            dimensions,
+            ..
+        } => {
+            let two_state = matches!(kind, IntegerVectorType::Bit);
+            let signed = matches!(signing, Some(Signing::Signed));
+            let w = if dimensions.is_empty() || dims_const_evaluable(dimensions, elab, class_ctx) {
+                Some(resolve_type_width(
+                    dt,
+                    Some(&elab.parameters),
+                    Some(&elab.typedefs),
+                ))
+            } else {
+                None
+            };
+            Some((two_state, signed, w))
+        }
+        DataType::Implicit {
+            signing,
+            dimensions,
+            ..
+        } => {
+            let signed = matches!(signing, Some(Signing::Signed));
+            let w = if dimensions.is_empty() || dims_const_evaluable(dimensions, elab, class_ctx) {
+                Some(resolve_type_width(
+                    dt,
+                    Some(&elab.parameters),
+                    Some(&elab.typedefs),
+                ))
+            } else {
+                None
+            };
+            Some((false, signed, w))
+        }
+        DataType::IntegerAtom { kind, signing, .. } => {
+            let two_state = matches!(
+                kind,
+                IntegerAtomType::Byte
+                    | IntegerAtomType::ShortInt
+                    | IntegerAtomType::Int
+                    | IntegerAtomType::LongInt
+            );
+            let signed = match signing {
+                Some(s) => matches!(s, Signing::Signed),
+                None => !matches!(kind, IntegerAtomType::Time),
+            };
+            let w = match kind {
+                IntegerAtomType::Byte => 8,
+                IntegerAtomType::ShortInt => 16,
+                IntegerAtomType::Int | IntegerAtomType::Integer => 32,
+                IntegerAtomType::LongInt | IntegerAtomType::Time => 64,
+            };
+            Some((two_state, signed, Some(w)))
+        }
+        DataType::TypeReference {
+            dimensions, ..
+        } if !dimensions.is_empty() => {
+            // Typedef + extra packed dims (e.g. `logic_t [3:0]`)
+            let two_state = is_type_two_state_resolved(dt, &elab.typedef_types);
+            let signed = is_type_signed_resolved(dt, &elab.typedef_types);
+            let w = if dims_const_evaluable(dimensions, elab, class_ctx) {
+                Some(resolve_type_width(
+                    dt,
+                    Some(&elab.parameters),
+                    Some(&elab.typedefs),
+                ))
+            } else {
+                None
+            };
+            Some((two_state, signed, w))
+        }
+        _ => None,
+    }
+}
+
+fn nettype_types_match(
+    elab: &ElaboratedModule,
+    nt_dt: &DataType,
+    other_dt: &DataType,
+    class_ctx: Option<&ElaboratedClass>,
+    depth: usize,
+) -> bool {
+    if depth >= 32 {
+        return true;
+    }
+    let a = unwrap_typedef_for_nettype(elab, nt_dt, class_ctx);
+    let b = unwrap_typedef_for_nettype(elab, other_dt, class_ctx);
+
+    // Parameterized class type parameter (e.g. `T`) in resolver signature:
+    if let (Some(ec), DataType::TypeReference { name, .. }) = (class_ctx, b)
+        && name.scopes.is_empty()
+        && ec.type_param_names.iter().any(|tp| tp == &name.name.name)
+    {
+        return true;
+    }
+
+    if let (DataType::Real { kind: k1, .. }, DataType::Real { kind: k2, .. }) = (a, b) {
+        return k1 == k2;
+    }
+    if matches!(a, DataType::Real { .. }) || matches!(b, DataType::Real { .. }) {
+        return false;
+    }
+
+    if let (Some((ts1, sg1, w1)), Some((ts2, sg2, w2))) = (
+        resolve_const_integral_shape(a, elab, class_ctx),
+        resolve_const_integral_shape(b, elab, class_ctx),
+    ) {
+        if ts1 != ts2 || sg1 != sg2 {
+            return false;
+        }
+        return match (w1, w2) {
+            (Some(x), Some(y)) => x == y,
+            // Polymorphic class parameter width (e.g. `[W-1:0]` inside generic class resolver):
+            _ if class_ctx.is_some() => true,
+            _ => true,
+        };
+    }
+
+    match (a, b) {
+        (DataType::Struct(s1), DataType::Struct(s2)) => {
+            if s1.packed != s2.packed || s1.kind != s2.kind || s1.members.len() != s2.members.len() {
+                return false;
+            }
+            for (m1, m2) in s1.members.iter().zip(s2.members.iter()) {
+                if m1.declarators.len() != m2.declarators.len() {
+                    return false;
+                }
+                for (d1, d2) in m1.declarators.iter().zip(m2.declarators.iter()) {
+                    if d1.name.name != d2.name.name {
+                        return false;
+                    }
+                }
+                if !nettype_types_match(elab, &m1.data_type, &m2.data_type, class_ctx, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        (DataType::Enum(e1), DataType::Enum(e2)) => {
+            if e1.members.len() != e2.members.len() {
+                return false;
+            }
+            for (m1, m2) in e1.members.iter().zip(e2.members.iter()) {
+                if m1.name.name != m2.name.name {
+                    return false;
+                }
+            }
+            true
+        }
+        // Fallback when either resolved into an unresolved TypeReference (e.g. external alias):
+        (DataType::TypeReference { name: n1, .. }, DataType::TypeReference { name: n2, .. }) => {
+            nettype_decl_key(n1) == nettype_decl_key(n2) || n1.name.name == n2.name.name
+        }
+        (DataType::TypeReference { .. }, _) | (_, DataType::TypeReference { .. })
+            if class_ctx.is_some() =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn check_resolver_no_formal_mutation(
+    fd: &crate::ast::decl::FunctionDeclaration,
+    formal_name: &str,
+    nettype: &str,
+    resolver_name: &str,
+) -> Result<(), String> {
+    fn lvalue_root_ident(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() => h.path.first().map(|s| s.name.name.as_str()),
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Paren(expr) => lvalue_root_ident(expr),
+            _ => None,
+        }
+    }
+
+    fn walk_expr(
+        e: &Expression,
+        formal: &str,
+        nettype: &str,
+        resolver: &str,
+    ) -> Result<(), String> {
+        let err = |what: &str| {
+            Err(format!(
+                "nettype '{}' resolution function '{}' {} formal '{}' (IEEE 1800-2023 §6.6.7)",
+                nettype, resolver, what, formal
+            ))
+        };
+        match &e.kind {
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                if lvalue_root_ident(lvalue) == Some(formal) {
+                    return err("modifies input");
+                }
+                walk_expr(lvalue, formal, nettype, resolver)?;
+                walk_expr(rvalue, formal, nettype, resolver)?;
+            }
+            ExprKind::Unary { op, operand } => {
+                if matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
+                ) && lvalue_root_ident(operand) == Some(formal)
+                {
+                    return err("modifies input");
+                }
+                walk_expr(operand, formal, nettype, resolver)?;
+            }
+            ExprKind::Call { func, args } => {
+                let mutating_method = match &func.kind {
+                    ExprKind::MemberAccess { expr, member }
+                        if lvalue_root_ident(expr) == Some(formal)
+                            && matches!(
+                                member.name.as_str(),
+                                "delete" | "push_back" | "push_front" | "pop_back" | "pop_front"
+                                    | "insert" | "sort" | "rsort" | "reverse" | "shuffle"
+                            ) =>
+                    {
+                        true
+                    }
+                    ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() >= 2
+                            && h.path[0].name.name == formal
+                            && matches!(
+                                h.path.last().map(|s| s.name.name.as_str()),
+                                Some(
+                                    "delete" | "push_back" | "push_front" | "pop_back" | "pop_front"
+                                        | "insert" | "sort" | "rsort" | "reverse" | "shuffle"
+                                )
+                            ) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if mutating_method {
+                    return err("mutates/resizes input");
+                }
+                walk_expr(func, formal, nettype, resolver)?;
+                for a in args {
+                    walk_expr(a, formal, nettype, resolver)?;
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                walk_expr(left, formal, nettype, resolver)?;
+                walk_expr(right, formal, nettype, resolver)?;
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                walk_expr(condition, formal, nettype, resolver)?;
+                walk_expr(then_expr, formal, nettype, resolver)?;
+                walk_expr(else_expr, formal, nettype, resolver)?;
+            }
+            ExprKind::Paren(x) | ExprKind::MemberAccess { expr: x, .. } => {
+                walk_expr(x, formal, nettype, resolver)?;
+            }
+            ExprKind::Index { expr, index } => {
+                walk_expr(expr, formal, nettype, resolver)?;
+                walk_expr(index, formal, nettype, resolver)?;
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                walk_expr(expr, formal, nettype, resolver)?;
+                walk_expr(left, formal, nettype, resolver)?;
+                walk_expr(right, formal, nettype, resolver)?;
+            }
+            ExprKind::Concatenation(xs) => {
+                for x in xs {
+                    walk_expr(x, formal, nettype, resolver)?;
+                }
+            }
+            ExprKind::AssignmentPattern(items) => {
+                for it in items {
+                    walk_expr(it.expr(), formal, nettype, resolver)?;
+                }
+            }
+            ExprKind::TypedPattern { pattern, .. } => {
+                walk_expr(pattern, formal, nettype, resolver)?;
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk_expr(a, formal, nettype, resolver)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn walk_stmt(
+        s: &Statement,
+        formal: &str,
+        nettype: &str,
+        resolver: &str,
+        shadowed: &mut bool,
+    ) -> Result<(), String> {
+        if *shadowed {
+            return Ok(());
+        }
+        match &s.kind {
+            StatementKind::BlockingAssign { lvalue, rvalue }
+            | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                if lvalue_root_ident(lvalue) == Some(formal) {
+                    return Err(format!(
+                        "nettype '{}' resolution function '{}' modifies input formal '{}' (IEEE 1800-2023 §6.6.7)",
+                        nettype, resolver, formal
+                    ));
+                }
+                walk_expr(lvalue, formal, nettype, resolver)?;
+                walk_expr(rvalue, formal, nettype, resolver)?;
+            }
+            StatementKind::Expr(e) => walk_expr(e, formal, nettype, resolver)?,
+            StatementKind::Return(Some(e)) => walk_expr(e, formal, nettype, resolver)?,
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                walk_expr(condition, formal, nettype, resolver)?;
+                walk_stmt(then_stmt, formal, nettype, resolver, shadowed)?;
+                if let Some(eb) = else_stmt {
+                    walk_stmt(eb, formal, nettype, resolver, shadowed)?;
+                }
+            }
+            StatementKind::Case { expr, items, .. } => {
+                walk_expr(expr, formal, nettype, resolver)?;
+                for it in items {
+                    for p in &it.patterns {
+                        walk_expr(p, formal, nettype, resolver)?;
+                    }
+                    walk_stmt(&it.stmt, formal, nettype, resolver, shadowed)?;
+                }
+            }
+            StatementKind::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
+                let mut loop_shadow = false;
+                for fi in init {
+                    match fi {
+                        ForInit::VarDecl { name, init: e, .. } => {
+                            walk_expr(e, formal, nettype, resolver)?;
+                            if name.name == formal {
+                                loop_shadow = true;
+                            }
+                        }
+                        ForInit::Assign { lvalue, rvalue } => {
+                            if lvalue_root_ident(lvalue) == Some(formal) {
+                                return Err(format!(
+                                    "nettype '{}' resolution function '{}' modifies input formal '{}' (IEEE 1800-2023 §6.6.7)",
+                                    nettype, resolver, formal
+                                ));
+                            }
+                            walk_expr(lvalue, formal, nettype, resolver)?;
+                            walk_expr(rvalue, formal, nettype, resolver)?;
+                        }
+                    }
+                }
+                if !loop_shadow {
+                    if let Some(c) = condition {
+                        walk_expr(c, formal, nettype, resolver)?;
+                    }
+                    for st in step {
+                        walk_expr(st, formal, nettype, resolver)?;
+                    }
+                    walk_stmt(body, formal, nettype, resolver, shadowed)?;
+                }
+            }
+            StatementKind::Foreach { array, vars, body } => {
+                walk_expr(array, formal, nettype, resolver)?;
+                if !vars.iter().flatten().any(|v| v.name == formal) {
+                    walk_stmt(body, formal, nettype, resolver, shadowed)?;
+                }
+            }
+            StatementKind::While { condition, body }
+            | StatementKind::DoWhile { body, condition } => {
+                walk_expr(condition, formal, nettype, resolver)?;
+                walk_stmt(body, formal, nettype, resolver, shadowed)?;
+            }
+            StatementKind::Repeat { count, body } => {
+                walk_expr(count, formal, nettype, resolver)?;
+                walk_stmt(body, formal, nettype, resolver, shadowed)?;
+            }
+            StatementKind::Forever { body } => {
+                walk_stmt(body, formal, nettype, resolver, shadowed)?;
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                let mut inner_shadow = *shadowed;
+                for st in stmts.iter() {
+                    walk_stmt(st, formal, nettype, resolver, &mut inner_shadow)?;
+                    if inner_shadow {
+                        break;
+                    }
+                }
+            }
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, formal, nettype, resolver)?;
+                    }
+                    if d.name.name == formal {
+                        *shadowed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut shadowed = false;
+    for st in fd.items.iter() {
+        walk_stmt(st, formal_name, nettype, resolver_name, &mut shadowed)?;
+    }
+    Ok(())
 }
 
 /// §6.6.7 constraints on a nettype resolution function, checked at elaboration
@@ -477,13 +1192,25 @@ pub(super) fn validate_resolver(
     // out-of-scope resolver would silently drive the net to 0, and
     // single-driver nets (routed through the resolver too) would regress from
     // always-correct to silently wrong.
-    let Some(fd) = lookup_resolver(elab, name) else {
-        return Err(format!(
-            "nettype '{}' names resolution function '{}', which is not declared \
-             (IEEE 1800-2017 6.6.7). Note a package-qualified resolver \
-             (`nettype T w with pkg::f;`) is not yet representable.",
-            nettype, name
-        ));
+    let (fd, class_ctx) = match lookup_resolver_full(elab, name) {
+        ResolverLookup::Found { fd, class_ctx } => (fd, class_ctx),
+        ResolverLookup::NonStaticMethod {
+            class_name,
+            method_name,
+        } => {
+            return Err(format!(
+                "nettype '{}' names class method '{}::{}', which is not `static` \
+                 (IEEE 1800-2023 §6.6.7)",
+                nettype, class_name, method_name
+            ));
+        }
+        ResolverLookup::Missing => {
+            return Err(format!(
+                "nettype '{}' names resolution function '{}', which is not declared \
+                 (IEEE 1800-2023 §6.6.7)",
+                nettype, name
+            ));
+        }
     };
 
     // §6.6.7: "A resolution function shall be automatic (or preserve no state
@@ -491,7 +1218,11 @@ pub(super) fn validate_resolver(
     // variable it reads earlier in the same call, as `res = 0.0;` before the
     // accumulating loop does. One that reads a value left by the previous call
     // would resolve to a stale value rather than an error, so it is rejected.
-    if fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
+    // Note: class methods have automatic lifetime by default (§8.6) unless
+    // explicitly declared `static`.
+    let is_automatic = fd.lifetime == Some(crate::ast::types::Lifetime::Automatic)
+        || (class_ctx.is_some() && fd.lifetime != Some(crate::ast::types::Lifetime::Static));
+    if !is_automatic
         && let Err(var) = super::resolver_state::static_carried_variable(elab, fd)
     {
         return Err(format!(
@@ -502,41 +1233,80 @@ pub(super) fn validate_resolver(
         ));
     }
 
-    // §6.6.7: the function takes a single input formal that is an UNPACKED
-    // ARRAY of the nettype's data type. A scalar formal otherwise falls through
-    // to the ordinary scalar call path and receives the drivers concatenated
-    // into one packed value, so the body's `foreach` reads stale state and the
-    // net resolves to a silently wrong value.
-    //
+    // §6.6.7: the function takes a single input formal that is a DYNAMIC
+    // UNPACKED ARRAY of the nettype's data type.
     // Only checked for an ANSI declaration: a non-ANSI `function f; input T d[];`
-    // parses its ports into the body, leaving `ports` empty, and rejecting that
-    // would be a false positive.
+    // parses its ports into the body, leaving `ports` empty.
     if !fd.ports.is_empty() {
         if fd.ports.len() != 1 {
             return Err(format!(
                 "nettype '{}' resolution function '{}' takes {} formals; it must take exactly one, \
-                 an unpacked array of the nettype data type (IEEE 1800-2017 6.6.7)",
+                 a dynamic array of the nettype data type (IEEE 1800-2023 §6.6.7)",
                 nettype,
                 name,
                 fd.ports.len()
             ));
         }
         let port = &fd.ports[0];
-        if port.dimensions.is_empty() {
-            return Err(format!(
-                "nettype '{}' resolution function '{}' declares formal '{}' as a scalar; it must be \
-                 an unpacked array of the nettype data type, e.g. `input T {} []` \
-                 (IEEE 1800-2017 6.6.7)",
-                nettype, name, port.name.name, port.name.name
-            ));
-        }
         if !matches!(port.direction, PortDirection::Input) {
             return Err(format!(
                 "nettype '{}' resolution function '{}' declares formal '{}' as {:?}; it must be an \
-                 `input` (IEEE 1800-2017 6.6.7)",
+                 `input` (IEEE 1800-2023 §6.6.7)",
                 nettype, name, port.name.name, port.direction
             ));
         }
+        let (eff_dims, typedef_elem): (std::borrow::Cow<'_, [UnpackedDimension]>, Option<&DataType>) =
+            if !port.dimensions.is_empty() {
+                (std::borrow::Cow::Borrowed(&port.dimensions), None)
+            } else if let DataType::TypeReference {
+                name: ptn,
+                dimensions,
+                ..
+            } = &port.data_type
+                && dimensions.is_empty()
+            {
+                let td_dims = lookup_scoped_type(ptn, &elab.typedef_unpacked_dims)
+                    .or_else(|| {
+                        class_ctx.and_then(|ec| ec.typedef_unpacked_dims.get(&ptn.name.name))
+                    });
+                let td_elem = lookup_scoped_type(ptn, &elab.typedef_types).or_else(|| {
+                    class_ctx.and_then(|ec| ec.typedef_targets.get(&ptn.name.name))
+                });
+                match td_dims {
+                    Some(d) => (std::borrow::Cow::Borrowed(d.as_slice()), td_elem),
+                    None => (std::borrow::Cow::Borrowed(&port.dimensions), None),
+                }
+            } else {
+                (std::borrow::Cow::Borrowed(&port.dimensions), None)
+            };
+
+        if eff_dims.len() != 1 || !matches!(eff_dims[0], UnpackedDimension::Unsized(_)) {
+            return Err(format!(
+                "nettype '{}' resolution function '{}' formal '{}' must be a single-dimensional \
+                 dynamic array `[]` of the nettype data type (IEEE 1800-2023 §6.6.7)",
+                nettype, name, port.name.name
+            ));
+        }
+
+        if let Some(nt_dt) = elab.typedef_types.get(nettype) {
+            let elem_dt = typedef_elem.unwrap_or(&port.data_type);
+            if !nettype_types_match(elab, nt_dt, elem_dt, class_ctx, 0) {
+                return Err(format!(
+                    "nettype '{}' resolution function '{}' formal '{}' element type does not match \
+                     nettype data type (IEEE 1800-2023 §6.6.7)",
+                    nettype, name, port.name.name
+                ));
+            }
+            if !nettype_types_match(elab, nt_dt, &fd.return_type, class_ctx, 0) {
+                return Err(format!(
+                    "nettype '{}' resolution function '{}' return type does not match \
+                     nettype data type (IEEE 1800-2023 §6.6.7)",
+                    nettype, name
+                ));
+            }
+        }
+
+        check_resolver_no_formal_mutation(fd, &port.name.name, nettype, name)?;
     }
 
     Ok(())

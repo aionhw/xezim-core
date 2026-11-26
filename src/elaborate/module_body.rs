@@ -742,9 +742,12 @@ pub fn elaborate_module_with_defs(
                     type_name: port
                         .data_type
                         .as_ref()
-                        .and_then(get_type_name)
+                        .and_then(|dt| declared_user_nettype(&elab, dt).or_else(|| get_type_name(dt)))
                         .map(SharedName::from),
                 };
+                if let (Some(nt), Some(dt)) = (port.net_type, port.data_type.as_ref()) {
+                    check_net_port_data_type(nt, dt, port.span, &elab, None)?;
+                }
                 elab.port_order.push(port.name.name.clone());
                 if let Some(net_type) = ansi_port_net_type(port) {
                     register_net_type(
@@ -1003,38 +1006,149 @@ pub fn elaborate_module_with_defs(
     // wraps — without it a `nettype real rn;` net lost `is_real` and read back
     // as the raw f64 bit pattern.
     let mut nettype_info: HashMap<String, (DataType, Option<String>)> = HashMap::default();
+    let mut alias_with_resolver_check: Vec<(String, DataType, Option<String>)> = Vec::new();
+    let format_nettype_resolver = |nd: &crate::ast::decl::NettypeDeclaration,
+                                   elab: &ElaboratedModule,
+                                   package: Option<&str>,
+                                   class_prefix: Option<&str>,
+                                   class_methods: &HashSet<String>|
+     -> Option<String> {
+        let r = nd.resolver.as_ref()?;
+        if !nd.resolver_scopes.is_empty() {
+            let mut parts: Vec<String> = nd
+                .resolver_scopes
+                .iter()
+                .map(|s| {
+                    if s.type_args.is_empty() {
+                        s.name.name.clone()
+                    } else {
+                        let args: Vec<String> = s
+                            .type_args
+                            .iter()
+                            .map(|a| {
+                                let v = eval_const_expr_val(a, &elab.parameters);
+                                if !v.is_real && !v.has_xz() && is_const_expr(a, &elab.parameters) {
+                                    if let Some(i) = v.to_i64() {
+                                        return i.to_string();
+                                    }
+                                }
+                                crate::elaborate::class_spec_names::expr_to_arg_string(a)
+                            })
+                            .collect();
+                        format!("{}#({})", s.name.name, args.join(","))
+                    }
+                })
+                .collect();
+            parts.push(r.name.clone());
+            return Some(parts.join("::"));
+        }
+        if let Some(cpfx) = class_prefix
+            && class_methods.contains(&r.name)
+        {
+            return Some(format!("{}::{}", cpfx, r.name));
+        }
+        // §26.3: an import exposes the original declaration; its
+        // resolver stays in the declaring package, even if the
+        // importing module has a function with the same name.
+        match package {
+            Some(pkg) => {
+                let qualified = format!("{}::{}", pkg, r.name);
+                if elab.functions.contains_key(&qualified) {
+                    Some(qualified)
+                } else {
+                    Some(r.name.clone())
+                }
+            }
+            None => Some(r.name.clone()),
+        }
+    };
     let register_nettype = |elab: &mut ElaboratedModule,
                             info: &mut HashMap<String, (DataType, Option<String>)>,
                             seen: &mut HashSet<String>,
+                            alias_checks: &mut Vec<(String, DataType, Option<String>)>,
                             nd: &crate::ast::decl::NettypeDeclaration,
                             key: String,
-                            package: Option<&str>| {
+                            package: Option<&str>,
+                            class_prefix: Option<&str>,
+                            class_methods: &HashSet<String>| {
         seen.insert(key.clone());
         let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
         typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", key.clone(), w);
         elab.typedef_types.insert(key.clone(), nd.data_type.clone());
-        info.insert(
-            key,
-            (
-                nd.data_type.clone(),
-                // §26.3: an import exposes the original declaration; its
-                // resolver stays in the declaring package, even if the
-                // importing module has a function with the same name.
-                nd.resolver.as_ref().map(|r| match package {
-                    Some(pkg) => {
-                        let qualified = format!("{}::{}", pkg, r.name);
-                        if elab.functions.contains_key(&qualified) {
-                            qualified
-                        } else {
-                            // Keep imported resolvers on the existing lookup path.
-                            r.name.clone()
-                        }
-                    }
-                    None => r.name.clone(),
-                }),
-            ),
-        );
+        let resolver = format_nettype_resolver(nd, elab, package, class_prefix, class_methods);
+        alias_checks.push((key.clone(), nd.data_type.clone(), resolver.clone()));
+        info.insert(key, (nd.data_type.clone(), resolver));
     };
+    fn register_class_nettypes(
+        c: &crate::ast::decl::ClassDeclaration,
+        class_prefix: &str,
+        package: Option<&str>,
+        elab: &mut ElaboratedModule,
+        info: &mut HashMap<String, (DataType, Option<String>)>,
+        seen: &mut HashSet<String>,
+        alias_checks: &mut Vec<(String, DataType, Option<String>)>,
+        format_resolver: &dyn Fn(
+            &crate::ast::decl::NettypeDeclaration,
+            &ElaboratedModule,
+            Option<&str>,
+            Option<&str>,
+            &HashSet<String>,
+        ) -> Option<String>,
+    ) {
+        let mut methods: HashSet<String> = HashSet::default();
+        for ci in &c.items {
+            if let crate::ast::decl::ClassItem::Method(m) = ci {
+                let mn = match &m.kind {
+                    crate::ast::decl::ClassMethodKind::Function(fd)
+                    | crate::ast::decl::ClassMethodKind::PureVirtual(fd)
+                    | crate::ast::decl::ClassMethodKind::Extern(fd) => &fd.name.name.name,
+                    crate::ast::decl::ClassMethodKind::Task(td) => &td.name.name.name,
+                };
+                methods.insert(mn.clone());
+            }
+        }
+        for ci in &c.items {
+            match ci {
+                crate::ast::decl::ClassItem::Nettype(nd) => {
+                    let key = if nd.name.name.contains("::") {
+                        nd.name.name.clone()
+                    } else {
+                        format!("{class_prefix}::{}", nd.name.name)
+                    };
+                    seen.insert(key.clone());
+                    let w = resolve_type_width(
+                        &nd.data_type,
+                        Some(&elab.parameters),
+                        Some(&elab.typedefs),
+                    );
+                    typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", key.clone(), w);
+                    elab.typedef_types.insert(key.clone(), nd.data_type.clone());
+                    let resolver =
+                        format_resolver(nd, elab, package, Some(class_prefix), &methods);
+                    alias_checks.push((key.clone(), nd.data_type.clone(), resolver.clone()));
+                    info.insert(key, (nd.data_type.clone(), resolver));
+                }
+                crate::ast::decl::ClassItem::Class(sub) => {
+                    let sub_pfx = if sub.name.name.contains("::") {
+                        sub.name.name.clone()
+                    } else {
+                        format!("{class_prefix}::{}", sub.name.name)
+                    };
+                    register_class_nettypes(
+                        sub,
+                        &sub_pfx,
+                        package,
+                        elab,
+                        info,
+                        seen,
+                        alias_checks,
+                        format_resolver,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 
     // §6.6.7 + §26.2: a nettype may be declared in a PACKAGE — which is the
     // natural place for one, since a nettype crossing a port boundary has to be
@@ -1049,6 +1163,7 @@ pub fn elaborate_module_with_defs(
     // in sorted order: `all_defs` is a hash map and a module-local declaration
     // below must be the last writer, so registration order is observable.
     if let Some(defs) = all_defs {
+        let empty_methods = HashSet::default();
         let mut pkg_names: Vec<&String> = defs
             .iter()
             .filter(|(_, d)| matches!(d, Definition::Package(_)))
@@ -1060,45 +1175,139 @@ pub fn elaborate_module_with_defs(
                 continue;
             };
             for item in &pkg.items {
-                if let crate::ast::decl::PackageItem::Nettype(nd) = item {
-                    let bare = nd.name.name.clone();
-                    // A package nettype whose name collides with another
-                    // package's type already carries its package key.
-                    if !bare.contains("::") {
+                match item {
+                    crate::ast::decl::PackageItem::Nettype(nd) => {
+                        let bare = nd.name.name.clone();
+                        // A package nettype whose name collides with another
+                        // package's type already carries its package key.
+                        if !bare.contains("::") {
+                            register_nettype(
+                                &mut elab,
+                                &mut nettype_info,
+                                &mut user_nettypes,
+                                &mut alias_with_resolver_check,
+                                nd,
+                                format!("{}::{}", pkg.name.name, bare),
+                                Some(&pkg.name.name),
+                                None,
+                                &empty_methods,
+                            );
+                        }
                         register_nettype(
                             &mut elab,
                             &mut nettype_info,
                             &mut user_nettypes,
+                            &mut alias_with_resolver_check,
                             nd,
-                            format!("{}::{}", pkg.name.name, bare),
+                            bare,
                             Some(&pkg.name.name),
+                            None,
+                            &empty_methods,
                         );
                     }
-                    register_nettype(
-                        &mut elab,
-                        &mut nettype_info,
-                        &mut user_nettypes,
-                        nd,
-                        bare,
-                        Some(&pkg.name.name),
-                    );
+                    crate::ast::decl::PackageItem::Class(c) => {
+                        if !c.name.name.contains("::") {
+                            register_class_nettypes(
+                                c,
+                                &format!("{}::{}", pkg.name.name, c.name.name),
+                                Some(&pkg.name.name),
+                                &mut elab,
+                                &mut nettype_info,
+                                &mut user_nettypes,
+                                &mut alias_with_resolver_check,
+                                &format_nettype_resolver,
+                            );
+                        }
+                        register_class_nettypes(
+                            c,
+                            &c.name.name,
+                            Some(&pkg.name.name),
+                            &mut elab,
+                            &mut nettype_info,
+                            &mut user_nettypes,
+                            &mut alias_with_resolver_check,
+                            &format_nettype_resolver,
+                        );
+                    }
+                    _ => {}
                 }
             }
+        }
+        let mut class_names: Vec<&String> = defs
+            .iter()
+            .filter(|(_, d)| matches!(d, Definition::Class(_)))
+            .map(|(n, _)| n)
+            .collect();
+        class_names.sort();
+        for cname in class_names {
+            let Some(Definition::Class(cd)) = defs.get(cname) else {
+                continue;
+            };
+            register_class_nettypes(
+                cd,
+                &cd.name.name,
+                None,
+                &mut elab,
+                &mut nettype_info,
+                &mut user_nettypes,
+                &mut alias_with_resolver_check,
+                &format_nettype_resolver,
+            );
         }
     }
 
     // A module-local declaration shadows an imported one, so it registers last.
-    for item in module.items() {
-        if let ModuleItem::NettypeDeclaration(nd) = item {
-            let key = nd.name.name.clone();
-            register_nettype(
-                &mut elab,
-                &mut nettype_info,
-                &mut user_nettypes,
-                nd,
-                key,
-                None,
-            );
+    {
+        let empty_methods = HashSet::default();
+        for item in module.items() {
+            match item {
+                ModuleItem::NettypeDeclaration(nd) => {
+                    let key = nd.name.name.clone();
+                    register_nettype(
+                        &mut elab,
+                        &mut nettype_info,
+                        &mut user_nettypes,
+                        &mut alias_with_resolver_check,
+                        nd,
+                        key,
+                        None,
+                        None,
+                        &empty_methods,
+                    );
+                }
+                ModuleItem::ClassDeclaration(cd) => {
+                    register_class_nettypes(
+                        cd,
+                        &cd.name.name,
+                        None,
+                        &mut elab,
+                        &mut nettype_info,
+                        &mut user_nettypes,
+                        &mut alias_with_resolver_check,
+                        &format_nettype_resolver,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    // §6.6.7 Syntax 6-1: a nettype alias (`nettype nettype_identifier
+    // nettype_identifier`) cannot specify a `with resolution_function` clause.
+    for (nt_key, dt, res) in &alias_with_resolver_check {
+        if let Some(rname) = res
+            && let DataType::TypeReference { name: ref_name, .. } = dt
+        {
+            let target_key = nettype_decl_key(ref_name);
+            let is_alias = (target_key != *nt_key && nettype_info.contains_key(&target_key))
+                || (ref_name.name.name != *nt_key
+                    && ref_name.scopes.is_empty()
+                    && nettype_info.contains_key(&ref_name.name.name));
+            if is_alias {
+                return Err(format!(
+                    "nettype alias '{}' cannot specify a resolution function '{}' (IEEE 1800-2023 §6.6.7)",
+                    nt_key, rname
+                ));
+            }
         }
     }
     // §6.6.7 nettype ALIAS: `nettype T wT; nettype wT wT2;` — a nettype may be
@@ -1110,10 +1319,15 @@ pub fn elaborate_module_with_defs(
         let aliases: Vec<(String, String)> = nettype_info
             .iter()
             .filter_map(|(n, (dt, res))| match dt {
-                DataType::TypeReference { name, .. }
-                    if res.is_none() && nettype_info.contains_key(&name.name.name) =>
-                {
-                    Some((n.clone(), name.name.name.clone()))
+                DataType::TypeReference { name, .. } if res.is_none() => {
+                    let qk = nettype_decl_key(name);
+                    if nettype_info.contains_key(&qk) {
+                        Some((n.clone(), qk))
+                    } else if nettype_info.contains_key(&name.name.name) {
+                        Some((n.clone(), name.name.name.clone()))
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             })
@@ -1125,6 +1339,8 @@ pub fn elaborate_module_with_defs(
             if let Some((tdt, tres)) = nettype_info.get(&target).cloned() {
                 if tres.is_some() || !matches!(tdt, DataType::TypeReference { .. }) {
                     nettype_info.insert(alias.clone(), (tdt.clone(), tres));
+                    let w = resolve_type_width(&tdt, Some(&elab.parameters), Some(&elab.typedefs));
+                    typedefs_insert_traced(&mut elab.typedefs, "insert:nettype_alias", alias.clone(), w);
                     elab.typedef_types.insert(alias, tdt);
                     changed = true;
                 }
@@ -1377,6 +1593,38 @@ pub fn elaborate_module_with_defs(
             }
         }
     }
+    // Refine nettype underlying types & widths once module-local typedefs and
+    // classes are registered (handles `nettype MyBase8::T ...` / `Base#(8)::T`).
+    {
+        let mut nettype_keys: Vec<String> = nettype_info.keys().cloned().collect();
+        nettype_keys.sort();
+        for nt_key in nettype_keys {
+            if let Some((dt, _)) = nettype_info.get(&nt_key).cloned() {
+                if let Some(spec) =
+                    resolve_specialized_class_data_type(&dt, &elab.parameters, &elab)
+                {
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:nettype_spec",
+                        nt_key.clone(),
+                        spec.width,
+                    );
+                    elab.typedef_types.insert(nt_key.clone(), spec.data_type.clone());
+                    if let Some(entry) = nettype_info.get_mut(&nt_key) {
+                        entry.0 = spec.data_type;
+                    }
+                } else {
+                    let w = resolve_type_width(&dt, Some(&elab.parameters), Some(&elab.typedefs));
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:nettype_refresh",
+                        nt_key,
+                        w,
+                    );
+                }
+            }
+        }
+    }
 
     // §6.21: subroutines default to the enclosing scope's lifetime.
     use crate::ast::types::Lifetime;
@@ -1453,6 +1701,9 @@ pub fn elaborate_module_with_defs(
         }
         match item {
             ModuleItem::PortDeclaration(pd) => {
+                if let Some(nt) = pd.net_type {
+                    check_net_port_data_type(nt, &pd.data_type, pd.span, &elab, None)?;
+                }
                 let port_modport_view = match &pd.data_type {
                     DataType::Interface {
                         name,
@@ -1573,6 +1824,9 @@ pub fn elaborate_module_with_defs(
                     // direction line carries an Implicit type, so keep the
                     // existing width/type; if this line DOES carry an explicit
                     // type, adopt it.
+                    let sig_type_name = declared_user_nettype(&elab, &pd.data_type)
+                        .or_else(|| get_type_name(&pd.data_type))
+                        .map(SharedName::from);
                     if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_none() {
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
@@ -1592,7 +1846,7 @@ pub fn elaborate_module_with_defs(
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
-                                existing.type_name = get_type_name(&pd.data_type).map(SharedName::from);
+                                existing.type_name = sig_type_name;
                                 existing.value = default_port_value(
                                     Some(pd.direction),
                                     Some(&pd.data_type),
@@ -1639,7 +1893,9 @@ pub fn elaborate_module_with_defs(
                             is_real,
                             port_decl_net_type(pd),
                         ).into(),
-                        type_name: get_type_name(&pd.data_type).map(SharedName::from),
+                        type_name: declared_user_nettype(&elab, &pd.data_type)
+                            .or_else(|| get_type_name(&pd.data_type))
+                            .map(SharedName::from),
                     };
                     if !elab.port_order.contains(&decl.name.name) {
                         elab.port_order.push(decl.name.name.clone());
@@ -2124,11 +2380,19 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 // User-defined nettype → classify as net (allow multiple continuous drivers).
-                if let DataType::TypeReference { name, .. } = &dd.data_type {
-                    if user_nettypes.contains(&name.name.name) {
-                        for decl in &dd.declarators {
-                            elab.nets.insert(decl.name.name.clone());
-                        }
+                let is_udn_decl = declared_user_nettype(&elab, &dd.data_type).is_some();
+                if is_udn_decl {
+                    if let DataType::TypeReference { type_args, .. } = &dd.data_type
+                        && type_args.len() > 1
+                    {
+                        return Err(span_error(
+                            &elab,
+                            dd.span,
+                            "user-defined nettype declaration permits at most a single delay value (IEEE 1800-2023 §6.6.7)",
+                        ));
+                    }
+                    for decl in &dd.declarators {
+                        elab.nets.insert(decl.name.name.clone());
                     }
                 }
                 let data_modport_view = match &dd.data_type {
@@ -2194,6 +2458,9 @@ pub fn elaborate_module_with_defs(
                         let explicit_type = !matches!(dd.data_type, DataType::Implicit { .. });
                         let decl_is_real =
                             is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                        let sig_type_name = declared_user_nettype(&elab, &dd.data_type)
+                            .or_else(|| get_type_name(&dd.data_type))
+                            .map(SharedName::from);
                         let existing = elab.signals.get_mut(&decl.name.name).unwrap();
                         if explicit_type {
                             if let Some(pats) = signal_trace_patterns() {
@@ -2210,7 +2477,7 @@ pub fn elaborate_module_with_defs(
                             existing.width = width;
                             existing.is_signed = is_signed;
                             existing.is_real = decl_is_real;
-                            existing.type_name = get_type_name(&dd.data_type).map(SharedName::from);
+                            existing.type_name = sig_type_name;
                             existing.value = if decl_is_real {
                                 Value::from_f64(0.0)
 .into()                            } else {
@@ -3234,7 +3501,9 @@ pub fn elaborate_module_with_defs(
                             is_real,
                             direction: None,
                             value: init_val.into(),
-                            type_name: get_type_name(&dd.data_type).map(SharedName::from),
+                            type_name: declared_user_nettype(&elab, &dd.data_type)
+                                .or_else(|| get_type_name(&dd.data_type))
+                                .map(SharedName::from),
                         };
                         signals_insert_traced(
                             &mut elab.signals,
@@ -4977,6 +5246,27 @@ pub fn elaborate_module_with_defs(
                 "Forward typedef '{}' does not resolve to a data type",
                 name
             ));
+        }
+    }
+
+    // IEEE 1800-2023 §6.6.7: validate user-defined nettype data types now
+    // that all package, class, and module-local typedefs/classes are populated.
+    {
+        let mut nt_keys: Vec<String> = nettype_info.keys().cloned().collect();
+        nt_keys.sort();
+        for nt_key in nt_keys {
+            if elab.shadowed_nettypes.contains(&nt_key) {
+                continue;
+            }
+            let dt_check = elab
+                .typedef_types
+                .get(&nt_key)
+                .cloned()
+                .or_else(|| nettype_info.get(&nt_key).map(|(dt, _)| dt.clone()));
+            if let Some(dt) = dt_check {
+                let mut visited = HashSet::default();
+                validate_nettype_data_type(&elab, &nt_key, &dt, &mut visited, 0)?;
+            }
         }
     }
 

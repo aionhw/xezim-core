@@ -855,6 +855,9 @@ fn rename_class_refs(c: &mut ClassDeclaration) {
                 t.data_type = gen_type(&t.data_type);
                 t.dimensions = gen_dims(&t.dimensions);
             }
+            ClassItem::Nettype(n) => {
+                n.data_type = gen_type(&n.data_type);
+            }
             ClassItem::Parameter(p) => param(p),
             ClassItem::Class(i) => rename_class_refs(i),
             ClassItem::Covergroup(g) => rename_covergroup_refs(g),
