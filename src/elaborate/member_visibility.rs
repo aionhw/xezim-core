@@ -525,6 +525,53 @@ pub(super) enum HeadRole {
     Callee,
     /// The base of a member select, `a.b` or `a[i].b`.
     Path,
+    /// A scope argument of a system task that takes scopes, `$asserton(0, u1)`
+    /// or `$dumpvars(0, u1)` (§20.12, §21.7.1.2): the name of an instance or
+    /// a block, which a `bind` may add to the module (§23.11).
+    Scope,
+}
+
+/// Whether the arguments of system task `name` name scopes, modules or
+/// instances, not values.
+pub(super) fn system_task_takes_scope_args(name: &str) -> bool {
+    matches!(
+        name,
+        "$dumpvars" | "$dumpfile" | "$dumpports" | "$dumpportsoff"
+            | "$dumpportson" | "$dumpportsflush" | "$dumpportsall"
+            | "$dumpportslimit" | "$printtimescale" | "$timeformat"
+            | "$coverage_control" | "$coverage_get" | "$coverage_get_max"
+            | "$coverage_merge" | "$coverage_save" | "$get_coverage"
+            | "$set_coverage_db_name" | "$load_coverage_db"
+            // FSDB/VPD waveform tasks: scope args like $dumpvars.
+            | "$fsdbDumpvars" | "$fsdbDumpfile" | "$vcdpluson" | "$vcdplusoff"
+            // SHM + SST2 waveform tasks: the first
+            // argument of $shm_probe/$recordvars/$probe is a SCOPE
+            // (`$shm_probe(testbench, "AC")`), so validating it as a
+            // value lookup failed whole-testbench elaboration with
+            // "Undeclared identifier '<top>'".
+            | "$shm_open" | "$shm_probe" | "$shm_close" | "$shm_save"
+            | "$recordfile" | "$recordvars" | "$recordon" | "$recordoff"
+            | "$recordsetup" | "$recordclose"
+            | "$probe" | "$probe_close" | "$probe_off" | "$probe_on"
+            // §20.16: second argument is an instance scope.
+            | "$sdf_annotate"
+            // §20.12 assertion controls: `$assertoff(0, testbench)`
+            // during reset is a staple of vendor testbenches — the
+            // trailing args are scopes/hierarchical refs, not values.
+            | "$assertoff" | "$asserton" | "$assertkill" | "$assertcontrol"
+            | "$assertpasson" | "$assertpassoff" | "$assertfailon"
+            | "$assertfailoff" | "$assertnonvacuouson" | "$assertvacuousoff"
+            // Legacy scope/listing tasks (§21 of 1364): scope args too.
+            | "$scope" | "$list" | "$showvars" | "$showscopes"
+    )
+    // Vendor debug/waveform families take scope args throughout and
+    // are runtime-ignored anyway; match by PREFIX so each vendor's
+    // next task name ($xm* Verisium/vwdb dumping, $indago*, ...)
+    // doesn't re-break elaboration one name at a time. None collide
+    // with an LRM-defined task name.
+    || ["$shm", "$xm", "$fsdb", "$vcdplus", "$vwdb", "$indago", "$record", "$probe"]
+        .iter()
+        .any(|p| name.starts_with(p))
 }
 
 pub(super) fn head_verdict(h: &HierarchicalIdentifier, role: HeadRole) -> HeadVerdict {
@@ -537,13 +584,14 @@ pub(super) fn head_verdict(h: &HierarchicalIdentifier, role: HeadRole) -> HeadVe
     if !h.bound.is_upward() {
         return HeadVerdict::Declared;
     }
-    let path = h.path.len() > 1 || role == HeadRole::Path;
+    let path = h.path.len() > 1 || matches!(role, HeadRole::Path | HeadRole::Scope);
     match role {
         // §27.6: an implicit block name is a name of its own scope only.
         _ if path && is_implicit_block_name(&h.path[0].name.name) => HeadVerdict::Undeclared,
         // §23.8: a hierarchical path, for the hierarchical-reference lint.
         _ if h.path.len() > 1 => HeadVerdict::Declared,
-        HeadRole::Path => HeadVerdict::Unbound,
+        // The name tables decide: they hold the instances binds add.
+        HeadRole::Path | HeadRole::Scope => HeadVerdict::Unbound,
         HeadRole::Callee => HeadVerdict::UpwardCall,
         HeadRole::Value => HeadVerdict::Undeclared,
     }
@@ -554,6 +602,8 @@ pub(super) fn head_verdict(h: &HierarchicalIdentifier, role: HeadRole) -> HeadVe
 pub(super) struct HeadRoles {
     callee: *const Expression,
     base: *const Expression,
+    /// The arguments of the last scope-taking system task visited.
+    scope_args: Vec<*const Expression>,
 }
 
 impl HeadRoles {
@@ -561,6 +611,7 @@ impl HeadRoles {
         HeadRoles {
             callee: std::ptr::null(),
             base: std::ptr::null(),
+            scope_args: Vec::new(),
         }
     }
 
@@ -574,6 +625,10 @@ impl HeadRoles {
                 }
                 self.base = b;
             }
+            ExprKind::SystemCall { name, args } if system_task_takes_scope_args(name) => {
+                self.scope_args.clear();
+                self.scope_args.extend(args.iter().map(|a| a as *const Expression));
+            }
             _ => {}
         }
     }
@@ -583,6 +638,8 @@ impl HeadRoles {
             HeadRole::Callee
         } else if std::ptr::eq(x, self.base) {
             HeadRole::Path
+        } else if self.scope_args.iter().any(|a| std::ptr::eq(x, *a)) {
+            HeadRole::Scope
         } else {
             HeadRole::Value
         }

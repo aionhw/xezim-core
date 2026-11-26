@@ -533,44 +533,7 @@ fn validate_expr_idents_as(
         ExprKind::SystemCall { name, args } => {
             // Args can be scope/module/instance references (not value lookups)
             // for dump/coverage/scope-info system tasks.
-            let skip = matches!(
-                name.as_str(),
-                "$dumpvars" | "$dumpfile" | "$dumpports" | "$dumpportsoff"
-                    | "$dumpportson" | "$dumpportsflush" | "$dumpportsall"
-                    | "$dumpportslimit" | "$printtimescale" | "$timeformat"
-                    | "$coverage_control" | "$coverage_get" | "$coverage_get_max"
-                    | "$coverage_merge" | "$coverage_save" | "$get_coverage"
-                    | "$set_coverage_db_name" | "$load_coverage_db"
-                    // FSDB/VPD waveform tasks: scope args like $dumpvars.
-                    | "$fsdbDumpvars" | "$fsdbDumpfile" | "$vcdpluson" | "$vcdplusoff"
-                    // SHM + SST2 waveform tasks: the first
-                    // argument of $shm_probe/$recordvars/$probe is a SCOPE
-                    // (`$shm_probe(testbench, "AC")`), so validating it as a
-                    // value lookup failed whole-testbench elaboration with
-                    // "Undeclared identifier '<top>'".
-                    | "$shm_open" | "$shm_probe" | "$shm_close" | "$shm_save"
-                    | "$recordfile" | "$recordvars" | "$recordon" | "$recordoff"
-                    | "$recordsetup" | "$recordclose"
-                    | "$probe" | "$probe_close" | "$probe_off" | "$probe_on"
-                    // §20.16: second argument is an instance scope.
-                    | "$sdf_annotate"
-                    // §20.12 assertion controls: `$assertoff(0, testbench)`
-                    // during reset is a staple of vendor testbenches — the
-                    // trailing args are scopes/hierarchical refs, not values.
-                    | "$assertoff" | "$asserton" | "$assertkill" | "$assertcontrol"
-                    | "$assertpasson" | "$assertpassoff" | "$assertfailon"
-                    | "$assertfailoff" | "$assertnonvacuouson" | "$assertvacuousoff"
-                    // Legacy scope/listing tasks (§21 of 1364): scope args too.
-                    | "$scope" | "$list" | "$showvars" | "$showscopes"
-            )
-            // Vendor debug/waveform families take scope args throughout and
-            // are runtime-ignored anyway; match by PREFIX so each vendor's
-            // next task name ($xm* Verisium/vwdb dumping, $indago*, ...)
-            // doesn't re-break elaboration one name at a time. None collide
-            // with an LRM-defined task name.
-            || ["$shm", "$xm", "$fsdb", "$vcdplus", "$vwdb", "$indago", "$record", "$probe"]
-                .iter()
-                .any(|p| name.starts_with(p));
+            let skip = system_task_takes_scope_args(name);
             if !skip {
                 for a in args { validate_expr_idents(a, elab, locals)?; }
             }
