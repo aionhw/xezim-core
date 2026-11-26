@@ -3096,7 +3096,7 @@ impl<'a> Lw<'a> {
 
     /// The statements of an update function that leave the value of
     /// signal `s` computed from drivers `ds` in `nv`.
-    fn update_body(&mut self, s: usize, ds: &[(usize, Driver)]) -> Option<String> {
+    fn update_body(&mut self, s: usize, ds: &[(usize, Driver)]) -> Option<(String, bool)> {
         let sig = self.sigs[s].clone();
         let info = self.d.objects[sig.obj].clone();
         let r = self.repr(sig.ty, &info.loc);
@@ -3158,10 +3158,7 @@ impl<'a> Lw<'a> {
             }
             (Repr::Arr(..) | Repr::Rec(_) | Repr::Pk(..), _) => {
                 // Scalar by scalar (§14.7.3.2).
-                let Some(b) = self.leaf_update_body(s, &ds, &tsv, &info, kind) else {
-                    return None;
-                };
-                body.push_str(&b);
+                return self.leaf_update_body(s, ds, &tsv, &info, kind);
             }
             _ => {
                 self.err(
@@ -3171,7 +3168,7 @@ impl<'a> Lw<'a> {
                 return None;
             }
         }
-        Some(body)
+        Some((body, false))
     }
 
     /// The update functions of signals computed from several drivers,
@@ -3189,7 +3186,7 @@ impl<'a> Lw<'a> {
             let info = self.d.objects[sig.obj].clone();
             let r = self.repr(sig.ty, &info.loc);
             let tsv = r.sv();
-            let Some(mut body) = self.update_body(s, &ds) else {
+            let Some((mut body, compare_copies)) = self.update_body(s, &ds) else {
                 continue;
             };
             // The signal of an `inout` port connected to SystemVerilog:
@@ -3200,7 +3197,7 @@ impl<'a> Lw<'a> {
                 let inner: Vec<(usize, Driver)> =
                     ds.iter().filter(|(p, _)| *p != fd).cloned().collect();
                 if !inner.is_empty()
-                    && let Some(b2) = self.update_body(s, &inner)
+                    && let Some((b2, false)) = self.update_body(s, &inner)
                 {
                     let _ = write!(
                         out,
@@ -3218,14 +3215,18 @@ impl<'a> Lw<'a> {
                 let _ = writeln!(out, "  bit vh_changed{s}_{p};");
                 let _ = writeln!(body, "    vh_changed{s}_{p} = 0;");
             }
-            let eq = self.eq_expr(&r, "nv", &format!("vh_s{}", s));
+            let changed = if compare_copies {
+                "value_changed".into()
+            } else {
+                format!("!{}", self.eq_expr(&r, "nv", &format!("vh_s{}", s)))
+            };
             let _ = write!(
                 out,
-                "  function automatic void vh_upd{s}(bit init);\n{body}    if (init) begin vh_s{s} = nv; vh_s{s}_last = nv; end\n    else if (!{eq}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = nv; vh_s{s}_ev = 1;{event_time} end\n  endfunction\n",
+                "  function automatic void vh_upd{s}(bit init);\n{body}    if (init) begin vh_s{s} = nv; vh_s{s}_last = nv; end\n    else if ({changed}) begin vh_s{s}_last = vh_s{s}; vh_s{s} = nv; vh_s{s}_ev = 1;{event_time} end\n  endfunction\n",
                 event_time = self.write_event_time(s, "$time"),
                 s = s,
                 body = body,
-                eq = eq
+                changed = changed
             );
             list.push(s);
         }

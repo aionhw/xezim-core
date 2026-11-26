@@ -724,7 +724,7 @@ impl<'a> Lw<'a> {
             if pending_only {
                 let _ = writeln!(
                     out,
-                    "{pad}vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1;"
+                    "{pad}vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1; vh_delta_pending = 1;"
                 );
                 return;
             }
@@ -785,7 +785,7 @@ impl<'a> Lw<'a> {
                         if pending_only {
                             let _ = writeln!(
                                 out,
-                                "{pad}if (vh_pn{s}_{p}_c{ci} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{ci}; vh_pi = vh_pi + 1) vh_pm{s}_{p}_c{ci}[vh_pl{s}_{p}_c{ci}[vh_pi]] = 0; vh_pn{s}_{p}_c{ci} = 0; end\n{pad}vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1;"
+                                "{pad}if (vh_pn{s}_{p}_c{ci} > 0) begin for (vh_pi = 0; vh_pi < vh_pn{s}_{p}_c{ci}; vh_pi = vh_pi + 1) vh_pm{s}_{p}_c{ci}[vh_pl{s}_{p}_c{ci}[vh_pi]] = 0; vh_pn{s}_{p}_c{ci} = 0; end\n{pad}vh_pw{s}_{p}_c{ci} = {val}; vh_pwf{s}_{p}_c{ci} = 1; vh_delta_pending = 1;"
                             );
                             return;
                         }
@@ -826,9 +826,10 @@ impl<'a> Lw<'a> {
                     } else {
                         format!("vh_sqn{s}_{p}_c{ci} == 0 && vh_pn{s}_{p}_c{ci} == 0")
                     };
+                    let delta = if pending_only { " vh_delta_pending = 1;" } else { "" };
                     let _ = writeln!(
                         out,
-                        "{pad}if ({guard}) begin\n{pad}  vh_lk = {key};\n{pad}  vh_pww{s}_{p}_c{c}[vh_lk] = {val}; if (!vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_pwwm{s}_{p}_c{c}[vh_lk] = 1; vh_pwwi{s}_{p}_c{c}[vh_pwwn{s}_{p}_c{c}] = vh_lk; vh_pwwn{s}_{p}_c{c} = vh_pwwn{s}_{p}_c{c} + 1; end\n{pad}end else begin",
+                        "{pad}if ({guard}) begin\n{pad}  vh_lk = {key};\n{pad}  vh_pww{s}_{p}_c{c}[vh_lk] = {val}; if (!vh_pwwm{s}_{p}_c{c}[vh_lk]) begin vh_pwwm{s}_{p}_c{c}[vh_lk] = 1; vh_pwwi{s}_{p}_c{c}[vh_pwwn{s}_{p}_c{c}] = vh_lk; vh_pwwn{s}_{p}_c{c} = vh_pwwn{s}_{p}_c{c} + 1; end{delta}\n{pad}end else begin",
                         pad = pad,
                         key = key,
                         c = ci,
@@ -912,7 +913,7 @@ impl<'a> Lw<'a> {
                     if pending_only {
                         let _ = writeln!(
                             out,
-                            "{pad}vh_lk = {key};\n{pad}vh_pf{s}_{p}_c{ci}[vh_lk] = {val}; if (!vh_pm{s}_{p}_c{ci}[vh_lk]) begin vh_pm{s}_{p}_c{ci}[vh_lk] = 1; vh_pl{s}_{p}_c{ci}[vh_pn{s}_{p}_c{ci}] = vh_lk; vh_pn{s}_{p}_c{ci} = vh_pn{s}_{p}_c{ci} + 1; end"
+                            "{pad}vh_lk = {key};\n{pad}vh_pf{s}_{p}_c{ci}[vh_lk] = {val}; if (!vh_pm{s}_{p}_c{ci}[vh_lk]) begin vh_pm{s}_{p}_c{ci}[vh_lk] = 1; vh_pl{s}_{p}_c{ci}[vh_pn{s}_{p}_c{ci}] = vh_lk; vh_pn{s}_{p}_c{ci} = vh_pn{s}_{p}_c{ci} + 1; end vh_delta_pending = 1;"
                         );
                         return;
                     }
@@ -997,11 +998,11 @@ impl<'a> Lw<'a> {
 
     /// The next transaction time of driver (s, p) by parts.
     pub(super) fn slot_driver_next(&self, s: usize, p: usize) -> String {
-        if self.singleton_slot_drivers.contains_key(&(s, p)) {
+        // Pending-only drivers request the next delta at the point of the write.
+        if self.pending_slot_drivers.contains(&(s, p)) {
             return String::new();
         }
         let mut out = String::new();
-        let pending_only = self.pending_slot_drivers.contains(&(s, p));
         let classes = self.leaf_classes(self.sigs[s].ty).unwrap_or_default();
         for c in self.driver_classes(s, p) {
             if classes.get(c).is_some_and(|c| Self::whole_class(c).is_some()) {
@@ -1010,17 +1011,13 @@ impl<'a> Lw<'a> {
             if classes.get(c).is_some_and(|c| Self::word_pending(c).is_some()) {
                 let _ = writeln!(out, "    if (vh_pwwn{s}_{p}_c{c} > 0) n = vh_now;");
             }
-            if pending_only {
-                let _ = writeln!(out, "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now;");
-            } else {
-                let _ = writeln!(
-                    out,
-                    "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now; else if (vh_sqn{s}_{p}_c{c} > 0 && (n < 0 || vh_dt{s}_{p}_c{c}[0] < n)) n = vh_dt{s}_{p}_c{c}[0];",
-                    s = s,
-                    p = p,
-                    c = c
-                );
-            }
+            let _ = writeln!(
+                out,
+                "    if (vh_pn{s}_{p}_c{c} > 0) n = vh_now; else if (vh_sqn{s}_{p}_c{c} > 0 && (n < 0 || vh_dt{s}_{p}_c{c}[0] < n)) n = vh_dt{s}_{p}_c{c}[0];",
+                s = s,
+                p = p,
+                c = c
+            );
         }
         out
     }
@@ -1037,7 +1034,7 @@ impl<'a> Lw<'a> {
         tsv: &str,
         info: &ObjInfo,
         kind: Option<crate::vhdl::ast::SignalKind>,
-    ) -> Option<String> {
+    ) -> Option<(String, bool)> {
         let ty = self.sigs[s].ty;
         let Some(classes) = self.leaf_classes(ty) else {
             self.err(
@@ -1059,6 +1056,45 @@ impl<'a> Lw<'a> {
             && !self.forced.contains(&s)
             && self.inout_driver(s).is_none()
             && !self.links.iter().any(|link| link.target.sig == s);
+        let design = self.d;
+        let single_source = |resolution: Option<(usize, bool)>| match resolution {
+            None => true,
+            Some((f, _)) => design.subprograms[f]
+                .path
+                .eq_ignore_ascii_case("ieee.std_logic_1164.resolved"),
+        };
+        // For disjoint drivers, each covered leaf is copied at most once.
+        // Compare those copies with the old effective value instead of
+        // passing two entire records to an equality function (§14.7.3.2).
+        // Limit comparisons to integral scalar and packed-word selections.
+        let compare_copies = record_parts
+            && kind.is_none()
+            && classes.iter().any(|c| c.steps.iter().any(|step| matches!(step, Step::Dim(_))))
+            && ds.iter().all(|(p, _)| self.pending_slot_drivers.contains(&(s, *p)))
+            && classes.iter().all(|c| {
+                matches!(
+                    design.types[design.base(c.scalar)].kind,
+                    TypeKind::Enum(_) | TypeKind::Integer | TypeKind::Physical(_)
+                ) && c.steps.iter().filter(|step| matches!(step, Step::Dim(_))).count() <= 1
+                    && single_source(self.resolution(c.scalar))
+            })
+            && classes.last().is_some_and(|last| {
+                let count = last.base + last.count;
+                ds.iter().enumerate().all(|(i, (_, a))| {
+                    ds[i + 1..].iter().all(|(_, b)| !a.cov.overlaps(&b.cov, 0, count))
+                })
+            });
+        if compare_copies {
+            let _ = writeln!(decls, "    bit value_changed;");
+            let _ = writeln!(body, "    value_changed = 0;");
+        }
+        let copy = |sel: &str, p: usize| {
+            if compare_copies {
+                format!("begin if (!value_changed && nv{sel} != vh_dv{s}_{p}{sel}) value_changed = 1; nv{sel} = vh_dv{s}_{p}{sel}; end")
+            } else {
+                format!("nv{sel} = vh_dv{s}_{p}{sel};")
+            }
+        };
         for (ci, c) in classes.iter().enumerate() {
             let cov: Vec<&(usize, Driver)> = ds
                 .iter()
@@ -1092,12 +1128,7 @@ impl<'a> Lw<'a> {
             // it takes (an unresolved signal, or RESOLVED of one value).
             // Each driver copies the leaves it covers, whole elements of the
             // outer dimension where its runs cover them.
-            let one_source = match res {
-                None => true,
-                Some((f, _)) => self.d.subprograms[f]
-                    .path
-                    .eq_ignore_ascii_case("ieee.std_logic_1164.resolved"),
-            };
+            let one_source = single_source(res);
             let disjoint = cov.iter().enumerate().all(|(i, a)| {
                 cov[i + 1..]
                     .iter()
@@ -1128,12 +1159,10 @@ impl<'a> Lw<'a> {
                         {
                             let _ = writeln!(
                                 body,
-                                "    for (k = {}; k <= {}; k++) nv{pre} = vh_dv{s}_{p}{pre};",
+                                "    for (k = {}; k <= {}; k++) {}",
                                 a / *n,
                                 b / *n,
-                                pre = pre,
-                                s = s,
-                                p = p
+                                copy(&pre, *p)
                             );
                             continue;
                         }
@@ -1153,30 +1182,26 @@ impl<'a> Lw<'a> {
                                     _ => None,
                                 })
                                 .collect();
-                            let _ = writeln!(body, "    nv{pre} = vh_dv{s}_{p}{pre};", pre = pre, s = s, p = p);
+                            let _ = writeln!(body, "    {}", copy(&pre, *p));
                             continue;
                         }
                         match &elem {
                             Some((stride, e)) if a % stride == 0 && (b + 1) % stride == 0 => {
                                 let _ = writeln!(
                                     body,
-                                    "    for (k = {}; k <= {}; k++) nv{e} = vh_dv{s}_{p}{e};",
+                                    "    for (k = {}; k <= {}; k++) {}",
                                     a / stride,
                                     b / stride,
-                                    e = e,
-                                    s = s,
-                                    p = p
+                                    copy(e, *p)
                                 );
                             }
                             _ => {
                                 let _ = writeln!(
                                     body,
-                                    "    for (k = {}; k <= {}; k++) nv{leaf} = vh_dv{s}_{p}{leaf};",
+                                    "    for (k = {}; k <= {}; k++) {}",
                                     a,
                                     b,
-                                    leaf = leaf,
-                                    s = s,
-                                    p = p
+                                    copy(&leaf, *p)
                                 );
                             }
                         }
@@ -1260,7 +1285,7 @@ impl<'a> Lw<'a> {
             }
             let _ = writeln!(body, "    end");
         }
-        Some(decls + &body)
+        Some((decls + &body, compare_copies))
     }
 
     /// The path an assignment target names (`a(i)(j)`, `r.f(3 downto 0)`):
@@ -1480,7 +1505,7 @@ impl<'a> Lw<'a> {
         let inner = if pending_only {
             format!(
                 "{pad}  if (!vh_pwf{s}_{p}_c{ci}) begin vh_pw{s}_{p}_c{ci} = vh_dv{s}_{p}; vh_pwf{s}_{p}_c{ci} = 1; end\n\
-                 {pad}  vh_pw{s}_{p}_c{ci}[({lo}) +: {width}] = {val};\n"
+                 {pad}  vh_pw{s}_{p}_c{ci}[({lo}) +: {width}] = {val}; vh_delta_pending = 1;\n"
             )
         } else if zero {
             format!(

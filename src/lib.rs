@@ -1421,7 +1421,10 @@ pub fn parse_and_elaborate_multi_preprocessed(
     // processes into the parsed design before elaboration.
     // VHDL (IEEE 1076): the lowered VHDL design joins the SV descriptions.
     let vhdl_top = vhdl::inject(&mut all_descriptions, top_module_name)?;
-    let top_module_name = top_module_name.or(vhdl_top.as_deref());
+    // IEEE 1076-2008 §15.4: basic identifiers are case-insensitive. When
+    // injection selected a VHDL top, use its actual lowered SV name. An
+    // explicitly named SV top leaves vhdl_top unset and stays case-sensitive.
+    let top_module_name = vhdl_top.as_deref().or(top_module_name);
     upf::inject(&mut all_descriptions, top_module_name)?;
     let (lib_defines, module_timescales, module_ts_own_file) = match pre {
         Some(p) => (p.macro_defines, p.module_timescales, p.module_ts_own_file),
