@@ -232,6 +232,7 @@ impl<'a> Parser<'a> {
             // died on the trailing `::T` when the declarator list parsed.
             let mut scopes: Vec<crate::ast::types::TypeScope> = Vec::new();
             let mut tn_name = first_name;
+            let mut bound = crate::ast::binding::Bound::UNSET;
             while self.at(TokenKind::DoubleColon) {
                 self.bump(); // ::
                 scopes.push(crate::ast::types::TypeScope {
@@ -248,6 +249,9 @@ impl<'a> Parser<'a> {
                 {
                     let link_args = self.parse_type_args_hash(start);
                     self.expect(TokenKind::DoubleColon);
+                    if link_args.is_empty() {
+                        bound = bound.with_explicit_empty_spec(scopes.len());
+                    }
                     scopes.push(crate::ast::types::TypeScope {
                         name: tn_name,
                         type_args: link_args,
@@ -266,7 +270,7 @@ impl<'a> Parser<'a> {
                     scopes,
                     name: second_name,
                     span: self.span_from(start),
-                    bound: Default::default(),
+                    bound,
                 }),
                 dimensions,
                 type_args,
@@ -343,6 +347,7 @@ impl<'a> Parser<'a> {
         // (further `::` links and per-link `#(...)::` specializations,
         // §8.23).
         if self.at(TokenKind::DoubleColon) {
+            let had_hash = params.is_some();
             let type_args: Vec<crate::ast::expr::Expression> = match &params {
                 Some(ps) => ps
                     .iter()
@@ -350,6 +355,10 @@ impl<'a> Parser<'a> {
                     .collect(),
                 None => Vec::new(),
             };
+            let mut bound = crate::ast::binding::Bound::UNSET;
+            if had_hash && type_args.is_empty() {
+                bound = bound.with_explicit_empty_spec(0);
+            }
             let mut scopes: Vec<crate::ast::types::TypeScope> =
                 vec![crate::ast::types::TypeScope {
                     name: first_name,
@@ -370,6 +379,9 @@ impl<'a> Parser<'a> {
                 {
                     let link_args = self.parse_type_args_hash(start);
                     self.expect(TokenKind::DoubleColon);
+                    if link_args.is_empty() {
+                        bound = bound.with_explicit_empty_spec(scopes.len());
+                    }
                     scopes.push(crate::ast::types::TypeScope {
                         name: tn_name,
                         type_args: link_args,
@@ -383,7 +395,7 @@ impl<'a> Parser<'a> {
                     scopes,
                     name: tn_name,
                     span: self.span_from(start),
-                    bound: Default::default(),
+                    bound,
                 }),
                 dimensions,
                 type_args: Vec::new(),

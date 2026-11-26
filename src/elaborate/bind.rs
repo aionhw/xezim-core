@@ -908,6 +908,7 @@ impl<'a> Binder<'a> {
                 self.with_pos("typedef", |b| {
                     b.data_type(&mut t.data_type);
                     b.unpacked(&mut t.dimensions);
+                    t.iface_selects.iter_mut().for_each(|e| b.expr(e));
                 });
             }
             ModuleItem::AlwaysConstruct(a) => self.stmt(&mut a.stmt),

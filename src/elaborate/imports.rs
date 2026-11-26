@@ -977,9 +977,18 @@ pub(super) fn process_import(
                                 .iter()
                                 .any(|decl| &decl.name.name == sym_name) =>
                         {
-                            let width = match &dd.data_type {
-                                DataType::TypeReference { name, .. } => {
-                                    {
+                            let spec_res = resolve_specialized_class_data_type(
+                                &dd.data_type,
+                                &elab.parameters,
+                                elab,
+                            );
+                            let eff_dt: &DataType =
+                                spec_res.as_ref().map_or(&dd.data_type, |r| &r.data_type);
+                            let width = if let Some(res) = &spec_res {
+                                res.width
+                            } else {
+                                match &dd.data_type {
+                                    DataType::TypeReference { name, .. } => {
                                         // §26.3: a SCOPED `P::T` prefers the qualified key so
                                         // a module-local `typedef ... T` cannot capture it.
                                         let scoped_w = specialized_class_scope_width(name, &elab)
@@ -996,18 +1005,18 @@ pub(super) fn process_import(
                                                 )
                                             })
                                     }
+                                    _ => resolve_type_width(
+                                        &dd.data_type,
+                                        Some(&elab.parameters),
+                                        Some(&elab.typedefs),
+                                    ),
                                 }
-                                _ => resolve_type_width(
-                                    &dd.data_type,
-                                    Some(&elab.parameters),
-                                    Some(&elab.typedefs),
-                                ),
                             };
                             let is_signed =
-                                is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
-                            let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                                is_type_signed_resolved(eff_dt, &elab.typedef_types);
+                            let is_real = is_type_real_resolved(eff_dt, &elab.typedef_types);
                             let is_string = matches!(
-                                &dd.data_type,
+                                eff_dt,
                                 DataType::Simple {
                                     kind: SimpleType::String,
                                     ..
@@ -1383,9 +1392,18 @@ pub(super) fn process_import(
                                     );
                                 }
                             }
-                            let width = match &dd.data_type {
-                                DataType::TypeReference { name, .. } => {
-                                    {
+                            let spec_res = resolve_specialized_class_data_type(
+                                &dd.data_type,
+                                &elab.parameters,
+                                elab,
+                            );
+                            let eff_dt: &DataType =
+                                spec_res.as_ref().map_or(&dd.data_type, |r| &r.data_type);
+                            let width = if let Some(res) = &spec_res {
+                                res.width
+                            } else {
+                                match &dd.data_type {
+                                    DataType::TypeReference { name, .. } => {
                                         // §26.3: a SCOPED `P::T` prefers the qualified key so
                                         // a module-local `typedef ... T` cannot capture it.
                                         let scoped_w = specialized_class_scope_width(name, &elab)
@@ -1402,23 +1420,23 @@ pub(super) fn process_import(
                                                 )
                                             })
                                     }
+                                    _ => resolve_type_width(
+                                        &dd.data_type,
+                                        Some(&elab.parameters),
+                                        Some(&elab.typedefs),
+                                    ),
                                 }
-                                _ => resolve_type_width(
-                                    &dd.data_type,
-                                    Some(&elab.parameters),
-                                    Some(&elab.typedefs),
-                                ),
                             };
                             let is_signed =
-                                is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
-                            let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                                is_type_signed_resolved(eff_dt, &elab.typedef_types);
+                            let is_real = is_type_real_resolved(eff_dt, &elab.typedef_types);
                             // Register the packed-struct field layout for an
                             // imported struct variable so a package subroutine's
                             // member write (`s.v = ...` in an imported task)
                             // resolves the field instead of missing the shared
                             // storage (§26.3).
                             let struct_fields = flatten_struct_fields(
-                                &dd.data_type,
+                                eff_dt,
                                 &elab.parameters,
                                 &elab.typedefs,
                                 &elab.typedef_types,
@@ -1429,11 +1447,11 @@ pub(super) fn process_import(
                             // e = B;` otherwise read B as an unknown (0). Also
                             // key the member list by the VARIABLE name so
                             // `e.first/next` resolve (§6.19.6).
-                            register_anonymous_enum_members(&dd.data_type, elab);
+                            register_anonymous_enum_members(eff_dt, elab);
                             let anon_members =
-                                anon_enum_members_ordered(&dd.data_type, &elab.parameters);
+                                anon_enum_members_ordered(eff_dt, &elab.parameters);
                             let is_string = matches!(
-                                &dd.data_type,
+                                eff_dt,
                                 DataType::Simple {
                                     kind: SimpleType::String,
                                     ..

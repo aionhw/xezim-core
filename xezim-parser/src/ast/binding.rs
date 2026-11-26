@@ -57,13 +57,20 @@ impl Bound {
     const EXTERNAL_TYPE: u32 = 1 << 30;
     /// §6.18: the local type declaration follows this use.
     const LATE_TYPE_DECLARATION: u32 = 1 << 29;
+    /// §8.25.1: explicit `#()` specialization on scope links 0..=2.
+    const EXPLICIT_EMPTY_SPEC_0: u32 = 1 << 28;
+    const EXPLICIT_EMPTY_SPEC_1: u32 = 1 << 27;
+    const EXPLICIT_EMPTY_SPEC_2: u32 = 1 << 26;
+    const SPEC_FLAGS: u32 =
+        Self::EXPLICIT_EMPTY_SPEC_0 | Self::EXPLICIT_EMPTY_SPEC_1 | Self::EXPLICIT_EMPTY_SPEC_2;
 
     pub fn external_type(index: u32) -> Bound {
         Bound(index | Self::EXTERNAL_TYPE)
     }
 
     pub fn external_type_index(self) -> Option<usize> {
-        (self.0 & Self::EXTERNAL_TYPE != 0).then_some((self.0 ^ Self::EXTERNAL_TYPE) as usize)
+        (self.0 & Self::EXTERNAL_TYPE != 0)
+            .then_some((self.0 & !(Self::EXTERNAL_TYPE | Self::SPEC_FLAGS)) as usize)
     }
 
     pub fn with_late_type_declaration(self) -> Bound {
@@ -72,6 +79,31 @@ impl Bound {
 
     pub fn has_late_type_declaration(self) -> bool {
         self.0 & Self::LATE_TYPE_DECLARATION != 0
+    }
+
+    pub fn with_explicit_empty_spec(self, link_idx: usize) -> Bound {
+        let bit = match link_idx {
+            0 => Self::EXPLICIT_EMPTY_SPEC_0,
+            1 => Self::EXPLICIT_EMPTY_SPEC_1,
+            2 => Self::EXPLICIT_EMPTY_SPEC_2,
+            _ => 0,
+        };
+        Bound(self.0 | bit)
+    }
+
+    pub fn has_explicit_empty_spec(self, link_idx: usize) -> bool {
+        let bit = match link_idx {
+            0 => Self::EXPLICIT_EMPTY_SPEC_0,
+            1 => Self::EXPLICIT_EMPTY_SPEC_1,
+            2 => Self::EXPLICIT_EMPTY_SPEC_2,
+            _ => 0,
+        };
+        bit != 0 && (self.0 & bit) != 0
+    }
+
+    pub fn shift_explicit_empty_spec_down(self) -> Bound {
+        let shifted = (self.0 & (Self::EXPLICIT_EMPTY_SPEC_1 | Self::EXPLICIT_EMPTY_SPEC_2)) << 1;
+        Bound((self.0 & !Self::SPEC_FLAGS) | (shifted & Self::SPEC_FLAGS))
     }
 
     pub fn decl(d: DeclId) -> Bound {
@@ -89,7 +121,7 @@ impl Bound {
         if self.external_type_index().is_some() {
             return None;
         }
-        (self.0 & !(Self::BLOCK_IMPLICIT_NET | Self::LATE_TYPE_DECLARATION))
+        (self.0 & !(Self::BLOCK_IMPLICIT_NET | Self::LATE_TYPE_DECLARATION | Self::SPEC_FLAGS))
             .checked_sub(4)
             .map(DeclId)
     }

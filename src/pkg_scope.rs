@@ -2023,7 +2023,12 @@ impl Rw<'_> {
         }
         // `C::t` (`Outer::Inner::t`, `pkg::C::t`) naming a renamed class-scoped type.
         let segs: Vec<String> = tn.scopes.iter().map(|s| s.name.name.clone()).collect();
-        if tn.scopes.iter().all(|s| s.type_args.is_empty()) {
+        if tn
+            .scopes
+            .iter()
+            .enumerate()
+            .all(|(i, s)| s.type_args.is_empty() && !tn.bound.has_explicit_empty_spec(i))
+        {
             if let Some(m) = self.class_scoped_type(&segs, &tn.name.name) {
                 tn.scopes.clear();
                 tn.name.name = m;
@@ -2057,6 +2062,7 @@ impl Rw<'_> {
                     if tn.scopes.len() > 1 {
                         tn.scopes.remove(0);
                         tn.scopes[0].name.name = m;
+                        tn.bound = tn.bound.shift_explicit_empty_spec_down();
                     } else {
                         tn.scopes.clear();
                         tn.name.name = m;
@@ -3412,6 +3418,7 @@ impl Rw<'_> {
                 }
                 self.dtype(&mut td.data_type);
                 self.unpacked(&mut td.dimensions);
+                td.iface_selects.iter_mut().for_each(|e| self.expr(e));
             }
             ModuleItem::AlwaysConstruct(a) => self.body(&mut a.stmt),
             ModuleItem::InitialConstruct(i) => self.body(&mut i.stmt),

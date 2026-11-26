@@ -255,9 +255,58 @@ impl<'a> Parser<'a> {
         decl
     }
 
+    fn peek_indexed_iface_typedef(&self) -> bool {
+        let mut p = self.pos;
+        if !matches!(
+            self.tokens.get(p).map(|t| t.kind),
+            Some(TokenKind::Identifier | TokenKind::EscapedIdentifier)
+        ) {
+            return false;
+        }
+        p += 1;
+        if self.tokens.get(p).map(|t| t.kind) != Some(TokenKind::LBracket) {
+            return false;
+        }
+        while self.tokens.get(p).map(|t| t.kind) == Some(TokenKind::LBracket) {
+            p += 1;
+            let mut depth = 1usize;
+            while depth > 0 {
+                match self.tokens.get(p).map(|t| t.kind) {
+                    None | Some(TokenKind::Eof) => return false,
+                    Some(TokenKind::LBracket) => depth += 1,
+                    Some(TokenKind::RBracket) => depth -= 1,
+                    Some(TokenKind::Colon) if depth == 1 => return false,
+                    _ => {}
+                }
+                p += 1;
+            }
+        }
+        self.tokens.get(p).map(|t| t.kind) == Some(TokenKind::Dot)
+            && matches!(
+                self.tokens.get(p + 1).map(|t| t.kind),
+                Some(TokenKind::Identifier | TokenKind::EscapedIdentifier)
+            )
+    }
+
     pub(super) fn parse_typedef_declaration(&mut self) -> TypedefDeclaration {
         let start = self.current_span().start;
         self.expect(TokenKind::KwTypedef);
+        if self.at(TokenKind::KwInterface) && self.peek_kind() == TokenKind::KwClass {
+            self.bump(); // interface
+            self.bump(); // class
+            let name = self.parse_identifier();
+            self.expect(TokenKind::Semicolon);
+            return TypedefDeclaration {
+                data_type: DataType::Void(self.span_from(start)),
+                name,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+                forward: false,
+                forward_kind: ForwardTypedefKind::InterfaceClass,
+                iface_selects: Vec::new(),
+                decl: Default::default(),
+            };
+        }
         if self.eat(TokenKind::KwClass).is_some() {
             let name = self.parse_identifier();
             self.expect(TokenKind::Semicolon);
@@ -267,6 +316,8 @@ impl<'a> Parser<'a> {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: false, // forward CLASS — resolved via a class decl, not checked here
+                forward_kind: ForwardTypedefKind::Class,
+                iface_selects: Vec::new(),
                 decl: Default::default(),
             };
         }
@@ -287,15 +338,24 @@ impl<'a> Parser<'a> {
             .get(self.pos + 2)
             .is_some_and(|t| t.kind == TokenKind::Semicolon)
         {
+            let kw = self.current_kind();
             self.bump(); // the struct/union/enum keyword
             let name = self.parse_identifier();
             self.expect(TokenKind::Semicolon);
+            let forward_kind = match kw {
+                TokenKind::KwEnum => ForwardTypedefKind::Enum,
+                TokenKind::KwStruct => ForwardTypedefKind::Struct,
+                TokenKind::KwUnion => ForwardTypedefKind::Union,
+                _ => unreachable!(),
+            };
             return TypedefDeclaration {
                 data_type: DataType::Void(self.span_from(start)),
                 name,
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                forward_kind,
+                iface_selects: Vec::new(),
                 decl: Default::default(),
             };
         }
@@ -312,6 +372,38 @@ impl<'a> Parser<'a> {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                forward_kind: ForwardTypedefKind::Bare,
+                iface_selects: Vec::new(),
+                decl: Default::default(),
+            };
+        }
+        // §6.18: indexed interface-based typedef `typedef p[0].data_t my_t;`
+        if self.peek_indexed_iface_typedef() {
+            let port_id = self.parse_identifier();
+            let mut iface_selects = Vec::new();
+            while self.eat(TokenKind::LBracket).is_some() {
+                iface_selects.push(self.parse_expression());
+                self.expect(TokenKind::RBracket);
+            }
+            self.expect(TokenKind::Dot);
+            let member_ty = self.parse_identifier();
+            let data_type = DataType::Interface {
+                name: Box::new(port_id),
+                modport: Some(Box::new(member_ty)),
+                type_args: Vec::new(),
+                span: self.span_from(start),
+            };
+            let name = self.parse_identifier();
+            let dimensions = self.parse_unpacked_dimensions();
+            self.expect(TokenKind::Semicolon);
+            return TypedefDeclaration {
+                data_type,
+                name,
+                dimensions,
+                span: self.span_from(start),
+                forward: false,
+                forward_kind: ForwardTypedefKind::None,
+                iface_selects,
                 decl: Default::default(),
             };
         }
@@ -325,6 +417,8 @@ impl<'a> Parser<'a> {
             dimensions,
             span: self.span_from(start),
             forward: false,
+            forward_kind: ForwardTypedefKind::None,
+            iface_selects: Vec::new(),
             decl: Default::default(),
         }
     }

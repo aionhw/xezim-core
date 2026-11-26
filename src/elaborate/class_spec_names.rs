@@ -15,6 +15,111 @@ pub(super) fn param_value_to_arg_string(pv: &ParamValue) -> String {
     }
 }
 
+/// Canonicalize a built-in scalar/vector/real type fragment per IEEE 1800-2023 §6.22.1
+/// so matching built-in types share one specialization signature:
+/// - `bit signed[31:0]` <-> `int`, `bit[31:0]` <-> `int unsigned`
+/// - `bit signed[7:0]` <-> `byte`, `bit[7:0]` <-> `byte unsigned`
+/// - `bit signed[15:0]` <-> `shortint`, `bit[15:0]` <-> `shortint unsigned`
+/// - `bit signed[63:0]` <-> `longint`, `bit[63:0]` <-> `longint unsigned`
+/// - `logic signed[31:0]` <-> `integer`, `logic[31:0]` <-> `integer unsigned`
+/// - `logic[63:0]` <-> `time`, `logic signed[63:0]` <-> `time signed`
+/// - `reg` <-> `logic`, `realtime` <-> `real`, `bit unsigned` <-> `bit`
+/// Preserves packed bounds (`[0:0]` != scalar `bit`, `[3:0]` != `[4:1]` != `[0:3]`).
+pub fn canonicalize_builtin_type_fragment(frag: &str) -> Option<String> {
+    let s = frag.trim();
+    let kw_end = s
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(s.len());
+    let kw = &s[..kw_end];
+    let mut rest = s[kw_end..].trim_start();
+    match kw {
+        "real" | "realtime" => return rest.is_empty().then(|| "real".to_string()),
+        "shortreal" => return rest.is_empty().then(|| "shortreal".to_string()),
+        _ => {}
+    }
+    let (is_4state, default_signed, atom_range): (bool, bool, Option<(i64, i64)>) = match kw {
+        "byte" => (false, true, Some((7, 0))),
+        "shortint" => (false, true, Some((15, 0))),
+        "int" => (false, true, Some((31, 0))),
+        "longint" => (false, true, Some((63, 0))),
+        "integer" => (true, true, Some((31, 0))),
+        "time" => (true, false, Some((63, 0))),
+        "bit" => (false, false, None),
+        "logic" | "reg" => (true, false, None),
+        _ => return None,
+    };
+    let mut signing: Option<bool> = None;
+    if let Some(after) = rest.strip_prefix("signed")
+        && after
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_ascii_whitespace() || c == '[')
+    {
+        signing = Some(true);
+        rest = after.trim_start();
+    } else if let Some(after) = rest.strip_prefix("unsigned")
+        && after
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_ascii_whitespace() || c == '[')
+    {
+        signing = Some(false);
+        rest = after.trim_start();
+    }
+    let is_signed = signing.unwrap_or(default_signed);
+    let mut dims: Vec<(i64, i64)> = Vec::new();
+    while let Some(after_open) = rest.strip_prefix('[') {
+        let close = after_open.find(']')?;
+        let (l, r) = after_open[..close].split_once(':')?;
+        let l = l.trim().parse::<i64>().ok()?;
+        let r = r.trim().parse::<i64>().ok()?;
+        dims.push((l, r));
+        rest = after_open[close + 1..].trim_start();
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    if let Some(ar) = atom_range {
+        if !dims.is_empty() {
+            return None;
+        }
+        dims.push(ar);
+    }
+    if dims.is_empty() {
+        return Some(
+            match (is_4state, is_signed) {
+                (false, false) => "bit",
+                (false, true) => "bit signed",
+                (true, false) => "logic",
+                (true, true) => "logic signed",
+            }
+            .to_string(),
+        );
+    }
+    Some(match (is_4state, is_signed, dims.as_slice()) {
+        (false, true, [(7, 0)]) => "byte".to_string(),
+        (false, true, [(15, 0)]) => "shortint".to_string(),
+        (false, true, [(31, 0)]) => "int".to_string(),
+        (false, true, [(63, 0)]) => "longint".to_string(),
+        (true, true, [(31, 0)]) => "integer".to_string(),
+        (true, false, [(63, 0)]) => "time".to_string(),
+        _ => {
+            let mut out = if is_4state {
+                "logic".to_string()
+            } else {
+                "bit".to_string()
+            };
+            if is_signed {
+                out.push_str(" signed");
+            }
+            for (l, r) in dims {
+                out.push_str(&format!("[{}:{}]", l, r));
+            }
+            out
+        }
+    })
+}
+
 /// Render a `DataType` (the default of a `type T = <dt>` parameter) to the
 /// textual fragment used in specialization-signature canonicalization. Only
 /// the shapes that can legally be a type-parameter default are handled
@@ -39,20 +144,13 @@ pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
                 IntegerAtomType::Time => "time",
             }
             .to_string();
-            // §6.11 / §8.25: explicit non-default signing is type identity.
-            match (kind, signing) {
-                (IntegerAtomType::Time, Some(crate::ast::types::Signing::Signed)) => {
-                    out.push_str(" signed")
-                }
-                (IntegerAtomType::Time, _) => {}
-                (_, Some(crate::ast::types::Signing::Unsigned)) => out.push_str(" unsigned"),
-                _ => {}
+            match signing {
+                Some(crate::ast::types::Signing::Signed) => out.push_str(" signed"),
+                Some(crate::ast::types::Signing::Unsigned) => out.push_str(" unsigned"),
+                None => {}
             }
-            Some(out)
+            Some(canonicalize_builtin_type_fragment(&out).unwrap_or(out))
         }
-        // The packed range is intentionally not rendered: a type ARGUMENT
-        // loses its range at parse time too, so keeping the bare keyword here
-        // matches what an explicit `#(logic [63:0])` produces.
         // Dimensions and signing are part of the type's identity:
         // `P#(bit[7:0])` is not `P#(bit)`. Literal bounds render inline;
         // a bound that is not a plain integer literal cannot be named here
@@ -87,13 +185,12 @@ pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
                     crate::ast::types::PackedDimension::Unsized(_) => return None,
                 }
             }
-            Some(out)
+            Some(canonicalize_builtin_type_fragment(&out).unwrap_or(out))
         }
         DataType::Real { kind, .. } => Some(
             match kind {
-                RealType::Real => "real",
+                RealType::Real | RealType::RealTime => "real",
                 RealType::ShortReal => "shortreal",
-                RealType::RealTime => "realtime",
             }
             .to_string(),
         ),
@@ -197,5 +294,52 @@ pub(super) fn data_type_kind_name(dt: &DataType) -> String {
         DataType::Struct(_) => "struct".to_string(),
         DataType::Enum(_) => "enum".to_string(),
         DataType::Implicit { .. } => "implicit".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_builtin_type_fragment;
+
+    fn canon(s: &str) -> String {
+        canonicalize_builtin_type_fragment(s).unwrap_or_else(|| s.to_string())
+    }
+
+    #[test]
+    fn matching_builtin_specialization_fragments_agree() {
+        assert_eq!(canon("int"), canon("bit signed[31:0]"));
+        assert_eq!(canon("int signed"), canon("int"));
+        assert_eq!(canon("int unsigned"), canon("bit[31:0]"));
+        assert_eq!(canon("bit unsigned[31:0]"), canon("bit[31:0]"));
+
+        assert_eq!(canon("byte"), canon("bit signed[7:0]"));
+        assert_eq!(canon("byte unsigned"), canon("bit[7:0]"));
+
+        assert_eq!(canon("shortint"), canon("bit signed[15:0]"));
+        assert_eq!(canon("shortint unsigned"), canon("bit[15:0]"));
+
+        assert_eq!(canon("longint"), canon("bit signed[63:0]"));
+        assert_eq!(canon("longint unsigned"), canon("bit[63:0]"));
+
+        assert_eq!(canon("integer"), canon("logic signed[31:0]"));
+        assert_eq!(canon("integer unsigned"), canon("logic[31:0]"));
+
+        assert_eq!(canon("time"), canon("logic[63:0]"));
+        assert_eq!(canon("time signed"), canon("logic signed[63:0]"));
+        assert_eq!(canon("reg signed[63:0]"), canon("time signed"));
+
+        assert_eq!(canon("reg"), canon("logic"));
+        assert_eq!(canon("realtime"), canon("real"));
+        assert_eq!(canon("bit unsigned"), canon("bit"));
+        assert_eq!(canon("reg[0:0]"), canon("logic[0:0]"));
+    }
+
+    #[test]
+    fn non_matching_builtin_specialization_fragments_stay_distinct() {
+        assert_ne!(canon("bit[0:0]"), canon("bit"));
+        assert_ne!(canon("logic[0:0]"), canon("logic"));
+        assert_ne!(canon("logic[3:0]"), canon("logic[4:1]"));
+        assert_ne!(canon("logic[4:1]"), canon("logic[0:3]"));
+        assert_ne!(canon("shortreal"), canon("real"));
     }
 }

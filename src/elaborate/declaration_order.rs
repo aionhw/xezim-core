@@ -467,6 +467,9 @@ pub(super) fn check_module_use_before_decl(
         fn typedef(&mut self, td: &TypedefDeclaration, scope: &Scope) {
             self.ty(&td.data_type, scope);
             self.unpacked(&td.dimensions, scope);
+            for e in &td.iface_selects {
+                self.expr(e, scope);
+            }
         }
         fn event_expr(&mut self, ev: &EventExpr, scope: &Scope) {
             self.expr(&ev.expr, scope);

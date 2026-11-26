@@ -2486,6 +2486,10 @@ pub struct ElaboratedClass {
     /// (e.g. `this_type`), then resolve it to the concrete specialization.
     #[serde(default)]
     pub extends_type_args: Vec<String>,
+    /// Raw AST `ParamValue` arguments from `extends Base#(...)` in source order
+    /// (preserving type arguments, constant expressions like `N+2`, and named args).
+    #[serde(default)]
+    pub extends_param_values: Vec<crate::ast::decl::ParamValue>,
     /// ALL parameter names (type and value), in declaration order. Needed to
     /// map positional `#(...)` type-args to the correct param when type and
     /// value params are interleaved (e.g. `uvm_component_registry#(type T,

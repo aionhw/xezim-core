@@ -2105,6 +2105,11 @@ fn elaborate_class_in_scope(
             .as_ref()
             .map(|e| e.args.iter().map(param_value_to_arg_string).collect())
             .unwrap_or_default(),
+        extends_param_values: c
+            .extends
+            .as_ref()
+            .map(|e| e.args.clone())
+            .unwrap_or_default(),
         properties,
         property_types,
         property_order,

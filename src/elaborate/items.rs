@@ -21,10 +21,18 @@ pub(super) fn elaborate_items(
                     } => resolve_interface_modport_view(&name.name, &mp.name, all_defs),
                     _ => None,
                 };
-                let width =
-                    resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
-                let is_real = is_type_real_resolved(&pd.data_type, &elab.typedef_types);
+                let pd_spec =
+                    resolve_specialized_class_data_type(&pd.data_type, &elab.parameters, elab);
+                let eff_pd_dt: &DataType =
+                    pd_spec.as_ref().map_or(&pd.data_type, |r| &r.data_type);
+                let width = pd_spec.as_ref().map_or_else(
+                    || {
+                        resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs))
+                    },
+                    |r| r.width,
+                );
+                let is_signed = is_type_signed_resolved(eff_pd_dt, &elab.typedef_types);
+                let is_real = is_type_real_resolved(eff_pd_dt, &elab.typedef_types);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
                         if elab.claim_local_decl_displacement(
@@ -126,11 +134,22 @@ pub(super) fn elaborate_items(
             }
             ModuleItem::NetDeclaration(nd) => {
                 check_net_data_type(nd, elab)?;
-                let width =
-                    resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
-                let is_real = is_type_real_resolved(&nd.data_type, &elab.typedef_types);
+                let nd_spec =
+                    resolve_specialized_class_data_type(&nd.data_type, &elab.parameters, elab);
+                let eff_nd_dt: &DataType =
+                    nd_spec.as_ref().map_or(&nd.data_type, |r| &r.data_type);
+                let width = nd_spec.as_ref().map_or_else(
+                    || {
+                        resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs))
+                    },
+                    |r| r.width,
+                );
+                let is_signed = is_type_signed_resolved(eff_nd_dt, &elab.typedef_types);
+                let is_real = is_type_real_resolved(eff_nd_dt, &elab.typedef_types);
                 for decl in &nd.declarators {
+                    if let Some(spec) = &nd_spec {
+                        register_port_packed_shape(elab, &decl.name.name, &spec.data_type);
+                    }
                     // §7.6: net arrays retain left-to-right declaration order too.
                     if let Some(dims) = declared_unpacked_dims(&decl.dimensions, &elab.parameters) {
                         if dims.first().is_some_and(|(l, r)| l > r) {
@@ -185,7 +204,31 @@ pub(super) fn elaborate_items(
                 if dd.declarators.is_empty() {
                     continue;
                 }
+                if let DataType::TypeReference { type_args, .. } = &dd.data_type {
+                    if !type_args.is_empty() {
+                        for decl in &dd.declarators {
+                            elab.class_type_args
+                                .insert(decl.name.name.clone(), type_args.clone());
+                        }
+                    }
+                }
                 register_anonymous_enum_members(&dd.data_type, elab);
+                let dd_spec =
+                    resolve_specialized_class_data_type(&dd.data_type, &elab.parameters, elab);
+                let dd_spec_owned;
+                let dd = if let Some(spec) = &dd_spec {
+                    let mut cloned = dd.clone();
+                    cloned.data_type = spec.data_type.clone();
+                    if !spec.unpacked_dims.is_empty() {
+                        for decl in &mut cloned.declarators {
+                            decl.dimensions.extend(spec.unpacked_dims.iter().cloned());
+                        }
+                    }
+                    dd_spec_owned = cloned;
+                    &dd_spec_owned
+                } else {
+                    dd
+                };
                 // Packed multi-D (`logic [N-1:0][W-1:0] mem;`) — record the
                 // per-element width under the bare declarator name so
                 // `mem[i] = v` writes a W-bit slice. Mirrors the same
@@ -246,16 +289,16 @@ pub(super) fn elaborate_items(
                     } => resolve_interface_modport_view(&name.name, &mp.name, all_defs),
                     _ => None,
                 };
-                let width = match &dd.data_type {
-                    // A bare typedef reference takes the registered typedef
-                    // width, but packed dimensions on the DECLARATION
-                    // (`foo_s [1:0][3:0] x`) multiply it — resolve_type_width
-                    // applies both, so only take the shortcut when there are
-                    // no such dims.
-                    DataType::TypeReference {
-                        name, dimensions, ..
-                    } if dimensions.is_empty() => {
-                        {
+                let width = dd_spec.as_ref().map_or_else(
+                    || match &dd.data_type {
+                        // A bare typedef reference takes the registered typedef
+                        // width, but packed dimensions on the DECLARATION
+                        // (`foo_s [1:0][3:0] x`) multiply it — resolve_type_width
+                        // applies both, so only take the shortcut when there are
+                        // no such dims.
+                        DataType::TypeReference {
+                            name, dimensions, ..
+                        } if dimensions.is_empty() => {
                             // §26.3: a SCOPED `P::T` prefers the qualified key so
                             // a module-local `typedef ... T` cannot capture it.
                             let scoped_w = specialized_class_scope_width(name, &elab)
@@ -270,21 +313,15 @@ pub(super) fn elaborate_items(
                                     )
                                 })
                         }
-                    }
-                    _ => resolve_type_width(
-                        &dd.data_type,
-                        Some(&elab.parameters),
-                        Some(&elab.typedefs),
-                    ),
-                };
-                if let DataType::TypeReference { type_args, .. } = &dd.data_type {
-                    if !type_args.is_empty() {
-                        for decl in &dd.declarators {
-                            elab.class_type_args
-                                .insert(decl.name.name.clone(), type_args.clone());
-                        }
-                    }
-                }
+                        _ => resolve_type_width(
+                            &dd.data_type,
+                            Some(&elab.parameters),
+                            Some(&elab.typedefs),
+                        ),
+                    },
+                    |r| r.width,
+                );
+                let _ = &dd.data_type;
                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                 let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
                 let shared_dd_type = crate::decl_types::intern_top_decl_type(&dd.data_type);
@@ -1177,7 +1214,19 @@ pub(super) fn elaborate_items(
                 }
             }
             ModuleItem::TypedefDeclaration(td) => {
-                process_typedef(td, elab);
+                if let Some(res) = interface_ports::resolve_interface_port_typedef(
+                    td,
+                    &PortList::Empty,
+                    items,
+                    &elab.parameters,
+                    &elab.interface_port_aliases,
+                    elab,
+                    all_defs,
+                ) {
+                    register_resolved_interface_typedef(td, res, elab);
+                } else {
+                    process_typedef(td, elab);
+                }
             }
             ModuleItem::AliasDecl(terms) => {
                 // §10.11: an alias statement in a generate block names ONE

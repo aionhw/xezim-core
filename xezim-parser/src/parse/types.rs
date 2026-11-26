@@ -503,6 +503,7 @@ impl<'a> Parser<'a> {
         let start = self.current_span().start;
         let mut scopes: Vec<crate::ast::types::TypeScope> = Vec::new();
         let mut name = self.parse_identifier();
+        let mut bound = crate::ast::binding::Bound::UNSET;
         loop {
             if self.at(TokenKind::DoubleColon) {
                 self.bump(); // ::
@@ -523,6 +524,9 @@ impl<'a> Parser<'a> {
             {
                 let args = self.parse_type_args_hash(start);
                 self.expect(TokenKind::DoubleColon);
+                if args.is_empty() {
+                    bound = bound.with_explicit_empty_spec(scopes.len());
+                }
                 scopes.push(crate::ast::types::TypeScope {
                     name,
                     type_args: args,
@@ -536,7 +540,7 @@ impl<'a> Parser<'a> {
             scopes,
             name,
             span: self.span_from(start),
-            bound: Default::default(),
+            bound,
         }
     }
 

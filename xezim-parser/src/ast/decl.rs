@@ -1210,6 +1210,19 @@ pub struct TypeParamAssignment {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ForwardTypedefKind {
+    #[default]
+    None,
+    Bare,
+    Enum,
+    Struct,
+    Union,
+    Class,
+    InterfaceClass,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypedefDeclaration {
@@ -1222,6 +1235,14 @@ pub struct TypedefDeclaration {
     /// full typedef in the same scope; elaboration errors otherwise.
     #[cfg_attr(feature = "serde", serde(default))]
     pub forward: bool,
+    /// IEEE 1800-2023 §6.18: syntactic forward-type category when declared as
+    /// a forward typedef (`bare`, `enum`, `struct`, `union`, `class`, `interface class`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub forward_kind: ForwardTypedefKind,
+    /// IEEE 1800-2023 §6.18: optional constant bit-selects on an indexed
+    /// interface-based typedef (`typedef p[0].data_t my_t;`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub iface_selects: Vec<super::expr::Expression>,
     /// The declaration's id in its definition's tree, from the binder (§23.9).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub decl: super::binding::Bound,
