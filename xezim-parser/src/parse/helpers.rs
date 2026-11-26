@@ -1,17 +1,19 @@
 //! Parser helpers: token stream navigation and error recovery.
 
+use std::borrow::Cow;
+
 use super::Parser;
 use crate::ast::{Identifier, Span};
 use crate::diagnostics::Diagnostic;
 use crate::lexer::token::{Token, TokenKind};
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// §22.5.1: preserve the preprocessor's undefined-macro diagnostic while
     /// recovering a whole invocation, rather than parsing its commas as code.
     pub(super) fn recover_undefined_macro(&mut self) -> bool {
         if !self.at(TokenKind::Directive)
             || crate::preprocessor::COMPILER_DIRECTIVES
-                .contains(&self.current().text.trim_start_matches('`'))
+                .contains(&self.current_text().trim_start_matches('`'))
         {
             return false;
         }
@@ -20,7 +22,7 @@ impl Parser {
             // Balanced arguments are opaque tokens: commas, strings and even
             // statement bodies belong to the macro, not to the surrounding SV.
             let mut nesting = 1;
-            let closing = self.tokens[self.pos..].iter().position(|token| {
+            let closing = self.tokens.iter_from(self.pos).position(|token| {
                 match token.kind {
                     TokenKind::LParen => nesting += 1,
                     TokenKind::RParen => nesting -= 1,
@@ -56,21 +58,49 @@ impl Parser {
                 }
             }
             if depth != 0 {
+                let span = self.token_span(invocation);
                 self.diagnostics.push(Diagnostic::error(
                     "unterminated undefined macro argument list".to_string(),
-                    invocation.span,
+                    span,
                 ));
             }
         }
         true
     }
 
-    pub(super) fn current(&self) -> &Token {
-        &self.tokens[self.pos.min(self.tokens.len() - 1)]
+    #[inline]
+    pub(super) fn current(&self) -> Token {
+        self.tokens.get_clamped(self.pos)
     }
 
+    #[inline]
     pub(super) fn current_kind(&self) -> TokenKind {
         self.current().kind
+    }
+
+    #[inline]
+    pub(super) fn current_span(&self) -> Span {
+        self.tokens.span(self.current())
+    }
+
+    #[inline]
+    pub(super) fn current_text(&self) -> Cow<'a, str> {
+        self.tokens.text(self.current())
+    }
+
+    #[inline]
+    pub(super) fn token_span(&self, tok: Token) -> Span {
+        self.tokens.span(tok)
+    }
+
+    #[inline]
+    pub(super) fn token_text(&self, tok: Token) -> Cow<'a, str> {
+        self.tokens.text(tok)
+    }
+
+    #[inline]
+    pub(super) fn release_consumed_tokens(&mut self) {
+        self.tokens.release_before(self.pos.saturating_sub(4));
     }
 
     pub(super) fn peek_kind(&self) -> TokenKind {
@@ -78,6 +108,13 @@ impl Parser {
             .get(self.pos + 1)
             .map(|t| t.kind)
             .unwrap_or(TokenKind::Eof)
+    }
+
+    /// The lexer represents the stand-alone apostrophe of a cast as an
+    /// integer-literal token, distinct from based and unbased literals.
+    pub(super) fn followed_by_cast_quote(&self) -> bool {
+        self.tokens.get(self.pos + 1).is_some_and(|next|
+            next.kind == TokenKind::IntegerLiteral && self.token_text(next) == "'")
     }
 
     #[allow(dead_code)]
@@ -97,7 +134,7 @@ impl Parser {
     }
 
     pub(super) fn bump(&mut self) -> Token {
-        let tok = self.tokens[self.pos.min(self.tokens.len() - 1)].clone();
+        let tok = self.current();
         if self.pos < self.tokens.len() {
             self.pos += 1;
         }
@@ -108,10 +145,12 @@ impl Parser {
         if self.at(kind) {
             self.bump()
         } else {
-            let tok = self.current().clone();
+            let tok = self.current();
+            let span = self.token_span(tok);
+            let text = self.token_text(tok);
             self.diagnostics.push(Diagnostic::error(
-                format!("expected {:?}, found {:?} '{}'", kind, tok.kind, tok.text),
-                tok.span,
+                format!("expected {:?}, found {:?} '{}'", kind, tok.kind, text),
+                span,
             ));
             tok
         }
@@ -127,7 +166,7 @@ impl Parser {
 
     pub(super) fn span_from(&self, start: usize) -> Span {
         let end = if self.pos > 0 {
-            self.tokens[self.pos - 1].span.end
+            self.tokens.span_at(self.pos - 1).end
         } else {
             start
         };
@@ -135,7 +174,7 @@ impl Parser {
     }
 
     pub(super) fn error(&mut self, msg: impl Into<String>) {
-        let span = self.current().span;
+        let span = self.current_span();
         self.diagnostics.push(Diagnostic::error(msg, span));
     }
 
@@ -152,14 +191,14 @@ impl Parser {
         let mut mixed_at = None;
         let mut comma_at = None;
         let mut trailing_at = None;
-        for token in &self.tokens[self.pos..] {
+        for token in self.tokens.iter_from(self.pos) {
             if depth == 0 && token.kind == TokenKind::RParen && at_entry_start {
                 trailing_at = comma_at;
             }
             if at_entry_start && !(depth == 0 && token.kind == TokenKind::RParen) {
                 let named = token.kind == TokenKind::Dot;
                 if *first_is_named.get_or_insert(named) != named {
-                    mixed_at = Some(token.span);
+                    mixed_at = Some(self.token_span(token));
                     break;
                 }
                 at_entry_start = false;
@@ -177,7 +216,7 @@ impl Parser {
                 }
                 TokenKind::Comma if depth == 0 => {
                     at_entry_start = true;
-                    comma_at = Some(token.span);
+                    comma_at = Some(self.token_span(token));
                 }
                 TokenKind::Semicolon | TokenKind::Eof => break,
                 _ => {}
@@ -210,34 +249,34 @@ impl Parser {
     }
 
     pub(super) fn parse_identifier(&mut self) -> Identifier {
-        let tok = self.current().clone();
+        let tok = self.current();
+        let span = self.token_span(tok);
         match tok.kind {
             TokenKind::EscapedIdentifier => {
                 self.bump();
                 // IEEE 1800-2017 §5.6.1: an escaped identifier (`\cpu3 `) is the
                 // same identifier as the nonescaped spelling (`cpu3`). Strip the
                 // leading backslash so both forms resolve to one symbol.
-                let name = tok.text.strip_prefix('\\').unwrap_or(&tok.text).to_string();
-                Identifier {
-                    name,
-                    span: tok.span,
-                }
+                let text = self.token_text(tok);
+                let name = text.strip_prefix('\\').unwrap_or(&text).to_string();
+                Identifier { name, span }
             }
             TokenKind::Identifier => {
                 self.bump();
                 Identifier {
-                    name: tok.text,
-                    span: tok.span,
+                    name: self.token_text(tok).into_owned(),
+                    span,
                 }
             }
             _ => {
+                let text = self.token_text(tok);
                 self.error(format!(
                     "expected identifier, found {:?} '{}'",
-                    tok.kind, tok.text
+                    tok.kind, text
                 ));
                 Identifier {
                     name: String::from("<e>"),
-                    span: tok.span,
+                    span,
                 }
             }
         }
@@ -248,8 +287,8 @@ impl Parser {
             let id = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
                 Identifier {
-                    name: tok.text,
-                    span: tok.span,
+                    name: self.token_text(tok).into_owned(),
+                    span: self.token_span(tok),
                 }
             } else {
                 self.parse_identifier()

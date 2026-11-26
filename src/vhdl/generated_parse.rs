@@ -7,36 +7,32 @@
 
 use super::{GENERATED_SPAN_BASE, parse_generated_tokens};
 use crate::ast::{Description, Span, module::PortList};
-use crate::sv_parser::lexer::{Lexer, Token, TokenKind as K};
+use crate::sv_parser::lexer::{Lexer, TokenKind as K, TokenStream};
+
+type ScannedToken = (K, Span);
 
 struct Stream<'a> {
     lexer: Lexer<'a>,
-    next: Token,
+    next: ScannedToken,
 }
 
 impl<'a> Stream<'a> {
     fn new(text: &'a str) -> Self {
         let mut lexer = Lexer::new(text);
-        let next = Self::offset(lexer.next_token());
+        let next = lexer.next_token();
         Self { lexer, next }
     }
 
-    fn offset(mut token: Token) -> Token {
-        token.span.start += GENERATED_SPAN_BASE;
-        token.span.end += GENERATED_SPAN_BASE;
-        token
-    }
-
-    fn take(&mut self) -> Token {
-        let next = Self::offset(self.lexer.next_token());
+    fn take(&mut self) -> ScannedToken {
+        let next = self.lexer.next_token();
         std::mem::replace(&mut self.next, next)
     }
 
     /// A header or simple item ends at a semicolon outside delimiters.
-    fn simple(&mut self, out: &mut Vec<Token>) -> Option<()> {
+    fn simple(&mut self, out: &mut Vec<ScannedToken>) -> Option<()> {
         let mut depth = 0usize;
         loop {
-            let kind = self.next.kind;
+            let kind = self.next.0;
             if matches!(kind, K::Eof | K::KwEndmodule) {
                 return None;
             }
@@ -52,16 +48,16 @@ impl<'a> Stream<'a> {
         }
     }
 
-    fn item(&mut self, out: &mut Vec<Token>) -> Option<()> {
-        match self.next.kind {
+    fn item(&mut self, out: &mut Vec<ScannedToken>) -> Option<()> {
+        match self.next.0 {
             K::KwFunction | K::KwTask => {
-                let end = if self.next.kind == K::KwFunction {
+                let end = if self.next.0 == K::KwFunction {
                     K::KwEndfunction
                 } else {
                     K::KwEndtask
                 };
                 loop {
-                    let kind = self.next.kind;
+                    let kind = self.next.0;
                     if matches!(kind, K::Eof | K::KwEndmodule) {
                         return None;
                     }
@@ -75,7 +71,7 @@ impl<'a> Stream<'a> {
                 let mut delimiters = 0usize;
                 let mut blocks = Vec::new();
                 loop {
-                    let kind = self.next.kind;
+                    let kind = self.next.0;
                     if matches!(kind, K::Eof | K::KwEndmodule) {
                         return None;
                     }
@@ -100,7 +96,7 @@ impl<'a> Stream<'a> {
                     if delimiters == 0
                         && blocks.is_empty()
                         && matches!(kind, K::Semicolon | K::KwEnd | K::KwEndcase)
-                        && self.next.kind != K::KwElse
+                        && self.next.0 != K::KwElse
                     {
                         return Some(());
                     }
@@ -139,8 +135,8 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
     let mut result = Vec::new();
     let mut batches = 0usize;
     let mut max_batch_tokens = 0usize;
-    while stream.next.kind != K::Eof {
-        if stream.next.kind != K::KwModule {
+    while stream.next.0 != K::Eof {
+        if stream.next.0 != K::KwModule {
             return None;
         }
         let mut header = Vec::new();
@@ -148,7 +144,7 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
         // The emitted modules have ANSI or empty ports and baked generics.
         if header
             .iter()
-            .any(|t| matches!(t.kind, K::KwImport | K::Hash))
+            .any(|t| matches!(t.0, K::KwImport | K::Hash))
         {
             return None;
         }
@@ -157,16 +153,16 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
         let mut capacity_before = 0;
         loop {
             let mut tokens = header.clone();
-            while stream.next.kind != K::KwEndmodule
+            while stream.next.0 != K::KwEndmodule
                 && (tokens.len() == header.len() || tokens.len() < batch_target)
             {
                 stream.item(&mut tokens)?;
             }
-            let end = stream.next.span;
-            tokens.push(Token::new(K::KwEndmodule, "endmodule".into(), end));
-            tokens.push(Token::new(K::Eof, String::new(), end));
+            let end = stream.next.1;
+            tokens.push((K::KwEndmodule, end));
+            tokens.push((K::Eof, Span::new(end.start, end.start)));
             max_batch_tokens = max_batch_tokens.max(tokens.len());
-            let mut descriptions = parse_generated_tokens(tokens, text).ok()?;
+            let mut descriptions = parse_generated_tokens(TokenStream::from_spans(text, tokens), text).ok()?;
             let Description::Module(mut module) = descriptions.pop()? else {
                 return None;
             };
@@ -194,10 +190,13 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
                     ],
                 );
             }
-            if stream.next.kind == K::KwEndmodule {
+            if stream.next.0 == K::KwEndmodule {
                 let end = stream.take();
                 let mut module = assembled?;
-                module.span = Span::new(header[0].span.start, end.span.end);
+                module.span = Span::new(
+                    GENERATED_SPAN_BASE + header[0].1.start,
+                    GENERATED_SPAN_BASE + end.1.end,
+                );
                 module.items = if item_batches.len() == 1 {
                     item_batches.pop()?.into_vec()
                 } else {
@@ -222,7 +221,7 @@ pub(super) fn parse(text: &str, batch_target: usize) -> Option<Vec<Description>>
                 );
                 result.push(Description::Module(module));
                 // End labels are not emitted; leave them to the whole parser.
-                if stream.next.kind == K::Colon {
+                if stream.next.0 == K::Colon {
                     return None;
                 }
                 break;

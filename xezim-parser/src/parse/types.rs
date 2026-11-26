@@ -4,7 +4,7 @@ use super::{Parser, compact_syntax_list};
 use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub(super) fn is_data_type_keyword(&self) -> bool {
         matches!(
             self.current_kind(),
@@ -73,7 +73,7 @@ impl Parser {
     }
 
     pub(super) fn parse_data_type(&mut self) -> DataType {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         match self.current_kind() {
             // §6.20.2.1 / §25.3: `virtual [interface] <iface>[#(params)][.modport]`
             // used as a type — e.g. a parameter-type default
@@ -231,7 +231,7 @@ impl Parser {
                 let is_this = matches!(
                     self.current_kind(),
                     TokenKind::KwThis | TokenKind::Identifier
-                ) && self.current().text == "this";
+                ) && self.current_text() == "this";
                 if is_this {
                     self.bump();
                     self.expect(TokenKind::RParen);
@@ -272,7 +272,7 @@ impl Parser {
                     span: self.span_from(start),
                 }
             }
-            TokenKind::Identifier => {
+            TokenKind::Identifier | TokenKind::EscapedIdentifier => {
                 let name = self.parse_type_name();
                 // Parse optional parameterized type list #(...). Collect
                 // the positional arguments as expressions; named (.NAME(expr))
@@ -372,8 +372,8 @@ impl Parser {
                             // the leaf as an Ident expression so
                             // per-spec keying recovers the signature,
                             // matching the builtin-keyword path above.
-                            let tok_text = self.current().text.clone(); // 'virtual'
-                            let tsp = self.current().span;
+                            let tok_text = self.current_text().into_owned(); // 'virtual'
+                            let tsp = self.current_span();
                             // Reconstruct the FULL interface type
                             // (`mem_if#(8,8)`) from the tokens that
                             // `parse_data_type()` consumes. The old code
@@ -386,7 +386,9 @@ impl Parser {
                             let name_start = self.pos + 1;
                             let _dt = self.parse_data_type();
                             let mut toks: Vec<String> = (name_start..self.pos)
-                                .filter_map(|i| self.tokens.get(i).map(|t| t.text.clone()))
+                                .filter_map(|i| {
+                                    self.tokens.get(i).map(|t| self.tokens.text(t).into_owned())
+                                })
                                 .collect();
                             if toks.is_empty() {
                                 toks.push(tok_text.clone());
@@ -444,8 +446,8 @@ impl Parser {
     /// names a 1-bit type and every property typed by the parameter came
     /// out the default type's width.
     fn parse_type_keyword_arg(&mut self, start: usize) -> crate::ast::expr::Expression {
-        let tok_text = self.current().text.clone();
-        let tsp = self.current().span;
+        let tok_text = self.current_text().into_owned();
+        let tsp = self.current_span();
         let dt = self.parse_data_type();
         let sp = self.span_from(start);
         if matches!(&dt, crate::ast::types::DataType::IntegerVector { dimensions, .. }
@@ -498,7 +500,7 @@ impl Parser {
     /// for the caller: `parse_data_type` parses it via
     /// `parse_type_args_hash`, exactly as it did before chains existed.
     pub(super) fn parse_type_name(&mut self) -> TypeName {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut scopes: Vec<crate::ast::types::TypeScope> = Vec::new();
         let mut name = self.parse_identifier();
         loop {
@@ -615,7 +617,7 @@ impl Parser {
     pub(super) fn parse_packed_dimensions(&mut self) -> Vec<PackedDimension> {
         let mut dims = Vec::new();
         while self.at(TokenKind::LBracket) {
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             self.bump();
             if self.at(TokenKind::RBracket) {
                 self.bump();
@@ -662,7 +664,7 @@ impl Parser {
                              must be a range `[N-1:0]`, not a size (IEEE 1800-2023 \
                              A.2.5: the `[constant_expression]` form is \
                              unpacked-only)",
-                        self.current().span,
+                        self.current_span(),
                     ));
                     self.bump();
                     let span = self.span_from(start);
@@ -711,7 +713,7 @@ impl Parser {
     pub(super) fn parse_unpacked_dimensions(&mut self) -> Vec<UnpackedDimension> {
         let mut dims = Vec::new();
         while self.at(TokenKind::LBracket) {
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             self.bump();
             if self.at(TokenKind::RBracket) {
                 self.bump();
@@ -813,7 +815,7 @@ impl Parser {
         )
     }
     fn parse_enum_type(&mut self) -> DataType {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwEnum);
         // Forward enum typedef `typedef enum name;` (§6.18): the identifier after
         // `enum` is the typedef NAME (left for the caller to consume), not a base
@@ -832,7 +834,7 @@ impl Parser {
         // dimension and no base type, which §6.19's enum_base_type does not
         // allow; read it as `enum bit [1:0]`, as other tools do.
         let base_type = if self.at(TokenKind::LBracket) && crate::RELAX_ENUM_NO_BASE.get() {
-            let bstart = self.current().span.start;
+            let bstart = self.current_span().start;
             let dimensions = self.parse_packed_dimensions();
             let span = self.span_from(bstart);
             self.diagnostics
@@ -885,7 +887,7 @@ impl Parser {
                 break;
             }
             let loop_start = self.pos;
-            let mstart = self.current().span.start;
+            let mstart = self.current_span().start;
             let name = self.parse_identifier();
             // IEEE 1800-2017 §6.19 enum_name_declaration:
             //   identifier [ '[' integral_number [ ':' integral_number ] ']' ] [ '=' constant_expression ]
@@ -1005,7 +1007,7 @@ impl Parser {
     }
 
     fn parse_struct_type(&mut self) -> DataType {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let kind = if self.eat(TokenKind::KwUnion).is_some() {
             StructUnionKind::Union
         } else {
@@ -1045,7 +1047,7 @@ impl Parser {
         self.expect(TokenKind::LBrace);
         let mut members = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-            let mstart = self.current().span.start;
+            let mstart = self.current_span().start;
             let loop_start_pos = self.pos;
             let rand_qualifier = match self.current_kind() {
                 TokenKind::KwRand => {
@@ -1061,7 +1063,7 @@ impl Parser {
             let data_type = self.parse_data_type();
             let mut declarators = Vec::new();
             loop {
-                let dstart = self.current().span.start;
+                let dstart = self.current_span().start;
                 let name = self.parse_identifier();
                 let dimensions = self.parse_unpacked_dimensions();
                 let init = if self.eat(TokenKind::Assign).is_some() {

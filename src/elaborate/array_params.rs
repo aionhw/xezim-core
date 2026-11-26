@@ -97,6 +97,30 @@ pub(super) fn elements(
     params: &dyn ParamLookup,
     init_params: &dyn ParamLookup,
 ) -> Option<Vec<(String, Value)>> {
+    elements_with_outer(
+        elab,
+        name,
+        dims,
+        init,
+        override_val,
+        data_type,
+        params,
+        init_params,
+        &[],
+    )
+}
+
+fn elements_with_outer(
+    elab: &ElaboratedModule,
+    name: &str,
+    dims: &[UnpackedDimension],
+    init: Option<&Expression>,
+    override_val: Option<&Value>,
+    data_type: &DataType,
+    params: &dyn ParamLookup,
+    init_params: &dyn ParamLookup,
+    outer_types: &[(DataType, Expression)],
+) -> Option<Vec<(String, Value)>> {
     let overlay;
     let params: &dyn ParamLookup = if needs_elab_fallback(elab, dims, params) {
         overlay = ArrayShapeEnv {
@@ -131,8 +155,18 @@ pub(super) fn elements(
         resolve_typedef_chain(data_type, &elab.typedef_types),
         DataType::Struct(_)
     );
-    let items =
-        init.and_then(|e| pattern_items(e, &outer, dims.len() > 1, struct_elem, init_params));
+    let items = init.and_then(|e| {
+        pattern_items(
+            e,
+            &outer,
+            &dims[1..],
+            struct_elem,
+            data_type,
+            elab,
+            init_params,
+            outer_types,
+        )
+    });
     let elem_w = resolve_type_width_env(data_type, Some(&params), Some(&elab.typedefs)).max(1);
     // An initializer that names another unpacked-array parameter (`= pkg::A`)
     // evaluates to that array packed (see `packed`), so slice it like an
@@ -167,13 +201,16 @@ pub(super) fn elements(
     let mut out = Vec::new();
     for (position, index) in outer.iter().enumerate() {
         let key = format!("{name}[{index}]");
-        let item = items.as_ref().and_then(|v| v.get(position));
+        let item_pair = items.as_ref().and_then(|v| v.get(position));
+        let item = item_pair.map(|(e, _)| e);
+        let elem_outer: &[(DataType, Expression)] =
+            item_pair.map_or(outer_types, |(_, ot)| ot.as_slice());
         let packed = override_val.map(|v| {
             let low = (outer.len() - 1 - position) * row_w;
             v.range_select(low + row_w - 1, low)
         });
         if dims.len() > 1 {
-            out.extend(elements(
+            out.extend(elements_with_outer(
                 elab,
                 &key,
                 &dims[1..],
@@ -182,6 +219,7 @@ pub(super) fn elements(
                 data_type,
                 params,
                 init_params,
+                elem_outer,
             )?);
             continue;
         }
@@ -196,18 +234,57 @@ pub(super) fn elements(
             }
         } else {
             let item = item?;
-            pack_struct_const_value(
+            // §10.9.1: a type key of an enclosing level sets every element
+            // of its type that no index key above set, so it also takes
+            // precedence over the items of a `default:` row pattern.
+            let elem_sig =
+                super::pattern_type_signature(data_type, &elab.typedef_types, init_params);
+            let item = elem_outer
+                .iter()
+                .rev()
+                .find_map(|(kt, v)| {
+                    let ks = super::pattern_type_signature(kt, &elab.typedef_types, init_params)?;
+                    (Some(&ks) == elem_sig.as_ref()).then_some(v)
+                })
+                .unwrap_or(item);
+            // §10.9.2: a `default:` value that reaches a structure element
+            // together with type keys is the default of that element's own
+            // members; the type keys still set the members they match.
+            let spread;
+            let item = if struct_elem
+                && !elem_outer.is_empty()
+                && !matches!(
+                    super::peel_unpacked_typed_pattern(item).kind,
+                    ExprKind::AssignmentPattern(_)
+                ) {
+                spread = Expression::new(
+                    ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(item.clone())]),
+                    item.span,
+                );
+                &spread
+            } else {
+                item
+            };
+            super::pack_struct_const_value_with_outer(
                 data_type,
                 item,
                 init_params,
                 &elab.typedefs,
                 &elab.typedef_types,
+                elem_outer,
             )
-                .or_else(|| {
-                    pack_packed_vector_pattern_env(data_type, item, init_params, &elab.typedef_types)
-                })
-                .map(|v| v.resize(elem_w))
-                .unwrap_or_else(|| eval_init_for_width(item, init_params, elem_w))
+            .or_else(|| {
+                super::pack_packed_dt_pattern(
+                    data_type,
+                    item,
+                    init_params,
+                    Some(&elab.typedefs),
+                    &elab.typedef_types,
+                    elem_outer,
+                )
+            })
+            .map(|v| v.resize(elem_w))
+            .unwrap_or_else(|| eval_init_for_width(item, init_params, elem_w))
         };
         if !value.is_real {
             value.is_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
@@ -261,21 +338,80 @@ fn referenced_array_elements(
 /// at index `k` (not at position `k`), and `default:` fills every index left
 /// unset. For a nested array a non-pattern `default:` reaches every leaf, so
 /// each missing row becomes `'{default: v}` (`int a [2][3] = '{default: 5}`).
+fn subarray_type_matches(
+    elem_dt: &DataType,
+    rest: &[UnpackedDimension],
+    key_dt: &DataType,
+    elab: &ElaboratedModule,
+    params: &dyn ParamLookup,
+) -> bool {
+    let DataType::TypeReference {
+        name, dimensions, ..
+    } = key_dt
+    else {
+        return false;
+    };
+    if !dimensions.is_empty() {
+        return false;
+    }
+    let key = if name.scopes.is_empty() {
+        name.name.name.clone()
+    } else {
+        name.qualified()
+    };
+    let Some(unpacked) = elab.typedef_unpacked_dims.get(&key) else {
+        return false;
+    };
+    let Some(rest_shape) = declared_unpacked_dims_env(rest, params) else {
+        return false;
+    };
+    let norm = normalize_unpacked_dims_env(unpacked, params, &elab.typedef_types);
+    let Some(key_shape) = declared_unpacked_dims_env(&norm, params) else {
+        return false;
+    };
+    if rest_shape != key_shape {
+        return false;
+    }
+    let Some(target) = lookup_scoped_type(name, &elab.typedef_types) else {
+        return false;
+    };
+    let Some(ks) = super::pattern_type_signature(target, &elab.typedef_types, params) else {
+        return false;
+    };
+    let Some(es) = super::pattern_type_signature(elem_dt, &elab.typedef_types, params) else {
+        return false;
+    };
+    ks == es
+}
+
 fn pattern_items(
     e: &Expression,
     outer: &[i64],
-    nested: bool,
+    rest: &[UnpackedDimension],
     struct_elem: bool,
+    elem_dt: &DataType,
+    elab: &ElaboratedModule,
     params: &dyn ParamLookup,
-) -> Option<Vec<Expression>> {
+    outer_types: &[(DataType, Expression)],
+) -> Option<Vec<(Expression, Vec<(DataType, Expression)>)>> {
+    let nested = !rest.is_empty();
     let items = match &super::peel_unpacked_typed_pattern(e).kind {
-        ExprKind::Concatenation(v) => return Some(v.clone()),
+        ExprKind::Concatenation(v) => {
+            return Some(
+                v.iter()
+                    .map(|x| (x.clone(), outer_types.to_vec()))
+                    .collect(),
+            );
+        }
         ExprKind::AssignmentPattern(items) => items,
         _ => return None,
     };
-    if items
-        .iter()
-        .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
+    // An empty pattern stands for a row that only the type keys of an
+    // enclosing level reach; it has no positional items.
+    if !items.is_empty()
+        && items
+            .iter()
+            .all(|it| matches!(it, AssignmentPatternItem::Ordered(_)))
     {
         if let [AssignmentPatternItem::Ordered(only)] = items.as_slice()
             && let ExprKind::Replication { count, exprs } = &only.kind
@@ -289,15 +425,31 @@ fn pattern_items(
                     .iter()
                     .cycle()
                     .take(reps * exprs.len())
-                    .cloned()
+                    .map(|x| (x.clone(), outer_types.to_vec()))
                     .collect(),
             );
         }
-        return Some(items.iter().map(|it| it.expr().clone()).collect());
+        return Some(
+            items
+                .iter()
+                .map(|it| (it.expr().clone(), outer_types.to_vec()))
+                .collect(),
+        );
     }
     let mut slots: Vec<Option<&Expression>> = vec![None; outer.len()];
+    let mut local_types: Vec<(DataType, Expression)> = Vec::new();
     let mut default = None;
     for it in items {
+        if let Some((kt, v)) = super::pattern_item_type_key(
+            it,
+            &elab.typedef_types,
+            params,
+            "",
+            &|n| params.contains_key(n),
+        ) {
+            local_types.push((kt, v.clone()));
+            continue;
+        }
         match it {
             AssignmentPatternItem::Keyed(key, v) => {
                 let index = const_eval_pattern_index_env(
@@ -318,18 +470,54 @@ fn pattern_items(
             _ => return None,
         }
     }
+    let mut combined = local_types;
+    combined.extend(outer_types.iter().cloned());
+    let matched_type = if nested {
+        combined.iter().rev().find_map(|(kt, v)| {
+            subarray_type_matches(elem_dt, rest, kt, elab, params).then_some(v)
+        })
+    } else {
+        super::pattern_type_signature(elem_dt, &elab.typedef_types, params).and_then(|esig| {
+            combined.iter().rev().find_map(|(kt, v)| {
+                (super::pattern_type_signature(kt, &elab.typedef_types, params).as_ref()
+                    == Some(&esig))
+                .then_some(v)
+            })
+        })
+    };
+    let is_agg = nested
+        || struct_elem
+        || super::pattern_slot_is_aggregate(elem_dt, &elab.typedef_types) == Some(true);
     slots
         .into_iter()
-        .map(|slot| match (slot, default) {
-            (Some(v), _) => Some(v.clone()),
-            (None, Some(d)) if nested && !default_is_row(d, struct_elem) => {
-                Some(Expression::new(
-                    ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(d.clone())]),
-                    d.span,
-                ))
+        .map(|slot| match slot {
+            Some(v) => Some((v.clone(), outer_types.to_vec())),
+            None => {
+                if let Some(tv) = matched_type {
+                    return Some((tv.clone(), Vec::new()));
+                }
+                if let Some(d) = default {
+                    if nested && !default_is_row(d, struct_elem) {
+                        return Some((
+                            Expression::new(
+                                ExprKind::AssignmentPattern(vec![AssignmentPatternItem::Default(
+                                    d.clone(),
+                                )]),
+                                d.span,
+                            ),
+                            combined.clone(),
+                        ));
+                    }
+                    return Some((d.clone(), combined.clone()));
+                }
+                if !combined.is_empty() && is_agg {
+                    return Some((
+                        Expression::new(ExprKind::AssignmentPattern(Vec::new()), e.span),
+                        combined.clone(),
+                    ));
+                }
+                None
             }
-            (None, Some(d)) => Some(d.clone()),
-            (None, None) => None,
         })
         .collect()
 }
@@ -424,6 +612,14 @@ pub(super) fn compute(
 }
 
 impl RegisteredArray {
+    pub(super) fn bind_local(&self, name: &str, params: &mut HashMap<String, Value>) {
+        params.insert(name.to_owned(), self.whole.clone());
+        params.extend(self.values.iter().cloned());
+        if let Some(fields) = &self.fields {
+            super::tls_register_struct_layout(name, fields);
+        }
+    }
+
     /// Write-only phase: apply the data computed by `compute` into an
     /// `ElaboratedModule`. Takes the `prefix` separately (not threaded through
     /// the struct) so the same computed value can back several prefixes.

@@ -7,9 +7,9 @@ use crate::ast::types::{DataType, Lifetime, SimpleType};
 use crate::lexer::token::TokenKind;
 use std::collections::HashMap;
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub(super) fn parse_statement(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
 
         // IEEE 1800-2023 §9.3.1: optional statement label
         //   <label> : <statement_item> ;
@@ -253,7 +253,8 @@ impl Parser {
                     && self.at(TokenKind::KwConst)
                     && crate::RELAX_STATIC_CONST.get()
                 {
-                    let span = self.bump().span;
+                    let tok = self.bump();
+                    let span = self.token_span(tok);
                     self.diagnostics
                         .push(crate::diagnostics::Diagnostic::warning(
                             "`const` belongs before the lifetime; read as `const static` \
@@ -272,7 +273,7 @@ impl Parser {
                 };
                 let mut declarators = Vec::new();
                 loop {
-                    let ds = self.current().span.start;
+                    let ds = self.current_span().start;
                     let name = self.parse_identifier();
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
@@ -739,7 +740,7 @@ impl Parser {
                 };
                 let mut declarators = Vec::new();
                 loop {
-                    let ds = self.current().span.start;
+                    let ds = self.current_span().start;
                     let name = self.parse_identifier();
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
@@ -782,7 +783,7 @@ impl Parser {
                 let data_type = self.parse_data_type();
                 let mut declarators = Vec::new();
                 loop {
-                    let ds = self.current().span.start;
+                    let ds = self.current_span().start;
                     let name = self.parse_identifier();
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
@@ -814,20 +815,17 @@ impl Parser {
             // Variable declaration (data type keywords)
             k if self.is_data_type_keyword()
                 && k != TokenKind::KwEvent
-                && !(self.peek_kind() == TokenKind::IntegerLiteral && {
-                    let next_text = self
+                && !(self.peek_kind() == TokenKind::IntegerLiteral
+                    && self
                         .tokens
                         .get(self.pos + 1)
-                        .map(|t| t.text.as_str())
-                        .unwrap_or("");
-                    next_text == "'"
-                }) =>
+                        .is_some_and(|t| self.token_text(t) == "'")) =>
             {
                 let data_type = self.parse_data_type();
                 let lifetime = None;
                 let mut declarators = Vec::new();
                 loop {
-                    let ds = self.current().span.start;
+                    let ds = self.current_span().start;
                     let name = self.parse_identifier();
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
@@ -857,7 +855,7 @@ impl Parser {
                 )
             }
             TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
                     self.bump();
@@ -874,7 +872,7 @@ impl Parser {
             TokenKind::KwEvent => {
                 // §6.17/§15.5: block-local `event e;` declares a real event —
                 // it was parsed and DISCARDED, so a later `->e` errored.
-                let ev_span = self.current().span;
+                let ev_span = self.current_span();
                 self.bump();
                 let mut declarators = Vec::new();
                 loop {
@@ -924,45 +922,12 @@ impl Parser {
                     && (matches!(
                         self.peek_kind(),
                         TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
-                    ) || (self.peek_kind() == TokenKind::LBracket && {
-                        // Look-ahead: balance brackets and check what follows.
-                        // §7.4.1: a typedef may carry SEVERAL packed dims
-                        // (`s_t [1:0][1:0] m;`), so walk every consecutive
-                        // balanced group before judging — stopping at the
-                        // first `]` saw the second `[` and sent the declaration
-                        // down the expression path (a parse error), while the
-                        // same declaration at module scope parsed fine.
-                        let mut depth: i32 = 0;
-                        let mut k: usize = 0;
-                        let mut next_after = TokenKind::Eof;
-                        loop {
-                            let kind = self.peek_kind_n(k + 1);
-                            match kind {
-                                TokenKind::LBracket => depth += 1,
-                                TokenKind::RBracket => {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        next_after = self.peek_kind_n(k + 2);
-                                        if next_after != TokenKind::LBracket {
-                                            break;
-                                        }
-                                    }
-                                }
-                                TokenKind::Eof => break,
-                                _ => {}
-                            }
-                            k += 1;
-                            if k > 64 {
-                                break;
-                            }
-                        }
-                        matches!(next_after, TokenKind::Identifier)
-                    })) =>
+                    ) || self.peek_is_packed_dims_then_identifier()) =>
             {
                 let data_type = self.parse_data_type();
                 let mut declarators = Vec::new();
                 loop {
-                    let ds = self.current().span.start;
+                    let ds = self.current_span().start;
                     let name = self.parse_identifier();
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
@@ -1012,7 +977,7 @@ impl Parser {
                         TokenKind::ArithShiftRightAssign,
                     ])
                 {
-                    let op_kind = self.current().kind.clone();
+                    let op_kind = self.current_kind().clone();
                     self.bump();
                     // §9.4.5 intra-assignment timing (only on plain `=`).
                     if op_kind == TokenKind::Assign {
@@ -1183,7 +1148,8 @@ impl Parser {
         // inside an if-block produced 15 cascade errors).
         let mut skipped_directive = false;
         while self.at(TokenKind::Directive) {
-            let bare = self.current().text.trim_start_matches('`');
+            let text = self.current_text();
+            let bare = text.trim_start_matches('`');
             if !CLOSING_DIRECTIVES.contains(&bare) {
                 break;
             }
@@ -1218,7 +1184,7 @@ impl Parser {
     }
 
     fn parse_seq_block(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let prefixed = self.after_block_label();
         self.expect(TokenKind::KwBegin);
         let name = if self.eat(TokenKind::Colon).is_some() {
@@ -1257,7 +1223,7 @@ impl Parser {
     }
 
     fn parse_par_block(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let prefixed = self.after_block_label();
         self.expect(TokenKind::KwFork);
         let name = if self.eat(TokenKind::Colon).is_some() {
@@ -1345,7 +1311,7 @@ impl Parser {
     }
 
     fn parse_if_with_priority(&mut self, up: Option<UniquePriority>) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwIf);
         self.expect(TokenKind::LParen);
         // Clear any stale bindings (e.g. from a `matches` in a prior
@@ -1380,7 +1346,7 @@ impl Parser {
     }
 
     fn parse_case_with_priority(&mut self, up: Option<UniquePriority>) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let kind = match self.bump().kind {
             TokenKind::KwCasex => CaseKind::Casex,
             TokenKind::KwCasez => CaseKind::Casez,
@@ -1398,7 +1364,8 @@ impl Parser {
         {
             // XEZIM_RELAX_CASEX_INSIDE (#626): only `case` takes `inside`
             // (A.6.7); read `casex (e) inside` as `case (e) inside`.
-            let span = self.bump().span;
+            let tok = self.bump();
+            let span = self.token_span(tok);
             self.diagnostics
                 .push(crate::diagnostics::Diagnostic::warning(
                     "`inside` follows only `case`; read as `case (...) inside` \
@@ -1419,7 +1386,7 @@ impl Parser {
         if self.eat(TokenKind::KwMatches).is_some() {
             let mut items = Vec::new();
             while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
-                let istart = self.current().span.start;
+                let istart = self.current_span().start;
                 let before = self.pos;
                 if self.eat(TokenKind::KwDefault).is_some() {
                     self.eat(TokenKind::Colon);
@@ -1475,7 +1442,7 @@ impl Parser {
 
         let mut items = Vec::new();
         while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
-            let istart = self.current().span.start;
+            let istart = self.current_span().start;
             if self.eat(TokenKind::KwDefault).is_some() {
                 self.eat(TokenKind::Colon);
                 let stmt = self.parse_statement();
@@ -1495,7 +1462,7 @@ impl Parser {
                     // the range as a single Expr::Range value; downstream
                     // elaboration / case-eval can map it.
                     if matches!(kind, CaseKind::CaseInside) && self.at(TokenKind::LBracket) {
-                        let bstart = self.current().span.start;
+                        let bstart = self.current_span().start;
                         self.bump(); // [
                         let lo = self.parse_expression();
                         self.expect(TokenKind::Colon);
@@ -1536,8 +1503,44 @@ impl Parser {
         )
     }
 
+    /// At an identifier followed by one or more balanced `[...]` groups and
+    /// then an identifier: `typedef_t [packed-dims] var`, a declaration, as
+    /// opposed to `arr[idx] = ...`. §7.4.1: a typedef may carry SEVERAL
+    /// packed dims (`s_t [1:0][1:0] m;`), so every consecutive balanced group
+    /// is walked before judging.
+    fn peek_is_packed_dims_then_identifier(&self) -> bool {
+        if self.peek_kind() != TokenKind::LBracket {
+            return false;
+        }
+        let mut depth: i32 = 0;
+        let mut k: usize = 0;
+        let mut next_after = TokenKind::Eof;
+        loop {
+            let kind = self.peek_kind_n(k + 1);
+            match kind {
+                TokenKind::LBracket => depth += 1,
+                TokenKind::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        next_after = self.peek_kind_n(k + 2);
+                        if next_after != TokenKind::LBracket {
+                            break;
+                        }
+                    }
+                }
+                TokenKind::Eof => break,
+                _ => {}
+            }
+            k += 1;
+            if k > 64 {
+                break;
+            }
+        }
+        matches!(next_after, TokenKind::Identifier)
+    }
+
     fn parse_for_statement(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwFor);
         self.expect(TokenKind::LParen);
         // Init — IEEE 1800-2023 §12.7.1 allows a comma-separated list, each
@@ -1574,10 +1577,10 @@ impl Parser {
                 if var_prefix
                     || self.is_data_type_keyword()
                     || (self.at(TokenKind::Identifier)
-                        && matches!(
+                        && (matches!(
                             self.peek_kind(),
                             TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash
-                        ))
+                        ) || self.peek_is_packed_dims_then_identifier()))
                 {
                     let dt = self.parse_data_type();
                     let name = self.parse_identifier();
@@ -1649,7 +1652,7 @@ impl Parser {
                         TokenKind::ArithShiftRightAssign,
                     ])
                 {
-                    let op_kind = self.current().kind;
+                    let op_kind = self.current_kind();
                     self.bump();
                     let rhs = self.parse_expression();
                     let span = self.span_from(start);
@@ -1781,7 +1784,7 @@ impl Parser {
     }
 
     fn parse_foreach_statement(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwForeach);
         self.expect(TokenKind::LParen);
 
@@ -1826,7 +1829,7 @@ impl Parser {
     }
 
     fn parse_while_statement(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwWhile);
         self.expect(TokenKind::LParen);
         let condition = self.parse_expression();
@@ -1842,7 +1845,7 @@ impl Parser {
     }
 
     fn parse_do_while_statement(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwDo);
         let body = self.parse_statement();
         self.expect(TokenKind::KwWhile);
@@ -1860,7 +1863,7 @@ impl Parser {
     }
 
     fn parse_repeat_statement(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwRepeat);
         self.expect(TokenKind::LParen);
         let count = self.parse_expression();
@@ -1928,7 +1931,7 @@ impl Parser {
             // XEZIM_RELAX_EVENT_THIS (#625): a hierarchical identifier cannot
             // start with `this` (A.6.5), so `@this.ev` needs parentheses;
             // read it as `@(this.ev)`, as other tools do.
-            let span = self.current().span;
+            let span = self.current_span();
             self.diagnostics
                 .push(crate::diagnostics::Diagnostic::warning(
                     "an event control on `this.` needs parentheses; read as `@(this. ...)` \
@@ -1937,7 +1940,7 @@ impl Parser {
                 ));
             EventControl::EventExpr(self.parse_event_expression_term())
         } else {
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             let expr = self.parse_hierarchical_identifier_expr();
             // §9.4.2: `@name` is `@(name)`. A plain identifier keeps the bare
             // form; a member name (`@vif.cb`, `@h.ev`) takes the one-term
@@ -1968,7 +1971,7 @@ impl Parser {
     }
 
     pub(super) fn parse_event_expression_term(&mut self) -> Vec<EventExpr> {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         // A parenthesized event expression can contain edge keywords and
         // unions. A parenthesized arithmetic expression must still reach
         // the expression parser, including operators after its closing ')'.
@@ -2043,7 +2046,7 @@ impl Parser {
     }
 
     pub(super) fn parse_assertion_statement(&mut self) -> AssertionStatement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let kind = match self.bump().kind {
             TokenKind::KwAssume => AssertionKind::Assume,
             TokenKind::KwCover => AssertionKind::Cover,
@@ -2334,7 +2337,7 @@ impl Parser {
     /// `randcase { weight : statement }+ endcase`
     /// Lowered to `if (w0 != 0) s0 else if (w1 != 0) s1 else ...`.
     fn parse_randcase(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwRandcase);
         let mut items: Vec<(Expression, Statement)> = Vec::new();
         while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
@@ -2353,7 +2356,7 @@ impl Parser {
     /// `randsequence ( name ) production_list endsequence`.
     /// Lowered by recursively expanding `name`. Productions are kept in a map.
     fn parse_randsequence(&mut self) -> Statement {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwRandsequence);
         let main_name = if self.eat(TokenKind::LParen).is_some() {
             let id = self.parse_identifier();
@@ -2402,7 +2405,7 @@ impl Parser {
                         DataType::IntegerAtom {
                             kind: crate::ast::types::IntegerAtomType::Int,
                             signing: None,
-                            span: self.current().span,
+                            span: self.current_span(),
                         }
                     };
                     if !self.at(TokenKind::Identifier) {
@@ -2522,7 +2525,7 @@ impl Parser {
                 // in an `RsAction` that catches it at the production
                 // boundary. `break` inside the block keeps its usual
                 // meaning (abort the whole sequence).
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let mut stmts = Vec::new();
                 while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {

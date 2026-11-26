@@ -93,6 +93,11 @@ struct Info {
     /// Value names (subroutines, parameters, variables, `let`s) declared by
     /// more than one package, or by a package and `$unit`.
     colliding_values: HashSet<String>,
+    /// Value parameter names any package declares. The elaborator binds a
+    /// package's bare parameter names only while it registers that package
+    /// (§26.3), so references from data types in its subroutines and
+    /// classes, sized later, are spelled `pkg::name` (see `resolve_value`).
+    pkg_params: HashSet<String>,
     /// Package VARIABLE names that two or more packages declare. Every
     /// package's variables share one design-wide bare namespace at run
     /// time, so each such variable is renamed to `pkg::name` and every
@@ -1008,6 +1013,10 @@ fn collect(descs: &[Description]) -> Option<Info> {
     let colliding = clash(|pi| &pi.types, &other);
     let colliding_members = clash(|pi| &pi.members, &other_members);
     let colliding_values = clash(|pi| &pi.values, &other_values);
+    let pkg_params: HashSet<String> = pkgs
+        .values()
+        .flat_map(|pi| pi.params.iter().cloned())
+        .collect();
     // A name some `import Q::n;` / `export Q::n;` spells out keeps its
     // declared name: the import and export checks look it up by that name.
     let mut explicit_named: HashSet<String> = HashSet::default();
@@ -1129,6 +1138,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
     if colliding.is_empty()
         && colliding_members.is_empty()
         && colliding_values.is_empty()
+        && pkg_params.is_empty()
         && class_colliding.is_empty()
         && hiding.is_empty()
         && classes.values().all(|ci| ci.inline.is_empty())
@@ -1140,6 +1150,7 @@ fn collect(descs: &[Description]) -> Option<Info> {
         colliding,
         colliding_members,
         colliding_values,
+        pkg_params,
         mangled_vars,
         class_colliding,
         hiding,
@@ -1314,6 +1325,14 @@ fn package_item_values(pi: &PackageItem, out: &mut HashSet<String>) {
         }
         PackageItem::Let(l) => {
             out.insert(l.name.name.clone());
+        }
+        // §16.8, §16.12, §26.3: a named sequence or property is a package
+        // value too: two packages declaring one name share one bare key.
+        PackageItem::Property(p) => {
+            out.insert(p.name.name.clone());
+        }
+        PackageItem::Sequence(s) => {
+            out.insert(s.name.name.clone());
         }
         _ => {}
     }
@@ -1512,10 +1531,11 @@ impl Rw<'_> {
     /// bare name, where the last package registered wins, so the reference
     /// is spelled `pkg::n`, the qualified lookup.
     fn resolve_value(&self, n: &str) -> Option<String> {
-        if !self.info.colliding_values.contains(n) {
+        let colliding = self.info.colliding_values.contains(n);
+        if !colliding && (self.in_const == 0 || !self.info.pkg_params.contains(n)) {
             return None;
         }
-        for f in self.frames.iter().rev() {
+        for (depth, f) in self.frames.iter().rev().enumerate() {
             if let Some(p) = &f.pkg {
                 if self
                     .info
@@ -1524,9 +1544,11 @@ impl Rw<'_> {
                     .is_some_and(|pi| pi.values.contains(n))
                 {
                     // §26.3: parameter references in package functions and
-                    // classes keep the package's value when a module owns
-                    // the same bare name in the flattened design.
-                    return self.info.pkgs[p].params.contains(n).then(|| p.clone());
+                    // classes keep the package's value, which is bound by
+                    // its bare name only while the package registers, and
+                    // which a module may shadow in the flattened design.
+                    return (self.info.pkgs[p].params.contains(n) && (colliding || depth > 0))
+                        .then(|| p.clone());
                 }
             }
             let inherited = f.inherits
@@ -1539,6 +1561,9 @@ impl Rw<'_> {
                     }));
             if f.values.contains(n) || inherited {
                 return None;
+            }
+            if !colliding && (f.pkg.is_none() || depth == 0) {
+                continue;
             }
             if let Some(q) = f.explicit.get(n).or(f.bound.borrow().get(n)) {
                 return self.info.value_owner(q, n, 0);
@@ -1860,7 +1885,7 @@ impl Rw<'_> {
         }
     }
 
-    fn type_name(&mut self, tn: &mut TypeName) {
+    fn type_name(&mut self, tn: &mut TypeName, own_args: bool) {
         for s in &mut tn.scopes {
             for a in &mut s.type_args {
                 self.expr(a);
@@ -1871,13 +1896,27 @@ impl Rw<'_> {
             return;
         }
         // `C::t` (`Outer::Inner::t`, `pkg::C::t`) naming a renamed class-scoped type.
+        let segs: Vec<String> = tn.scopes.iter().map(|s| s.name.name.clone()).collect();
         if tn.scopes.iter().all(|s| s.type_args.is_empty()) {
-            let segs: Vec<String> = tn.scopes.iter().map(|s| s.name.name.clone()).collect();
             if let Some(m) = self.class_scoped_type(&segs, &tn.name.name) {
                 tn.scopes.clear();
                 tn.name.name = m;
                 return;
             }
+        } else if !own_args
+            && !self.is_package(&segs[0])
+            && let Some(m) = self.class_scoped_type(&segs, &tn.name.name)
+            && self.info.classes.contains_key(&m)
+        {
+            // §8.23, §8.25: `C#(..)::Inner` naming a nested class this pass
+            // renamed (another class nests one of the same name): the
+            // nested class goes by its renamed spelling, and the scopes keep
+            // the specialization its enclosing parameters take. The bare
+            // name named whichever class kept it, or none (#1273). A
+            // `pkg::C#(..)::Inner` reference, or one with arguments of its
+            // own, is resolved through its qualified spelling at run time.
+            tn.name.name = m;
+            return;
         }
         let first = tn.scopes[0].name.name.clone();
         if self.is_package(&first) {
@@ -1928,7 +1967,7 @@ impl Rw<'_> {
                 type_args,
                 ..
             } => {
-                self.type_name(name);
+                self.type_name(name, !type_args.is_empty());
                 self.packed(dimensions);
                 type_args.iter_mut().for_each(|a| self.expr(a));
             }
@@ -2041,9 +2080,7 @@ impl Rw<'_> {
         }
         let n = name.name.name.as_str();
         // A type of that name in scope keeps the associative reading.
-        if !matches!(self.resolve(n), Res::Keep)
-            || self.frames.iter().any(|f| f.types.contains(n))
-            || !self.info.colliding_values.contains(n)
+        if !matches!(self.resolve(n), Res::Keep) || self.frames.iter().any(|f| f.types.contains(n))
         {
             return None;
         }
@@ -2187,7 +2224,9 @@ impl Rw<'_> {
                         if let Res::To(m) = self.resolve(n) {
                             h.path[0].name.name = m;
                         }
-                    } else if self.info.colliding_values.contains(n) {
+                    } else if self.info.colliding_values.contains(n)
+                        || (self.in_const > 0 && self.info.pkg_params.contains(n))
+                    {
                         if let Some(p) = self.resolve_value(n) {
                             let span = e.span;
                             let member = h.path[0].name.clone();
@@ -2257,9 +2296,18 @@ impl Rw<'_> {
             ExprKind::AssignmentPattern(items) => {
                 for it in items {
                     match it {
-                        AssignmentPatternItem::Ordered(x)
-                        | AssignmentPatternItem::Named(_, x)
-                        | AssignmentPatternItem::Default(x) => self.expr(x),
+                        AssignmentPatternItem::Ordered(x) | AssignmentPatternItem::Default(x) => {
+                            self.expr(x)
+                        }
+                        AssignmentPatternItem::Named(id, x) => {
+                            // §10.9.1/§10.9.2/§26.3: record a lexically resolved
+                            // colliding package/class typedef on `type_key` while
+                            // preserving `id.ident` for struct member matching.
+                            if let Res::To(m) = self.resolve(&id.name) {
+                                id.type_key = Some(m.into_boxed_str());
+                            }
+                            self.expr(x);
+                        }
                         AssignmentPatternItem::Typed(t, x) => {
                             self.dtype(t);
                             self.expr(x);
@@ -2304,15 +2352,17 @@ impl Rw<'_> {
                     let tokens = Lexer::new(args_text).tokenize();
                     let mut edits = Vec::new();
                     for (i, token) in tokens.iter().enumerate() {
-                        if token.kind == TokenKind::Identifier
-                            && self.info.hiding.contains(&token.text)
-                            && !self.value_shadowed(&token.text)
-                            && !i.checked_sub(1).is_some_and(|p| {
-                                matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
-                            })
-                            && let Res::To(named) = self.resolve(&token.text)
-                        {
-                            edits.push((token.span, named));
+                        if token.kind == TokenKind::Identifier {
+                            let name = tokens.text(token);
+                            if self.info.hiding.contains(name.as_ref())
+                                && !self.value_shadowed(&name)
+                                && !i.checked_sub(1).is_some_and(|p| {
+                                    matches!(tokens[p].kind, TokenKind::Dot | TokenKind::DoubleColon)
+                                })
+                                && let Res::To(named) = self.resolve(&name)
+                            {
+                                edits.push((tokens.span(token), named));
+                            }
                         }
                     }
                     for (span, named) in edits.into_iter().rev() {
@@ -2786,22 +2836,30 @@ impl Rw<'_> {
     fn function(&mut self, f: &mut FunctionDeclaration) {
         let method = !f.name.scopes.is_empty();
         self.subroutine_name(&mut f.name);
+        // The return type and formals are sized after the package pass, so
+        // they need a frame nested in the package's for `resolve_value` to
+        // qualify a package parameter in them (its `depth > 0` check).
+        self.frames.push(Frame::default());
         self.dtype(&mut f.return_type);
         let pushed = self.push_method_class(&f.name);
         self.subroutine_body(&mut f.ports, &mut f.items, method);
         if pushed {
             self.frames.pop();
         }
+        self.frames.pop();
     }
 
     fn task(&mut self, t: &mut TaskDeclaration) {
         let method = !t.name.scopes.is_empty();
         self.subroutine_name(&mut t.name);
+        // A nested frame for the formals, as in `function`.
+        self.frames.push(Frame::default());
         let pushed = self.push_method_class(&t.name);
         self.subroutine_body(&mut t.ports, &mut t.items, method);
         if pushed {
             self.frames.pop();
         }
+        self.frames.pop();
     }
 
     /// §8.24: the formals and body of an out-of-block method `C::f` are in
@@ -2972,7 +3030,10 @@ impl Rw<'_> {
                     | ClassMethodKind::Extern(fd) => self.function(fd),
                     ClassMethodKind::Task(td) => self.task(td),
                 },
-                ClassItem::Constraint(cc) => cc.items.iter_mut().for_each(|i| self.constraint(i)),
+                ClassItem::Constraint(cc) => std::sync::Arc::make_mut(cc)
+                    .items
+                    .iter_mut()
+                    .for_each(|i| self.constraint(i)),
                 ClassItem::Typedef(td) => {
                     // §8.3/§6.18: a class typedef whose name is declared
                     // elsewhere too is renamed to its class-qualified spelling.
@@ -3058,9 +3119,15 @@ impl Rw<'_> {
         items: &mut [ModuleItem],
     ) {
         // §23.2/§6.5: body classes are not visible in header defaults.
+        // §26.3: only module-header imports (leading ImportDeclarations before
+        // body items) are visible in parameter/port headers; body imports take
+        // effect at their declaration point.
         let mut f = Self::module_frame(params, ports, &[]);
         f.module = Some(name.to_string());
-        for it in items.iter() {
+        for it in items
+            .iter()
+            .take_while(|it| matches!(it, ModuleItem::ImportDeclaration(_)))
+        {
             if let ModuleItem::ImportDeclaration(imp) = it {
                 f.add_imports(imp);
             }
@@ -3075,6 +3142,10 @@ impl Rw<'_> {
                 self.unpacked(&mut p.dimensions);
                 self.opt(&mut p.default);
             }
+        }
+        if let Some(hdr) = self.frames.last_mut() {
+            hdr.explicit.clear();
+            hdr.wild.clear();
         }
         let mut body = Frame::default();
         // §23.2/§26.3: the header and body form one module scope.
@@ -3144,6 +3215,7 @@ impl Rw<'_> {
             ModuleItem::GateInstantiation(g) => {
                 self.opt(&mut g.delay);
                 self.opt(&mut g.delay_fall);
+                self.opt(&mut g.delay_off);
                 for i in &mut g.instances {
                     i.terminals.iter_mut().for_each(|t| self.expr(t));
                 }
@@ -3182,7 +3254,12 @@ impl Rw<'_> {
             }
             ModuleItem::FunctionDeclaration(f) => self.function(f),
             ModuleItem::TaskDeclaration(t) => self.task(t),
-            ModuleItem::ImportDeclaration(imp) => self.import_decl(imp),
+            ModuleItem::ImportDeclaration(imp) => {
+                if let Some(f) = self.frames.last_mut() {
+                    f.add_imports(imp);
+                }
+                self.import_decl(imp);
+            }
             ModuleItem::ClassDeclaration(c) => {
                 if self.info.hiding.contains(&c.name.name)
                     && let Res::To(named) = self.resolve(&c.name.name)
@@ -3490,7 +3567,13 @@ fn module_item_names(items: &[ModuleItem], f: &mut Frame) {
             ModuleItem::LetDeclaration(l) => {
                 f.values.insert(l.name.name.clone());
             }
-            ModuleItem::ImportDeclaration(imp) => f.add_imports(imp),
+            ModuleItem::PropertyDeclaration(p) => {
+                f.values.insert(p.name.name.clone());
+            }
+            ModuleItem::SequenceDeclaration(s) => {
+                f.values.insert(s.name.name.clone());
+            }
+            ModuleItem::ImportDeclaration(_) => {}
             ModuleItem::GenerateRegion(g) => module_item_names(&g.items, f),
             _ => {}
         }

@@ -23,7 +23,7 @@ use std::sync::Arc;
 /// the name is declared there as something else (hiding outer lets).
 pub(super) type LetScope = HashMap<String, Option<Arc<LetDeclaration>>>;
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub(super) fn push_let_scope(&mut self) {
         self.let_scopes.push(LetScope::new());
     }
@@ -156,7 +156,7 @@ impl Parser {
     /// expression ;` (A.2.12). The declaration becomes visible in the current
     /// scope once parsed.
     pub(super) fn parse_let_declaration(&mut self) -> LetDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwLet);
         let name = self.parse_identifier();
         let ports = self.parse_let_port_list();
@@ -201,7 +201,7 @@ impl Parser {
         }
         let mut ports = Vec::new();
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             let data_type: Option<DataType> = if self.eat(TokenKind::KwUntyped).is_some() {
                 None
             } else if self.is_data_type_keyword() {

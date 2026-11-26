@@ -4,8 +4,9 @@
 //! opt-in `RelaxFlag` switches of the same batch (#608, #622-#629) are
 //! process-wide and are not exercised here.
 
+use sv_parser::RELAX_CROSS_HIER_ITEM;
 use sv_parser::ast::Description;
-use sv_parser::ast::decl::{CovergroupItem, ModuleItem, PackageItem};
+use sv_parser::ast::decl::{CovergroupItem, CrossSelect, ModuleItem, PackageItem};
 use sv_parser::ast::expr::{ExprKind, NumberLiteral};
 use sv_parser::ast::types::NetType;
 use sv_parser::parse;
@@ -352,7 +353,10 @@ fn keyword_set_frees_later_words() {
     let reserved = |version: &str, word: &str| {
         let src = format!("`begin_keywords \"{version}\"\n{word}\n`end_keywords\n");
         let tokens = Lexer::new(&src).tokenize();
-        let tok = tokens.iter().find(|t| t.text == word).expect("word token");
+        let tok = tokens
+            .iter()
+            .find(|&t| tokens.text(t) == word)
+            .expect("word token");
         tok.kind != TokenKind::Identifier
     };
     for (version, names, keywords) in [
@@ -384,4 +388,59 @@ fn keyword_set_frees_later_words() {
             assert!(reserved(version, w), "{version}: {w} is reserved");
         }
     }
+}
+
+/// §19.6.1: dotted `binsof(...)` in a cross select when
+/// `RELAX_CROSS_HIER_ITEM` is on (extension to `bins_expression`).
+#[test]
+fn cross_binsof_hier_bins_expression_relax() {
+    RELAX_CROSS_HIER_ITEM.set(true);
+    let result = parse(
+        "typedef struct packed { logic field; } inner_t;\n module leaf; logic sig; endmodule\n\
+     module leaf2; inner_t inner; endmodule\n module top;\n  leaf u(); leaf2 s(); bit par;\n\
+     covergroup cg;\n   u: coverpoint par { bins lo = {0}; bins hi = {1}; }\n\
+     coverpoint u.sig { bins slo = {0}; bins shi = {1}; }\n\
+     X: cross u, u.sig { ignore_bins par_lo = binsof(u.lo); }\n\
+     X2: cross u, s.inner.field { illegal_bins bad = binsof(s.inner.field); }\n\
+    endgroup\n endmodule\n",
+    );
+    RELAX_CROSS_HIER_ITEM.set(false);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let Some(Description::Module(m)) = result.source.descriptions.last() else {
+        panic!("missing module");
+    };
+    let cg = m
+        .items
+        .iter()
+        .find_map(|i| match i {
+            ModuleItem::CovergroupDeclaration(cg) => Some(cg),
+            _ => None,
+        })
+        .expect("covergroup");
+    let cross = cg
+        .items
+        .iter()
+        .find_map(|i| match i {
+            CovergroupItem::Cross(c) if c.name.as_ref().is_some_and(|n| n.name == "X2") => Some(c),
+            _ => None,
+        })
+        .expect("cross X2");
+    let CrossSelect::Binsof { cp, bin, .. } = &cross.bins[0].select else {
+        panic!("illegal_bins select");
+    };
+    assert_eq!(cp.name, "s.inner.field");
+    assert!(bin.is_none());
+    let cross_x = cg
+        .items
+        .iter()
+        .find_map(|i| match i {
+            CovergroupItem::Cross(c) if c.name.as_ref().is_some_and(|n| n.name == "X") => Some(c),
+            _ => None,
+        })
+        .expect("cross X");
+    let CrossSelect::Binsof { cp, bin, .. } = &cross_x.bins[0].select else {
+        panic!("ignore_bins select");
+    };
+    assert_eq!(cp.name, "u");
+    assert_eq!(bin.as_ref().map(|b| b.name.as_str()), Some("lo"));
 }

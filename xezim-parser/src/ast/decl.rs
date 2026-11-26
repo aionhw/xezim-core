@@ -569,6 +569,10 @@ pub enum DPIProperty {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClockingDeclaration {
     pub name: Identifier,
+    /// §14.3, §23.9: the block's declaration in its definition's tree, from
+    /// the binder; a generate block's copies rename the block by it.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     /// LRM §14.3: clock event (e.g. `@(posedge clk)`). The signal
     /// expression is captured so the simulator can snapshot input
     /// signals before each clock edge. None when the clocking block
@@ -622,6 +626,10 @@ pub struct ClockingSignal {
     /// name to a different signal. None = the clocking name IS the signal.
     #[cfg_attr(feature = "serde", serde(default))]
     pub bound_to: Option<super::expr::Expression>,
+    /// §23.9: the binding of `name` when the clockvar has no `= expression`
+    /// (the signal of that name), from the binder.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bound: super::binding::Bound,
     pub span: Span,
 }
 
@@ -903,6 +911,10 @@ pub struct PropertyDeclaration {
     /// `assert property (p(actuals))` can substitute formals→actuals.
     #[cfg_attr(feature = "serde", serde(default))]
     pub ports: Vec<Identifier>,
+    /// §16.8, §16.12: the default actual argument of each formal, parallel
+    /// to `ports`; `None` for a formal without one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub port_defaults: Vec<Option<super::expr::Expression>>,
     pub items: Vec<super::stmt::Statement>, // Approximate property body as statements for parsing
     /// LRM §16.6 property body, captured when it matches the common
     /// `@(clk_event) <expr>` shape. Used by `assert property (p_name)`
@@ -927,6 +939,10 @@ pub struct SequenceDeclaration {
     /// PropertyDeclaration::ports).
     #[cfg_attr(feature = "serde", serde(default))]
     pub ports: Vec<Identifier>,
+    /// §16.8: the default actual argument of each formal, parallel to
+    /// `ports`; `None` for a formal without one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub port_defaults: Vec<Option<super::expr::Expression>>,
     pub items: Vec<super::stmt::Statement>, // Approximate sequence body as statements
     /// LRM §16.5 — sequence body when it matches the common
     /// `@(clk) <expr>` shape (an `SvaClocked` wrapper). Used for
@@ -981,9 +997,12 @@ pub struct GateInstantiation {
     /// §28.11 `#(rise, fall)` — the FALL delay (second expression), applied to
     /// 1→0 output transitions. `None` when the spec gave a single delay, in
     /// which case the rise value governs both edges. A third (turn-off) value
-    /// is still skipped.
+    /// is carried separately for primitives that allow delay3.
     #[cfg_attr(feature = "serde", serde(default))]
     pub delay_fall: Option<Expression>,
+    /// §28.11: optional turn-off delay of a delay3 primitive.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_off: Option<Expression>,
     pub instances: Vec<GateInstance>,
     pub span: Span,
 }
@@ -1515,8 +1534,10 @@ pub enum ClassItem {
     Property(ClassProperty),
     /// Method: function or task
     Method(ClassMethod),
-    /// Constraint declaration
-    Constraint(ClassConstraint),
+    /// Constraint declaration. Shared: a copy of the class (one per instance
+    /// of the module declaring it, §8.3; one per specialization, §8.25)
+    /// holds the same block until a rewriter takes it with `Arc::make_mut`.
+    Constraint(std::sync::Arc<ClassConstraint>),
     /// Typedef inside class
     Typedef(TypedefDeclaration),
     /// Parameter/localparam inside class

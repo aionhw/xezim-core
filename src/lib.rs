@@ -76,6 +76,7 @@ mod ast_intern;
 pub mod oom_trace;
 pub mod bits2;
 mod body_type_params;
+pub mod decl_types;
 pub mod elaborate;
 pub mod packed_value;
 mod duplicate_definitions;
@@ -83,6 +84,7 @@ mod param_override_lists;
 pub mod scope_tree;
 pub mod shared_names;
 mod unit_subroutine_usage;
+mod unit_storage;
 #[cfg(test)]
 mod unit_assertion_retention_tests;
 #[cfg(test)]
@@ -231,11 +233,69 @@ pub use value::Value;
 /// \x45 = \x44 + procedural parameter declarations, corrected parameter overlays,
 ///         alias/port resolution and separate zero-rise gate/net delays.
 /// \x46 = \x45 + parameter declaration ownership for waveform scopes (§26.3, §21.7.2.3).
-/// \x47 = \x46 + shared sequential and parallel statement block bodies (§9.3).
-/// \x48 = \x47 + boxed optional assignment delays and inferred assertion clocks.
-/// \x49 = \x48 + compact optional declaration payloads and cold module constructs.
-/// \x4a = \x49 + boxed optional case matching patterns and guards (§12.6).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x4a";
+/// \x47 = \x46 + compilation-unit DPI imports and constants only in the definitions that name them
+///         (§3.12.1, §35.5.4), each compilation-unit variable and net declared once in the hierarchy
+///         root, and declared types shared per declaration.
+/// \x48 = \x47 + a formal written with neither a data type nor a direction takes the previous
+///         formal's type (§13.5).
+/// \x49 = \x48 + package members left unrooted in continuous assignments that write another
+///         scope (§26.3), member signals for each element of a multi-dimensional unpacked-struct
+///         array (§7.4.2), and `binsof()` of a hierarchical cross item (§19.6.1).
+/// \x4a = \x49 + fill operands of real operators folded at one bit (§5.7.1), stream operands
+///         keeping their `with [ array_range ]` (§11.4.14.4), per-driver delay stages and
+///         declaration-initializer drivers of user-defined nettype nets (§10.3.3, §6.6.7), and
+///         nettype input ports kept apart from non-nettype actuals (§23.3.3).
+/// \x4b = \x4a + unsized signed decimal numbers sized by their magnitude and a sign bit in
+///         parameters, constant expressions and cached literals (§5.7.1).
+/// \x4c = \x4b + package parameters qualified in the data types of package subroutines and
+///         classes (§26.3), an instance's `[N]` sized by its module's uncontested import
+///         (§7.4.2), nested classes named through a specialized host by their renamed spelling
+///         (§8.23), class-local typedef property widths (§6.18) and package sequences and
+///         properties under `pkg::name` keys (§16.8, §26.3).
+/// \x4d = \x4c + real initializers of 64-bit integral variables and typed package parameters
+///         held as integers (§6.12.1), and time literals and delays scaled to the unit,
+///         precision and tick by exact powers of ten (§5.8, §3.14.1).
+/// \x4e = \x4d + assignment pattern type keys bound at every array dimension in
+///         continuous assignments, nettype drivers and parameter values (§10.9.1, §10.9.2).
+/// \x4f = \x4e + a named assignment pattern key carries its lexically bound type name, real and
+///         realtime type keys are one type (§10.9.1, §26.3, §6.12), and aliased nets of a
+///         user-defined nettype resolve as one net (§10.11, §6.6.7).
+///         Also typedefs of real classified as real, UDP instance delays in the holding
+///         module's time unit, the declared types of packed-array and structure ports, and
+///         the default actual arguments of named sequences and properties kept in the
+///         elaborated design (§6.18, §3.14.2, §7.4.1, §16.8, §16.12).
+/// Driver contributions, net-cell resolution, delayed structures, interface-array
+/// bounds, sampled input nets and fill-literal state are preserved in this format.
+/// \x56 retains sampled input-formal identities through simulator aliasing (§16.5.1).
+// §10.9.1: continuous packed array defaults retain their element type.
+/// \x58 = \x57 + a macro chain inside a `" ... `" region expanded to the end (§22.5.1), each
+///         generate copy's clocking block registered under the copy's name with its clockvar
+///         signals, and an instance's block named from inside the instance (§14.3, §27.4), and
+///         `[N]` sized by an imported parameter next to another package's type N (§26.3).
+/// \x59 = \x58 + cycle delay operands that open with a clocking event, a concatenation, a
+///         literal, an escaped name or first_match (§16.13.1, A.2.10); packed user-defined port
+///         types of subroutine bodies and escaped port names after a type (§13.4, §5.6.1), enum
+///         labels and imported names kept out of the implicit nets of port actuals (§6.19,
+///         §6.10, §26.3), a gated_clk_cell elaborated from its body unless it is a plain
+///         pass-through (§23.3.2), connection widths of ranges after an index (§7.4.3) and
+///         prefixed parameter bounds of unpacked port slices folded (§7.4.6); type parameter
+///         overrides resolved with the instantiating instance's typedefs, block-local type
+///         parameters with packed dimensions, package array elements in generate conditions
+///         below the top, class typedefs through specializations, 2-state struct initial values,
+///         statement-local dimensions folded per instance and library-file macros kept across
+///         library files (§6.20.3, §7.4.1, §26.3, §8.25.1, §7.2.1, §20.6.2, §22.5.1); compact
+///         tokens, nested bind targets elaborated per newly bound scope and instance function and
+///         task bodies shared until used (§23.11, §13.4); literal input actuals converted to the
+///         formal's type, 2-state port formals, formals kept for X/Z-, real- and pull-sensitive
+///         actuals, package constant actual widths and the scoped `$stime` read (§23.3.3.8,
+///         §6.11.2, §6.6.5, §20.3.2), fixed-array declaration initializers and continuous
+///         assignments of unpacked concatenations (§6.8, §10.3, §10.10), and time reads and time
+///         literals of continuous assignments in the declaring module's unit (§3.14.2.3, §5.8).
+/// \x69 retains scoped runtime driver delays, shortreal metadata and full packed memory widths.
+/// \x6A records the packed shape of the top module's ANSI ports (§7.4.1, §7.2) and keeps a
+///         shortreal input formal's own storage for a real actual (§6.12, §23.3.3.8).
+/// \xf0 is the vhd 0.11.7 format, with its own AST and scope metadata.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\xf0";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -762,6 +822,28 @@ fn diag_kind_key(msg: &str) -> &str {
 thread_local! {
     static ELAB_DIAG_COUNTS: std::cell::RefCell<crate::hasher::HashMap<String, u32>> =
         std::cell::RefCell::new(crate::hasher::HashMap::default());
+    /// Set while elaboration does work that a later pass repeats.
+    static ELAB_DIAG_MUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with elaboration diagnostics dropped: neither printed, counted
+/// nor recorded by a warn-once site, because a later pass elaborates the
+/// same scopes again and reports them there.
+pub(crate) fn with_elab_diags_muted<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ELAB_DIAG_MUTED.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(ELAB_DIAG_MUTED.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether elaboration diagnostics are currently dropped
+/// (`with_elab_diags_muted`).
+pub(crate) fn elab_diags_muted() -> bool {
+    ELAB_DIAG_MUTED.with(|c| c.get())
 }
 
 /// Reset the per-kind diagnostic counters (start of an elaboration run).
@@ -777,6 +859,9 @@ pub fn elab_diag_reset_counts() {
 /// the reader can see the rest. Suppressed messages are dropped from the
 /// capture sink too, so a warm-cache replay reproduces the same output.
 pub(crate) fn elab_diag(msg: String) {
+    if elab_diags_muted() {
+        return;
+    }
     let n = ELAB_DIAG_COUNTS.with(|c| {
         let mut m = c.borrow_mut();
         let e = m.entry(diag_kind_key(&msg).to_string()).or_insert(0);
@@ -821,6 +906,16 @@ fn adopted_lib_files_cell() -> &'static std::sync::Mutex<Vec<(std::path::PathBuf
     ADOPTED_LIB_FILES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// A library file's text, decoded as source files and `include`d files are:
+/// a byte sequence that is not UTF-8 (a Latin-1 `®` in a comment) becomes
+/// U+FFFD instead of failing the read, which dropped the whole file.
+fn read_library_file(path: &std::path::Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    })
+}
+
 pub(crate) fn record_adopted_lib_file(path: std::path::PathBuf, module: &str) {
     if let Ok(mut v) = adopted_lib_files_cell().lock() {
         if let Some((_, mods)) = v.iter_mut().find(|(p, _)| *p == path) {
@@ -833,8 +928,18 @@ pub(crate) fn record_adopted_lib_file(path: std::path::PathBuf, module: &str) {
     }
 }
 
-/// The adopted-library record, in adoption order. Does not clear — a single
-/// CLI run elaborates once.
+/// Forget the library files a previous elaboration adopted and the texts
+/// they were preprocessed to; called at the start of each elaboration.
+fn clear_adopted_libs() {
+    if let Ok(mut v) = adopted_lib_files_cell().lock() {
+        v.clear();
+    }
+    if let Ok(mut t) = adopted_lib_texts_cell().lock() {
+        t.clear();
+    }
+}
+
+/// The adopted-library record of the last elaboration, in adoption order.
 pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
     adopted_lib_files_cell()
         .lock()
@@ -842,59 +947,36 @@ pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
         .unwrap_or_default()
 }
 
-/// The preprocessing context `-v`/`-y` indexing ran under: the include dirs
-/// and the macro snapshot taken AFTER the primary sources (so a library file
-/// sees defines from the design, exactly as `index_library_file` did).
-/// Recorded once per run by `resolve_library_modules`; consumed by
-/// `preprocess_adopted_lib` so `--dump-merged-sv` can append library text
-/// with includes/macros resolved instead of raw bytes (raw text broke
-/// standalone re-compiles of the merged file the moment it left the original
-/// directory).
-static ADOPTED_LIB_PP_CONTEXT: std::sync::OnceLock<
-    std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>>,
+/// The text each adopted library file's definitions were parsed from, as
+/// `-v`/`-y` indexing preprocessed it (§22.5.1: from the design's macros and
+/// those of the library files read before it), or `None` when that
+/// preprocessing reported errors. Only adopted files are kept, the first
+/// read of a file named twice; recorded by `resolve_library_modules` and
+/// consumed by `preprocess_adopted_lib`, so `--dump-merged-sv` can append
+/// library text with includes and macros resolved instead of raw bytes (raw
+/// text broke standalone re-compiles of the merged file the moment it left
+/// the original directory).
+static ADOPTED_LIB_TEXTS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, Option<std::sync::Arc<str>>>,
+    >,
 > = std::sync::OnceLock::new();
 
-fn adopted_lib_pp_context_cell()
--> &'static std::sync::Mutex<Option<(Vec<String>, Vec<(String, preprocessor::MacroDef)>)>> {
-    ADOPTED_LIB_PP_CONTEXT.get_or_init(|| std::sync::Mutex::new(None))
+fn adopted_lib_texts_cell() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, Option<std::sync::Arc<str>>>,
+> {
+    ADOPTED_LIB_TEXTS.get_or_init(Default::default)
 }
 
-pub(crate) fn record_adopted_lib_pp_context(
-    include_dirs: &[String],
-    lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
-) {
-    if let Ok(mut g) = adopted_lib_pp_context_cell().lock() {
-        *g = Some((
-            include_dirs.to_vec(),
-            lib_defines
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ));
-    }
-}
-
-/// Preprocess one adopted library file exactly as the `-v`/`-y` indexing pass
-/// did: a FRESH preprocessor per file with the recorded include dirs and the
-/// post-primary-source macro snapshot, resolving includes relative to the
-/// file itself. Returns None when no context was recorded (no library pass
-/// ran) or when preprocessing reports errors — callers fall back to the raw
-/// bytes so the merged dump still contains the file either way.
+/// One adopted library file's text exactly as the `-v`/`-y` indexing pass
+/// preprocessed it: includes resolved relative to the file, the recorded
+/// include dirs, and the macros that file started from. Returns None for a
+/// file no library pass adopted or whose preprocessing reported errors —
+/// callers fall back to the raw bytes so the merged dump still contains the
+/// file either way.
 pub fn preprocess_adopted_lib(path: &std::path::Path) -> Option<String> {
-    let ctx = adopted_lib_pp_context_cell().lock().ok()?.clone()?;
-    let source = std::fs::read_to_string(path).ok()?;
-    let mut pp = preprocessor::Preprocessor::new();
-    for dir in &ctx.0 {
-        pp.add_include_dir(std::path::PathBuf::from(dir));
-    }
-    for (name, def) in &ctx.1 {
-        pp.define(name.clone(), def.clone());
-    }
-    let text = pp.preprocess_file(&source, Some(path));
-    if !pp.errors().is_empty() {
-        return None;
-    }
-    Some(text)
+    let texts = adopted_lib_texts_cell().lock().ok()?;
+    texts.get(path)?.as_deref().map(str::to_string)
 }
 
 static MODULE_TIMESCALE_CLI: std::sync::OnceLock<std::sync::Mutex<ModuleTimescaleCli>> =
@@ -957,8 +1039,8 @@ impl SourceDefinition {
 }
 
 /// Tokenize a source string.
-pub fn tokenize_file(source: &str, _path: Option<&std::path::Path>) -> Vec<lexer::Token> {
-    lexer::Lexer::new(source).tokenize()
+pub fn tokenize_file(source: &str, _path: Option<&std::path::Path>) -> Vec<lexer::OwnedToken> {
+    lexer::Lexer::new(source).tokenize().to_owned_tokens()
 }
 
 /// Parse a source string into an AST.
@@ -1297,6 +1379,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
         let mut parser = sv_parser::parse::Parser::new(tokens);
         let source_ast = parser.parse_source_text();
         let diags = parser.diagnostics().to_vec();
+        drop(parser);
 
         if diags
             .iter()
@@ -1453,20 +1536,28 @@ pub fn parse_and_elaborate_multi_preprocessed(
                 _ => None,
             })
             .collect();
+        // §22.5.1: the module pass (`resolve_library_modules`) reads the
+        // `-v` files in this order, each from the macros the design and the
+        // files before it left. Read them the same way here, files without
+        // packages included, so a `` `define `` in one library file picks
+        // the same `` `ifdef `` branch of a later one in both passes: the
+        // package compiled here is then the one the adopted module imports.
+        let mut lib_macros = lib_defines.clone();
         for file in lib_files {
             let path = std::path::PathBuf::from(&file);
             // An unreadable file is reported when the library is indexed.
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = read_library_file(&path) else {
                 continue;
             };
             let mut lpp = preprocessor::Preprocessor::new();
             for dir in include_dirs {
                 lpp.add_include_dir(std::path::PathBuf::from(dir));
             }
-            for (name, def) in &lib_defines {
+            for (name, def) in &lib_macros {
                 lpp.define(name.clone(), def.clone());
             }
             let preprocessed = lpp.preprocess_file(&text, Some(&path));
+            lib_macros = lpp.snapshot_defines();
             let line_map = lpp.take_line_map();
             let result = sv_parser::parse(&preprocessed);
             let line_map = line_map.filter(|_| result.source_text == preprocessed);
@@ -1613,11 +1704,12 @@ pub(crate) fn parse_override_value(text: &str) -> Option<ast::expr::Expression> 
     );
     let mut parser = sv_parser::parse::Parser::new(lexer::Lexer::new(&src).tokenize());
     let parsed = parser.parse_source_text();
-    if parser
+    let has_err = parser
         .diagnostics()
         .iter()
-        .any(|d| d.severity == diagnostics::Severity::Error)
-    {
+        .any(|d| d.severity == diagnostics::Severity::Error);
+    drop(parser);
+    if has_err {
         return None;
     }
     let Some(ast::Description::Module(m)) = parsed.descriptions.into_iter().next() else {
@@ -1870,6 +1962,9 @@ fn parse_and_elaborate(
     oom_trace::checkpoint("prepare.body_types.ready", &[]);
     pkg_scope::qualify_colliding_package_types(&mut all_descriptions)?;
     oom_trace::checkpoint("prepare.package_types.ready", &[]);
+    // §8.25.1: the parameterized classes whose typedefs name a member of a
+    // type parameter, for `Cls#(args)::t` lookups.
+    elaborate::class_scope_types::install(&all_descriptions);
     pkg_scope::stamp_automatic_subroutines(&mut all_descriptions);
     oom_trace::checkpoint("prepare.automatic.ready", &[]);
     scope_tree::build_design(&mut all_descriptions);
@@ -2157,6 +2252,7 @@ fn parse_and_elaborate(
                     for item in m.items.drain(..) {
                         if let ast::decl::ModuleItem::NestedModule(inner) = item {
                             let mut inner = *inner;
+                            inner.lexical_parent = Some(m.name.name.clone());
                             hoist_nested(&mut inner, out);
                             out.push(inner);
                         } else {
@@ -2320,6 +2416,7 @@ fn parse_and_elaborate(
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
                 let m = ast::module::ModuleDeclaration {
+                    lexical_parent: None,
                     attrs: Vec::new(),
                     kind: ast::module::ModuleKind::Module,
                     lifetime: None,
@@ -2483,6 +2580,7 @@ fn parse_and_elaborate(
         && top_level_assertion_decls.is_empty()
         && top_level_vars.is_empty()
         && top_level_nets.is_empty()
+        && top_level_dpi_imports.is_empty()
     {
         None
     } else if let Some(name) = named_top {
@@ -2515,7 +2613,17 @@ fn parse_and_elaborate(
             })
             .map(|(name, _)| name.clone())
     };
-    let unit_usage = unit_subroutine_usage::Usage::new(&top_level_functions, &top_level_tasks);
+    // §3.12.1 / §35.5.4 (#721): a unit DPI import is a unit subroutine. A
+    // definition receives the imports it names, or that a unit subroutine
+    // or declaration it receives names; copying every import into every
+    // definition held one declaration per import and definition, twice
+    // (the injected item and its prepared copy). The carrier keeps them all,
+    // and an import registers under its one global name wherever it is.
+    let unit_usage = unit_subroutine_usage::Usage::new(
+        &top_level_functions,
+        &top_level_tasks,
+        &top_level_dpi_imports,
+    );
     let common_unit_refs = unit_usage.references(&(
         &top_level_nettypes,
         &top_level_params,
@@ -2523,7 +2631,6 @@ fn parse_and_elaborate(
         &top_level_nets,
         &top_level_covergroups,
         &top_level_assertion_decls,
-        &top_level_dpi_imports,
         &top_level_dpi_exports,
     ));
 
@@ -2579,17 +2686,26 @@ fn parse_and_elaborate(
         (&top_level_lets, &top_level_binds, &top_level_ooc_constraints),
         (&top_level_imports, &class_defs, &typedef_defs),
     ));
-    for def in definitions.values() {
-        let refs = match def {
-            SourceDefinition::Module(d) => unit_param_usage.references(d),
-            SourceDefinition::Interface(d) => unit_param_usage.references(d),
-            SourceDefinition::Program(d) => unit_param_usage.references(d),
-            SourceDefinition::Class(d) => unit_param_usage.references(d),
-            SourceDefinition::Package(d) => unit_param_usage.references(d),
-            SourceDefinition::Typedef(d) => unit_param_usage.references(d),
-            SourceDefinition::Udp(d) => unit_param_usage.references(d),
+    // §23.9 (#721): a constant a module, interface or program reads by its
+    // bare name resolves in that definition, so only that definition needs
+    // its declaration. Every other spelling keeps the constant everywhere,
+    // as do the uses of the other kinds of definition.
+    let mut own_unit_params: std::collections::HashMap<String, crate::hasher::HashSet<String>> =
+        Default::default();
+    for (def_name, def) in definitions.iter() {
+        let (refs, heads) = match def {
+            SourceDefinition::Module(d) => unit_param_usage.references_by_scope(d),
+            SourceDefinition::Interface(d) => unit_param_usage.references_by_scope(d),
+            SourceDefinition::Program(d) => unit_param_usage.references_by_scope(d),
+            SourceDefinition::Class(d) => (unit_param_usage.references(d), Default::default()),
+            SourceDefinition::Package(d) => (unit_param_usage.references(d), Default::default()),
+            SourceDefinition::Typedef(d) => (unit_param_usage.references(d), Default::default()),
+            SourceDefinition::Udp(d) => (unit_param_usage.references(d), Default::default()),
         };
         needed_unit_params.extend(refs);
+        if !heads.is_empty() {
+            own_unit_params.insert(def_name.clone(), unit_param_usage.close(heads));
+        }
     }
     // Library modules are adopted below, after unit injection. Their bodies
     // may contain hierarchical references into these definitions that this
@@ -2648,6 +2764,12 @@ fn parse_and_elaborate(
                     .filter(|t| !t.name.has_scope())
                     .map(|t| (t.name.name.name.clone(), unit_storage_usage.references(t))),
             )
+            .chain(top_level_dpi_imports.iter().map(|di| {
+                (
+                    unit_subroutine_usage::dpi_import_name(di),
+                    unit_storage_usage.references(di),
+                )
+            }))
             .filter(|(_, refs)| !refs.is_empty())
             .collect();
 
@@ -2723,10 +2845,13 @@ fn parse_and_elaborate(
                     }
                     Some(unit_storage_usage.close(refs))
                 };
+                // §3.12.1: with a hierarchy root, the root alone declares the
+                // unit's storage (`unit_storage::settle`, once the root is known).
                 let storage_needed = |name: &str| {
-                    needed_unit_storage
-                        .as_ref()
-                        .is_none_or(|needed| needed.contains(name))
+                    unit_carrier.is_none()
+                        && needed_unit_storage
+                            .as_ref()
+                            .is_none_or(|needed| needed.contains(name))
                 };
                 // What this module declares ITSELF, captured before anything is
                 // injected — a name in here shadows the $unit declaration of
@@ -2839,12 +2964,15 @@ fn parse_and_elaborate(
                     items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
                 }
                 for di in top_level_dpi_imports.iter().rev() {
+                    let name = unit_subroutine_usage::dpi_import_name(di);
+                    if needed_unit_subs
+                        .as_ref()
+                        .is_some_and(|needed| !needed.contains(&name))
+                    {
+                        continue;
+                    }
                     // A module's own import of the same name shadows the
                     // $unit one (§3.12.1); do not inject a duplicate.
-                    let name = match &di.proto {
-                        ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
-                        ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
-                    };
                     let own = items.iter().any(|it| {
                         matches!(it, ast::decl::ModuleItem::DPIImport(x)
                         if match &x.proto {
@@ -2894,8 +3022,13 @@ fn parse_and_elaborate(
                 }
                 // §3.12.1: keep shadowed constants under their qualified
                 // names, and bind dependent initializers/ranges to that copy.
+                let own_params = own_unit_params.get(def_name);
                 for p in top_level_params.iter().rev() {
-                    let needed = |name: &str| retain_all || needed_unit_params.contains(name);
+                    let needed = |name: &str| {
+                        retain_all
+                            || needed_unit_params.contains(name)
+                            || own_params.is_some_and(|own| own.contains(name))
+                    };
                     let keep = match &p.kind {
                         ast::decl::ParameterKind::Data { assignments, .. } => {
                             assignments.iter().any(|a| needed(&a.name.name))
@@ -3036,6 +3169,10 @@ fn parse_and_elaborate(
     // A previous elaboration's library files on this thread must not locate
     // this design's spans.
     elaborate::set_elab_library_sources(Default::default());
+    // Nor may the library files it adopted, or the texts they were
+    // preprocessed to, reach this design's `--dump-merged-sv` or VPI model:
+    // both records are process-wide.
+    clear_adopted_libs();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(
             &mut definitions,
@@ -3079,6 +3216,45 @@ fn parse_and_elaborate(
                             elaborate::secs_to_exp(elaborate::exp_to_secs(p)),
                         ),
                     );
+                }
+            }
+        }
+    }
+
+    // §29.8, §28.16: the delays of a UDP instance count the time unit of the
+    // definition holding the instance. Only now is every primitive known
+    // (one may be defined after its first instance, or come from a library).
+    {
+        let udps: std::collections::HashSet<String> = definitions
+            .iter()
+            .filter(|(_, d)| matches!(d, SourceDefinition::Udp(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !udps.is_empty() {
+            let is_udp = |n: &str| udps.contains(n);
+            for (name, def) in definitions.iter_mut() {
+                let (unit_s, prec_s) = module_timescale_exp
+                    .get(name)
+                    .map(|&(u, p)| (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)))
+                    .unwrap_or((tick_s, tick_s));
+                match def {
+                    SourceDefinition::Module(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let m = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut m.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    SourceDefinition::Interface(rc)
+                        if elaborate::instantiates_udp(&rc.items, &is_udp) =>
+                    {
+                        let i = Rc::make_mut(rc);
+                        elaborate::rewrite_udp_instance_delays(
+                            &mut i.items, &is_udp, unit_s, prec_s, tick_s,
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3604,6 +3780,16 @@ fn parse_and_elaborate(
 
     elaborate::relaxed_static::normalize(&mut definitions);
     let top_name = top_module.ok_or("No module found")?;
+    // §3.12.1: one storage for each compilation-unit variable and net.
+    unit_storage::settle(
+        &mut definitions,
+        unit_carrier.is_some(),
+        &top_name,
+        &top_level_vars,
+        &top_level_nets,
+        &top_level_params,
+        &mut class_defs,
+    );
     let top_def = definitions
         .get(&top_name)
         .ok_or_else(|| format!("Module '{}' not found", top_name))?;
@@ -3701,37 +3887,53 @@ fn parse_and_elaborate(
     release_free_memory();
     oom_trace::checkpoint("elaborate.memory_released", &[]);
 
-    // §23.11: bind selection uses the finished hierarchy and declaration
-    // scope. Re-elaborate only designs with newly resolved bindings; ordinary
-    // designs retain their single elaboration pass. This also permits binds
-    // into hierarchy introduced by an earlier bind.
-    for pass in 0..64 {
-        elaborate::inline_instantiations(&mut elab, &def_refs)?;
-        if !resolve_instance_binds(&mut elab, &top_level_binds, &unit_bind_params)? {
-            break;
+    // §23.11: find every bind target in one walk that elaborates only the
+    // newly bound scopes on each step, then elaborate the root once more
+    // with all of them, so a bound instance takes its place at the end of
+    // its target. A design without resolved binds keeps the single walk.
+    let mut bind_resolver = IncrementalBindResolver::new(&top_level_binds, &unit_bind_params);
+    let rebuild = elaborate::inline_instantiations_with_binds(
+        &mut elab,
+        &def_refs,
+        &top_level_binds,
+        &mut |elab| bind_resolver.resolve_step(elab),
+    )?;
+    if !rebuild {
+        for target in &bind_resolver.unresolved {
+            log_eprintln(&format!(
+                "[elab] no bind target instance '{}'; bind ignored",
+                target
+            ));
         }
-        if pass == 63 {
-            return Err("bind hierarchy does not converge (§23.11)".into());
+    } else {
+        for pass in 0..64 {
+            let binds = std::mem::take(&mut elab.resolved_binds);
+            let timescales = std::mem::take(&mut elab.module_timescale_exp);
+            let without_timescale = std::mem::take(&mut elab.modules_without_timescale);
+            let unit = elab.timeunit_exp;
+            let precision = elab.timeprecision_exp;
+            elab = elaborate::elaborate_module_with_defs(
+                elab_def,
+                &params,
+                Some(&def_refs),
+                &top_level_imports,
+                &top_level_lets,
+                &top_level_ooc_constraints,
+            )?;
+            elab.resolved_binds = binds;
+            elab.tick_s = tick_s;
+            elab.module_timescale_exp = timescales;
+            elab.modules_without_timescale = without_timescale;
+            elab.timeunit_exp = unit;
+            elab.timeprecision_exp = precision;
+            elaborate::inline_instantiations(&mut elab, &def_refs)?;
+            if !resolve_instance_binds(&mut elab, &top_level_binds, &unit_bind_params)? {
+                break;
+            }
+            if pass == 63 {
+                return Err("bind hierarchy does not converge (§23.11)".into());
+            }
         }
-        let binds = std::mem::take(&mut elab.resolved_binds);
-        let timescales = std::mem::take(&mut elab.module_timescale_exp);
-        let without_timescale = std::mem::take(&mut elab.modules_without_timescale);
-        let unit = elab.timeunit_exp;
-        let precision = elab.timeprecision_exp;
-        elab = elaborate::elaborate_module_with_defs(
-            elab_def,
-            &params,
-            Some(&def_refs),
-            &top_level_imports,
-            &top_level_lets,
-            &top_level_ooc_constraints,
-        )?;
-        elab.resolved_binds = binds;
-        elab.tick_s = tick_s;
-        elab.module_timescale_exp = timescales;
-        elab.modules_without_timescale = without_timescale;
-        elab.timeunit_exp = unit;
-        elab.timeprecision_exp = precision;
     }
     elab_phase("inline instantiations", &mut phase_t);
     // Re-register any compilation-unit-scope CLASS whose name a module
@@ -3782,6 +3984,7 @@ fn parse_and_elaborate(
     // §6.6.7: fold user-defined nettype drivers — after inlining, so drivers
     // arriving from several instances through ports resolve together with any
     // written in the parent. Must precede the bitwise fold below.
+    elaborate::stage_vpi_net_drivers(&mut elab);
     elaborate::resolve_user_nettype_drivers(&mut elab)?;
     elab_phase("switches and nettype drivers", &mut phase_t);
     // §7.2.2: a whole-struct continuous assign that arrived through inlining
@@ -3886,6 +4089,7 @@ fn parse_and_elaborate(
     }
     elab_phase("post-inline passes", &mut phase_t);
     oom_trace::model("elaboration complete", &elab, None);
+    elaborate::check_packed_widths()?;
     Ok((definitions, elab))
 }
 
@@ -4006,6 +4210,330 @@ impl<'a> BindConstants<'a> {
     }
 }
 
+fn bind_directive_matches(
+    previous: &ast::decl::BindDirective,
+    b: &ast::decl::BindDirective,
+) -> bool {
+    previous.span == b.span
+        && previous.instantiation.module_name.name == b.instantiation.module_name.name
+        && previous.gen_scope == b.gen_scope
+        && previous
+            .instantiation
+            .instances
+            .iter()
+            .map(|i| &i.name.name)
+            .eq(b.instantiation.instances.iter().map(|i| &i.name.name))
+}
+
+fn collect_bind_ancestors<'a>(scope: &'a str) -> Vec<&'a str> {
+    let mut ancestors = vec![scope];
+    let mut ancestor = scope;
+    while let Some((parent, _)) = ancestor.rsplit_once('.') {
+        ancestors.push(parent);
+        ancestor = parent;
+    }
+    ancestors
+}
+
+fn find_lexical_bind_target(
+    ancestors: &[&str],
+    target_module: &str,
+    host_paths: &crate::hasher::HashSet<String>,
+) -> Option<String> {
+    ancestors
+        .iter()
+        .filter(|parent| !parent.is_empty())
+        .map(|parent| format!("{parent}.{target_module}"))
+        .chain(std::iter::once(target_module.to_string()))
+        .find(|candidate| host_paths.contains(candidate.as_str()))
+}
+
+fn eval_bind_path_target(
+    path: &[ast::expr::HierPathSegment],
+    target_module_name: &str,
+    top_name: &str,
+    unit_scope: bool,
+    ancestors: &[&str],
+    host_paths: &crate::hasher::HashSet<String>,
+    constants: &mut BindConstants<'_>,
+) -> Result<Option<String>, String> {
+    let mut joined = String::new();
+    for segment in path {
+        if !joined.is_empty() {
+            joined.push('.');
+        }
+        joined.push_str(&segment.name.name);
+        for select in &segment.selects {
+            let constants = constants.scope(unit_scope, ancestors);
+            let value = elaborate::const_eval_i64_with_params(select, Some(constants))
+                .ok_or_else(|| {
+                    format!(
+                        "nonconstant bind target index in '{}' (§23.11)",
+                        target_module_name
+                    )
+                })?;
+            use std::fmt::Write as _;
+            let _ = write!(joined, "[{value}]");
+        }
+    }
+    let absolute = joined.strip_prefix("$root.").unwrap_or(&joined);
+    let rooted = absolute.strip_prefix(&format!("{}.", top_name));
+    let mut candidates = Vec::new();
+    if absolute == top_name {
+        candidates.push(String::new());
+    }
+    if let Some(p) = rooted {
+        candidates.push(p.to_string());
+    }
+    if joined.starts_with("$root.") {
+        candidates.push(absolute.to_string());
+    } else {
+        for parent in ancestors {
+            if !parent.is_empty() {
+                candidates.push(format!("{parent}.{joined}"));
+            }
+        }
+        candidates.push(joined);
+    }
+    Ok(candidates
+        .into_iter()
+        .find(|p| host_paths.contains(p.as_str())))
+}
+
+/// Incremental §23.11 target resolver: indexes only newly instantiated
+/// hierarchy per round and returns newly matched `(target_path, directives)`
+/// pairs as a worklist.
+struct IncrementalBindResolver<'a> {
+    unit_binds: &'a [ast::decl::BindDirective],
+    unit_params: &'a crate::hasher::HashMap<String, Value>,
+    host_paths: crate::hasher::HashSet<String>,
+    hosts_of: crate::hasher::HashMap<String, Vec<String>>,
+    indexed_instances: usize,
+    top_indexed: bool,
+    scanned_bind_sites: usize,
+    scanned_unit_binds: bool,
+    path_site_resolved: crate::hasher::HashSet<usize>,
+    path_site_complete: crate::hasher::HashSet<usize>,
+    /// Path targets no pass resolved, as the last step found them.
+    unresolved: Vec<String>,
+}
+
+impl<'a> IncrementalBindResolver<'a> {
+    fn new(
+        unit_binds: &'a [ast::decl::BindDirective],
+        unit_params: &'a crate::hasher::HashMap<String, Value>,
+    ) -> Self {
+        Self {
+            unit_binds,
+            unit_params,
+            host_paths: crate::hasher::HashSet::default(),
+            hosts_of: crate::hasher::HashMap::default(),
+            indexed_instances: 0,
+            top_indexed: false,
+            scanned_bind_sites: 0,
+            scanned_unit_binds: false,
+            path_site_resolved: crate::hasher::HashSet::default(),
+            path_site_complete: crate::hasher::HashSet::default(),
+            unresolved: Vec::new(),
+        }
+    }
+
+    fn resolve_step(
+        &mut self,
+        elab: &mut elaborate::ElaboratedModule,
+    ) -> Result<Vec<(String, Vec<ast::decl::BindDirective>)>, String> {
+        let mut new_hosts_start: crate::hasher::HashMap<&str, usize> =
+            crate::hasher::HashMap::default();
+        if !self.top_indexed {
+            self.top_indexed = true;
+            self.host_paths.insert(String::new());
+            let list = self.hosts_of.entry(elab.name.clone()).or_default();
+            new_hosts_start
+                .entry(elab.name.as_str())
+                .or_insert(list.len());
+            list.push(String::new());
+        }
+        for inst in &elab.instances[self.indexed_instances..] {
+            self.host_paths.insert(inst.path.clone());
+            let list = self.hosts_of.entry(inst.def_name.clone()).or_default();
+            new_hosts_start
+                .entry(inst.def_name.as_str())
+                .or_insert(list.len());
+            list.push(inst.path.clone());
+        }
+        self.indexed_instances = elab.instances.len();
+
+        if elab.bind_sites.is_empty() && self.unit_binds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut additions: Vec<(String, bool, usize)> = Vec::new();
+        {
+            let mut constants = BindConstants {
+                parameters: &elab.parameters,
+                top: &elab.name,
+                unit_params: self.unit_params,
+                dotted: None,
+                module: None,
+                unit: None,
+                entered: None,
+                undo: Vec::new(),
+            };
+
+            let mod_site_count = elab.bind_sites.len();
+            let unit_count = self.unit_binds.len();
+            for idx in 0..(mod_site_count + unit_count) {
+                let (scope, b, unit_scope, site_id, local_idx, is_new) = if idx < mod_site_count {
+                    let (ref sc, ref bd) = elab.bind_sites[idx];
+                    (
+                        sc.as_str(),
+                        bd,
+                        false,
+                        unit_count + idx,
+                        idx,
+                        idx >= self.scanned_bind_sites,
+                    )
+                } else {
+                    let u_idx = idx - mod_site_count;
+                    (
+                        "",
+                        &self.unit_binds[u_idx],
+                        true,
+                        u_idx,
+                        u_idx,
+                        !self.scanned_unit_binds,
+                    )
+                };
+
+                if !is_new && new_hosts_start.is_empty() {
+                    continue;
+                }
+                if !b.target_path.is_empty() && self.path_site_complete.contains(&site_id) {
+                    continue;
+                }
+
+                let ancestors = collect_bind_ancestors(scope);
+                let mut targets = Vec::new();
+                if b.target_path.is_empty() {
+                    if let Some(instance) = find_lexical_bind_target(
+                        &ancestors,
+                        &b.target_module.name,
+                        &self.host_paths,
+                    ) {
+                        targets.push(instance);
+                    } else if let Some(all_hosts) = self.hosts_of.get(b.target_module.name.as_str())
+                    {
+                        let start = if is_new {
+                            0
+                        } else if let Some(&s) = new_hosts_start.get(b.target_module.name.as_str())
+                        {
+                            s
+                        } else {
+                            all_hosts.len()
+                        };
+                        targets.extend(all_hosts[start..].iter().cloned());
+                    }
+                } else {
+                    let mut total_paths = 0usize;
+                    let mut matched_paths = 0usize;
+                    for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
+                        total_paths += 1;
+                        if let Some(target) = eval_bind_path_target(
+                            path,
+                            &b.target_module.name,
+                            &elab.name,
+                            unit_scope,
+                            &ancestors,
+                            &self.host_paths,
+                            &mut constants,
+                        )? {
+                            matched_paths += 1;
+                            targets.push(target);
+                        }
+                    }
+                    constants.leave();
+                    if matched_paths > 0 {
+                        self.path_site_resolved.insert(site_id);
+                    }
+                    if matched_paths == total_paths {
+                        self.path_site_complete.insert(site_id);
+                    }
+                }
+                targets.sort();
+                targets.dedup();
+                for target in targets {
+                    additions.push((target, unit_scope, local_idx));
+                }
+            }
+        }
+
+        self.scanned_bind_sites = elab.bind_sites.len();
+        self.scanned_unit_binds = true;
+
+        let mut order: Vec<String> = Vec::new();
+        let mut by_target: crate::hasher::HashMap<String, Vec<ast::decl::BindDirective>> =
+            crate::hasher::HashMap::default();
+        for (target, unit_scope, local_idx) in additions {
+            let b = if unit_scope {
+                &self.unit_binds[local_idx]
+            } else {
+                &elab.bind_sites[local_idx].1
+            };
+            let bound = elab.resolved_binds.entry(target.clone()).or_default();
+            if !bound.iter().any(|prev| bind_directive_matches(prev, b)) {
+                bound.push(b.clone());
+                let entry = by_target.entry(target.clone()).or_insert_with(|| {
+                    order.push(target);
+                    Vec::new()
+                });
+                entry.push(b.clone());
+            }
+        }
+
+        if order.is_empty() {
+            let mut unresolved = Vec::new();
+            let unit_count = self.unit_binds.len();
+            for (idx, (_, b)) in elab.bind_sites.iter().enumerate() {
+                let site_id = unit_count + idx;
+                if !b.target_path.is_empty() && !self.path_site_resolved.contains(&site_id) {
+                    unresolved.push(
+                        b.target_path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
+            }
+            for (idx, b) in self.unit_binds.iter().enumerate() {
+                if !b.target_path.is_empty() && !self.path_site_resolved.contains(&idx) {
+                    unresolved.push(
+                        b.target_path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
+            }
+            unresolved.sort();
+            unresolved.dedup();
+            // Reported once by whichever pass ends the fixed point: here
+            // when no bind resolved, else the final root elaboration.
+            self.unresolved = unresolved;
+            return Ok(Vec::new());
+        }
+
+        Ok(order
+            .into_iter()
+            .map(|t| {
+                let list = by_target.remove(&t).expect("target in by_target");
+                (t, list)
+            })
+            .collect())
+    }
+}
+
 /// §23.11: select targets using effective hierarchy and lexical constants.
 fn resolve_instance_binds(
     elab: &mut elaborate::ElaboratedModule,
@@ -4026,10 +4554,10 @@ fn resolve_instance_binds(
     // once, so selecting a target is a lookup rather than a scan.
     let mut host_paths = crate::hasher::HashSet::default();
     let mut hosts_of = crate::hasher::HashMap::<&str, Vec<&str>>::default();
-    host_paths.insert("");
+    host_paths.insert(String::new());
     hosts_of.entry(elab.name.as_str()).or_default().push("");
     for i in &elab.instances {
-        host_paths.insert(i.path.as_str());
+        host_paths.insert(i.path.clone());
         hosts_of
             .entry(i.def_name.as_str())
             .or_default()
@@ -4048,24 +4576,15 @@ fn resolve_instance_binds(
     let mut changed = false;
     let mut unresolved = Vec::new();
     for (scope, b, unit_scope) in sites {
-        let mut ancestors = vec![scope.as_str()];
-        let mut ancestor = scope.as_str();
-        while let Some((parent, _)) = ancestor.rsplit_once('.') {
-            ancestors.push(parent);
-            ancestor = parent;
-        }
+        let ancestors = collect_bind_ancestors(&scope);
         let mut targets = Vec::new();
         if b.target_path.is_empty() {
             // §23.11: a single identifier can name an instance as well as a
             // module/interface type. Lexical instance lookup takes priority,
             // including when an unrelated type has the same spelling.
-            let instance = ancestors
-                .iter()
-                .filter(|parent| !parent.is_empty())
-                .map(|parent| format!("{parent}.{}", b.target_module.name))
-                .chain(std::iter::once(b.target_module.name.clone()))
-                .find(|candidate| host_paths.contains(candidate.as_str()));
-            if let Some(instance) = instance {
+            if let Some(instance) =
+                find_lexical_bind_target(&ancestors, &b.target_module.name, &host_paths)
+            {
                 targets.push(instance);
             } else {
                 targets.extend(
@@ -4078,48 +4597,15 @@ fn resolve_instance_binds(
             }
         } else {
             for path in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
-                let mut joined = String::new();
-                for segment in path {
-                    if !joined.is_empty() {
-                        joined.push('.');
-                    }
-                    joined.push_str(&segment.name.name);
-                    for select in &segment.selects {
-                        let constants = constants.scope(unit_scope, &ancestors);
-                        let value = elaborate::const_eval_i64_with_params(select, Some(constants))
-                            .ok_or_else(|| {
-                                format!(
-                                    "nonconstant bind target index in '{}' (§23.11)",
-                                    b.target_module.name
-                                )
-                            })?;
-                        use std::fmt::Write as _;
-                        let _ = write!(joined, "[{value}]");
-                    }
-                }
-                let absolute = joined.strip_prefix("$root.").unwrap_or(&joined);
-                let rooted = absolute.strip_prefix(&format!("{}.", elab.name));
-                let mut candidates = Vec::new();
-                if absolute == elab.name {
-                    candidates.push(String::new());
-                }
-                if let Some(p) = rooted {
-                    candidates.push(p.to_string());
-                }
-                if joined.starts_with("$root.") {
-                    candidates.push(absolute.to_string());
-                } else {
-                    for parent in &ancestors {
-                        if !parent.is_empty() {
-                            candidates.push(format!("{parent}.{joined}"));
-                        }
-                    }
-                    candidates.push(joined.clone());
-                }
-                if let Some(target) = candidates
-                    .into_iter()
-                    .find(|p| host_paths.contains(p.as_str()))
-                {
+                if let Some(target) = eval_bind_path_target(
+                    path,
+                    &b.target_module.name,
+                    &elab.name,
+                    unit_scope,
+                    &ancestors,
+                    &host_paths,
+                    &mut constants,
+                )? {
                     targets.push(target);
                 }
             }
@@ -4138,17 +4624,7 @@ fn resolve_instance_binds(
         targets.dedup();
         for target in targets {
             let bound = elab.resolved_binds.entry(target).or_default();
-            if !bound.iter().any(|previous| {
-                previous.span == b.span
-                    && previous.instantiation.module_name.name == b.instantiation.module_name.name
-                    && previous.gen_scope == b.gen_scope
-                    && previous
-                        .instantiation
-                        .instances
-                        .iter()
-                        .map(|i| &i.name.name)
-                        .eq(b.instantiation.instances.iter().map(|i| &i.name.name))
-            }) {
+            if !bound.iter().any(|previous| bind_directive_matches(previous, &b)) {
                 bound.push(b.clone());
                 changed = true;
             }
@@ -4237,6 +4713,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         })
         .collect();
     ast::module::ModuleDeclaration {
+        lexical_parent: None,
         attrs: vec![],
         kind: ast::module::ModuleKind::Module,
         lifetime: None,
@@ -4259,9 +4736,6 @@ fn resolve_library_modules(
     lib_cli: &LibraryCli,
     unit_binds: &[ast::decl::BindDirective],
 ) -> Result<(), String> {
-    // Remember this pass's preprocessing context so --dump-merged-sv can
-    // re-preprocess ADOPTED files identically (see preprocess_adopted_lib).
-    record_adopted_lib_pp_context(include_dirs, lib_defines);
     fn collect_sv_files(
         dir: &std::path::Path,
         exts: &[String],
@@ -4309,6 +4783,9 @@ fn resolve_library_modules(
         if path.is_dir() {
             let mut found = Vec::new();
             collect_sv_files(path, &exts, &mut found)?;
+            // Directory order is the filesystem's; the files are read, and
+            // their macros defined, in a fixed order instead.
+            found.sort();
             pending.extend(found);
         }
     }
@@ -4340,12 +4817,18 @@ fn resolve_library_modules(
     // name), so a diagnostic inside an ADOPTED definition names its own file;
     // and the packages library files declared, which are never compiled.
     let mut lib_sources = elaborate::LibrarySources::default();
+    // Per entry of `lib_sources.files`: its file, and whether it preprocessed
+    // without errors (see `preprocess_adopted_lib`).
+    let mut indexed: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    // The macros defined so far: the design's, then each library file's as
+    // it is read (see `index_library_file`).
+    let mut lib_macros = lib_defines.clone();
     #[allow(clippy::too_many_arguments)]
     fn index_library_file(
         path: std::path::PathBuf,
         explicit_v: bool,
         include_dirs: &[String],
-        lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+        lib_defines: &mut std::collections::HashMap<String, preprocessor::MacroDef>,
         lib_cli: &LibraryCli,
         lib: &mut crate::hasher::HashMap<String, SourceDefinition>,
         lib_typedefs: &mut Vec<Rc<ast::decl::TypedefDeclaration>>,
@@ -4353,8 +4836,9 @@ fn resolve_library_modules(
         parse_issue_files: &mut Vec<std::path::PathBuf>,
         lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
         lib_sources: &mut elaborate::LibrarySources,
+        indexed: &mut Vec<(std::path::PathBuf, bool)>,
     ) {
-        let source = match std::fs::read_to_string(&path) {
+        let source = match read_library_file(&path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -4370,16 +4854,25 @@ fn resolve_library_modules(
         for dir in include_dirs {
             pp.add_include_dir(std::path::PathBuf::from(dir));
         }
-        for (name, def) in lib_defines {
+        for (name, def) in lib_defines.iter() {
             pp.define(name.clone(), def.clone());
         }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
+        // §22.5.1, §3.12.1: a library file is read as part of the one
+        // compilation, so a macro it defines (or an `include` of the
+        // design's headers defines) stays defined for every library file
+        // read after it, and one it undefines is gone. Each file started
+        // from only the design's macros, so a library module that included
+        // the headers did not share them with the library modules it
+        // instantiates.
+        *lib_defines = pp.snapshot_defines();
         let line_map = pp.take_line_map();
         // A missing `include or illegal directive in a library file: nothing
         // else reports the preprocessor's list on this path.
         for e in pp.errors() {
             eprintln!("{}", e);
         }
+        let preprocessed_cleanly = pp.errors().is_empty();
         let result = sv_parser::parse(&preprocessed);
         // Spans index the re-parsed text; it is the preprocessed text again
         // (nothing is left to expand), so the map applies to it.
@@ -4558,7 +5051,8 @@ fn resolve_library_modules(
             }
             lib_sources
                 .files
-                .push((file_label, result.source_text, line_map));
+                .push((file_label, result.source_text.into(), line_map));
+            indexed.push((path, preprocessed_cleanly));
         }
     }
 
@@ -4567,7 +5061,7 @@ fn resolve_library_modules(
             path,
             explicit_v,
             include_dirs,
-            lib_defines,
+            &mut lib_macros,
             lib_cli,
             &mut lib,
             &mut lib_typedefs,
@@ -4575,6 +5069,7 @@ fn resolve_library_modules(
             &mut parse_issue_files,
             &mut lib_origins,
             &mut lib_sources,
+            &mut indexed,
         );
     }
 
@@ -4617,7 +5112,10 @@ fn resolve_library_modules(
         }
         seed.extend(names);
     }
+    // Resolved in a fixed order: library files are read, and their macros
+    // defined (§22.5.1), in the order their modules are resolved.
     let mut work: Vec<String> = seed.into_iter().collect();
+    work.sort_unstable_by(|a, b| b.cmp(a));
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut adopted_from_v = 0usize;
     let mut adopted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4645,7 +5143,7 @@ fn resolve_library_modules(
                     path,
                     false,
                     include_dirs,
-                    lib_defines,
+                    &mut lib_macros,
                     lib_cli,
                     &mut lib,
                     &mut lib_typedefs,
@@ -4653,6 +5151,7 @@ fn resolve_library_modules(
                     &mut parse_issue_files,
                     &mut lib_origins,
                     &mut lib_sources,
+                    &mut indexed,
                 );
             }
             if !lib.contains_key(&name) && !full_scan_done {
@@ -4662,7 +5161,7 @@ fn resolve_library_modules(
                         path,
                         false,
                         include_dirs,
-                        lib_defines,
+                        &mut lib_macros,
                         lib_cli,
                         &mut lib,
                         &mut lib_typedefs,
@@ -4670,6 +5169,7 @@ fn resolve_library_modules(
                         &mut parse_issue_files,
                         &mut lib_origins,
                         &mut lib_sources,
+                        &mut indexed,
                     );
                 }
             }
@@ -4694,6 +5194,8 @@ fn resolve_library_modules(
             }
             let mut more = std::collections::HashSet::new();
             instantiations(def, &mut more);
+            let mut more: Vec<String> = more.into_iter().collect();
+            more.sort_unstable_by(|a, b| b.cmp(a));
             let mut def = def.clone();
             scope_tree::adopt(&mut def);
             definitions.insert(name.clone(), def);
@@ -4776,7 +5278,7 @@ fn resolve_library_modules(
             let prim_pat = format!("primitive {}", name);
             let prim_pat2 = format!("primitive  {}", name);
             if let Some(f) = scanned_paths.iter().find(|p| {
-                std::fs::read_to_string(p)
+                read_library_file(p)
                     .map(|s| s.contains(&prim_pat) || s.contains(&prim_pat2))
                     .unwrap_or(false)
             }) {
@@ -4811,7 +5313,7 @@ fn resolve_library_modules(
                 path,
                 false,
                 include_dirs,
-                lib_defines,
+                &mut lib_macros,
                 lib_cli,
                 &mut lib,
                 &mut lib_typedefs,
@@ -4819,6 +5321,7 @@ fn resolve_library_modules(
                 &mut parse_issue_files,
                 &mut lib_origins,
                 &mut lib_sources,
+                &mut indexed,
             );
         }
     }
@@ -4832,13 +5335,20 @@ fn resolve_library_modules(
         }
     }
     // Publish only the files an adopted definition came from.
-    let mut slots: Vec<Option<(String, String, Option<sv_parser::source_map::LineMap>)>> =
-        std::mem::take(&mut lib_sources.files)
-            .into_iter()
-            .map(Some)
-            .collect();
+    #[allow(clippy::type_complexity)]
+    let mut slots: Vec<
+        Option<(String, std::sync::Arc<str>, Option<sv_parser::source_map::LineMap>)>,
+    > = std::mem::take(&mut lib_sources.files)
+        .into_iter()
+        .map(Some)
+        .collect();
     let mut renumber: crate::hasher::HashMap<u32, u32> = Default::default();
     let mut def_file: crate::hasher::HashMap<String, u32> = Default::default();
+    #[allow(clippy::type_complexity)]
+    let mut adopted_texts: std::collections::HashMap<
+        std::path::PathBuf,
+        (u32, Option<std::sync::Arc<str>>),
+    > = Default::default();
     for (name, i) in std::mem::take(&mut lib_sources.def_file) {
         if !adopted.contains(&name) {
             continue;
@@ -4849,6 +5359,21 @@ fn resolve_library_modules(
                 let Some(file) = slots.get_mut(i as usize).and_then(Option::take) else {
                     continue;
                 };
+                // `preprocess_adopted_lib`'s text: of the first read that an
+                // adopted definition came from, for a file named twice.
+                if let Some((path, clean)) = indexed.get(i as usize) {
+                    let text = clean.then(|| file.1.clone());
+                    match adopted_texts.entry(path.clone()) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if i < e.get().0 {
+                                e.insert((i, text));
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((i, text));
+                        }
+                    }
+                }
                 let j = lib_sources.files.len() as u32;
                 lib_sources.files.push(file);
                 renumber.insert(i, j);
@@ -4858,6 +5383,9 @@ fn resolve_library_modules(
         def_file.insert(name, j);
     }
     lib_sources.def_file = def_file;
+    if let Ok(mut g) = adopted_lib_texts_cell().lock() {
+        g.extend(adopted_texts.into_iter().map(|(p, (_, t))| (p, t)));
+    }
     elaborate::set_elab_library_sources(lib_sources);
     Ok(())
 }

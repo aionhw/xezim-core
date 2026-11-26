@@ -663,7 +663,7 @@ fn an_inner_clocking_block_hides_a_block_function() {
         .iter()
         .find(|m| m.name == "f" && m.pos == "process")
         .expect("the event");
-    check(m, "Decl(top.g.h, Clocking)", None);
+    check(m, "Decl(top.g.h, Clocking)", Some("g.h.f"));
 }
 
 #[test]
@@ -973,6 +973,30 @@ fn block_data_read_from_a_final_block_or_a_class_takes_the_blocks_key() {
         let m = at(&l, "v", n);
         assert_eq!(m.pos, pos);
         check(m, "Decl(top.g, Data)", Some("g.v"));
+    }
+}
+
+#[test]
+fn a_clocking_block_and_its_clockvar_signal_take_the_blocks_keys() {
+    // §14.3, §23.9, §27.4: each copy of the block has its own clocking block,
+    // and a clockvar without `= expression` names the signal of the copy.
+    let src = "module top; logic c; int v, w;
+        for (genvar i = 0; i < 2; i++) begin : g int v;
+          clocking cb @(posedge c); input v; input w; endclocking
+          initial @(cb) $display(cb.v);
+        end endmodule";
+    let l = audit(src);
+    let sig = |n: &str| {
+        l.iter()
+            .find(|m| m.name == n && m.pos == "clocking-signal")
+            .unwrap_or_else(|| panic!("{n}: {l:#?}"))
+    };
+    check(sig("v"), "Decl(top.g[@], Data)", Some("g[@].v"));
+    check(sig("w"), "Decl(top, Data)", None);
+    for (n, pos) in [(0, "process"), (1, "process")] {
+        let m = at(&l, "cb", n);
+        assert_eq!(m.pos, pos);
+        check(m, "Decl(top.g[@], Clocking)", Some("g[@].cb"));
     }
 }
 

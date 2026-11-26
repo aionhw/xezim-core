@@ -73,6 +73,7 @@ pub struct Preprocessor {
     /// §22.9: pull direction of the ACTIVE `unconnected_drive region
     /// (Some(true)=pull1, Some(false)=pull0), None outside a region.
     unconnected_pull: Option<bool>,
+    default_net_pull: Option<bool>,
     /// Macro-expansion-time strict errors (bad argument counts). Interior
     /// mutability because `expand_macros*` run behind `&self`; drained into
     /// `errors` after each line is expanded.
@@ -344,6 +345,7 @@ impl Preprocessor {
             errors: Vec::new(),
             design_element_depth: 0,
             unconnected_pull: None,
+            default_net_pull: None,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
             undefined_seen: std::cell::RefCell::new(Vec::new()),
             paste_separated: std::cell::Cell::new(false),
@@ -1180,6 +1182,31 @@ impl Preprocessor {
                 pos.push((ln, 0));
                 continue;
             }
+            // §22.2: directives with a defined end can be followed by another
+            // directive or a text macro on the same physical line. Leave the
+            // macro tail intact, including nested backticks in its arguments.
+            let mut line = line;
+            let mut base_col = 0;
+            while let Some(n) = line.trim_start().strip_prefix('`')
+                .and_then(|rest| rest.find('`'))
+            {
+                let i = line.len() - line.trim_start().len() + n + 1;
+                let head = line[..i].trim();
+                let finished = matches!(head, "`resetall" | "`celldefine" | "`endcelldefine")
+                    || head.strip_prefix("`timescale").and_then(|t| t.split_once('/'))
+                        .is_some_and(|(u,p)| Self::parse_time_literal(u).is_some() && Self::parse_time_literal(p).is_some())
+                    || head.strip_prefix("`include").is_some_and(|t| {
+                        let t = t.trim(); t.starts_with('"') && t.ends_with('"') && t.len() > 1
+                    })
+                    || head.strip_prefix("`default_nettype").is_some_and(|t| t.split_whitespace().count() == 1);
+                if !finished { break; }
+                out.push_str(&line[..i]);
+                out.push('\n');
+                pos.push((ln, base_col));
+                base_col += line[..i].chars().count() as u32;
+                line = &line[i..];
+            }
+            let trimmed = fast_trim_start(line);
             // A line STARTING with a conditional directive may still carry
             // trailing content (`\`endif initial ...`; `\`endif junk`) —
             // §22.6 makes the directive its own token, so the tail must be
@@ -1189,10 +1216,10 @@ impl Preprocessor {
             if (trimmed.starts_with('`') && !starts_cond) || !line.contains('`') {
                 out.push_str(line);
                 out.push('\n');
-                pos.push((ln, 0));
+                pos.push((ln, base_col));
                 continue;
             }
-            let col_of = |byte: usize| line[..byte].chars().count() as u32;
+            let col_of = |byte: usize| base_col + line[..byte].chars().count() as u32;
             let b = line.as_bytes();
             let mut i = 0usize;
             let mut seg = 0usize;
@@ -1267,6 +1294,7 @@ impl Preprocessor {
         let saved_col_off = self.cur_col_off;
         // Text re-resolved after a macro expansion stays at the invocation:
         // every line it emits maps there, and the cursor does not move.
+        let starts_file = matches!(ctx, Ctx::File { included_from: None });
         let fixed = match ctx {
             Ctx::Macro(o) => Some(o),
             Ctx::File { included_from } => {
@@ -1293,6 +1321,10 @@ impl Preprocessor {
         let mut last_src: i64 = -1;
         // Origin for lines emitted on behalf of the current source line.
         let mut here = fixed.unwrap_or(LineOrigin::plain(self.cur_file_idx, 1, 0));
+        if starts_file && let Some(pull) = self.default_net_pull {
+            output.push_str(if pull { "`default_nettype tri1\n" } else { "`default_nettype tri0\n" });
+            sink.fill(&output, here);
+        }
         let mut joined: Vec<usize> = Vec::new();
 
         while let Some((li, line)) = lines.next() {
@@ -1632,6 +1664,19 @@ impl Preprocessor {
                 if rest.starts_with("none") {
                     crate::set_default_nettype_none_seen(true);
                 }
+                let pull = match rest.split_whitespace().next() {
+                    Some("tri0") => Some(false),
+                    Some("tri1") => Some(true),
+                    _ => None,
+                };
+                if pull.is_some() || self.default_net_pull.is_some() {
+                    output.push_str(match pull {
+                        Some(true) => "`default_nettype tri1",
+                        Some(false) => "`default_nettype tri0",
+                        None => "`default_nettype wire",
+                    });
+                }
+                self.default_net_pull = pull;
                 output.push('\n');
                 continue;
             }
@@ -1818,6 +1863,9 @@ impl Preprocessor {
                 // §22.3: `\`resetall` resets all compiler directives to their
                 // defaults, including clearing the active `\`timescale`, so a
                 // module declared after it has no explicit source-level timescale.
+                if self.default_net_pull.take().is_some() {
+                    output.push_str("`default_nettype wire");
+                }
                 self.timescale = None;
                 output.push('\n');
                 continue;
@@ -2476,6 +2524,12 @@ impl Preprocessor {
             }
             result = next;
         }
+        // A `" ... `" region still kept open (its macro never stops
+        // expanding, or the cap ended the chain) becomes a string literal
+        // here, so no stringify delimiter reaches the tokenizer.
+        if result.contains("`\"") {
+            result = Self::close_stringified_regions(&result);
+        }
         if self.paste_separated.replace(false) {
             result.retain(|c| c != PASTE_SEPARATOR);
         }
@@ -2615,6 +2669,16 @@ impl Preprocessor {
         // delimiters (`` `" ``) are backtick-prefixed and consumed by the
         // backtick handler below, so they never reach this path.
         let mut in_string = false;
+        // §22.5.1: a `" ... `" region includes "expansions of embedded
+        // macros", however deep the chain. One level expands per pass, and a
+        // region written as "..." would be a string literal to the next pass,
+        // where nothing expands (`` `"`INST.x`" `` with `INST = `TOP.u0 gave
+        // "`TOP.u0.x", #1338). So the region that is open in this pass
+        // remembers where its opening quote and its escaped quotes (`\`")
+        // sit in `result`; when a macro expanded inside it left a backtick,
+        // its closing delimiter restores them to `" and `\`" for the next
+        // pass, and `expand_macros` closes what never finishes.
+        let mut region: Option<StringifyRegion> = None;
         while i < bytes.len() {
             // Copy ordinary text in bulk: inside a string only `\\` and `"`
             // matter, outside it only `` ` `` and `"`.
@@ -2657,7 +2721,21 @@ impl Preprocessor {
                 }
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\"' {
                     // Stringification: replace with normal quote
-                    result.push('\"');
+                    match region.take() {
+                        None => {
+                            region = Some(StringifyRegion {
+                                start: result.len(),
+                                escapes: Vec::new(),
+                                unfinished: false,
+                            });
+                            result.push('\"');
+                        }
+                        Some(r) if r.unfinished => {
+                            r.reopen(&mut result);
+                            result.push_str("`\"");
+                        }
+                        Some(_) => result.push('\"'),
+                    }
                     i += 2;
                     continue;
                 }
@@ -2669,6 +2747,9 @@ impl Preprocessor {
                     // §22.5.1 `\`" — an ESCAPED quote inside the expanded
                     // string literal. Previously fell into the macro-name
                     // scan and came out mangled.
+                    if let Some(r) = region.as_mut() {
+                        r.escapes.push(result.len());
+                    }
                     result.push('\\');
                     result.push('\"');
                     i += 4;
@@ -2779,7 +2860,18 @@ impl Preprocessor {
                         }
                         let body = Self::substitute_formals(&def.body, &actuals);
                         let body_pasted = self.apply_token_pasting(&body);
-                        result.push_str(&body_pasted);
+                        // The text of a macro with arguments keeps the white
+                        // space after its formal list, which separates the
+                        // expansion from a token before the usage. Inside a
+                        // `" region it would become part of the string:
+                        // `` `"x`F(top)`" `` is "xtop.u0".
+                        let text = if region.is_some() {
+                            body_pasted.trim_start()
+                        } else {
+                            &body_pasted
+                        };
+                        StringifyRegion::note_text(&mut region, text);
+                        result.push_str(text);
                     } else {
                         // §22.5.1: a macro defined with a formal list must be
                         // invoked with parentheses, even when empty.
@@ -2794,6 +2886,7 @@ impl Preprocessor {
                             ));
                         }
                         let body_pasted = self.apply_token_pasting(&def.body);
+                        StringifyRegion::note_text(&mut region, &body_pasted);
                         result.push_str(&body_pasted);
                     }
                 } else {
@@ -2825,6 +2918,80 @@ impl Preprocessor {
             }
         }
         result
+    }
+
+    /// Turn the `` `" ... `" `` regions that `expand_macros_once` kept open
+    /// into string literals, with no further expansion: each `` `" `` becomes
+    /// `"` and each `` `\`" `` becomes `\"`, as one pass writes a finished
+    /// region. A `"` outside a delimiter starts a string literal that runs to
+    /// its closing `"` (§22.5.1), and its text is copied as it is.
+    fn close_stringified_regions(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        let mut i = 0;
+        let mut in_string = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 2,
+                b'"' => {
+                    in_string = !in_string;
+                    i += 1;
+                }
+                b'`' if !in_string && bytes.get(i + 1) == Some(&b'"') => {
+                    out.push_str(&text[last..i]);
+                    out.push('"');
+                    i += 2;
+                    last = i;
+                }
+                b'`' if !in_string && bytes[i..].starts_with(b"`\\`\"") => {
+                    out.push_str(&text[last..i]);
+                    out.push_str("\\\"");
+                    i += 4;
+                    last = i;
+                }
+                _ => i += 1,
+            }
+        }
+        out.push_str(&text[last.min(text.len())..]);
+        out
+    }
+}
+
+/// The `` `" ... `" `` region open in one `expand_macros_once` pass
+/// (§22.5.1). `start` is the offset in the pass's output of the `"` its
+/// opening delimiter was written as, and `escapes` the offsets of the `\"`
+/// each `` `\`" `` in it was written as.
+struct StringifyRegion {
+    start: usize,
+    escapes: Vec<usize>,
+    /// A macro expanded in the region inserted text that holds a backtick,
+    /// so the region has another level to expand.
+    unfinished: bool,
+}
+
+impl StringifyRegion {
+    /// Record macro text inserted at the current point of the pass.
+    fn note_text(region: &mut Option<Self>, text: &str) {
+        if let Some(r) = region {
+            r.unfinished |= text.contains('`');
+        }
+    }
+
+    /// Write the region's opening delimiter and escaped quotes back as
+    /// `` `" `` and `` `\`" ``, so the next pass reads it as a region again.
+    fn reopen(&self, result: &mut String) {
+        let tail = result.split_off(self.start + 1);
+        result.truncate(self.start);
+        result.push_str("`\"");
+        let mut last = 0;
+        for &e in &self.escapes {
+            let e = e - (self.start + 1);
+            result.push_str(&tail[last..e]);
+            result.push_str("`\\`\"");
+            last = e + 2;
+        }
+        result.push_str(&tail[last..]);
     }
 }
 

@@ -429,15 +429,11 @@ fn parse_generated(text: &str) -> Result<Vec<Description>, String> {
 }
 
 fn parse_generated_whole(text: &str) -> Result<Vec<Description>, String> {
-    let mut tokens = crate::sv_parser::lexer::Lexer::new(text).tokenize();
+    let tokens = crate::sv_parser::lexer::Lexer::new(text).tokenize();
     crate::oom_trace::checkpoint(
         "vhdl.generated_tokens",
         &[("generated_sv_bytes", text.len()), ("tokens", tokens.len())],
     );
-    for t in &mut tokens {
-        t.span.start += GENERATED_SPAN_BASE;
-        t.span.end += GENERATED_SPAN_BASE;
-    }
     let descriptions = parse_generated_tokens(tokens, text)?;
     crate::oom_trace::checkpoint(
         "vhdl.generated_ast",
@@ -447,10 +443,10 @@ fn parse_generated_whole(text: &str) -> Result<Vec<Description>, String> {
 }
 
 fn parse_generated_tokens(
-    tokens: Vec<crate::sv_parser::lexer::Token>,
+    tokens: crate::sv_parser::lexer::TokenStream<'_>,
     text: &str,
 ) -> Result<Vec<Description>, String> {
-    let mut parser = crate::sv_parser::parse::Parser::new(tokens);
+    let mut parser = crate::sv_parser::parse::Parser::new(tokens.with_span_base(GENERATED_SPAN_BASE));
     let source = parser.parse_source_text();
     let errors: Vec<String> = parser
         .diagnostics()

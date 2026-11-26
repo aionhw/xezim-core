@@ -1,14 +1,14 @@
 //! Expression parsing (IEEE 1800-2017 §A.8) with Pratt precedence climbing.
 
-use super::{Parser, compact_syntax_list};
 use super::items::ConstraintPos;
+use super::{Parser, compact_syntax_list};
 use crate::ast::Identifier;
 use crate::ast::Span;
 use crate::ast::expr::*;
 use crate::diagnostics::Diagnostic;
 use crate::lexer::token::TokenKind;
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub(super) fn parse_expression(&mut self) -> Expression {
         self.parse_expr_bp(0)
     }
@@ -91,7 +91,7 @@ impl Parser {
                 let s = lval.span.start; // base
                 self.bump();
                 let member = if matches!(
-                    self.current().kind,
+                    self.current_kind(),
                     TokenKind::KwNew
                         | TokenKind::KwAnd
                         | TokenKind::KwOr
@@ -100,11 +100,8 @@ impl Parser {
                 ) {
                     let tok = self.bump();
                     Identifier {
-                        name: tok.text.clone(),
-                        span: Span {
-                            start: tok.span.start,
-                            end: tok.span.end,
-                        },
+                        name: self.token_text(tok).into_owned(),
+                        span: self.token_span(tok),
                     }
                 } else {
                     self.parse_identifier()
@@ -123,7 +120,7 @@ impl Parser {
                     let tok = self.bump();
                     crate::ast::Identifier {
                         name: "new".to_string(),
-                        span: tok.span,
+                        span: self.token_span(tok),
                     }
                 } else {
                     self.parse_identifier()
@@ -241,7 +238,7 @@ impl Parser {
     }
 
     fn parse_expr_bp_ctx(&mut self, min_bp: u8, no_arrow: bool) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut lhs = self.parse_prefix();
 
         loop {
@@ -623,7 +620,7 @@ impl Parser {
                 self.bump();
                 // Allow 'new'/'and'/'or'/'xor'/'unique' as member names (e.g. arr.and, arr.unique)
                 let member = if matches!(
-                    self.current().kind,
+                    self.current_kind(),
                     TokenKind::KwNew
                         | TokenKind::KwAnd
                         | TokenKind::KwOr
@@ -632,11 +629,8 @@ impl Parser {
                 ) {
                     let tok = self.bump();
                     Identifier {
-                        name: tok.text.clone(),
-                        span: Span {
-                            start: tok.span.start,
-                            end: tok.span.end,
-                        },
+                        name: self.token_text(tok).into_owned(),
+                        span: self.token_span(tok),
                     }
                 } else {
                     self.parse_identifier()
@@ -718,7 +712,7 @@ impl Parser {
                     let tok = self.bump();
                     crate::ast::Identifier {
                         name: "new".to_string(),
-                        span: tok.span,
+                        span: self.token_span(tok),
                     }
                 } else {
                     self.parse_identifier()
@@ -753,7 +747,7 @@ impl Parser {
                             if !text.is_empty() {
                                 text.push(' ');
                             }
-                            text.push_str(&self.current().text);
+                            text.push_str(&self.current_text());
                         }
                         self.bump();
                     }
@@ -943,21 +937,52 @@ impl Parser {
             // §11.4.14 stream-expression form `expr with [ array_range ]`
             // (`<<8{ data with [0 +: len] }`). The bracketed range selects a
             // slice of the operand inside a streaming concatenation.
+            // §11.4.14.4: `with [ array_range ]` selects a sub-range of a
+            // one-dimensional unpacked operand inside a stream concatenation;
+            // the selected elements are what stream (pack) or are written
+            // (unpack). Keep the range in the AST by wrapping the operand in
+            // the matching select node — `Index` for the single-item `[e]`
+            // form, `RangeSelect` for `[lo:hi]`, `[lo+:w]`, `[lo-:w]` — so
+            // the runtime can enumerate just those elements.
             if self.at(TokenKind::KwWith) && self.peek_kind() == TokenKind::LBracket {
                 self.bump(); // with
                 self.bump(); // [
-                let _lo = self.parse_expression();
-                // optional `: hi` / `+: width` / `-: width`
+                let lo = self.parse_expression();
                 if self.at(TokenKind::Colon)
                     || self.at(TokenKind::PlusColon)
                     || self.at(TokenKind::MinusColon)
                 {
-                    self.bump();
-                    let _hi = self.parse_expression();
+                    let kind = if self.at(TokenKind::Colon) {
+                        self.bump();
+                        RangeKind::Constant
+                    } else if self.at(TokenKind::PlusColon) {
+                        self.bump();
+                        RangeKind::IndexedUp
+                    } else {
+                        self.bump();
+                        RangeKind::IndexedDown
+                    };
+                    let hi = self.parse_expression();
+                    self.expect(TokenKind::RBracket);
+                    lhs = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lhs),
+                            kind,
+                            left: Box::new(lo),
+                            right: Box::new(hi),
+                        },
+                        self.span_from(start),
+                    );
+                } else {
+                    self.expect(TokenKind::RBracket);
+                    lhs = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(lhs),
+                            index: Box::new(lo),
+                        },
+                        self.span_from(start),
+                    );
                 }
-                self.expect(TokenKind::RBracket);
-                // Pass the operand through unchanged — the range is a slice hint.
-                lhs = Expression::new(ExprKind::Paren(Box::new(lhs)), self.span_from(start));
                 continue;
             }
             if self.eat(TokenKind::KwWith).is_some() {
@@ -981,7 +1006,7 @@ impl Parser {
             // Sized / type cast postfix: <expr>'(value)
             // Covers (expr)'(value), pkg::type'(value), id'(value), array_select'(value), etc.
             // Treated as pass-through (cast is a width/type hint at parse time).
-            if self.current().text == "'" && self.peek_kind() == TokenKind::LParen {
+            if self.current_text() == "'" && self.peek_kind() == TokenKind::LParen {
                 self.bump(); // skip '
                 self.bump(); // skip (
                 let inner = self.parse_expression();
@@ -1188,7 +1213,7 @@ impl Parser {
     pub(super) fn parse_prefix(&mut self) -> Expression {
         // One primary only: a parenthesized count (`##(f(1))`) parses as usual.
         let delay_count = std::mem::take(&mut self.sva_delay_count);
-        let start = self.current().span.start;
+        let start = self.current_span().start;
 
         match self.current_kind() {
             // §16.13 multiclock sequence: a clocking-event prefix `@(event)` on
@@ -1262,6 +1287,14 @@ impl Parser {
                         }
                         self.bump();
                     }
+                } else if matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ) {
+                    // §16.13.1, §9.4.2: `clocking_event ::= @ identifier`
+                    // too: `a ##1 @e b` changes the clock to the event `e`.
+                    // The name is the event, not the start of the operand.
+                    let _ = self.parse_hierarchical_identifier();
                 }
                 self.parse_expr_bp(0)
             }
@@ -1410,7 +1443,7 @@ impl Parser {
                 // accepts). Capture the body for `parse_constraint_item`;
                 // outside constraint context `dist` here stays an error.
                 if self.in_constraint && self.at(TokenKind::KwDist) {
-                    let dspan = self.current().span;
+                    let dspan = self.current_span();
                     self.diagnostics
                         .push(crate::diagnostics::Diagnostic::warning(
                             "parenthesized 'dist' constraint is nonstandard (accepted for \
@@ -1431,7 +1464,7 @@ impl Parser {
                 if self.in_sva_seq && self.at(TokenKind::Comma) {
                     let mut args = vec![inner];
                     while self.eat(TokenKind::Comma).is_some() {
-                        let istart = self.current().span.start;
+                        let istart = self.current_span().start;
                         let item = self.parse_expression();
                         args.push(self.parse_paren_assign_tail(item, istart));
                     }
@@ -1532,27 +1565,29 @@ impl Parser {
                 // otherwise be silently coerced to a wrong value (zero-size
                 // based literal, decimal with multiple/mixed x·z). The span of
                 // the current (pre-bump) token points at the literal itself.
-                if let Some(msg) = validate_number_literal(&self.current().text) {
-                    self.error(msg);
-                }
                 let tok = self.bump();
-                let num = parse_number_literal(&tok.text);
+                let span = self.token_span(tok);
+                let text = self.token_text(tok);
+                if let Some(msg) = validate_number_literal(&text) {
+                    self.diagnostics.push(Diagnostic::error(msg, span));
+                }
+                let num = parse_number_literal(&text);
                 // IEEE 1800-2017 §5.7.1: reject based literals whose value is
                 // empty or contains digits outside the base alphabet (e.g. the
                 // illegal `8'd-6`, tokenised as `8'd` `-` `6`).
-                if tok.text.contains('\'') {
+                if text.contains('\'') {
                     if let NumberLiteral::Integer { base, value, .. } = &num {
                         if let Some(msg) = validate_based_literal_value(*base, value) {
                             self.diagnostics.push(Diagnostic::error(
-                                format!("{}: '{}'", msg, tok.text),
-                                tok.span,
+                                format!("{}: '{}'", msg, text),
+                                span,
                             ));
                         }
                     }
                 }
                 let expr = Expression::new(ExprKind::Number(num), self.span_from(start));
-                if self.current().kind == TokenKind::IntegerLiteral
-                    && self.current().text == "'"
+                if self.current_kind() == TokenKind::IntegerLiteral
+                    && self.current_text() == "'"
                     && self.peek_kind() == TokenKind::LParen
                 {
                     self.bump();
@@ -1575,7 +1610,7 @@ impl Parser {
             }
             TokenKind::UnbasedUnsizedLiteral => {
                 let tok = self.bump();
-                let ch = tok.text.chars().last().unwrap_or('0');
+                let ch = self.token_text(tok).chars().last().unwrap_or('0');
                 Expression::new(
                     ExprKind::Number(NumberLiteral::UnbasedUnsized(ch)),
                     self.span_from(start),
@@ -1585,16 +1620,24 @@ impl Parser {
             // String literal
             TokenKind::StringLiteral => {
                 let tok = self.bump();
-                let (s, diags) = decode_string_escapes_checked(&tok.text[1..tok.text.len() - 1]);
-                self.push_string_escape_diags(diags, tok.span);
+                let span = self.token_span(tok);
+                let (s, diags) = {
+                    let text = self.token_text(tok);
+                    decode_string_escapes_checked(&text[1..text.len() - 1])
+                };
+                self.push_string_escape_diags(diags, span);
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
 
             // IEEE 1800-2023 §5.9: triple-quoted string literal.
             TokenKind::TripleStringLiteral => {
                 let tok = self.bump();
-                let (s, diags) = decode_string_escapes_checked(&tok.text[3..tok.text.len() - 3]);
-                self.push_string_escape_diags(diags, tok.span);
+                let span = self.token_span(tok);
+                let (s, diags) = {
+                    let text = self.token_text(tok);
+                    decode_string_escapes_checked(&text[3..text.len() - 3])
+                };
+                self.push_string_escape_diags(diags, span);
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
 
@@ -1610,7 +1653,7 @@ impl Parser {
             // are injected into every module under their own name and are
             // never shadow-renamed, so the qualifier has nothing to select.
             TokenKind::SystemIdentifier
-                if self.current().text == "$unit" && self.peek_kind() == TokenKind::DoubleColon =>
+                if self.current_text() == "$unit" && self.peek_kind() == TokenKind::DoubleColon =>
             {
                 self.bump(); // $unit
                 self.bump(); // ::
@@ -1631,12 +1674,27 @@ impl Parser {
                 // task" and read/wrote nothing (every `$root.` reference was
                 // a silent 32-bit zero). Route it into the hierarchical
                 // parser, which accepts `$root` as an ordinary first segment.
-                if self.current().text == "$root" && self.peek_kind() == TokenKind::Dot {
+                if self.current_text() == "$root" && self.peek_kind() == TokenKind::Dot {
                     let hier = self.parse_hierarchical_identifier();
                     return Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 }
                 let tok = self.bump();
-                let name = tok.text.clone();
+                let mut name = self.token_text(tok).into_owned();
+                // §20.6.1, §26.3: a package-qualified value and a
+                // dotted block member have different declarations even when
+                // their expression trees lower to the same member path.
+                if name == "$typename" {
+                    let mut head = self.pos;
+                    while self.tokens.get(head).is_some_and(|t| t.kind == TokenKind::LParen) {
+                        head += 1;
+                    }
+                    if self.tokens.get(head).is_some_and(|t|
+                        matches!(t.kind, TokenKind::Identifier | TokenKind::EscapedIdentifier))
+                        && self.tokens.get(head + 1).is_some_and(|t| t.kind == TokenKind::DoubleColon)
+                    {
+                        name = "$__xz_scoped_typename".to_string();
+                    }
+                }
                 let args = if self.at(TokenKind::LParen) {
                     self.parse_call_args_inner(matches!(
                         name.as_str(),
@@ -1676,11 +1734,8 @@ impl Parser {
             TokenKind::KwSuper => {
                 let tok = self.bump();
                 let id = Identifier {
-                    name: tok.text.clone(),
-                    span: Span {
-                        start: tok.span.start,
-                        end: tok.span.end,
-                    },
+                    name: self.token_text(tok).into_owned(),
+                    span: self.token_span(tok),
                 };
                 let hier = HierarchicalIdentifier {
                     root: None,
@@ -1719,7 +1774,7 @@ impl Parser {
                         self.current_kind(),
                         TokenKind::Hash | TokenKind::DoubleColon | TokenKind::Dot
                     )
-                    && self.current().text != "'"
+                    && self.current_text() != "'"
                     && let Some(ld) = self.visible_let(&id.name)
                 {
                     return self.parse_let_instance(&ld, &id, start);
@@ -1744,7 +1799,7 @@ impl Parser {
                                 if !text.is_empty() {
                                     text.push(' ');
                                 }
-                                text.push_str(&self.current().text);
+                                text.push_str(&self.current_text());
                             }
                             self.bump();
                         }
@@ -1785,7 +1840,7 @@ impl Parser {
                 // parameter tables. Formerly this dropped the cast (returned the
                 // bare operand), so `size1'(x)` kept x's width and `my_t'(x)`
                 // skipped the sign/width conversion.
-                if self.current().text == "'" && self.peek_kind() == TokenKind::LParen {
+                if self.current_text() == "'" && self.peek_kind() == TokenKind::LParen {
                     self.bump(); // skip '
                     self.bump(); // skip (
                     let inner = self.parse_expression();
@@ -1873,18 +1928,7 @@ impl Parser {
             | TokenKind::KwReal
             | TokenKind::KwShortreal
             | TokenKind::KwRealtime
-                if {
-                    // Look ahead: is this type_keyword'(expr) ?
-                    let next = self.peek_kind();
-                    next == TokenKind::IntegerLiteral && {
-                        let next_text = self
-                            .tokens
-                            .get(self.pos + 1)
-                            .map(|t| t.text.as_str())
-                            .unwrap_or("");
-                        next_text == "'"
-                    }
-                } =>
+                if self.followed_by_cast_quote() =>
             {
                 let cast_kw = self.current_kind();
                 self.bump(); // skip type keyword
@@ -1964,11 +2008,8 @@ impl Parser {
             TokenKind::KwNew => {
                 let tok = self.bump();
                 let name_id = Identifier {
-                    name: tok.text.clone(),
-                    span: Span {
-                        start: tok.span.start,
-                        end: tok.span.end,
-                    },
+                    name: self.token_text(tok).into_owned(),
+                    span: self.token_span(tok),
                 };
                 let hier = HierarchicalIdentifier {
                     root: None,
@@ -2033,7 +2074,7 @@ impl Parser {
                 self.parse_expr_bp(3)
             }
             TokenKind::KwS_eventually => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let operand = self.parse_expr_bp(3);
                 Expression::new(
@@ -2052,7 +2093,7 @@ impl Parser {
             // §16.12.11: `always p` shares the `s_always` node. An always
             // block is parsed at item level and never reaches this arm.
             TokenKind::KwS_always | TokenKind::KwAlways => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let operand = self.parse_expr_bp(3);
                 Expression::new(
@@ -2069,7 +2110,7 @@ impl Parser {
             // delay. `s_nexttime` of a sequence is the strong form, which
             // fails when the clock stops before the n-th tick.
             TokenKind::KwNexttime | TokenKind::KwS_nexttime => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 let strong = self.at(TokenKind::KwS_nexttime);
                 self.bump();
                 let count = if self.eat(TokenKind::LBracket).is_some() {
@@ -2099,7 +2140,7 @@ impl Parser {
             // handling matches nexttime/always above. `not` in gate-primitive
             // position is caught at item level (items.rs) before reaching here.
             TokenKind::KwNot => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 let operand = self.parse_expr_bp(3);
                 Expression::new(
@@ -2114,7 +2155,7 @@ impl Parser {
                 // LRM §16.9.7 `first_match(sequence_expr [, sequence_match_item…])`.
                 // Kept as a `$sva_first_match(seq)` marker: the assertion
                 // engine stops the operand at its first match.
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 if self.eat(TokenKind::LParen).is_none() {
                     self.error("expected '(' after first_match".to_string());
@@ -2167,7 +2208,7 @@ impl Parser {
                 // lower it to exactly that and no new evaluator is needed:
                 //     if (b) p1           ==  b |-> p1
                 //     if (b) p1 else p2   ==  (b |-> p1) and (!b |-> p2)
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 if self.eat(TokenKind::LParen).is_none() {
                     self.error("expected '(' after property if".to_string());
@@ -2224,7 +2265,7 @@ impl Parser {
             }
             // §16.12.2 `strong(seq)` / `weak(seq)`: kept as markers.
             TokenKind::KwStrong | TokenKind::KwWeak => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 let strong = self.at(TokenKind::KwStrong);
                 self.bump();
                 let _ = self.eat(TokenKind::LParen);
@@ -2243,7 +2284,7 @@ impl Parser {
                 // cycles, rest}. Without consuming the right-hand side
                 // here, the bare `##N` would leave the trailing operand
                 // dangling (e.g. `a |-> ##1 b` errored on `b`).
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump();
                 // LRM §16.8: prefix `##N rest` or a cycle-delay RANGE
                 // `##[m:n]` / `##[m:$]` / `##[*]` / `##[+]` (e.g. after `|->`:
@@ -2285,7 +2326,24 @@ impl Parser {
                         | TokenKind::BitNand
                         | TokenKind::BitNor
                         | TokenKind::BitXnor
-                );
+                        | TokenKind::EscapedIdentifier
+                        | TokenKind::RealLiteral
+                        | TokenKind::UnbasedUnsizedLiteral
+                        | TokenKind::StringLiteral
+                        | TokenKind::LBrace
+                        | TokenKind::KwFirst_match
+                ) || (self.in_sva_seq && self.at(TokenKind::At));
+                // A.2.10: the operand is any sequence_expr, so it may also
+                // open with an escaped name, a real, unbased or string
+                // literal, a concatenation (`##1 {a, b} == 2'b11`) or
+                // `first_match(...)`; each of these left a bare delay and
+                // an "unexpected" error at the closing parenthesis.
+                // §16.13.1 / A.2.10: in a sequence the operand may also open
+                // with a clocking event (`clocking_event sequence_expr`), as
+                // in the multiclocked `b ##1 @(posedge clk2) ##1 ##1
+                // @(posedge clk) c`. Without `At` here the inner
+                // `##1 @(posedge clk) c` stopped at the `@`, and the enclosing
+                // parentheses failed with "expected RParen, found At".
                 if allow_rhs {
                     let rest = self.parse_expr_bp(3);
                     Expression::new(
@@ -2311,7 +2369,7 @@ impl Parser {
                 self.error(format!(
                     "expected expression, found {:?} '{}'",
                     self.current_kind(),
-                    self.current().text
+                    self.current_text()
                 ));
                 self.bump();
                 Expression::new(ExprKind::Empty, self.span_from(start))
@@ -2324,7 +2382,7 @@ impl Parser {
     /// Shared by the `'{ ... }` and the tagged-union pattern-literal forms
     /// (`tagged member '{ ... }`, IEEE 1800-2023 §7.3.1).
     fn parse_assignment_pattern_items(&mut self) -> Vec<AssignmentPatternItem> {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut items = Vec::new();
         let mut first = true;
         loop {
@@ -2356,7 +2414,7 @@ impl Parser {
                 let name = self.parse_identifier();
                 self.expect(TokenKind::Colon);
                 let expr = self.parse_expression();
-                items.push(AssignmentPatternItem::Named(name, expr));
+                items.push(AssignmentPatternItem::Named(name.into(), expr));
             } else if self.at(TokenKind::StringLiteral) && self.peek_kind() == TokenKind::Colon {
                 // IEEE 1800-2023 §10.10: associative-array literal
                 // with a string key — `'{"key": value, ...}`.
@@ -2421,7 +2479,7 @@ impl Parser {
     }
 
     fn parse_concatenation(&mut self) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::LBrace);
 
         // Handle streaming operators { >> [slice_size] { ... } } or { << [slice_size] { ... } }
@@ -2431,7 +2489,7 @@ impl Parser {
             let slice_size = if !self.at(TokenKind::LBrace) {
                 // Slice can be a type keyword (byte, shortint, int, longint, logic[N:0], etc.)
                 // or an expression. Convert common type keywords to their bit widths.
-                let tk = self.current().kind.clone();
+                let tk = self.current_kind().clone();
                 let type_width: Option<u32> = match tk {
                     TokenKind::KwByte => Some(8),
                     TokenKind::KwShortint => Some(16),
@@ -2440,7 +2498,7 @@ impl Parser {
                     _ => None,
                 };
                 if let Some(w) = type_width {
-                    let start_s = self.current().span.start;
+                    let start_s = self.current_span().start;
                     self.bump();
                     let lit = Expression::new(
                         ExprKind::Number(NumberLiteral::Integer {
@@ -2567,7 +2625,7 @@ impl Parser {
                 break;
             }
 
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             if self.at(TokenKind::Comma) {
                 // Empty argument: foo(a, , b)
                 args.push(Expression::new(ExprKind::Empty, self.span_from(start)));
@@ -2586,12 +2644,12 @@ impl Parser {
                 // parse a lone type keyword, so capture it as an Ident carrying
                 // the type name — `$bits`/`$size` map it to the type's width.
                 let tok = self.bump();
-                let span = tok.span;
+                let span = self.token_span(tok);
                 let ident = HierarchicalIdentifier {
                     root: None,
                     path: vec![HierPathSegment {
                         name: Identifier {
-                            name: tok.text.clone(),
+                            name: self.token_text(tok).into_owned(),
                             span,
                         },
                         selects: Vec::new(),
@@ -2639,7 +2697,7 @@ impl Parser {
                 // Trailing comma case
                 args.push(Expression::new(
                     ExprKind::Empty,
-                    self.span_from(self.current().span.start),
+                    self.span_from(self.current_span().start),
                 ));
                 break;
             }
@@ -2672,7 +2730,7 @@ impl Parser {
             TokenKind::ArithShiftLeftAssign,
             TokenKind::ArithShiftRightAssign,
         ]) {
-            let op_kind = self.current().kind.clone();
+            let op_kind = self.current_kind().clone();
             self.bump();
             let rhs = self.parse_expression();
             let span = self.span_from(start);
@@ -2799,7 +2857,7 @@ impl Parser {
     }
 
     pub(super) fn parse_hierarchical_identifier(&mut self) -> HierarchicalIdentifier {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         // §8.15: `this.super.x` is `super.x`.
         if self.at(TokenKind::KwThis)
             && self.peek_kind() == TokenKind::Dot
@@ -2817,8 +2875,8 @@ impl Parser {
         {
             let tok = self.bump();
             Identifier {
-                name: tok.text,
-                span: tok.span,
+                name: self.token_text(tok).into_owned(),
+                span: self.token_span(tok),
             }
         } else {
             self.parse_identifier()
@@ -2844,7 +2902,7 @@ impl Parser {
                     let tok = self.bump();
                     crate::ast::Identifier {
                         name: "new".to_string(),
-                        span: tok.span,
+                        span: self.token_span(tok),
                     }
                 } else {
                     self.parse_identifier()
@@ -2899,14 +2957,12 @@ impl Parser {
     /// list of `and #6 (q, a, b);` or `buf #d (o, i);` became the arguments
     /// of a call.
     pub(super) fn parse_delay_value(&mut self) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         match self.current_kind() {
             TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral => {
                 let tok = self.bump();
-                Expression::new(
-                    ExprKind::Number(parse_number_literal(&tok.text)),
-                    self.span_from(start),
-                )
+                let num = parse_number_literal(&self.token_text(tok));
+                Expression::new(ExprKind::Number(num), self.span_from(start))
             }
             TokenKind::Identifier
                 if !matches!(self.peek_kind(), TokenKind::DoubleColon | TokenKind::Dot) =>
@@ -2931,7 +2987,7 @@ impl Parser {
 
     /// Handles indices [expr] as well.
     pub(super) fn parse_hierarchical_identifier_expr(&mut self) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let id = self.parse_identifier();
         let hier = HierarchicalIdentifier {
             root: None,
@@ -2992,7 +3048,7 @@ impl Parser {
     /// count even when `(` follows (`##N (x)`, `##pkg::N (x)`): the
     /// parenthesis starts the next sequence, not a call (#609).
     fn parse_sva_delay_count(&mut self) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.sva_delay_count = true;
         let mut count = self.parse_prefix();
         while matches!(
@@ -3133,7 +3189,7 @@ impl Parser {
     /// sequence. Other operands are reported, not run with other semantics.
     /// The keyword is current and `[` follows it.
     fn parse_sva_ranged_operator(&mut self) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let kind = self.current_kind();
         let word = match kind {
             TokenKind::KwEventually => "eventually",
@@ -3234,7 +3290,7 @@ impl Parser {
     ///
     /// With no item matching and no default, the property holds vacuously.
     fn parse_sva_property_case(&mut self) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.bump(); // `case`
         self.expect(TokenKind::LParen);
         let sel = self.parse_expr_bp(0);
@@ -3341,7 +3397,7 @@ impl Parser {
 
     /// §16.12.14 `accept_on (b) p` and its kin; the keyword is current.
     fn parse_sva_abort(&mut self) -> Expression {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let (word, marker) = match self.current_kind() {
             TokenKind::KwAccept_on => ("accept_on", "$sva_accept_on"),
             TokenKind::KwReject_on => ("reject_on", "$sva_reject_on"),
@@ -3512,22 +3568,28 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
     // simulator converts it against the global tick precision. Kept distinct
     // from a bare numeric delay (scaled by the module timeunit) so relative
     // timing is correct under sub-ns timescales.
-    let time_suffixes: &[(&str, f64)] = &[
-        ("fs", 1e-15),
-        ("ps", 1e-12),
-        ("ns", 1e-9),
-        ("us", 1e-6),
-        ("ms", 1e-3),
-        ("s", 1.0),
+    // §5.8: the seconds are the nearest f64 to the literal's decimal value,
+    // read in one correctly rounded conversion (`9.2e3`, `1.5e-9`); scaling
+    // the mantissa by an inexact `1e-9` rounded twice.
+    let time_suffixes: &[(&str, i32)] = &[
+        ("fs", -15),
+        ("ps", -12),
+        ("ns", -9),
+        ("us", -6),
+        ("ms", -3),
+        ("s", 0),
     ];
-    for (suf, scale) in time_suffixes {
+    for (suf, exp) in time_suffixes {
         if text.ends_with(suf)
             && text.len() > suf.len()
             && text.as_bytes()[text.len() - suf.len() - 1].is_ascii_digit()
         {
-            let mantissa = &text[..text.len() - suf.len()];
-            if let Ok(v) = mantissa.replace('_', "").parse::<f64>() {
-                return NumberLiteral::Time(v * *scale);
+            let mantissa = text[..text.len() - suf.len()].replace('_', "");
+            if let Ok(m) = mantissa.parse::<f64>() {
+                let v = format!("{mantissa}e{exp}")
+                    .parse::<f64>()
+                    .unwrap_or(m * 10f64.powi(*exp));
+                return NumberLiteral::Time(v);
             }
         }
     }

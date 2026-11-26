@@ -129,3 +129,58 @@ endmodule
     assert!(!m.implicit_nets.contains("m1"), "phantom implicit net m1");
     assert!(!m.signals.contains_key("m1"), "phantom signal m1");
 }
+
+#[test]
+fn variable_delays_survive_port_rewriting_and_net_staging() {
+    let m = elab(
+        r#"
+`timescale 1ns/1ps
+module child #(parameter int PD = 1) (input a, input [3:0] dv);
+  wire c, g;
+  assign #(dv + PD, 2, dv) c = a;
+  wire #(dv) init_net = a;
+  buf #(dv) drive(g, a);
+endmodule
+module top;
+  logic a;
+  int d;
+  wire out;
+  assign #(d) out = a;
+  child u(a, d[3:0]);
+endmodule
+"#,
+    );
+    for (target, arity) in [("out", 1), ("u.c", 3), ("u.init_net", 1), ("u.g", 1)] {
+        let ca = assign_to(&m, target);
+        assert_ne!(ca.delay, 0, "{target} must use the delayed driver path");
+        let args = ca.delay_exprs.as_ref().expect("runtime operands");
+        assert_eq!(args.iter().flatten().count(), arity, "{target}");
+    }
+}
+
+#[test]
+fn variable_net_delay_retains_its_own_scope_for_an_external_driver() {
+    let m = elab(
+        r#"
+module sub;
+  timeunit 1ns;
+  timeprecision 100ps;
+  real d = 0.16;
+  wire #(d) y;
+endmodule
+module top;
+  timeunit 1ns;
+  timeprecision 1ps;
+  logic a;
+  sub u();
+  assign u.y = a;
+endmodule
+"#,
+    );
+    let stage = assign_to(&m, "u.y");
+    assert!(stage.delay_exprs.is_some());
+    assert!(stage.origin.is_none(), "the stage derives its scope from u.y");
+    let driver = assign_to(&m, "u.y$netdrv");
+    assert!(driver.delay_exprs.is_none());
+    assert_eq!(driver.origin.as_ref().unwrap().1.as_ref(), "");
+}
