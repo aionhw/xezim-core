@@ -94,6 +94,18 @@ fn multi_leaf_driver_keeps_pending_leaf_state_without_future_queues() {
     }
     assert_no_slot_queue(&sv);
     assert!(!sv.contains("bit vh_pend0_0;"));
+    let next = sv
+        .split("function automatic longint vh_next();")
+        .nth(1)
+        .unwrap();
+    assert!(
+        !next
+            .split("endfunction")
+            .next()
+            .unwrap()
+            .contains("vh_pn0_0_c0")
+    );
+    assert!(sv.contains("vh_pn0_0_c0 = vh_pn0_0_c0 + 1; end vh_delta_pending = 1;"));
 }
 
 fn partial_lowered(decls: &str, body: &str) -> String {
@@ -164,6 +176,7 @@ fn whole_and_partial_implicit_writes_keep_word_and_leaf_state() {
     assert!(sv.contains("vh_pw0_0_c0"));
     assert!(sv.contains("vh_pwf0_0_c0"));
     assert!(sv.contains("vh_pf0_0_c0"));
+    assert!(sv.contains("vh_pwf0_0_c0 = 1; vh_delta_pending = 1;"));
     assert_no_slot_queue(&sv);
 }
 
@@ -195,6 +208,7 @@ fn array_words_keep_word_pending_lists_without_future_queues() {
     assert!(sv.contains("vh_pwwi0_0_c0"));
     assert!(sv.contains("vh_pwwm0_0_c0"));
     assert!(sv.contains("vh_pwwn0_0_c0"));
+    assert!(sv.contains("vh_pwwn0_0_c0 = vh_pwwn0_0_c0 + 1; end vh_delta_pending = 1;"));
     assert_no_slot_queue(&sv);
 }
 
@@ -205,6 +219,7 @@ fn packed_record_parts_keep_pending_overlays_without_future_queues() {
         .unwrap_or_else(|errors| panic!("{}", errors.join("\n")));
     assert!(sv.contains("vh_pw0_0_c0"));
     assert!(sv.contains("vh_pwf0_0_c0"));
+    assert!(sv.contains("vh_delta_pending = 1;"));
     assert_no_slot_queue(&sv);
 }
 

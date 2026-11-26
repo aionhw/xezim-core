@@ -39,7 +39,9 @@ fn wide_std_logic_vector_is_packed() {
         "2048-element std_logic_vector was not packed"
     );
     assert!(
-        sv.contains("bit [8191:0] vh_pv"),
+        sv.lines().any(|line| {
+            line.trim_start().starts_with("bit [8191:0] ") && line.contains("vh_pv")
+        }),
         "the implicit-zero driver's pending value is not packed"
     );
     // The queue-form requirement still applies to timed writes; pending
