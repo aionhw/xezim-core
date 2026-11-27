@@ -602,6 +602,9 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
         }
         ModuleItem::ContinuousAssign(ca) => {
             let mut new_ca = ca.clone();
+            new_ca.delay = ca.delay.as_deref().map(gen_expr).map(Box::new);
+            new_ca.delay_fall = ca.delay_fall.as_deref().map(gen_expr).map(Box::new);
+            new_ca.delay_off = ca.delay_off.as_deref().map(gen_expr).map(Box::new);
             new_ca.assignments = ca
                 .assignments
                 .iter()

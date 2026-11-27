@@ -271,11 +271,36 @@ pub(super) fn validate_stmt_idents(
         }
         StatementKind::Assertion(a) => {
             validate_expr_idents(&a.expr, elab, locals)?;
-            if let Some(s) = &a.action {
-                validate_stmt_idents(s, elab, locals)?;
-            }
-            if let Some(s) = &a.else_action {
-                validate_stmt_idents(s, elab, locals)?;
+            for action in [a.action.as_deref(), a.else_action.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if a.deferred.is_some() && sv_parser::strict_checks()
+                    && let StatementKind::Expr(expr) = &action.kind
+                {
+                    let mut expr = expr;
+                    while let ExprKind::Paren(inner) = &expr.kind {
+                        expr = inner.as_ref();
+                    }
+                    // The parser lowers a call without parentheses to a Call
+                    // too. Resolve the callee rather than the whole expression.
+                    let callee = match &expr.kind {
+                        ExprKind::Call { func, .. } => func.as_ref(),
+                        _ => expr,
+                    };
+                    if let Some(name) = simple_lhs_name(callee)
+                        && (locals.contains(&name)
+                            || elab.signals.contains_key(&name)
+                            || elab.parameters.contains_key(&name))
+                        && !elab.tasks.contains_key(&name)
+                        && !elab.functions.contains_key(&name)
+                    {
+                        return Err(format!(
+                            "'{name}' is not a subroutine in a deferred assertion action (IEEE 1800-2017 §16.4)"
+                        ));
+                    }
+                }
+                validate_stmt_idents(action, elab, locals)?;
             }
         }
         StatementKind::Return(Some(expr)) => {

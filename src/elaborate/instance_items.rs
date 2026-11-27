@@ -1,5 +1,38 @@
 use super::*;
 
+// A collection member needs an object copy and collection sensitivity.
+// Registering its element as scalar leaves would mask the existing read.
+fn has_collection_member(s: &StructUnionType, elab: &ElaboratedModule) -> bool {
+    s.members.iter().any(|m| {
+        m.declarators.iter().any(|decl| {
+            struct_member_dims(&m.data_type, &decl.dimensions, &elab.typedef_unpacked_dims)
+                .iter()
+                .any(|d| match d {
+                    UnpackedDimension::Queue { .. } | UnpackedDimension::Unsized(_) => true,
+                    UnpackedDimension::Associative { .. } => {
+                        extract_array_range(std::slice::from_ref(d), &elab.parameters).is_none()
+                    }
+                    _ => false,
+                })
+        }) || matches!(resolve_typedef_chain(&m.data_type, &elab.typedef_types),
+            DataType::Struct(inner) if !inner.packed && has_collection_member(inner, elab))
+    })
+}
+
+fn register_struct_array_elements(
+    elab: &mut ElaboratedModule,
+    name: &str,
+    dt: &DataType,
+    lo: i64,
+    hi: i64,
+) {
+    if lo <= hi && lo.abs_diff(hi) < 4096 {
+        for i in lo..=hi {
+            register_unpacked_aggregate(elab, &format!("{name}[{i}]"), dt);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inline_instantiation_items(
     elab: &mut ElaboratedModule,
@@ -2912,6 +2945,39 @@ pub(super) fn inline_instantiation_items(
                                 // which is what made this look type-specific.
                                 let resolved_dt =
                                     resolve_typedef_chain(dt, &elab.typedef_types).clone();
+                                // §7.2.2, §7.4.2, §23.3.3.2: the copies need
+                                // the same typed leaves as a body declaration.
+                                // The connection already pairs elements in declared
+                                // order (§7.6, §23.3.3.5). An open implicit input
+                                // net keeps Z (§23.2.2.3, §23.3.3.3).
+                                if member_wise
+                                    && let Some(&[(left, right)]) =
+                                        elab.unpacked_decl_dims.get(&sig_name).map(|d| d.as_slice())
+                                    && matches!(
+                                        port.direction,
+                                        Some(PortDirection::Input | PortDirection::Output)
+                                    )
+                                    && ansi_port_net_type(port).is_none()
+                                    && (port.var_kw
+                                        || port.direction == Some(PortDirection::Output)
+                                        || port_map.contains_key(&port.name.name))
+                                    && let DataType::TypeReference { name, .. } = dt
+                                    && lookup_scoped_type(name, &elab.nettype_resolvers).is_none()
+                                    && (port.dimensions.is_empty()
+                                        || lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                            .is_none())
+                                    && let DataType::Struct(s) = &resolved_dt
+                                    && s.kind == StructUnionKind::Struct
+                                    && !has_collection_member(s, elab)
+                                {
+                                    register_struct_array_elements(
+                                        elab,
+                                        &sig_name,
+                                        dt,
+                                        left.min(right),
+                                        left.max(right),
+                                    );
+                                }
                                 if matches!(
                                     resolved_dt,
                                     DataType::Simple { kind: SimpleType::String, .. }
@@ -4942,17 +5008,14 @@ pub(super) fn inline_instantiation_items(
                                         if !su.packed
                                             && !(matches!(su.kind, StructUnionKind::Union)
                                                 && !su.tagged)
-                                            && hi >= lo
-                                            && (hi - lo) < 4096
                                         {
-                                            for i in lo..=hi {
-                                                let ebase = format!("{}[{}]", sig_name, i);
-                                                register_unpacked_aggregate(
-                                                    elab,
-                                                    &ebase,
-                                                    &dd.data_type,
-                                                );
-                                            }
+                                            register_struct_array_elements(
+                                                elab,
+                                                &sig_name,
+                                                &dd.data_type,
+                                                lo,
+                                                hi,
+                                            );
                                         }
                                     }
                                     if is_type_two_state_resolved(

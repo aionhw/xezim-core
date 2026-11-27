@@ -20,13 +20,13 @@ fn param(m: &xezim_core::ElaboratedModule, key: &str) -> Option<i64> {
 
 #[test]
 fn defparam_in_a_generate_block_reaches_its_instance() {
-    let t = "module t; int y, y2, y3;
+    let t = "module t; int y, y2[2], y3;
       if (1) begin : gb
         c u (y);
         defparam u.A = 9;
       end
       for (genvar i = 0; i < 2; i++) begin : gl
-        c u (y2);
+        c u (y2[i]);
         defparam u.A = 4 + i;
       end
       if (1) begin : outer

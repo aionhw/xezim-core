@@ -2042,6 +2042,41 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Semicolon);
     }
 
+    /// §16.4: the pass and fail statements of a deferred immediate assertion
+    /// (`assert #0`, `assert final`) are each a single subroutine call: a
+    /// task, task method, void function or system task call, or a function
+    /// call cast to `void`. A null statement omits the action. A simple
+    /// immediate assertion takes any statement.
+    fn check_deferred_action(&mut self, deferred: Option<DeferredAssertion>, s: &Statement) {
+        if deferred.is_none() || !crate::strict_checks() {
+            return;
+        }
+        let valid_action = match &s.kind {
+            StatementKind::Null => true,
+            StatementKind::Expr(e) => {
+                let mut e = e;
+                while let ExprKind::Paren(p) = &e.kind {
+                    e = p;
+                }
+                matches!(
+                    e.kind,
+                    ExprKind::Call { .. }
+                        | ExprKind::SystemCall { .. }
+                        | ExprKind::Ident(_)
+                        | ExprKind::MemberAccess { .. }
+                )
+            }
+            _ => false,
+        };
+        if !valid_action {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "the pass and fail statements of a deferred assertion must each be a single \
+                 subroutine call (IEEE 1800-2017 §16.4)",
+                s.span,
+            ));
+        }
+    }
+
     pub(super) fn parse_assertion_statement(&mut self) -> AssertionStatement {
         let start = self.current_span().start;
         let kind = match self.bump().kind {
@@ -2125,7 +2160,9 @@ impl<'a> Parser<'a> {
         };
         self.expect(TokenKind::RParen);
         let action = if !self.at(TokenKind::Semicolon) && !self.at(TokenKind::KwElse) {
-            Some(Box::new(self.parse_statement()))
+            let s = self.parse_statement();
+            self.check_deferred_action(deferred, &s);
+            Some(Box::new(s))
         } else {
             if self.at(TokenKind::Semicolon) {
                 self.bump();
@@ -2133,7 +2170,9 @@ impl<'a> Parser<'a> {
             None
         };
         let else_action = if self.eat(TokenKind::KwElse).is_some() {
-            Some(Box::new(self.parse_statement()))
+            let s = self.parse_statement();
+            self.check_deferred_action(deferred, &s);
+            Some(Box::new(s))
         } else {
             None
         };
