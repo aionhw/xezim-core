@@ -1152,9 +1152,26 @@ fn inline_instantiations_inner(
     let bind_driver = if let Some(binds) = bind_driver.as_ref().and_then(|(unit_binds, _)| {
         super::bind_inline::unit_module_binds(unit_binds, definitions, &elab.checker_decls)
     }) {
+        crate::oom_trace::checkpoint(
+            "bind.single_pass",
+            &[("targets", binds.len())],
+        );
         cache.unit_module_binds = binds;
         None
     } else {
+        if crate::oom_trace::enabled()
+            && let Some((unit_binds, _)) = bind_driver.as_ref()
+            && !unit_binds.is_empty()
+        {
+            crate::oom_trace::checkpoint(
+                "bind.discovery_pass",
+                &super::bind_inline::single_pass_blockers(
+                    unit_binds,
+                    definitions,
+                    &elab.checker_decls,
+                ),
+            );
+        }
         bind_driver
     };
     let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
@@ -1252,6 +1269,7 @@ fn inline_instantiations_inner(
             Ok(false)
         })?;
         if discovered {
+            crate::oom_trace::checkpoint("bind.rebuild", &[("target_needs_rebuild", 1)]);
             return Ok(true);
         }
         // §23.11: a bound instance is inlined as if written at the end of its
@@ -1262,6 +1280,13 @@ fn inline_instantiations_inner(
         // all of them, which yields the same design as a fixed point that
         // rebuilds the root on every pass.
         if !elab.resolved_binds.is_empty() || bs.kept_bound_ports {
+            crate::oom_trace::checkpoint(
+                "bind.rebuild",
+                &[
+                    ("resolved_bind_targets", elab.resolved_binds.len()),
+                    ("kept_bound_ports", usize::from(bs.kept_bound_ports)),
+                ],
+            );
             return Ok(true);
         }
         drop(bs);
