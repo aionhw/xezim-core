@@ -11,6 +11,54 @@ use std::path::{Path, PathBuf};
 use crate::diagnostics::{self, Location};
 use crate::source_map::{LineMap, LineOrigin, MacroColumn, MapFile};
 
+/// Process-wide `include file-access counters for the opt-in memory and time
+/// diagnostics. Numbers only: no file name is kept.
+pub mod include_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) static DIRECTIVES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PROBES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static READS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NANOS: AtomicU64 = AtomicU64::new(0);
+
+    /// `include directives resolved, existence probes of candidate paths,
+    /// header reads, bytes read, and the milliseconds spent in all of them.
+    pub fn snapshot() -> [(&'static str, usize); 5] {
+        [
+            ("include_directives", DIRECTIVES.load(Relaxed) as usize),
+            ("include_path_probes", PROBES.load(Relaxed) as usize),
+            ("include_file_reads", READS.load(Relaxed) as usize),
+            ("include_read_kib", (READ_BYTES.load(Relaxed) / 1024) as usize),
+            ("include_file_access_ms", (NANOS.load(Relaxed) / 1_000_000) as usize),
+        ]
+    }
+
+    pub(super) fn exists(path: &std::path::Path) -> bool {
+        PROBES.fetch_add(1, Relaxed);
+        path.exists()
+    }
+
+    pub(super) fn read(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        let bytes = std::fs::read(path)?;
+        READS.fetch_add(1, Relaxed);
+        READ_BYTES.fetch_add(bytes.len() as u64, Relaxed);
+        Ok(bytes)
+    }
+
+    pub(super) struct Timer(std::time::Instant);
+
+    pub(super) fn timer() -> Timer {
+        Timer(std::time::Instant::now())
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MacroDef {
     pub name: String,
@@ -1598,7 +1646,11 @@ impl Preprocessor {
                         {
                             // Lossy decode — tolerate stray non-UTF-8 bytes in
                             // included RTL (replace with U+FFFD, don't fail).
-                            match std::fs::read(&resolved).map(|b| {
+                            let include_read = {
+                                let _timer = include_stats::timer();
+                                include_stats::read(&resolved)
+                            };
+                            match include_read.map(|b| {
                                 String::from_utf8(b).unwrap_or_else(|e| {
                                     String::from_utf8_lossy(e.as_bytes()).into_owned()
                                 })
@@ -2344,6 +2396,8 @@ impl Preprocessor {
     /// 1. The directory of the currently-processed source file
     /// 2. Each directory in include_dirs (in order)
     fn resolve_include(&self, filename: &str, source_dir: Option<&Path>) -> Option<PathBuf> {
+        let _timer = include_stats::timer();
+        include_stats::DIRECTIVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let found = self.resolve_include_first(filename, source_dir);
         if let Some(chosen) = &found {
             self.warn_shadowed_include(filename, chosen, source_dir);
@@ -2369,7 +2423,7 @@ impl Preprocessor {
                 return;
             }
         }
-        let chosen_bytes = std::fs::read(chosen).ok();
+        let chosen_bytes = include_stats::read(chosen).ok();
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(d) = source_dir {
             dirs.push(d.to_path_buf());
@@ -2377,10 +2431,10 @@ impl Preprocessor {
         dirs.extend(self.include_dirs.iter().cloned());
         for dir in dirs {
             let other = dir.join(filename);
-            if !other.exists() || same_file(&other, chosen) {
+            if !include_stats::exists(&other) || same_file(&other, chosen) {
                 continue;
             }
-            if std::fs::read(&other).ok() == chosen_bytes {
+            if include_stats::read(&other).ok() == chosen_bytes {
                 continue;
             }
             WARNED
@@ -2404,7 +2458,7 @@ impl Preprocessor {
 
         // If the include path is absolute, use it directly
         if inc_path.is_absolute() {
-            if inc_path.exists() {
+            if include_stats::exists(inc_path) {
                 return Some(inc_path.to_path_buf());
             }
             return None;
@@ -2413,7 +2467,7 @@ impl Preprocessor {
         // Search relative to the current source file's directory first
         if let Some(dir) = source_dir {
             let candidate = dir.join(inc_path);
-            if candidate.exists() {
+            if include_stats::exists(&candidate) {
                 return Some(candidate);
             }
         }
@@ -2421,7 +2475,7 @@ impl Preprocessor {
         // Search include directories
         for dir in &self.include_dirs {
             let candidate = dir.join(inc_path);
-            if candidate.exists() {
+            if include_stats::exists(&candidate) {
                 return Some(candidate);
             }
         }
@@ -2429,7 +2483,7 @@ impl Preprocessor {
         // Fallback: try relative to current working directory
         if let Ok(cwd) = std::env::current_dir() {
             let candidate = cwd.join(inc_path);
-            if candidate.exists() {
+            if include_stats::exists(&candidate) {
                 return Some(candidate);
             }
         }

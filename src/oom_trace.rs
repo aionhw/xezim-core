@@ -11,6 +11,22 @@
 //! per-instance records unless resident memory changed by at least `N` KiB
 //! since the previous emitted record (phase boundaries and 1 s samples are
 //! always emitted, and live context/counts stay updated for the sampler).
+//!
+//! Besides the per-step records, a session writes:
+//! - `environment` (once, at start): machine memory and the memory limit and
+//!   usage of the job's control group, which is what an out-of-memory kill is
+//!   measured against;
+//! - `include file access` (at finish, cumulative for the process): `include
+//!   directives, path probes, header reads and the time they took;
+//! - `bind.single_pass`, or `bind.discovery_pass` then `bind.rebuild`:
+//!   whether bind directives forced a second elaboration of the design, with
+//!   counts of the constructs that did;
+//! - `error` (on failure): the failing step, with the message reduced to its
+//!   class when redacting;
+//! - `phase_summary` and `definition_summary` (at finish): for each phase and
+//!   for the definitions that grew memory most, the number of scopes entered,
+//!   the time, and the resident-memory growth of the scope itself, excluding
+//!   nested scopes. These are small enough to share whole.
 
 use crate::hasher::HashMap;
 use std::cell::RefCell;
@@ -100,6 +116,48 @@ impl Redactor {
     }
 }
 
+/// One open scope, for the exclusive time and memory of the summaries.
+struct Frame {
+    phase: String,
+    definition: String,
+    entered_us: u128,
+    entered_rss: Option<u64>,
+    nested_us: u128,
+    nested_rss: i128,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Stat {
+    scopes: usize,
+    self_us: u128,
+    grow_kib: u64,
+    shrink_kib: u64,
+}
+
+impl Stat {
+    fn add(&mut self, self_us: u128, self_rss: i128) {
+        self.scopes += 1;
+        self.self_us += self_us;
+        if self_rss >= 0 {
+            self.grow_kib += self_rss as u64;
+        } else {
+            self.shrink_kib += (-self_rss) as u64;
+        }
+    }
+
+    fn counts(&self) -> [(&'static str, usize); 4] {
+        [
+            ("scopes", self.scopes),
+            ("self_ms", (self.self_us / 1000) as usize),
+            ("self_grow_kib", self.grow_kib as usize),
+            ("self_shrink_kib", self.shrink_kib as usize),
+        ]
+    }
+}
+
+/// Definitions listed in the finish summary, largest growth first.
+const SUMMARY_DEFINITIONS: usize = 40;
+
 struct State {
     sink: Box<dyn Write + Send>,
     buffer: Vec<u8>,
@@ -111,6 +169,13 @@ struct State {
     redactor: Option<Redactor>,
     min_delta_kib: u64,
     failed: bool,
+    last_rss: Option<u64>,
+    /// The context of the first scope left since the last scope entry or
+    /// checkpoint: where the work was when an error began to unwind.
+    unwind_origin: Option<Context>,
+    frames: Vec<Frame>,
+    phase_stats: HashMap<String, Stat>,
+    definition_stats: HashMap<String, Stat>,
 }
 
 struct Trace {
@@ -179,8 +244,9 @@ impl Trace {
             return;
         }
         let (rss_kib, peak_rss_kib) = resident_memory();
+        state.last_rss = rss_kib;
         if state.min_delta_kib > 0
-            && !matches!(event, "start" | "finish" | "sample")
+            && matches!(event, "enter" | "leave" | "checkpoint")
             && is_high_frequency_phase(&state.context.phase)
             && let (Some(now), Some(last)) = (rss_kib, state.last_emitted_rss)
             && now.abs_diff(last) < state.min_delta_kib
@@ -222,6 +288,164 @@ impl Trace {
             ));
         }
     }
+}
+
+impl Trace {
+    /// Write the per-phase and per-definition totals gathered from the
+    /// scopes. A definition's name is the alias its scopes already used.
+    fn summaries(&self, state: &mut State) {
+        let saved = std::mem::take(&mut state.context);
+        let mut phases: Vec<(String, Stat)> = state.phase_stats.drain().collect();
+        phases.sort_by(|a, b| b.1.grow_kib.cmp(&a.1.grow_kib).then_with(|| a.0.cmp(&b.0)));
+        for (phase, stat) in phases {
+            state.context = Context {
+                phase,
+                ..Context::default()
+            };
+            state.counts.clear();
+            state.counts.extend_from_slice(&stat.counts());
+            self.record(state, "phase_summary");
+        }
+        let mut definitions: Vec<(String, Stat)> = state.definition_stats.drain().collect();
+        let total = definitions.len();
+        definitions.sort_by(|a, b| b.1.grow_kib.cmp(&a.1.grow_kib).then_with(|| a.0.cmp(&b.0)));
+        for (rank, (definition, stat)) in definitions
+            .into_iter()
+            .take(SUMMARY_DEFINITIONS)
+            .enumerate()
+        {
+            state.context = Context {
+                definition,
+                ..Context::default()
+            };
+            state.counts.clear();
+            state.counts.push(("rank", rank + 1));
+            state.counts.push(("definitions", total));
+            state.counts.extend_from_slice(&stat.counts());
+            self.record(state, "definition_summary");
+        }
+        state.context = Context {
+            phase: "include file access".into(),
+            ..Context::default()
+        };
+        state.counts.clear();
+        state
+            .counts
+            .extend_from_slice(&crate::sv_parser::preprocessor::include_stats::snapshot());
+        self.record(state, "checkpoint");
+        state.counts.clear();
+        state.context = saved;
+    }
+}
+
+/// Machine memory and the job's control-group memory limit and usage, in KiB.
+/// A limit of 0 means none was found (no control group, or `max`).
+fn environment_counts() -> Vec<(&'static str, usize)> {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    let kib = |text: Option<String>| {
+        text.and_then(|t| t.trim().parse::<u64>().ok())
+            // An unlimited v1 group reports a value near `i64::MAX`.
+            .filter(|&bytes| bytes < 1 << 60)
+            .map_or(0, |bytes| (bytes / 1024) as usize)
+    };
+    let meminfo = read("/proc/meminfo").unwrap_or_default();
+    let field = |key: &str| {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.split_whitespace().next()?.parse().ok())
+            .unwrap_or(0usize)
+    };
+    // v2: one line `0::/path`. v1: the line whose controller list has `memory`.
+    let cgroups = read("/proc/self/cgroup").unwrap_or_default();
+    let v2 = cgroups
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| format!("/sys/fs/cgroup{}", path.trim_end_matches('/')));
+    let v1 = cgroups.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let controllers = parts.nth(1)?;
+        let path = parts.next()?;
+        controllers
+            .split(',')
+            .any(|c| c == "memory")
+            .then(|| format!("/sys/fs/cgroup/memory{}", path.trim_end_matches('/')))
+    });
+    let mut limit = 0;
+    let mut usage = 0;
+    let mut oom_kills = 0;
+    if let Some(mut dir) = v2 {
+        // The tightest limit may be on an ancestor group.
+        usage = kib(read(&format!("{dir}/memory.current")));
+        oom_kills = read(&format!("{dir}/memory.events"))
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok())
+            })
+            .unwrap_or(0usize);
+        loop {
+            let here = kib(read(&format!("{dir}/memory.max")));
+            if here > 0 && (limit == 0 || here < limit) {
+                limit = here;
+            }
+            match dir.rfind('/') {
+                Some(cut) if dir.len() > "/sys/fs/cgroup".len() => dir.truncate(cut),
+                _ => break,
+            }
+        }
+    }
+    if limit == 0
+        && let Some(dir) = v1
+    {
+        limit = kib(read(&format!("{dir}/memory.limit_in_bytes")));
+        usage = kib(read(&format!("{dir}/memory.usage_in_bytes")));
+    }
+    vec![
+        ("mem_total_kib", field("MemTotal:")),
+        ("mem_available_kib", field("MemAvailable:")),
+        ("cgroup_limit_kib", limit),
+        ("cgroup_usage_kib", usage),
+        ("cgroup_oom_kills", oom_kills),
+    ]
+}
+
+/// The class of an error message: the wording before the first quoted name.
+/// With redaction on, anything that is not plain words is withheld, since a
+/// message can carry a path or an identifier outside quotes.
+fn error_class(message: &str, redacted: bool) -> String {
+    let line = message.lines().next().unwrap_or_default();
+    if !redacted {
+        return line.chars().take(300).collect();
+    }
+    let Some(cut) = line.find(['\'', '"', '`']) else {
+        return "unclassified".into();
+    };
+    let head = line[..cut].rsplit(": ").next().unwrap_or_default().trim();
+    if head.is_empty()
+        || head.split(' ').count() > 6
+        || !head.chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
+    {
+        return "unclassified".into();
+    }
+    head.into()
+}
+
+/// Record that the pipeline failed, in the phase the error left first. The counts are the
+/// last ones a checkpoint published, so they describe the design at failure.
+pub fn failure(message: &str) {
+    ACTIVE.with(|active| {
+        if let Some(trace) = active.borrow().as_ref()
+            && let Ok(mut state) = trace.state.lock()
+        {
+            let class = error_class(message, trace.redacted);
+            let saved = state.context.clone();
+            if let Some(origin) = state.unwind_origin.take() {
+                state.context = origin;
+            }
+            state.context.phase = format!("{}: {class}", state.context.phase);
+            trace.record(&mut state, "error");
+            state.context = saved;
+        }
+    });
 }
 
 /// Owns a trace for this thread. Nested pipeline calls reuse the outer trace.
@@ -281,6 +505,11 @@ pub fn session() -> Session {
             redactor: redacted.then(Redactor::default),
             min_delta_kib,
             failed: false,
+            last_rss: None,
+            unwind_origin: None,
+            frames: Vec::new(),
+            phase_stats: HashMap::default(),
+            definition_stats: HashMap::default(),
         }),
     });
     let (stop, receiver) = mpsc::channel();
@@ -301,6 +530,11 @@ pub fn session() -> Session {
         Ok(worker) => {
             if let Ok(mut state) = trace.state.lock() {
                 trace.record(&mut state, "start");
+                state.context.phase = "environment".into();
+                state.counts = environment_counts();
+                trace.record(&mut state, "checkpoint");
+                state.context.phase.clear();
+                state.counts.clear();
             }
             ACTIVE.with(|active| *active.borrow_mut() = Some(trace));
             session.owner = Some((stop, worker));
@@ -319,6 +553,7 @@ impl Drop for Session {
                 if let Some(trace) = active.borrow_mut().take()
                     && let Ok(mut state) = trace.state.lock()
                 {
+                    trace.summaries(&mut state);
                     trace.record(&mut state, "finish");
                 }
             });
@@ -365,8 +600,27 @@ pub fn scope(phase: &str, source: &str, definition: &str, instance: &str) -> Sco
                     instance: instance.into(),
                 },
             };
+            let definition = if next.definition.is_empty() {
+                state
+                    .frames
+                    .last()
+                    .map(|f| f.definition.clone())
+                    .unwrap_or_default()
+            } else {
+                next.definition.clone()
+            };
             let previous = std::mem::replace(&mut state.context, next);
+            state.unwind_origin = None;
             trace.record(&mut state, "enter");
+            let frame = Frame {
+                phase: phase.into(),
+                definition,
+                entered_us: trace.start.elapsed().as_micros(),
+                entered_rss: state.last_rss,
+                nested_us: 0,
+                nested_rss: 0,
+            };
+            state.frames.push(frame);
             scope.0 = Some((Arc::clone(trace), previous));
         }
     });
@@ -379,7 +633,37 @@ impl Drop for Scope {
             && let Ok(mut state) = trace.state.lock()
         {
             trace.record(&mut state, "leave");
-            state.context = previous;
+            let left = std::mem::replace(&mut state.context, previous);
+            state.unwind_origin.get_or_insert(left);
+            if let Some(frame) = state.frames.pop() {
+                let us = trace
+                    .start
+                    .elapsed()
+                    .as_micros()
+                    .saturating_sub(frame.entered_us);
+                let rss = state
+                    .last_rss
+                    .zip(frame.entered_rss)
+                    .map_or(0, |(now, old)| i128::from(now) - i128::from(old));
+                if let Some(parent) = state.frames.last_mut() {
+                    parent.nested_us += us;
+                    parent.nested_rss += rss;
+                }
+                let self_us = us.saturating_sub(frame.nested_us);
+                let self_rss = rss - frame.nested_rss;
+                state
+                    .phase_stats
+                    .entry(frame.phase)
+                    .or_default()
+                    .add(self_us, self_rss);
+                if !frame.definition.is_empty() {
+                    state
+                        .definition_stats
+                        .entry(frame.definition)
+                        .or_default()
+                        .add(self_us, self_rss);
+                }
+            }
         }
     }
 }
@@ -392,6 +676,7 @@ pub fn checkpoint(phase: &str, counts: &[(&'static str, usize)]) {
             && let Ok(mut state) = trace.state.lock()
         {
             state.context.phase = phase.into();
+            state.unwind_origin = None;
             state.counts.clear();
             state.counts.extend_from_slice(counts);
             trace.record(&mut state, "checkpoint");
@@ -422,6 +707,11 @@ pub(crate) fn definition(def: Definition, phase: &str, instance: &str) -> crate:
         def.name(),
         instance,
     )
+}
+
+/// KiB held by `capacity` slots of `T` themselves, not by what they own.
+fn slots_kib<T>(capacity: usize) -> usize {
+    capacity.saturating_mul(std::mem::size_of::<T>()) / 1024
 }
 
 pub(crate) fn model(phase: &str, elab: &ElaboratedModule, prepared: Option<usize>) {
@@ -470,6 +760,26 @@ pub(crate) fn model(phase: &str, elab: &ElaboratedModule, prepared: Option<usize
         ("decl_sites", elab.decl_sites.len()),
         ("resolved_binds", elab.resolved_binds.len()),
         ("source_texts_kib", source_texts_kib),
+        (
+            "instances_slots_kib",
+            slots_kib::<crate::elaborate::ElabInstance>(elab.instances.capacity()),
+        ),
+        (
+            "continuous_assigns_slots_kib",
+            slots_kib::<crate::elaborate::ContinuousAssignment>(elab.continuous_assigns.capacity()),
+        ),
+        (
+            "always_slots_kib",
+            slots_kib::<crate::elaborate::AlwaysBlock>(elab.always_blocks.capacity()),
+        ),
+        (
+            "pending_always_slots_kib",
+            slots_kib::<crate::elaborate::PendingAlways>(elab.pending_always.capacity()),
+        ),
+        (
+            "pending_assigns_slots_kib",
+            slots_kib::<crate::elaborate::PendingContAssign>(elab.pending_cont_assign.capacity()),
+        ),
         ("prepared_bodies", prepared.unwrap_or(0)),
     ];
     checkpoint(
@@ -480,4 +790,59 @@ pub(crate) fn model(phase: &str, elab: &ElaboratedModule, prepared: Option<usize
             &counts[..counts.len() - 1]
         },
     );
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    #[test]
+    fn error_class_keeps_wording_and_withholds_names_when_redacted() {
+        let message = "Undeclared identifier 'secret_sig' at dir/secret.sv:7:19";
+        assert_eq!(error_class(message, true), "Undeclared identifier");
+        assert_eq!(error_class(message, false), message);
+        assert_eq!(
+            error_class("dir/secret.sv:3: Unknown module 'secret_mod'", true),
+            "Unknown module"
+        );
+        // No quoted name: the text may hold an identifier anywhere.
+        assert_eq!(error_class("module secret_mod not found", true), "unclassified");
+        assert_eq!(error_class("secret_mod.x 'y'", true), "unclassified");
+        assert_eq!(error_class("", true), "unclassified");
+    }
+
+    #[test]
+    fn stat_splits_growth_from_release() {
+        let mut stat = Stat::default();
+        stat.add(1500, 40);
+        stat.add(2500, -10);
+        assert_eq!(
+            stat.counts(),
+            [
+                ("scopes", 2),
+                ("self_ms", 4),
+                ("self_grow_kib", 40),
+                ("self_shrink_kib", 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_reports_machine_memory_and_group_fields() {
+        let counts = environment_counts();
+        let names: Vec<&str> = counts.iter().map(|c| c.0).collect();
+        assert_eq!(
+            names,
+            [
+                "mem_total_kib",
+                "mem_available_kib",
+                "cgroup_limit_kib",
+                "cgroup_usage_kib",
+                "cgroup_oom_kills",
+            ]
+        );
+        if cfg!(target_os = "linux") {
+            assert!(counts[0].1 > 0);
+        }
+    }
 }

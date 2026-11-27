@@ -138,6 +138,87 @@ pub(super) fn bind_inlined_import_params(
     Ok(())
 }
 
+/// For the memory diagnostics: what kept `unit_module_binds` from attaching
+/// the compilation-unit binds in the first hierarchy walk, as counts. When
+/// every count but `unit_binds` is zero, the cause is a bind cycle or a bind
+/// whose own instance name equals a target's.
+pub(super) fn single_pass_blockers(
+    unit_binds: &[BindDirective],
+    definitions: &HashMap<String, Definition>,
+    checker_decls: &HashMap<String, crate::ast::decl::CheckerDeclaration>,
+) -> [(&'static str, usize); 8] {
+    let is_design_unit = |name: &str| {
+        matches!(
+            definitions.get(name),
+            Some(Definition::Module(_) | Definition::Interface(_) | Definition::Program(_))
+        )
+    };
+    let mut instance_path = 0;
+    let mut generate_scope = 0;
+    let mut other_kind = 0;
+    let mut targets: HashSet<&str> = HashSet::default();
+    for bind in unit_binds {
+        if !bind.target_path.is_empty() || !bind.extra_paths.is_empty() {
+            instance_path += 1;
+        }
+        if !bind.gen_scope.is_empty() {
+            generate_scope += 1;
+        }
+        let bound = &bind.instantiation.module_name.name;
+        if !is_design_unit(&bind.target_module.name)
+            || !is_design_unit(bound)
+            || checker_decls.contains_key(bound)
+        {
+            other_kind += 1;
+        }
+        targets.insert(bind.target_module.name.as_str());
+    }
+    // [local binds, defparams, nested modules, instances named as a target]
+    fn walk(items: &[ModuleItem], targets: &HashSet<&str>, found: &mut [usize; 4]) {
+        for item in items {
+            match item {
+                ModuleItem::Bind(_) => found[0] += 1,
+                ModuleItem::Defparam(_) => found[1] += 1,
+                ModuleItem::NestedModule(_) => found[2] += 1,
+                ModuleItem::ModuleInstantiation(inst) => {
+                    found[3] += inst
+                        .instances
+                        .iter()
+                        .filter(|i| targets.contains(i.name.name.as_str()))
+                        .count();
+                }
+                ModuleItem::GenerateRegion(region) => walk(&region.items, targets, found),
+                ModuleItem::GenerateFor(loop_) => walk(&loop_.items, targets, found),
+                ModuleItem::GenerateIf(cond) => {
+                    for (_, branch) in &cond.branches {
+                        walk(branch, targets, found);
+                    }
+                }
+                ModuleItem::GenerateCase(case) => {
+                    for arm in &case.arms {
+                        walk(&arm.items, targets, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = [0; 4];
+    for def in definitions.values() {
+        walk(def.items(), &targets, &mut found);
+    }
+    [
+        ("unit_binds", unit_binds.len()),
+        ("binds_to_instance_path", instance_path),
+        ("binds_in_generate_scope", generate_scope),
+        ("binds_of_other_kind", other_kind),
+        ("module_scope_binds", found[0]),
+        ("defparams", found[1]),
+        ("nested_modules", found[2]),
+        ("instances_named_as_target", found[3]),
+    ]
+}
+
 /// Acyclic module-type binds in compilation-unit scope are known before the
 /// first hierarchy walk (§23.11). Attach those while visiting their targets so
 /// designs with standard compilation-unit binds do not trigger a full second

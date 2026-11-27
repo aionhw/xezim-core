@@ -1485,7 +1485,7 @@ fn parse_and_elaborate_multi_inner(
     include_dirs: &[String],
     source_files: &[String],
     defines: &[(String, Option<String>)],
-    mut pre: Option<PreprocessedSources>,
+    pre: Option<PreprocessedSources>,
 ) -> Result<
     (
         crate::hasher::HashMap<String, SourceDefinition>,
@@ -1494,6 +1494,34 @@ fn parse_and_elaborate_multi_inner(
     String,
 > {
     let _oom_trace = oom_trace::session();
+    let result = parse_and_elaborate_multi_traced(
+        sources,
+        top_module_name,
+        include_dirs,
+        source_files,
+        defines,
+        pre,
+    );
+    if let Err(message) = &result {
+        oom_trace::failure(message);
+    }
+    result
+}
+
+fn parse_and_elaborate_multi_traced(
+    sources: Option<&[String]>,
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    source_files: &[String],
+    defines: &[(String, Option<String>)],
+    mut pre: Option<PreprocessedSources>,
+) -> Result<
+    (
+        crate::hasher::HashMap<String, SourceDefinition>,
+        elaborate::ElaboratedModule,
+    ),
+    String,
+> {
     let _census_session = sv_parser::census_session();
     if let Some(p) = pre.as_ref() {
         if p.default_nettype_none {
@@ -1548,7 +1576,17 @@ fn parse_and_elaborate_multi_inner(
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("<unnamed>");
-        let _oom_source = oom_trace::scope("preprocess", label, "", "");
+        // With the text preprocessed earlier, only lexing and parsing remain.
+        let _oom_source = oom_trace::scope(
+            if pre_files.is_some() {
+                "parse source"
+            } else {
+                "preprocess"
+            },
+            label,
+            "",
+            "",
+        );
         if compile_verbose() {
             eprintln!("[compile] ({}/{}) parsing {}", i + 1, file_count, label);
         } else {
@@ -4239,7 +4277,7 @@ fn parse_and_elaborate(
             // 2 never overlap in RAM (#721).
             drop(elab);
             release_free_memory();
-            oom_trace::checkpoint("bind_rebuild.memory_released", &[]);
+            oom_trace::checkpoint("bind_rebuild.memory_released", &[("rebuild_pass", pass + 1)]);
             elab = elaborate::elaborate_module_with_defs(
                 elab_def,
                 &params,
